@@ -32,7 +32,7 @@ use js_sys::{Array, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{DedicatedWorkerGlobalScope, File};
+use web_sys::{DedicatedWorkerGlobalScope, FileReaderSync};
 
 #[path = "content_archive/support.rs"]
 mod support;
@@ -246,7 +246,8 @@ async fn a_relay_import_drives_the_worker_outbox() {
     let (hub, _, _) = start_recovering_relay(worker, ContentArchive::new(store, [3; 32]));
     let uploaded = Rc::new(RefCell::new(Vec::new()));
     let transport = install_content_transport(&uploaded);
-    hub.import_local_data(archive).await.expect("relay import");
+    let blob = archive_to_blob(&archive);
+    hub.import_local_data(blob).await.expect("relay import");
     assert!(
         until(async || uploads_of(&uploaded, RELAY_PHOTO) > 0).await,
         "the relay import must upload the restored photo"
@@ -272,7 +273,8 @@ async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
     let (hub, _, _) = start_recovering_relay(worker, ContentArchive::new(store, [4; 32]));
     let uploaded = Rc::new(RefCell::new(Vec::new()));
     let transfer = install_blocked_content_transport(&uploaded);
-    hub.import_local_data(archive).await.expect("relay import");
+    let blob = archive_to_blob(&archive);
+    hub.import_local_data(blob).await.expect("relay import");
     assert!(
         until(async || transfer.started.get()).await,
         "the content transfer must start"
@@ -326,7 +328,7 @@ async fn stage_source(photo: &'static [u8]) -> (Vec<u8>, FileId) {
         .await
         .expect("stage offline photo");
     let archive = source
-        .export_local_data(ExportScope::Unsynced)
+        .export_local_data(ExportScope::Unsynced, Vec::new())
         .await
         .expect("export through content policy");
     (archive, file_id)
@@ -360,12 +362,8 @@ async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
     serve_export_requests(hub.clone()).expect("export service");
     serve_import_requests(hub).expect("import service");
     let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
-    let file = File::new_with_u8_array_sequence(
-        &Array::of1(&Uint8Array::from(archive)),
-        "offline-photo.zip",
-    )
-    .expect("archive file");
-    let (_, collisions) = request_import(file).await.expect("relay import");
+    let blob = archive_to_blob(archive);
+    let (_, collisions) = request_import(blob).await.expect("relay import");
     assert_eq!(collisions, 0);
     wait_for_reconnect(&completed_subscribes).await;
     assert_eq!(
@@ -373,9 +371,21 @@ async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
         1,
         "local archive work must not discard a transport that completed its handshake"
     );
-    request_export(ExportScope::Unsynced)
+    let export_blob = request_export(ExportScope::Unsynced)
         .await
-        .expect("relay export")
+        .expect("relay export");
+    // Read the Blob to bytes so restore_target can call prepare_local_data_import.
+    let reader = FileReaderSync::new().expect("FileReaderSync in dedicated worker");
+    let buffer = reader
+        .read_as_array_buffer(&export_blob)
+        .expect("read export blob");
+    Uint8Array::new(&buffer).to_vec()
+}
+
+/// Build a `Blob` from a byte slice so it can be posted across `postMessage`.
+fn archive_to_blob(bytes: &[u8]) -> web_sys::Blob {
+    let arr = Uint8Array::from(bytes);
+    web_sys::Blob::new_with_u8_array_sequence(&Array::of1(&arr)).expect("blob from archive bytes")
 }
 
 fn start_recovering_relay(
@@ -435,13 +445,13 @@ async fn restore_target(archive: &[u8]) -> Rc<BrowserContentClient<TicketTranspo
         .await
         .expect("attach replacement content"),
     );
-    let plan = replacement
-        .prepare_local_data_import(archive)
+    let mut plan = replacement
+        .prepare_local_data_import(std::io::Cursor::new(archive))
         .await
         .expect("prepare content archive");
     assert_eq!(plan.replica_plan().collisions().len(), 0);
     replacement
-        .apply_local_data_import(&plan, &ImportChoices::keeping_the_file())
+        .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
         .await
         .expect("apply content archive");
     replacement

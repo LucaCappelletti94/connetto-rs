@@ -9,7 +9,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, File, MessageEvent};
+use web_sys::{Blob, BroadcastChannel, DedicatedWorkerGlobalScope, MessageEvent};
 
 use super::archive_channel::{
     decode_export_request, decode_import_request, export_generation_reply, export_reply_ok,
@@ -145,11 +145,14 @@ async fn two_concurrent_exports_each_receive_their_own_archive() {
             };
             // The archive names the scope it was asked for, which is what makes
             // a crossed reply visible.
-            let archive = match scope {
-                ExportScope::Everything => b"everything".to_vec(),
-                ExportScope::Unsynced => b"unsynced".to_vec(),
+            let bytes: &[u8] = match scope {
+                ExportScope::Everything => b"everything",
+                ExportScope::Unsynced => b"unsynced",
             };
-            let reply = export_reply_ok(&tag, &archive).expect("export reply");
+            let arr = js_sys::Uint8Array::from(bytes);
+            let blob = Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&arr))
+                .expect("create archive blob");
+            let reply = export_reply_ok(&tag, &blob).expect("export reply");
             channel.post_message(&reply).expect("answer export");
         })
     };
@@ -161,8 +164,19 @@ async fn two_concurrent_exports_each_receive_their_own_archive() {
     )
     .await;
 
-    assert_eq!(everything.expect("whole archive"), b"everything");
-    assert_eq!(unsynced.expect("unsynced archive"), b"unsynced");
+    let everything_blob = everything.expect("whole archive");
+    let everything_buf = JsFuture::from(everything_blob.array_buffer())
+        .await
+        .expect("read everything blob");
+    assert_eq!(
+        js_sys::Uint8Array::new(&everything_buf).to_vec(),
+        b"everything"
+    );
+    let unsynced_blob = unsynced.expect("unsynced archive");
+    let unsynced_buf = JsFuture::from(unsynced_blob.array_buffer())
+        .await
+        .expect("read unsynced blob");
+    assert_eq!(js_sys::Uint8Array::new(&unsynced_buf).to_vec(), b"unsynced");
     channel.set_onmessage(None);
     channel.close();
     drop(on_message);
@@ -190,14 +204,14 @@ async fn two_concurrent_imports_each_receive_their_own_outcome() {
                 channel.post_message(&reply).expect("post gen reply");
                 return;
             }
-            let Some((tag, file)) = decode_import_request(&data) else {
+            let Some((tag, blob)) = decode_import_request(&data) else {
                 return;
             };
             let channel = channel.clone();
             spawn_local(async move {
-                let buffer = JsFuture::from(file.array_buffer())
+                let buffer = JsFuture::from(blob.array_buffer())
                     .await
-                    .expect("read file buffer");
+                    .expect("read blob buffer");
                 let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
                 let reply = if bytes.first() == Some(&b'A') {
                     import_reply_ok(
@@ -210,7 +224,7 @@ async fn two_concurrent_imports_each_receive_their_own_outcome() {
                         0,
                     )
                 } else {
-                    import_reply_failed(&tag, "file B rejected intentionally")
+                    import_reply_failed(&tag, "blob B rejected intentionally")
                 };
                 channel
                     .post_message(&reply.expect("build import reply"))
@@ -220,15 +234,15 @@ async fn two_concurrent_imports_each_receive_their_own_outcome() {
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
-    let make_file = |content: &str| {
-        let arr = js_sys::Array::new();
-        arr.push(&JsValue::from_str(content));
-        File::new_with_str_sequence(&arr, "test.zip").expect("create file")
+    let make_blob = |content: &'static str| {
+        let parts = js_sys::Array::new();
+        parts.push(&JsValue::from_str(content));
+        Blob::new_with_str_sequence(&parts).expect("create blob")
     };
 
     let (result_a, result_b) = futures_util::future::join(
-        request_import(make_file("A-file content")),
-        request_import(make_file("B-file content")),
+        request_import(make_blob("A-blob content")),
+        request_import(make_blob("B-blob content")),
     )
     .await;
 
@@ -284,10 +298,10 @@ async fn import_wait_ends_when_worker_generation_is_replaced() {
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
 
-    let content = js_sys::Array::new();
-    content.push(&JsValue::from_str("x"));
-    let file = File::new_with_str_sequence(&content, "test.zip").expect("create test file");
-    let result = request_import(file).await;
+    let arr = js_sys::Uint8Array::from(b"x".as_ref());
+    let blob =
+        Blob::new_with_u8_array_sequence(&js_sys::Array::of1(&arr)).expect("create test blob");
+    let result = request_import(blob).await;
 
     assert!(
         matches!(result, Err(crate::relay::ImportRefused::Gone(_))),

@@ -95,7 +95,7 @@ fn archive_carries_manifest_and_compressed_patchset_entries() {
         .expect("seed drafts");
 
     let bytes = conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export local data");
 
     // Encrypted replica files are not readable as plain SQLite.
@@ -229,7 +229,7 @@ fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
 
     // ExportScope::Everything carries both tiers.
     let bytes_all = conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export everything");
     let mut arch_all = ZipArchive::new(Cursor::new(bytes_all)).expect("open zip");
     assert_eq!(
@@ -248,7 +248,7 @@ fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
 
     // ExportScope::Unsynced omits the synced replica but keeps the private tier.
     let bytes_unsynced = conn
-        .export_local_data(ExportScope::Unsynced)
+        .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export unsynced");
     let mut arch_unsynced = ZipArchive::new(Cursor::new(bytes_unsynced)).expect("open zip");
     assert_eq!(
@@ -289,7 +289,7 @@ fn table_without_primary_key_is_refused_by_name() {
     )
     .expect("create it mid-run");
     let err = conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect_err("must refuse a table without a primary key");
     let msg = format!("{err}");
     assert!(
@@ -328,7 +328,7 @@ CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
         .expect("seed order row");
 
     let bytes = conn
-        .export_local_data(ExportScope::Everything)
+        .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export local data");
     let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open zip");
     let raw = zip_entry(&mut archive, "synced.patchset");
@@ -365,6 +365,92 @@ CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
             .any(|row| row.contains(&Value::Blob(vec![0xaau8, 0xbb]))),
         "payload must survive in the patchset row"
     );
+}
+
+/// A file sink carries the same archive a buffer sink does, entry for entry,
+/// and the reader accepts the data descriptors a stream writer emits.
+///
+/// The writer never seeks, so nothing proves the two agree except reading one
+/// of them back beside the other.
+#[test]
+fn a_file_sink_and_a_buffer_sink_write_the_same_archive() {
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let replica = Replica::in_memory().with_tier(TIER_DDL);
+    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
+        &replica,
+        SYNCED_DDL,
+        &ClientConfig::new("file-sink".to_owned()),
+        None,
+    )
+    .expect("open replica");
+    diesel::insert_into(items::table)
+        .values((
+            items::id.eq(1),
+            items::label.eq("row"),
+            items::payload.eq(vec![9u8, 8, 7]),
+        ))
+        .execute(conn.conn())
+        .expect("seed synced row");
+    diesel::insert_into(drafts::table)
+        .values((drafts::id.eq(4), drafts::body.eq("draft")))
+        .execute(conn.conn())
+        .expect("seed private row");
+
+    let attachment = connetto_client::ArchiveAttachment::new("content/chunks/one", 5)
+        .expect("attachment declaration");
+    let path = dir.path().join("device.zip");
+    let mut to_file = conn
+        .export_local_data_with_attachments(
+            ExportScope::Everything,
+            std::slice::from_ref(&attachment),
+            std::fs::File::create(&path).expect("create the archive file"),
+        )
+        .expect("start the file export");
+    to_file
+        .write_attachment("content/chunks/one", b"bytes")
+        .expect("attachment body");
+    to_file.finish().expect("finish the file export");
+
+    let mut to_buffer = conn
+        .export_local_data_with_attachments(
+            ExportScope::Everything,
+            std::slice::from_ref(&attachment),
+            Vec::new(),
+        )
+        .expect("start the buffer export");
+    to_buffer
+        .write_attachment("content/chunks/one", b"bytes")
+        .expect("attachment body");
+    let buffered = to_buffer.finish().expect("finish the buffer export");
+
+    let on_disk = std::fs::read(&path).expect("read the archive file");
+    assert_eq!(
+        entry_shapes(&on_disk),
+        entry_shapes(&buffered),
+        "a file sink and a buffer sink must produce the same entries"
+    );
+
+    // The reader takes the file itself, which is the path the decision names.
+    let mut plan = conn
+        .import_local_data(std::fs::File::open(&path).expect("open the archive file"))
+        .expect("plan from the file");
+    assert_eq!(plan.attachments().len(), 1);
+    let mut body = Vec::new();
+    plan.read_attachment("content/chunks/one", &mut body)
+        .expect("attachment reads out of the file");
+    assert_eq!(body, b"bytes");
+}
+
+/// Every entry of one archive as its name, its length and its checksum, which
+/// is content identity without holding two archives side by side.
+fn entry_shapes(bytes: &[u8]) -> Vec<(String, u64, u32)> {
+    let mut archive = ZipArchive::new(Cursor::new(bytes)).expect("open zip");
+    (0..archive.len())
+        .map(|at| {
+            let entry = archive.by_index(at).expect("zip entry");
+            (entry.name().to_owned(), entry.size(), entry.crc32())
+        })
+        .collect()
 }
 
 fn zip_entry(archive: &mut ZipArchive<Cursor<Vec<u8>>>, name: &str) -> Vec<u8> {

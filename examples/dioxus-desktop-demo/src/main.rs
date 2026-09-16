@@ -21,7 +21,7 @@
 //!   IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source
 //!   `target/dev-idp.env` before starting the server.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use connetto_client::auth::{
@@ -186,13 +186,23 @@ fn export_path() -> PathBuf {
     data_dir().join("connetto-local-data.zip")
 }
 
-/// Write an export archive beside the replica, reporting what the user can go
-/// and open. The bytes are handed over whole rather than streamed: they are
-/// already in memory, and the archive is the whole point of the call.
-fn write_export(bytes: &[u8]) -> std::io::Result<PathBuf> {
-    let path = export_path();
+/// Opens the file the archive is written into, beside the one a previous
+/// export left.
+///
+/// A partly written archive never takes the name the user knows, so an export
+/// that fails leaves the last good one where it was.
+fn create_export_file() -> std::io::Result<(PathBuf, std::fs::File)> {
+    let path = export_path().with_extension("zip.part");
     std::fs::create_dir_all(data_dir())?;
-    std::fs::write(&path, bytes)?;
+    let file = std::fs::File::create(&path)?;
+    Ok((path, file))
+}
+
+/// Moves a finished archive onto the name the user knows, replacing whatever
+/// a previous export left there.
+fn publish_export(part: &Path) -> std::io::Result<PathBuf> {
+    let path = export_path();
+    std::fs::rename(part, &path)?;
     Ok(path)
 }
 
@@ -1096,19 +1106,32 @@ fn app() -> Element {
                     onclick: move |_| {
                         let client = export_client.clone();
                         spawn(async move {
-                            let message = match client
-                                .with_conn(|c| c.export_local_data(ExportScope::Everything))
-                                .await
-                            {
-                                Ok(bytes) => match write_export(&bytes) {
-                                    Ok(path) => format!(
-                                        "Wrote {} bytes to {}",
-                                        bytes.len(),
-                                        path.display()
-                                    ),
-                                    Err(err) => format!("could not write the export: {err}"),
+                            let message = match create_export_file() {
+                                Err(err) => format!("could not open the export file: {err}"),
+                                Ok((part, file)) => match client
+                                    .with_conn(move |c| {
+                                        c.export_local_data(ExportScope::Everything, file)
+                                    })
+                                    .await
+                                {
+                                    Ok(file) => {
+                                        let written = file.metadata().map(|meta| meta.len());
+                                        drop(file);
+                                        match (publish_export(&part), written) {
+                                            (Ok(path), Ok(bytes)) => {
+                                                format!("Wrote {bytes} bytes to {}", path.display())
+                                            }
+                                            (Ok(path), Err(err)) => format!(
+                                                "wrote {} but could not measure it: {err}",
+                                                path.display()
+                                            ),
+                                            (Err(err), _) => {
+                                                format!("could not replace the last export: {err}")
+                                            }
+                                        }
+                                    }
+                                    Err(err) => format!("export failed: {err}"),
                                 },
-                                Err(err) => format!("export failed: {err}"),
                             };
                             export_status.set(Some(message));
                         });
@@ -1147,9 +1170,15 @@ fn app() -> Element {
                             else {
                                 return;
                             };
-                            let bytes = file.read().await;
+                            let source = match std::fs::File::open(file.path()) {
+                                Ok(source) => source,
+                                Err(err) => {
+                                    import_status.set(Some(format!("could not open it: {err}")));
+                                    return;
+                                }
+                            };
                             let message =
-                                match client.with_conn(move |c| c.import_local_data(&bytes)).await
+                                match client.with_conn(move |c| c.import_local_data(source)).await
                                 {
                                     Err(err) => format!("refused: {err}"),
                                     Ok(plan) => {

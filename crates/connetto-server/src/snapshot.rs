@@ -915,14 +915,17 @@ mod pg {
                         })?;
                 let mut key_ordinals = Vec::with_capacity(member_keys.len());
                 for member_key in member_keys {
-                    let ordinal =
-                        catalog_helpers::column_id(&self.catalog, member_table_id, member_key)
-                            .ok_or_else(|| {
-                                SnapshotError::Encode(format!(
-                                    "the seed projects {member_key}, which {member_table} does \
+                    let ordinal = catalog_helpers::column_id::<Postgres, _>(
+                        &self.catalog,
+                        member_table_id,
+                        member_key,
+                    )
+                    .ok_or_else(|| {
+                        SnapshotError::Encode(format!(
+                            "the seed projects {member_key}, which {member_table} does \
                                      not have"
-                                ))
-                            })?;
+                        ))
+                    })?;
                     key_ordinals.push(usize::from(ordinal));
                 }
                 let built = subql::emit::pgbinary_patchset_builder::<Postgres, _>(

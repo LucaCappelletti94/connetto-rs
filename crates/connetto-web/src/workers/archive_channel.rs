@@ -5,8 +5,8 @@ use std::rc::Rc;
 
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
-use wasm_bindgen_futures::{JsFuture, spawn_local};
-use web_sys::{BroadcastChannel, File, MessageEvent};
+use wasm_bindgen_futures::spawn_local;
+use web_sys::{Blob, BroadcastChannel, MessageEvent};
 
 use connetto_client::{ExportScope, ImportOutcome};
 
@@ -31,7 +31,7 @@ enum ExportWorkerError {
     Failed(String),
 }
 
-type ExportReply = Result<Vec<u8>, ExportWorkerError>;
+type ExportReply = Result<web_sys::Blob, ExportWorkerError>;
 
 #[derive(Default)]
 struct ExportWait {
@@ -232,19 +232,19 @@ fn build_export_request(scope: ExportScope, tag: &ExportTag) -> JsValue {
     request.into()
 }
 
-pub(super) fn decode_import_request(data: &JsValue) -> Option<(ImportTag, File)> {
+pub(super) fn decode_import_request(data: &JsValue) -> Option<(ImportTag, Blob)> {
     if export_message_kind(data).as_deref() != Some(IMPORT_REQUEST_KIND) {
         return None;
     }
     let tag = ImportTag::read(data)?;
-    let file = js_sys::Reflect::get(data, &JsValue::from_str("file"))
+    let blob = js_sys::Reflect::get(data, &JsValue::from_str("blob"))
         .ok()?
-        .dyn_into::<File>()
+        .dyn_into::<Blob>()
         .ok()?;
-    Some((tag, file))
+    Some((tag, blob))
 }
 
-fn build_import_request(file: &File, tag: &ImportTag) -> Result<JsValue, ChannelError> {
+fn build_import_request(blob: &Blob, tag: &ImportTag) -> Result<JsValue, ChannelError> {
     let request = js_sys::Object::new();
     js_sys::Reflect::set(
         &request,
@@ -253,7 +253,7 @@ fn build_import_request(file: &File, tag: &ImportTag) -> Result<JsValue, Channel
     )
     .map_err(|e| reflect_error("build import request", &e))?;
     tag.write(&request)?;
-    js_sys::Reflect::set(&request, &JsValue::from_str("file"), file.as_ref())
+    js_sys::Reflect::set(&request, &JsValue::from_str("blob"), blob.as_ref())
         .map_err(|e| reflect_error("build import request", &e))?;
     Ok(request.into())
 }
@@ -262,8 +262,11 @@ fn decode_export_reply(data: &JsValue) -> Option<(ExportTag, ExportReply)> {
     let tag = ExportTag::read(data)?;
     let reply = match export_message_kind(data)?.as_str() {
         EXPORT_REPLY_OK => {
-            let bytes = js_sys::Reflect::get(data, &JsValue::from_str("bytes")).ok()?;
-            Ok(js_sys::Uint8Array::new(&bytes).to_vec())
+            let blob = js_sys::Reflect::get(data, &JsValue::from_str("blob"))
+                .ok()?
+                .dyn_into::<Blob>()
+                .ok()?;
+            Ok(blob)
         }
         EXPORT_REPLY_FAILED => {
             let error = js_sys::Reflect::get(data, &JsValue::from_str("error"))
@@ -356,7 +359,7 @@ fn set_export_generation(reply: &js_sys::Object, generation: &str) -> Result<boo
     .map_err(|e| reflect_error("set export generation", &e))
 }
 
-pub(super) fn export_reply_ok(tag: &ExportTag, bytes: &[u8]) -> Result<JsValue, ChannelError> {
+pub(super) fn export_reply_ok(tag: &ExportTag, blob: &Blob) -> Result<JsValue, ChannelError> {
     let reply = js_sys::Object::new();
     js_sys::Reflect::set(
         &reply,
@@ -365,12 +368,8 @@ pub(super) fn export_reply_ok(tag: &ExportTag, bytes: &[u8]) -> Result<JsValue, 
     )
     .map_err(|e| reflect_error("export reply ok", &e))?;
     tag.write(&reply)?;
-    js_sys::Reflect::set(
-        &reply,
-        &JsValue::from_str("bytes"),
-        &js_sys::Uint8Array::from(bytes),
-    )
-    .map_err(|e| reflect_error("export reply ok", &e))?;
+    js_sys::Reflect::set(&reply, &JsValue::from_str("blob"), blob.as_ref())
+        .map_err(|e| reflect_error("export reply ok", &e))?;
     Ok(reply.into())
 }
 
@@ -484,7 +483,21 @@ async fn poll_for_export_reply(
 ///
 /// [`ChannelError::ChannelOpen`] when the broadcast channel cannot be opened.
 pub fn serve_export_requests(hub: crate::relay::RelayHub) -> Result<(), ChannelError> {
-    serve_exports(move |scope| {
+    serve_export_requests_on(hub, super::EXPORT_CHANNEL)
+}
+
+/// Like [`serve_export_requests`] but listens on `channel` instead of [`super::EXPORT_CHANNEL`].
+///
+/// Use a test-unique name to isolate concurrent tests that share the production channel.
+///
+/// # Errors
+///
+/// [`ChannelError::ChannelOpen`] when the broadcast channel cannot be opened.
+pub fn serve_export_requests_on(
+    hub: crate::relay::RelayHub,
+    channel: &str,
+) -> Result<(), ChannelError> {
+    serve_exports(channel, move |scope| {
         let hub = hub.clone();
         async move { hub.export_local_data(scope).await }
     })
@@ -510,17 +523,16 @@ fn install_worker_listener(channel: &BroadcastChannel, listener: Closure<dyn FnM
     listener.forget();
 }
 
-fn serve_exports<F, Fut, E>(export: F) -> Result<(), ChannelError>
+fn serve_exports<F, Fut, E>(channel: &str, export: F) -> Result<(), ChannelError>
 where
     F: Fn(ExportScope) -> Fut + 'static,
-    Fut: Future<Output = Result<Vec<u8>, E>> + 'static,
+    Fut: Future<Output = Result<Blob, E>> + 'static,
     E: Display + 'static,
 {
-    let channel =
-        BroadcastChannel::new(super::EXPORT_CHANNEL).map_err(|err| ChannelError::ChannelOpen {
-            operation: "export channel",
-            detail: format!("{err:?}"),
-        })?;
+    let channel = BroadcastChannel::new(channel).map_err(|err| ChannelError::ChannelOpen {
+        operation: "export channel",
+        detail: format!("{err:?}"),
+    })?;
     let generation = Rc::new(rosetta_uuid::Uuid::new_v4().to_string());
     let export = Rc::new(export);
     let listener = {
@@ -543,7 +555,7 @@ where
             let export = Rc::clone(&export);
             spawn_local(async move {
                 let reply = match export(scope).await {
-                    Ok(bytes) => export_reply_ok(&tag, &bytes),
+                    Ok(blob) => export_reply_ok(&tag, &blob),
                     Err(err) => export_reply_failed(&tag, &err.to_string()),
                 };
                 post_channel_reply(&channel, reply, "export");
@@ -562,23 +574,36 @@ where
 ///
 /// [`ChannelError::ChannelOpen`] when the broadcast channel cannot be opened.
 pub fn serve_import_requests(hub: crate::relay::RelayHub) -> Result<(), ChannelError> {
-    serve_imports(move |bytes| {
+    serve_import_requests_on(hub, super::IMPORT_CHANNEL)
+}
+
+/// Like [`serve_import_requests`] but listens on `channel` instead of [`super::IMPORT_CHANNEL`].
+///
+/// Use a test-unique name to isolate concurrent tests that share the production channel.
+///
+/// # Errors
+///
+/// [`ChannelError::ChannelOpen`] when the broadcast channel cannot be opened.
+pub fn serve_import_requests_on(
+    hub: crate::relay::RelayHub,
+    channel: &str,
+) -> Result<(), ChannelError> {
+    serve_imports(channel, move |blob| {
         let hub = hub.clone();
-        async move { hub.import_local_data(bytes).await }
+        async move { hub.import_local_data(blob).await }
     })
 }
 
-fn serve_imports<F, Fut, E>(import: F) -> Result<(), ChannelError>
+fn serve_imports<F, Fut, E>(channel: &str, import: F) -> Result<(), ChannelError>
 where
-    F: Fn(Vec<u8>) -> Fut + 'static,
+    F: Fn(Blob) -> Fut + 'static,
     Fut: Future<Output = Result<(ImportOutcome, usize), E>> + 'static,
     E: Display + 'static,
 {
-    let channel =
-        BroadcastChannel::new(super::IMPORT_CHANNEL).map_err(|err| ChannelError::ChannelOpen {
-            operation: "import channel",
-            detail: format!("{err:?}"),
-        })?;
+    let channel = BroadcastChannel::new(channel).map_err(|err| ChannelError::ChannelOpen {
+        operation: "import channel",
+        detail: format!("{err:?}"),
+    })?;
     let generation = Rc::new(rosetta_uuid::Uuid::new_v4().to_string());
     let import = Rc::new(import);
     let listener = {
@@ -591,7 +616,7 @@ where
                 }
                 return;
             }
-            let Some((tag, file)) = decode_import_request(&event.data()) else {
+            let Some((tag, blob)) = decode_import_request(&event.data()) else {
                 return;
             };
             if tag.generation != *generation {
@@ -600,17 +625,7 @@ where
             let channel = channel.clone();
             let import = Rc::clone(&import);
             spawn_local(async move {
-                let buffer = match JsFuture::from(file.array_buffer()).await {
-                    Ok(buffer) => buffer,
-                    Err(err) => {
-                        let error = format!("{err:?}");
-                        tracing::error!(error = %error, "db worker: reading import file failed");
-                        post_channel_reply(&channel, import_reply_failed(&tag, &error), "import");
-                        return;
-                    }
-                };
-                let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
-                let reply = match import(bytes).await {
+                let reply = match import(blob).await {
                     Ok((outcome, collisions)) => import_reply_ok(&tag, &outcome, collisions),
                     Err(err) => import_reply_failed(&tag, &err.to_string()),
                 };
@@ -650,13 +665,13 @@ fn collect_export_result(
     channel: &BroadcastChannel,
     on_message: Closure<dyn FnMut(MessageEvent)>,
     state: &ExportSlot,
-) -> Result<Vec<u8>, crate::relay::ExportRefused> {
+) -> Result<Blob, crate::relay::ExportRefused> {
     channel.set_onmessage(None);
     channel.close();
     drop(on_message);
     let mut state = state.borrow_mut();
     match state.result.take() {
-        Some(Ok(bytes)) if !state.replaced => Ok(bytes),
+        Some(Ok(blob)) if !state.replaced => Ok(blob),
         Some(Err(err)) if !state.replaced => {
             Err(crate::relay::ExportRefused::Failed(err.to_string()))
         }
@@ -666,12 +681,29 @@ fn collect_export_result(
 
 /// Page side: ask the DB worker for a zip archive of this device's local data.
 ///
+/// The returned `Blob` is owned by the browser and costs no copy on the page.
+///
 /// # Errors
 ///
 /// [`crate::relay::ExportRefused::Gone`] when no DB worker is running,
 /// [`crate::relay::ExportRefused::Failed`] when the worker answered without an archive.
-pub async fn request_export(scope: ExportScope) -> Result<Vec<u8>, crate::relay::ExportRefused> {
-    let channel = BroadcastChannel::new(super::EXPORT_CHANNEL)
+pub async fn request_export(scope: ExportScope) -> Result<Blob, crate::relay::ExportRefused> {
+    request_export_on(scope, super::EXPORT_CHANNEL).await
+}
+
+/// Like [`request_export`] but polls `channel` instead of [`super::EXPORT_CHANNEL`].
+///
+/// Use a test-unique name to isolate concurrent tests that share the production channel.
+///
+/// # Errors
+///
+/// [`crate::relay::ExportRefused::Gone`] when no DB worker is running,
+/// [`crate::relay::ExportRefused::Failed`] when the worker answered without an archive.
+pub async fn request_export_on(
+    scope: ExportScope,
+    channel: &str,
+) -> Result<Blob, crate::relay::ExportRefused> {
+    let channel = BroadcastChannel::new(channel)
         .map_err(|err| crate::relay::ExportRefused::Failed(format!("export channel: {err:?}")))?;
     let state: ExportSlot = Rc::new(RefCell::new(ExportWait::default()));
     let request = rosetta_uuid::Uuid::new_v4().to_string();
@@ -769,7 +801,10 @@ fn collect_import_result(
     }
 }
 
-/// Page side: hand the DB worker a `File` to import and wait for the outcome.
+/// Page side: hand the DB worker a `Blob` to import and wait for the outcome.
+///
+/// The `Blob` crosses `postMessage` without copying its bytes, and the worker
+/// reads it with `FileReaderSync` inside a dedicated worker.
 ///
 /// # Errors
 ///
@@ -777,19 +812,24 @@ fn collect_import_result(
 /// replacement worker takes the alive lock before the request is answered,
 /// [`crate::relay::ImportRefused::Failed`] when the worker refused the import.
 pub async fn request_import(
-    file: File,
+    archive: Blob,
 ) -> Result<(ImportOutcome, usize), crate::relay::ImportRefused> {
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "2^31 is exactly representable as f64; no precision is lost"
-    )]
-    if file.size() > super::MAX_ARCHIVE_BUFFER_BYTES as f64 {
-        return Err(crate::relay::ImportRefused::Failed(
-            "archive is above the 2 GiB a browser worker can buffer, import it from a native client"
-                .to_owned(),
-        ));
-    }
-    let channel = BroadcastChannel::new(super::IMPORT_CHANNEL)
+    request_import_on(archive, super::IMPORT_CHANNEL).await
+}
+
+/// Like [`request_import`] but polls `channel` instead of [`super::IMPORT_CHANNEL`].
+///
+/// Use a test-unique name to isolate concurrent tests that share the production channel.
+///
+/// # Errors
+///
+/// [`crate::relay::ImportRefused::Gone`] when no DB worker is running,
+/// [`crate::relay::ImportRefused::Failed`] when the worker refused the import.
+pub async fn request_import_on(
+    archive: Blob,
+    channel: &str,
+) -> Result<(ImportOutcome, usize), crate::relay::ImportRefused> {
+    let channel = BroadcastChannel::new(channel)
         .map_err(|err| crate::relay::ImportRefused::Failed(format!("import channel: {err:?}")))?;
     let state: ImportSlot = Rc::new(RefCell::new(ImportWait::default()));
     let request_id = rosetta_uuid::Uuid::new_v4().to_string();
@@ -804,7 +844,7 @@ pub async fn request_import(
             generation,
             request: request_id,
         };
-        if let Ok(request_msg) = build_import_request(&file, &tag) {
+        if let Ok(request_msg) = build_import_request(&archive, &tag) {
             poll_for_import_reply(&channel, &state, &generation_request, &request_msg).await;
         } else {
             channel.set_onmessage(None);

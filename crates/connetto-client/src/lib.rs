@@ -81,7 +81,7 @@ pub mod teardown;
 
 pub use archive::{
     ArchiveAttachment, Cell, Collision, Difference, ExportScope, ImportChoices, ImportOutcome,
-    ImportPlan, Keep,
+    ImportPlan, Keep, LocalDataExport, MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_BYTES,
 };
 #[cfg(feature = "native-auth")]
 pub use auth::{
@@ -2742,8 +2742,12 @@ where
         &self.local_tables
     }
 
-    /// Write an archive of this device's local data, which
+    /// Write an archive of this device's local data into `sink`, which
     /// [`import_local_data`](Self::import_local_data) reads back.
+    ///
+    /// The archive is written through as it is made, so a file sink costs a
+    /// file and no copy of it. The sink comes back, which is how a caller
+    /// reaches a buffer it passed in.
     ///
     /// `scope` decides how much travels: [`ExportScope::Everything`] carries
     /// the synced replica and the device-private tier, and
@@ -2763,22 +2767,36 @@ where
     /// [`ClientError::Export`] when a table has no declared primary key and
     /// was not named in [`ClientConfig::with_unrecorded_tables`], since SQLite
     /// records no changes for one and its rows would be silently absent. A
-    /// named one is skipped, which is what the declaration means.
-    pub fn export_local_data(&mut self, scope: ExportScope) -> Result<Vec<u8>, ClientError> {
-        self.export_local_data_with_attachments(scope, &[])
+    /// named one is skipped, which is what the declaration means. Also when
+    /// the sink refuses a write.
+    pub fn export_local_data<W: std::io::Write>(
+        &mut self,
+        scope: ExportScope,
+        sink: W,
+    ) -> Result<W, ClientError> {
+        self.export_local_data_with_attachments(scope, &[], sink)?
+            .finish()
     }
 
-    /// Writes a local-data archive with uninterpreted attachments at their declared relative paths.
+    /// Starts a local-data archive that declares `attachments` at their relative paths.
+    ///
+    /// The returned export owes one
+    /// [`write_attachment`](LocalDataExport::write_attachment) per declaration
+    /// and is closed by [`finish`](LocalDataExport::finish), so the caller
+    /// holds one attachment at a time and the archive is never assembled in
+    /// memory.
     ///
     /// # Errors
     ///
     /// Returns the errors from [`Self::export_local_data`] and refuses unsafe
-    /// or repeated attachment paths.
-    pub fn export_local_data_with_attachments(
+    /// or repeated attachment paths, one declaration above the per-entry
+    /// ceiling, or declarations above the aggregate ceiling.
+    pub fn export_local_data_with_attachments<W: std::io::Write>(
         &mut self,
         scope: ExportScope,
         attachments: &[ArchiveAttachment],
-    ) -> Result<Vec<u8>, ClientError> {
+        sink: W,
+    ) -> Result<LocalDataExport<W>, ClientError> {
         let synced_rows = match scope {
             ExportScope::Everything => Some(export_rows(
                 &mut self.db,
@@ -2800,15 +2818,18 @@ where
                 &self.config.unrecorded_tables,
             )?)
         };
-        archive::write(&archive::Archive {
-            scope,
-            fingerprint: self.schema_fingerprint()?,
-            account: self.account(),
-            synced_rows,
-            local_rows,
-            pending: self.pending.values().cloned().collect(),
-            attachments,
-        })
+        archive::start(
+            sink,
+            &archive::Archive {
+                scope,
+                fingerprint: self.schema_fingerprint()?,
+                account: self.account(),
+                synced_rows,
+                local_rows,
+                pending: self.pending.values().cloned().collect(),
+                attachments,
+            },
+        )
     }
 
     /// The fingerprint of the schema this replica runs, over both tiers.
@@ -2840,8 +2861,12 @@ where
             .map(|(_, identity)| identity.clone())
     }
 
-    /// Read an archive, check it against this replica, and report what
-    /// applying it would overwrite. Nothing is written.
+    /// Read an archive from a seekable `source`, check it against this replica,
+    /// and report what applying it would overwrite. Nothing is written.
+    ///
+    /// The plan holds `source` open, because the attachments it names are read
+    /// from it one at a time rather than carried, so a `2 GiB` archive costs
+    /// the largest attachment in it and never the whole file.
     ///
     /// Only what the server does not have is ever restored: the device-private
     /// tier and the writes that never reached it. The cache of rows the server
@@ -2860,8 +2885,11 @@ where
     /// format or version, one made under a different schema, one belonging to
     /// another account, a queue longer than this build holds, or a table this
     /// build does not have.
-    pub fn import_local_data(&mut self, bytes: &[u8]) -> Result<ImportPlan, ClientError> {
-        let archive = archive::read(bytes)?;
+    pub fn import_local_data<R: std::io::Read + std::io::Seek>(
+        &mut self,
+        source: R,
+    ) -> Result<ImportPlan<R>, ClientError> {
+        let (archive, reader) = archive::open(source)?;
         validate_archive_compat(
             &archive,
             &self.schema_fingerprint()?,
@@ -2885,6 +2913,7 @@ where
             archive,
             rows,
             collisions,
+            reader,
         })
     }
 
@@ -2909,9 +2938,9 @@ where
     /// # Errors
     ///
     /// [`ClientError::Import`] when rows, queued writes, or attachment handling fail, and [`ClientError::Db`] on a local database failure.
-    pub fn apply_import(
+    pub fn apply_import<R>(
         &mut self,
-        plan: &ImportPlan,
+        plan: &ImportPlan<R>,
         choices: &ImportChoices,
     ) -> Result<ImportOutcome, ClientError> {
         if !plan.attachments().is_empty() {
@@ -2928,9 +2957,9 @@ where
     /// # Errors
     ///
     /// Returns the errors from [`Self::apply_import`] or `bookkeeping`.
-    pub fn apply_import_with_bookkeeping<F>(
+    pub fn apply_import_with_bookkeeping<R, F>(
         &mut self,
-        plan: &ImportPlan,
+        plan: &ImportPlan<R>,
         choices: &ImportChoices,
         bookkeeping: F,
     ) -> Result<ImportOutcome, ClientError>
@@ -4587,7 +4616,7 @@ mod tests {
                 .expect("scratch schema");
             export_rows(&mut other, "main", None, &HashSet::new(), &HashSet::new()).expect("record")
         };
-        let bytes = archive::write(&archive::Archive {
+        let bytes = archive_bytes(&archive::Archive {
             scope: ExportScope::Unsynced,
             fingerprint,
             account: None,
@@ -4595,9 +4624,8 @@ mod tests {
             local_rows: Some(rows),
             pending: Vec::new(),
             attachments: &[],
-        })
-        .expect("write archive");
-        match conn.import_local_data(&bytes) {
+        });
+        match conn.import_local_data(std::io::Cursor::new(&bytes)) {
             Err(ClientError::Import(message)) => {
                 assert!(
                     message.contains("ghosts"),
@@ -4620,7 +4648,7 @@ mod tests {
         for seq in 0..PENDING_CAP as u64 {
             conn.pending.insert(seq, Vec::new());
         }
-        let bytes = archive::write(&archive::Archive {
+        let bytes = archive_bytes(&archive::Archive {
             scope: ExportScope::Unsynced,
             fingerprint,
             account: None,
@@ -4628,9 +4656,8 @@ mod tests {
             local_rows: None,
             pending: vec![Vec::new()],
             attachments: &[],
-        })
-        .expect("write archive");
-        match conn.import_local_data(&bytes) {
+        });
+        match conn.import_local_data(std::io::Cursor::new(&bytes)) {
             Err(ClientError::Import(message)) => {
                 assert!(
                     message.contains("already holds 256"),
@@ -4654,7 +4681,7 @@ mod tests {
         let fingerprint = conn.schema_fingerprint().expect("fingerprint");
         // The records themselves are never reached: the count is checked
         // first, which is the point.
-        let bytes = archive::write(&archive::Archive {
+        let bytes = archive_bytes(&archive::Archive {
             scope: ExportScope::Unsynced,
             fingerprint,
             account: None,
@@ -4662,9 +4689,8 @@ mod tests {
             local_rows: None,
             pending: vec![Vec::new(); PENDING_CAP + 1],
             attachments: &[],
-        })
-        .expect("write archive");
-        match conn.import_local_data(&bytes) {
+        });
+        match conn.import_local_data(std::io::Cursor::new(&bytes)) {
             Err(ClientError::Import(message)) => {
                 assert!(
                     message.contains("queued writes") && message.contains("256"),
@@ -4673,5 +4699,13 @@ mod tests {
             }
             other => panic!("expected a refusal, got {}", other.is_ok()),
         }
+    }
+
+    /// One archive in a buffer, for the refusal cases that build a file by hand.
+    fn archive_bytes(archive: &archive::Archive<'_>) -> Vec<u8> {
+        archive::start(Vec::new(), archive)
+            .expect("start archive")
+            .finish()
+            .expect("finish archive")
     }
 }
