@@ -24,7 +24,9 @@ use connetto_test_harness::Client;
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{membership_term_fixture, term_over_owner_fixture};
 use diesel::prelude::*;
-use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value as WireValue};
+use sqlite_diff_rs::{
+    DiffOps, Insert, ParsedDiffSet, PatchSet, PatchsetOp, SimpleTable, Value as WireValue,
+};
 
 /// The motivating filter, in the client's own SQLite dialect: the caller is
 /// the no-arg function the deployment mapped `current_setting` onto.
@@ -197,20 +199,41 @@ async fn expect_membership_opened(client: &mut Client) {
     assert_eq!(op.table().name(), "team_members");
 }
 
-/// The next live patch for `sub_id`. Frames for the hidden membership
-/// subscription may interleave, because its own table's rows move too, and
-/// are tolerated without applying: the test replica holds `items` alone.
-async fn live_for(client: &mut Client, sub_id: &str, timeout: Duration) -> LivePatch {
+/// Apply the next `sub_id` frame caused by a change past everything
+/// `accounted` covers.
+///
+/// The settling tail of an earlier change may be waiting on the wire or in the
+/// client's backlog, and applying it is harmless, but it must not stand in for
+/// the change this waits for. Frames for the hidden membership subscription may
+/// interleave, because its own table's rows move too, and are tolerated without
+/// applying: the test replica holds `items` alone.
+async fn live_past(
+    client: &mut Client,
+    sub_id: &str,
+    replica: &mut Replica,
+    accounted: &mut Accounted,
+    timeout: Duration,
+) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match client.try_live(remaining).await {
-            Some(patch) if patch.sub_id == sub_id => return patch,
+            Some(patch) if patch.sub_id == sub_id => {
+                let fresh = !accounted.covers(&patch.cursor);
+                accounted.note(&patch.cursor);
+                replica.apply(&patch.patchset_zstd);
+                if fresh {
+                    return;
+                }
+            }
             Some(patch) => assert_eq!(
                 patch.sub_id, MEMBERSHIP_SUB,
                 "only the hidden subscription may interleave"
             ),
-            None => panic!("timed out waiting for a {sub_id} patch"),
+            None => panic!(
+                "timed out waiting for a {sub_id} patch past {:?}",
+                accounted.0
+            ),
         }
     }
 }
@@ -278,23 +301,41 @@ async fn live_until(
     }
 }
 
-/// Assert that nothing past `accounted` arrives for `sub_id` within `timeout`.
+/// Assert that nothing past `accounted` arrives for `sub_id` within `timeout`,
+/// and that what does arrive changes nothing.
 ///
 /// The settling tail of a change the test already waited for may still be in
 /// flight, and so may a frame for the hidden membership subscription, so the
 /// assertion weighs the position a frame carries rather than the wire being
-/// quiet.
-async fn no_live_past(client: &mut Client, sub_id: &str, accounted: &Accounted, timeout: Duration) {
+/// quiet. A tail frame is applied on arrival, because one that repeats what
+/// the replica holds is the shape the design permits and one that adds a row
+/// is the delivery this assertion exists to catch.
+async fn no_live_past(
+    client: &mut Client,
+    sub_id: &str,
+    replica: &mut Replica,
+    accounted: &Accounted,
+    timeout: Duration,
+) {
+    let held = replica.ids();
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         match client.try_live(remaining).await {
-            Some(patch) if patch.sub_id == sub_id => assert!(
-                accounted.covers(&patch.cursor),
-                "a frame for {sub_id} at {} arrived, past the change this test accounted for at {:?}",
-                position_of(&patch.cursor),
-                accounted.0
-            ),
+            Some(patch) if patch.sub_id == sub_id => {
+                assert!(
+                    accounted.covers(&patch.cursor),
+                    "a frame for {sub_id} at {} arrived, past the change this test accounted for at {:?}",
+                    position_of(&patch.cursor),
+                    accounted.0
+                );
+                replica.apply(&patch.patchset_zstd);
+                assert_eq!(
+                    replica.ids(),
+                    held,
+                    "a frame at an accounted change added to the replica"
+                );
+            }
             Some(patch) => assert_eq!(
                 patch.sub_id, MEMBERSHIP_SUB,
                 "only the hidden subscription may interleave"
@@ -304,37 +345,83 @@ async fn no_live_past(client: &mut Client, sub_id: &str, accounted: &Accounted, 
     }
 }
 
-/// One frame at a chosen position, with the sending end handed back so the
-/// connection stays open for the assertion under test.
-async fn one_frame_at(position: u64) -> (Client, LoopbackTransport) {
+/// A compressed patchset inserting one `items` row, as a frame carries it.
+fn items_patch(id: i64, label: &str) -> Vec<u8> {
+    let table = SimpleTable::new("items", &["id", "owner", "team_id", "label"], &[0]);
+    let mut insert = Insert::<_, String, Vec<u8>>::from(table);
+    for (index, value) in [
+        WireValue::Integer(id),
+        WireValue::Text("bob".to_owned()),
+        WireValue::Integer(1),
+        WireValue::Text(label.to_owned()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        insert = insert.set(index, value).expect("set column");
+    }
+    let bytes = PatchSet::<SimpleTable, String, Vec<u8>>::new()
+        .insert(insert)
+        .build();
+    zstd::encode_all(bytes.as_slice(), 0).expect("compress the patch")
+}
+
+/// A connection carrying the given frames, with the sending end handed back so
+/// it stays open for the assertion under test.
+async fn frames(frames: Vec<(u64, Vec<u8>)>) -> (Client, LoopbackTransport) {
     let (mut server_end, client_end) = loopback();
-    server_end
-        .send_bulk(BulkMessage::LivePatch(LivePatch::new(
-            "docs",
-            Cursor::new(position.to_be_bytes().to_vec()),
-            Vec::new(),
-        )))
-        .await
-        .expect("send the frame");
+    for (position, patchset_zstd) in frames {
+        server_end
+            .send_bulk(BulkMessage::LivePatch(LivePatch::new(
+                "docs",
+                Cursor::new(position.to_be_bytes().to_vec()),
+                patchset_zstd,
+            )))
+            .await
+            .expect("send the frame");
+    }
     (Client::new(client_end), server_end)
 }
 
-/// A change at position 9, accounted for.
-fn accounted_at_nine() -> Accounted {
+/// A change at position 9, accounted for, and a replica holding the row that
+/// change delivered.
+fn accounted_at_nine() -> (Replica, Accounted) {
+    let mut replica = Replica::new();
+    replica.apply(&items_patch(7, "delivered"));
     let mut accounted = Accounted::default();
     accounted.note(&Cursor::new(9_u64.to_be_bytes().to_vec()));
-    accounted
+    (replica, accounted)
 }
 
-/// A frame carrying a change this test already accounted for is the settling
-/// tail the design permits, not a violation.
+/// A frame repeating what an accounted change already delivered is the
+/// settling tail the design permits, not a violation.
 #[tokio::test]
-async fn a_frame_at_an_accounted_change_is_not_a_violation() {
-    let (mut client, _server) = one_frame_at(9).await;
+async fn a_settling_frame_at_an_accounted_change_is_not_a_violation() {
+    let (mut client, _server) = frames(vec![(9, items_patch(7, "delivered"))]).await;
+    let (mut replica, accounted) = accounted_at_nine();
     no_live_past(
         &mut client,
         "docs",
-        &accounted_at_nine(),
+        &mut replica,
+        &accounted,
+        Duration::from_millis(50),
+    )
+    .await;
+    assert_eq!(replica.ids(), vec![7]);
+}
+
+/// A frame at an accounted change that adds a row is a delivery nothing asked
+/// for, whatever position it carries.
+#[tokio::test]
+#[should_panic(expected = "added to the replica")]
+async fn a_frame_at_an_accounted_change_that_adds_a_row_is_a_violation() {
+    let (mut client, _server) = frames(vec![(9, items_patch(8, "unasked"))]).await;
+    let (mut replica, accounted) = accounted_at_nine();
+    no_live_past(
+        &mut client,
+        "docs",
+        &mut replica,
+        &accounted,
         Duration::from_millis(50),
     )
     .await;
@@ -345,14 +432,53 @@ async fn a_frame_at_an_accounted_change_is_not_a_violation() {
 #[tokio::test]
 #[should_panic(expected = "past the change")]
 async fn a_frame_past_every_accounted_change_is_a_violation() {
-    let (mut client, _server) = one_frame_at(10).await;
+    let (mut client, _server) = frames(vec![(10, items_patch(8, "unasked"))]).await;
+    let (mut replica, accounted) = accounted_at_nine();
     no_live_past(
         &mut client,
         "docs",
-        &accounted_at_nine(),
+        &mut replica,
+        &accounted,
         Duration::from_millis(50),
     )
     .await;
+}
+
+/// Waiting for a change is not satisfied by the settling tail of an earlier
+/// one, which may already be sitting in the client's backlog.
+#[tokio::test]
+#[should_panic(expected = "timed out waiting for a docs patch past")]
+async fn a_settling_frame_does_not_stand_in_for_the_change_awaited() {
+    let (mut client, _server) = frames(vec![(9, items_patch(7, "delivered"))]).await;
+    let (mut replica, mut accounted) = accounted_at_nine();
+    live_past(
+        &mut client,
+        "docs",
+        &mut replica,
+        &mut accounted,
+        Duration::from_millis(50),
+    )
+    .await;
+}
+
+/// The change itself, behind that tail, is what the wait returns on.
+#[tokio::test]
+async fn the_change_behind_a_settling_frame_is_the_one_awaited() {
+    let (mut client, _server) = frames(vec![
+        (9, items_patch(7, "delivered")),
+        (10, items_patch(8, "the change")),
+    ])
+    .await;
+    let (mut replica, mut accounted) = accounted_at_nine();
+    live_past(
+        &mut client,
+        "docs",
+        &mut replica,
+        &mut accounted,
+        Duration::from_millis(50),
+    )
+    .await;
+    assert_eq!(replica.ids(), vec![7, 8]);
 }
 
 /// The phase's central proof, on the motivating shape: the policy on the
@@ -430,9 +556,7 @@ async fn a_membership_change_moves_rows_without_a_resync() {
     fixture
         .exec("UPDATE items SET label = 'renamed' WHERE id = 21")
         .await;
-    let patch = live_for(&mut alice, "docs", DELIVERY).await;
-    accounted.note(&patch.cursor);
-    replica.apply(&patch.patchset_zstd);
+    live_past(&mut alice, "docs", &mut replica, &mut accounted, DELIVERY).await;
 
     // Move-out: leaving team 2 withdraws its rows, again with no resync.
     fixture
@@ -454,7 +578,7 @@ async fn a_membership_change_moves_rows_without_a_resync() {
 
     // Rows of teams the caller never joined were never delivered.
     fixture.exec("DELETE FROM items WHERE id = 31").await;
-    no_live_past(&mut alice, "docs", &accounted, QUIET).await;
+    no_live_past(&mut alice, "docs", &mut replica, &accounted, QUIET).await;
 
     // Torn down together (decision 7): after the term subscription ends, the
     // membership subscription is gone too, so a membership change moves
@@ -538,7 +662,7 @@ async fn the_first_row_of_a_team_already_joined_arrives_live() {
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (31, 'bob', 3, 'nope')")
         .await;
-    no_live_past(&mut alice, "docs", &accounted, QUIET).await;
+    no_live_past(&mut alice, "docs", &mut replica, &accounted, QUIET).await;
 }
 
 /// The intersection with the policy, in both directions, on a policy that
@@ -617,7 +741,7 @@ async fn the_term_intersects_the_policy_and_never_widens_it() {
     fixture
         .exec("UPDATE items SET label = 'still excluded' WHERE id = 91")
         .await;
-    no_live_past(&mut alice, "docs", &accounted, QUIET).await;
+    no_live_past(&mut alice, "docs", &mut replica, &accounted, QUIET).await;
 
     // Move-out under a policy that still admits the rows: no delete arrives
     // (the withdrawal question is may_see on the current row, and the answer
@@ -626,7 +750,7 @@ async fn the_term_intersects_the_policy_and_never_widens_it() {
     fixture
         .exec("DELETE FROM team_members WHERE team_id = 2 AND member = 'alice'")
         .await;
-    no_live_past(&mut alice, "docs", &accounted, QUIET).await;
+    no_live_past(&mut alice, "docs", &mut replica, &accounted, QUIET).await;
     assert!(
         alice.try_resync("docs", QUIET).await.is_none(),
         "a term exit under a still-allowing policy must not re-snapshot"
@@ -698,5 +822,5 @@ async fn a_direct_caller_comparison_registers_and_self_seeds() {
     fixture
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (54, 'bob', 1, 'not-hers')")
         .await;
-    no_live_past(&mut alice, "mine", &accounted, QUIET).await;
+    no_live_past(&mut alice, "mine", &mut replica, &accounted, QUIET).await;
 }
