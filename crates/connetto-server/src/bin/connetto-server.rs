@@ -553,6 +553,55 @@ fn ticket_keypair(
     }
 }
 
+/// The resolved `CONNETTO_CONTENT_*` settings, read once at startup so
+/// building the file half takes no environment at all.
+#[derive(Clone, Debug)]
+struct ContentSettings {
+    /// The address the file routes answer on, trailing slashes trimmed.
+    base_url: String,
+    ttl: Duration,
+    read_ceiling: u64,
+    grace: Duration,
+    cadence: Duration,
+    owner_pool_size: u32,
+    store_setting: String,
+    key_path: Option<std::path::PathBuf>,
+}
+
+impl ContentSettings {
+    /// Read the `CONNETTO_CONTENT_*` settings. `CONNETTO_CONTENT_URL` unset
+    /// answers `None`, the no-files deployment of today; set, every other
+    /// setting is parsed on the spot so a typo refuses startup by name.
+    fn from_env() -> Result<Option<Self>> {
+        let Some(base_url) = var_nonempty("CONNETTO_CONTENT_URL") else {
+            return Ok(None);
+        };
+        // The signer appends `/files/...` textually to this text, so the
+        // trailing slash goes and a query or fragment has nowhere to go.
+        if base_url.contains('?') || base_url.contains('#') {
+            return Err(anyhow!(
+                "CONNETTO_CONTENT_URL must carry no query or fragment, only the \
+                 address the file routes answer on: {base_url}"
+            ));
+        }
+        let ttl = Duration::from_secs(env_u64("CONNETTO_CONTENT_TICKET_TTL_SECS", 3_600)?);
+        Ok(Some(Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            read_ceiling: env_u64("CONNETTO_CONTENT_READ_CEILING", 1 << 26)?,
+            grace: Duration::from_secs(env_u64(
+                "CONNETTO_CONTENT_SWEEP_GRACE_SECS",
+                ttl.as_secs(),
+            )?),
+            cadence: Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_SECS", 3_600)?),
+            owner_pool_size: env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?,
+            store_setting: var_nonempty("CONNETTO_CONTENT_STORE")
+                .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?,
+            key_path: var_nonempty("CONNETTO_CONTENT_KEY").map(std::path::PathBuf::from),
+            ttl,
+        }))
+    }
+}
+
 /// The file-serving half of the deployment, from the `CONNETTO_CONTENT_*`
 /// settings.
 ///
@@ -569,33 +618,20 @@ fn ticket_keypair(
 /// share (R81's finding).
 #[cfg(feature = "content")]
 async fn build_content(
+    settings: Option<ContentSettings>,
     admin_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
 ) -> Result<(ServerSigner, Option<axum::Router>)> {
-    let Some(base_url) = var_nonempty("CONNETTO_CONTENT_URL") else {
+    let Some(settings) = settings else {
         return Ok((ServerSigner::None, None));
     };
-    // The signer appends `/files/...` textually to this text, so the trailing
-    // slash goes and a query or fragment has nowhere to go.
-    if base_url.contains('?') || base_url.contains('#') {
-        return Err(anyhow!(
-            "CONNETTO_CONTENT_URL must carry no query or fragment, only the \
-             address the file routes answer on: {base_url}"
-        ));
-    }
-    let base_url = base_url.trim_end_matches('/').to_owned();
-    let ttl = Duration::from_secs(env_u64("CONNETTO_CONTENT_TICKET_TTL_SECS", 3_600)?);
-    let read_ceiling = env_u64("CONNETTO_CONTENT_READ_CEILING", 1 << 26)?;
-    let grace = Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_GRACE_SECS", ttl.as_secs())?);
-    let store_setting = var_nonempty("CONNETTO_CONTENT_STORE")
-        .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?;
-    let spec = parse_store_spec(&store_setting)?;
-    let der = match var_nonempty("CONNETTO_CONTENT_KEY") {
+    let spec = parse_store_spec(&settings.store_setting)?;
+    let der = match settings.key_path {
         // Spawned because startup runs on the async runtime, and one key
         // file is worth the round trip off the worker thread.
         Some(path) => {
-            let shown = path.clone();
+            let shown = path.display().to_string();
             Some(
                 tokio::task::spawn_blocking(move || std::fs::read(&path))
                     .await
@@ -605,8 +641,13 @@ async fn build_content(
         }
         None => None,
     };
-    let (signer, public) = ticket_keypair(der.as_deref(), &base_url, ttl, read_ceiling)?;
-    let admin = build_pool(admin_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
+    let (signer, public) = ticket_keypair(
+        der.as_deref(),
+        &settings.base_url,
+        settings.ttl,
+        settings.read_ceiling,
+    )?;
+    let admin = build_pool(admin_url, settings.owner_pool_size).await?;
     let reader = build_pool(reader_url, reader_pool_size).await?;
     let router = files::serve(files::Config::<DefaultFileSchema> {
         pools: files::AppPools {
@@ -615,18 +656,17 @@ async fn build_content(
         },
         store: open_store(&spec)?,
         verifier: TicketVerifier::new(public),
-        grace,
+        grace: settings.grace,
         _schema: std::marker::PhantomData,
     })
     .await
     .map_err(|err| anyhow!("content preflight: {err}"))?;
-    let cadence = Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_SECS", 3_600)?);
-    spawn_sweep(admin, spec, grace, cadence);
+    spawn_sweep(admin, spec, settings.grace, settings.cadence);
     tracing::info!(
-        base = %base_url,
-        store = %store_setting,
-        ticket_ttl_secs = ttl.as_secs(),
-        sweep_secs = cadence.as_secs(),
+        base = %settings.base_url,
+        store = %settings.store_setting,
+        ticket_ttl_secs = settings.ttl.as_secs(),
+        sweep_secs = settings.cadence.as_secs(),
         "file routes mounted on the auth listener",
     );
     Ok((ServerSigner::Files(Box::new(signer)), Some(router)))
@@ -636,11 +676,12 @@ async fn build_content(
 /// `content` feature. A configured deployment still hears about it.
 #[cfg(not(feature = "content"))]
 async fn build_content(
+    settings: Option<ContentSettings>,
     _admin_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
 ) -> Result<(ServerSigner, Option<axum::Router>)> {
-    if var_nonempty("CONNETTO_CONTENT_URL").is_some() {
+    if settings.is_some() {
         tracing::warn!(
             "CONNETTO_CONTENT_URL is set but this binary was built without the content \
              feature, so no file routes are mounted"
@@ -909,6 +950,13 @@ fn reader_split() -> Result<(u32, crate::ReaderGate)> {
     ))
 }
 
+/// Startup is one straight read of the deployment: every component is built,
+/// checked and wired here so no setting is applied in a place a reader has
+/// to hunt for.
+#[expect(
+    clippy::too_many_lines,
+    reason = "startup reads as one straight deployment"
+)]
 #[tokio::main]
 async fn main() -> Result<()> {
     // `pg_walstream` reports every standby status update at `info`, which is one
@@ -961,7 +1009,13 @@ async fn main() -> Result<()> {
     // The file routes mount on the auth listener beside the login
     // endpoints, and the session mints with the same keypair the mounted
     // routes verify with, so no key material leaves the process.
-    let (signer, file_router) = build_content(&database_url, &reader_url, reader_pool_size).await?;
+    let (signer, file_router) = build_content(
+        ContentSettings::from_env()?,
+        &database_url,
+        &reader_url,
+        reader_pool_size,
+    )
+    .await?;
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?
         .with_publication(publication.as_str());
@@ -1020,7 +1074,14 @@ async fn main() -> Result<()> {
             });
         }));
     }
-    spawn_auth_endpoints(&service, registry, file_router);
+    spawn_auth_endpoints(
+        &service,
+        registry,
+        file_router,
+        &var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081"),
+        &comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")),
+        &comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")),
+    );
     run(
         &manager,
         &pool,
@@ -1058,46 +1119,47 @@ fn mount_on_auth_listener(auth: axum::Router, files: Option<axum::Router>) -> ax
     }
 }
 
+/// Split a comma-separated setting into its trimmed non-empty entries.
+fn comma_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
+}
+
 /// Serve the login and refresh endpoints beside the sync listener, and the
 /// file routes when the deployment configured a content backend. The one
 /// `CorsLayer` covers both surfaces, so a browser client sees one origin.
+///
+/// `redirect_allowlist` holds exact non-loopback client redirect URIs that
+/// are permitted (a browser client lists its own callback under
+/// `CONNETTO_AUTH_REDIRECT_ALLOWLIST`). Loopback redirects are always
+/// allowed, so a native client needs no entry. `cors_origins` lists exact
+/// origins whose script may read a login response
+/// (`CONNETTO_AUTH_CORS_ORIGINS`). An app served from a different origin
+/// than these endpoints needs one, because without it the browser refuses
+/// to hand the response to the page. Loopback origins are always allowed,
+/// mirroring the redirect policy's loopback rule and for the same reason:
+/// script on a loopback origin is already on the machine.
 fn spawn_auth_endpoints(
     service: &Arc<AuthService<ServerStore>>,
     registry: Arc<ProviderRegistry>,
     file_router: Option<axum::Router>,
+    auth_bind: &str,
+    redirect_allowlist: &[String],
+    cors_origins: &[String],
 ) {
-    let auth_bind = var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081");
-    // CONNETTO_AUTH_REDIRECT_ALLOWLIST is a comma-separated list of exact
-    // non-loopback client redirect URIs that are permitted (a browser client
-    // lists its own callback). Loopback redirects are always allowed, so a
-    // native client needs no entry.
-    let allowlist = var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
-        .collect();
-    // CONNETTO_AUTH_CORS_ORIGINS is a comma-separated list of exact origins
-    // whose script may read a login response. An app served from a different
-    // origin than these endpoints needs one, because without it the browser
-    // refuses to hand the response to the page. Loopback origins are always
-    // allowed, mirroring the redirect policy's loopback rule and for the same
-    // reason: script on a loopback origin is already on the machine.
-    let cors_origins: Vec<String> = var_or("CONNETTO_AUTH_CORS_ORIGINS", "")
-        .split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
-        .collect();
     let router = mount_on_auth_listener(
         auth_router(
             Arc::clone(service),
             registry,
-            RedirectPolicy::new(allowlist),
+            RedirectPolicy::new(redirect_allowlist.to_vec()),
         ),
         file_router,
     )
-    .layer(cors_layer(&cors_origins));
+    .layer(cors_layer(cors_origins));
+    let auth_bind = auth_bind.to_owned();
     tokio::spawn(async move {
         match TcpListener::bind(&auth_bind).await {
             Ok(listener) => {
@@ -1407,6 +1469,55 @@ mod tests {
         assert!(matches!(err, SignerError::NotConfigured));
     }
 
+    #[test]
+    fn comma_lists_trim_and_drop_empties() {
+        assert_eq!(
+            comma_list(" https://a.example ,https://b.example, "),
+            vec![
+                "https://a.example".to_owned(),
+                "https://b.example".to_owned()
+            ]
+        );
+        assert_eq!(comma_list(" , "), Vec::<String>::new());
+    }
+
+    /// Both bind outcomes of the auth listener are survivable: the bound
+    /// router keeps serving, a refused bind is an error line, not a panic.
+    #[tokio::test]
+    async fn the_auth_endpoints_survive_binding_and_a_refused_bind() {
+        let config = AuthConfig::default();
+        let authority = TokenAuthority::generate(&config).expect("an ephemeral token authority");
+        let store = ServerStore::InMemory(InMemoryAuthStore::new(config.refresh_lifetimes()));
+        let guard = Arc::new(RequestGuard::new(
+            ThrottleConfig::default(),
+            AbuseConfig::default(),
+        ));
+        let service = Arc::new(
+            AuthService::new(Arc::new(authority), Arc::new(store), Arc::clone(&guard))
+                .with_registry(Arc::new(ProviderRegistry::new())),
+        );
+        spawn_auth_endpoints(
+            &service,
+            Arc::new(ProviderRegistry::new()),
+            Some(
+                axum::Router::new().route("/files/{id}", axum::routing::get(|| async { "served" })),
+            ),
+            "127.0.0.1:0",
+            &["https://app.example".to_owned()],
+            &["https://app.example".to_owned()],
+        );
+        spawn_auth_endpoints(
+            &service,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            "not a socket address",
+            &[],
+            &[],
+        );
+        // The bind arms run inside the spawned tasks; give them a turn.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     #[tokio::test]
     async fn the_file_routes_share_the_auth_listeners_cors_layer() {
         let file_routes =
@@ -1548,6 +1659,118 @@ mod tests {
                 .verify(token)
                 .expect("the minted token verifies");
             assert_eq!(payload.file_id, [9u8; 32]);
+        }
+
+        /// The no-files deployment is the common one: no settings, no
+        /// signer, no router, and the environment reads as none.
+        #[tokio::test]
+        async fn a_deployment_without_settings_mounts_nothing() {
+            let (signer, router) = build_content(None, "postgres://unused", "postgres://unused", 1)
+                .await
+                .expect("no settings is a valid deployment");
+            assert!(matches!(signer, ServerSigner::None));
+            assert!(router.is_none());
+            assert!(
+                ContentSettings::from_env()
+                    .expect("an unset environment reads cleanly")
+                    .is_none(),
+                "CONNETTO_CONTENT_URL unset is the no-files deployment"
+            );
+        }
+
+        /// A configured deployment builds the whole file half in process:
+        /// the deployment DDL, the router's preflight, a signer whose mints
+        /// the mounted routes would verify, and one sweep tick reclaimed on
+        /// the cadence.
+        #[tokio::test]
+        async fn a_configured_deployment_mounts_routes_and_sweeps() {
+            use diesel_async::RunQueryDsl as _;
+            const DEPLOYMENT_SQL: &[&str] = &[
+                "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
+                 DEFAULT 'staged')",
+                "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) \
+                 RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ \
+                 SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f \
+                 WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f)) $$",
+                "CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, \
+                 p_new_state TEXT, p_caller TEXT) RETURNS BYTEA \
+                 LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
+                 AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
+                 WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
+            ];
+            let fixture = connetto_test_harness::Fixture::acquire().await;
+            let admin_url = fixture.admin_url().to_owned();
+            let pool = build_pool(&admin_url, 2)
+                .await
+                .expect("a pool on the fixture");
+            let mut conn = pool.get().await.expect("a connection");
+            for stmt in [
+                "DROP TABLE IF EXISTS photos CASCADE",
+                "DROP TABLE IF EXISTS _cfs_manifest_chunks CASCADE",
+                "DROP TABLE IF EXISTS _cfs_manifests CASCADE",
+                "DROP TABLE IF EXISTS _cfs_chunk_registry CASCADE",
+                "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
+                "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
+            ] {
+                diesel::sql_query(stmt)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("a clean slate");
+            }
+            for stmt in connetto_file_server::DEPLOYMENT_DDL.split(';') {
+                let meaningful = stmt
+                    .lines()
+                    .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with("--"));
+                if meaningful {
+                    diesel::sql_query(stmt.trim())
+                        .execute(&mut *conn)
+                        .await
+                        .expect("the deployment applies");
+                }
+            }
+            for stmt in DEPLOYMENT_SQL {
+                diesel::sql_query(*stmt)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("the contract applies");
+            }
+            for stmt in [
+                "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+                 THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+                "GRANT USAGE ON SCHEMA public TO app_reader",
+                "GRANT SELECT ON photos TO app_reader",
+                "GRANT SELECT ON _cfs_chunk_registry, _cfs_manifests, _cfs_manifest_chunks \
+                 TO app_reader",
+            ] {
+                diesel::sql_query(stmt)
+                    .execute(&mut *conn)
+                    .await
+                    .expect("the reader role can read the deployment");
+            }
+            let reader_url =
+                connetto_test_harness::with_user(&admin_url, "app_reader", "app_reader");
+            drop(conn);
+            let dir = tempfile::tempdir().expect("a chunk directory");
+            let settings = ContentSettings {
+                base_url: "http://127.0.0.1:8099".to_owned(),
+                ttl: Duration::from_secs(60),
+                read_ceiling: 1 << 20,
+                grace: Duration::ZERO,
+                cadence: Duration::from_secs(1),
+                owner_pool_size: 2,
+                store_setting: format!("fs:{}", dir.path().display()),
+                key_path: None,
+            };
+            let (signer, router) = build_content(Some(settings), &admin_url, &reader_url, 2)
+                .await
+                .expect("a configured deployment builds");
+            let url = ContentTicketSigner::mint(&signer, "caller-9", [3u8; 32], ContentVerb::Read)
+                .await
+                .expect("the deployment signer mints");
+            assert!(url.starts_with("http://127.0.0.1:8099/files/"));
+            assert!(router.is_some(), "the file router rides the auth listener");
+            // One sweep tick at the cadence, so the reclaim arm runs.
+            tokio::time::sleep(Duration::from_millis(1_300)).await;
         }
     }
 }
