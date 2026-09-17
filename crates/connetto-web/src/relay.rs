@@ -3,7 +3,7 @@
 //! One worker-held [`ConnettoConnection`] owns the durable replica and the
 //! server session, and any number of tabs speak the ordinary connetto wire
 //! protocol to it over their own [`Transport`]s (an in-memory loopback, or a
-//! [`MessageTransport`](crate::MessageTransport) over a `MessageChannel`
+//! [`MessageTransport`] over a `MessageChannel`
 //! port). The hub is a single-task core fed by channels: each attached tab
 //! gets a shovel task that owns its transport and exchanges frames with the
 //! core, so the core never selects over a dynamic set of transports and sends

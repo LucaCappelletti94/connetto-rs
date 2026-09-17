@@ -11,7 +11,7 @@
 //! event.
 //!
 //! Alongside the codec frames rides an internal lane for the content
-//! protocol: a frame under [`TAG_INTERNAL`] carries JSON rather than
+//! protocol: a frame under the internal tag byte carries JSON rather than
 //! `MessagePack`, and a message whose payload is a two-element array carries
 //! a `Blob` beside that JSON. The lane never reaches the codec.
 
