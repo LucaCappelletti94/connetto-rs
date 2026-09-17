@@ -2261,6 +2261,7 @@ mod tests {
         n: i64,
     }
 
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     fn count(connection: &mut diesel::SqliteConnection, sql: &str) -> i64 {
         use diesel::RunQueryDsl;
         diesel::sql_query(sql)
@@ -2269,6 +2270,7 @@ mod tests {
             .n
     }
 
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     fn staged_fixture(
         name: &str,
     ) -> (
