@@ -1693,6 +1693,9 @@ async fn e2e_content_startup_names_each_refused_setting() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
     fixture.start_replication(&["orders"]).await;
+    // Sweep cadence is parsed after the content preflight, so the refusal
+    // cases that reach it need a file-ready deployment.
+    apply_content_deployment(&pool, true).await;
 
     let auth_port = free_port();
     let auth_stack = build_auth_stack(auth_port).await;
