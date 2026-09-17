@@ -672,19 +672,20 @@ async fn ensure_server_bin() -> Result<PathBuf> {
     let candidate = target_dir()?
         .join("release")
         .join(exe_name("connetto-server"));
-    if !candidate.exists() {
-        let args = strings(&[
-            "+stable",
-            "build",
-            "--release",
-            "--all-features",
-            "-p",
-            "connetto-server",
-            "--bin",
-            "connetto-server",
-        ]);
-        run_process(OsStr::new("cargo"), &args, &[]).await?;
-    }
+    // The build runs even when the binary exists. A cached tree can hold a
+    // server from another commit, and cargo's fingerprinting makes the warm
+    // case a no-op while a stale exists() shortcut cannot.
+    let args = strings(&[
+        "+stable",
+        "build",
+        "--release",
+        "--all-features",
+        "-p",
+        "connetto-server",
+        "--bin",
+        "connetto-server",
+    ]);
+    run_process(OsStr::new("cargo"), &args, &[]).await?;
     if candidate.exists() {
         Ok(candidate)
     } else {
