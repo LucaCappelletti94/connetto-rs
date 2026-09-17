@@ -211,4 +211,19 @@ mod tests {
             "the prefix must separate sibling locations"
         );
     }
+
+    #[tokio::test]
+    async fn an_empty_prefix_url_stores_at_the_backend_root() {
+        // A file url naming the filesystem root carries no prefix, the shape
+        // that takes the no-prefix branch of `from_url`.  Nothing is written,
+        // the root is the real filesystem, so only the open and one absent
+        // lookup are proven.
+        let root = url::Url::from_file_path(std::path::Path::new("/")).expect("a root url");
+        let store = AnyStore::from_url(&root).expect("the filesystem root opens");
+        let hash = connetto_file_core::ChunkHash::from_bytes([4u8; 32]);
+        assert!(
+            !store.exists(&hash).await.is_ok_and(|found| found),
+            "a fresh hash is absent from the backend root"
+        );
+    }
 }
