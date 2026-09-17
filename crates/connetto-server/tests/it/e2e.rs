@@ -1424,3 +1424,524 @@ async fn audit_ops(pool: &Pool<AsyncPgConnection>) -> Vec<String> {
             .expect("read auth_events");
     rows.into_iter().map(|row| row.op).collect()
 }
+
+/// Removes every artifact the content tests create, so each run starts from
+/// the deployment state its name describes. One statement per entry because
+/// diesel sends each query prepared, and Postgres refuses a batch there.
+#[cfg(feature = "content")]
+const CONTENT_DROP_STATEMENTS: &[&str] = &[
+    "DROP TABLE IF EXISTS photos CASCADE",
+    "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
+    "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
+    "DROP TABLE IF EXISTS _cfs_manifest_chunks",
+    "DROP TABLE IF EXISTS _cfs_manifests",
+    "DROP TABLE IF EXISTS _cfs_chunk_registry",
+];
+
+/// The file-serving deployment contract, the same shape `content.sql` ships
+/// in the demos: the metadata table the two contract functions consult and
+/// the functions themselves.
+#[cfg(feature = "content")]
+const CONTENT_CONTRACT_STATEMENTS: &[&str] = &[
+    "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
+     DEFAULT 'staged')",
+    "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) RETURNS BYTEA[] \
+     LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ \
+     SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f \
+     WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f)) $$",
+    "CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, p_new_state TEXT, \
+     p_caller TEXT) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
+     AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
+     WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
+];
+
+/// Brings the database to a content-ready deployment, or to none at all.
+///
+/// The shipped [`connetto_file_server::DEPLOYMENT_DDL`] is one text of several
+/// statements; comment-only fragments carry no statement to send.
+#[cfg(feature = "content")]
+async fn apply_content_deployment(pool: &Pool<AsyncPgConnection>, ready: bool) {
+    for stmt in CONTENT_DROP_STATEMENTS {
+        exec(pool, stmt).await;
+    }
+    if !ready {
+        return;
+    }
+    for stmt in connetto_file_server::DEPLOYMENT_DDL.split(';') {
+        let meaningful = stmt
+            .lines()
+            .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with("--"));
+        if meaningful {
+            exec(pool, stmt.trim()).await;
+        }
+    }
+    for stmt in CONTENT_CONTRACT_STATEMENTS {
+        exec(pool, stmt).await;
+    }
+}
+
+/// One file id of the shape the routes parse.
+#[cfg(feature = "content")]
+fn sample_file_id() -> String {
+    "ab".repeat(32)
+}
+
+/// Writes a PKCS#8 v1 ed25519 document, the shape `CONNETTO_CONTENT_KEY`
+/// loads, through the same ring keypair the signer parses.
+#[cfg(feature = "content")]
+fn generate_ticket_key(path: &std::path::Path) {
+    let keypair = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("generate the content ticket key");
+    std::fs::write(path, keypair.as_ref()).expect("write the ticket key");
+}
+
+/// A server configured with `CONNETTO_CONTENT_URL` boots, mounts the four
+/// file routes on the auth listener under its CORS layer, and still serves
+/// the login endpoints on the same port.
+///
+/// The routes answer a ticket-less request with the extractor rejection (a
+/// 400 naming the missing `t` query parameter), which distinguishes them
+/// from the bare 404 of an unmounted path. A bad ticket answers 404, the
+/// same code the router itself emits, so the 400 is what proves the mount.
+#[cfg(feature = "content")]
+#[tokio::test]
+async fn e2e_content_routes_mount_on_the_auth_listener() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    // Startup checks the slot before it builds anything content-related, so
+    // every boot here needs the replication objects present.
+    fixture.start_replication(&["orders"]).await;
+    apply_content_deployment(&pool, true).await;
+
+    let store = TempDir::new().expect("content store dir");
+    let key_dir = TempDir::new().expect("content key dir");
+    let key_path = key_dir.path().join("ticket.der");
+    generate_ticket_key(&key_path);
+    let port = free_port();
+    let auth_port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let store_spec = format!("fs:{}", store.path().display());
+
+    let auth_stack = build_auth_stack(auth_port).await;
+    let mut envs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    envs.extend([
+        ("CONNETTO_CONTENT_URL", content_base.as_str()),
+        ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+        (
+            "CONNETTO_CONTENT_KEY",
+            key_path.to_str().expect("utf-8 path"),
+        ),
+        ("CONNETTO_CONTENT_SWEEP_SECS", "1"),
+    ]);
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        PG_DDL,
+        "orders",
+        Some(&reader_url),
+        &authorization,
+        &envs,
+    );
+    let secs = Duration::from_secs(30);
+    assert!(
+        wait_for_port(&bind, secs).await,
+        "server did not open {bind}"
+    );
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    // The login dance through the same listener still works with the file
+    // routes mounted beside it.
+    let (_token, _user) = mint_token(&auth_stack.auth_base).await;
+
+    let agent = reqwest::Client::new();
+    let id = sample_file_id();
+    let download = agent
+        .get(format!("{content_base}/files/{id}"))
+        .send()
+        .await
+        .expect("GET /files/{id}");
+    assert_eq!(
+        download.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the download route must answer a ticket-less request with the \
+         extractor rejection, not the bare 404 of an unmounted path"
+    );
+    let intent = agent
+        .post(format!("{content_base}/files/{id}/intent"))
+        .send()
+        .await
+        .expect("POST /files/{id}/intent");
+    assert_eq!(
+        intent.status(),
+        reqwest::StatusCode::BAD_REQUEST,
+        "the intent route must answer a ticket-less request with the \
+         extractor rejection"
+    );
+}
+
+/// With content configured but the file server's tables absent, startup
+/// refuses naming the preflight that failed.
+#[cfg(feature = "content")]
+#[tokio::test]
+async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
+    apply_content_deployment(&pool, false).await;
+
+    let auth_port = free_port();
+    let auth_stack = build_auth_stack(auth_port).await;
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let store = TempDir::new().expect("content store dir");
+    let store_spec = format!("fs:{}", store.path().display());
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+
+    let mut envs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    envs.extend([
+        ("CONNETTO_CONTENT_URL", content_base.as_str()),
+        ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+    ]);
+    let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
+    assert!(
+        !output.status.success(),
+        "expected refusal without the file server tables"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("content preflight"),
+        "expected the refusal to name the content preflight, got: {stderr}"
+    );
+}
+
+/// A `CONNETTO_CONTENT_STORE` the parser rejects names the variable in the
+/// refusal.
+#[cfg(feature = "content")]
+#[tokio::test]
+async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
+
+    let auth_port = free_port();
+    let auth_stack = build_auth_stack(auth_port).await;
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+
+    let mut envs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    envs.extend([
+        ("CONNETTO_CONTENT_URL", content_base.as_str()),
+        ("CONNETTO_CONTENT_STORE", "not a store spec"),
+    ]);
+    let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
+    assert!(
+        !output.status.success(),
+        "expected refusal for an unparsable store spec"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("CONNETTO_CONTENT_STORE"),
+        "expected the refusal to name CONNETTO_CONTENT_STORE, got: {stderr}"
+    );
+}
+
+/// Every remaining way the content settings can be wrong, each refused with
+/// a message naming the setting or the file at fault. One boot per case
+/// because the refusals are what the case is, not a fixture to reuse.
+#[cfg(feature = "content")]
+#[tokio::test]
+async fn e2e_content_startup_names_each_refused_setting() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
+    // Sweep cadence is parsed after the content preflight, so the refusal
+    // cases that reach it need a file-ready deployment.
+    apply_content_deployment(&pool, true).await;
+
+    let auth_port = free_port();
+    let auth_stack = build_auth_stack(auth_port).await;
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let query_base = format!("{content_base}/?probe=1");
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+
+    let store = TempDir::new().expect("content store dir");
+    let store_spec = format!("fs:{}", store.path().display());
+    let junk_dir = TempDir::new().expect("junk key dir");
+    let junk_key = junk_dir.path().join("junk.der");
+    std::fs::write(&junk_key, [0u8; 16]).expect("write the junk key");
+    let missing_key = "/tmp/connetto-r69-definitely-not-a-key.pem";
+
+    let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_KEY", missing_key),
+            ],
+            "connetto-r69-definitely-not-a-key.pem",
+        ),
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                (
+                    "CONNETTO_CONTENT_KEY",
+                    junk_key.to_str().expect("utf-8 path"),
+                ),
+            ],
+            "loading the content ticket key",
+        ),
+        (
+            vec![("CONNETTO_CONTENT_STORE", "fs:")],
+            "fs: needs a directory",
+        ),
+        (
+            vec![("CONNETTO_CONTENT_STORE", "ftp://example.com")],
+            "opening the chunk store",
+        ),
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_TICKET_TTL_SECS", "soon"),
+            ],
+            "parsing CONNETTO_CONTENT_TICKET_TTL_SECS",
+        ),
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_SWEEP_SECS", "soon"),
+            ],
+            "parsing CONNETTO_CONTENT_SWEEP_SECS",
+        ),
+        (
+            vec![("CONNETTO_CONTENT_URL", query_base.as_str())],
+            "no query or fragment",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let mut envs: Vec<(&str, &str)> = auth_stack
+            .env_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        envs.push(("CONNETTO_CONTENT_URL", content_base.as_str()));
+        envs.extend(extra);
+        let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(expected),
+            "expected a refusal naming {expected:?}, got status {:?} and: {stderr}",
+            output.status.code()
+        );
+    }
+}
+
+/// Drives a live session through the binary's own ticket signer: an
+/// unidentified file is refused, a file the deployment makes visible mints a
+/// URL that rides the query, and that URL answers its download route.
+///
+/// `CONNETTO_CONTENT_KEY` stays unset here, so this boot also takes the
+/// ephemeral-keypair branch every other content test skips.
+#[cfg(feature = "content")]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a live session round trip: handshake, ghost refusal, row insert, mint and download run as one ordered exchange"
+)]
+async fn e2e_content_ticket_round_trips_over_a_live_session() {
+    use connetto_core::PROTOCOL_VERSION;
+    use connetto_core::messages::{
+        ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, Grant, Handshake,
+        HandshakeAck, NonFatalError,
+    };
+    use connetto_core::traits::{IncomingFrame, Transport};
+    use connetto_server::WebSocketTransport;
+    use tokio::net::TcpStream;
+
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
+    apply_content_deployment(&pool, true).await;
+    exec(&pool, "GRANT SELECT ON photos TO app_reader").await;
+
+    let store = TempDir::new().expect("content store dir");
+    let port = free_port();
+    let auth_port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let ws = format!("ws://127.0.0.1:{port}/");
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let store_spec = format!("fs:{}", store.path().display());
+
+    let auth_stack = build_auth_stack(auth_port).await;
+    let mut envs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    envs.extend([
+        ("CONNETTO_CONTENT_URL", content_base.as_str()),
+        ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+    ]);
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        PG_DDL,
+        "orders",
+        Some(&reader_url),
+        &authorization,
+        &envs,
+    );
+    let secs = Duration::from_secs(30);
+    assert!(
+        wait_for_port(&bind, secs).await,
+        "server did not open {bind}"
+    );
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    let (token, _user) = mint_token(&auth_stack.auth_base).await;
+    let tcp = TcpStream::connect(&bind).await.expect("connect ws");
+    let mut client = WebSocketTransport::connect(&ws, tcp)
+        .await
+        .expect("ws handshake");
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "ticket-probe").with_grant(Grant::new(token)),
+        ))
+        .await
+        .expect("post handshake");
+
+    let mut acked = false;
+    let mut ghost_refused = false;
+    let file_id = [0xa7u8; 32];
+    let mut hex = String::new();
+    for byte in file_id {
+        std::fmt::write(&mut hex, format_args!("{byte:02x}")).expect("string append");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut granted: Option<ContentTicketGrant> = None;
+    let mut visible_asked = false;
+    while granted.is_none() {
+        assert!(Instant::now() < deadline, "the ticket round trip stalled");
+        let frame = tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("a frame arrives")
+            .expect("transport")
+            .expect("open");
+        match frame {
+            IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id,
+                ..
+            })) => {
+                assert!(!connection_id.is_empty(), "the ack names the session");
+                acked = true;
+                client
+                    .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
+                        request_id: "probe-ghost".to_owned(),
+                        file_id: [0x5cu8; 32],
+                        verb: ContentVerb::Read,
+                    }))
+                    .await
+                    .expect("post the ghost request");
+            }
+            IncomingFrame::Control(ControlMessage::NonFatalError(NonFatalError {
+                related_to,
+                detail,
+            })) if related_to.as_deref() == Some("probe-ghost") => {
+                assert!(
+                    detail.contains("refused"),
+                    "an invisible file is refused, got {detail}"
+                );
+                ghost_refused = true;
+                if !visible_asked {
+                    visible_asked = true;
+                    exec(
+                        &pool,
+                        &format!("INSERT INTO photos VALUES (decode('{hex}', 'hex'), 'staged')"),
+                    )
+                    .await;
+                    client
+                        .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
+                            request_id: "probe-visible".to_owned(),
+                            file_id,
+                            verb: ContentVerb::Read,
+                        }))
+                        .await
+                        .expect("post the visible request");
+                }
+            }
+            IncomingFrame::Control(ControlMessage::ContentTicketGrant(grant))
+                if grant.request_id == "probe-visible" =>
+            {
+                granted = Some(grant);
+            }
+            IncomingFrame::Control(_) | IncomingFrame::Bulk(_) => {}
+        }
+    }
+    assert!(acked && ghost_refused, "the ack and refusal must arrive");
+    let grant = granted.expect("the visible file mints");
+    assert!(
+        grant.url.starts_with(&content_base) && grant.url.contains(&hex),
+        "the granted URL names the base and the file, got {}",
+        grant.url
+    );
+    assert!(
+        grant.url.contains("?t="),
+        "the ticket rides the query, got {}",
+        grant.url
+    );
+    let response = reqwest::get(&grant.url).await.expect("GET the ticket");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a minted ticket passes the extractor and misses the empty store"
+    );
+}

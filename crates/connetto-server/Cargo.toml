@@ -117,8 +117,20 @@ subtle = "2"
 # response without it. The library's `auth_router` stays a plain Router: the
 # binary decides.
 tower-http = { version = "0.6", default-features = false, features = ["cors"] }
+# The four file routes mounted on the auth listener (R69 decision 1), behind
+# a default-on feature so every plain build and every CI leg of the executable
+# carries them while a library consumer opts out with `default-features =
+# false` and never compiles the object_store SDK path (R69 decision 2).
+connetto-file-server = { path = "../connetto-file-server", optional = true }
+
+[features]
+default = ["content"]
+content = ["dep:connetto-file-server"]
 
 [dev-dependencies]
+# The e2e content boot tests write the ticket key document the server loads,
+# through the same ring keypair the server's signer parses.
+ring = "0.17"
 # Building a change event by hand, so the store upkeep can be driven without
 # standing up a replication stream. subql re-exports `ChangeEvent` and not the
 # types its fields are made of.

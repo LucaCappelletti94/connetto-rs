@@ -374,9 +374,8 @@ async fn start_file_server(
         .await
         .expect("bind the file server");
     let base_url = format!("http://{}", listener.local_addr().expect("address"));
-    let (signer, public_key) =
-        TicketSigner::generate(base_url.clone(), Duration::from_secs(600), 1 << 20)
-            .expect("generate a ticket key");
+    let (signer, public_key) = TicketSigner::generate(&base_url, Duration::from_secs(600), 1 << 20)
+        .expect("generate a ticket key");
     let router = connetto_file_server::serve(Config::<DefaultFileSchema> {
         pools: AppPools {
             admin: fixture.admin().clone(),
