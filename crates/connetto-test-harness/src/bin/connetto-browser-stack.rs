@@ -29,6 +29,8 @@ const SYNC_BIND: &str = "127.0.0.1:7777";
 const SYNC_WS: &str = "ws://127.0.0.1:7777/";
 const AUTH_BIND: &str = "127.0.0.1:18099";
 const AUTH_BASE: &str = "http://127.0.0.1:18099";
+const CONTENT_BIND: &str = "127.0.0.1:18100";
+const CONTENT_BASE: &str = "http://127.0.0.1:18100";
 const CALLBACK: &str = "http://127.0.0.1:18099/auth/callback";
 const LANDING_PATH: &str = "/dev/landing";
 const CALLER_FUNCTION: &str = "current_app_user";
@@ -37,16 +39,28 @@ const BROWSER_PROVIDER: &str = "dev-idp";
 const SCHEMA_SQL: &str = include_str!("../../../../examples/wasm-smoke/schema.sql");
 const POLICIES_SQL: &str = include_str!("../../../../examples/wasm-smoke/policies.sql");
 const ROLES_SQL: &str = include_str!("../../../../examples/wasm-smoke/roles.sql");
-
+const DEPLOYMENT_SQL: &str = include_str!("../../../../crates/connetto-file-server/sql/schema.sql");
+const CONTENT_SQL: &str = include_str!("../../../../examples/wasm-smoke/content.sql");
 connetto_auth_tables!(String, diesel::sql_types::Text);
 
 struct KeyDir {
     dir: PathBuf,
     private: PathBuf,
     public: PathBuf,
+    content_der: PathBuf,
 }
 
 impl Drop for KeyDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.dir);
+    }
+}
+
+struct StoreDir {
+    dir: PathBuf,
+}
+
+impl Drop for StoreDir {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.dir);
     }
@@ -58,6 +72,8 @@ struct Services {
     keys: KeyDir,
     server_bin: PathBuf,
     envs: Vec<(String, String)>,
+    #[expect(dead_code, reason = "the value's Drop removes the store directory")]
+    content_store: StoreDir,
 }
 
 struct ChildGuard {
@@ -104,6 +120,7 @@ async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
     require_free(SYNC_BIND)?;
     require_free(AUTH_BIND)?;
+    require_free(CONTENT_BIND)?;
 
     let (shard, command) = cli_arguments()?;
     let server_bin = ensure_server_bin().await?;
@@ -181,14 +198,26 @@ fn require_free(bind: &str) -> Result<()> {
 
 async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
     let fixture = Fixture::acquire().await;
-    fixture.setup(&[SCHEMA_SQL, POLICIES_SQL]).await;
+    fixture.setup(&[SCHEMA_SQL]).await;
+    fixture.setup(&[DEPLOYMENT_SQL]).await;
     provision_auth_tables(&fixture).await;
     fixture.setup(&[ROLES_SQL]).await;
+    fixture.setup(&[CONTENT_SQL]).await;
+    fixture.setup(&[POLICIES_SQL]).await;
     fixture
         .start_replication(&["orders", "order_lines", "photos"])
         .await;
     let (fga_url, fga_store) = fixture_fga(&fixture).await;
     let keys = generate_keys().await?;
+    let content_dir = std::env::temp_dir().join(format!(
+        "connetto-browser-content-{}-{}",
+        std::process::id(),
+        now_millis()
+    ));
+    tokio::fs::create_dir_all(&content_dir)
+        .await
+        .with_context(|| format!("creating {}", content_dir.display()))?;
+    let content_store = StoreDir { dir: content_dir };
     let idp = MockOauth::start().await;
     let reader_url = with_user_url(fixture.admin_url(), "connetto_reader", "connetto_reader");
     let schema_file = repo_path(&["examples", "wasm-smoke", "schema.sql"])?;
@@ -201,6 +230,20 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
         ("CONNETTO_AUTH_BIND".to_owned(), AUTH_BIND.to_owned()),
         ("CONNETTO_AUTH".to_owned(), "database".to_owned()),
         ("CONNETTO_WRITABLE".to_owned(), "orders,photos".to_owned()),
+        ("CONNETTO_CONTENT_URL".to_owned(), CONTENT_BASE.to_owned()),
+        (
+            "CONNETTO_CONTENT_STORE".to_owned(),
+            format!("fs:{}", content_store.dir.display()),
+        ),
+        (
+            "CONNETTO_CONTENT_KEY".to_owned(),
+            keys.content_der.display().to_string(),
+        ),
+        ("CONNETTO_CONTENT_SWEEP_SECS".to_owned(), "1".to_owned()),
+        (
+            "CONNETTO_TEST_CONTENT_BASE".to_owned(),
+            CONTENT_BASE.to_owned(),
+        ),
         ("CONNETTO_PG_DDL".to_owned(), SCHEMA_SQL.to_owned()),
         ("CONNETTO_PG_POLICIES".to_owned(), POLICIES_SQL.to_owned()),
         ("CONNETTO_SLOT".to_owned(), SLOT.to_owned()),
@@ -247,6 +290,7 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
         keys,
         server_bin,
         envs,
+        content_store,
     })
 }
 
@@ -342,12 +386,16 @@ async fn start_sync_server(services: &Services) -> Result<ChildGuard> {
     let mut command = Command::new(&services.server_bin);
     command
         .envs(services.envs.iter().cloned())
-        .env("CONNETTO_AUTH_BIND", "127.0.0.1:0")
+        .env("CONNETTO_AUTH_BIND", CONTENT_BIND)
+        // The child's auth listener carries the file routes the suites fetch.
         // The server logs to stdout. Nulling it hid every server line from CI.
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     let mut child = command.spawn().context("spawning connetto-server")?;
     wait_for_child_port(&mut child, SYNC_BIND, "connetto-server").await?;
+    if !wait_for_tcp(CONTENT_BIND, Duration::from_secs(20)).await {
+        return Err(anyhow!("connetto-server did not open {CONTENT_BIND}"));
+    }
     Ok(ChildGuard { child })
 }
 
@@ -624,19 +672,20 @@ async fn ensure_server_bin() -> Result<PathBuf> {
     let candidate = target_dir()?
         .join("release")
         .join(exe_name("connetto-server"));
-    if !candidate.exists() {
-        let args = strings(&[
-            "+stable",
-            "build",
-            "--release",
-            "--all-features",
-            "-p",
-            "connetto-server",
-            "--bin",
-            "connetto-server",
-        ]);
-        run_process(OsStr::new("cargo"), &args, &[]).await?;
-    }
+    // The build runs even when the binary exists. A cached tree can hold a
+    // server from another commit, and cargo's fingerprinting makes the warm
+    // case a no-op while a stale exists() shortcut cannot.
+    let args = strings(&[
+        "+stable",
+        "build",
+        "--release",
+        "--all-features",
+        "-p",
+        "connetto-server",
+        "--bin",
+        "connetto-server",
+    ]);
+    run_process(OsStr::new("cargo"), &args, &[]).await?;
     if candidate.exists() {
         Ok(candidate)
     } else {
@@ -655,6 +704,7 @@ async fn generate_keys() -> Result<KeyDir> {
         .with_context(|| format!("creating {}", dir.display()))?;
     let private = dir.join("priv.pem");
     let public = dir.join("pub.pem");
+    let content_der = dir.join("content.der");
     let gen_args = vec![
         OsString::from("genpkey"),
         OsString::from("-algorithm"),
@@ -672,10 +722,17 @@ async fn generate_keys() -> Result<KeyDir> {
         public.as_os_str().to_owned(),
     ];
     run_process(OsStr::new("openssl"), &pub_args, &[]).await?;
+    let content_key =
+        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+            .map_err(|err| anyhow!("generating the content ticket keypair: {err:?}"))?;
+    tokio::fs::write(&content_der, content_key.as_ref())
+        .await
+        .with_context(|| format!("writing {}", content_der.display()))?;
     Ok(KeyDir {
         dir,
         private,
         public,
+        content_der,
     })
 }
 

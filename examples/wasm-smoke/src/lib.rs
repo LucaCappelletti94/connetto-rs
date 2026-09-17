@@ -147,6 +147,8 @@ pub mod workers {
     );
     /// The upstream subscription the DB worker registers.
     pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
+    /// The extra upstream subscription the photo flow needs.
+    pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
     /// The OPFS file holding the DB worker's durable replica.
     pub const DB_NAME: &str = "connetto-relay.sqlite";
     /// OPFS file for unlock-protocol tests, separate from DB_NAME so the two
@@ -187,6 +189,40 @@ pub mod workers {
                 .with_upstream_sub_id("db-upstream")
                 .with_upstream_query(DEMO_QUERY)
                 .with_hub_meta_name("connetto-hub-meta.sqlite")
+                .with_sql_functions(crate::uuidv4_functions())
+                .with_policy_tables(crate::demo_policy_tables())
+                .with_caller_function(crate::CALLER_FUNCTION)
+                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
+                    "http://127.0.0.1:18099",
+                    "dev-idp",
+                    "http://127.0.0.1:18099/dev/landing",
+                )))
+                .with_auth_db_name("connetto-auth.sqlite"),
+        )
+        .await
+        .map(drop)
+        .map_err(JsValue::from)
+    }
+
+    /// DB worker entry point for the photo flow test binary.
+    ///
+    /// # Errors
+    ///
+    /// A string describing the VFS, upstream connect, or subscribe failure.
+    #[wasm_bindgen]
+    pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
+        connetto_web::logging::init_console();
+        connetto_web::workers::boot_db_worker::<String>(
+            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
+                .with_ws_url(DEMO_WS_URL)
+                .with_replica_db_prefix(DB_NAME)
+                .with_replica_ddl(DEMO_SQLITE_DDL)
+                .with_frontend_ddl(DEMO_FRONTEND_DDL)
+                .with_upstream_sub_id("db-upstream")
+                .with_upstream_query(DEMO_QUERY)
+                .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
+                .with_hub_meta_name("connetto-hub-meta.sqlite")
+                .with_content_namespace("connetto-photo-content")
                 .with_sql_functions(crate::uuidv4_functions())
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)

@@ -125,10 +125,10 @@ pub(super) async fn start_boot_services<Id>(
         },
         sleeper: super::super::intake::sleep,
         policy: ReconnectPolicy::default(),
-        upstream: vec![(
-            config.upstream_sub_id.to_owned(),
-            SubscriptionSpec::new(config.upstream_query),
-        )],
+        upstream: config
+            .upstream_subscriptions()
+            .map(|(sub_id, query)| (sub_id.to_owned(), SubscriptionSpec::new(query)))
+            .collect(),
     };
     let (content, content_persistent, content_wipe_namespace) = setup_content_store(
         config,
