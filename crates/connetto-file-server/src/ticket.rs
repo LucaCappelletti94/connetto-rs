@@ -161,11 +161,11 @@ impl TicketSigner {
     /// or fragment.
     /// Returns `TicketError::Ring` if key generation fails or if the ring library rejects the generated PKCS8 document.
     pub fn generate(
-        base_url: String,
+        base_url: &str,
         ticket_ttl: Duration,
         read_ceiling: u64,
     ) -> Result<(Self, Vec<u8>), TicketError> {
-        let base_url = normalize_base(&base_url)?;
+        let base_url = normalize_base(base_url)?;
         let rng = SystemRandom::new();
         let doc = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|e| TicketError::Ring(format!("{e:?}")))?;
@@ -196,11 +196,11 @@ impl TicketSigner {
     /// Returns `TicketError::Ring` if `der` is not a valid PKCS8 document for an Ed25519 key pair.
     pub fn from_pkcs8_der(
         der: &[u8],
-        base_url: String,
+        base_url: &str,
         ticket_ttl: Duration,
         read_ceiling: u64,
     ) -> Result<Self, TicketError> {
-        let base_url = normalize_base(&base_url)?;
+        let base_url = normalize_base(base_url)?;
         let kp =
             Ed25519KeyPair::from_pkcs8(der).map_err(|e| TicketError::Ring(format!("{e:?}")))?;
         Ok(Self {

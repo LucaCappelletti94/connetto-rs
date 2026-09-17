@@ -534,7 +534,7 @@ fn open_store(spec: &StoreSpec) -> Result<files::AnyStore> {
 #[cfg(feature = "content")]
 fn ticket_keypair(
     der: Option<&[u8]>,
-    base_url: String,
+    base_url: &str,
     ttl: Duration,
     read_ceiling: u64,
 ) -> Result<(TicketSigner, Vec<u8>)> {
@@ -605,7 +605,7 @@ async fn build_content(
         }
         None => None,
     };
-    let (signer, public) = ticket_keypair(der.as_deref(), base_url.clone(), ttl, read_ceiling)?;
+    let (signer, public) = ticket_keypair(der.as_deref(), &base_url, ttl, read_ceiling)?;
     let admin = build_pool(admin_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
     let reader = build_pool(reader_url, reader_pool_size).await?;
     let router = files::serve(files::Config::<DefaultFileSchema> {
@@ -1508,7 +1508,7 @@ mod tests {
             let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("a fresh key");
             let (signer, public) = ticket_keypair(
                 Some(doc.as_ref()),
-                "http://127.0.0.1:8081".to_owned(),
+                "http://127.0.0.1:8081",
                 Duration::from_secs(60),
                 1 << 20,
             )
@@ -1528,7 +1528,7 @@ mod tests {
         async fn an_ephemeral_keypair_mints_what_its_public_half_verifies() {
             let (signer, public) = ticket_keypair(
                 None,
-                "http://127.0.0.1:8081".to_owned(),
+                "http://127.0.0.1:8081",
                 Duration::from_secs(60),
                 1 << 20,
             )

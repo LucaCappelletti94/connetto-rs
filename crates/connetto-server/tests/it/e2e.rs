@@ -1781,6 +1781,10 @@ async fn e2e_content_startup_names_each_refused_setting() {
 /// ephemeral-keypair branch every other content test skips.
 #[cfg(feature = "content")]
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "a live session round trip: handshake, ghost refusal, row insert, mint and download run as one ordered exchange"
+)]
 async fn e2e_content_ticket_round_trips_over_a_live_session() {
     use connetto_core::PROTOCOL_VERSION;
     use connetto_core::messages::{
@@ -1919,8 +1923,7 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
             {
                 granted = Some(grant);
             }
-            IncomingFrame::Control(_) => {}
-            IncomingFrame::Bulk(_) => {}
+            IncomingFrame::Control(_) | IncomingFrame::Bulk(_) => {}
         }
     }
     assert!(acked && ghost_refused, "the ack and refusal must arrive");
