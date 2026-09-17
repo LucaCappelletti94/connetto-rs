@@ -10,7 +10,7 @@
 -- transaction and the replica answers with the registered current_app_user()
 -- function, so both ends compare against the same identity.
 ALTER TABLE orders ENABLE ROW LEVEL SECURITY;
-CREATE POLICY orders_p ON orders USING (owner_id = current_setting('app.user_id', true));
+CREATE POLICY orders_p ON orders USING (owner_id = current_setting('app.user_id', true));  -- NOSONAR S1192, SQL DDL has no constants for the caller setting the three policies share
 
 -- The same shape on the composite-key table, so its replica half is split the
 -- same way and its INSTEAD OF triggers have to match a row on two key columns
