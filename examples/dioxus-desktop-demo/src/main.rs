@@ -77,6 +77,15 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    photos (id) {
+        id -> rosetta_uuid::sql_types::Uuid,
+        order_id -> rosetta_uuid::sql_types::Uuid,
+        content_id -> diesel::sql_types::Binary,
+        content_state -> Nullable<diesel::sql_types::Text>,
+    }
+}
+
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
 #[diesel(table_name = orders)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]

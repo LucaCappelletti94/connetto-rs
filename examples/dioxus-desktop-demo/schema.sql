@@ -1,8 +1,10 @@
 -- The one source of truth for the demo: the Postgres dialect schema the
 -- backend owns. build.rs translates this through pg2sqlite and bakes the
 -- replica template database the app ships. The connetto-server for this demo
--- must be started with this same schema in CONNETTO_PG_DDL. Apply roles.sql
--- after this file to provision the non-owner role required by CONNETTO_READER_URL.
+-- must be started with this same schema in CONNETTO_PG_DDL and must list
+-- every synced table in CONNETTO_WRITABLE. Apply in this order: this file,
+-- connetto_file_server::DEPLOYMENT_DDL, roles.sql (the non-owner role
+-- required by CONNETTO_READER_URL), then content.sql.
 -- The server also requires CONNETTO_AUTH, CONNETTO_AUTH_BIND, and the
 -- CONNETTO_OIDC_* variables written by the dev IdP (see dev_idp.rs).
 -- The key default is load-bearing on the client rather than here: build.rs
@@ -20,3 +22,10 @@ CREATE TABLE order_lines (
   quantity BIGINT NOT NULL CHECK (quantity >= 0),
   PRIMARY KEY (order_id, line_no)
 );
+
+-- The photo entry: metadata for one file's bytes, attached to an order.
+-- content_id is the BLAKE3 identity the file server stores and serves under,
+-- and content_state stays null until the file server's commit writes
+-- `available`, so the placeholder condition is "not available" and the
+-- availability flip arrives as an ordinary synced column change.
+CREATE TABLE photos (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id), content_id BYTEA NOT NULL, content_state TEXT);
