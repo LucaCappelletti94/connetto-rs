@@ -1486,6 +1486,15 @@ fn sample_file_id() -> String {
     "ab".repeat(32)
 }
 
+/// Writes a PKCS#8 v1 ed25519 document, the shape `CONNETTO_CONTENT_KEY`
+/// loads, through the same ring keypair the signer parses.
+#[cfg(feature = "content")]
+fn generate_ticket_key(path: &std::path::Path) {
+    let keypair = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("generate the content ticket key");
+    std::fs::write(path, keypair.as_ref()).expect("write the ticket key");
+}
+
 /// A server configured with `CONNETTO_CONTENT_URL` boots, mounts the four
 /// file routes on the auth listener under its CORS layer, and still serves
 /// the login endpoints on the same port.
@@ -1504,9 +1513,15 @@ async fn e2e_content_routes_mount_on_the_auth_listener() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    // Startup checks the slot before it builds anything content-related, so
+    // every boot here needs the replication objects present.
+    fixture.start_replication(&["orders"]).await;
     apply_content_deployment(&pool, true).await;
 
     let store = TempDir::new().expect("content store dir");
+    let key_dir = TempDir::new().expect("content key dir");
+    let key_path = key_dir.path().join("ticket.der");
+    generate_ticket_key(&key_path);
     let port = free_port();
     let auth_port = free_port();
     let bind = format!("127.0.0.1:{port}");
@@ -1522,6 +1537,10 @@ async fn e2e_content_routes_mount_on_the_auth_listener() {
     envs.extend([
         ("CONNETTO_CONTENT_URL", content_base.as_str()),
         ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+        (
+            "CONNETTO_CONTENT_KEY",
+            key_path.to_str().expect("utf-8 path"),
+        ),
         ("CONNETTO_CONTENT_SWEEP_SECS", "1"),
     ]);
 
@@ -1589,6 +1608,7 @@ async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
     apply_content_deployment(&pool, false).await;
 
     let auth_port = free_port();
@@ -1631,6 +1651,7 @@ async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
 
     let auth_port = free_port();
     let auth_stack = build_auth_stack(auth_port).await;
@@ -1656,4 +1677,76 @@ async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
         stderr.contains("CONNETTO_CONTENT_STORE"),
         "expected the refusal to name CONNETTO_CONTENT_STORE, got: {stderr}"
     );
+}
+
+/// Every remaining way the content settings can be wrong, each refused with
+/// a message naming the setting or the file at fault. One boot per case
+/// because the refusals are what the case is, not a fixture to reuse.
+#[cfg(feature = "content")]
+#[tokio::test]
+async fn e2e_content_startup_names_each_refused_setting() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
+
+    let auth_port = free_port();
+    let auth_stack = build_auth_stack(auth_port).await;
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+
+    let store = TempDir::new().expect("content store dir");
+    let store_spec = format!("fs:{}", store.path().display());
+    let junk_dir = TempDir::new().expect("junk key dir");
+    let junk_key = junk_dir.path().join("junk.der");
+    std::fs::write(&junk_key, [0u8; 16]).expect("write the junk key");
+    let missing_key = "/tmp/connetto-r69-definitely-not-a-key.pem";
+
+    let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_KEY", missing_key),
+            ],
+            "connetto-r69-definitely-not-a-key.pem",
+        ),
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                (
+                    "CONNETTO_CONTENT_KEY",
+                    junk_key.to_str().expect("utf-8 path"),
+                ),
+            ],
+            "loading the content ticket key",
+        ),
+        (
+            vec![("CONNETTO_CONTENT_STORE", "fs:")],
+            "fs: needs a directory",
+        ),
+        (
+            vec![("CONNETTO_CONTENT_STORE", "ftp://example.com")],
+            "opening the chunk store",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let mut envs: Vec<(&str, &str)> = auth_stack
+            .env_pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        envs.push(("CONNETTO_CONTENT_URL", content_base.as_str()));
+        envs.extend(extra);
+        let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success() && stderr.contains(expected),
+            "expected a refusal naming {expected:?}, got status {:?} and: {stderr}",
+            output.status.code()
+        );
+    }
 }
