@@ -1,6 +1,6 @@
 # 18: File handling
 
-**Status**: normative for the decisions it records. R64 the file core, R65 the file server, R66 the connetto seam, R67 the native client and R68 the browser client are built. R69 the demos is designed (2026-09-12) and not built. R79 the peer link and R87 the quotas are not built. Every statement carries **Decided (RN)** or an **Amended (RN)** beside it, where `RN` is the phase in `plans/master-implementation-plan.md` that owns it, and that phase's section records each decision with its rejected alternatives. Chapter 07 is the historical record of the thinking that preceded these decisions and defers to this chapter wherever the two disagree.
+**Status**: normative for the decisions it records. R64 the file core, R65 the file server, R66 the connetto seam, R67 the native client and R68 the browser client are built. R69 the demos is in progress, its executable half, demo schemas, tab and worker content protocol and browser-stack wiring built 2026-09-17 as pull requests #28 to #31, with the demo surfaces and the offline and two-viewer proofs open. R79 the peer link and R87 the quotas are not built. Every statement carries **Decided (RN)** or an **Amended (RN)** beside it, where `RN` is the phase in `plans/master-implementation-plan.md` that owns it, and that phase's section records each decision with its rejected alternatives. Chapter 07 is the historical record of the thinking that preceded these decisions and defers to this chapter wherever the two disagree.
 
 ---
 
