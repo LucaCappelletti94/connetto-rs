@@ -3,7 +3,7 @@
 //! One worker-held [`ConnettoConnection`] owns the durable replica and the
 //! server session, and any number of tabs speak the ordinary connetto wire
 //! protocol to it over their own [`Transport`]s (an in-memory loopback, or a
-//! [`MessageTransport`](crate::MessageTransport) over a `MessageChannel`
+//! [`MessageTransport`] over a `MessageChannel`
 //! port). The hub is a single-task core fed by channels: each attached tab
 //! gets a shovel task that owns its transport and exchanges frames with the
 //! core, so the core never selects over a dynamic set of transports and sends
@@ -61,6 +61,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auth::PendingWork;
+use crate::content_wire::{ContentFrame, WireResolve, mime_from_code};
+use crate::frames::{
+    InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
+};
+use crate::workers::blob_io::BlobSource;
+use crate::workers::helpers::sleep_ms;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices,
@@ -76,7 +82,8 @@ use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
-    ContentFlushStart, ContentFlushState, ContentUpload, FileId, ScanStep,
+    ContentFlushStart, ContentFlushState, ContentUpload, FileId, PendingConnectionResolve,
+    ResolveRoute, ResolveStart, Resolved, ScanStep, StageCommitError,
 };
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
@@ -85,11 +92,22 @@ use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
 use diesel::sql_query;
 use diesel::sqlite::Sqlite;
 use diesel_sqlite_session::{ConflictAction, SqliteSessionExt};
+use futures_util::StreamExt;
 use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet, TableSchema, Value};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
-
 /// Zstd level for relayed snapshot payloads, matching the client library default.
 const ZSTD_LEVEL: i32 = 3;
+
+/// Staged content older than this lost its mutation at the hub; the blob is
+/// dropped when the tab next stages or writes.
+const STALE_CONTENT_MS: f64 = 15_000.0;
+
+/// Staged blobs a single tab may hold at once, oldest dropped first.
+const MAX_STAGED_CONTENT: usize = 8;
+
+/// Longest a tab's resolve question waits on a ticket round trip before the
+/// hub answers `Unavailable`.
+const RESOLVE_WAIT_MS: i32 = 15_000;
 
 /// Upstream sequence numbers retained for mapping rejections back to a tab.
 /// A rejection arrives well within this window, mirroring the client's own
@@ -261,6 +279,9 @@ enum HubEvent {
         FileId,
         futures_channel::oneshot::Sender<Result<(), ArchiveServiceError>>,
     ),
+    /// One content-protocol message from a tab's internal lane. A `Stage`
+    /// arrives with its blob; the other frames carry none.
+    Internal(TabId, ContentFrame, Option<web_sys::Blob>),
 }
 
 /// One outbound frame toward a tab. Dropping a tab's sender closes it: the
@@ -268,6 +289,10 @@ enum HubEvent {
 enum TabOut {
     Control(ControlMessage),
     Bulk(BulkMessage),
+    /// One content-protocol reply toward a tab, with the blob a `Local`
+    /// resolution carries. Only transports attached with an internal lane
+    /// can receive these.
+    Internal(Vec<u8>, Option<web_sys::Blob>),
 }
 
 /// A fault while handling one tab's frame: either close that tab, or a
@@ -310,6 +335,20 @@ struct TabState {
     credits: u32,
     /// Frames queued toward this tab, drained in FIFO order as credits return.
     pending: VecDeque<TabDeliverable>,
+    /// Content blobs this tab has staged and not yet paired with a mutation,
+    /// oldest first.
+    staged: VecDeque<StagedContent>,
+}
+
+/// One staged blob awaiting the mutation that names it. The mutation pairs
+/// by the declared identity, and content nothing paired by the time it goes
+/// stale is dropped.
+struct StagedContent {
+    file_id: FileId,
+    mime: connetto_file_core::MimeClass,
+    blob: web_sys::Blob,
+    /// `Date::now()` at arrival, milliseconds.
+    taken: f64,
 }
 
 /// One item waiting on a tab's outbound queue.
@@ -468,6 +507,20 @@ struct HubState {
     /// `SnapshotEnd` triggers the tab re-snapshot, which carries that reason on
     /// rather than restating one cause as another.
     resyncing: HashMap<String, FullResyncReason>,
+
+    /// Resolves waiting on a server ticket answer, each with the tab and
+    /// request to answer and the `Date::now` instant its wait ends.
+    pending_resolve: Vec<PendingHubResolve>,
+}
+
+/// One resolve whose ticket request is in flight, kept in the hub state so
+/// the wait costs a slot rather than the event loop.
+struct PendingHubResolve {
+    tab: TabId,
+    request_id: u64,
+    ticket: PendingConnectionResolve,
+    /// `Date::now` milliseconds by which the tab hears at the latest.
+    deadline: f64,
 }
 
 /// Handle for attaching tabs to a running hub. Cloneable, and every clone
@@ -731,13 +784,45 @@ impl RelayHub {
         D: Transport + 'static,
         D::Error: core::fmt::Display,
     {
+        self.spawn_tab(tab, None, None)
+    }
+
+    /// Attach one message transport together with its internal lane, so the
+    /// tab can stage content and ask resolution questions alongside its
+    /// sync frames.
+    pub fn attach_with_content<S>(&self, mut tab: MessageTransport<S>) -> TabId
+    where
+        S: MessageSink + Clone + 'static,
+    {
+        let internal_rx = tab.take_internal_inbox();
+        let replier: Box<dyn InternalReplier> = Box::new(InternalLaneReplier(tab.internal_lane()));
+        self.spawn_tab(tab, internal_rx, Some(replier))
+    }
+
+    fn spawn_tab<D>(
+        &self,
+        tab: D,
+        internal_rx: Option<futures_channel::mpsc::UnboundedReceiver<InternalInbound>>,
+        replier: Option<Box<dyn InternalReplier>>,
+    ) -> TabId
+    where
+        D: Transport + 'static,
+        D::Error: core::fmt::Display,
+    {
         // Relaxed: pure id allocation, nothing orders against it.
         let id = self.next_tab.fetch_add(1, Ordering::Relaxed);
         let (out_tx, out_rx) = unbounded_channel();
         // Queued before the shovel exists, so the core learns the tab
         // before its first frame can possibly arrive on the same channel.
         let _ = self.events.send(HubEvent::Attached(id, out_tx));
-        wasm_bindgen_futures::spawn_local(shovel(id, tab, out_rx, self.events.clone()));
+        wasm_bindgen_futures::spawn_local(shovel(
+            id,
+            tab,
+            out_rx,
+            internal_rx,
+            replier,
+            self.events.clone(),
+        ));
         id
     }
 
@@ -882,24 +967,77 @@ fn prepare_hub_worker<U: Transport>(
     Ok(local_tables)
 }
 
-/// The per-tab I/O task: owns the transport, feeds inbound frames to the
-/// core, writes outbound frames, and closes the transport when the core
-/// drops the tab.
+/// The reply leg of an attached tab's internal lane, boxed shape for the
+/// shovel so the lane's sink type stays private to the attach call.
+trait InternalReplier {
+    /// Post one internal message to the tab.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageTransportError::Sink`] when the browser refuses the post.
+    fn post(&self, json: &[u8], blob: Option<&web_sys::Blob>) -> Result<(), MessageTransportError>;
+}
+
+struct InternalLaneReplier<S: MessageSink>(InternalLane<S>);
+
+impl<S: MessageSink> InternalReplier for InternalLaneReplier<S> {
+    fn post(&self, json: &[u8], blob: Option<&web_sys::Blob>) -> Result<(), MessageTransportError> {
+        self.0.post_internal(json, blob)
+    }
+}
+
+/// The per-tab I/O task: owns the transport, feeds inbound frames and
+/// internal messages to the core, writes outbound frames and internal
+/// replies, and closes the transport when the core drops the tab.
 async fn shovel<D>(
     id: TabId,
     mut tab: D,
     mut out_rx: UnboundedReceiver<TabOut>,
+    mut internal_rx: Option<futures_channel::mpsc::UnboundedReceiver<InternalInbound>>,
+    replier: Option<Box<dyn InternalReplier>>,
     events: UnboundedSender<HubEvent>,
 ) where
     D: Transport,
     D::Error: core::fmt::Display,
 {
     loop {
-        // Cancel safety: both legs park on an mpsc backed receive, which
+        // Cancel safety: every leg parks on an mpsc backed receive, which
         // loses nothing when dropped, and sends on the transports this hub
         // runs over (loopback and message ports) complete in one poll, so a
         // losing branch is only ever dropped while parked.
+        //
+        // Biased on purpose: the content lane and the codec frames share one
+        // message port, so a staged blob is posted before the mutation that
+        // names it, and poll order here is the only thing that keeps that
+        // order at the hub. A fair select could deliver the mutation first
+        // and lose the pairing. The handshake needs no such guard: a tab
+        // stages only after its ack round trip, which the hub already
+        // answered.
         tokio::select! {
+            biased;
+            inbound = async {
+                match internal_rx.as_mut() {
+                    Some(rx) => rx.next().await,
+                    None => std::future::pending::<Option<InternalInbound>>().await,
+                }
+            } => match inbound {
+                Some(inbound) => match ContentFrame::from_json(&inbound.json) {
+                    Some(frame) => {
+                        if events
+                            .send(HubEvent::Internal(id, frame, inbound.blob))
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    None => {
+                        tracing::warn!(tab = %id, "relay hub dropped an undecodable internal frame");
+                    }
+                },
+                // The lane ended with its transport; parking on a closed
+                // channel would spin until the frame leg catches up.
+                None => break,
+            },
             frame = tab.recv() => match frame {
                 Ok(Some(frame)) => {
                     if events.send(HubEvent::Frame(id, frame)).is_err() {
@@ -917,6 +1055,13 @@ async fn shovel<D>(
                 Some(TabOut::Bulk(message)) => {
                     if tab.send_bulk(message).await.is_err() {
                         break;
+                    }
+                }
+                Some(TabOut::Internal(json, blob)) => {
+                    // Only core replies reach this arm, and only tabs
+                    // attached with a lane receive them.
+                    if let Some(replier) = &replier {
+                        let _ = replier.post(&json, blob.as_ref());
                     }
                 }
                 None => {
@@ -1032,6 +1177,8 @@ enum Wake {
     Upstream(Result<ClientEvent, ClientError>),
     /// The content integrity walk has a file left to check.
     Verify,
+    /// A resolve's ticket wait ran out while the hub served everything else.
+    Resolve,
 }
 
 impl<U> HubRuntime<U>
@@ -1082,6 +1229,17 @@ where
             }
         };
         tokio::pin!(content_wait);
+        // The resolve waits ride a timer here rather than parking a handler:
+        // when one fires, the sweep answers only the waits that have truly
+        // elapsed and the loop keeps serving everything else in between.
+        let resolve_ms = resolve_deadline_ms(&self.state.pending_resolve);
+        let resolve_wait = async {
+            match resolve_ms {
+                Some(ms) => sleep_ms(ms).await,
+                None => core::future::pending().await,
+            }
+        };
+        tokio::pin!(resolve_wait);
         // Each arm only names its wake reason, so a losing branch leaves
         // nothing half applied: every mpsc receive loses nothing when dropped.
         let wake = {
@@ -1098,6 +1256,7 @@ where
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
+                () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
             }
         };
         match wake {
@@ -1105,6 +1264,10 @@ where
             Wake::Local(event) => self.serve_local(event).await,
             Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
             Wake::Verify => self.verify_turn().await,
+            Wake::Resolve => {
+                expire_resolves(&mut self.state);
+                Ok(true)
+            }
         }
     }
 
@@ -1313,7 +1476,6 @@ where
         Ok(true)
     }
 
-    /// Run the content driver now when anything is queued.
     fn wake_content(&mut self) -> Result<(), RelayError> {
         if content_sendable_files(
             &mut self.worker,
@@ -1621,7 +1783,10 @@ where
     match event {
         HubEvent::Attached(id, out) => attach_tab(state, id, out),
         HubEvent::Frame(id, frame) => {
-            handle_tab_frame(worker, state, notices, id, frame).await?;
+            handle_tab_frame(worker, state, notices, content, walk, id, frame).await?;
+        }
+        HubEvent::Internal(id, frame, blob) => {
+            handle_tab_internal(worker, state, content, id, frame, blob).await?;
         }
         HubEvent::Unsynced(reply) => {
             let pending = PendingWork {
@@ -1700,6 +1865,7 @@ fn attach_tab(state: &mut HubState, id: TabId, out: UnboundedSender<TabOut>) {
             local_watermark: None,
             credits: INITIAL_CREDITS,
             pending: VecDeque::new(),
+            staged: VecDeque::new(),
         },
     );
 }
@@ -1763,6 +1929,7 @@ where
     U::Error: core::fmt::Display,
 {
     state.tabs.remove(&id);
+    state.pending_resolve.retain(|resolve| resolve.tab != id);
     let upstreams: Vec<String> = state
         .agg_routes
         .iter()
@@ -2195,6 +2362,7 @@ fn recovery_serves_idle(event: &HubEvent) -> bool {
             | HubEvent::ForgetRetired(_, _)
             | HubEvent::RefusedContent(_)
             | HubEvent::RetryRefused(_, _)
+            | HubEvent::Internal(_, _, _)
     )
 }
 
@@ -2212,6 +2380,7 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::ForgetRetired(_, _)
             | HubEvent::RefusedContent(_)
             | HubEvent::RetryRefused(_, _)
+            | HubEvent::Internal(_, ContentFrame::Resolve { .. }, _)
     )
 }
 
@@ -2240,6 +2409,8 @@ async fn handle_tab_frame<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     notices: &UnboundedSender<HubNotice>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
     id: TabId,
     frame: IncomingFrame,
 ) -> Result<(), RelayError>
@@ -2251,13 +2422,14 @@ where
         IncomingFrame::Control(message) => {
             handle_tab_control(worker, state, notices, id, message).await
         }
-        IncomingFrame::Bulk(bulk) => handle_tab_bulk(worker, state, id, bulk).await,
+        IncomingFrame::Bulk(bulk) => handle_tab_bulk(worker, state, content, walk, id, bulk).await,
     };
     match outcome {
         Ok(()) => Ok(()),
         Err(TabFault::Close(reason)) => {
             tracing::warn!(tab = %id, reason = %reason, "relay hub closed a tab");
             state.tabs.remove(&id);
+            state.pending_resolve.retain(|resolve| resolve.tab != id);
             Ok(())
         }
         Err(TabFault::Hub(err)) => Err(err),
@@ -2522,6 +2694,8 @@ where
 async fn handle_tab_bulk<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
     id: TabId,
     bulk: BulkMessage,
 ) -> Result<(), TabFault>
@@ -2585,7 +2759,15 @@ where
             &patch.patchset_zstd,
         );
     }
-    handle_synced_mutation(worker, state, id, tab_seq, &changeset).await
+    // Content rides a mutation that names it: a changeset carrying a staged
+    // file's identity commits the manifest, the upload queue entry and the
+    // rows together. A changeset naming nothing staged is an ordinary
+    // mutation, and staged content it never names ages out.
+    let staged = take_staged(state, id, &changeset);
+    handle_synced_mutation(
+        worker, state, id, tab_seq, &changeset, staged, content, walk,
+    )
+    .await
 }
 
 /// Bind one changeset value at its own SQLite storage class.
@@ -2957,12 +3139,25 @@ where
 /// mutation. An apply failure rejects the mutation back to the tab and
 /// leaves the replica untouched, since the abort policy rolls the whole
 /// apply back.
+///
+/// When the changeset paired with staged content, the file is chunked into
+/// the encrypted store and its manifest and upload entry commit in the same
+/// transaction as the rows, with the declared identity checked against what
+/// the bytes actually hash to. A chunking, identity or apply failure all
+/// reject the mutation with nothing committed.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the mutation needs its tab, its content archive and the walk to wake, none of which belongs on another's struct"
+)]
 async fn handle_synced_mutation<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     id: TabId,
     tab_seq: u64,
     changeset: &[u8],
+    staged: Option<StagedContent>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
 ) -> Result<(), TabFault>
 where
     U: Transport,
@@ -2998,35 +3193,37 @@ where
     let Ok(seq) = i64::try_from(tab_seq) else {
         return Err(TabFault::Close("sequence overflows storage".to_owned()));
     };
-    let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
-        conn.apply_changeset(&changeset, |_conflict| ConflictAction::Abort)
-            .map_err(|err| TabApplyError::Apply(err.to_string()))?;
-        // sql_query is kept because connetto_hub._tab_mutations is in an
-        // ATTACHED schema that diesel's table! macro does not model for SQLite.
-        diesel::sql_query(
-            "INSERT INTO connetto_hub._tab_mutations (client_id, last_seq) VALUES (?, ?) \
-             ON CONFLICT (client_id) DO UPDATE SET \
-             last_seq = MAX(last_seq, excluded.last_seq)",
-        )
-        .bind::<rosetta_uuid::diesel_impls::Uuid, _>(client_id)
-        .bind::<diesel::sql_types::BigInt, _>(seq)
-        .execute(conn)?;
-        Ok(())
-    });
-    match applied {
-        Ok(()) => {}
-        Err(TabApplyError::Apply(detail)) => {
-            let _ = out.send(TabOut::Control(ControlMessage::MutationReject(
-                MutationReject {
-                    client_seq: tab_seq,
-                    reason: MutationRejectReason::Other {
-                        detail: format!("worker replica apply failed: {detail}"),
-                    },
-                },
-            )));
-            return Ok(());
+    if let Some(staged) = staged {
+        match commit_staged_mutation(worker, content, staged, &changeset, client_id, seq).await {
+            Ok(()) => {
+                // The commit left an outbox entry the driver has not been
+                // told about, and no upstream event may arrive to tell it.
+                walk.outbox_wake = true;
+            }
+            Err(detail) => {
+                reject_mutation(&out, tab_seq, detail);
+                return Ok(());
+            }
         }
-        Err(TabApplyError::Db(err)) => return Err(RelayError::from(err).into()),
+    } else {
+        let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
+            conn.apply_changeset(&changeset, |_conflict| ConflictAction::Abort)
+                .map_err(|err| TabApplyError::Apply(err.to_string()))?;
+            record_tab_watermark(conn, client_id, seq)?;
+            Ok(())
+        });
+        match applied {
+            Ok(()) => {}
+            Err(TabApplyError::Apply(detail)) => {
+                reject_mutation(
+                    &out,
+                    tab_seq,
+                    format!("worker replica apply failed: {detail}"),
+                );
+                return Ok(());
+            }
+            Err(TabApplyError::Db(err)) => return Err(RelayError::from(err).into()),
+        }
     }
     if let Some(tab) = state.tabs.get_mut(&id) {
         tab.applied_watermark = Some(tab_seq);
@@ -3038,6 +3235,346 @@ where
         }
     }
     Ok(())
+}
+
+/// Chunk a staged blob and commit its manifest, outbox entry, watermark and
+/// row change in one transaction.
+///
+/// The error is the refusal detail for the tab, never a hub fault.
+async fn commit_staged_mutation<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: Option<&ContentArchive<BrowserStore>>,
+    staged: StagedContent,
+    changeset: &[u8],
+    client_id: rosetta_uuid::Uuid,
+    seq: i64,
+) -> Result<(), String>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        return Err("this worker holds no content archive".to_owned());
+    };
+    let Ok(reader) = BlobSource::new(staged.blob) else {
+        return Err("staged content could not be opened for reading".to_owned());
+    };
+    // Chunking runs outside the transaction: a large blob must not hold the
+    // write lock, and bytes chunked for a commit that never lands are orphans
+    // the next sweep collects, exactly as with the native client's staging.
+    let manifest = content
+        .chunk_file(reader, staged.mime)
+        .await
+        .map_err(|err| format!("staged content could not be chunked: {err}"))?;
+    let declared = staged.file_id;
+    content
+        .commit_staged(worker, &manifest, |conn, worker_id| {
+            if worker_id != declared {
+                return Err(StageCommitError::Row(format!(
+                    "staged bytes hash to {worker_id}, the mutation names {declared}"
+                )));
+            }
+            conn.apply_changeset(changeset, |_conflict| ConflictAction::Abort)
+                .map_err(|err| {
+                    StageCommitError::Row(format!("worker replica apply failed: {err}"))
+                })?;
+            record_tab_watermark(conn, client_id, seq)?;
+            Ok(())
+        })
+        .map_err(|err| match err {
+            StageCommitError::Row(detail) => detail,
+            StageCommitError::Bookkeeping(err) => {
+                format!("the worker could not record the staged file: {err}")
+            }
+        })
+}
+
+/// Answer a mutation with a refusal the tab can surface.
+fn reject_mutation(out: &UnboundedSender<TabOut>, tab_seq: u64, detail: String) {
+    let _ = out.send(TabOut::Control(ControlMessage::MutationReject(
+        MutationReject {
+            client_seq: tab_seq,
+            reason: MutationRejectReason::Other { detail },
+        },
+    )));
+}
+
+/// Advance one tab's durable mutation watermark inside the transaction that
+/// applied its mutation.
+///
+/// `sql_query` is kept because `connetto_hub`._`tab_mutations` is in an ATTACHED
+/// schema that diesel's table! macro does not model for SQLite.
+fn record_tab_watermark(
+    conn: &mut SqliteConnection,
+    client_id: rosetta_uuid::Uuid,
+    seq: i64,
+) -> Result<(), diesel::result::Error> {
+    diesel::sql_query(
+        "INSERT INTO connetto_hub._tab_mutations (client_id, last_seq) VALUES (?, ?) \
+         ON CONFLICT (client_id) DO UPDATE SET \
+         last_seq = MAX(last_seq, excluded.last_seq)",
+    )
+    .bind::<rosetta_uuid::diesel_impls::Uuid, _>(client_id)
+    .bind::<diesel::sql_types::BigInt, _>(seq)
+    .execute(conn)?;
+    Ok(())
+}
+
+/// Take the staged blob a synced changeset names, if this tab holds one,
+/// dropping entries that went stale waiting for a mutation that never came.
+fn take_staged(state: &mut HubState, id: TabId, changeset: &[u8]) -> Option<StagedContent> {
+    let tab = state.tabs.get_mut(&id)?;
+    if tab.staged.is_empty() {
+        return None;
+    }
+    let now = js_sys::Date::now();
+    tab.staged
+        .retain(|staged| now - staged.taken < STALE_CONTENT_MS);
+    let named = changeset_blob_values(changeset);
+    if named.is_empty() {
+        return None;
+    }
+    let index = tab
+        .staged
+        .iter()
+        .position(|staged| named.contains(&staged.file_id))?;
+    tab.staged.remove(index)
+}
+
+/// The file identities a changeset could be naming: every 32-byte blob value
+/// it writes, which is where staged content declares itself. Old images are
+/// never scanned: a row's previous identity names content the hub holds
+/// already, not content this mutation uploaded.
+///
+/// Only changesets are scanned. A tab's own capture produces changesets, and
+/// a patchset from a foreign tab is applied without content either way.
+fn changeset_blob_values(bytes: &[u8]) -> Vec<FileId> {
+    fn named(value: &Value<String, Vec<u8>>) -> Option<FileId> {
+        let Value::Blob(blob) = value else {
+            return None;
+        };
+        <[u8; 32]>::try_from(blob.as_slice())
+            .ok()
+            .map(FileId::from_bytes)
+    }
+    let Ok(parsed) = ParsedDiffSet::parse(bytes) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    if let ParsedDiffSet::Changeset(diff) = parsed {
+        for op in diff.iter() {
+            match op {
+                ChangesetOp::Insert { values, .. } => {
+                    found.extend(values.iter().filter_map(named));
+                }
+                ChangesetOp::Update { values, .. } => {
+                    found.extend(values.iter().filter_map(|pair| named(pair.1.as_ref()?)));
+                }
+                ChangesetOp::Delete { .. } => {}
+            }
+        }
+    }
+    found
+}
+
+/// cannot hold the hub. Both serve wherever they arrive, like `Attached`:
+/// they write hub state or read the replica, never the server on the
+/// critical path a resolve cannot wait out.
+async fn handle_tab_internal<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    id: TabId,
+    frame: ContentFrame,
+    blob: Option<web_sys::Blob>,
+) -> Result<(), RelayError>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    if !state.tabs.get(&id).is_some_and(|tab| tab.handshaken) {
+        return Ok(());
+    }
+    match frame {
+        ContentFrame::Stage { file_id, mime } => {
+            let Some(tab) = state.tabs.get_mut(&id) else {
+                return Ok(());
+            };
+            let Some(blob) = blob else {
+                tracing::warn!(tab = %id, "a stage message carried no blob");
+                return Ok(());
+            };
+            let now = js_sys::Date::now();
+            tab.staged
+                .retain(|staged| now - staged.taken < STALE_CONTENT_MS);
+            if tab.staged.len() >= MAX_STAGED_CONTENT {
+                tracing::warn!(
+                    tab = %id,
+                    "the tab already holds the maximum unpaired stages, refusing another; \
+                     content it announces from here on will not ride its mutation"
+                );
+                return Ok(());
+            }
+            tab.staged.push_back(StagedContent {
+                file_id: FileId::from_bytes(file_id),
+                mime: mime_from_code(mime),
+                blob,
+                taken: now,
+            });
+            Ok(())
+        }
+        ContentFrame::Resolve {
+            request_id,
+            file_id,
+        } => {
+            let start = match content {
+                Some(content) => {
+                    match content
+                        .start_resolve_connection(worker, FileId::from_bytes(file_id))
+                        .await
+                    {
+                        Ok(start) => Some(start),
+                        Err(err) => {
+                            tracing::warn!(
+                                tab = %id,
+                                ?err,
+                                "the resolve's ticket request could not go out"
+                            );
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            match start {
+                Some(ResolveStart::Waiting(ticket)) => {
+                    state.pending_resolve.push(PendingHubResolve {
+                        tab: id,
+                        request_id,
+                        ticket,
+                        deadline: js_sys::Date::now() + f64::from(RESOLVE_WAIT_MS),
+                    });
+                }
+                Some(ResolveStart::Answered(Resolved::Remote { url })) => {
+                    answer_resolve(state, id, request_id, WireResolve::Remote { url }, None);
+                }
+                Some(ResolveStart::Answered(Resolved::Local { bytes, .. })) => {
+                    answer_resolve(state, id, request_id, WireResolve::Local, Some(bytes));
+                }
+                Some(ResolveStart::Answered(Resolved::Unavailable)) | None => {
+                    answer_resolve(state, id, request_id, WireResolve::Unavailable, None);
+                }
+            }
+            Ok(())
+        }
+        ContentFrame::ResolveReply { .. } => Ok(()),
+    }
+}
+
+/// Answers a tab's resolve on its content lane. A `Local` answer attaches its
+/// bytes as the reply's blob; a tab that has detached loses the answer with
+/// the lane.
+fn answer_resolve(
+    state: &mut HubState,
+    tab: TabId,
+    request_id: u64,
+    answer: WireResolve,
+    bytes: Option<Vec<u8>>,
+) {
+    let reply = ContentFrame::ResolveReply { request_id, answer };
+    let blob = bytes.and_then(|bytes| {
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes.as_slice()));
+        match web_sys::Blob::new_with_u8_array_sequence(&parts) {
+            Ok(blob) => Some(blob),
+            Err(err) => {
+                tracing::warn!(
+                    tab = %tab,
+                    error = ?err,
+                    "the browser refused a resolve reply blob"
+                );
+                None
+            }
+        }
+    });
+    if let Some(entry) = state.tabs.get(&tab) {
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), blob));
+    }
+}
+
+/// Runs one upstream event past the resolves waiting on tickets, answering
+/// every tab whose wait it settles. The event goes on to the ordinary
+/// handling: a grant is news the rest of the hub ignores, a refusal detail
+/// names a request no tab write knows, and a closed link is news every
+/// handler needs.
+fn route_resolves(state: &mut HubState, event: &ClientEvent) {
+    if state.pending_resolve.is_empty() {
+        return;
+    }
+    let mut settled = Vec::new();
+    let mut waiting = Vec::new();
+    for resolve in std::mem::take(&mut state.pending_resolve) {
+        match resolve.ticket.route(event) {
+            ResolveRoute::Settled(result) => {
+                settled.push((resolve.tab, resolve.request_id, result));
+            }
+            ResolveRoute::Other => waiting.push(resolve),
+        }
+    }
+    state.pending_resolve = waiting;
+    for (tab, request_id, result) in settled {
+        let answer = match result {
+            Ok(url) => WireResolve::Remote { url },
+            Err(err) => {
+                tracing::warn!(tab = %tab, ?err, "the content ticket request did not reach a grant");
+                WireResolve::Unavailable
+            }
+        };
+        answer_resolve(state, tab, request_id, answer, None);
+    }
+}
+
+/// Milliseconds until the earliest resolve wait must answer, `None` when no
+/// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
+/// deadline the sweep has not yet collected.
+fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
+    let now = js_sys::Date::now();
+    // The floor is 1 ms and the ceiling is RESOLVE_WAIT_MS, the widest wait
+    // this file ever queues, so the value is always in i32 range.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [1.0, RESOLVE_WAIT_MS = 15_000]; sub-ms rounding is deliberate"
+    )]
+    let ms = pending
+        .iter()
+        .map(|resolve| {
+            (resolve.deadline - now)
+                .clamp(1.0, f64::from(RESOLVE_WAIT_MS))
+                .ceil() as i32
+        })
+        .min();
+    ms
+}
+
+/// Answers `Unavailable` to every resolve whose wait ran out.
+fn expire_resolves(state: &mut HubState) {
+    if state.pending_resolve.is_empty() {
+        return;
+    }
+    let now = js_sys::Date::now();
+    let mut settled = Vec::new();
+    let mut waiting = Vec::new();
+    for resolve in std::mem::take(&mut state.pending_resolve) {
+        if now >= resolve.deadline {
+            settled.push((resolve.tab, resolve.request_id));
+        } else {
+            waiting.push(resolve);
+        }
+    }
+    state.pending_resolve = waiting;
+    for (tab, request_id) in settled {
+        tracing::warn!(tab = %tab, request_id, "the content ticket did not answer in time");
+        answer_resolve(state, tab, request_id, WireResolve::Unavailable, None);
+    }
 }
 
 /// Rewrite a tab's logical-named changeset onto the physical backing tables,
@@ -3092,6 +3629,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    route_resolves(state, &event);
     match event {
         ClientEvent::LivePatch {
             cursor,
@@ -3750,9 +4288,11 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserHttp, HubContent, HubEvent, TabApplyError, apply_local_changeset,
-        recovery_interrupts_attach, recovery_serves_idle, schedule_recovery_event,
+        BrowserHttp, ContentFrame, HubContent, HubEvent, TabApplyError, apply_local_changeset,
+        changeset_blob_values, recovery_interrupts_attach, recovery_serves_idle,
+        schedule_recovery_event,
     };
+    use connetto_file_core::FileId;
     use diesel::connection::SimpleConnection;
     use diesel::{Connection, RunQueryDsl, SqliteConnection};
     use diesel_sqlite_session::SqliteSessionExt;
@@ -3878,6 +4418,125 @@ mod tests {
             "and the request behind it keeps the arrival order"
         );
         assert_eq!(deferred.len(), 2);
+    }
+
+    /// A staged blob only writes hub state, and a resolve is answered from
+    /// the replica or the chunk store, so both are served wherever they
+    /// arrive. A resolve has a tab waiting on the answer, so it interrupts a
+    /// replay. A stage waits on nobody and keeps its queue place.
+    #[wasm_bindgen_test]
+    fn internal_content_frames_follow_the_recovery_columns() {
+        let stage = HubEvent::Internal(
+            1,
+            ContentFrame::Stage {
+                file_id: [1; 32],
+                mime: 0,
+            },
+            None,
+        );
+        let resolve = HubEvent::Internal(
+            1,
+            ContentFrame::Resolve {
+                request_id: 7,
+                file_id: [2; 32],
+            },
+            None,
+        );
+        assert!(
+            recovery_serves_idle(&stage),
+            "a stage writes hub state only"
+        );
+        assert!(
+            recovery_serves_idle(&resolve),
+            "a resolve never needs the server"
+        );
+        assert!(
+            recovery_interrupts_attach(&resolve),
+            "a tab waits on its resolve, so it overtakes a replay"
+        );
+        assert!(
+            !recovery_interrupts_attach(&stage),
+            "nothing waits on a stage, so it keeps its place"
+        );
+    }
+
+    /// Pairing reads the declared identity straight out of the tab's
+    /// changeset: every 32-byte blob an insert writes or an update names in
+    /// its new values. Old images name nothing, and a delete writes nothing.
+    #[wasm_bindgen_test]
+    fn a_changeset_names_its_thirty_two_byte_blobs() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open");
+        conn.batch_execute(
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)",
+        )
+        .expect("schema");
+        let mut session = conn.create_session().expect("session");
+        session.attach_all().expect("attach");
+        conn.batch_execute("INSERT INTO photos VALUES (1, x'000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f')")
+            .expect("insert");
+        let changeset = session.changeset().expect("changeset");
+        assert_eq!(
+            changeset_blob_values(&changeset),
+            vec![FileId::from_bytes([
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f
+            ])],
+            "an insert names its content"
+        );
+
+        conn.batch_execute("UPDATE photos SET content_id = x'202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f' WHERE id = 1")
+            .expect("update");
+        let changeset = session.changeset().expect("changeset");
+        let named = changeset_blob_values(&changeset);
+        assert!(
+            named.contains(&FileId::from_bytes([
+                0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d,
+                0x2e, 0x2f, 0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x3b,
+                0x3c, 0x3d, 0x3e, 0x3f
+            ])),
+            "an update names its new content, got {named:?}"
+        );
+        assert!(
+            !named.contains(&FileId::from_bytes([
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+                0x1c, 0x1d, 0x1e, 0x1f
+            ])),
+            "the old image a column sheds names nothing, got {named:?}"
+        );
+
+        conn.batch_execute("DELETE FROM photos WHERE id = 1")
+            .expect("delete");
+        let changeset = session.changeset().expect("changeset");
+        assert!(
+            changeset_blob_values(&changeset).is_empty(),
+            "a delete writes no content and stages nothing"
+        );
+    }
+
+    /// Thirty-one bytes is data, not an identity, and a blob value longer
+    /// than a hash is nobody's file.
+    #[wasm_bindgen_test]
+    fn only_a_thirty_two_byte_blob_names_a_file() {
+        let mut conn = SqliteConnection::establish(":memory:").expect("open");
+        conn.batch_execute(
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)",
+        )
+        .expect("schema");
+        let mut session = conn.create_session().expect("session");
+        session.attach_all().expect("attach");
+        conn.batch_execute("INSERT INTO photos VALUES (1, x'010203')")
+            .expect("short blob");
+        let changeset = session.changeset().expect("changeset");
+        assert!(
+            changeset_blob_values(&changeset).is_empty(),
+            "a short blob is not an identity"
+        );
+        assert!(
+            changeset_blob_values(b"not even a changeset").is_empty(),
+            "undecodable bytes name nothing"
+        );
     }
 
     /// Chapter 18's job table: the walk owes a turn through the retry sleep and the
@@ -4168,6 +4827,7 @@ mod tests {
             local_watermark: None,
             credits: super::INITIAL_CREDITS,
             pending: VecDeque::new(),
+            staged: VecDeque::new(),
         };
         let mut agg_routes: HashMap<String, super::AggRoute> = HashMap::new();
         let subscribe = Subscribe {

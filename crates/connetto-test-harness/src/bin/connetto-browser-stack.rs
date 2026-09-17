@@ -184,7 +184,9 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
     fixture.setup(&[SCHEMA_SQL, POLICIES_SQL]).await;
     provision_auth_tables(&fixture).await;
     fixture.setup(&[ROLES_SQL]).await;
-    fixture.start_replication(&["orders", "order_lines"]).await;
+    fixture
+        .start_replication(&["orders", "order_lines", "photos"])
+        .await;
     let (fga_url, fga_store) = fixture_fga(&fixture).await;
     let keys = generate_keys().await?;
     let idp = MockOauth::start().await;
@@ -198,7 +200,7 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
         ("CONNETTO_BIND".to_owned(), SYNC_BIND.to_owned()),
         ("CONNETTO_AUTH_BIND".to_owned(), AUTH_BIND.to_owned()),
         ("CONNETTO_AUTH".to_owned(), "database".to_owned()),
-        ("CONNETTO_WRITABLE".to_owned(), "orders".to_owned()),
+        ("CONNETTO_WRITABLE".to_owned(), "orders,photos".to_owned()),
         ("CONNETTO_PG_DDL".to_owned(), SCHEMA_SQL.to_owned()),
         ("CONNETTO_PG_POLICIES".to_owned(), POLICIES_SQL.to_owned()),
         ("CONNETTO_SLOT".to_owned(), SLOT.to_owned()),

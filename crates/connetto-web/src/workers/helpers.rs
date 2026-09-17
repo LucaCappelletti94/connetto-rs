@@ -14,7 +14,7 @@ pub(super) fn content_store_namespace(seed: &str, replica_db_name: &str) -> Stri
 }
 
 /// Resolve after `ms` milliseconds, in a window or a worker context.
-pub(super) async fn sleep_ms(ms: i32) {
+pub(crate) async fn sleep_ms(ms: i32) {
     let promise = Promise::new(&mut |resolve, _reject| {
         let global = js_sys::global();
         let set_timeout = js_sys::Reflect::get(&global, &JsValue::from_str("setTimeout"))

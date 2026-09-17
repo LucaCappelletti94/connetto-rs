@@ -11,4 +11,7 @@ END $$;
 GRANT USAGE ON SCHEMA public TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO connetto_reader;
+-- Photo rows travel the same path as the orders, and the demo write path
+-- inserts them as connetto_reader, so the writer grant sits with the others.
+GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO connetto_reader;
 GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO connetto_reader;
