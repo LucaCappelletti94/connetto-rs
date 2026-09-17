@@ -82,8 +82,8 @@ use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
-    ContentFlushStart, ContentFlushState, ContentUpload, FileId, Resolved, ScanStep,
-    StageCommitError,
+    ContentFlushStart, ContentFlushState, ContentUpload, FileId, PendingConnectionResolve,
+    ResolveRoute, ResolveStart, Resolved, ScanStep, StageCommitError,
 };
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
@@ -507,6 +507,20 @@ struct HubState {
     /// `SnapshotEnd` triggers the tab re-snapshot, which carries that reason on
     /// rather than restating one cause as another.
     resyncing: HashMap<String, FullResyncReason>,
+
+    /// Resolves waiting on a server ticket answer, each with the tab and
+    /// request to answer and the `Date::now` instant its wait ends.
+    pending_resolve: Vec<PendingHubResolve>,
+}
+
+/// One resolve whose ticket request is in flight, kept in the hub state so
+/// the wait costs a slot rather than the event loop.
+struct PendingHubResolve {
+    tab: TabId,
+    request_id: u64,
+    ticket: PendingConnectionResolve,
+    /// `Date::now` milliseconds by which the tab hears at the latest.
+    deadline: f64,
 }
 
 /// Handle for attaching tabs to a running hub. Cloneable, and every clone
@@ -1163,6 +1177,8 @@ enum Wake {
     Upstream(Result<ClientEvent, ClientError>),
     /// The content integrity walk has a file left to check.
     Verify,
+    /// A resolve's ticket wait ran out while the hub served everything else.
+    Resolve,
 }
 
 impl<U> HubRuntime<U>
@@ -1213,6 +1229,17 @@ where
             }
         };
         tokio::pin!(content_wait);
+        // The resolve waits ride a timer here rather than parking a handler:
+        // when one fires, the sweep answers only the waits that have truly
+        // elapsed and the loop keeps serving everything else in between.
+        let resolve_ms = resolve_deadline_ms(&self.state.pending_resolve);
+        let resolve_wait = async {
+            match resolve_ms {
+                Some(ms) => sleep_ms(ms).await,
+                None => core::future::pending().await,
+            }
+        };
+        tokio::pin!(resolve_wait);
         // Each arm only names its wake reason, so a losing branch leaves
         // nothing half applied: every mpsc receive loses nothing when dropped.
         let wake = {
@@ -1229,6 +1256,7 @@ where
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
+                () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
             }
         };
         match wake {
@@ -1236,6 +1264,10 @@ where
             Wake::Local(event) => self.serve_local(event).await,
             Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
             Wake::Verify => self.verify_turn().await,
+            Wake::Resolve => {
+                expire_resolves(&mut self.state);
+                Ok(true)
+            }
         }
     }
 
@@ -1897,6 +1929,7 @@ where
     U::Error: core::fmt::Display,
 {
     state.tabs.remove(&id);
+    state.pending_resolve.retain(|resolve| resolve.tab != id);
     let upstreams: Vec<String> = state
         .agg_routes
         .iter()
@@ -2396,6 +2429,7 @@ where
         Err(TabFault::Close(reason)) => {
             tracing::warn!(tab = %id, reason = %reason, "relay hub closed a tab");
             state.tabs.remove(&id);
+            state.pending_resolve.retain(|resolve| resolve.tab != id);
             Ok(())
         }
         Err(TabFault::Hub(err)) => Err(err),
@@ -3374,7 +3408,12 @@ where
             tab.staged
                 .retain(|staged| now - staged.taken < STALE_CONTENT_MS);
             if tab.staged.len() >= MAX_STAGED_CONTENT {
-                tab.staged.pop_front();
+                tracing::warn!(
+                    tab = %id,
+                    "the tab already holds the maximum unpaired stages, refusing another; \
+                     content it announces from here on will not ride its mutation"
+                );
+                return Ok(());
             }
             tab.staged.push_back(StagedContent {
                 file_id: FileId::from_bytes(file_id),
@@ -3388,47 +3427,153 @@ where
             request_id,
             file_id,
         } => {
-            let (answer, bytes) = match content {
+            let start = match content {
                 Some(content) => {
-                    let (answer, observed) = content
-                        .resolve_connection(
-                            worker,
-                            FileId::from_bytes(file_id),
-                            sleep_ms(RESOLVE_WAIT_MS),
-                        )
-                        .await;
-                    for event in observed {
-                        handle_worker_event(worker, state, event)?;
-                    }
-                    match answer {
-                        Resolved::Remote { url } => (WireResolve::Remote { url }, None),
-                        Resolved::Local { bytes, .. } => (WireResolve::Local, Some(bytes)),
-                        Resolved::Unavailable => (WireResolve::Unavailable, None),
+                    match content
+                        .start_resolve_connection(worker, FileId::from_bytes(file_id))
+                        .await
+                    {
+                        Ok(start) => Some(start),
+                        Err(err) => {
+                            tracing::warn!(
+                                tab = %id,
+                                ?err,
+                                "the resolve's ticket request could not go out"
+                            );
+                            None
+                        }
                     }
                 }
-                None => (WireResolve::Unavailable, None),
+                None => None,
             };
-            let reply = ContentFrame::ResolveReply { request_id, answer };
-            let blob = bytes.and_then(|bytes| {
-                let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes.as_slice()));
-                match web_sys::Blob::new_with_u8_array_sequence(&parts) {
-                    Ok(blob) => Some(blob),
-                    Err(err) => {
-                        tracing::warn!(
-                            tab = %id,
-                            error = ?err,
-                            "the browser refused a resolve reply blob"
-                        );
-                        None
-                    }
+            match start {
+                Some(ResolveStart::Waiting(ticket)) => {
+                    state.pending_resolve.push(PendingHubResolve {
+                        tab: id,
+                        request_id,
+                        ticket,
+                        deadline: js_sys::Date::now() + f64::from(RESOLVE_WAIT_MS),
+                    });
                 }
-            });
-            if let Some(tab) = state.tabs.get(&id) {
-                let _ = tab.out.send(TabOut::Internal(reply.to_json(), blob));
+                Some(ResolveStart::Answered(Resolved::Remote { url })) => {
+                    answer_resolve(state, id, request_id, WireResolve::Remote { url }, None);
+                }
+                Some(ResolveStart::Answered(Resolved::Local { bytes, .. })) => {
+                    answer_resolve(state, id, request_id, WireResolve::Local, Some(bytes));
+                }
+                Some(ResolveStart::Answered(Resolved::Unavailable)) | None => {
+                    answer_resolve(state, id, request_id, WireResolve::Unavailable, None);
+                }
             }
             Ok(())
         }
         ContentFrame::ResolveReply { .. } => Ok(()),
+    }
+}
+
+/// Answers a tab's resolve on its content lane. A `Local` answer attaches its
+/// bytes as the reply's blob; a tab that has detached loses the answer with
+/// the lane.
+fn answer_resolve(
+    state: &mut HubState,
+    tab: TabId,
+    request_id: u64,
+    answer: WireResolve,
+    bytes: Option<Vec<u8>>,
+) {
+    let reply = ContentFrame::ResolveReply { request_id, answer };
+    let blob = bytes.and_then(|bytes| {
+        let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes.as_slice()));
+        match web_sys::Blob::new_with_u8_array_sequence(&parts) {
+            Ok(blob) => Some(blob),
+            Err(err) => {
+                tracing::warn!(
+                    tab = %tab,
+                    error = ?err,
+                    "the browser refused a resolve reply blob"
+                );
+                None
+            }
+        }
+    });
+    if let Some(entry) = state.tabs.get(&tab) {
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), blob));
+    }
+}
+
+/// Runs one upstream event past the resolves waiting on tickets, answering
+/// every tab whose wait it settles. The event goes on to the ordinary
+/// handling: a grant is news the rest of the hub ignores, a refusal detail
+/// names a request no tab write knows, and a closed link is news every
+/// handler needs.
+fn route_resolves(state: &mut HubState, event: &ClientEvent) {
+    if state.pending_resolve.is_empty() {
+        return;
+    }
+    let mut settled = Vec::new();
+    let mut waiting = Vec::new();
+    for resolve in std::mem::take(&mut state.pending_resolve) {
+        match resolve.ticket.route(event) {
+            ResolveRoute::Settled(result) => {
+                settled.push((resolve.tab, resolve.request_id, result));
+            }
+            ResolveRoute::Other => waiting.push(resolve),
+        }
+    }
+    state.pending_resolve = waiting;
+    for (tab, request_id, result) in settled {
+        let answer = match result {
+            Ok(url) => WireResolve::Remote { url },
+            Err(err) => {
+                tracing::warn!(tab = %tab, ?err, "the content ticket request did not reach a grant");
+                WireResolve::Unavailable
+            }
+        };
+        answer_resolve(state, tab, request_id, answer, None);
+    }
+}
+
+/// Milliseconds until the earliest resolve wait must answer, `None` when no
+/// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
+/// deadline the sweep has not yet collected.
+fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
+    let now = js_sys::Date::now();
+    // The floor is 1 ms and the ceiling is RESOLVE_WAIT_MS, the widest wait
+    // this file ever queues, so the value is always in i32 range.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped to [1.0, RESOLVE_WAIT_MS = 15_000]; sub-ms rounding is deliberate"
+    )]
+    let ms = pending
+        .iter()
+        .map(|resolve| {
+            (resolve.deadline - now)
+                .clamp(1.0, f64::from(RESOLVE_WAIT_MS))
+                .ceil() as i32
+        })
+        .min();
+    ms
+}
+
+/// Answers `Unavailable` to every resolve whose wait ran out.
+fn expire_resolves(state: &mut HubState) {
+    if state.pending_resolve.is_empty() {
+        return;
+    }
+    let now = js_sys::Date::now();
+    let mut settled = Vec::new();
+    let mut waiting = Vec::new();
+    for resolve in std::mem::take(&mut state.pending_resolve) {
+        if now >= resolve.deadline {
+            settled.push((resolve.tab, resolve.request_id));
+        } else {
+            waiting.push(resolve);
+        }
+    }
+    state.pending_resolve = waiting;
+    for (tab, request_id) in settled {
+        tracing::warn!(tab = %tab, request_id, "the content ticket did not answer in time");
+        answer_resolve(state, tab, request_id, WireResolve::Unavailable, None);
     }
 }
 
@@ -3484,6 +3629,7 @@ where
     U: Transport,
     U::Error: core::fmt::Display,
 {
+    route_resolves(state, &event);
     match event {
         ClientEvent::LivePatch {
             cursor,

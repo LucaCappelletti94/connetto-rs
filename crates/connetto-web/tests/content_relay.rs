@@ -57,18 +57,29 @@ const REFUSE_PHOTO: &[u8] = b"a photograph whose declared identity is a lie";
 const UNPAIRED_PHOTO: &[u8] = b"a staged photograph no mutation ever names";
 const LOCAL_PHOTO: &[u8] = b"a photograph resolved back over the lane before upload";
 const REMOTE_PHOTO: &[u8] = b"a photograph resolved to its server address after upload";
+const HELD_PHOTO: &[u8] = b"a photograph committed while another file's ticket is held";
+
+/// How the fake upstream answers content tickets.
+#[derive(Clone)]
+enum Tickets {
+    Grants,
+    Refused,
+    /// Every request goes unanswered and lands on the shared list, for a
+    /// test that releases one later.
+    Held(Rc<RefCell<Vec<String>>>),
+}
 
 struct Upstream {
     incoming: mpsc::UnboundedReceiver<IncomingFrame>,
     answers: mpsc::UnboundedSender<IncomingFrame>,
     mutations: Rc<Cell<u32>>,
-    grant_tickets: bool,
+    tickets: Tickets,
 }
 
 impl Upstream {
     /// A live upstream answering the handshake, counting forwarded mutations,
-    /// and answering every content ticket per `grant_tickets`.
-    fn live(mutations: Rc<Cell<u32>>, grant_tickets: bool) -> Self {
+    /// and answering every content ticket per `tickets`.
+    fn live(mutations: Rc<Cell<u32>>, tickets: Tickets) -> Self {
         let (answers, incoming) = mpsc::unbounded();
         answers
             .unbounded_send(IncomingFrame::Control(ControlMessage::HandshakeAck(
@@ -87,8 +98,14 @@ impl Upstream {
             incoming,
             answers,
             mutations,
-            grant_tickets,
+            tickets,
         }
+    }
+
+    /// A sender onto this upstream's inbound queue, for a test that injects
+    /// an answer of its own after the connection has moved into the hub.
+    fn answers(&self) -> mpsc::UnboundedSender<IncomingFrame> {
+        self.answers.clone()
     }
 }
 
@@ -100,23 +117,28 @@ impl Transport for Upstream {
         message: ControlMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
         if let ControlMessage::ContentTicketRequest(request) = message {
-            let reply = if self.grant_tickets {
-                ControlMessage::ContentTicketGrant(ContentTicketGrant {
-                    request_id: request.request_id,
+            let reply = match &self.tickets {
+                Tickets::Grants => Some(ControlMessage::ContentTicketGrant(ContentTicketGrant {
+                    request_id: request.request_id.clone(),
                     url: format!(
                         "https://content.invalid/files/{}/intent?t=r69c",
                         FileId::from_bytes(request.file_id)
                     ),
-                })
-            } else {
-                ControlMessage::NonFatalError(NonFatalError {
-                    related_to: Some(request.request_id),
+                })),
+                Tickets::Refused => Some(ControlMessage::NonFatalError(NonFatalError {
+                    related_to: Some(request.request_id.clone()),
                     detail: CONTENT_TICKET_REFUSED.to_owned(),
-                })
+                })),
+                Tickets::Held(held) => {
+                    held.borrow_mut().push(request.request_id);
+                    None
+                }
             };
-            self.answers
-                .unbounded_send(IncomingFrame::Control(reply))
-                .expect("queue ticket");
+            if let Some(reply) = reply {
+                self.answers
+                    .unbounded_send(IncomingFrame::Control(reply))
+                    .expect("queue ticket");
+            }
         }
         ready(Ok(()))
     }
@@ -141,17 +163,26 @@ fn hub_config() -> ClientConfig {
     ClientConfig::new("r69c-content-relay").with_login(Some(Grant::new("user:r69c")))
 }
 
-/// A content-aware hub on a live fake upstream, plus this test's mutation
-/// counter, and the tab transport on the other end of a real message channel,
-/// already handshaken.
-async fn relay_with_tab(
+/// A content-aware hub on a live fake upstream plus the tab transport on
+/// the other end of a real message channel, already handshaken.
+///
+/// Also hands back the mutation counter, and a sender onto the upstream's
+/// inbound queue for tests that inject an answer the fake never scripts.
+async fn relay_tab(
     store_name: &str,
     key: [u8; 32],
-    grants: bool,
-) -> (RelayHub, Rc<Cell<u32>>, MessageTransport<MessagePort>) {
+    tickets: Tickets,
+) -> (
+    RelayHub,
+    Rc<Cell<u32>>,
+    MessageTransport<MessagePort>,
+    mpsc::UnboundedSender<IncomingFrame>,
+) {
     let mutations = Rc::new(Cell::new(0u32));
+    let upstream = Upstream::live(Rc::clone(&mutations), tickets.clone());
+    let answers = upstream.answers();
     let worker = ConnettoConnection::<Upstream>::connect(
-        Upstream::live(Rc::clone(&mutations), grants),
+        upstream,
         &Replica::in_memory(),
         DDL,
         &hub_config(),
@@ -172,10 +203,11 @@ async fn relay_with_tab(
         HubReconnect {
             factory: {
                 let mutations = Rc::clone(&mutations);
+                let tickets = tickets.clone();
                 move || {
                     ready(Ok::<_, Infallible>(Upstream::live(
                         Rc::clone(&mutations),
-                        grants,
+                        tickets.clone(),
                     )))
                 }
             },
@@ -213,6 +245,25 @@ async fn relay_with_tab(
         matches!(ack, IncomingFrame::Control(ControlMessage::HandshakeAck(_))),
         "the hub's first answer is the ack, got {ack:?}"
     );
+    (hub, mutations, tab, answers)
+}
+
+/// The same relay with a scripted grant or refusal for every ticket.
+async fn relay_with_tab(
+    store_name: &str,
+    key: [u8; 32],
+    grants: bool,
+) -> (RelayHub, Rc<Cell<u32>>, MessageTransport<MessagePort>) {
+    let (hub, mutations, tab, _answers) = relay_tab(
+        store_name,
+        key,
+        if grants {
+            Tickets::Grants
+        } else {
+            Tickets::Refused
+        },
+    )
+    .await;
     (hub, mutations, tab)
 }
 
@@ -529,6 +580,81 @@ async fn a_file_the_hub_never_saw_answers_unavailable() {
         matches!(answer, WireResolve::Unavailable),
         "no manifest and a refused ticket answer Unavailable, got {answer:?}"
     );
+    assert!(blob.is_none());
+    serial.release();
+}
+
+/// Proves the hub's event loop is not parked on a ticket wait: a resolve
+/// whose ticket never arrives stays unanswered, while mutations commit and
+/// other resolves answer, and the grant released at last reaches only the
+/// resolve that asked for it.
+#[wasm_bindgen_test]
+async fn the_hub_answers_around_a_ticket_that_never_arrives() {
+    let serial = locks::hold_lock(TEST_LOCK).await;
+    let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
+    let held: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+    let (_hub, mutations, mut tab, answers) = relay_tab(
+        "r69c-resolve-held",
+        [17; 32],
+        Tickets::Held(Rc::clone(&held)),
+    )
+    .await;
+    let mut inbox = tab.take_internal_inbox().expect("the lane is the tab's");
+
+    let stuck = FileId::from_bytes([42u8; 32]);
+    resolve(&tab, 11, stuck);
+    assert!(
+        until(async || !held.borrow().is_empty()).await,
+        "the ticket request goes out and waits"
+    );
+    timeout_ms(200).await;
+    assert!(
+        matches!(
+            inbox.try_recv(),
+            Err(futures_channel::mpsc::TryRecvError::Empty)
+        ),
+        "a held ticket must leave the resolve unanswered"
+    );
+
+    stage(&tab, declared_id(HELD_PHOTO), &blob_of(HELD_PHOTO));
+    let file_id = declared_id(HELD_PHOTO);
+    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    assert!(
+        until(async || mutations.get() == 1).await,
+        "a mutation commits while another resolve waits on its ticket"
+    );
+    resolve(&tab, 12, file_id);
+    let (reply_id, answer, _blob) = next_reply(&mut inbox).await;
+    assert_eq!(
+        reply_id, 12,
+        "the second resolve answers while the first waits"
+    );
+    assert!(
+        matches!(answer, WireResolve::Local),
+        "an unsent staged file answers Local beside a waiting resolve, got {answer:?}"
+    );
+
+    let request_id = held.borrow_mut().remove(0);
+    answers
+        .unbounded_send(IncomingFrame::Control(ControlMessage::ContentTicketGrant(
+            ContentTicketGrant {
+                request_id,
+                url: format!("https://content.invalid/files/{stuck}?t=r69c-held"),
+            },
+        )))
+        .expect("queue the released grant");
+    let (reply_id, answer, blob) = next_reply(&mut inbox).await;
+    assert_eq!(
+        reply_id, 11,
+        "the grant answers the resolve that waited on it"
+    );
+    match answer {
+        WireResolve::Remote { url } => assert!(
+            url.contains(&stuck.to_string()),
+            "the released grant carries its URL, got {url}"
+        ),
+        other => panic!("a granted ticket answers Remote, got {other:?}"),
+    }
     assert!(blob.is_none());
     serial.release();
 }

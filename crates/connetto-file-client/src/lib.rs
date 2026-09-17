@@ -27,7 +27,7 @@ pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, S
 pub use store::{FsStore, FsStoreError};
 pub use worker::{
     ChunkScan, ContentArchive, ContentFlush, ContentFlushStart, ContentFlushState, ContentUpload,
-    FlushCursor, ScanStep,
+    FlushCursor, PendingConnectionResolve, ResolveRoute, ResolveStart, ScanStep,
 };
 
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]

@@ -88,7 +88,7 @@ where
     }
 }
 
-async fn ensure_pending_request<T: Transport>(
+pub(crate) async fn ensure_pending_request<T: Transport>(
     connection: &mut ConnettoConnection<T>,
     file_id: FileId,
     verb: ContentVerb,
@@ -170,6 +170,26 @@ fn resolve_connection_event(
     Some(result)
 }
 
+/// What one pumped event has to say about one in-flight ticket request,
+/// without consuming the event or the waiting slot.
+pub(crate) enum RouteAnswer {
+    /// The request's answer arrived, or the link carrying it is gone.
+    Settled(Result<String, ContentError>),
+    /// The event concerns something else.
+    Other,
+}
+
+pub(crate) fn route_connection_event(pending: &PendingTicket, event: &ClientEvent) -> RouteAnswer {
+    match classify(event.clone(), &pending.request_id, pending.file_id) {
+        TicketAnswer::Granted(url) => RouteAnswer::Settled(Ok(url)),
+        TicketAnswer::Failed(error) => RouteAnswer::Settled(Err(error)),
+        TicketAnswer::Unrelated(ClientEvent::Closed | ClientEvent::ServerClosed { .. }) => {
+            RouteAnswer::Settled(Err(ContentError::TicketAbandoned))
+        }
+        TicketAnswer::Unrelated(_) => RouteAnswer::Other,
+    }
+}
+
 fn next_request_id() -> String {
     format!("content-{}", NEXT_REQUEST.fetch_add(1, Ordering::Relaxed))
 }
@@ -184,4 +204,57 @@ fn refusal(detail: &str, file_id: FileId) -> ContentError {
         "a non-fatal error correlated to a ticket request carries one of the two ticket details"
     );
     ContentError::TicketRefused { file_id }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn waiting() -> PendingTicket {
+        PendingTicket {
+            file_id: FileId::from_bytes([1; 32]),
+            request_id: "content-7".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_routed_event_settles_only_its_own_request() {
+        let pending = waiting();
+        let grant = ClientEvent::ContentTicket {
+            request_id: "content-7".to_owned(),
+            url: "https://content.invalid/f".to_owned(),
+        };
+        assert!(matches!(
+            route_connection_event(&pending, &grant),
+            RouteAnswer::Settled(Ok(url)) if url == "https://content.invalid/f"
+        ));
+        let someone_elses_grant = ClientEvent::ContentTicket {
+            request_id: "content-8".to_owned(),
+            url: "https://content.invalid/f".to_owned(),
+        };
+        assert!(matches!(
+            route_connection_event(&pending, &someone_elses_grant),
+            RouteAnswer::Other
+        ));
+        let refusal = ClientEvent::NonFatal {
+            related_to: Some("content-7".to_owned()),
+            detail: CONTENT_TICKET_REFUSED.to_owned(),
+        };
+        assert!(matches!(
+            route_connection_event(&pending, &refusal),
+            RouteAnswer::Settled(Err(_))
+        ));
+        let unrelated = ClientEvent::NonFatal {
+            related_to: Some("subscription-1".to_owned()),
+            detail: "something else failed".to_owned(),
+        };
+        assert!(matches!(
+            route_connection_event(&pending, &unrelated),
+            RouteAnswer::Other
+        ));
+        assert!(matches!(
+            route_connection_event(&pending, &ClientEvent::Closed),
+            RouteAnswer::Settled(Err(ContentError::TicketAbandoned))
+        ));
+    }
 }

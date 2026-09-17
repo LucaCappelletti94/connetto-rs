@@ -182,6 +182,12 @@ fn object_url_error(value: &wasm_bindgen::JsValue) -> ObjectUrlError {
 /// answering entirely.
 const TAB_RESOLVE_WAIT_MS: i32 = 16_000;
 
+/// The bytes one staging hash read takes from the blob. The identity is the
+/// hash of the whole file, but the file goes through one window of this size
+/// at a time, so the tab's peak holds a window rather than two copies of the
+/// largest file it can upload.
+const STAGE_READ_BYTES: f64 = 4.0 * 1024.0 * 1024.0;
+
 /// Where a file's bytes are to be had, as answered by the worker hub over
 /// the tab's content lane.
 #[derive(Debug)]
@@ -302,12 +308,22 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
         F: FnOnce(&mut SqliteConnection, FileId) -> Result<O, E>,
         E: Display,
     {
-        let bytes = match blob_bytes(blob).await {
-            Ok(bytes) => bytes,
-            Err(err) => return Err(TabStageError::Read(format!("{err:?}"))),
-        };
         let mut hasher = FileIdHasher::new();
-        hasher.update(&bytes);
+        let size = blob.size();
+        let mut offset: f64 = 0.0;
+        while offset < size {
+            let end = (offset + STAGE_READ_BYTES).min(size);
+            let window = match blob.slice_with_f64_and_f64(offset, end) {
+                Ok(window) => window,
+                Err(err) => return Err(TabStageError::Read(format!("{err:?}"))),
+            };
+            let bytes = match blob_bytes(&window).await {
+                Ok(bytes) => bytes,
+                Err(err) => return Err(TabStageError::Read(format!("{err:?}"))),
+            };
+            hasher.update(&bytes);
+            offset = end;
+        }
         let file_id = hasher.finalize();
         let frame = ContentFrame::Stage {
             file_id: *file_id.as_bytes(),

@@ -155,6 +155,49 @@ where
     }
 }
 
+/// The decision of a [`ContentArchive::start_resolve_connection`] at the
+/// moment it was asked.
+pub enum ResolveStart {
+    /// The answer is already in hand: the local store had the bytes, or the
+    /// connection cannot ask the server.
+    Answered(Resolved),
+    /// The read-ticket request is in flight; pumped events settle it through
+    /// [`PendingConnectionResolve::route`].
+    Waiting(PendingConnectionResolve),
+}
+
+/// A connection resolve whose ticket request is in flight.
+///
+/// Opaque: the caller keeps it beside its own request bookkeeping until
+/// routing an event settles the wait.
+pub struct PendingConnectionResolve {
+    ticket: ticket::PendingTicket,
+}
+
+impl PendingConnectionResolve {
+    /// What one pumped upstream event has to say about this waiting resolve.
+    ///
+    /// `Settled` ends the wait; `Err` means answer
+    /// [`Resolved::Unavailable`]. `Other` leaves the event to the caller's
+    /// own handling, the same events [`resolve_connection`](ContentArchive::resolve_connection)
+    /// returns as observed.
+    pub fn route(&self, event: &ClientEvent) -> ResolveRoute {
+        match ticket::route_connection_event(&self.ticket, event) {
+            ticket::RouteAnswer::Settled(result) => ResolveRoute::Settled(result),
+            ticket::RouteAnswer::Other => ResolveRoute::Other,
+        }
+    }
+}
+
+/// What routing one pumped event did to a waiting resolve.
+pub enum ResolveRoute {
+    /// The wait ends. `Ok(url)` is the granted read; `Err` means answer
+    /// [`Resolved::Unavailable`] and log.
+    Settled(Result<String, ContentError>),
+    /// The event belongs to something else; the caller still owns it.
+    Other,
+}
+
 /// Content archive policy for an owner of a raw sync connection.
 pub struct ContentArchive<B> {
     store: B,
@@ -320,6 +363,49 @@ where
             Ok(answer) => (answer, observed),
             Err(_) => (Resolved::Unavailable, observed),
         }
+    }
+
+    /// Starts a connection resolve without waiting for the server.
+    ///
+    /// [`resolve_local`](Self::resolve_local) answers first and
+    /// `Answered(Resolved::Unavailable)` follows when the connection cannot
+    /// ask; otherwise the read-ticket request goes out and the handle comes
+    /// back in `Waiting`, to be settled event by event with
+    /// [`route`](PendingConnectionResolve::route). This is the shape
+    /// a hub that must keep serving its queue uses instead of
+    /// [`resolve_connection`](Self::resolve_connection), which holds a task
+    /// parked until the answer or the cancel.
+    ///
+    /// # Errors
+    ///
+    /// A replica read failure or a transport failure on the way to sending
+    /// the ticket request is returned. Nothing else is an error: a refusal
+    /// and a closed link both answer through the routed events.
+    ///
+    /// # Panics
+    ///
+    /// Never. A request that reports success always leaves its handle
+    /// behind, and the handle is what the returned waiting state carries.
+    pub async fn start_resolve_connection<T>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+    ) -> Result<ResolveStart, ContentError>
+    where
+        T: Transport,
+        T::Error: Display,
+    {
+        if let Some(answer) = self.resolve_local(connection, file_id).await? {
+            return Ok(ResolveStart::Answered(answer));
+        }
+        if !connection.is_connected() {
+            return Ok(ResolveStart::Answered(Resolved::Unavailable));
+        }
+        let mut pending = None;
+        ticket::ensure_pending_request(connection, file_id, ContentVerb::Read, &mut pending)
+            .await?;
+        let ticket = pending.expect("a sent request leaves its handle behind");
+        Ok(ResolveStart::Waiting(PendingConnectionResolve { ticket }))
     }
 
     async fn answer_connection<T, C>(
