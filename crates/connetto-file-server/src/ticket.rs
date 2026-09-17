@@ -150,9 +150,9 @@ impl TicketSigner {
     ///
     /// Returns the signer plus the raw public-key bytes needed to construct the
     /// matching [`TicketVerifier`].  `base_url` is the file server's base
-    /// address, stored as [`normalize_base`] keeps it, with no trailing slash;
-    /// `ticket_ttl` is how long each minted ticket remains valid;
-    /// `read_ceiling` is the byte cap on every read ticket.
+    /// address, stored normalized, its trailing slashes trimmed so a minted URL
+    /// never carries a double slash.  `ticket_ttl` is how long each minted
+    /// ticket remains valid, and `read_ceiling` is the byte cap on every read ticket.
     ///
     /// # Errors
     ///
