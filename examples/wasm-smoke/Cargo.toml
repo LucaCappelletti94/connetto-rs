@@ -17,6 +17,7 @@ crate-type = ["cdylib", "rlib"]
 connetto-web = { path = "../../crates/connetto-web" }
 connetto-client = { path = "../../crates/connetto-client", default-features = false }
 connetto-core = { path = "../../crates/connetto-core", features = ["loopback"] }
+connetto-file-core = { path = "../../crates/connetto-file-core" }
 diesel = { version = "2", features = ["sqlite"] }
 futures-channel = "0.3"
 js-sys = "0.3"

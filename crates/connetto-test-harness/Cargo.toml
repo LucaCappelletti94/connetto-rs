@@ -81,6 +81,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "env-filter",
   "std",
 ] }
+ring = "0.17"
 
 [dev-dependencies]
 # The smoke test reads a table back through the admin pool with a typed row.

@@ -880,6 +880,7 @@ dependencies = [
  "openfga-client",
  "openidconnect",
  "pg2sqlite",
+ "ring",
  "rls2fga",
  "sqlite-diff-rs",
  "sqlparser",

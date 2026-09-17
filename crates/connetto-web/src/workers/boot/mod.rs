@@ -144,6 +144,8 @@ pub struct DbWorkerConfig {
     pub(crate) upstream_sub_id: &'static str,
     /// The subscription query the worker registers upstream.
     pub(crate) upstream_query: &'static str,
+    /// Additional upstream subscriptions the worker keeps live.
+    pub(crate) extra_upstream: Vec<(&'static str, &'static str)>,
     /// Attached database file holding the hub's own durable state.
     pub(crate) hub_meta_name: &'static str,
     /// Seed for account-isolated browser content storage.
@@ -194,6 +196,7 @@ impl DbWorkerConfig {
             frontend_ddl: "",
             upstream_sub_id: "",
             upstream_query: "",
+            extra_upstream: Vec::new(),
             hub_meta_name: "",
             content_namespace: None,
             content_http: connetto_file_client::BrowserHttp::new(),
@@ -247,6 +250,12 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_upstream_query(mut self, upstream_query: &'static str) -> Self {
         self.upstream_query = upstream_query;
+        self
+    }
+    /// Register one more upstream subscription alongside the primary one.
+    #[must_use]
+    pub fn with_extra_upstream(mut self, sub_id: &'static str, query: &'static str) -> Self {
+        self.extra_upstream.push((sub_id, query));
         self
     }
 
@@ -325,6 +334,13 @@ impl DbWorkerConfig {
     pub fn with_pick_account(mut self, pick_account: bool) -> Self {
         self.pick_account = pick_account;
         self
+    }
+
+    pub(crate) fn upstream_subscriptions(
+        &self,
+    ) -> impl Iterator<Item = (&'static str, &'static str)> + '_ {
+        std::iter::once((self.upstream_sub_id, self.upstream_query))
+            .chain(self.extra_upstream.iter().copied())
     }
 }
 

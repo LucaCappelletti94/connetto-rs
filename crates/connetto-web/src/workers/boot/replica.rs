@@ -391,10 +391,12 @@ pub(super) async fn subscribe_and_boot(
     if !worker.is_connected() {
         return Ok(());
     }
-    worker
-        .subscribe(config.upstream_sub_id, config.upstream_query)
-        .await
-        .map_err(BootError::Subscribe)?;
+    for (sub_id, query) in config.upstream_subscriptions() {
+        worker
+            .subscribe(sub_id, query)
+            .await
+            .map_err(BootError::Subscribe)?;
+    }
     worker.ping(1).await.map_err(BootError::Subscribe)?;
     // Performance::now() is monotonic so a backward wall-clock step cannot extend the wait.
     let performance = js_sys::global()
