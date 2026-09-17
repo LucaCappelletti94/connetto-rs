@@ -404,6 +404,7 @@ jobs:
               -p connetto-yew
               -p connetto-file-core
               -p connetto-file-server
+              -p connetto-file-client
             bins: ''
     steps:
       - uses: actions/checkout@v7
@@ -508,7 +509,6 @@ jobs:
         run: |
           echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
           echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
-
 
       # The identity-provider image is pulled inside each shard's startup
       # wait, which a congested ghcr.io can overrun. Pulling it once here

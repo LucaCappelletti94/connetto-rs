@@ -9,6 +9,11 @@
 //! wire tag byte followed by the `MessagePack` payload. Neither object reports
 //! the peer going away, so a private close sentinel stands in for a close
 //! event.
+//!
+//! Alongside the codec frames rides an internal lane for the content
+//! protocol: a frame under the internal tag byte carries JSON rather than
+//! `MessagePack`, and a message whose payload is a two-element array carries
+//! a `Blob` beside that JSON. The lane never reaches the codec.
 
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
@@ -27,6 +32,10 @@ use web_sys::MessageEvent;
 /// Private wire tag marking a clean close. Never reaches the codec layer,
 /// shared by every message-delimited transport in this crate.
 pub(crate) const TAG_CLOSE: u8 = 0xFF;
+
+/// Private wire tag marking the internal content lane. Like the close
+/// sentinel it never reaches the codec layer.
+pub(crate) const TAG_INTERNAL: u8 = 0xFE;
 
 /// A browser object that carries binary messages one frame at a time.
 pub trait MessageSink {
@@ -71,6 +80,81 @@ impl MessageTransportError {
     }
 }
 
+/// One message from a transport's inbound internal lane.
+#[derive(Debug)]
+pub struct InternalInbound {
+    /// The internal frame's JSON, without the tag byte.
+    pub json: Vec<u8>,
+    /// The bytes attached to the message, when it carried a blob.
+    pub blob: Option<web_sys::Blob>,
+}
+
+/// Decode an internal message posted as `[bytes, blob]`, the shape
+/// [`MessageTransport::post_internal`] writes. `None` rejects anything that
+/// is not one.
+fn decode_attached_internal(data: &JsValue) -> Option<InternalInbound> {
+    let parts = data.dyn_ref::<js_sys::Array>()?;
+    if parts.length() != 2 {
+        return None;
+    }
+    let head = parts.get(0);
+    let bytes = match head.clone().dyn_into::<Uint8Array>() {
+        Ok(view) => view,
+        Err(_) => Uint8Array::new(head.dyn_ref::<js_sys::ArrayBuffer>()?),
+    };
+    let blob = parts.get(1).dyn_into::<web_sys::Blob>().ok()?;
+    let framed = bytes.to_vec();
+    let (tag, json) = framed.split_first()?;
+    if *tag != TAG_INTERNAL {
+        return None;
+    }
+    Some(InternalInbound {
+        json: json.to_vec(),
+        blob: Some(blob),
+    })
+}
+
+/// Post one internal message on `sink`: the JSON under the internal tag,
+/// with the blob carried beside it rather than inside it.
+fn post_internal_to<S: MessageSink>(
+    sink: &S,
+    json: &[u8],
+    blob: Option<&web_sys::Blob>,
+) -> Result<(), MessageTransportError> {
+    let mut framed = Vec::with_capacity(1 + json.len());
+    framed.push(TAG_INTERNAL);
+    framed.extend_from_slice(json);
+    let message = match blob {
+        None => Uint8Array::from(framed.as_slice()).into(),
+        Some(blob) => {
+            js_sys::Array::of2(&Uint8Array::from(framed.as_slice()), blob.as_ref()).into()
+        }
+    };
+    sink.post(&message)
+        .map_err(|err| MessageTransportError::refused::<S>(&err))
+}
+
+/// A handle that posts internal messages on a transport's lane without
+/// owning the transport, for the side that handed the transport over.
+pub struct InternalLane<S: MessageSink> {
+    sink: S,
+}
+
+impl<S: MessageSink> InternalLane<S> {
+    /// Post one internal message, shaped as [`MessageTransport::post_internal`].
+    ///
+    /// # Errors
+    ///
+    /// [`MessageTransportError::Sink`] when the browser refuses the post.
+    pub fn post_internal(
+        &self,
+        json: &[u8],
+        blob: Option<&web_sys::Blob>,
+    ) -> Result<(), MessageTransportError> {
+        post_internal_to(&self.sink, json, blob)
+    }
+}
+
 /// A [`Transport`] over one end of a browser message sink.
 ///
 /// The closure stays alive as long as the transport: dropping it would
@@ -78,6 +162,7 @@ impl MessageTransportError {
 pub struct MessageTransport<S: MessageSink> {
     sink: S,
     inbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    internal: Option<mpsc::UnboundedReceiver<InternalInbound>>,
     closed: bool,
     _on_message: Closure<dyn FnMut(MessageEvent)>,
 }
@@ -90,11 +175,25 @@ impl<S: MessageSink> MessageTransport<S> {
     /// peer posted before this call arrive rather than being lost.
     pub(crate) fn attach(sink: S) -> (Self, mpsc::UnboundedSender<Vec<u8>>) {
         let (tx, inbound) = mpsc::unbounded::<Vec<u8>>();
+        let (internal_tx, internal) = mpsc::unbounded::<InternalInbound>();
         let on_message = {
             let tx = tx.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
-                if let Ok(bytes) = event.data().dyn_into::<Uint8Array>() {
-                    let _ = tx.unbounded_send(bytes.to_vec());
+                let data = event.data();
+                if let Ok(bytes) = data.clone().dyn_into::<Uint8Array>() {
+                    let raw = bytes.to_vec();
+                    if raw.first() == Some(&TAG_INTERNAL) {
+                        let _ = internal_tx.unbounded_send(InternalInbound {
+                            json: raw[1..].to_vec(),
+                            blob: None,
+                        });
+                    } else {
+                        let _ = tx.unbounded_send(raw);
+                    }
+                    return;
+                }
+                if let Some(inbound) = decode_attached_internal(&data) {
+                    let _ = internal_tx.unbounded_send(inbound);
                 }
             })
         };
@@ -103,6 +202,7 @@ impl<S: MessageSink> MessageTransport<S> {
             Self {
                 sink,
                 inbound,
+                internal: Some(internal),
                 closed: false,
                 _on_message: on_message,
             },
@@ -110,6 +210,35 @@ impl<S: MessageSink> MessageTransport<S> {
         )
     }
 
+    /// Take the inbound half of this transport's internal lane, once.
+    pub fn take_internal_inbox(&mut self) -> Option<mpsc::UnboundedReceiver<InternalInbound>> {
+        self.internal.take()
+    }
+
+    /// Hand out a handle that posts internal messages on this lane without
+    /// owning the transport.
+    pub fn internal_lane(&self) -> InternalLane<S>
+    where
+        S: Clone,
+    {
+        InternalLane {
+            sink: self.sink.clone(),
+        }
+    }
+
+    /// Post one internal message: its JSON under the internal tag, with the
+    /// blob carried beside it rather than inside it.
+    ///
+    /// # Errors
+    ///
+    /// [`MessageTransportError::Sink`] when the browser refuses the post.
+    pub fn post_internal(
+        &self,
+        json: &[u8],
+        blob: Option<&web_sys::Blob>,
+    ) -> Result<(), MessageTransportError> {
+        post_internal_to(&self.sink, json, blob)
+    }
     fn send_frame(&self, tag: u8, payload: &[u8]) -> Result<(), MessageTransportError> {
         let mut framed = Vec::with_capacity(1 + payload.len());
         framed.push(tag);
