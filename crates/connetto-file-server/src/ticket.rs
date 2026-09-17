@@ -75,6 +75,15 @@ pub enum TicketError {
         /// The rejected base URL.
         base: String,
     },
+    /// The base URL carries a query or a fragment.
+    ///
+    /// A minted URL appends its own query, so a base that already carries one
+    /// composes a URL no client will send.
+    #[error("base URL carries a query or fragment: {base}")]
+    AmbiguousBase {
+        /// The rejected base URL.
+        base: String,
+    },
 }
 
 /// Holds the Ed25519 private key and mints ticket tokens.
@@ -94,17 +103,27 @@ pub struct TicketSigner {
     read_ceiling: u64,
 }
 
-/// Returns `Ok(())` when `base_url` is safe to mint tickets against.
+/// Returns the base text to mint against, when `base_url` is safe for it.
+///
+/// A trailing slash is stripped, because minting appends `/files/...` and a
+/// kept slash composes the double slash no router here serves. A query or a
+/// fragment is refused, because the minted URL carries its own.
 ///
 /// # Errors
 ///
 /// Returns `TicketError::InsecureBase` when the scheme is `http` and the host
-/// is not `localhost`, `127.0.0.1`, or `[::1]`.
-fn validate_base(base_url: &str) -> Result<(), TicketError> {
+/// is not `localhost`, `127.0.0.1`, or `[::1]`, and
+/// `TicketError::AmbiguousBase` when the base carries a query or fragment.
+fn normalize_base(base_url: &str) -> Result<String, TicketError> {
     let insecure = || TicketError::InsecureBase {
         base: base_url.to_owned(),
     };
     let url = url::Url::parse(base_url).map_err(|_| insecure())?;
+    if url.query().is_some() || url.fragment().is_some() {
+        return Err(TicketError::AmbiguousBase {
+            base: base_url.to_owned(),
+        });
+    }
     // The host comes from the parser rather than from the text, because userinfo of the
     // form localhost@elsewhere reads as a loopback authority and resolves elsewhere.
     // The set is exactly what every client accepts, rather than the whole 127.0.0.0/8
@@ -117,8 +136,9 @@ fn validate_base(base_url: &str) -> Result<(), TicketError> {
     };
     if url.username().is_empty() && url.password().is_none() {
         match url.scheme() {
-            "https" => return Ok(()),
-            "http" if loopback => return Ok(()),
+            "https" | "http" if loopback || url.scheme() == "https" => {
+                return Ok(base_url.trim_end_matches('/').to_owned());
+            }
             _ => {}
         }
     }
@@ -129,20 +149,23 @@ impl TicketSigner {
     /// Generates a fresh keypair.
     ///
     /// Returns the signer plus the raw public-key bytes needed to construct the
-    /// matching [`TicketVerifier`].  `base_url` is the file server's base address
-    /// without a trailing slash; `ticket_ttl` is how long each minted ticket
-    /// remains valid; `read_ceiling` is the byte cap on every read ticket.
+    /// matching [`TicketVerifier`].  `base_url` is the file server's base
+    /// address, stored as [`normalize_base`] keeps it, with no trailing slash;
+    /// `ticket_ttl` is how long each minted ticket remains valid;
+    /// `read_ceiling` is the byte cap on every read ticket.
     ///
     /// # Errors
     ///
-    /// Returns `TicketError::InsecureBase` if `base_url` is not HTTPS or loopback HTTP.
+    /// Returns `TicketError::InsecureBase` if `base_url` is not HTTPS or
+    /// loopback HTTP, and `TicketError::AmbiguousBase` if it carries a query
+    /// or fragment.
     /// Returns `TicketError::Ring` if key generation fails or if the ring library rejects the generated PKCS8 document.
     pub fn generate(
         base_url: String,
         ticket_ttl: Duration,
         read_ceiling: u64,
     ) -> Result<(Self, Vec<u8>), TicketError> {
-        validate_base(&base_url)?;
+        let base_url = normalize_base(&base_url)?;
         let rng = SystemRandom::new();
         let doc = Ed25519KeyPair::generate_pkcs8(&rng)
             .map_err(|e| TicketError::Ring(format!("{e:?}")))?;
@@ -167,7 +190,9 @@ impl TicketSigner {
     ///
     /// # Errors
     ///
-    /// Returns `TicketError::InsecureBase` if `base_url` is not HTTPS or loopback HTTP.
+    /// Returns `TicketError::InsecureBase` if `base_url` is not HTTPS or
+    /// loopback HTTP, and `TicketError::AmbiguousBase` if it carries a query
+    /// or fragment.
     /// Returns `TicketError::Ring` if `der` is not a valid PKCS8 document for an Ed25519 key pair.
     pub fn from_pkcs8_der(
         der: &[u8],
@@ -175,7 +200,7 @@ impl TicketSigner {
         ticket_ttl: Duration,
         read_ceiling: u64,
     ) -> Result<Self, TicketError> {
-        validate_base(&base_url)?;
+        let base_url = normalize_base(&base_url)?;
         let kp =
             Ed25519KeyPair::from_pkcs8(der).map_err(|e| TicketError::Ring(format!("{e:?}")))?;
         Ok(Self {

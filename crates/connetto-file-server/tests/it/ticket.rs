@@ -298,6 +298,52 @@ fn an_unsendable_loopback_base_is_refused() {
     );
 }
 
+/// Proves: a trailing slash in the configured base never becomes the double
+/// slash no router here serves, and the minted path is the plain `/files/...`.
+#[tokio::test]
+async fn a_trailing_slash_in_the_base_mints_a_single_slashed_url() {
+    let (signer, _public) = connetto_file_server::TicketSigner::generate(
+        "http://127.0.0.1:8080/".to_owned(),
+        std::time::Duration::from_secs(3600),
+        1024,
+    )
+    .expect("a trailing slash in the base must be accepted");
+    let url = ContentTicketSigner::mint(&signer, "alice", [7u8; 32], ContentVerb::Read)
+        .await
+        .expect("minting against the trimmed base must work");
+    let (path, _) = url.split_once("?t=").expect("the token rides the query");
+    assert_eq!(
+        path,
+        format!(
+            "http://127.0.0.1:8080/files/{}",
+            connetto_file_server::hex_32(&[7u8; 32])
+        )
+    );
+}
+
+/// Proves: a base carrying a query or a fragment is refused rather than
+/// composed into a URL with two queries.
+#[test]
+fn a_base_with_a_query_or_fragment_is_refused() {
+    for base in ["https://files.example/?v=2", "https://files.example/#a"] {
+        let Err(err) = connetto_file_server::TicketSigner::generate(
+            base.to_owned(),
+            std::time::Duration::from_secs(3600),
+            1024,
+        ) else {
+            panic!("a base carrying a query or fragment must be refused, got Ok")
+        };
+        assert!(
+            matches!(
+                &err,
+                connetto_file_server::ticket::TicketError::AmbiguousBase { base: named }
+                    if named == base
+            ),
+            "expected AmbiguousBase naming {base}, got {err:?}"
+        );
+    }
+}
+
 /// Proves: an authority whose userinfo reads as loopback is refused, because the host a
 /// client resolves is the one after the at sign.
 #[test]

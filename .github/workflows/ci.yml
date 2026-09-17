@@ -509,6 +509,13 @@ jobs:
           echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
           echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
 
+
+      # The identity-provider image is pulled inside each shard's startup
+      # wait, which a congested ghcr.io can overrun. Pulling it once here
+      # takes the registry out of the container startup budget.
+      - name: Pre-pull the identity provider image
+        run: docker pull ghcr.io/navikt/mock-oauth2-server:6.0.2
+
       - name: Run browser suites
         run: |
           cargo +stable run \
