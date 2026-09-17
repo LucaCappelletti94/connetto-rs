@@ -446,3 +446,34 @@ pub async fn connected_content(
     let content = attach_content(client.clone(), &root.join("chunks"), http).await;
     (client, content)
 }
+
+/// Opens a replica at `path` and hands back the raw attached connection.
+///
+/// The test owns the pump loop this way, the same shape a relay hub drives
+/// the archive's waiting resolve API against.
+pub async fn connected_connection(
+    path: &std::path::Path,
+    transport: Scripted,
+) -> ConnettoConnection<Scripted> {
+    let replica = Replica::encrypted_file(
+        path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+    let mut conn = ConnettoConnection::<Scripted>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+    conn.attach(transport).await.expect("attach the transport");
+    conn
+}
+
+/// Opens a replica at `path` and hands back the raw connection with no
+/// transport, the cold state where asking the server is impossible.
+pub fn cold_connection(path: &std::path::Path) -> ConnettoConnection<Scripted> {
+    let replica = Replica::encrypted_file(
+        path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+    ConnettoConnection::<Scripted>::open(&replica, DDL, &config(), None)
+        .expect("open with no server")
+}

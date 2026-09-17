@@ -5,8 +5,9 @@ use connetto_file_core::MimeClass;
 use tempfile::tempdir;
 
 use crate::support::{
-    RecordingHttp, Scripted, TicketAnswer, attach_content, connected_client, connected_content,
-    insert_row_and_pin_album, learn_file_id, offline_client, stage_photo,
+    ROOT_KEY, RecordingHttp, Scripted, TicketAnswer, attach_content, cold_connection,
+    connected_client, connected_connection, connected_content, insert_row_and_pin_album,
+    learn_file_id, offline_client, stage_photo,
 };
 
 /// A granted read address, the shape the file server mints for a download.
@@ -287,5 +288,96 @@ async fn a_refused_read_ticket_is_reported() {
     assert!(
         matches!(refused, Err(ContentError::TicketRefused { file_id }) if file_id == unknown),
         "a caller learns it may not read, and learns nothing else, got {refused:?}"
+    );
+}
+
+/// The split resolve API a relay hub drives: the request leaves without the
+/// caller waiting, foreign events pass by untouched, and the grant this
+/// request asked for settles it.
+#[tokio::test]
+async fn a_started_resolve_waits_and_settles_on_its_own_grant() {
+    use connetto_client::ClientEvent;
+    use connetto_file_client::{ContentArchive, FsStore, ResolveRoute, ResolveStart};
+
+    let dir = tempdir().expect("temp dir");
+    let mut conn = connected_connection(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting(READ_URL),
+    )
+    .await;
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    archive
+        .install(&mut conn)
+        .expect("install content bookkeeping");
+    let unknown = connetto_file_core::FileId::from_bytes([7; 32]);
+
+    let start = archive
+        .start_resolve_connection(&mut conn, unknown)
+        .await
+        .expect("start a resolve on the live connection");
+    let ResolveStart::Waiting(pending) = start else {
+        panic!("an unknown file on a live connection waits for its ticket");
+    };
+    assert!(
+        matches!(
+            pending.route(&ClientEvent::ContentTicket {
+                request_id: "content-someone-else".to_owned(),
+                url: READ_URL.to_owned(),
+            }),
+            ResolveRoute::Other
+        ),
+        "a grant for another request is not this one's answer"
+    );
+
+    let mut settled = None;
+    for _ in 0..8 {
+        let event = conn.pump_one().await.expect("a pumped event");
+        if matches!(event, ClientEvent::ContentTicket { .. })
+            && let ResolveRoute::Settled(result) = pending.route(&event)
+        {
+            settled = Some(result);
+            break;
+        }
+    }
+    assert!(
+        matches!(&settled, Some(Ok(url)) if url == READ_URL),
+        "the grant this request asked for settles the wait, got {settled:?}"
+    );
+
+    let second = archive
+        .start_resolve_connection(&mut conn, connetto_file_core::FileId::from_bytes([8; 32]))
+        .await
+        .expect("start the second resolve");
+    let ResolveStart::Waiting(pending) = second else {
+        panic!("the second request waits too");
+    };
+    assert!(
+        matches!(
+            pending.route(&ClientEvent::Closed),
+            ResolveRoute::Settled(Err(_))
+        ),
+        "a closed link abandons the wait"
+    );
+}
+
+/// On a connection with no transport there is nobody to ask, and the split
+/// API says so at once instead of waiting.
+#[tokio::test]
+async fn a_started_resolve_on_a_cold_connection_answers_unavailable() {
+    use connetto_file_client::{ContentArchive, FsStore, ResolveStart};
+
+    let dir = tempdir().expect("temp dir");
+    let mut conn = cold_connection(&dir.path().join("replica.sqlite"));
+    let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
+    archive
+        .install(&mut conn)
+        .expect("install content bookkeeping");
+    let start = archive
+        .start_resolve_connection(&mut conn, connetto_file_core::FileId::from_bytes([7; 32]))
+        .await
+        .expect("a cold start is an answer, not an error");
+    assert!(
+        matches!(start, ResolveStart::Answered(Resolved::Unavailable)),
+        "no transport means Unavailable at once"
     );
 }
