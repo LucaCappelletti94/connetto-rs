@@ -2,20 +2,23 @@
 
 use core::fmt::Display;
 use std::collections::HashSet;
+use std::io::Read;
 
 use connetto_client::{ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome};
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
     ChunkHash, ChunkStore, EncryptStoreError, EncryptingStore, FileId, Manifest, MaybeSend,
+    MimeClass, process_file_from_reader,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 
 use crate::db;
-use crate::error::{AttemptOutcome, ContentError};
+use crate::error::{AttemptOutcome, ContentError, StageCommitError};
 use crate::http::ContentHttp;
 use crate::import::{apply_content_import, prepare_content_import, write_import_chunks};
+use crate::resolve::{ChunkStoreSource, LocalContentSource, Resolved};
 use crate::{ticket, upload};
 
 /// Result of one worker-owned outbox attempt.
@@ -180,6 +183,177 @@ where
         let conn = connection.conn();
         conn.batch_execute(db::CONTENT_DDL)?;
         db::add_refused_column(conn).map_err(ContentError::from)
+    }
+
+    /// Chunks one file into the encrypted store without touching the replica.
+    ///
+    /// The slow half of staging a file, so a hub can keep serving local work
+    /// while a large file is split. [`commit_staged`](Self::commit_staged)
+    /// closes the pair in one transaction. The identity inside the returned
+    /// manifest is what the bytes hash to, and it is the only identity the
+    /// chunks can ever be served under.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Store`] when reading the bytes or writing a chunk fails.
+    pub async fn chunk_file<R>(&self, reader: R, mime: MimeClass) -> Result<Manifest, ContentError>
+    where
+        R: Read + MaybeSend,
+    {
+        let store = EncryptingStore::new_with(
+            self.store.clone(),
+            &self.root_key,
+            mime.params().skip_compression,
+        );
+        process_file_from_reader(reader, mime, &store)
+            .await
+            .map_err(|err| ContentError::Store(err.to_string()))
+    }
+
+    /// Commits staged content and the row that names it as one transaction.
+    ///
+    /// The raw-connection shape of [`ContentClient::stage`](crate::ContentClient::stage):
+    /// the manifest and its outbox entry are recorded with capture suspended,
+    /// and `row` then runs with capture live, so the row syncs as part of the
+    /// same mutation and the upload leg sees the queued entry. `row` receives
+    /// the identity the chunked bytes hash to; a caller told an identity
+    /// elsewhere compares it here, because bytes that hash to something else
+    /// can never be served under the declared one.
+    ///
+    /// # Errors
+    ///
+    /// Anything `row` returns, or [`StageCommitError::Bookkeeping`] when the
+    /// manifest or outbox write fails. Either way nothing committed, and the
+    /// chunks stand until the next orphan sweep.
+    pub fn commit_staged<T, F, O>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        manifest: &Manifest,
+        row: F,
+    ) -> Result<O, StageCommitError>
+    where
+        T: Transport,
+        F: FnOnce(&mut SqliteConnection, FileId) -> Result<O, StageCommitError>,
+    {
+        let file_id = manifest.file_id();
+        connection
+            .transact_with_bookkeeping(
+                |conn| {
+                    db::put_manifest(conn, manifest)?;
+                    db::enqueue(conn, file_id)?;
+                    Ok(())
+                },
+                |conn| row(conn, file_id),
+            )
+            .map(|((), outcome)| outcome)
+    }
+
+    /// The answer about this file's bytes this device can give on its own.
+    ///
+    /// The shape of [`ContentClient`](crate::ContentClient)'s own local
+    /// answer: unsent content answers from the chunk store or nowhere, pinned
+    /// content prefers what the pin paid to keep, and anything else answers
+    /// `None`, which means only a server knows.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] on a bookkeeping read failure.
+    pub async fn resolve_local<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+    ) -> Result<Option<Resolved>, ContentError> {
+        let Some(manifest) = db::load_manifest(connection.conn(), file_id)? else {
+            return Ok(None);
+        };
+        let source =
+            ChunkStoreSource::new(EncryptingStore::new(self.store.clone(), &self.root_key));
+        if db::is_unsent(connection.conn(), file_id)? {
+            return Ok(Some(match source.bytes(&manifest).await? {
+                Some(bytes) => Resolved::Local {
+                    source: source.name(),
+                    bytes,
+                },
+                None => Resolved::Unavailable,
+            }));
+        }
+        if !crate::retain::pinned_ids(connection.conn())?.contains(&file_id) {
+            return Ok(None);
+        }
+        Ok(source.bytes(&manifest).await?.map(|bytes| Resolved::Local {
+            source: source.name(),
+            bytes,
+        }))
+    }
+
+    /// Where this file's bytes are to be had, answering the way the owning
+    /// client would, for a hub that serves resolution questions for others.
+    ///
+    /// [`resolve_local`](Self::resolve_local) first, then the server for
+    /// anything local sources cannot answer, exactly as
+    /// [`ContentClient::resolve`](crate::ContentClient::resolve) does. A
+    /// `cancel` that fires, a server refusal and an offline connection all
+    /// answer [`Resolved::Unavailable`], because the question deserves an
+    /// answer rather than a wait. Events pumped while the ticket round trip
+    /// runs come back in the returned vector for the caller to re-apply; a
+    /// cancelled wait re-applies them without an answer.
+    ///
+    /// There is no error to handle. A bookkeeping failure, a server refusal,
+    /// a transport failure and a cancelled wait all answer
+    /// [`Resolved::Unavailable`], the only answer better than no answer.
+    pub async fn resolve_connection<T, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+        cancel: C,
+    ) -> (Resolved, Vec<ClientEvent>)
+    where
+        T: Transport,
+        T::Error: Display,
+        C: core::future::Future<Output = ()>,
+    {
+        let mut observed = Vec::new();
+        match self
+            .answer_connection(connection, file_id, cancel, &mut observed)
+            .await
+        {
+            Ok(answer) => (answer, observed),
+            Err(_) => (Resolved::Unavailable, observed),
+        }
+    }
+
+    async fn answer_connection<T, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        file_id: FileId,
+        cancel: C,
+        observed: &mut Vec<ClientEvent>,
+    ) -> Result<Resolved, ContentError>
+    where
+        T: Transport,
+        T::Error: Display,
+        C: core::future::Future<Output = ()>,
+    {
+        if let Some(answer) = self.resolve_local(connection, file_id).await? {
+            return Ok(answer);
+        }
+        if !connection.is_connected() {
+            return Ok(Resolved::Unavailable);
+        }
+        let mut pending = None;
+        let url = ticket::request_connection_or(
+            connection,
+            file_id,
+            ContentVerb::Read,
+            observed,
+            cancel,
+            &mut pending,
+        )
+        .await?;
+        Ok(match url {
+            Some(url) => Resolved::Remote { url },
+            None => Resolved::Unavailable,
+        })
     }
 
     /// Counts content files that have not reached the server.
@@ -2077,6 +2251,218 @@ mod tests {
                 .expect("sendable count"),
             1,
             "sendable_files counts only unmarked entries"
+        );
+    }
+
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[derive(diesel::QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+
+    fn count(connection: &mut diesel::SqliteConnection, sql: &str) -> i64 {
+        use diesel::RunQueryDsl;
+        diesel::sql_query(sql)
+            .get_result::<Count>(connection)
+            .expect("the count reads")
+            .n
+    }
+
+    fn staged_fixture(
+        name: &str,
+    ) -> (
+        tempfile::TempDir,
+        super::ContentArchive<crate::store::FsStore>,
+        connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport>,
+    ) {
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)",
+            &ClientConfig::new(name),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+        (dir, archive, connection)
+    }
+
+    /// The manifest, the outbox entry and the naming row commit together, and
+    /// the identity they carry is the one the bytes hash to.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_staged_file_and_its_row_commit_together() {
+        use crate::db;
+        use connetto_file_core::MimeClass;
+        use diesel::RunQueryDsl;
+
+        let (_dir, archive, mut connection) = staged_fixture("stage-commit");
+        let bytes = vec![7u8; 1024];
+        let manifest = archive
+            .chunk_file(&bytes[..], MimeClass::Jpeg)
+            .await
+            .expect("the bytes chunk");
+        let expected = manifest.file_id();
+
+        let written = archive
+            .commit_staged(&mut connection, &manifest, |conn, id| {
+                diesel::sql_query("INSERT INTO photos (id, content_id) VALUES (1, ?)")
+                    .bind::<diesel::sql_types::Binary, _>(id.as_bytes().to_vec())
+                    .execute(conn)?;
+                Ok(id)
+            })
+            .expect("the staged commit lands");
+
+        assert_eq!(written, expected, "the row is told the computed identity");
+        assert!(
+            db::load_manifest(connection.conn(), expected)
+                .expect("the manifest reads")
+                .is_some(),
+            "the manifest committed with the row"
+        );
+        assert_eq!(
+            db::outbox(connection.conn()).expect("the outbox reads"),
+            vec![expected],
+            "the upload was queued with the row"
+        );
+        assert_eq!(
+            count(connection.conn(), "SELECT COUNT(*) AS n FROM photos"),
+            1,
+            "the row committed"
+        );
+    }
+
+    /// A row closure that refuses the computed identity rolls back the
+    /// manifest and the outbox entry with it, leaving nothing staged behind.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_row_that_refuses_the_computed_id_rolls_the_manifest_back() {
+        use crate::db;
+        use crate::error::StageCommitError;
+        use connetto_file_core::MimeClass;
+        use diesel::RunQueryDsl;
+
+        let (_dir, archive, mut connection) = staged_fixture("stage-mismatch");
+        let bytes = vec![8u8; 1024];
+        let manifest = archive
+            .chunk_file(&bytes[..], MimeClass::Jpeg)
+            .await
+            .expect("the bytes chunk");
+        let declared = FileId::from_bytes([9; 32]);
+
+        let error = archive
+            .commit_staged(&mut connection, &manifest, |conn, id| {
+                if id != declared {
+                    return Err(StageCommitError::Row(format!(
+                        "declared {declared}, the bytes hash to {id}"
+                    )));
+                }
+                diesel::sql_query("INSERT INTO photos (id, content_id) VALUES (1, ?)")
+                    .bind::<diesel::sql_types::Binary, _>(id.as_bytes().to_vec())
+                    .execute(conn)?;
+                Ok(id)
+            })
+            .expect_err("a mismatched identity must refuse");
+        assert!(matches!(error, StageCommitError::Row(_)));
+
+        assert!(
+            db::load_manifest(connection.conn(), manifest.file_id())
+                .expect("the manifest reads")
+                .is_none(),
+            "a refused row leaves no manifest behind"
+        );
+        assert!(
+            db::outbox(connection.conn())
+                .expect("the outbox reads")
+                .is_empty(),
+            "a refused row queues no upload"
+        );
+        assert_eq!(
+            count(connection.conn(), "SELECT COUNT(*) AS n FROM photos"),
+            0,
+            "nothing wrote to the application table"
+        );
+    }
+
+    /// Content the worker just staged answers locally before any upload, and
+    /// answers with the exact bytes.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn unsent_staged_content_resolves_from_the_chunk_store() {
+        use crate::resolve::Resolved;
+        use connetto_file_core::MimeClass;
+
+        let (_dir, archive, mut connection) = staged_fixture("stage-resolve");
+        let bytes = vec![5u8; 2048];
+        let manifest = archive
+            .chunk_file(&bytes[..], MimeClass::Jpeg)
+            .await
+            .expect("the bytes chunk");
+        archive
+            .commit_staged(&mut connection, &manifest, |_conn, id| Ok(id))
+            .expect("the staged commit lands");
+
+        let (answer, observed) = archive
+            .resolve_connection(
+                &mut connection,
+                manifest.file_id(),
+                core::future::pending::<()>(),
+            )
+            .await;
+        match answer {
+            Resolved::Local { bytes: served, .. } => assert_eq!(served, bytes),
+            other => panic!("unsent content must resolve locally, got {other:?}"),
+        }
+        assert!(observed.is_empty(), "no round trip ran");
+    }
+
+    /// Content the worker cannot produce answers `Unavailable`: a file with no
+    /// manifest, and an uploaded file no pin covers, both with no server
+    /// online.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn content_the_worker_cannot_produce_resolves_unavailable_offline() {
+        use crate::db;
+        use crate::resolve::Resolved;
+        use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+
+        let (dir, archive, mut connection) = staged_fixture("stage-unavailable");
+        let (answer, _) = archive
+            .resolve_connection(
+                &mut connection,
+                FileId::from_bytes([3; 32]),
+                core::future::pending::<()>(),
+            )
+            .await;
+        assert!(
+            matches!(answer, Resolved::Unavailable),
+            "an unknown file must resolve Unavailable, got {answer:?}"
+        );
+
+        let encrypted = EncryptingStore::new(
+            crate::store::FsStore::new(dir.path().join("chunks")),
+            &[1; 32],
+        );
+        let uploaded = process_file(&vec![4u8; 1024], MimeClass::Jpeg, &encrypted)
+            .await
+            .expect("the file chunks");
+        db::put_manifest(connection.conn(), &uploaded).expect("record the manifest");
+        let (answer, _) = archive
+            .resolve_connection(
+                &mut connection,
+                uploaded.file_id(),
+                core::future::pending::<()>(),
+            )
+            .await;
+        assert!(
+            matches!(answer, Resolved::Unavailable),
+            "an uploaded unpinned file offline must resolve Unavailable, got {answer:?}"
         );
     }
 }

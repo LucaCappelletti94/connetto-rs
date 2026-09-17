@@ -1,16 +1,27 @@
 //! Browser display handles for resolved content.
 
 use core::fmt::Display;
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
+use crate::content_wire::{ContentFrame, WireResolve, mime_code};
+use crate::frames::{InternalLane, MessageSink, MessageTransport};
+use crate::workers::helpers::sleep_ms;
 use connetto_client::live::ConnettoClient;
 use connetto_core::traits::{MaybeSend, Transport};
 use connetto_file_client::{
-    BrowserHttp, BrowserStore, BrowserStoreError, ContentClient, ContentError, Resolved,
+    BrowserHttp, BrowserStore, BrowserStoreError, ContentClient, ContentError, FileId,
+    FileIdHasher, MimeClass, Resolved,
 };
+use diesel::SqliteConnection;
+use futures_channel::oneshot;
+use futures_util::StreamExt;
 use js_sys::{Array, Uint8Array};
 use thiserror::Error;
 use wasm_bindgen::JsCast;
+use wasm_bindgen_futures::JsFuture;
 
 /// Failure to attach browser file handling.
 #[derive(Debug, Error)]
@@ -98,6 +109,19 @@ impl ObjectUrl {
     pub fn as_str(&self) -> &str {
         &self.inner.value
     }
+
+    /// Creates an object URL for a blob the browser already holds.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectUrlError`] when the browser rejects URL creation.
+    pub fn from_blob(blob: &Blob) -> Result<Self, ObjectUrlError> {
+        let value =
+            Url::create_object_url_with_blob(blob).map_err(|value| object_url_error(&value))?;
+        Ok(Self {
+            inner: Arc::new(ObjectUrlInner { value }),
+        })
+    }
 }
 
 impl AsRef<str> for ObjectUrl {
@@ -151,4 +175,187 @@ impl BrowserResolved {
 
 fn object_url_error(value: &wasm_bindgen::JsValue) -> ObjectUrlError {
     ObjectUrlError::Browser(value.as_string().unwrap_or_else(|| format!("{value:?}")))
+}
+
+/// The longest a tab waits for the worker's resolve answer. The hub bounds
+/// its own wait sooner, so this only fires when the hub has stopped
+/// answering entirely.
+const TAB_RESOLVE_WAIT_MS: i32 = 16_000;
+
+/// Where a file's bytes are to be had, as answered by the worker hub over
+/// the tab's content lane.
+#[derive(Debug)]
+pub enum TabResolved {
+    /// The server granted a read at this URL.
+    Remote {
+        /// The granted URL.
+        url: String,
+    },
+    /// The worker held the bytes itself.
+    Local {
+        /// The file's bytes.
+        blob: Blob,
+    },
+    /// Neither the worker nor the server can produce the bytes right now.
+    Unavailable,
+}
+
+impl TabResolved {
+    /// Exposes a local answer as an object URL. A remote answer is already a
+    /// URL, and `Unavailable` has no bytes; both answer `None`.
+    ///
+    /// # Errors
+    ///
+    /// [`ObjectUrlError`] when the browser rejects URL creation.
+    pub fn into_object_url(self) -> Result<Option<ObjectUrl>, ObjectUrlError> {
+        match self {
+            Self::Local { blob } => ObjectUrl::from_blob(&blob).map(Some),
+            Self::Remote { .. } | Self::Unavailable => Ok(None),
+        }
+    }
+}
+
+/// Why a tab-side stage did not complete.
+#[derive(Debug, Error)]
+pub enum TabStageError<E: Display> {
+    /// The blob's bytes could not be read for hashing.
+    #[error("the staged blob could not be read: {0}")]
+    Read(String),
+    /// The content lane refused the announcement.
+    #[error("the staged content could not be announced: {0}")]
+    Post(String),
+    /// The caller's row failed. The announced blob ages out at the worker on
+    /// its own; nothing needs unwinding.
+    #[error("the staged row failed: {0}")]
+    Row(E),
+}
+
+/// One answer to a `Resolve`, with the bytes a `Local` answer carries.
+type ResolveAnswer = (WireResolve, Option<Blob>);
+
+/// A tab's content lane: stage files through the worker and ask where bytes
+/// live, while the tab's client owns the transport itself.
+///
+/// Staging pairs with the mutation that names the file.
+/// [`stage`](Self::stage) announces the blob before the caller's transaction
+/// commits, and message ports deliver in order, so the worker holds the
+/// bytes by the time the mutation arrives; the worker then commits the
+/// file's manifest, its upload queue entry and the rows as one mutation,
+/// checking that the bytes hash to the identity the row names.
+pub struct TabContent<S: MessageSink + Clone + 'static> {
+    lane: InternalLane<S>,
+    replies: Rc<RefCell<HashMap<u64, oneshot::Sender<ResolveAnswer>>>>,
+    next_request: Rc<Cell<u64>>,
+}
+
+impl<S: MessageSink + Clone + 'static> TabContent<S> {
+    /// Split the content lane off a tab transport, before handing that
+    /// transport to the tab's client.
+    #[must_use]
+    pub fn new(transport: &mut MessageTransport<S>) -> Self {
+        let lane = transport.internal_lane();
+        let replies: Rc<RefCell<HashMap<u64, oneshot::Sender<ResolveAnswer>>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+        if let Some(mut inbox) = transport.take_internal_inbox() {
+            let waiting = Rc::clone(&replies);
+            wasm_bindgen_futures::spawn_local(async move {
+                while let Some(inbound) = inbox.next().await {
+                    if let Some(ContentFrame::ResolveReply { request_id, answer }) =
+                        ContentFrame::from_json(&inbound.json)
+                        && let Some(sender) = waiting.borrow_mut().remove(&request_id)
+                    {
+                        let _ = sender.send((answer, inbound.blob));
+                    }
+                }
+            });
+        }
+        Self {
+            lane,
+            replies,
+            next_request: Rc::new(Cell::new(0)),
+        }
+    }
+
+    /// Announce `blob` to the worker and run `row`, so the file, its upload
+    /// and the rows naming it reach the hub as one mutation.
+    ///
+    /// The identity handed to `row` is what the blob's bytes hash to; the
+    /// worker recomputes it and refuses the mutation if the rows name
+    /// anything else. A `row` that fails leaves the announced blob to age
+    /// out at the worker, which costs the bytes and nothing else.
+    ///
+    /// # Errors
+    ///
+    /// [`TabStageError::Read`] when the blob cannot be hashed,
+    /// [`TabStageError::Post`] when the lane refuses the announcement, and
+    /// whatever `row` returns as [`TabStageError::Row`].
+    pub async fn stage<T, F, O, E>(
+        &self,
+        blob: &Blob,
+        mime: MimeClass,
+        client: &ConnettoClient<T>,
+        row: F,
+    ) -> Result<(FileId, O), TabStageError<E>>
+    where
+        T: Transport + MaybeSend + 'static,
+        T::Error: Display,
+        F: FnOnce(&mut SqliteConnection, FileId) -> Result<O, E>,
+        E: Display,
+    {
+        let bytes = match blob_bytes(blob).await {
+            Ok(bytes) => bytes,
+            Err(err) => return Err(TabStageError::Read(format!("{err:?}"))),
+        };
+        let mut hasher = FileIdHasher::new();
+        hasher.update(&bytes);
+        let file_id = hasher.finalize();
+        let frame = ContentFrame::Stage {
+            file_id: *file_id.as_bytes(),
+            mime: mime_code(mime),
+        };
+        self.lane
+            .post_internal(&frame.to_json(), Some(blob))
+            .map_err(|err| TabStageError::Post(err.to_string()))?;
+        client
+            .with_conn(|conn| row(conn.conn(), file_id))
+            .await
+            .map(|outcome| (file_id, outcome))
+            .map_err(TabStageError::Row)
+    }
+
+    /// Where this file's bytes are to be had, answered by the worker.
+    pub async fn resolve(&self, file_id: FileId) -> TabResolved {
+        let request_id = {
+            let next = self.next_request.get() + 1;
+            self.next_request.set(next);
+            next
+        };
+        let (sender, answer) = oneshot::channel();
+        self.replies.borrow_mut().insert(request_id, sender);
+        let frame = ContentFrame::Resolve {
+            request_id,
+            file_id: *file_id.as_bytes(),
+        };
+        if self.lane.post_internal(&frame.to_json(), None).is_err() {
+            self.replies.borrow_mut().remove(&request_id);
+            return TabResolved::Unavailable;
+        }
+        tokio::select! {
+            answer = answer => match answer.unwrap_or((WireResolve::Unavailable, None)) {
+                (WireResolve::Remote { url }, _) => TabResolved::Remote { url },
+                (WireResolve::Local, Some(blob)) => TabResolved::Local { blob },
+                (WireResolve::Local, None) | (WireResolve::Unavailable, _) => {
+                    TabResolved::Unavailable
+                }
+            },
+            () = sleep_ms(TAB_RESOLVE_WAIT_MS) => TabResolved::Unavailable,
+        }
+    }
+}
+
+/// Read a whole blob through the browser's file reader, which works from any
+/// context, page or worker.
+async fn blob_bytes(blob: &Blob) -> Result<Vec<u8>, wasm_bindgen::JsValue> {
+    let buffer = JsFuture::from(blob.array_buffer()).await?;
+    Ok(Uint8Array::new(&buffer).to_vec())
 }

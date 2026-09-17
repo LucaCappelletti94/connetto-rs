@@ -1,9 +1,9 @@
 //! DB worker orchestration and page-side glue for the leader topology.
 
 mod archive_channel;
-mod blob_io;
+pub(crate) mod blob_io;
 mod boot;
-mod helpers;
+pub(crate) mod helpers;
 mod intake;
 mod logout;
 mod session;

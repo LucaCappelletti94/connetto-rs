@@ -23,6 +23,7 @@
 pub mod auth;
 pub mod broadcast;
 pub mod content;
+pub mod content_wire;
 pub mod frames;
 pub mod leader;
 pub mod locks;
@@ -47,9 +48,12 @@ use connetto_core::messages::{BulkMessage, ControlMessage};
 use connetto_core::traits::{IncomingFrame, Transport};
 pub use content::{
     BrowserContentClient, BrowserContentError, BrowserResolved, ObjectUrl, ObjectUrlError,
-    attach_browser_content,
+    TabContent, TabResolved, TabStageError, attach_browser_content,
 };
-pub use frames::{MessageSink, MessageTransport, MessageTransportError};
+pub use content_wire::{ContentFrame, WireResolve, mime_code, mime_from_code};
+pub use frames::{
+    InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
+};
 use futures_channel::mpsc;
 use futures_util::StreamExt;
 use js_sys::{ArrayBuffer, Uint8Array};

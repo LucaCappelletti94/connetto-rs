@@ -112,6 +112,24 @@ pub enum ContentError {
     },
 }
 
+/// Why a staged commit did not land, keeping the row's refusal distinguishable
+/// from a bookkeeping failure so the caller can word the answer.
+#[derive(Debug, Error)]
+pub enum StageCommitError {
+    /// Recording the manifest or queueing the upload failed.
+    #[error("staged content bookkeeping: {0}")]
+    Bookkeeping(#[from] ContentError),
+    /// The row closure refused, carrying the detail it gave.
+    #[error("staged row refused: {0}")]
+    Row(String),
+}
+
+impl From<diesel::result::Error> for StageCommitError {
+    fn from(err: diesel::result::Error) -> Self {
+        Self::Bookkeeping(err.into())
+    }
+}
+
 /// What the outbox walk does with a failed upload attempt, decided by where the fact came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {

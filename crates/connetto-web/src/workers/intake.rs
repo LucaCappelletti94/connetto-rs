@@ -451,7 +451,7 @@ pub(super) fn install_hello_intake(hub: RelayHub) -> Result<(), IntakeError> {
             } else if let Some(wire) = message.strip_prefix("tab:") {
                 match MessageTransport::<BroadcastChannel>::new(wire) {
                     Ok(transport) => {
-                        hub.attach(transport);
+                        hub.attach_with_content(transport);
                         let _ = hello.post_message(&JsValue::from_str(&format!("attached:{wire}")));
                     }
                     Err(err) => {
