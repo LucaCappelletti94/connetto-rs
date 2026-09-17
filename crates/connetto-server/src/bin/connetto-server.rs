@@ -62,7 +62,8 @@
 //!   out at one level on a fixed interval rather than escalating on a
 //!   threshold connetto picked.
 //! - `CONNETTO_CONTENT_URL`: the base URL content tickets embed, which is the
-//!   auth listener's public address. Unset means no file routes and the
+//!   auth listener's public address, a path prefix allowed, with no query or
+//!   fragment and a trailing slash ignored. Unset means no file routes and the
 //!   signer-refused detail on every ticket request, as today. Set, the four
 //!   file routes mount on the auth listener under its CORS layer, and the
 //!   file server's preflight must pass before the server starts, so the
@@ -575,6 +576,15 @@ async fn build_content(
     let Some(base_url) = var_nonempty("CONNETTO_CONTENT_URL") else {
         return Ok((ServerSigner::None, None));
     };
+    // The signer appends `/files/...` textually to this text, so the trailing
+    // slash goes and a query or fragment has nowhere to go.
+    if base_url.contains('?') || base_url.contains('#') {
+        return Err(anyhow!(
+            "CONNETTO_CONTENT_URL must carry no query or fragment, only the \
+             address the file routes answer on: {base_url}"
+        ));
+    }
+    let base_url = base_url.trim_end_matches('/').to_owned();
     let ttl = Duration::from_secs(env_u64("CONNETTO_CONTENT_TICKET_TTL_SECS", 3_600)?);
     let read_ceiling = env_u64("CONNETTO_CONTENT_READ_CEILING", 1 << 26)?;
     let grace = Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_GRACE_SECS", ttl.as_secs())?);

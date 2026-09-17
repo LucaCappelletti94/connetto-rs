@@ -1697,6 +1697,7 @@ async fn e2e_content_startup_names_each_refused_setting() {
     let auth_port = free_port();
     let auth_stack = build_auth_stack(auth_port).await;
     let content_base = format!("http://127.0.0.1:{auth_port}");
+    let query_base = format!("{content_base}/?probe=1");
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
     let store = TempDir::new().expect("content store dir");
@@ -1732,6 +1733,24 @@ async fn e2e_content_startup_names_each_refused_setting() {
             vec![("CONNETTO_CONTENT_STORE", "ftp://example.com")],
             "opening the chunk store",
         ),
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_TICKET_TTL_SECS", "soon"),
+            ],
+            "parsing CONNETTO_CONTENT_TICKET_TTL_SECS",
+        ),
+        (
+            vec![
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_SWEEP_SECS", "soon"),
+            ],
+            "parsing CONNETTO_CONTENT_SWEEP_SECS",
+        ),
+        (
+            vec![("CONNETTO_CONTENT_URL", query_base.as_str())],
+            "no query or fragment",
+        ),
     ];
     for (extra, expected) in cases {
         let mut envs: Vec<(&str, &str)> = auth_stack
@@ -1749,4 +1768,174 @@ async fn e2e_content_startup_names_each_refused_setting() {
             output.status.code()
         );
     }
+}
+
+/// Drives a live session through the binary's own ticket signer: an
+/// unidentified file is refused, a file the deployment makes visible mints a
+/// URL that rides the query, and that URL answers its download route.
+///
+/// `CONNETTO_CONTENT_KEY` stays unset here, so this boot also takes the
+/// ephemeral-keypair branch every other content test skips.
+#[cfg(feature = "content")]
+#[tokio::test]
+async fn e2e_content_ticket_round_trips_over_a_live_session() {
+    use connetto_core::PROTOCOL_VERSION;
+    use connetto_core::messages::{
+        ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, Grant, Handshake,
+        HandshakeAck, NonFatalError,
+    };
+    use connetto_core::traits::{IncomingFrame, Transport};
+    use connetto_server::WebSocketTransport;
+    use tokio::net::TcpStream;
+
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.start_replication(&["orders"]).await;
+    apply_content_deployment(&pool, true).await;
+    exec(&pool, "GRANT SELECT ON photos TO app_reader").await;
+
+    let store = TempDir::new().expect("content store dir");
+    let port = free_port();
+    let auth_port = free_port();
+    let bind = format!("127.0.0.1:{port}");
+    let ws = format!("ws://127.0.0.1:{port}/");
+    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let store_spec = format!("fs:{}", store.path().display());
+
+    let auth_stack = build_auth_stack(auth_port).await;
+    let mut envs: Vec<(&str, &str)> = auth_stack
+        .env_pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    envs.extend([
+        ("CONNETTO_CONTENT_URL", content_base.as_str()),
+        ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+    ]);
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let _server = spawn_server_cfg(
+        &url,
+        &bind,
+        PG_DDL,
+        "orders",
+        Some(&reader_url),
+        &authorization,
+        &envs,
+    );
+    let secs = Duration::from_secs(30);
+    assert!(
+        wait_for_port(&bind, secs).await,
+        "server did not open {bind}"
+    );
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+    assert!(
+        wait_for_port(&auth_bind, secs).await,
+        "auth endpoints did not open {auth_bind}"
+    );
+
+    let (token, _user) = mint_token(&auth_stack.auth_base).await;
+    let tcp = TcpStream::connect(&bind).await.expect("connect ws");
+    let mut client = WebSocketTransport::connect(&ws, tcp)
+        .await
+        .expect("ws handshake");
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "ticket-probe").with_grant(Grant::new(token)),
+        ))
+        .await
+        .expect("post handshake");
+
+    let mut acked = false;
+    let mut ghost_refused = false;
+    let file_id = [0xa7u8; 32];
+    let mut hex = String::new();
+    for byte in file_id {
+        std::fmt::write(&mut hex, format_args!("{byte:02x}")).expect("string append");
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut granted: Option<ContentTicketGrant> = None;
+    let mut visible_asked = false;
+    while granted.is_none() {
+        assert!(Instant::now() < deadline, "the ticket round trip stalled");
+        let frame = tokio::time::timeout(Duration::from_secs(10), client.recv())
+            .await
+            .expect("a frame arrives")
+            .expect("transport")
+            .expect("open");
+        match frame {
+            IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id,
+                ..
+            })) => {
+                assert!(!connection_id.is_empty(), "the ack names the session");
+                acked = true;
+                client
+                    .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
+                        request_id: "probe-ghost".to_owned(),
+                        file_id: [0x5cu8; 32],
+                        verb: ContentVerb::Read,
+                    }))
+                    .await
+                    .expect("post the ghost request");
+            }
+            IncomingFrame::Control(ControlMessage::NonFatalError(NonFatalError {
+                related_to,
+                detail,
+            })) if related_to.as_deref() == Some("probe-ghost") => {
+                assert!(
+                    detail.contains("refused"),
+                    "an invisible file is refused, got {detail}"
+                );
+                ghost_refused = true;
+                if !visible_asked {
+                    visible_asked = true;
+                    exec(
+                        &pool,
+                        &format!("INSERT INTO photos VALUES (decode('{hex}', 'hex'), 'staged')"),
+                    )
+                    .await;
+                    client
+                        .send_control(ControlMessage::ContentTicketRequest(ContentTicketRequest {
+                            request_id: "probe-visible".to_owned(),
+                            file_id,
+                            verb: ContentVerb::Read,
+                        }))
+                        .await
+                        .expect("post the visible request");
+                }
+            }
+            IncomingFrame::Control(ControlMessage::ContentTicketGrant(grant))
+                if grant.request_id == "probe-visible" =>
+            {
+                granted = Some(grant);
+            }
+            IncomingFrame::Control(_) => {}
+            IncomingFrame::Bulk(_) => {}
+        }
+    }
+    assert!(acked && ghost_refused, "the ack and refusal must arrive");
+    let grant = granted.expect("the visible file mints");
+    assert!(
+        grant.url.starts_with(&content_base) && grant.url.contains(&hex),
+        "the granted URL names the base and the file, got {}",
+        grant.url
+    );
+    assert!(
+        grant.url.contains("?t="),
+        "the ticket rides the query, got {}",
+        grant.url
+    );
+    let response = reqwest::get(&grant.url).await.expect("GET the ticket");
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::NOT_FOUND,
+        "a minted ticket passes the extractor and misses the empty store"
+    );
 }
