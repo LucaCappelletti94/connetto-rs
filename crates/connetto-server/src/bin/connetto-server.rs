@@ -582,7 +582,17 @@ async fn build_content(
         .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?;
     let spec = parse_store_spec(&store_setting)?;
     let der = match var_nonempty("CONNETTO_CONTENT_KEY") {
-        Some(path) => Some(std::fs::read(&path).with_context(|| format!("reading {path}"))?),
+        // Spawned because startup runs on the async runtime, and one key
+        // file is worth the round trip off the worker thread.
+        Some(path) => {
+            let shown = path.clone();
+            Some(
+                tokio::task::spawn_blocking(move || std::fs::read(&path))
+                    .await
+                    .map_err(|err| anyhow!("joining the key read: {err}"))?
+                    .with_context(|| format!("reading {shown}"))?,
+            )
+        }
         None => None,
     };
     let (signer, public) = ticket_keypair(der.as_deref(), base_url.clone(), ttl, read_ceiling)?;
