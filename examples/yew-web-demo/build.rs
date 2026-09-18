@@ -110,13 +110,17 @@ fn write_policy_tables(documents: &[&str], views: &[String], out: &std::path::Pa
 fn main() {
     println!("cargo::rerun-if-changed=schema.sql");
     println!("cargo::rerun-if-changed=frontend.sql");
+    println!("cargo::rerun-if-changed=policies.sql");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    let synced_views = translate(&["schema.sql"], &out_dir.join("replica-ddl.sql"));
+    let synced_views = translate(
+        &["schema.sql", "policies.sql"],
+        &out_dir.join("replica-ddl.sql"),
+    );
     translate(&["frontend.sql"], &out_dir.join("frontend-ddl.sql"));
     // The synced tier only: the local tier is a separate database, attached
     // under its own schema, and the check the map feeds reads `main`.
     write_policy_tables(
-        &["schema.sql"],
+        &["schema.sql", "policies.sql"],
         &synced_views,
         &out_dir.join("replica-tables.rs"),
     );
