@@ -2349,7 +2349,8 @@ fn schedule_recovery_event(
 /// What the recovery loop serves while the connection sits idle, in the retry sleep and
 /// during the connect.
 ///
-/// Everything but a frame, which needs the server.
+/// Tab work that the replica or the hub can answer stays live offline, so a tab can boot,
+/// subscribe, mutate and ask content questions before the worker reaches the server.
 fn recovery_serves_idle(event: &HubEvent) -> bool {
     matches!(
         event,
@@ -2362,6 +2363,7 @@ fn recovery_serves_idle(event: &HubEvent) -> bool {
             | HubEvent::ForgetRetired(_, _)
             | HubEvent::RefusedContent(_)
             | HubEvent::RetryRefused(_, _)
+            | HubEvent::Frame(_, _)
             | HubEvent::Internal(_, _, _)
     )
 }
@@ -4354,10 +4356,14 @@ mod tests {
         assert!(deferred.is_empty());
     }
 
-    /// Chapter 18's idle column: everything but a frame is served where it arrives while
-    /// the connection sits idle, because a frame is the only request that needs the server.
+    /// Chapter 18's idle column (amended R69-F): every event that can be answered from
+    /// local state is served where it arrives during idle recovery, including Frames. A
+    /// tab mutation commits to durable pending and replays exactly once on attach under
+    /// the R67 watermark, mirroring the native client's offline behaviour. The only events
+    /// that wait for the upstream are those in `recovery_interrupts_attach` not in this
+    /// predicate, because the attach phase owns the connection for replay.
     #[wasm_bindgen_test]
-    fn only_a_frame_waits_for_the_upstream_while_the_connection_is_idle() {
+    fn a_frame_is_served_into_pending_during_idle_recovery() {
         use connetto_core::messages::{ControlMessage, Ping};
         use connetto_core::traits::IncomingFrame;
         use tokio::sync::mpsc::unbounded_channel;
@@ -4373,7 +4379,7 @@ mod tests {
                 ),
                 Some(HubEvent::Attached(_, _))
             ),
-            "a tab attaching only writes hub state, and its announce has its own deadline"
+            "a tab attach writes hub state and is served"
         );
         assert!(matches!(
             schedule_recovery_event(&mut deferred, HubEvent::Gone(1), recovery_serves_idle),
@@ -4383,19 +4389,28 @@ mod tests {
             schedule_recovery_event(&mut deferred, HubEvent::Kill(1), recovery_serves_idle),
             Some(HubEvent::Kill(1))
         ));
+        // Frames are now served during idle recovery: a tab mutation that arrives while
+        // the upstream is down commits to the replica and to _connetto_pending, then
+        // replays exactly once when the upstream attaches, the same contract as native.
         assert!(
-            schedule_recovery_event(
-                &mut deferred,
-                HubEvent::Frame(
-                    1,
-                    IncomingFrame::Control(ControlMessage::Ping(Ping { nonce: 1 })),
+            matches!(
+                schedule_recovery_event(
+                    &mut deferred,
+                    HubEvent::Frame(
+                        1,
+                        IncomingFrame::Control(ControlMessage::Ping(Ping { nonce: 1 })),
+                    ),
+                    recovery_serves_idle,
                 ),
-                recovery_serves_idle,
-            )
-            .is_none(),
-            "a frame needs the server, so it waits"
+                Some(HubEvent::Frame(_, _))
+            ),
+            "a frame is served from local state during idle recovery"
         );
-        assert_eq!(deferred.len(), 1, "and only the frame is queued");
+        assert_eq!(
+            deferred.len(),
+            0,
+            "nothing is queued while the deque was empty"
+        );
     }
 
     /// Chapter 18's attach column: a departure or a kill unsubscribes through the

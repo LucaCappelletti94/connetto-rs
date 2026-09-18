@@ -443,6 +443,7 @@ version = "0.0.0"
 dependencies = [
  "connetto-client",
  "connetto-core",
+ "connetto-file-client",
  "connetto-file-core",
  "connetto-web",
  "diesel",

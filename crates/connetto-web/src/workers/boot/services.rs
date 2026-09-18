@@ -1,4 +1,5 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
 
 use connetto_client::ConnettoConnection;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
@@ -6,7 +7,9 @@ use connetto_core::messages::SubscriptionSpec;
 use connetto_file_client::{BrowserStore, ContentArchive};
 use tokio::sync::mpsc::UnboundedReceiver;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen_futures::spawn_local;
+use web_sys::{BroadcastChannel, MessageEvent};
 
 use super::super::helpers::content_store_namespace;
 use super::BootError;
@@ -19,6 +22,32 @@ thread_local! {
     static DB_ALIVE: RefCell<Option<locks::HeldLock>> = const { RefCell::new(None) };
 }
 
+struct ConnectGate {
+    open: Rc<Cell<bool>>,
+    _channel: BroadcastChannel,
+    _listener: Closure<dyn FnMut(MessageEvent)>,
+}
+
+fn install_connect_gate(name: &'static str) -> Result<Rc<ConnectGate>, BootError> {
+    let channel =
+        BroadcastChannel::new(name).map_err(|err| super::super::IntakeError::ChannelOpen {
+            operation: "connect gate",
+            detail: format!("{err:?}"),
+        })?;
+    let open = Rc::new(Cell::new(false));
+    let listener = {
+        let open = Rc::clone(&open);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |_event: MessageEvent| {
+            open.set(true);
+        })
+    };
+    channel.set_onmessage(Some(listener.as_ref().unchecked_ref()));
+    Ok(Rc::new(ConnectGate {
+        open,
+        _channel: channel,
+        _listener: listener,
+    }))
+}
 /// Install storage and custody, carry out any outstanding data wipe, and
 /// reserve this boot's database slots.
 ///
@@ -117,11 +146,21 @@ pub(super) async fn start_boot_services<Id>(
     content_root_key: Option<[u8; 32]>,
 ) -> Result<Option<bool>, BootError> {
     let ws_url = config.ws_url;
+    let connect_gate = match config.connect_gate {
+        Some(name) => Some(install_connect_gate(name)?),
+        None => None,
+    };
     let reconnect = HubReconnect {
-        factory: move || async move {
-            BrowserSocket::connect(ws_url)
-                .await
-                .map_err(|err| err.to_string())
+        factory: move || {
+            let connect_gate = connect_gate.clone();
+            async move {
+                if connect_gate.as_ref().is_some_and(|gate| !gate.open.get()) {
+                    return Err("connect gate closed".to_owned());
+                }
+                BrowserSocket::connect(ws_url)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
         },
         sleeper: super::super::intake::sleep,
         policy: ReconnectPolicy::default(),
