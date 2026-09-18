@@ -1,44 +1,36 @@
-//! Browser photo worker infrastructure for the dioxus web demo.
-//!
-//! This lib target exposes the `db_worker_photo_boot` wasm-bindgen entry point
-//! for browser tests that drive the photo flow through the real content routes.
-//! The main binary (`src/main.rs`) is the actual Dioxus application.
+//! Browser test worker entry points for the dioxus web demo photo surface.
 
 use wasm_bindgen::JsValue;
 use wasm_bindgen::prelude::wasm_bindgen;
 
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
-/// Schema SQL this build was compiled against (matches the browser-stack server).
+// SchemaVersion hashes this string; it must be byte-identical to
+// examples/wasm-smoke/schema.sql, which the browser-stack server uses.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
-/// The synced replica schema (worker replica, policy-split by build.rs).
 pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
-
-/// The local tier schema (device-private, attached, never synced).
 pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
-
-/// The tab mirror schema: both tiers in the tab's main schema.
 pub const DEMO_TAB_DDL: &str = concat!(
     include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql")),
     "\n",
     include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql")),
 );
 
-/// The demo server the DB worker connects upstream to.
 pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
-
-/// The upstream subscription the DB worker registers.
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-
-/// The extra upstream subscription for photos.
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
-
-/// The OPFS file base for the worker's durable synced replica.
-pub const DB_NAME: &str = "connetto-photo-dioxus.sqlite";
-
-/// The registered caller-identity function connetto installs on every connection.
 pub const CALLER_FUNCTION: &str = "current_app_user";
+
+// Each test gets unique OPFS filenames so Chrome's delayed handle release after
+// Worker.terminate() never blocks the next worker's file open.
+const ALIGN_DB_PREFIX: &str = "connetto-dioxus-align";
+const ALIGN_HUB_META: &str = "connetto-dioxus-align-hub-meta.sqlite";
+const ALIGN_AUTH_DB: &str = "connetto-dioxus-align-auth.sqlite";
+
+const PHOTO_DB_PREFIX: &str = "connetto-dioxus-photo";
+const PHOTO_HUB_META: &str = "connetto-dioxus-photo-hub-meta.sqlite";
+const PHOTO_AUTH_DB: &str = "connetto-dioxus-photo-auth.sqlite";
 
 /// The schema version this build was compiled against.
 #[must_use]
@@ -46,8 +38,6 @@ pub fn demo_schema_version() -> connetto_core::SchemaVersion {
     connetto_core::SchemaVersion::from_source(SCHEMA_SQL)
 }
 
-// The uuidv4 SQL function registered on every connection so the orders
-// and photos DEFAULT (uuidv4()) mints a UUID on local writes.
 #[diesel::declare_sql_function]
 extern "SQL" {
     /// Client-authored primary key: a 16-byte UUID v4, stored as a BLOB.
@@ -68,7 +58,7 @@ pub fn uuidv4_functions() -> connetto_client::SqlFunctions {
     ))
 }
 
-/// The policy table map for this build, for `ClientConfig::with_policy_tables`.
+/// The policy table map for this build.
 #[must_use]
 pub fn demo_policy_tables() -> connetto_client::PolicyTables {
     connetto_client::PolicyTables::from_translation(
@@ -77,26 +67,42 @@ pub fn demo_policy_tables() -> connetto_client::PolicyTables {
     )
 }
 
-/// DB worker entry point: boot the connetto DB tier with the photo config.
+/// Worker entry point for the alignment test; uses `connetto-dioxus-align*` OPFS files.
 ///
-/// The test's blob worker bootstrap imports this crate's wasm module and awaits this.
+/// # Errors
+///
+/// A string describing the VFS, upstream connect, or subscribe failure.
+#[wasm_bindgen]
+pub async fn db_worker_boot_align() -> Result<(), JsValue> {
+    boot_with(ALIGN_DB_PREFIX, ALIGN_HUB_META, ALIGN_AUTH_DB).await
+}
+
+/// Worker entry point for the photo test; uses `connetto-dioxus-photo*` OPFS files.
 ///
 /// # Errors
 ///
 /// A string describing the VFS, upstream connect, or subscribe failure.
 #[wasm_bindgen]
 pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
+    boot_with(PHOTO_DB_PREFIX, PHOTO_HUB_META, PHOTO_AUTH_DB).await
+}
+
+async fn boot_with(
+    db_prefix: &'static str,
+    hub_meta: &'static str,
+    auth_db: &'static str,
+) -> Result<(), JsValue> {
     connetto_web::logging::init_console();
     connetto_web::workers::boot_db_worker::<String>(
         &connetto_web::workers::DbWorkerConfig::new(demo_schema_version())
             .with_ws_url(DEMO_WS_URL)
-            .with_replica_db_prefix(DB_NAME)
+            .with_replica_db_prefix(db_prefix)
             .with_replica_ddl(DEMO_SQLITE_DDL)
             .with_frontend_ddl(DEMO_FRONTEND_DDL)
             .with_upstream_sub_id("db-upstream")
             .with_upstream_query(DEMO_QUERY)
             .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-            .with_hub_meta_name("connetto-photo-dioxus-hub-meta.sqlite")
+            .with_hub_meta_name(hub_meta)
             .with_content_namespace("connetto-photo-content")
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(demo_policy_tables())
@@ -106,7 +112,7 @@ pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
                 "dev-idp",
                 "http://127.0.0.1:18099/dev/landing",
             )))
-            .with_auth_db_name("connetto-photo-dioxus-auth.sqlite"),
+            .with_auth_db_name(auth_db),
     )
     .await
     .map(drop)

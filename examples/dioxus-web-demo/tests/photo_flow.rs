@@ -1,17 +1,19 @@
 //! Photo surface browser tests for the dioxus web demo.
 //!
-//! Drives the real demo boot path (`db_worker_photo_boot`) through the browser
-//! stack.  Two tests run in this binary and are serialized by a shared Web Lock
-//! to avoid OPFS conflicts between concurrent workers.
+//! COUPLING: `SchemaVersion` is a hash of `schema.sql`.  This file must be
+//! byte-identical to `examples/wasm-smoke/schema.sql`, which the browser-stack
+//! server uses.  The first test is the permanent drift detector: it fails at
+//! the WebSocket handshake the instant the two schemas diverge.  Maintain
+//! identity with `cp examples/wasm-smoke/schema.sql
+//! examples/dioxus-web-demo/schema.sql`.
 //!
-//! COUPLING: `SchemaVersion` is a hash of the schema SQL source string.
-//! `schema.sql` in this workspace MUST be byte-identical to
-//! `examples/wasm-smoke/schema.sql`, which is what the browser stack server
-//! is compiled against.  The first test (`a_tab_order_reaches_the_replica…`)
-//! acts as the permanent drift detector: it fails at the WebSocket handshake
-//! the moment the two schemas diverge, long before any photo assertion runs.
-//! Maintain the identity with `cp examples/wasm-smoke/schema.sql
-//! examples/dioxus-web-demo/schema.sql` whenever wasm-smoke's schema changes.
+//! ISOLATION: each test uses a distinct `db_worker_boot_*` function whose OPFS
+//! filenames are unique, so Chrome's delayed `FileSystemSyncAccessHandle`
+//! release after `Worker.terminate()` never blocks the next worker's file open.
+//! `DB_ALIVE_LOCK` is shared across all connetto workers on the same origin;
+//! each test holds its own `SUITE_LOCK_*` that serialises that test's lifecycle
+//! and a 200 ms sleep before releasing the lock gives Chrome time to finish the
+//! OPFS cleanup before the next worker starts.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -42,16 +44,13 @@ use web_sys::{
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-// Auth server coordinates matching the browser stack setup.
 const AUTH_BASE: &str = "http://127.0.0.1:18099";
 const AUTH_LANDING: &str = "http://127.0.0.1:18099/dev/landing";
 const AUTH_PROVIDER: &str = "dev-idp";
 const AUTH_USERNAME: &str = "startup";
 
-// Serializes tests in this binary to prevent OPFS worker conflicts.
-const SUITE_LOCK: &str = "connetto-dioxus-photo-suite";
-
-// --- Diesel table schema matching DEMO_TAB_DDL (policy-split, uses logical names) ---
+const SUITE_LOCK_ALIGN: &str = "connetto-dioxus-photo-suite-align";
+const SUITE_LOCK_PHOTO: &str = "connetto-dioxus-photo-suite-photo";
 
 diesel::table! {
     orders (id) {
@@ -90,8 +89,6 @@ struct Photo {
     content_id: Vec<u8>,
     content_state: Option<String>,
 }
-
-// --- Helpers ---
 
 fn stage(msg: &str) {
     web_sys::console::log_1(&msg.into());
@@ -171,7 +168,7 @@ async fn walk_login(login_url: &str) -> (String, String) {
     let req = Request::new_with_str_and_init(&form_url, &init).expect("login request");
     req.headers()
         .set("content-type", "application/x-www-form-urlencoded")
-        .expect("content-type header");
+        .expect("header");
     let resp = global_fetch_req(&req).await;
     assert!(
         resp.ok(),
@@ -180,7 +177,7 @@ async fn walk_login(login_url: &str) -> (String, String) {
         resp.status()
     );
     let final_url = resp.url();
-    let parsed = web_sys::Url::new(&final_url).expect("parse final url");
+    let parsed = web_sys::Url::new(&final_url).expect("parse url");
     let params = parsed.search_params();
     (
         params
@@ -204,11 +201,7 @@ async fn mint_session() -> (String, String) {
         WorkerAuthConfig::new(AUTH_BASE, AUTH_PROVIDER, AUTH_LANDING),
         None,
     );
-    let pending = match auth
-        .acquire::<String, _>(&store)
-        .await
-        .expect("acquire session")
-    {
+    let pending = match auth.acquire::<String, _>(&store).await.expect("acquire") {
         Acquired::NeedLogin(p) => p,
         Acquired::Access(_) => panic!("fresh store cannot refresh silently"),
     };
@@ -233,25 +226,24 @@ fn glue_url() -> String {
     format!("{base}.js")
 }
 
-fn spawn_photo_worker(glue_url: &str) -> Worker {
+fn spawn_worker(glue_url: &str, boot_fn: &str) -> Worker {
     let wasm_url = glue_url
         .strip_suffix(".js")
         .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
     let src = format!(
         "const ch=new BroadcastChannel('connetto-debug');\n\
-         try{{\n  const mod=await import({g:?});\n  await mod.default({{module_or_path:{w:?}}});\n  ch.postMessage('dioxus photo worker ready');\n  await mod.db_worker_photo_boot();\n}}catch(e){{\n  ch.postMessage('dioxus photo worker FAILED: '+e);\n  throw e;\n}}",
+         try{{\n  const mod=await import({g:?});\n  await mod.default({{module_or_path:{w:?}}});\n  await mod.{f}();\n}}catch(e){{\n  ch.postMessage('dioxus worker FAILED: '+e);\n  throw e;\n}}",
         g = glue_url,
         w = wasm_url,
+        f = boot_fn,
     );
     let parts = Array::of1(&JsValue::from_str(&src));
     let opts = web_sys::BlobPropertyBag::new();
     opts.set_type("text/javascript");
-    let blob =
-        web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).expect("bootstrap blob");
+    let blob = web_sys::Blob::new_with_str_sequence_and_options(&parts, &opts).expect("blob");
     let url = web_sys::Url::create_object_url_with_blob(&blob).expect("object url");
     let worker_opts = web_sys::WorkerOptions::new();
     worker_opts.set_type(web_sys::WorkerType::Module);
-    worker_opts.set_name("connetto-dioxus-photo");
     let w = Worker::new_with_options(&url, &worker_opts).expect("spawn worker");
     web_sys::Url::revoke_object_url(&url).ok();
     w
@@ -278,10 +270,10 @@ fn blob_of(bytes: &[u8]) -> web_sys::Blob {
 async fn fetch_bytes(url: &str) -> Vec<u8> {
     let scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
-        .expect("dedicated worker");
+        .expect("worker");
     let resp: web_sys::Response = JsFuture::from(scope.fetch_with_str(url))
         .await
-        .expect("fetch content")
+        .expect("fetch")
         .dyn_into()
         .expect("Response");
     assert!(
@@ -326,18 +318,18 @@ async fn connect_tab(
     (content, conn)
 }
 
-// --- Test 1: alignment proof — version agreement via an orders round trip ---
+// --- Test 1: alignment proof ---
 
 #[wasm_bindgen_test]
 async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
     relay_worker_breadcrumbs();
     play_the_tab();
-    let _serial = locks::hold_lock(SUITE_LOCK).await;
-    let worker = spawn_photo_worker(&glue_url());
+    let _serial = locks::hold_lock(SUITE_LOCK_ALIGN).await;
+    let worker = spawn_worker(&glue_url(), "db_worker_boot_align");
     workers::await_db_worker_ready(&[])
         .await
         .expect("db worker ready");
-    stage("dioxus demo worker booted (align)");
+    stage("dioxus align worker booted");
 
     let (token, identity) = mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
@@ -345,7 +337,7 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
     let (_content, mut conn) = connect_tab(&client_id, token, &identity).await;
     conn.subscribe("align-orders", "SELECT * FROM orders")
         .await
-        .expect("orders subscribe");
+        .expect("subscribe");
     loop {
         let event = conn.pump_one().await.expect("pump");
         assert_ne!(event, ClientEvent::Closed, "connection closed early");
@@ -353,7 +345,7 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
             break;
         }
     }
-    stage("orders subscription ready (align)");
+    stage("orders subscription ready");
 
     let (client, pump) = ConnettoClient::with_pump(conn);
     let (done_tx, done_rx) = oneshot::channel::<()>();
@@ -367,7 +359,7 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
         .select(Order::as_select())
         .live(&client)
         .await
-        .expect("orders live query");
+        .expect("live query");
 
     let qty = 77_i64;
     let id_str = identity.clone();
@@ -383,7 +375,7 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
         .await
         .expect("order insert");
     client.replay_pending().await.expect("replay pending");
-    stage("order written (align)");
+    stage("order written");
 
     loop {
         if live.rows().iter().any(|o| o.quantity == qty) {
@@ -391,26 +383,29 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
         }
         live.changed().await.expect("live refresh");
     }
-    stage("order arrived at replica — version agreement confirmed");
+    stage("order arrived — version agreement confirmed");
 
     drop(live);
     drop(client);
     done_rx.await.expect("pump exited");
     worker.terminate();
+    // Chrome headless does not release the OPFS access handle synchronously on
+    // terminate; per-test file names are the isolation guarantee, this is margin.
+    workers::sleep(core::time::Duration::from_millis(200)).await;
 }
 
-// --- Test 2: photo round trip through stage, commit, resolve, and HTTP fetch ---
+// --- Test 2: photo round trip ---
 
 #[wasm_bindgen_test]
 async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     relay_worker_breadcrumbs();
     play_the_tab();
-    let _serial = locks::hold_lock(SUITE_LOCK).await;
-    let worker = spawn_photo_worker(&glue_url());
+    let _serial = locks::hold_lock(SUITE_LOCK_PHOTO).await;
+    let worker = spawn_worker(&glue_url(), "db_worker_photo_boot");
     workers::await_db_worker_ready(&[])
         .await
         .expect("db worker ready");
-    stage("dioxus demo worker booted (photo)");
+    stage("dioxus photo worker booted");
 
     let (token, identity) = mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
@@ -418,7 +413,7 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     let (content, mut conn) = connect_tab(&client_id, token, &identity).await;
     conn.subscribe("photo-test-photos", "SELECT * FROM photos")
         .await
-        .expect("photos subscribe");
+        .expect("subscribe");
     loop {
         let event = conn.pump_one().await.expect("pump");
         assert_ne!(event, ClientEvent::Closed, "connection closed early");
@@ -440,7 +435,7 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
         .select(Photo::as_select())
         .live(&client)
         .await
-        .expect("photo live query");
+        .expect("live query");
 
     let bytes = photo_bytes();
     let blob = blob_of(&bytes);
@@ -514,11 +509,14 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
         TabResolved::Unavailable => panic!("available photo must resolve"),
     };
     assert_eq!(fetch_bytes(&url).await, bytes);
-    stage("photo bytes verified via HTTP fetch");
+    stage("photo bytes verified");
 
     drop(live);
     drop(content);
     drop(client);
     done_rx.await.expect("pump exited");
     worker.terminate();
+    // Chrome headless does not release the OPFS access handle synchronously on
+    // terminate; per-test file names are the isolation guarantee, this is margin.
+    workers::sleep(core::time::Duration::from_millis(200)).await;
 }
