@@ -7,7 +7,7 @@ use axum::{
 };
 use bytes::Bytes;
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
-use diesel_async::AsyncConnection;
+use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -183,7 +183,10 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
 ///
 /// Four outcomes by manifest state:
 /// - Absent (`file_id`, `caller`) row: 404.
-/// - Already committed (sequential retry after a lost response): idempotent 200.
+/// - Already committed (sequential retry after a lost response, or a second
+///   session staging bytes identical to a file a previous session committed):
+///   idempotent 200, with the state setter re-run so metadata rows inserted
+///   since the first commit are still flipped.
 /// - Uncommitted: verify all chunks are satisfied (stored through this upload OR deduped
 ///   from a committed manifest visible to the caller), then verify identity, then commit.
 ///   The caller must have declared the manifest (ownership is implicit in the composite key).
@@ -220,7 +223,20 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
         .transaction::<StatusCode, ServerError, _>(async move |conn| {
             let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &caller).await? {
                 None => return Err(ServerError::NotFound),
-                Some(db::ManifestState::Committed) => return Ok(StatusCode::OK),
+                Some(db::ManifestState::Committed) => {
+                    // Already committed from a previous call or session: re-run the
+                    // setter so metadata rows inserted since the first commit are
+                    // updated. The setter is UPDATE ... WHERE content_id = $1 and
+                    // is idempotent for rows already at the target state.
+                    diesel::select(crate::functions::connetto_set_content_state(
+                        file_id.as_bytes().to_vec().as_slice(),
+                        "available",
+                        caller.as_str(),
+                    ))
+                    .get_result::<Option<Vec<u8>>>(conn)
+                    .await?;
+                    return Ok(StatusCode::OK);
+                }
                 Some(db::ManifestState::Uncommitted(manifest)) => manifest,
             };
             verify_file_identity(store, &manifest).await?;
