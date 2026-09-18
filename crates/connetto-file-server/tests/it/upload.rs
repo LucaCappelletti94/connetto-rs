@@ -1164,6 +1164,161 @@ async fn commit_setter_failure_rolls_back_retry_succeeds() {
     assert_eq!(resp.status(), StatusCode::OK, "retry commit must succeed");
 }
 
+/// A commit that finds the manifest already committed, a second session
+/// staging bytes identical to a file a previous session committed, must
+/// still run the deployment state setter, because the metadata rows this
+/// session wrote for the same content can only be flipped by that call.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "proves one session's commit sequence and a second session's re-commit in strict order against a recorded setter; splitting hides the causal chain"
+)]
+async fn recommit_of_committed_manifest_still_runs_the_setter() {
+    async fn upload(
+        app: &axum::Router,
+        signer: &connetto_file_server::TicketSigner,
+        data: &[u8],
+    ) -> FileId {
+        let mem = MemStore::new();
+        let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+        let file_id = manifest.file_id();
+        let file_hex = format!("{file_id}");
+        let file_size = u64::try_from(data.len()).unwrap();
+        let ticket = write_payload(signer, &file_id, file_size + 1024);
+        let chunks_json: Vec<serde_json::Value> = manifest
+            .chunks()
+            .iter()
+            .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+            .collect();
+        let body = serde_json::json!({ "total_len": file_size, "chunks": chunks_json });
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "intent"
+        );
+        for c in manifest.chunks() {
+            let chunk_data = mem.read_chunk(&c.hash).await.unwrap();
+            let hash_hex = format!("{}", c.hash);
+            let req = axum::http::Request::builder()
+                .method("PUT")
+                .uri(format!("/chunks/{hash_hex}?t={ticket}"))
+                .header("content-type", "application/octet-stream")
+                .body(axum::body::Body::from(chunk_data))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(req).await.unwrap().status(),
+                StatusCode::NO_CONTENT,
+                "chunk PUT"
+            );
+        }
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/files/{file_hex}/commit?t={ticket}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "commit"
+        );
+        file_id
+    }
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"identical bytes staged by two devices";
+    let file_id = upload(&app, &signer, data).await;
+    let file_hex = format!("{file_id}");
+
+    // Record every setter call from here on, as a deployment's UPDATE by
+    // content_id would be called by the second session's commit.
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    diesel::sql_query(
+        "CREATE TABLE IF NOT EXISTS public.setter_calls (
+             p_file_id BYTEA, p_new_state TEXT, p_caller TEXT
+         )",
+    )
+    .execute(&mut admin_conn)
+    .await
+    .unwrap();
+    diesel::sql_query(
+        "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+             p_file_id BYTEA, p_new_state TEXT, p_caller TEXT
+         ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+             SET search_path TO '' AS $$
+         BEGIN
+             INSERT INTO public.setter_calls VALUES (p_file_id, p_new_state, p_caller);
+             RETURN p_file_id;
+         END; $$",
+    )
+    .execute(&mut admin_conn)
+    .await
+    .unwrap();
+
+    // The second session: a fresh ticket, intent answered by dedup, commit.
+    let manifest = process_file(data, MimeClass::Generic, &MemStore::new())
+        .await
+        .unwrap();
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let body = serde_json::json!({ "total_len": u64::try_from(data.len()).unwrap(), "chunks": chunks_json });
+    let ticket2 = write_payload(&signer, &file_id, 8192);
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_hex}/intent?t={ticket2}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "second intent on the committed manifest"
+    );
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_hex}/commit?t={ticket2}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "second commit on the committed manifest"
+    );
+
+    let calls: i64 = diesel_async::RunQueryDsl::get_result(
+        diesel::sql_query(
+            "SELECT COUNT(*) AS calls FROM public.setter_calls \
+             WHERE p_file_id = $1 AND p_new_state = 'available' AND p_caller = 'alice'",
+        )
+        .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref()),
+        &mut admin_conn,
+    )
+    .await
+    .map(|r: SetterCallCount| r.calls)
+    .unwrap();
+    assert_eq!(
+        calls, 1,
+        "the re-commit must run the setter exactly once so the second session's \
+         metadata row for the same content is flipped"
+    );
+}
+
+#[derive(diesel::QueryableByName)]
+struct SetterCallCount {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    calls: i64,
+}
+
 #[derive(diesel::QueryableByName)]
 struct CommittedRow {
     #[diesel(sql_type = diesel::sql_types::Bool)]
