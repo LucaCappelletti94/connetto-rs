@@ -545,6 +545,28 @@ fn app() -> Element {
         })
     });
 
+    // Seed the failure lists from what the content client already persists,
+    // so a restart does not hide last run's refusals and lost files.
+    {
+        let cc = content.clone();
+        let mut refused_seed = refused_uploads;
+        let mut retired_seed = retired_files;
+        use_hook(move || {
+            spawn(async move {
+                if let Ok(list) = cc.refused_content().await {
+                    for entry in list {
+                        refused_seed.write().push(entry);
+                    }
+                }
+                if let Ok(list) = cc.retired_content().await {
+                    for id in list {
+                        retired_seed.write().push(id);
+                    }
+                }
+            });
+        });
+    }
+
     // Session expiry warning.
     let mut expiry_warn: Signal<Option<String>> = use_signal(|| None);
     {
@@ -604,18 +626,21 @@ fn app() -> Element {
             spawn(async move {
                 let mut srcs = HashMap::new();
                 for photo in &photos {
-                    if photo.content_state.as_deref() != Some("available") {
-                        continue;
-                    }
+                    let available = photo.content_state.as_deref() == Some("available");
                     let Some(fid) = photo_file_id(&photo.content_id) else {
                         continue;
                     };
                     match cc.resolve(fid).await {
+                        // Local bytes render at every state: content this
+                        // device staged answers as Local while it is still
+                        // unsent, so a freshly picked photo shows immediately.
                         Ok(Resolved::Local { bytes, .. }) => {
                             let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
                             srcs.insert(photo.id, format!("data:image/jpeg;base64,{enc}"));
                         }
-                        Ok(Resolved::Remote { url }) => {
+                        // A signed URL is trustworthy only once the server
+                        // says the content is available for this row.
+                        Ok(Resolved::Remote { url }) if available => {
                             srcs.insert(photo.id, url);
                         }
                         _ => {}
@@ -692,6 +717,7 @@ fn app() -> Element {
     let pin_content = content.clone();
     let tidy_content_handle = content.clone();
     let fetch_content = content.clone();
+    let unpin_content = content.clone();
     let retry_content = content.clone();
     let forget_content = content.clone();
 
@@ -1152,6 +1178,21 @@ fn app() -> Element {
                             });
                         },
                         "Pin all photos"
+                    }
+                    button {
+                        onclick: move |_| {
+                            let cc = unpin_content.clone();
+                            spawn(async move {
+                                match cc.unpin_content("photos").await {
+                                    Ok(()) => {
+                                        photo_pin_msg.set(Some("unpinned photos".to_owned()));
+                                    }
+                                    Err(err) => photo_pin_msg
+                                        .set(Some(format!("unpin failed: {err}"))),
+                                }
+                            });
+                        },
+                        "Unpin photos"
                     }
                     button {
                         onclick: move |_| {
