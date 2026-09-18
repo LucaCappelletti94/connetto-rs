@@ -81,9 +81,9 @@ async fn fetch_request(request: &Request) -> Response {
         .expect("a fetch resolves to a Response")
 }
 
-/// Walk a login URL the way a navigating tab would, and return the code and state
-/// the redirect chain delivers.
-pub async fn walk_the_login(login_url: &str) -> (String, String) {
+/// Walk a login URL as `username`, and return the code and state the redirect
+/// chain delivers.
+pub async fn walk_the_login_as(login_url: &str, username: &str) -> (String, String) {
     let response = fetch_str(login_url).await;
     assert!(
         response.ok(),
@@ -94,7 +94,7 @@ pub async fn walk_the_login(login_url: &str) -> (String, String) {
     let form_url = response.url();
     let init = RequestInit::new();
     init.set_method("POST");
-    init.set_body(&"username=startup".into());
+    init.set_body(&format!("username={username}").into());
     let request = Request::new_with_str_and_init(&form_url, &init).expect("build form request");
     request
         .headers()
@@ -118,6 +118,12 @@ pub async fn walk_the_login(login_url: &str) -> (String, String) {
             .get("state")
             .unwrap_or_else(|| panic!("no state in {final_url}")),
     )
+}
+
+/// Walk a login URL the way a navigating tab would, and return the code and state
+/// the redirect chain delivers.
+pub async fn walk_the_login(login_url: &str) -> (String, String) {
+    walk_the_login_as(login_url, "startup").await
 }
 
 /// Play the tab: answer the worker's login request on the login channel exactly as
@@ -188,15 +194,15 @@ pub async fn mint_token() -> String {
 /// to name that identity: writing one the policy would then hide from its own
 /// author is indistinguishable from a rename that did not happen.
 pub async fn mint_session() -> (String, String) {
+    mint_session_as("startup").await
+}
+
+pub async fn mint_session_as(username: &str) -> (String, String) {
     let storage = connetto_web::storage::ReplicaStorage::install().await;
     let keys = IdbKeyStore::open().await.expect("open the key store");
     let device = connetto_web::storage::device_key(&keys)
         .await
         .expect("device key");
-    // A fresh store per call, so every mint starts empty and lands a distinct
-    // server session. The name comes from a counter rather than the clock:
-    // two mints inside one millisecond would otherwise pick the same OPFS
-    // file, and the sahpool VFS allows only one live connection per file.
     static NEXT_MINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db_name = format!("common-mint-{unique}.sqlite");
@@ -210,13 +216,11 @@ pub async fn mint_session() -> (String, String) {
         Acquired::NeedLogin(pending) => pending,
         Acquired::Access(_) => panic!("a fresh store cannot refresh silently"),
     };
-    let (code, state) = walk_the_login(&pending.login_url).await;
+    let (code, state) = walk_the_login_as(&pending.login_url, username).await;
     let session = authenticator
         .complete::<String, _>(&pending, &code, &state, &store)
         .await
         .expect("complete login");
-    // Close the connection before removing the file: deleting an OPFS database
-    // out from under a live handle is what trips the sahpool bookkeeping.
     drop(store);
     storage.delete_db(&db_name).ok();
     (session.access_token, session.user_id)

@@ -152,6 +152,8 @@ pub struct DbWorkerConfig {
     pub(crate) content_namespace: Option<&'static str>,
     /// The transport every content transfer runs under, carrying the idle bound.
     pub(crate) content_http: connetto_file_client::BrowserHttp,
+    /// Broadcast channel opening the first upstream connect attempt.
+    pub(crate) connect_gate: Option<&'static str>,
     /// Schema version presented to the server at handshake.
     pub(crate) schema_version: connetto_core::SchemaVersion,
     /// Custom SQLite functions registered on every connection before any DDL.
@@ -200,6 +202,7 @@ impl DbWorkerConfig {
             hub_meta_name: "",
             content_namespace: None,
             content_http: connetto_file_client::BrowserHttp::new(),
+            connect_gate: None,
             schema_version,
             sql_functions: connetto_client::SqlFunctions::default(),
             policy_tables: connetto_client::PolicyTables::new(),
@@ -270,6 +273,13 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_content_namespace(mut self, namespace: &'static str) -> Self {
         self.content_namespace = Some(namespace);
+        self
+    }
+
+    /// Hold the worker offline until this channel receives any message.
+    #[must_use]
+    pub fn with_connect_gate(mut self, connect_gate: &'static str) -> Self {
+        self.connect_gate = Some(connect_gate);
         self
     }
 
@@ -659,7 +669,10 @@ where
     let replica_key = replica::resolve_replica_key(&key_store, &spec).await?;
     let login = spec.login.take();
     let client_config = replica::build_boot_client_config(config, login, &spec);
-    let transport = replica::try_connect_upstream(config.ws_url).await;
+    let transport = match config.connect_gate {
+        Some(_) => None,
+        None => replica::try_connect_upstream(config.ws_url).await,
+    };
     let (mut worker, content_root_key) =
         replica::open_boot_replica(transport, &spec, config, &client_config, replica_key).await?;
     replica::subscribe_and_boot(&mut worker, config).await?;
