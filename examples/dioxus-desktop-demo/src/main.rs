@@ -555,12 +555,20 @@ fn app() -> Element {
             spawn(async move {
                 if let Ok(list) = cc.refused_content().await {
                     for entry in list {
-                        refused_seed.write().push(entry);
+                        // The event stream is already live, so a fresh
+                        // refusal may arrive before this query returns.
+                        let seen = refused_seed.read().iter().any(|(id, _)| *id == entry.0);
+                        if !seen {
+                            refused_seed.write().push(entry);
+                        }
                     }
                 }
                 if let Ok(list) = cc.retired_content().await {
                     for id in list {
-                        retired_seed.write().push(id);
+                        let seen = retired_seed.read().contains(&id);
+                        if !seen {
+                            retired_seed.write().push(id);
+                        }
                     }
                 }
             });
