@@ -38,7 +38,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, Sessio
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
-use subql::backend::{CdcEvent, Postgres, Value as PgValue};
+use subql::backend::{CdcEvent, Postgres, ScalarFamily, Value as PgValue};
 use subql::term::TermDescription;
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
@@ -64,6 +64,7 @@ use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
+use connetto_core::auth::CapabilitySubject;
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
 pub struct SnapshotPage {
@@ -129,13 +130,47 @@ pub struct SnapshotEstimate {
 /// The caller's own membership rows for a term at registration, read by a
 /// [`SnapshotSource`] that can run the seed under the caller's own binding.
 pub struct TermSeedRead {
-    /// The value rows the membership rows admit, one cell per compared pair
-    /// in the term's stated order, decoded the same way the snapshot decodes,
-    /// so the seed and the snapshot agree by construction.
-    pub rows: Vec<Vec<PgValue<Postgres>>>,
+    /// The value rows the membership rows admit, each the subject granting it
+    /// and then one cell per compared pair in the term's stated order,
+    /// decoded the same way the snapshot decodes, so the seed and the
+    /// snapshot agree by construction.
+    ///
+    /// The subject rides along because a caller is a set. A value two of its
+    /// subjects grant has to survive either one of them losing its
+    /// membership, and only the row's own subject says which withdrawal
+    /// touches it.
+    pub rows: Vec<(PgValue<Postgres>, Vec<PgValue<Postgres>>)>,
     /// Whether the membership table is carried by the publication this source
     /// was configured with, or `None` when it has none to check against.
     pub published: Option<bool>,
+}
+
+/// Every subject the caller holds, typed at the compared column's kind, the
+/// identity first and then each capability key.
+///
+/// A caller is a set, the same set [`CallerBinding`](crate::capability) hands
+/// Postgres, so a membership row naming any of them moves what the filter
+/// admits here exactly as it does in the database.
+///
+/// A subject that cannot be built at the column's kind refuses the whole
+/// registration rather than being dropped from the set, because a seed short
+/// one subject admits fewer rows than the query the caller registered
+/// returns, and nothing later repairs that.
+fn caller_subjects<Key: CapabilityKey>(
+    identity: &str,
+    capabilities: &[CapabilitySubject<Key>],
+    kind: ScalarFamily,
+) -> Result<Vec<PgValue<Postgres>>, SubscribeRefusal> {
+    let mut subjects = Vec::with_capacity(1 + capabilities.len());
+    subjects.push(typed_subscriber(identity, kind).ok_or(SubscribeRefusal::Mistyped)?);
+    for capability in capabilities {
+        let subject = typed_subscriber(&capability.key().to_string(), kind)
+            .ok_or(SubscribeRefusal::Mistyped)?;
+        if !subjects.contains(&subject) {
+            subjects.push(subject);
+        }
+    }
+    Ok(subjects)
 }
 
 /// Why a subscription was not registered, beyond the materializer's own
@@ -289,9 +324,10 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// `seed_sql` run as `caller` under the same binding the snapshot uses,
     /// plus whether `member_table` is carried by the configured publication.
     ///
-    /// `member_keys` names the columns the seed projects in order, one per
-    /// compared pair, which the source resolves against its own catalog to
-    /// pick each row's admitted cells.
+    /// `member_subject` names the column the seed projects first, the subject
+    /// granting each row, and `member_keys` names the columns it projects
+    /// after it in order, one per compared pair. The source resolves all of
+    /// them against its own catalog to pick each row's cells.
     ///
     /// The default cannot seed and returns `Ok(None)`, which refuses the
     /// registration: a term served without its seed admits nobody in silence,
@@ -304,10 +340,11 @@ pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
         &self,
         seed_sql: &str,
         member_table: &str,
+        member_subject: &str,
         member_keys: &[String],
         caller: &Principal<Id, Key>,
     ) -> Result<Option<TermSeedRead>, Self::Error> {
-        let _ = (seed_sql, member_table, member_keys, caller);
+        let _ = (seed_sql, member_table, member_subject, member_keys, caller);
         Ok(None)
     }
 }
@@ -1738,7 +1775,6 @@ where
             return Ok(());
         }
         let mut verdicts = Transitions::new();
-        verdicts.reset(watchers.len());
         if !watchers.is_empty() {
             transitions(
                 &self.auth,
@@ -3537,11 +3573,127 @@ where
             .map_err(transport_err)
     }
 
+    /// Build the term seed one described filter needs, or `None` when it
+    /// names no term.
+    ///
+    /// Refuses rather than narrows. A caller whose subjects cannot all be
+    /// built at the compared column's kind, or whose terms compare at
+    /// different kinds, is turned away, because a seed missing a subject
+    /// admits fewer rows than the query the caller registered returns.
+    ///
+    /// A caller holding keys and no identity is turned away here, which is
+    /// the honest limit of the set. The membership mirror
+    /// [`open_membership_subscription`](Self::open_membership_subscription)
+    /// reads `WHERE <member_subject> = <caller function>()`, which renders
+    /// the identity and has no spelling for a subject, so letting a key-only
+    /// caller register would install its term and then fail it a step later.
+    async fn seed_for_terms(
+        &self,
+        terms: &[TermDescription],
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<TermSeed>, SubscribeRefusal> {
+        let seed = match terms {
+            [] => None,
+            all => {
+                let identity = state
+                    .principal
+                    .identity()
+                    .ok_or(SubscribeRefusal::Anonymous)?;
+                // One subject kind across every term, membership or caller.
+                // One subject set serves every membership subquery and the
+                // caller comparison reads the same identity, so terms
+                // comparing at different kinds cannot share them.
+                let mut kinds = all.iter().map(|term| match term {
+                    TermDescription::Membership(membership) => membership.subject_kind,
+                    TermDescription::Caller(caller) => caller.kind,
+                });
+                let first_kind = kinds.next().expect("the slice is non-empty");
+                if kinds.any(|kind| kind != first_kind) {
+                    return Err(SubscribeRefusal::Mistyped);
+                }
+                let subjects = caller_subjects(
+                    &identity.user_id.to_string(),
+                    state.principal.capabilities(),
+                    first_kind,
+                )?;
+                let identity_value = subjects
+                    .first()
+                    .cloned()
+                    .expect("the identity is the first subject");
+                // A caller comparison admits the one session value, never the
+                // set, so it is stated only when a term actually compares it.
+                let subscriber = all
+                    .iter()
+                    .any(|term| matches!(term, TermDescription::Caller(_)))
+                    .then_some(identity_value);
+                let mut term_values = Vec::new();
+                for term in all {
+                    // A caller comparison seeds itself from the subscriber:
+                    // there is no membership table to read.
+                    let TermDescription::Membership(membership) = term else {
+                        continue;
+                    };
+                    let member_keys: Vec<String> = membership
+                        .pairs
+                        .iter()
+                        .map(|pair| pair.member_key.clone())
+                        .collect();
+                    let read = self
+                        .snapshot_source
+                        .term_seed(
+                            &membership.seed_sql,
+                            &membership.member_table,
+                            &membership.member_subject,
+                            &member_keys,
+                            &state.principal,
+                        )
+                        .await
+                        .map_err(|err| SubscribeRefusal::Seed(err.to_string()))?
+                        .ok_or(SubscribeRefusal::Unseedable)?;
+                    match read.published {
+                        Some(true) => {}
+                        Some(false) => {
+                            return Err(SubscribeRefusal::Unpublished(
+                                membership.member_table.clone(),
+                            ));
+                        }
+                        None => return Err(SubscribeRefusal::NoPublication),
+                    }
+                    // Registration refuses a null cell inside a stated row,
+                    // and a null subject with it, so a row carrying either is
+                    // dropped whole rather than half-stated.
+                    let rows: Vec<(PgValue<Postgres>, Vec<PgValue<Postgres>>)> = read
+                        .rows
+                        .into_iter()
+                        .filter(|(subject, values)| {
+                            !core::iter::once(subject)
+                                .chain(values)
+                                .any(|value| matches!(value, PgValue::Missing | PgValue::Null))
+                        })
+                        .collect();
+                    let columns: Vec<String> = membership
+                        .pairs
+                        .iter()
+                        .map(|pair| pair.column.clone())
+                        .collect();
+                    term_values.push((columns, rows));
+                }
+                Some(TermSeed {
+                    subscriber,
+                    subjects,
+                    term_values,
+                })
+            }
+        };
+        Ok(seed)
+    }
+
     /// Translate and register one subscription, seeding a membership term.
     ///
     /// A filter naming no term registers as before. A term is seeded per R27:
-    /// the subscriber typed at `member_subject`'s own catalog kind and the
-    /// values read from the membership table as the caller. The materializer
+    /// every subject the caller holds typed at `member_subject`'s own catalog
+    /// kind and the values read from the membership table as the caller,
+    /// each value row under the subject granting it. The materializer
     /// lock is held across the seed read and the register (decision 11), so
     /// no dispatch lands between the seed's snapshot and the engine watching,
     /// which would silently lose that membership change for good. The
@@ -3564,81 +3716,7 @@ where
         let terms = materializer
             .describe_terms(consumer_id, &pg_sql, &sub.spec.binds)
             .unwrap_or_default();
-        let seed = match terms.as_slice() {
-            [] => None,
-            all => {
-                let identity = state
-                    .principal
-                    .identity()
-                    .ok_or(SubscribeRefusal::Anonymous)?;
-                // One subscriber kind across every term, membership or caller:
-                // the engine builds one typed subscriber per registration, so
-                // terms comparing at different kinds cannot share it.
-                let mut kinds = all.iter().map(|term| match term {
-                    TermDescription::Membership(membership) => membership.subject_kind,
-                    TermDescription::Caller(caller) => caller.kind,
-                });
-                let first_kind = kinds.next().expect("the slice is non-empty");
-                if kinds.any(|kind| kind != first_kind) {
-                    return Err(SubscribeRefusal::Mistyped);
-                }
-                let subscriber = typed_subscriber(&identity.user_id.to_string(), first_kind)
-                    .ok_or(SubscribeRefusal::Mistyped)?;
-                let mut term_values = Vec::new();
-                for term in all {
-                    // A caller comparison seeds itself from the subscriber:
-                    // there is no membership table to read.
-                    let TermDescription::Membership(membership) = term else {
-                        continue;
-                    };
-                    let member_keys: Vec<String> = membership
-                        .pairs
-                        .iter()
-                        .map(|pair| pair.member_key.clone())
-                        .collect();
-                    let read = self
-                        .snapshot_source
-                        .term_seed(
-                            &membership.seed_sql,
-                            &membership.member_table,
-                            &member_keys,
-                            &state.principal,
-                        )
-                        .await
-                        .map_err(|err| SubscribeRefusal::Seed(err.to_string()))?
-                        .ok_or(SubscribeRefusal::Unseedable)?;
-                    match read.published {
-                        Some(true) => {}
-                        Some(false) => {
-                            return Err(SubscribeRefusal::Unpublished(
-                                membership.member_table.clone(),
-                            ));
-                        }
-                        None => return Err(SubscribeRefusal::NoPublication),
-                    }
-                    // Registration refuses a null cell inside a stated row, so
-                    // a row with one is dropped whole rather than half-stated.
-                    let rows: Vec<Vec<PgValue<Postgres>>> = read
-                        .rows
-                        .into_iter()
-                        .filter(|row| {
-                            !row.iter()
-                                .any(|value| matches!(value, PgValue::Missing | PgValue::Null))
-                        })
-                        .collect();
-                    let columns: Vec<String> = membership
-                        .pairs
-                        .iter()
-                        .map(|pair| pair.column.clone())
-                        .collect();
-                    term_values.push((columns, rows));
-                }
-                Some(TermSeed {
-                    subscriber,
-                    term_values,
-                })
-            }
-        };
+        let seed = self.seed_for_terms(&terms, state).await?;
         let member_tables = Self::member_tables_of(&terms);
         // Engine-driven reads run on the dispatch path, so they spend the
         // shared re-execution bound: a slow read delays everyone's stream.
@@ -4643,7 +4721,6 @@ where
         let mut auth_attempt: u32 = 0;
         let mut paused = false;
         loop {
-            verdicts.reset(watchers.len());
             match transitions(&self.auth, event, self.catalog.as_ref(), watchers, verdicts).await {
                 Ok(()) => {
                     if paused {
@@ -4929,7 +5006,46 @@ async fn flush<T: Transport>(
 
 #[cfg(test)]
 mod tests {
-    use super::page_rows;
+    use connetto_core::auth::CapabilitySubject;
+    use subql::backend::{ScalarFamily, Value as PgValue};
+
+    use super::{SubscribeRefusal, caller_subjects, page_rows};
+
+    /// A caller is a set, so every key it holds is seeded beside the
+    /// identity. A membership row naming a key admits rows in the database,
+    /// and a seed that named the identity alone would admit fewer.
+    #[test]
+    fn a_caller_is_its_identity_and_every_key_it_holds() {
+        let keys = [
+            CapabilitySubject::<String>::new("key:a"),
+            CapabilitySubject::<String>::new("key:b"),
+        ];
+        let subjects = caller_subjects("alice", &keys, ScalarFamily::String)
+            .expect("a text subject column takes any of them");
+        assert_eq!(
+            subjects,
+            vec![
+                PgValue::String("alice".to_owned()),
+                PgValue::String("key:a".to_owned()),
+                PgValue::String("key:b".to_owned()),
+            ]
+        );
+    }
+
+    /// A key the subject column cannot hold refuses the registration. Dropping
+    /// it would register a subscription admitting fewer rows than the query
+    /// the caller sent returns, and no later membership change repairs that.
+    #[test]
+    fn a_key_the_subject_column_cannot_hold_refuses_rather_than_being_dropped() {
+        let keys = [CapabilitySubject::<String>::new("key:a")];
+        let refusal = caller_subjects(
+            "0193c8e5-1111-7abc-8def-000000000000",
+            &keys,
+            ScalarFamily::Uuid,
+        )
+        .expect_err("the identity reads as a uuid and the key cannot");
+        assert!(matches!(refusal, SubscribeRefusal::Mistyped), "{refusal}");
+    }
 
     /// A page's rows come from a byte budget divided by the width Postgres
     /// predicts, so a table of wide rows pages smaller under the same budget.

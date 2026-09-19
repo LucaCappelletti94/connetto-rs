@@ -49,8 +49,8 @@ use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
 use subql::visibility::store::{
-    Enumeration, KeyedRequery, Materialisation, Replay, Replayer, StoreDiff, StoreDiffError,
-    UncoveredReason,
+    Enumeration, KeyedRequery, Materialisation, Replay, Replayer, Requeries, StoreDiff,
+    StoreDiffError, UncoveredReason,
 };
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
@@ -1161,8 +1161,8 @@ where
         event: &'a subql::ChangeEvent,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
         Box::pin(async move {
-            let diff = match self.shapes.diff(event) {
-                Ok(diff) => diff,
+            let (diff, requeries) = match self.shapes.diff(event) {
+                Ok(moved) => moved,
                 // A truncate names no row, so nothing single-row moved and
                 // there is nothing here to apply. Everything else means the
                 // difference is not knowable, which is not the same as empty.
@@ -1173,7 +1173,12 @@ where
                 .apply(&diff)
                 .await
                 .map_err(|err| UpkeepError::Write(err.to_string()))?;
-            let replayed = self.reconcile(&diff).await?;
+            // The obligation the queries carry is discharged here, before
+            // the event is delivered and before any replacement is read.
+            // Until they have run the store still states what the change took
+            // away, and in the allow direction that is a row handed to
+            // somebody whose access has already gone.
+            let replayed = self.reconcile(requeries).await?;
             // Read after the store is level, never before: a replacement
             // snapshot produced against the old facts would hand back exactly
             // the rows the change took away.
@@ -1253,7 +1258,10 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     ///
     /// [`UpkeepError::Replay`] when the query cannot be run or its rows cannot
     /// be read, and [`UpkeepError::Write`] when the reconcile is refused.
-    async fn reconcile(&self, diff: &StoreDiff<'_, Postgres>) -> Result<Vec<GrantMove>, UpkeepError>
+    async fn reconcile(
+        &self,
+        requeries: Requeries<'_, Postgres>,
+    ) -> Result<Vec<GrantMove>, UpkeepError>
     where
         Id: Display + Send + Sync,
         Key: CapabilityKey,
@@ -1265,7 +1273,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     {
         use diesel_async::RunQueryDsl as _;
 
-        if diff.requeries.is_empty() {
+        if requeries.is_empty() {
             return Ok(Vec::new());
         }
         let outputs = self
@@ -1283,7 +1291,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             outputs: &outputs,
         };
         let mut moves = Vec::new();
-        for requery in &diff.requeries {
+        for requery in requeries.as_slice() {
             match requery {
                 subql::visibility::store::Requery::Keyed(k) => {
                     let query = bind_key(sql_query(k.query.sql()).into_boxed(), &k.key)?;
@@ -1406,7 +1414,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     /// A grant given counts as much as a grant taken away: rows the caller may
     /// now see exist already and no row event will announce them, so only a
     /// replacement carries them.
-    fn moved(&self, event: &subql::ChangeEvent, diff: &StoreDiff<'_, Postgres>) -> Vec<GrantMove> {
+    fn moved(&self, event: &subql::ChangeEvent, diff: &StoreDiff) -> Vec<GrantMove> {
         use subql::backend::CdcEvent as _;
 
         let catalog = self.shapes.catalog();

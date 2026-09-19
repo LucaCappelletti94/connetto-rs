@@ -55,8 +55,7 @@ use subql::emit::{
 };
 use subql::patchset::SqliteAdapter;
 use subql::reexec::{
-    AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, ResolvedReads, RowDelta,
-    RowsUpdate, ScalarUpdate,
+    AsyncConnector, AsyncMode, AutoResolvingEngine, ReExecError, RowDelta, RowsUpdate, ScalarUpdate,
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
@@ -691,27 +690,41 @@ fn wire_binds(binds: &[BindValue]) -> Vec<PgValue<Postgres>> {
         .collect()
 }
 
-/// One term's seed: the compared columns and the value rows the caller
-/// currently matches, one cell per column in the stated order.
-pub type TermValueRows = (Vec<String>, Vec<Vec<PgValue<Postgres>>>);
+/// One term's seed: the compared columns and the value rows the caller's
+/// subjects currently match, each row carrying the subject that grants it and
+/// then one cell per column in the stated order.
+pub type TermValueRows = (
+    Vec<String>,
+    Vec<(PgValue<Postgres>, Vec<PgValue<Postgres>>)>,
+);
 
-/// What a term registration is seeded with: the subscriber it filters for and
-/// the values each compared column currently admits, read from the membership
+/// What a term registration is seeded with: the value a caller comparison
+/// admits, the subjects a membership subquery matches the caller by, and the
+/// values each compared column currently admits, read from the membership
 /// table as the caller.
 #[derive(Clone)]
 pub struct TermSeed {
-    /// The caller, typed at `member_subject`'s kind (see [`typed_subscriber`]).
-    pub subscriber: PgValue<Postgres>,
+    /// The one value a caller comparison admits, typed at the compared
+    /// column's kind (see [`typed_subscriber`]), and `None` when no term
+    /// compares the caller. One value rather than a set, because the
+    /// registered SQL compares one session value, so a union there would
+    /// deliver rows the source query does not.
+    pub subscriber: Option<PgValue<Postgres>>,
+    /// Every subject the caller holds, typed at `member_subject`'s kind, the
+    /// identity and each capability key it carries. A membership row naming
+    /// any of them admits rows, so a subject left out admits fewer rows than
+    /// the query itself returns.
+    pub subjects: Vec<PgValue<Postgres>>,
     /// Per term, its columns and value rows.
     pub term_values: Vec<TermValueRows>,
 }
 
-/// Build the subscriber value at `member_subject`'s own scalar kind.
+/// Build one subject value at `member_subject`'s own scalar kind.
 ///
 /// `TermKey::String` and `TermKey::Uuid` are different variants inside subql's
-/// lookup, so a string identity against a column of another kind admits nobody
-/// in silence. `None` refuses the term instead: an identity that cannot be
-/// read at the column's kind cannot be a member.
+/// lookup, so a string subject against a column of another kind admits nobody
+/// in silence. `None` refuses the term instead: a subject that cannot be read
+/// at the column's kind cannot be a member.
 #[must_use]
 pub fn typed_subscriber(identity: &str, kind: ScalarFamily) -> Option<PgValue<Postgres>> {
     match kind {
@@ -1144,21 +1157,21 @@ where
     /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
     pub async fn dispatch(&mut self, event: &ChangeEvent) -> Result<Dispatched, MaterializerError> {
-        let notifications = self
+        // The drain is the only way to the in-process half, which is what
+        // keeps one delivery path for every computed movement (R82). Whole-row
+        // captures, scalar extremes and keyed rows arrive as the read half,
+        // everything the fold answered without a round trip as the other, and
+        // both are read off one value. An event that queued no read drains in
+        // place, so the ordinary event still pays nothing for the call.
+        let settled = self
             .engine
             .consumers(event)
             .await
-            .map_err(MaterializerError::Dispatch)?;
-        // Resolve reads queued by this event. `pending_read_count` is the
-        // signal: non-zero means whole-row captures, scalar extremes, or keyed
-        // rows need a database round-trip. The notifications' rows_updates and
-        // row_deltas are always empty (the inner engine holds no connector);
-        // resolved data arrives only through resolve_collect.
-        let resolved = if self.engine.pending_read_count() > 0 {
-            self.engine.resolve_collect().await.map_err(reexec_error)?
-        } else {
-            ResolvedReads::default()
-        };
+            .map_err(MaterializerError::Dispatch)?
+            .resolve_collect()
+            .await;
+        let notifications = settled.dispatched;
+        let resolved = settled.reads.map_err(reexec_error)?;
         Self::log_transitions(&resolved.transitions);
         let cursor = event
             .checkpoint()
@@ -1801,11 +1814,12 @@ where
     }
 
     /// Register a pre-translated Postgres `SELECT`, optionally seeded with the
-    /// subscriber and the values its membership terms currently admit.
+    /// caller's subjects and the values its membership terms currently admit.
     ///
     /// The seed rides the registration itself because subql maintains the
-    /// membership sets from the change stream only after it: a term registered
-    /// without a subscriber is refused, and one registered without values
+    /// membership sets from the change stream only after it. A membership term
+    /// registered with no subject is refused, a caller comparison registered
+    /// with no value it admits is refused, and one registered without values
     /// admits nobody until a membership row changes.
     ///
     /// An aggregate over a row-level-security table cannot share one fold
@@ -1840,7 +1854,10 @@ where
             let mut request =
                 SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
             if let Some(seed) = seed {
-                request = request.subscriber(seed.subscriber);
+                if let Some(subscriber) = seed.subscriber {
+                    request = request.subscriber(subscriber);
+                }
+                request = request.subjects(seed.subjects);
                 for (columns, rows) in seed.term_values {
                     request = request.term_values(columns, rows);
                 }
@@ -2421,13 +2438,14 @@ mod membership_term_tests {
             "the seed reads the membership table, got {}",
             membership.seed_sql
         );
-        let subscriber = typed_subscriber("alice", membership.subject_kind)
+        let subject = typed_subscriber("alice", membership.subject_kind)
             .expect("a text subject takes any string");
         let seed = TermSeed {
-            subscriber,
+            subscriber: None,
+            subjects: vec![subject.clone()],
             term_values: vec![(
                 vec![membership.pairs[0].column.clone()],
-                vec![vec![PgValue::Int(7)]],
+                vec![(subject, vec![PgValue::Int(7)])],
             )],
         };
         let registration = match mat.register_translated(
