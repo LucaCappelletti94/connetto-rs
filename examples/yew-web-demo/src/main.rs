@@ -29,6 +29,7 @@
 //! the served URL in several windows.
 
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
@@ -38,9 +39,12 @@ use connetto_client::{
     Replica,
 };
 use connetto_core::custody::Custody;
+use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::{PendingWork, WorkerAuthConfig};
 use connetto_web::unlock::{AccountChoice, serve_account_choice};
-use connetto_web::{MessageTransport, deliver_login_code, leader, locks, workers};
+use connetto_web::{
+    MessageTransport, TabContent, TabResolved, deliver_login_code, leader, locks, workers,
+};
 use connetto_yew::use_live;
 use diesel::prelude::*;
 use wasm_bindgen::closure::Closure;
@@ -64,18 +68,21 @@ const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 /// yields the version the server advertises, so this build presents a matching
 /// version at handshake and is not rejected as stale.
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
-/// The synced replica schema (worker first boot). Matches `schema.sql`.
-const DEMO_SQLITE_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT; \
-     CREATE TABLE order_lines (order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), line_no INTEGER NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0), PRIMARY KEY (order_id, line_no)) STRICT; \
-     CREATE TABLE photos (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), content_id BLOB NOT NULL, content_state TEXT) STRICT;";
-/// The tab mirror schema: both tiers in the tab's main schema, because every
-/// relayed patch applies to main. The hub, not the tab, keeps the tiers apart.
-const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT; \
-     CREATE TABLE order_lines (order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), line_no INTEGER NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0), PRIMARY KEY (order_id, line_no)) STRICT; \
-     CREATE TABLE photos (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), content_id BLOB NOT NULL, content_state TEXT) STRICT; \
+/// The synced replica schema (worker first boot, policy-split by build.rs from schema.sql +
+/// policies.sql). The tab mirror uses a simpler non-split DDL below.
+const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
+/// The tab mirror schema: simple tables in the tab's main schema. The hub does not use
+/// policy views on the tab side; the server's CDC already filters rows by the user's identity.
+const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, owner_id TEXT NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT; \
+     CREATE TABLE order_lines (order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), line_no INTEGER NOT NULL, owner_id TEXT NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0), PRIMARY KEY (order_id, line_no)) STRICT; \
+     CREATE TABLE photos (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), owner_id TEXT NOT NULL, content_id BLOB NOT NULL, content_state TEXT) STRICT; \
      CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
+/// The extra upstream subscription for photos.
+const PHOTO_QUERY: &str = "SELECT * FROM photos";
+/// SQLite function name a translated policy calls for the caller identity.
+const CALLER_FUNCTION: &str = "current_app_user";
 /// The OPFS file holding the worker's durable synced replica.
 const DB_NAME: &str = "connetto-relay.sqlite";
 /// The shared leader lock every window of this app races.
@@ -98,6 +105,7 @@ const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
     }
 }
@@ -113,6 +121,7 @@ diesel::table! {
     photos (id) {
         id -> rosetta_uuid::sql_types::Uuid,
         order_id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         content_id -> diesel::sql_types::Binary,
         content_state -> Nullable<diesel::sql_types::Text>,
     }
@@ -123,6 +132,7 @@ diesel::table! {
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Order {
     id: rosetta_uuid::Uuid,
+    owner_id: String,
     quantity: i64,
 }
 
@@ -132,6 +142,17 @@ struct Order {
 struct Note {
     id: i64,
     body: String,
+}
+
+#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[diesel(table_name = photos)]
+#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
+struct Photo {
+    id: rosetta_uuid::Uuid,
+    order_id: rosetta_uuid::Uuid,
+    owner_id: String,
+    content_id: Vec<u8>,
+    content_state: Option<String>,
 }
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
@@ -308,12 +329,15 @@ async fn run_db_worker() -> Result<(), JsValue> {
             .with_frontend_ddl(FRONTEND_DDL)
             .with_upstream_sub_id("db-upstream")
             .with_upstream_query(DEMO_QUERY)
+            .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_content_namespace("connetto-photo-content")
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(PolicyTables::from_translation(
                 POLICY_TABLES.iter().copied(),
                 POLICY_VIEWS.iter().copied(),
             ))
+            .with_caller_function(CALLER_FUNCTION)
             .with_auth(auth)
             .with_auth_db_name("connetto-auth.sqlite")
             .with_unlock(true)
@@ -425,6 +449,8 @@ fn glue_url() -> String {
 /// liveness lock (dropped on unmount, so the worker reaps this tab).
 struct Boot {
     client: ConnettoClient<Tab>,
+    /// The tab's content lane, split off the transport before the client took it.
+    content: Rc<TabContent<BroadcastChannel>>,
     _membership: leader::Membership,
     _tab_lock: locks::HeldLock,
     /// Passkey custody level as of this boot, read from the worker after it settled.
@@ -458,19 +484,16 @@ async fn boot_window() -> Result<Boot, JsValue> {
     let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
     let wire = format!("connetto-wire-{client_id}-boot");
     workers::announce_tab(&wire).await?;
-    let transport =
+    let mut transport =
         MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let content = Rc::new(TabContent::new(&mut transport));
     let config = ClientConfig::new(client_id.clone())
         .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
         .with_sql_functions(uuidv4_functions())
-        .with_policy_tables(PolicyTables::from_translation(
-            POLICY_TABLES.iter().copied(),
-            POLICY_VIEWS.iter().copied(),
-        ))
-        // A low threshold so the free-up-space affordance reclaims after a
-        // modest deletion, rather than only once the freelist is a quarter of
-        // the file. Trimming still runs only when the pass is called.
+        // No with_policy_tables: the tab mirror uses the simple non-split DDL and the
+        // server's CDC already filters rows to the authenticated user's identity.
+        // A low threshold so the free-up-space affordance reclaims after a modest deletion.
         .with_trim_threshold(5);
     let conn = ConnettoConnection::connect(
         transport,
@@ -493,6 +516,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
     spawn_local(pump);
     Ok(Boot {
         client,
+        content,
         _membership: membership,
         _tab_lock: tab_lock,
         custody,
@@ -573,6 +597,16 @@ const CSS: &str = r"
 struct ClientHandle(Rc<ConnettoClient<Tab>>);
 
 impl PartialEq for ClientHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// A cheaply clonable, identity-compared content handle for Dashboard props.
+#[derive(Clone)]
+struct ContentHandle(Rc<TabContent<BroadcastChannel>>);
+
+impl PartialEq for ContentHandle {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
     }
@@ -782,6 +816,7 @@ fn use_provider_listener() {
 #[hook]
 fn use_boot_window_effect(
     client: UseStateHandle<Option<ClientHandle>>,
+    content: UseStateHandle<Option<ContentHandle>>,
     status: UseStateHandle<String>,
     boot_hold: Rc<RefCell<Option<Boot>>>,
     custody: UseStateHandle<Custody>,
@@ -791,6 +826,7 @@ fn use_boot_window_effect(
             match boot_window().await {
                 Ok(boot) => {
                     custody.set(boot.custody);
+                    content.set(Some(ContentHandle(Rc::clone(&boot.content))));
                     let mut events = boot.client.events();
                     client.set(Some(ClientHandle(Rc::new(boot.client.clone()))));
                     status.set("connected".to_owned());
@@ -811,6 +847,8 @@ fn use_boot_window_effect(
 #[function_component(App)]
 fn app() -> Html {
     let client = use_state(|| None::<ClientHandle>);
+    // The content lane split off the transport at boot; held here so Dashboard can use it.
+    let content = use_state(|| None::<ContentHandle>);
     let status = use_state(|| "connecting to the connetto stack".to_owned());
     // The boot tokens live as long as the app: dropping them on page close
     // resigns leadership and frees the tab lock, which reaps this tab.
@@ -865,6 +903,7 @@ fn app() -> Html {
 
     use_boot_window_effect(
         client.clone(),
+        content.clone(),
         status.clone(),
         boot_hold.clone(),
         custody.clone(),
@@ -1157,8 +1196,9 @@ fn app() -> Html {
         }
     };
 
-    let dashboard = if let Some(handle) = &*client {
-        html! { <Dashboard client={handle.clone()} /> }
+    let dashboard = if let (Some(handle), Some(content_handle)) = (&*client, &*content) {
+        let id = (*identity).clone().unwrap_or_default();
+        html! { <Dashboard client={handle.clone()} content={content_handle.clone()} identity={id} /> }
     } else {
         html! { <p>{ "Connecting to the DB worker and the connetto stack..." }</p> }
     };
@@ -1182,20 +1222,55 @@ fn app() -> Html {
 #[derive(Properties, PartialEq)]
 struct DashboardProps {
     client: ClientHandle,
+    content: ContentHandle,
+    identity: String,
 }
 
 #[function_component(Dashboard)]
 fn dashboard(props: &DashboardProps) -> Html {
     let client = (*props.client.0).clone();
+    let identity = props.identity.clone();
 
     let orders = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
+    let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
 
     let order_rows = orders.value();
     let note_rows = notes.value();
+    let photo_rows = photos.value();
     let order_count = order_rows.len();
     let order_sum: i64 = order_rows.iter().map(|row| row.quantity).sum();
     let note_count = note_rows.len();
+    let photo_count = photo_rows.len();
+
+    // Resolved signed URLs for available photos. Refetched (not cached) whenever the
+    // set of available photos changes, so a stale ticket never wedges the panel.
+    let photo_urls = use_state(HashMap::<rosetta_uuid::Uuid, String>::new);
+    {
+        let content = Rc::clone(&props.content.0);
+        let photo_urls = photo_urls.clone();
+        let available: Vec<(rosetta_uuid::Uuid, Vec<u8>)> = photo_rows
+            .iter()
+            .filter(|p| p.content_state.as_deref() == Some("available"))
+            .map(|p| (p.id, p.content_id.clone()))
+            .collect();
+        let key: Vec<rosetta_uuid::Uuid> = available.iter().map(|(id, _)| *id).collect();
+        use_effect_with(key, move |_| {
+            spawn_local(async move {
+                let mut new_urls = HashMap::new();
+                for (id, content_id) in available {
+                    if let Ok(bytes) = <[u8; 32]>::try_from(content_id.as_slice()) {
+                        let file_id = FileId::from_bytes(bytes);
+                        if let TabResolved::Remote { url } = content.resolve(file_id).await {
+                            new_urls.insert(id, url);
+                        }
+                    }
+                }
+                photo_urls.set(new_urls);
+            });
+            || ()
+        });
+    }
 
     let note_text = use_state(String::new);
 
@@ -1205,9 +1280,8 @@ fn dashboard(props: &DashboardProps) -> Html {
     {
         let client = client.clone();
         let footprint = footprint.clone();
-        let order_count = order_rows.len();
-        let note_count = note_rows.len();
-        use_effect_with((order_count, note_count), move |_| {
+        let covered = order_count + note_count + photo_count;
+        use_effect_with(covered, move |_| {
             let client = client.clone();
             let footprint = footprint.clone();
             spawn_local(async move {
@@ -1223,14 +1297,19 @@ fn dashboard(props: &DashboardProps) -> Html {
 
     let add_order = {
         let client = client.clone();
+        let identity = identity.clone();
         Callback::from(move |_| {
             let client = client.clone();
+            let identity = identity.clone();
             spawn_local(async move {
                 let quantity = fresh_quantity();
                 let result = client
                     .with_conn(move |conn| {
                         diesel::insert_into(orders::table)
-                            .values(orders::quantity.eq(quantity))
+                            .values((
+                                orders::owner_id.eq(identity.as_str()),
+                                orders::quantity.eq(quantity),
+                            ))
                             .execute(conn.conn())
                     })
                     .await;
@@ -1295,6 +1374,84 @@ fn dashboard(props: &DashboardProps) -> Html {
                     }
                 }
             });
+        })
+    };
+
+    // Pick a photo file, stage its bytes through the content lane, and insert the rows.
+    // A new order is created for each photo so the foreign key is always satisfied.
+    let pick_photo = if identity.is_empty() {
+        Callback::noop()
+    } else {
+        let client = client.clone();
+        let content = Rc::clone(&props.content.0);
+        let identity = identity.clone();
+        Callback::from(move |event: Event| {
+            let input: HtmlInputElement = event.target_unchecked_into();
+            if let Some(files) = input.files()
+                && let Some(file) = files.get(0)
+            {
+                let client = client.clone();
+                let content = Rc::clone(&content);
+                let identity = identity.clone();
+                spawn_local(async move {
+                    let blob: web_sys::Blob = file.into();
+                    let stage_identity = identity.clone();
+                    let result = content
+                        .stage(&blob, MimeClass::Jpeg, &client, move |conn, file_id| {
+                            conn.transaction(|conn| {
+                                let before_orders: std::collections::HashSet<rosetta_uuid::Uuid> =
+                                    orders::table
+                                        .select(orders::id)
+                                        .load::<rosetta_uuid::Uuid>(conn)?
+                                        .into_iter()
+                                        .collect();
+                                diesel::insert_into(orders::table)
+                                    .values((
+                                        orders::owner_id.eq(stage_identity.as_str()),
+                                        orders::quantity.eq(1_i64),
+                                    ))
+                                    .execute(conn)?;
+                                let order_id = orders::table
+                                    .select(orders::id)
+                                    .load::<rosetta_uuid::Uuid>(conn)?
+                                    .into_iter()
+                                    .find(|id| !before_orders.contains(id))
+                                    .expect("order minted");
+                                let before_photos: std::collections::HashSet<rosetta_uuid::Uuid> =
+                                    photos::table
+                                        .select(photos::id)
+                                        .load::<rosetta_uuid::Uuid>(conn)?
+                                        .into_iter()
+                                        .collect();
+                                diesel::insert_into(photos::table)
+                                    .values((
+                                        photos::order_id.eq(order_id),
+                                        photos::owner_id.eq(stage_identity.as_str()),
+                                        photos::content_id.eq(file_id.as_bytes().to_vec()),
+                                        photos::content_state.eq::<Option<String>>(None),
+                                    ))
+                                    .execute(conn)?;
+                                Ok::<_, diesel::result::Error>(
+                                    photos::table
+                                        .select(photos::id)
+                                        .load::<rosetta_uuid::Uuid>(conn)?
+                                        .into_iter()
+                                        .find(|id| !before_photos.contains(id))
+                                        .expect("photo minted"),
+                                )
+                            })
+                        })
+                        .await;
+                    match result {
+                        Ok(_) => {
+                            client.replay_pending().await.ok();
+                        }
+                        Err(err) => {
+                            tracing::error!(error = %err, "photo stage failed");
+                        }
+                    }
+                });
+            }
         })
     };
 
@@ -1370,6 +1527,10 @@ fn dashboard(props: &DashboardProps) -> Html {
     let notes_error = notes.error().map(|err| {
         html! { <p style="color:#b00;">{ format!("notes error: {err}") }</p> }
     });
+    let photos_error = photos.error().map(|err| {
+        html! { <p style="color:#b00;">{ format!("photos error: {err}") }</p> }
+    });
+    let urls = (*photo_urls).clone();
 
     html! {
         <div class="panes">
@@ -1377,7 +1538,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                 <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ format!("count {order_count}, total quantity {order_sum}. Converges across every window through Postgres.") }</p>
                 <div class="row">
-                    <button onclick={add_order}>{ "Add order" }</button>
+                    <button onclick={add_order} disabled={identity.is_empty()}>{ "Add order" }</button>
                     if newest_order.is_some() {
                         <button onclick={remove_order}>{ "Remove newest" }</button>
                     }
@@ -1392,6 +1553,33 @@ fn dashboard(props: &DashboardProps) -> Html {
                                 <tr key={id.clone()}>
                                     <td>{ id }</td>
                                     <td>{ row.quantity.to_string() }</td>
+                                </tr>
+                            }
+                        }) }
+                    </tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2>{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
+                <p>{ format!("count {photo_count}. Pick an image file to stage and upload through the content route.") }</p>
+                <div class="row">
+                    <input type="file" accept="image/*" onchange={pick_photo} disabled={identity.is_empty()} />
+                </div>
+                { photos_error.unwrap_or_default() }
+                <table>
+                    <thead><tr><th>{ "id" }</th><th>{ "state" }</th><th>{ "image" }</th></tr></thead>
+                    <tbody>
+                        { for photo_rows.iter().map(|row| {
+                            let id = row.id.to_string();
+                            let state = row.content_state.as_deref().unwrap_or("pending");
+                            let img = urls.get(&row.id).map(|url| {
+                                html! { <img src={url.clone()} style="max-height:60px;" /> }
+                            });
+                            html! {
+                                <tr key={id.clone()}>
+                                    <td>{ id }</td>
+                                    <td>{ state }</td>
+                                    <td>{ img.unwrap_or_default() }</td>
                                 </tr>
                             }
                         }) }
@@ -1423,7 +1611,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             </div>
             <div class="pane">
                 <h2>{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
-                <p>{ format!("Replica mirror: {pages} pages (~{kb} KB), {free} free to reclaim. Covered rows: {}.", order_count + note_count) }</p>
+                <p>{ format!("Replica mirror: {pages} pages (~{kb} KB), {free} free to reclaim. Covered rows: {}.", order_count + note_count + photo_count) }</p>
                 <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
                 <div class="row">
                     <button onclick={tidy}>{ "Free up space" }</button>
