@@ -847,6 +847,7 @@ mod pg {
             &self,
             seed_sql: &str,
             member_table: &str,
+            member_subject: &str,
             member_keys: &[String],
             caller: &Principal<Id, Key>,
         ) -> Result<Option<TermSeedRead>, SnapshotError> {
@@ -913,20 +914,25 @@ mod pg {
                                 "the membership table {member_table} is not in the catalog"
                             ))
                         })?;
-                let mut key_ordinals = Vec::with_capacity(member_keys.len());
-                for member_key in member_keys {
+                // The subject is projected first and resolved the same way,
+                // because the row it grants has to name which of the caller's
+                // subjects admits it.
+                let mut ordinals = Vec::with_capacity(1 + member_keys.len());
+                for projected in
+                    core::iter::once(member_subject).chain(member_keys.iter().map(String::as_str))
+                {
                     let ordinal = catalog_helpers::column_id::<Postgres, _>(
                         &self.catalog,
                         member_table_id,
-                        member_key,
+                        projected,
                     )
                     .ok_or_else(|| {
                         SnapshotError::Encode(format!(
-                            "the seed projects {member_key}, which {member_table} does \
+                            "the seed projects {projected}, which {member_table} does \
                                      not have"
                         ))
                     })?;
-                    key_ordinals.push(usize::from(ordinal));
+                    ordinals.push((projected.to_owned(), usize::from(ordinal)));
                 }
                 let built = subql::emit::pgbinary_patchset_builder::<Postgres, _>(
                     &self.catalog,
@@ -942,16 +948,18 @@ mod pg {
                         ));
                     };
                     let row = crate::pk::row_from_wire(&self.catalog, member_table_id, cells);
-                    let mut tuple = Vec::with_capacity(key_ordinals.len());
-                    for (ordinal, member_key) in key_ordinals.iter().zip(member_keys) {
-                        tuple.push(row.get(*ordinal).cloned().ok_or_else(|| {
+                    let mut projected = Vec::with_capacity(ordinals.len());
+                    for (name, ordinal) in &ordinals {
+                        projected.push(row.get(*ordinal).cloned().ok_or_else(|| {
                             SnapshotError::Encode(format!(
-                                "the decoded membership row has no column at {member_key}'s \
+                                "the decoded membership row has no column at {name}'s \
                                  ordinal"
                             ))
                         })?);
                     }
-                    rows.push(tuple);
+                    let mut projected = projected.into_iter();
+                    let subject = projected.next().expect("the subject is projected first");
+                    rows.push((subject, projected.collect()));
                 }
             }
             Ok(Some(TermSeedRead { rows, published }))

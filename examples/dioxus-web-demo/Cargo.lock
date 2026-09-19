@@ -3068,7 +3068,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#01d308e91fd94cd73d6aa657b5e552ee8521109d"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#29868bf2d8f27923b3469c577e2e90afb46783d3"
 dependencies = [
  "git2",
  "sql-traits",
@@ -4070,7 +4070,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9296011a1c2ba0905310f10c7c1287d9cc12b62c"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
 dependencies = [
  "log",
  "recursive",
@@ -4100,7 +4100,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#9296011a1c2ba0905310f10c7c1287d9cc12b62c"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4141,7 +4141,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#ff0b5bcb65abde7837f7984350a1aa1a0be6a77a"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#d842df6607c0cdbd087bb4863592261a9f924819"
 dependencies = [
  "arc-swap",
  "async-lock",
