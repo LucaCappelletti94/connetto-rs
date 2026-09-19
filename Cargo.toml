@@ -62,7 +62,7 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # its shape, per-consumer reads on row-secured tables restored the way
 # registration accepts them, and the pending read queue indexed by
 # subscription and group and purged when either unregisters.
-# Moved to `d842df6` for the caller stated as a set of subjects (#97).
+# Moved to `c2223b9` for the caller stated as a set of subjects (#97).
 # `subscriber` stays the one value a caller comparison admits, `subjects`
 # carries the identity plus every key the caller holds and is what a
 # membership subquery matches it by, and `seed_sql` projects the granting
@@ -71,7 +71,10 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # replay queries back beside it rather than inside it, with the obligation to
 # run them before the event is delivered (#100), and closes `Dispatch`'s
 # fields behind `resolve` and `resolve_collect` so a queued read cannot be
-# skipped in silence (#96).
+# skipped in silence (#96). It also holds the term index in a persistent map
+# (#109), so a mutation deepens one index instead of rebuilding the set, and
+# seeds the streaming task's position so a slot that only ever sees
+# keepalives still reports what it holds (#111).
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
 subql = { git = "https://github.com/LucaCappelletti94/subql", branch = "main", default-features = false, features = [
