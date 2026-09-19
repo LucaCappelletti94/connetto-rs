@@ -605,7 +605,7 @@
       <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">transfers bounded by silence, never by elapsed time. No redirect is followed</text>
       <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
       <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#555">query-shaped content pins, a sweep that asks the store what it holds, a wipe with the replica</text>
-      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#C62828">demos driving the content surface: not started, R69</text>
+      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the demos drive the content surface end to end, R69</text>
     </g>
 
     <path d="M 1130 1660 L 1075 1660" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
