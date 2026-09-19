@@ -132,6 +132,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R66~~ | The connetto seam, on R65 |
 | done | ~~R67~~ | The native file client, on R66 |
 | done | ~~R68~~ | The browser file client, on R67 |
+| done | ~~R69~~ | Files in every demo. Seven pull requests, G first, then A, B and C concurrently, then D and E, then F |
 | done | ~~R81~~ | Aggregate read time bound |
 | done | ~~R82~~ | Grouped and re-executed delivery, first of the R30 derivations |
 | done | ~~R83~~ | The client resting table, on R82 |
@@ -149,8 +150,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
 | any | R11 | The shared public store. Off the critical path |
 | any | R31 | Application schema majors. Deadline is the first deployment intending to survive a schema change |
-| any | R69 | Files in every demo. Seven pull requests, G first, then A, B and C concurrently, then D and E, then F |
-| any | R87 | Storage quotas and deployment ceilings. Needs the file routes in the executable, R69's pull request A |
+| any | R87 | Storage quotas and deployment ceilings |
 | any | R70 | Backup and restore. Steps 1, 3 and 4 wait on nothing. Step 2 waits on R75, whose frontier is what it demonstrates against |
 | any | R71 | Linux replica-key custody. Independent, and it makes R74's Linux caveat go away |
 | any | R72 | Clock discipline. Independent, and it absorbs the certificate clock rule R74 states |
@@ -4634,7 +4634,7 @@ Storage quotas and the deployment-wide ceilings are NOT in this phase. They are 
 
 **Status.** NOT STARTED. Raised 2026-09-08 while scoping R66, because the maintainer asked for a deployment-wide maximum and the mechanism turned out to belong in the file server rather than in connetto. The four points the 2026-09-12 review found undefined were decided 2026-09-13 and are recorded under Decided.
 
-**Blocked on** R69's pull request A, which puts the file routes in the shipped executable: until then no deployment serves files, so saturation has nowhere to be observed. R67 and R68 do NOT depend on this phase.
+**Blocked on** nothing as of 2026-09-19. The blocker was R69's pull request A, which put the file routes in the shipped executable, and #28 landed it, so a deployment serves files and saturation has somewhere to be observed. R67 and R68 do NOT depend on this phase.
 
 ### Purpose
 
