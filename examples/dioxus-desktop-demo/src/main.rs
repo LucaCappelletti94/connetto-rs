@@ -20,23 +20,36 @@
 //!   `target/dev-idp.env`: server auth env from the dev IdP. Start the dev
 //!   IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source
 //!   `target/dev-idp.env` before starting the server.
+//! - `CONNETTO_CONTENT_URL`, `CONNETTO_CONTENT_STORE`, `CONNETTO_CONTENT_KEY`:
+//!   file server settings; required for photo upload and signed-URL resolve.
+//!   The server must also list `photos` in `CONNETTO_WRITABLE`. Apply schema.sql,
+//!   `connetto_file_server::DEPLOYMENT_DDL`, roles.sql, content.sql in that order.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use base64::Engine as _;
 use connetto_client::auth::{
     KeyringKeyStore, KeyringStore, NativeAuthenticator, provision_replica_key, remembered_account,
 };
+use connetto_client::reconnect::TokioSleeper;
 use connetto_client::replica::{Replica, replica_db_name};
-use connetto_client::teardown::{ForgetError, PurgeError, expiry_warning, forget_device};
+use connetto_client::teardown::{
+    ForgetError, PurgeError, content_dir, expiry_warning, forget_device,
+};
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, ExportScope, Grant,
-    IDENTITY_RECORD, ImportChoices, PolicyTables, SqlFunctions, decode_identity,
+    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, IDENTITY_RECORD,
+    ImportChoices, PolicyTables, SqlFunctions, decode_identity,
 };
 use connetto_core::messages::FatalErrorReason;
 use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
 use connetto_core::transport::WebSocketTransport;
 use connetto_dioxus::use_live;
+use connetto_dioxus_desktop_demo::{
+    Order, Photo, mime_from_extension, orders, photo_file_id, photos, short_hex, stage_photo_row,
+};
+use connetto_file_client::{ContentClient, ContentEvent, FileId, FsStore, ReqwestHttp, Resolved};
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use rosetta_uuid::Uuid;
@@ -52,52 +65,10 @@ const REPLICA_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica
 /// handshake.
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
-/// connetto-server auth base URL. The native PKCE loopback flow talks here
-/// directly: no CORS, no proxy needed.
 const AUTH_SERVER: &str = "http://127.0.0.1:18081";
-/// Provider name registered on connetto-server's dev IdP.
 const AUTH_PROVIDER: &str = "dev-idp";
-/// Prefix for per-identity replica file names (passed to `replica_db_name`).
 const REPLICA_PREFIX: &str = "connetto-desktop-demo";
-/// OS keyring service name for both refresh tokens and per-replica keys.
-/// One service, one refresh-token entry per account (keyed by the encoded user
-/// id), connetto's own reserved records, and one key entry per replica name.
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
-
-diesel::table! {
-    orders (id) {
-        id -> rosetta_uuid::sql_types::Uuid,
-        quantity -> diesel::sql_types::BigInt,
-        // Postgres holds this as `timestamptz`, which is an absolute instant,
-        // and the replica as the text `datetime('now')` writes, which is UTC.
-        // Both decode to the same instant. The declared type is the naive
-        // `Timestamp` because one `table!` serves both backends here and
-        // diesel's SQLite backend has no `Timestamptz`.
-        created_at -> diesel::sql_types::Timestamp,
-    }
-}
-
-diesel::table! {
-    photos (id) {
-        id -> rosetta_uuid::sql_types::Uuid,
-        order_id -> rosetta_uuid::sql_types::Uuid,
-        content_id -> diesel::sql_types::Binary,
-        content_state -> Nullable<diesel::sql_types::Text>,
-    }
-}
-
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
-#[diesel(table_name = orders)]
-#[diesel(check_for_backend(diesel::sqlite::Sqlite))]
-struct Order {
-    id: Uuid,
-    quantity: i64,
-    /// When the row was created, in UTC. The key cannot answer that: a v4 UUID
-    /// is random, so ordering by it is arbitrary. Postgres fills this with
-    /// `now()` and the replica with `datetime('now')`, which is second
-    /// resolution, so two rows made in the same second tie.
-    created_at: chrono::NaiveDateTime,
-}
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
 // local write omits the id and this registered function mints it.
@@ -107,12 +78,7 @@ extern "SQL" {
     fn uuidv4() -> diesel::sql_types::Binary;
 }
 
-/// The registrar connetto installs on the replica connection: `uuidv4()` mints
-/// a fresh `rosetta_uuid::Uuid` (the same strongly typed key the `orders`
-/// schema uses on SQLite and Postgres). Nondeterministic, so SQLite calls it
-/// per row instead of folding the DEFAULT to a constant, and `INNOCUOUS`
-/// because the replica runs with trusted schema off and a column DEFAULT is a
-/// schema object.
+/// The registrar connetto installs on the replica connection.
 fn uuidv4_functions() -> SqlFunctions {
     SqlFunctions::new().with(Arc::new(|conn: &mut diesel::SqliteConnection| {
         uuidv4_utils::register_impl_with_behavior(
@@ -123,10 +89,6 @@ fn uuidv4_functions() -> SqlFunctions {
     }))
 }
 
-/// A positive demo quantity, varied by the wall clock so successive rows
-/// differ. The key is minted separately (the DEFAULT on a local write, an
-/// explicit bind in the backend writer), so quantity is never keyed off
-/// the id.
 fn demo_quantity() -> i64 {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -135,49 +97,27 @@ fn demo_quantity() -> i64 {
 }
 
 type Ws = WebSocketTransport<TcpStream>;
+type Content = Arc<ContentClient<Ws, FsStore, ReqwestHttp>>;
 
-/// Commands for the backend writer task, standing in for any non-connetto
-/// process mutating the source Postgres directly.
 enum DemoCmd {
-    /// Insert one row into Postgres.
     Insert,
-    /// Delete the newest backend-inserted row from Postgres.
     DeleteNewest,
 }
 
-/// Cloneable handle the UI uses to reach the backend writer task.
 #[derive(Clone)]
 struct Backend(mpsc::UnboundedSender<DemoCmd>);
 
-/// Authentication context passed as Dioxus context.
-///
-/// Clone is cheap: the heavy pieces live behind `Arc`.
 #[derive(Clone)]
 struct AuthCtx {
-    /// The authenticator that owns the refresh-token store and can revoke
-    /// the session server-side.
     authenticator: Arc<NativeAuthenticator>,
-    /// Absolute path to the replica SQLite file for this identity.
     db_path: PathBuf,
-    /// Key store that holds the per-replica encryption key in the OS keyring.
     key_store: Arc<KeyringKeyStore>,
-    /// The replica name (from `replica_db_name`), used as both the keyring
-    /// record name and the human-readable replica label.
     key_name: String,
-    /// Token store, used to enumerate stored accounts and to update the
-    /// last-used pointer when switching accounts.
     token_store: Arc<KeyringStore>,
-    /// When the current session lapses if never refreshed again.
     session_expires_at: std::time::SystemTime,
-    /// Encoded account key for the signed-in user, matching what
-    /// `RefreshTokenStore::accounts` returns for this identity.
     current_account: String,
 }
 
-/// App data directory following XDG conventions on Linux.
-///
-/// On platforms without XDG, falls back to `$HOME/.local/share` and then to
-/// the temp dir. The directory is created on demand before writing the flag.
 fn data_dir() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(xdg)
@@ -189,17 +129,10 @@ fn data_dir() -> PathBuf {
     .join("connetto-dioxus-demo")
 }
 
-/// Where an export lands. One fixed name per profile, so exporting twice
-/// replaces the copy rather than accumulating them.
 fn export_path() -> PathBuf {
     data_dir().join("connetto-local-data.zip")
 }
 
-/// Opens the file the archive is written into, beside the one a previous
-/// export left.
-///
-/// A partly written archive never takes the name the user knows, so an export
-/// that fails leaves the last good one where it was.
 fn create_export_file() -> std::io::Result<(PathBuf, std::fs::File)> {
     let path = export_path().with_extension("zip.part");
     std::fs::create_dir_all(data_dir())?;
@@ -207,22 +140,12 @@ fn create_export_file() -> std::io::Result<(PathBuf, std::fs::File)> {
     Ok((path, file))
 }
 
-/// Moves a finished archive onto the name the user knows, replacing whatever
-/// a previous export left there.
 fn publish_export(part: &Path) -> std::io::Result<PathBuf> {
     let path = export_path();
     std::fs::rename(part, &path)?;
     Ok(path)
 }
 
-/// Restart the current binary and exit this process, so a sign-out takes
-/// effect immediately. A clean exit is performed if the binary path cannot be
-/// resolved: the user relaunches manually.
-///
-/// Declared as returning `()` rather than `!` so that Dioxus onclick closures
-/// that call it satisfy `SpawnIfAsync`: `!` as the block type prevents the
-/// closure from matching the expected `FnMut(_) -> ()` signature.
-/// `process::exit` still terminates immediately at runtime.
 fn restart() {
     if let Ok(exe) = std::env::current_exe() {
         let _ = std::process::Command::new(exe).spawn();
@@ -230,21 +153,14 @@ fn restart() {
     std::process::exit(0)
 }
 
-/// Top-level sync boundary: build the runtime, drive `setup` to completion,
-/// then hand everything to the Dioxus event loop.
-///
-/// `block_on` is correct here because `main` is a sync function that owns the
-/// runtime, not a worker task running inside it.
 fn main() {
     connetto_core::logging::init_stdout();
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("build tokio runtime");
-    // A startup failure opens a window that says so. Aborting here instead would
-    // leave nothing on screen to explain itself.
     let started = rt.block_on(setup());
-    let (client, backend, auth_ctx) = match started {
+    let (client, backend, auth_ctx, content) = match started {
         Ok(parts) => parts,
         Err(err) => {
             let _guard = rt.enter();
@@ -259,20 +175,17 @@ fn main() {
             dioxus::desktop::Config::new().with_window(
                 dioxus::desktop::WindowBuilder::new()
                     .with_title(title)
-                    .with_inner_size(dioxus::desktop::LogicalSize::new(760.0, 900.0)),
+                    .with_inner_size(dioxus::desktop::LogicalSize::new(760.0, 1100.0)),
             ),
         )
         .with_context(client)
         .with_context(backend)
         .with_context(auth_ctx)
+        .with_context(content)
         .launch(app);
 }
 
-/// Open a window that reports why startup failed, showing the error so the
-/// user can diagnose and fix the configuration.
 fn launch_startup_failure(err: &anyhow::Error) {
-    // The chain, not just the outermost message, so the cause is not hidden behind
-    // a summary.
     let detail = err
         .chain()
         .map(ToString::to_string)
@@ -290,9 +203,6 @@ fn launch_startup_failure(err: &anyhow::Error) {
         .launch(startup_failure_app);
 }
 
-/// Set once before the failure window launches, because `launch` takes the
-/// component by value and the message has to reach it without a context that the
-/// working app also uses.
 static STARTUP_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 
 fn startup_failure_app() -> Element {
@@ -310,9 +220,7 @@ fn startup_failure_app() -> Element {
     }
 }
 
-/// Connect to the server and start the backend writer task. Always runs the
-/// authenticated path via the native PKCE loopback flow.
-async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
+async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx, Content)> {
     use anyhow::Context as _;
 
     let server =
@@ -327,15 +235,10 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
         .await
         .map_err(|err| anyhow::anyhow!("websocket handshake: {err}"))?;
 
-    let (conn, auth_ctx) = setup_authenticated(transport).await?;
+    let (conn, auth_ctx, root_key) = setup_authenticated(transport).await?;
 
     let client = ConnettoClient::start(conn);
 
-    // Backend writer: DML straight into Postgres through the SAME typed
-    // `orders` schema the frontend live query uses, echoed to every window by
-    // the server's logical replication stream. The insert lets Postgres mint
-    // both the key and `created_at`. `on_conflict_do_nothing` keeps concurrent
-    // button presses harmless.
     let (tx, mut rx) = mpsc::unbounded_channel::<DemoCmd>();
     tokio::spawn(async move {
         use diesel_async::AsyncConnection;
@@ -343,8 +246,6 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
             .await
             .expect("connect to postgres");
         while let Some(cmd) = rx.recv().await {
-            // Fully qualified async RunQueryDsl: diesel's sync RunQueryDsl is
-            // also in scope through the prelude, so method syntax is ambiguous.
             let run: diesel::QueryResult<()> = match cmd {
                 DemoCmd::Insert => diesel_async::RunQueryDsl::execute(
                     diesel::insert_into(orders::table)
@@ -355,9 +256,6 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
                 .await
                 .map(|_| ()),
                 DemoCmd::DeleteNewest => {
-                    // The key is random, so `created_at` is the only thing that
-                    // orders rows. It is second resolution on a row the client
-                    // made, so the id breaks a tie and exactly one row goes.
                     match diesel_async::RunQueryDsl::get_result::<Uuid>(
                         orders::table
                             .select(orders::id)
@@ -384,29 +282,33 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx)> {
         }
     });
 
-    Ok((client, Backend(tx), auth_ctx))
+    let store_dir = content_dir(&auth_ctx.db_path);
+    let content = Arc::new(
+        ContentClient::attach(
+            client.clone(),
+            FsStore::new(store_dir),
+            root_key,
+            ReqwestHttp::new(),
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?,
+    );
+    let cc_drive = Arc::clone(&content);
+    tokio::spawn(async move { cc_drive.drive_outbox(TokioSleeper).await });
+
+    Ok((client, Backend(tx), auth_ctx, content))
 }
 
-/// Acquire a session via the native PKCE loopback flow, name the replica from
-/// the resolved identity, provision or load the per-replica encryption key,
-/// open the replica, and install a silent-refresh token source.
-///
-/// The sequence mirrors the ordering in `connetto-web/src/workers.rs`:
-/// acquire first, name the replica from the identity, resolve the key,
-/// then open. Identity must be known before the file is opened because it
-/// decides which file to open.
 async fn setup_authenticated(
     transport: WebSocketTransport<TcpStream>,
-) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx)> {
+) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx, [u8; 32])> {
     use anyhow::Context as _;
 
     tokio::fs::create_dir_all(data_dir())
         .await
         .context("creating the application data directory")?;
 
-    // Credential store: one entry per service, one record per account.
     let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));
-    // Key store: one entry per replica name (one per identity on this device).
     let key_store = Arc::new(KeyringKeyStore::new(KEYRING_SERVICE));
 
     let account =
@@ -419,19 +321,14 @@ async fn setup_authenticated(
         account,
     ));
 
-    // Acquire the session. Silently refreshes from the stored refresh token
-    // when one is present; runs the interactive loopback login otherwise.
     let session = authenticator
         .acquire::<String>()
         .await
         .map_err(|err| anyhow::anyhow!("acquiring a session: {err}"))?;
 
-    // Identity is known now. Derive the replica name before opening anything:
-    // the name decides which file to open, so it must come first.
     let key_name = replica_db_name(REPLICA_PREFIX, &session.user_id)
         .map_err(|err| anyhow::anyhow!("naming the replica for this identity: {err}"))?;
 
-    // Save the session fields we need before the access token is moved below.
     let session_expires_at = session.session_expires_at;
     let current_account = connetto_client::encode_identity(&session.user_id)
         .map_err(|err| anyhow::anyhow!("encoding current account key: {err}"))?;
@@ -444,10 +341,6 @@ async fn setup_authenticated(
 
     let existing = db_path.exists();
 
-    // Provision-once key custody: an existing replica reads from the keyring
-    // (minting a fresh key for it would produce a key that decrypts nothing
-    // and would overwrite the slot a backup restore could still use); a new
-    // replica mints a fresh key from the platform RNG and caches it.
     let replica_key = if existing {
         key_store
             .load(&key_name)
@@ -461,12 +354,13 @@ async fn setup_authenticated(
         )
     };
 
+    // Extract the raw bytes before replica_key is consumed below.
+    let root_key = replica_key.as_ref().map_or([0u8; 32], |k| *k.as_bytes());
+
     let replica = Replica::encrypted_file(&db_path_str, replica_key)
         .map_err(|err| anyhow::anyhow!("opening the encrypted replica: {err}"))?;
 
     let config = ClientConfig::new(key_name.clone())
-        // Use the replica name as the client id so the server can correlate
-        // this connection to the specific per-identity replica.
         .with_login(Some(Grant::new(session.access_token)))
         .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
         .with_sql_functions(uuidv4_functions())
@@ -474,13 +368,9 @@ async fn setup_authenticated(
             POLICY_TABLES.iter().copied(),
             POLICY_VIEWS.iter().copied(),
         ))
-        // A low threshold so the free-up-space button reclaims after a modest
-        // deletion, rather than only once the freelist is a quarter of the file.
-        // Trimming still runs only when the button is pressed.
         .with_trim_threshold(5);
 
     let conn = if existing {
-        // Resume: the replica already carries its schema and cursor.
         ConnettoConnection::connect_existing(transport, &replica, &config, None)
             .await
             .map_err(|err| match err {
@@ -491,9 +381,6 @@ async fn setup_authenticated(
                 other => anyhow::anyhow!("resuming the encrypted replica: {other}"),
             })?
     } else {
-        // First boot: apply the schema DDL to the fresh encrypted file.
-        // The plaintext template cannot be used here because the per-replica
-        // key does not exist at build time.
         ConnettoConnection::connect(transport, &replica, REPLICA_SQLITE_DDL, &config, None)
             .await
             .map_err(|err| match err {
@@ -505,9 +392,6 @@ async fn setup_authenticated(
             })?
     };
 
-    // Install a silent-refresh token source so that every reconnect
-    // transparently refreshes the access token from the stored refresh token
-    // without opening a browser.
     let conn = conn.with_token_source(authenticator.token_source());
 
     let auth_ctx = AuthCtx {
@@ -519,10 +403,9 @@ async fn setup_authenticated(
         session_expires_at,
         current_account,
     };
-    Ok((conn, auth_ctx))
+    Ok((conn, auth_ctx, root_key))
 }
 
-/// The replica's physical footprint: total pages and free pages a trim can reclaim.
 async fn replica_footprint(client: &ConnettoClient<Ws>) -> (i64, i64) {
     client
         .with_conn(|conn| {
@@ -534,10 +417,6 @@ async fn replica_footprint(client: &ConnettoClient<Ws>) -> (i64, i64) {
         .await
 }
 
-/// A short status word for one client event, or `None` to ignore it.
-///
-/// Covers mutation outcomes (feature 5), rate-limit signals (feature 3), and
-/// reconnect / close events.
 fn status_label(event: &ClientEvent) -> Option<String> {
     match event {
         ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
@@ -561,16 +440,10 @@ fn status_label(event: &ClientEvent) -> Option<String> {
                 )
             },
         )),
-        // The server asked this client to back off before retrying a request.
-        // The client's reconnect policy uses a fixed backoff and does not read
-        // retry_after_ms, so the value here is informational only.
         ClientEvent::RateLimited { retry_after_ms, .. } => Some(format!(
             "rate limited: server asks {retry_after_ms}ms before retrying \
              (client reconnects on its own fixed schedule)"
         )),
-        // Connection-level throttle: the server closed the entire session because
-        // this client exceeded a connection-rate limit. Distinct from the
-        // per-request RateLimited above.
         ClientEvent::ServerClosed {
             reason: FatalErrorReason::RateLimited { retry_after_ms },
         } => Some(format!(
@@ -584,14 +457,10 @@ fn status_label(event: &ClientEvent) -> Option<String> {
     }
 }
 
-/// State of the wipe-replica control, including the force-confirm step.
 #[derive(Clone, PartialEq)]
 enum WipeState {
-    /// Showing the wipe button.
     Idle,
-    /// Wipe refused because unsynced writes exist: waiting for force confirm.
     ConfirmForce { unsynced_count: usize },
-    /// Error from a failed wipe or account switch.
     Error(String),
 }
 
@@ -599,6 +468,7 @@ fn app() -> Element {
     let client = use_context::<ConnettoClient<Ws>>();
     let backend = use_context::<Backend>();
     let auth_ctx = use_context::<AuthCtx>();
+    let content = use_context::<Content>();
 
     // Live queries.
     let rows = use_live::<_, _, Order>(
@@ -612,9 +482,9 @@ fn app() -> Element {
             .group_by(orders::quantity)
             .select((orders::quantity, diesel::dsl::count_star())),
     );
+    let photos_query = use_live::<_, _, Photo>(&client, photos::table.order(photos::id.asc()));
 
-    // Features 3 and 5: status line updated by client events. The receiver is
-    // obtained before the hook so `client` is not moved into it.
+    // Client event status line.
     let mut status: Signal<String> = use_signal(|| "connected".to_owned());
     let event_rx = client.events();
     use_hook(move || {
@@ -628,9 +498,84 @@ fn app() -> Element {
         })
     });
 
-    // Feature 2: session expiry warning. Rechecked when rows change (live rows
-    // are a proxy for "something happened"). Only fires when unsynced writes
-    // exist AND the session is within 7 days of lapsing.
+    // Content event stream: track uploads, losses, and refusals.
+    let mut content_status: Signal<String> = use_signal(String::new);
+    let mut retired_files: Signal<Vec<FileId>> = use_signal(Vec::new);
+    let mut refused_uploads: Signal<Vec<(FileId, String)>> = use_signal(Vec::new);
+    let content_event_rx = content.events();
+    use_hook(move || {
+        spawn(async move {
+            let mut rx = content_event_rx;
+            while let Ok(event) = rx.recv().await {
+                match event {
+                    ContentEvent::Uploaded { file_id } => {
+                        content_status.set(format!("uploaded {}", short_hex(file_id.as_bytes())));
+                    }
+                    ContentEvent::UploadDeferred { file_id, detail } => {
+                        content_status.set(format!(
+                            "deferred {}: {detail}",
+                            short_hex(file_id.as_bytes())
+                        ));
+                    }
+                    ContentEvent::UploadRefused { file_id, detail } => {
+                        content_status.set(format!(
+                            "refused {}: {detail}",
+                            short_hex(file_id.as_bytes())
+                        ));
+                        refused_uploads.write().push((file_id, detail));
+                    }
+                    ContentEvent::BytesLost {
+                        file_id,
+                        unreadable,
+                    } => {
+                        content_status.set(format!(
+                            "bytes lost {} ({unreadable} unreadable chunks)",
+                            short_hex(file_id.as_bytes())
+                        ));
+                        retired_files.write().push(file_id);
+                    }
+                    ContentEvent::Fetched { file_id } => {
+                        content_status.set(format!("fetched {}", short_hex(file_id.as_bytes())));
+                    }
+                    ContentEvent::IntegrityPassFailed { detail } => {
+                        content_status.set(format!("integrity check failed: {detail}"));
+                    }
+                }
+            }
+        })
+    });
+
+    // Seed the failure lists from what the content client already persists,
+    // so a restart does not hide last run's refusals and lost files.
+    {
+        let cc = content.clone();
+        let mut refused_seed = refused_uploads;
+        let mut retired_seed = retired_files;
+        use_hook(move || {
+            spawn(async move {
+                if let Ok(list) = cc.refused_content().await {
+                    for entry in list {
+                        // The event stream is already live, so a fresh
+                        // refusal may arrive before this query returns.
+                        let seen = refused_seed.read().iter().any(|(id, _)| *id == entry.0);
+                        if !seen {
+                            refused_seed.write().push(entry);
+                        }
+                    }
+                }
+                if let Ok(list) = cc.retired_content().await {
+                    for id in list {
+                        let seen = retired_seed.read().contains(&id);
+                        if !seen {
+                            retired_seed.write().push(id);
+                        }
+                    }
+                }
+            });
+        });
+    }
+
+    // Session expiry warning.
     let mut expiry_warn: Signal<Option<String>> = use_signal(|| None);
     {
         let client = client.clone();
@@ -665,7 +610,7 @@ fn app() -> Element {
         });
     }
 
-    // Feature 4: replica page footprint, refreshed whenever rows change.
+    // Replica page footprint.
     let mut footprint: Signal<(i64, i64)> = use_signal(|| (0_i64, 0_i64));
     {
         let client = client.clone();
@@ -678,20 +623,53 @@ fn app() -> Element {
         });
     }
 
-    // Feature 6: state for the force-confirm wipe.
+    // Resolve display srcs for available photos: local bytes become data: URIs,
+    // remote signed URLs go straight to the webview.
+    let mut photo_srcs: Signal<HashMap<Uuid, String>> = use_signal(HashMap::new);
+    {
+        let cc = content.clone();
+        use_effect(move || {
+            let photos = photos_query.value().read().clone();
+            let cc = cc.clone();
+            spawn(async move {
+                let mut srcs = HashMap::new();
+                for photo in &photos {
+                    let available = photo.content_state.as_deref() == Some("available");
+                    let Some(fid) = photo_file_id(&photo.content_id) else {
+                        continue;
+                    };
+                    match cc.resolve(fid).await {
+                        // Local bytes render at every state: content this
+                        // device staged answers as Local while it is still
+                        // unsent, so a freshly picked photo shows immediately.
+                        Ok(Resolved::Local { bytes, .. }) => {
+                            let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            srcs.insert(photo.id, format!("data:image/jpeg;base64,{enc}"));
+                        }
+                        // A signed URL is trustworthy only once the server
+                        // says the content is available for this row.
+                        Ok(Resolved::Remote { url }) if available => {
+                            srcs.insert(photo.id, url);
+                        }
+                        _ => {}
+                    }
+                }
+                photo_srcs.set(srcs);
+            });
+        });
+    }
+
     let mut wipe_state: Signal<WipeState> = use_signal(|| WipeState::Idle);
     let mut add_picking: Signal<bool> = use_signal(|| false);
-    // Feature 7: the last export's outcome, shown so the user knows where the
-    // archive went without the app opening a file manager.
     let mut export_status: Signal<Option<String>> = use_signal(|| None);
     let mut import_status: Signal<Option<String>> = use_signal(|| None);
+    let mut photo_pick_msg: Signal<Option<String>> = use_signal(|| None);
+    let mut photo_pin_msg: Signal<Option<String>> = use_signal(|| None);
 
-    // Feature 1: stored accounts, read from the keyring once on mount.
     let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
     let current_account = auth_ctx.current_account.clone();
     let token_store = Arc::clone(&auth_ctx.token_store);
 
-    // Derive display values from live queries before any closures move them.
     let display_rows: Vec<(Uuid, i64)> = rows
         .value()
         .read()
@@ -722,12 +700,17 @@ fn app() -> Element {
     };
     let grouped_error = counts_by_quantity.error().read().clone();
 
+    let display_photos: Vec<Photo> = photos_query.value().read().iter().cloned().collect();
+    let photos_error = photos_query.error().read().clone();
+    let srcs_snap = photo_srcs.read().clone();
+    let retired_snap = retired_files.read().clone();
+    let refused_snap = refused_uploads.read().clone();
+
     let (pages, free) = *footprint.read();
     let kb = pages * 4;
     let pid = std::process::id();
     let replica_label = auth_ctx.key_name.clone();
 
-    // Clones for closures; one purpose each so moves do not conflict.
     let insert_backend = backend.clone();
     let delete_backend = backend;
     let write_client = client.clone();
@@ -736,11 +719,16 @@ fn app() -> Element {
     let force_client = client.clone();
     let switch_client = client.clone();
     let add_client = client.clone();
-    let export_client = client.clone();
-    let import_client = client.clone();
+    let export_content = content.clone();
+    let import_content = content.clone();
+    let pick_content = content.clone();
+    let pin_content = content.clone();
+    let tidy_content_handle = content.clone();
+    let fetch_content = content.clone();
+    let unpin_content = content.clone();
+    let retry_content = content.clone();
+    let forget_content = content.clone();
 
-    // Wipe auth data; cloned twice so the Idle and ConfirmForce arms each get
-    // their own (each arm's onclick is a separate move closure).
     let auth_data = (
         Arc::clone(&auth_ctx.authenticator),
         auth_ctx.db_path.clone(),
@@ -751,7 +739,6 @@ fn app() -> Element {
 
     let token_store_add = Arc::clone(&token_store);
 
-    // Pre-compute account rows so per-item clones are plain Rust, not macro magic.
     let accounts_snap = accounts_list.read().clone();
     let account_items: Vec<(String, String, bool)> = accounts_snap
         .iter()
@@ -766,13 +753,11 @@ fn app() -> Element {
         div {
             style: "font-family: sans-serif; padding: 16px; max-width: 760px;",
 
-            // Status line: mutation outcomes, rate-limit notices, reconnect events.
             p {
                 style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
                 "status: " {status}
             }
 
-            // Session expiry warning (feature 2).
             if let Some(warn) = expiry_warn.read().clone() {
                 p {
                     style: "background: #fff3cd; border: 1px solid #f0ad4e; \
@@ -782,7 +767,6 @@ fn app() -> Element {
                 }
             }
 
-            // Auth strip with wipe and force-confirm (features 6).
             div {
                 style: "background: #f0f4ff; border: 1px solid #c0c8e8; \
                         border-radius: 6px; padding: 10px 14px; margin-bottom: 16px;",
@@ -876,7 +860,6 @@ fn app() -> Element {
                 }}
             }
 
-            // Account management pane (feature 1).
             div {
                 style: "border: 1px solid #ccc; border-radius: 6px; \
                         padding: 10px 14px; margin-bottom: 16px;",
@@ -895,9 +878,6 @@ fn app() -> Element {
                                 "(current)"
                             }
                         } else {
-                            // Switch to another stored account: check for unsent
-                            // writes, update the last-used pointer, then restart
-                            // so the next boot silently refreshes as that user.
                             {
                                 let ts = Arc::clone(&token_store);
                                 let cl = switch_client.clone();
@@ -918,8 +898,6 @@ fn app() -> Element {
                                                     )));
                                                     return;
                                                 }
-                                                // Update the last-used pointer so the next boot
-                                                // silently refreshes as the chosen account.
                                                 if let Err(err) =
                                                     ts.store(IDENTITY_RECORD, &key)
                                                 {
@@ -938,7 +916,6 @@ fn app() -> Element {
                         }
                     }
                 }
-                // Clears the last-used pointer so the next boot starts a fresh login.
                 if *add_picking.read() {
                     div {
                         style: "margin-top: 8px; background: #f5f5ff; \
@@ -1070,7 +1047,291 @@ fn app() -> Element {
                 }
             }
 
-            // Retention pane (feature 4): page footprint and a trim button.
+            // Photos panel: pick, stage, list, display.
+            div {
+                style: "border: 1px solid #ccc; border-radius: 6px; \
+                        padding: 10px 14px; margin-bottom: 16px;",
+                h2 {
+                    style: "margin-top: 0; font-size: 1em;",
+                    "Photos"
+                }
+                if !content_status.read().is_empty() {
+                    p {
+                        style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
+                        "content: " {content_status}
+                    }
+                }
+
+                // Pick and stage a photo; inserts an order row and a photo row together.
+                button {
+                    onclick: move |_| {
+                        let cc = pick_content.clone();
+                        spawn(async move {
+                            let Some(file) = rfd::AsyncFileDialog::new()
+                                .add_filter("images", &["jpg", "jpeg", "png"])
+                                .pick_file()
+                                .await
+                            else {
+                                return;
+                            };
+                            let path = file.path().to_owned();
+                            let Some(mime) = mime_from_extension(&path) else {
+                                photo_pick_msg.set(Some(
+                                    "not an image: only .jpg .jpeg .png are accepted".to_owned(),
+                                ));
+                                return;
+                            };
+                            let bytes = match tokio::fs::read(&path).await {
+                                Ok(b) => b,
+                                Err(err) => {
+                                    photo_pick_msg
+                                        .set(Some(format!("could not read the file: {err}")));
+                                    return;
+                                }
+                            };
+                            let name = path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .unwrap_or("photo")
+                                .to_owned();
+                            match cc
+                                .stage(bytes.as_slice(), mime, stage_photo_row)
+                                .await
+                            {
+                                Ok(_) => {
+                                    photo_pick_msg.set(Some(format!("staged: {name}")));
+                                }
+                                Err(err) => {
+                                    photo_pick_msg
+                                        .set(Some(format!("stage failed: {err}")));
+                                }
+                            }
+                        });
+                    },
+                    "Pick and stage photo"
+                }
+                if let Some(msg) = photo_pick_msg.read().clone() {
+                    p {
+                        style: "font-family: monospace; font-size: 0.85em; \
+                                color: #555; margin: 6px 0 0 0;",
+                        {msg}
+                    }
+                }
+
+                if let Some(err) = photos_error {
+                    p { style: "color: #b00; margin-top: 8px;", "photos subscription error: {err}" }
+                }
+
+                // Live list of photos with content_state and display.
+                if display_photos.is_empty() {
+                    p {
+                        style: "color: #888; font-size: 0.9em; margin-top: 8px;",
+                        "No photos yet."
+                    }
+                } else {
+                    div {
+                        style: "margin-top: 10px;",
+                        for photo in display_photos {
+                            {
+                                let state_label = match photo.content_state.as_deref() {
+                                    Some("available") => "available",
+                                    Some(s) => s,
+                                    None => "pending upload",
+                                };
+                                let src = srcs_snap.get(&photo.id).cloned();
+                                let pid = photo.id;
+                                rsx! {
+                                    div {
+                                        key: "{pid}",
+                                        style: "border: 1px solid #e0e0e0; border-radius: 4px; \
+                                                padding: 8px; margin-bottom: 8px;",
+                                        p {
+                                            style: "margin: 0 0 4px 0; font-size: 0.85em; color: #555;",
+                                            "id: {pid}  state: {state_label}"
+                                        }
+                                        if let Some(src) = src {
+                                            img {
+                                                src: {src},
+                                                style: "max-width: 200px; max-height: 200px; \
+                                                        display: block; margin-top: 4px;",
+                                                alt: "photo"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Content pins: pin all photos, fetch pinned bytes, unpin.
+                div {
+                    style: "margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap;",
+                    button {
+                        onclick: move |_| {
+                            let cc = pin_content.clone();
+                            spawn(async move {
+                                match cc
+                                    .pin_content(
+                                        "photos",
+                                        "SELECT content_id FROM photos",
+                                        "content_id",
+                                    )
+                                    .await
+                                {
+                                    Ok(()) => photo_pin_msg.set(Some("pinned photos".to_owned())),
+                                    Err(err) => photo_pin_msg
+                                        .set(Some(format!("pin failed: {err}"))),
+                                }
+                            });
+                        },
+                        "Pin all photos"
+                    }
+                    button {
+                        onclick: move |_| {
+                            let cc = unpin_content.clone();
+                            spawn(async move {
+                                match cc.unpin_content("photos").await {
+                                    Ok(()) => {
+                                        photo_pin_msg.set(Some("unpinned photos".to_owned()));
+                                    }
+                                    Err(err) => photo_pin_msg
+                                        .set(Some(format!("unpin failed: {err}"))),
+                                }
+                            });
+                        },
+                        "Unpin photos"
+                    }
+                    button {
+                        onclick: move |_| {
+                            let cc = fetch_content.clone();
+                            spawn(async move {
+                                match cc.fetch_pinned().await {
+                                    Ok(ids) => photo_pin_msg.set(Some(format!(
+                                        "fetched {} pinned file(s)",
+                                        ids.len()
+                                    ))),
+                                    Err(err) => photo_pin_msg
+                                        .set(Some(format!("fetch failed: {err}"))),
+                                }
+                            });
+                        },
+                        "Fetch pinned"
+                    }
+                    button {
+                        onclick: move |_| {
+                            let cc = tidy_content_handle.clone();
+                            spawn(async move {
+                                match cc.tidy_content().await {
+                                    Ok(n) => photo_pin_msg.set(Some(format!(
+                                        "content tidy: {n} file(s) evicted"
+                                    ))),
+                                    Err(err) => photo_pin_msg
+                                        .set(Some(format!("tidy failed: {err}"))),
+                                }
+                            });
+                        },
+                        "Free up content storage"
+                    }
+                }
+                if let Some(msg) = photo_pin_msg.read().clone() {
+                    p {
+                        style: "font-family: monospace; font-size: 0.85em; \
+                                color: #555; margin: 6px 0 0 0;",
+                        {msg}
+                    }
+                }
+
+                // Refused uploads: show detail and offer retry.
+                if !refused_snap.is_empty() {
+                    div {
+                        style: "margin-top: 10px; background: #fff3cd; \
+                                border: 1px solid #f0ad4e; border-radius: 4px; padding: 8px;",
+                        p {
+                            style: "margin: 0 0 4px 0; font-weight: bold; font-size: 0.9em;",
+                            "Refused uploads"
+                        }
+                        for (fid, detail) in refused_snap {
+                            {
+                                let fid_clone = fid;
+                                let cc = retry_content.clone();
+                                rsx! {
+                                    div {
+                                        key: "{short_hex(fid.as_bytes())}",
+                                        style: "display: flex; align-items: center; gap: 8px; \
+                                                margin-bottom: 4px; font-size: 0.85em;",
+                                        span {
+                                            style: "flex: 1; font-family: monospace;",
+                                            "{short_hex(fid.as_bytes())}: {detail}"
+                                        }
+                                        button {
+                                            onclick: move |_| {
+                                                let cc = cc.clone();
+                                                spawn(async move {
+                                                    if let Err(err) =
+                                                        cc.retry_refused(fid_clone).await
+                                                    {
+                                                        tracing::error!(
+                                                            error = %err,
+                                                            "retry refused failed"
+                                                        );
+                                                    } else {
+                                                        refused_uploads
+                                                            .write()
+                                                            .retain(|(id, _)| *id != fid_clone);
+                                                    }
+                                                });
+                                            },
+                                            "Retry"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // BytesLost: show lost file IDs and offer acknowledgement.
+                if !retired_snap.is_empty() {
+                    div {
+                        style: "margin-top: 10px; background: #fdecea; \
+                                border: 1px solid #f5c6cb; border-radius: 4px; padding: 8px;",
+                        p {
+                            style: "margin: 0 0 4px 0; font-weight: bold; font-size: 0.9em;",
+                            "Bytes lost"
+                        }
+                        p {
+                            style: "font-size: 0.85em; margin: 0 0 6px 0; color: #666;",
+                            "These files' chunks are unreadable. Their row still exists. \
+                             Acknowledge to clear the record."
+                        }
+                        for fid in &retired_snap {
+                            p {
+                                style: "font-family: monospace; font-size: 0.85em; margin: 2px 0;",
+                                "{short_hex(fid.as_bytes())}"
+                            }
+                        }
+                        button {
+                            onclick: move |_| {
+                                let ids = retired_snap.clone();
+                                let cc = forget_content.clone();
+                                spawn(async move {
+                                    if let Err(err) = cc.forget_retired_content(&ids).await {
+                                        tracing::error!(
+                                            error = %err,
+                                            "forget retired failed"
+                                        );
+                                    } else {
+                                        retired_files.write().retain(|id| !ids.contains(id));
+                                    }
+                                });
+                            },
+                            "Acknowledge all"
+                        }
+                    }
+                }
+            }
+
             div {
                 style: "border: 1px solid #ccc; border-radius: 6px; padding: 10px 14px;",
                 h2 {
@@ -1097,7 +1358,6 @@ fn app() -> Element {
                 }
             }
 
-            // Export pane (feature 7): a readable copy of the local data.
             div {
                 style: "border: 1px solid #ccc; border-radius: 6px; \
                         padding: 10px 14px; margin-top: 16px;",
@@ -1107,35 +1367,39 @@ fn app() -> Element {
                 }
                 p {
                     style: "color: #666; font-size: 0.9em;",
-                    "Save a zip archive of this device's local data. The archive is \
-                     not encrypted and holds every row the device can read: whoever \
-                     holds the file holds the data."
+                    "Save a zip archive of this device's local data, including any unsent \
+                     photo bytes. The archive is not encrypted."
                 }
                 button {
                     onclick: move |_| {
-                        let client = export_client.clone();
+                        let cc = export_content.clone();
                         spawn(async move {
                             let message = match create_export_file() {
                                 Err(err) => format!("could not open the export file: {err}"),
-                                Ok((part, file)) => match client
-                                    .with_conn(move |c| {
-                                        c.export_local_data(ExportScope::Everything, file)
-                                    })
-                                    .await
+                                Ok((part, file)) => match cc.export_local_data(
+                                    connetto_client::ExportScope::Everything,
+                                    file,
+                                )
+                                .await
                                 {
                                     Ok(file) => {
                                         let written = file.metadata().map(|meta| meta.len());
                                         drop(file);
                                         match (publish_export(&part), written) {
                                             (Ok(path), Ok(bytes)) => {
-                                                format!("Wrote {bytes} bytes to {}", path.display())
+                                                format!(
+                                                    "Wrote {bytes} bytes to {}",
+                                                    path.display()
+                                                )
                                             }
                                             (Ok(path), Err(err)) => format!(
                                                 "wrote {} but could not measure it: {err}",
                                                 path.display()
                                             ),
                                             (Err(err), _) => {
-                                                format!("could not replace the last export: {err}")
+                                                format!(
+                                                    "could not replace the last export: {err}"
+                                                )
                                             }
                                         }
                                     }
@@ -1156,7 +1420,6 @@ fn app() -> Element {
                 }
             }
 
-            // Import pane (R56): restore local data from an archive.
             div {
                 style: "border: 1px solid #ccc; border-radius: 6px; \
                         padding: 10px 14px; margin-top: 16px;",
@@ -1170,7 +1433,7 @@ fn app() -> Element {
                 }
                 button {
                     onclick: move |_| {
-                        let client = import_client.clone();
+                        let cc = import_content.clone();
                         spawn(async move {
                             let Some(file) = rfd::AsyncFileDialog::new()
                                 .add_filter("archive", &["zip"])
@@ -1182,41 +1445,42 @@ fn app() -> Element {
                             let source = match std::fs::File::open(file.path()) {
                                 Ok(source) => source,
                                 Err(err) => {
-                                    import_status.set(Some(format!("could not open it: {err}")));
+                                    import_status
+                                        .set(Some(format!("could not open it: {err}")));
                                     return;
                                 }
                             };
-                            let message =
-                                match client.with_conn(move |c| c.import_local_data(source)).await
-                                {
-                                    Err(err) => format!("refused: {err}"),
-                                    Ok(plan) => {
-                                        let clash_count = plan.collisions().len();
-                                        let choices = ImportChoices::keeping_the_file();
-                                        match client
-                                            .with_conn(move |c| c.apply_import(&plan, &choices))
-                                            .await
-                                        {
-                                            Ok(outcome) => {
-                                                let mut msg = format!(
-                                                    "{} row(s) restored, {} kept, \
-                                                     {} write(s) restored",
-                                                    outcome.rows_restored,
-                                                    outcome.rows_kept,
-                                                    outcome.writes_restored
-                                                );
-                                                if clash_count > 0 {
-                                                    msg.push_str(&format!(
-                                                        " ({clash_count} clash(es) \
-                                                         resolved to the file)"
-                                                    ));
-                                                }
-                                                msg
+                            let message = match cc.prepare_local_data_import(source).await {
+                                Err(err) => format!("refused: {err}"),
+                                Ok(mut plan) => {
+                                    let clash_count =
+                                        plan.replica_plan().collisions().len();
+                                    let choices = ImportChoices::keeping_the_file();
+                                    match cc
+                                        .apply_local_data_import(&mut plan, &choices)
+                                        .await
+                                    {
+                                        Ok(outcome) => {
+                                            let mut msg = format!(
+                                                "{} row(s) restored, {} kept, \
+                                                 {} write(s) restored, {} content file(s)",
+                                                outcome.rows_restored,
+                                                outcome.rows_kept,
+                                                outcome.writes_restored,
+                                                plan.content_files(),
+                                            );
+                                            if clash_count > 0 {
+                                                msg.push_str(&format!(
+                                                    " ({clash_count} clash(es) \
+                                                     resolved to the file)"
+                                                ));
                                             }
-                                            Err(err) => format!("apply failed: {err}"),
+                                            msg
                                         }
+                                        Err(err) => format!("apply failed: {err}"),
                                     }
-                                };
+                                }
+                            };
                             import_status.set(Some(message));
                         });
                     },
