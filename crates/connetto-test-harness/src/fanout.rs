@@ -18,10 +18,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use connetto_core::auth::CapabilityKey;
 use connetto_core::messages::BulkMessage;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::CallerMappings;
-use connetto_server::capability::CapabilityKey;
 use connetto_server::counters::{self, CountersSnapshot};
 use connetto_server::openfga::{
     Counted, FgaAuth, ModelSubject, StoreUpkeep, SubjectNaming, Translated,

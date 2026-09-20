@@ -89,6 +89,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::auth::CapabilityKey;
 use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
@@ -99,7 +100,6 @@ use connetto_file_server::{
 };
 use connetto_server::CallerMappings;
 use connetto_server::audit::pg_audit_hook;
-use connetto_server::capability::CapabilityKey;
 use connetto_server::capability::DEFAULT_USER_SETTING;
 use connetto_server::openfga::{
     Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,

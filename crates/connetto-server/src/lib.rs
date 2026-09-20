@@ -51,7 +51,8 @@ pub use abuse::{
 };
 pub use auth::{RlsAuth, RlsAuthError};
 pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
-pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError, ShareLevel};
+pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel};
+pub use connetto_core::auth::CapabilityKey;
 pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.

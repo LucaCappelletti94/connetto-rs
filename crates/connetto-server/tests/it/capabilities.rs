@@ -24,9 +24,10 @@ use std::time::{Duration, SystemTime};
 use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession};
 use connetto_server::audit::{AuthEvent, AuthOp};
+use connetto_server::capability::MintCapabilityKey;
 use connetto_server::{
-    AuthConfig, CapabilityIssuer, CapabilityKey, Materializer, PgSnapshotSource, RlsAuth,
-    RowSource, ShareError, ShareLevel, SnapshotSource, SourceRow, TokenAuthority,
+    AuthConfig, CapabilityIssuer, Materializer, PgSnapshotSource, RlsAuth, RowSource, ShareError,
+    ShareLevel, SnapshotSource, SourceRow, TokenAuthority,
 };
 use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID, pool_for, with_user};
 use diesel::prelude::*;
@@ -450,7 +451,7 @@ async fn the_grant_row_itself_is_refused_when_the_sharer_cannot_read_the_paper()
 #[tokio::test]
 async fn an_expired_capability_is_refused() {
     let authority = TokenAuthority::generate(&AuthConfig::default()).expect("keypair");
-    let subject = CapabilitySubject::new(<String as CapabilityKey>::mint());
+    let subject = CapabilitySubject::new(<String as MintCapabilityKey>::mint());
     let issued_at = SystemTime::now() - Duration::from_secs(3600);
     let ttl = Duration::from_secs(60);
 
@@ -776,7 +777,7 @@ async fn no_minted_token_carries_a_permission() {
     // Asserted by reading the signed payload rather than the claims struct, so
     // a field added to that struct later fails here.
     let authority = TokenAuthority::generate(&AuthConfig::default()).expect("keypair");
-    let key = <String as CapabilityKey>::mint();
+    let key = <String as MintCapabilityKey>::mint();
     let token = authority
         .mint_capability(
             &CapabilitySubject::<String>::new(key.clone()),

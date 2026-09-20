@@ -48,7 +48,6 @@ use tracing::Instrument;
 
 use crate::abuse::{Caller, Reaction};
 use crate::audit::{AuthEvent, AuthOp};
-use crate::capability::CapabilityKey;
 use crate::counters;
 use crate::guard::RequestGuard;
 use crate::materializer::{
@@ -64,6 +63,7 @@ use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
+use connetto_core::auth::CapabilityKey;
 use connetto_core::auth::{AuthContext, CapabilitySubject};
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
@@ -5191,6 +5191,10 @@ mod tests {
         assert_eq!(
             mirror_predicate(&watched(false, true), Some("caller"), None, ','),
             Err(MirrorGap::Subjects)
+        );
+        assert_eq!(
+            mirror_predicate(&watched(true, false), None, Some("subjects"), ','),
+            Err(MirrorGap::Identity)
         );
     }
 
