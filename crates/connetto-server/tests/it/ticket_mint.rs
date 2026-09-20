@@ -340,7 +340,7 @@ async fn the_ticket_carries_the_whole_caller() {
     };
     assert_eq!(
         key_only.subjects(),
-        Some(KEY_GRANT),
+        [KEY_GRANT],
         "the share key rides to the signer"
     );
     assert_eq!(
@@ -349,10 +349,17 @@ async fn the_ticket_carries_the_whole_caller() {
         "a key-only caller mints with no identity, not with an empty one"
     );
     assert_eq!(anonymous.identity(), None, "an anonymous caller has none");
-    assert_eq!(anonymous.subjects(), None, "and holds no subject either");
+    assert!(
+        anonymous.subjects().is_empty(),
+        "and holds no subject either"
+    );
+    assert!(
+        anonymous.attributions().is_empty(),
+        "so there is nobody to attribute a commit to"
+    );
     assert_eq!(
-        anonymous.attribution(),
+        anonymous.storage_key(),
         None,
-        "so it has no manifest key at all"
+        "and it has no manifest key at all"
     );
 }

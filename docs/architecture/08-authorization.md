@@ -111,7 +111,9 @@ That direction is chosen because the trait has callers on both sides, and there 
 
 **Fixed (R1).** The reference binary refuses to start without `CONNETTO_READER_URL`, so snapshots, read authorization, and mutation applies never run on the owner pool, where RLS is bypassed entirely because Postgres does not apply policies to a superuser or to the table owner.
 
-A caller with no identity leaves `app.user_id` unset for the whole transaction rather than binding an empty string. That is deliberate and it is what makes the policy answer correctly with no policy change: `current_setting('app.user_id', true)` is NULL, so an owner comparison is NULL rather than true and the row is hidden, while a public predicate still returns its own rows. An empty string would be a real identity that happens to be blank, and a policy comparing against it could match.
+A caller with no identity must not bind an empty string, because an empty string is a real identity that happens to be blank and a policy comparing against it could match. The original rule was to leave `app.user_id` unset, which Postgres cannot keep on a pooled connection: once any transaction on a session binds a custom setting, the placeholder exists for the life of that session and `current_setting(name, true)` returns `''` from then on, which neither `set_config` with NULL, nor `RESET`, nor `DISCARD ALL`, nor a rolled back transaction takes away. So on the second caller to reuse a connection the unset rule silently produced the blank identity it was written to forbid.
+
+**Corrected (fix/content-ticket-caller-binding, 2026-09-20).** Both settings are always bound, and a half the caller does not hold takes an unguessable marker minted once per process (`connetto_core::auth::absent_marker`). No row can carry it, so an owner comparison against it is false and the row is hidden, while a public predicate still returns its own rows, which is the behaviour the unset rule was after. A policy that tests for an anonymous caller must test its own rows rather than testing the setting for NULL, because absence now reads as a value no caller can be.
 
 ### At change time
 

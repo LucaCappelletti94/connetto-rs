@@ -786,6 +786,6 @@ pub fn identified(user_id: &str) -> ContentCaller {
 }
 
 /// A ticket caller carrying share-key subjects and no identity.
-pub fn keyed(subjects: &str) -> ContentCaller {
-    ContentCaller::new(None, Some(subjects.to_owned()))
+pub fn keyed<'a>(subjects: impl IntoIterator<Item = &'a str>) -> ContentCaller {
+    ContentCaller::new(None, subjects.into_iter().map(ToOwned::to_owned))
 }

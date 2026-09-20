@@ -3392,7 +3392,7 @@ async fn intent_and_commit_under_a_key_only_caller() {
                 verb: Verb::Write,
                 ceiling: 1 << 20,
                 expiry: chrono::Utc::now().timestamp() + 3600,
-                caller: crate::fixture::keyed(SUBJECT),
+                caller: crate::fixture::keyed([SUBJECT]),
             })
             .unwrap()
     };
@@ -3523,7 +3523,7 @@ async fn an_identity_shaped_like_a_key_owns_its_own_manifest() {
 
     let key_needed = needed_count(
         &app,
-        &write_ticket(&signer, &file_id, &keyed(SHARED)),
+        &write_ticket(&signer, &file_id, &keyed([SHARED])),
         &manifest,
     )
     .await;
@@ -3553,7 +3553,7 @@ async fn an_identity_shaped_like_a_key_owns_its_own_manifest() {
         .method("POST")
         .uri(format!(
             "/files/{file_id}/commit?t={}",
-            write_ticket(&signer, &file_id, &keyed(SHARED))
+            write_ticket(&signer, &file_id, &keyed([SHARED]))
         ))
         .body(axum::body::Body::empty())
         .unwrap();
@@ -3580,4 +3580,120 @@ fn write_ticket(
             caller: caller.clone(),
         })
         .unwrap()
+}
+
+/// A caller holding several share keys is attributed under each of them, so
+/// it can see its own upload afterwards.
+///
+/// The deployment stores what the setter is told as the owner and compares
+/// one subject at a time against it, which is how the shipped policy is
+/// written. A row owned by the joined list would match no single key and the
+/// file would be invisible to the very caller that uploaded it.
+#[tokio::test]
+async fn a_caller_holding_two_keys_sees_its_own_upload() {
+    use crate::fixture::keyed;
+
+    const FIRST: &str = "key:k1";
+    const SECOND: &str = "key:k2";
+
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"bytes uploaded by a caller holding two keys";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+    let both = keyed([FIRST, SECOND]);
+    let ticket = write_ticket(&signer, &file_id, &both);
+
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let body = serde_json::json!({ "total_len": data.len(), "chunks": chunks_json });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "intent must succeed"
+    );
+
+    for chunk in manifest.chunks() {
+        use connetto_file_core::ChunkStore;
+        let bytes = mem.read_chunk(&chunk.hash).await.unwrap();
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/chunks/{}?t={ticket}", chunk.hash))
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(bytes))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NO_CONTENT,
+            "chunk PUT must succeed"
+        );
+    }
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_hex}/commit?t={ticket}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "commit must succeed"
+    );
+
+    // The uploader reads its own bytes back, which only a visible file serves.
+    let read = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 1 << 20,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: both,
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .uri(format!("/files/{file_hex}?t={read}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the caller that uploaded the file must see it"
+    );
+
+    // And so does a caller holding only one of the two keys, because each key
+    // owns the file rather than the pair owning it jointly.
+    for key in [FIRST, SECOND] {
+        let read = signer
+            .mint(&TicketPayload {
+                file_id: *file_id.as_bytes(),
+                verb: Verb::Read,
+                ceiling: 1 << 20,
+                expiry: chrono::Utc::now().timestamp() + 3600,
+                caller: keyed([key]),
+            })
+            .unwrap();
+        let req = axum::http::Request::builder()
+            .uri(format!("/files/{file_hex}?t={read}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "{key} alone must see the file it was attributed"
+        );
+    }
 }

@@ -107,10 +107,14 @@ impl SnapshotSource for NeverSnapshot {
     }
 }
 
-/// The caller as a signer renders it into a URL: whatever names it, or
-/// `nobody` when it binds neither half.
-pub(crate) fn rendered(caller: &ContentCaller) -> &str {
-    caller.attribution().unwrap_or("nobody")
+/// The caller as a signer renders it into a URL: the identity, else every key
+/// it holds, else `nobody` when it binds neither half.
+pub(crate) fn rendered(caller: &ContentCaller) -> String {
+    let named = caller.attributions().join(",");
+    if named.is_empty() {
+        return "nobody".to_owned();
+    }
+    named
 }
 
 /// A signer that returns a deterministic URL encoding the caller and the

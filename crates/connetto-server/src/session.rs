@@ -3186,11 +3186,11 @@ where
         let request_id = req.request_id;
         let caller = crate::capability::rendered_caller(&state.principal);
         // The byte window keys on whatever names this caller, the identity or
-        // the subjects it holds, and falls back to the run's own handle rather
-        // than to a shared empty string.
+        // the whole set of subjects it holds, and falls back to the run's own
+        // handle rather than to a shared empty string.
         let budget_key = caller
-            .attribution()
-            .map_or_else(|| state.session_id.to_string(), ToOwned::to_owned);
+            .storage_key()
+            .unwrap_or_else(|| state.session_id.to_string());
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.

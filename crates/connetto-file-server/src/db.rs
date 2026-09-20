@@ -398,6 +398,11 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
 /// Atomically marks the manifest committed and calls the deployment setter,
 /// all inside one Postgres transaction.
 ///
+/// The setter is called once per name in `attributions`, so a caller whose
+/// rights come from several share keys is attributed under each of them and
+/// can see the file afterwards under any one. A deployment setter is
+/// therefore called more than once for one commit and must be idempotent.
+///
 /// When the manifest is already committed (zero rows from the guarded UPDATE),
 /// returns [`CommitOutcome::AlreadyCommitted`] without re-calling the setter.
 ///
@@ -407,11 +412,11 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
     key: &str,
-    attribution: &str,
+    attributions: &[&str],
 ) -> Result<CommitOutcome, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
     let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), key.to_owned());
-    let attribution = attribution.to_owned();
+    let attributions: Vec<String> = attributions.iter().map(|to| (*to).to_owned()).collect();
     let setter_arg = file_id_bytes;
 
     conn.transaction::<CommitOutcome, CommitTxError, _>(async move |c| {
@@ -423,14 +428,16 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
 
         // Call the deployment setter inside the transaction.  A raise rolls
         // back the committed flag so the client can retry.
-        diesel::select(crate::functions::connetto_set_content_state(
-            setter_arg.as_slice(),
-            "available",
-            attribution.as_str(),
-        ))
-        .get_result::<Option<Vec<u8>>>(c)
-        .await
-        .map_err(CommitTxError::Setter)?;
+        for attribution in &attributions {
+            diesel::select(crate::functions::connetto_set_content_state(
+                setter_arg.as_slice(),
+                "available",
+                attribution.as_str(),
+            ))
+            .get_result::<Option<Vec<u8>>>(c)
+            .await
+            .map_err(CommitTxError::Setter)?;
+        }
 
         Ok(CommitOutcome::Committed)
     })

@@ -207,22 +207,27 @@ impl<Id, Key> Principal<Id, Key> {
 }
 
 /// The caller a content ticket carries: the identity, and the capability
-/// subjects packed by the deployment's key type.
+/// subjects it holds.
 ///
 /// Both halves travel so the file server binds what the mint bound, and an
-/// absent half stays absent rather than becoming `""`, which would be a real
-/// identity a policy could match.
+/// unheld half stays unheld rather than becoming `""`, which would be a real
+/// identity a policy could match. The subjects ride as the list they are,
+/// because a commit is attributed to each of them and only the binding needs
+/// them joined, under the separator that deployment's key type chose.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentCaller {
     identity: Option<String>,
-    subjects: Option<String>,
+    subjects: Vec<String>,
 }
 
 impl ContentCaller {
-    /// Name the two halves.
+    /// Name both halves.
     #[must_use]
-    pub const fn new(identity: Option<String>, subjects: Option<String>) -> Self {
-        Self { identity, subjects }
+    pub fn new(identity: Option<String>, subjects: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            identity,
+            subjects: subjects.into_iter().collect(),
+        }
     }
 
     /// The identity, when a login grant resolved.
@@ -231,20 +236,39 @@ impl ContentCaller {
         self.identity.as_deref()
     }
 
-    /// The packed capability subjects, when the caller holds any.
+    /// The capability subjects the caller holds, sorted and without repeats,
+    /// empty when it holds none.
     #[must_use]
-    pub fn subjects(&self) -> Option<&str> {
-        self.subjects.as_deref()
+    pub fn subjects(&self) -> &[String] {
+        &self.subjects
     }
 
-    /// What the deployment attributes a commit to: the identity, else the
-    /// subjects, as the deployment's own policies already spell them, so a row
-    /// storing it can be compared against the caller settings directly.
-    ///
-    /// A caller holding neither is nobody to attribute to.
+    /// The subjects joined for the one Postgres setting a policy reads them
+    /// from, or `None` when the caller holds none.
     #[must_use]
-    pub fn attribution(&self) -> Option<&str> {
-        self.identity().or_else(|| self.subjects())
+    pub fn packed_subjects(&self, separator: char) -> Option<String> {
+        (!self.subjects.is_empty()).then(|| {
+            self.subjects
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(&separator.to_string())
+        })
+    }
+
+    /// Everyone this commit is attributed to: the identity when a login
+    /// resolved, else every subject the caller holds, each as the deployment's
+    /// own policies spell it.
+    ///
+    /// A key holder is attributed once per key rather than once for the set,
+    /// because a row owned by the joined list matches no single subject and
+    /// would hide the file from the caller that uploaded it.
+    #[must_use]
+    pub fn attributions(&self) -> Vec<&str> {
+        self.identity().map_or_else(
+            || self.subjects.iter().map(String::as_str).collect(),
+            |identity| vec![identity],
+        )
     }
 
     /// The key a manifest row is owned under, which names the half it came
@@ -260,13 +284,10 @@ impl ContentCaller {
     pub fn storage_key(&self) -> Option<String> {
         self.identity()
             .map(|identity| format!("user:{identity}"))
-            .or_else(|| self.subjects().map(|subjects| format!("keys:{subjects}")))
-    }
-
-    /// Take both halves out.
-    #[must_use]
-    pub fn into_parts(self) -> (Option<String>, Option<String>) {
-        (self.identity, self.subjects)
+            .or_else(|| {
+                self.packed_subjects(',')
+                    .map(|subjects| format!("keys:{subjects}"))
+            })
     }
 }
 

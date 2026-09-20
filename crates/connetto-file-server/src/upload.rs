@@ -11,7 +11,7 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    caller::{attribution, manifest_key},
+    caller::{attributions, manifest_key},
     db,
     error::ServerError,
     needed,
@@ -204,7 +204,10 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
     let key = manifest_key(&ticket.caller)?;
-    let attribution = attribution(&ticket.caller)?.to_owned();
+    let attributions: Vec<String> = attributions(&ticket.caller)?
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect();
     let store = &state.store;
     // Ordering: acquire reader before admin so a saturated reader pool never
     // blocks a holder of the manifest FOR UPDATE lock.
@@ -241,19 +244,22 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     // setter so metadata rows inserted since the first commit are
                     // updated. The setter is UPDATE ... WHERE content_id = $1 and
                     // is idempotent for rows already at the target state.
-                    diesel::select(crate::functions::connetto_set_content_state(
-                        file_id.as_bytes().to_vec().as_slice(),
-                        "available",
-                        attribution.as_str(),
-                    ))
-                    .get_result::<Option<Vec<u8>>>(conn)
-                    .await?;
+                    for attribution in &attributions {
+                        diesel::select(crate::functions::connetto_set_content_state(
+                            file_id.as_bytes().to_vec().as_slice(),
+                            "available",
+                            attribution.as_str(),
+                        ))
+                        .get_result::<Option<Vec<u8>>>(conn)
+                        .await?;
+                    }
                     return Ok(StatusCode::OK);
                 }
                 Some(db::ManifestState::Uncommitted(manifest)) => manifest,
             };
             verify_file_identity(store, &manifest).await?;
-            db::commit_manifest_atomic::<S>(conn, &file_id, &key, &attribution).await?;
+            let attributions: Vec<&str> = attributions.iter().map(String::as_str).collect();
+            db::commit_manifest_atomic::<S>(conn, &file_id, &key, &attributions).await?;
             Ok(StatusCode::OK)
         })
         .await

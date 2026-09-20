@@ -21,8 +21,11 @@ use crate::functions;
 pub struct CallerSettings {
     /// The setting the identity is bound to.
     pub user: String,
-    /// The setting the packed capability subjects are bound to.
+    /// The setting the joined capability subjects are bound to.
     pub subjects: String,
+    /// The character the subjects are joined by, which the deployment's
+    /// policies split them on.
+    pub separator: char,
 }
 
 impl Default for CallerSettings {
@@ -30,6 +33,7 @@ impl Default for CallerSettings {
         Self {
             user: DEFAULT_USER_SETTING.to_owned(),
             subjects: DEFAULT_SUBJECTS_SETTING.to_owned(),
+            separator: ',',
         }
     }
 }
@@ -47,13 +51,12 @@ pub(crate) async fn bind_caller(
     caller: &ContentCaller,
 ) -> Result<(), diesel::result::Error> {
     let marker = absent_marker();
+    let subjects = caller
+        .packed_subjects(settings.separator)
+        .unwrap_or_else(|| marker.to_owned());
     diesel::select((
         functions::set_config(&settings.user, caller.identity().unwrap_or(marker), true),
-        functions::set_config(
-            &settings.subjects,
-            caller.subjects().unwrap_or(marker),
-            true,
-        ),
+        functions::set_config(&settings.subjects, subjects.as_str(), true),
     ))
     .get_result::<(String, String)>(conn)
     .await
@@ -64,9 +67,8 @@ pub(crate) async fn bind_caller(
 ///
 /// Namespaced by the half it came from, so an identity and a capability
 /// subject that render alike cannot own one another's rows. The deployment is
-/// attributed the plain value instead, through
-/// [`ContentCaller::attribution`], because that is what its own policies
-/// compare against.
+/// attributed the plain values instead, through [`attributions`], because
+/// that is what its own policies compare against.
 ///
 /// # Errors
 ///
@@ -76,11 +78,20 @@ pub(crate) fn manifest_key(caller: &ContentCaller) -> Result<String, ServerError
     caller.storage_key().ok_or(ServerError::NotFound)
 }
 
-/// The value the deployment's content-state setter is given for the commit.
+/// Everyone the deployment's content-state setter is told the commit belongs
+/// to: the identity, else each subject the caller holds.
+///
+/// A key holder is named once per key, because a deployment that stores the
+/// value as the owner and compares it against one subject would never match a
+/// row owned by the joined list, hiding the file from its own uploader.
 ///
 /// # Errors
 ///
 /// [`ServerError::NotFound`] when the ticket's caller holds neither half.
-pub(crate) fn attribution(caller: &ContentCaller) -> Result<&str, ServerError> {
-    caller.attribution().ok_or(ServerError::NotFound)
+pub(crate) fn attributions(caller: &ContentCaller) -> Result<Vec<&str>, ServerError> {
+    let attributions = caller.attributions();
+    if attributions.is_empty() {
+        return Err(ServerError::NotFound);
+    }
+    Ok(attributions)
 }

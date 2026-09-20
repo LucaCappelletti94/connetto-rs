@@ -940,7 +940,7 @@ async fn a_key_only_ticket_serves() {
     let file_id = FileId::from_bytes([0xC1u8; 32]);
     let chunks = vec![ChunkMeta { hash, len: 96 }];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, &keyed(SUBJECT), &chunks).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &keyed([SUBJECT]), &chunks).await;
     register_file_ownership(&mut admin_conn, &file_id, SUBJECT).await;
     drop(admin_conn);
 
@@ -950,7 +950,7 @@ async fn a_key_only_ticket_serves() {
             verb: Verb::Read,
             ceiling: u64::MAX,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: crate::fixture::keyed(SUBJECT),
+            caller: crate::fixture::keyed([SUBJECT]),
         })
         .unwrap();
     let id_hex = connetto_file_server::hex_32(file_id.as_bytes());

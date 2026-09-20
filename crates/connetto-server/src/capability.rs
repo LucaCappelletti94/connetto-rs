@@ -64,29 +64,20 @@ pub trait CapabilityKey:
     /// Mint a fresh key. It is a bearer secret, so it must be unguessable.
     fn mint() -> Self;
 
-    /// Pack the keys a caller holds, or `None` to leave the setting unbound.
+    /// The subjects a caller holds, sorted and without repeats, or empty to
+    /// leave the setting unbound.
     ///
     /// Unbound rather than empty is what makes an absent capability fail
     /// closed: `current_setting` yields NULL, and a comparison against NULL is
-    /// NULL rather than true. Packing sorts and drops repeats, so one holder
-    /// packs one value whatever order its grants arrived in and however many
-    /// copies of one grant it presented, and a manifest or a byte window keyed
-    /// on that value stays put across runs.
-    fn pack(keys: &[CapabilitySubject<Self>]) -> Option<String> {
-        if keys.is_empty() {
-            return None;
-        }
+    /// NULL rather than true. Sorting and dropping repeats give one holder one
+    /// value whatever order its grants arrived in and however many copies of
+    /// one grant it presented, so a manifest or a byte window keyed on that
+    /// value stays put across runs.
+    fn subjects(keys: &[CapabilitySubject<Self>]) -> Vec<String> {
         let mut rendered: Vec<String> = keys.iter().map(|key| key.key().to_string()).collect();
         rendered.sort_unstable();
         rendered.dedup();
-        let mut packed = String::new();
-        for key in rendered {
-            if !packed.is_empty() {
-                packed.push(Self::SEPARATOR);
-            }
-            packed.push_str(&key);
-        }
-        Some(packed)
+        rendered
     }
 }
 
@@ -119,7 +110,7 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
         caller
             .identity()
             .map(|identity| identity.user_id.to_string()),
-        Key::pack(caller.capabilities()),
+        Key::subjects(caller.capabilities()),
     )
 }
 
@@ -134,6 +125,7 @@ pub(crate) struct CallerBinding {
     caller: ContentCaller,
     user_setting: Arc<str>,
     setting: &'static str,
+    separator: char,
 }
 
 impl CallerBinding {
@@ -147,6 +139,7 @@ impl CallerBinding {
             caller: rendered_caller(caller),
             user_setting,
             setting: Key::SETTING,
+            separator: Key::SEPARATOR,
         }
     }
 
@@ -158,9 +151,14 @@ impl CallerBinding {
     /// identity chapter 08 forbids.
     pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
         let user_setting = self.user_setting.to_string();
-        let (user, subjects) = self.caller.into_parts();
-        let user = user.unwrap_or_else(|| absent_marker().to_owned());
-        let subjects = subjects.unwrap_or_else(|| absent_marker().to_owned());
+        let subjects = self
+            .caller
+            .packed_subjects(self.separator)
+            .unwrap_or_else(|| absent_marker().to_owned());
+        let user = self
+            .caller
+            .identity()
+            .map_or_else(|| absent_marker().to_owned(), ToOwned::to_owned);
         diesel::select((
             set_config(user_setting, user, true),
             set_config(self.setting, subjects, true),
@@ -181,12 +179,16 @@ impl CallerBinding {
             value.replace('\'', "''")
         }
         let marker = absent_marker();
+        let subjects = self
+            .caller
+            .packed_subjects(self.separator)
+            .unwrap_or_else(|| marker.to_owned());
         [
             (
                 &*self.user_setting,
                 self.caller.identity().unwrap_or(marker),
             ),
-            (self.setting, self.caller.subjects().unwrap_or(marker)),
+            (self.setting, subjects.as_str()),
         ]
         .into_iter()
         .map(|(setting, value)| {
@@ -201,7 +203,7 @@ impl CallerBinding {
 
     /// Whether this caller holds anything to be read as.
     pub(crate) fn binds_a_caller(&self) -> bool {
-        self.caller.identity().is_some() || self.caller.subjects().is_some()
+        self.caller.identity().is_some() || !self.caller.subjects().is_empty()
     }
 }
 
@@ -602,16 +604,32 @@ mod tests {
 
     #[test]
     fn nothing_held_leaves_the_setting_unbound() {
-        assert!(String::pack(&[]).is_none());
+        assert_eq!(String::subjects(&[]), Vec::<String>::new());
+        assert!(
+            ContentCaller::new(None, String::subjects(&[]))
+                .packed_subjects(',')
+                .is_none()
+        );
     }
 
     #[test]
-    fn held_keys_pack_in_order_under_one_separator() {
+    fn held_keys_join_in_order_under_one_separator() {
         let keys = [
-            CapabilitySubject::new("key:a"),
             CapabilitySubject::new("key:b"),
+            CapabilitySubject::new("key:a"),
+            CapabilitySubject::new("key:a"),
         ];
-        assert_eq!(String::pack(&keys).as_deref(), Some("key:a,key:b"));
+        let caller = ContentCaller::new(None, String::subjects(&keys));
+        assert_eq!(
+            caller.packed_subjects(',').as_deref(),
+            Some("key:a,key:b"),
+            "sorted, deduped, and joined by the deployment's separator"
+        );
+        assert_eq!(
+            caller.attributions(),
+            vec!["key:a", "key:b"],
+            "and a commit is attributed to each key rather than to the list"
+        );
     }
 
     #[test]
