@@ -19,11 +19,11 @@ use core::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use connetto_core::auth::{CapabilitySubject, ContentCaller, Principal, absent_marker};
+use connetto_core::auth::{
+    CapabilityKey, CapabilitySubject, ContentCaller, Principal, absent_marker,
+};
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{RowWrite, Verdict, VisibilityPolicy, WriteOp};
 
@@ -33,58 +33,19 @@ use crate::row_view::ValuesRow;
 use crate::snapshot::RowSource;
 use crate::throttle::Tier;
 
-/// The deployment's share-key type: how one is minted, and how the keys a
-/// caller holds reach Postgres.
+/// How a deployment makes a fresh share key.
 ///
-/// A policy can only compare against a value the transaction bound, and a
-/// caller may hold several keys, so the set travels as one text value under
-/// [`SETTING`](Self::SETTING). The default packing joins the keys with
-/// [`SEPARATOR`](Self::SEPARATOR), which a policy unpacks:
-///
-/// ```sql
-/// viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))
-/// ```
-///
-/// Whatever a deployment chooses is the contract its policies are written
-/// against, so choose before writing policies rather than after. A deployment
-/// wanting its own key type, setting, or packing implements this for that type
-/// and everything downstream follows from
-/// [`Principal`]'s key parameter.
-pub trait CapabilityKey:
-    Clone + Display + Serialize + DeserializeOwned + Send + Sync + 'static
-{
-    /// The Postgres setting the packed keys are bound to.
-    const SETTING: &'static str = connetto_core::auth::DEFAULT_SUBJECTS_SETTING;
-
-    /// The character joining packed keys. A key whose rendering contains it is
-    /// refused at minting, because one that slipped through would split into
-    /// two and grant a neighbouring key's access.
-    const SEPARATOR: char = ',';
-
+/// Separate from [`CapabilityKey`] because only the issuing side mints one.
+/// A replica needs the packing to answer the policies it holds and has no
+/// business creating a bearer secret.
+pub trait MintCapabilityKey: CapabilityKey {
     /// Mint a fresh key. It is a bearer secret, so it must be unguessable.
     fn mint() -> Self;
-
-    /// The subjects a caller holds, sorted and without repeats, or empty to
-    /// leave the setting unbound.
-    ///
-    /// Unbound rather than empty is what makes an absent capability fail
-    /// closed: `current_setting` yields NULL, and a comparison against NULL is
-    /// NULL rather than true. Sorting and dropping repeats give one holder one
-    /// value whatever order its grants arrived in and however many copies of
-    /// one grant it presented, so a manifest or a byte window keyed on that
-    /// value stays put across runs.
-    fn subjects(keys: &[CapabilitySubject<Self>]) -> Vec<String> {
-        let mut rendered: Vec<String> = keys.iter().map(|key| key.key().to_string()).collect();
-        rendered.sort_unstable();
-        rendered.dedup();
-        rendered
-    }
 }
 
-/// The default share-key: `key:` followed by a version 4 UUID.
-///
-/// 122 bits of randomness, and no rendering of it can contain the separator.
-impl CapabilityKey for String {
+/// The default share-key: `key:` followed by a version 4 UUID. 122 bits of
+/// randomness, and no rendering of it can contain the separator.
+impl MintCapabilityKey for String {
     fn mint() -> Self {
         format!("key:{}", uuid::Uuid::new_v4())
     }
@@ -492,7 +453,7 @@ impl<P, R, Id> CapabilityIssuer<P, R, Id> {
     ) -> Result<IssuedCapability<Key>, ShareError>
     where
         Id: Clone,
-        Key: CapabilityKey,
+        Key: MintCapabilityKey,
         P: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
         P::Error: Display,
         R: RowSource<Id, Key>,
@@ -641,6 +602,6 @@ mod tests {
 
     #[test]
     fn two_mints_never_collide() {
-        assert_ne!(String::mint(), <String as CapabilityKey>::mint());
+        assert_ne!(String::mint(), <String as MintCapabilityKey>::mint());
     }
 }

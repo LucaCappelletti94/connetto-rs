@@ -7,6 +7,9 @@
 //! checks go through the authorization model rather than through anything here.
 //! See `docs/architecture/12-identity-session-capability.md`.
 
+use core::fmt::Display;
+
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use crate::SessionId;
@@ -50,7 +53,7 @@ pub fn absent_marker() -> &'static str {
 pub struct AuthContext<Id = String> {
     /// Stable user identifier resolved at handshake time. A developer-defined
     /// distributed id type. Text appears only at the one Postgres GUC bind,
-    /// through [`Display`](std::fmt::Display).
+    /// through [`Display`].
     pub user_id: Id,
 }
 
@@ -82,7 +85,7 @@ pub struct VerifiedSession<Id = String> {
 /// Generic over the deployment's own key type for the same reason
 /// [`AuthContext`] is generic over its user id: text belongs at the edges, not
 /// in the middle. The key's serde encoding is what the signed token carries,
-/// and its [`Display`](core::fmt::Display) rendering is what reaches Postgres.
+/// and its [`Display`] rendering is what reaches Postgres.
 ///
 /// It is not a person and it asserts nothing about what it may do: the
 /// authorization model holds the permission as a relation on this name, so
@@ -291,6 +294,54 @@ impl ContentCaller {
     }
 }
 
+/// The deployment's share-key type: how the keys a caller holds reach
+/// Postgres.
+///
+/// A policy can only compare against a value the transaction bound, and a
+/// caller may hold several keys, so the set travels as one text value under
+/// [`SETTING`](Self::SETTING), joined by [`SEPARATOR`](Self::SEPARATOR), which
+/// a policy unpacks:
+///
+/// ```sql
+/// viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))
+/// ```
+///
+/// Whatever a deployment chooses is the contract its policies are written
+/// against, so choose before writing policies rather than after. A deployment
+/// wanting its own key type, setting, or rendering implements this for that
+/// type and everything downstream follows from [`Principal`]'s key parameter.
+/// Minting lives beside the issuer rather than here, because a replica needs
+/// the rendering to answer its own policies and never needs to make a key.
+pub trait CapabilityKey:
+    Clone + Display + Serialize + DeserializeOwned + Send + Sync + 'static
+{
+    /// The Postgres setting the joined keys are bound to.
+    const SETTING: &'static str = DEFAULT_SUBJECTS_SETTING;
+
+    /// The character joining the keys. A key whose rendering contains it is
+    /// refused at minting, because one that slipped through would split into
+    /// two and grant a neighbouring key's access.
+    const SEPARATOR: char = ',';
+
+    /// The subjects a caller holds, sorted and without repeats, empty when it
+    /// holds none.
+    ///
+    /// The list rather than one joined value, because a commit is attributed
+    /// to each subject and only the binding needs them joined. Sorting and
+    /// dropping repeats give one holder one value whatever order its grants
+    /// arrived in and however many copies of one grant it presented, so a
+    /// manifest or a byte window keyed on that value stays put across runs.
+    fn subjects(keys: &[CapabilitySubject<Self>]) -> Vec<String> {
+        let mut rendered: Vec<String> = keys.iter().map(|key| key.key().to_string()).collect();
+        rendered.sort_unstable();
+        rendered.dedup();
+        rendered
+    }
+}
+
+/// The default share-key: `key:` followed by a version 4 UUID, which no
+/// rendering of can contain the separator.
+impl CapabilityKey for String {}
 /// More than one login grant resolved on one handshake.
 ///
 /// The identity is dropped rather than picked, so the caller proceeds

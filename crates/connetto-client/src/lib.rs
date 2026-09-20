@@ -27,6 +27,7 @@
 //! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
+use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
 pub use connetto_core::{Custody, NoGate};
 
@@ -606,6 +607,15 @@ pub struct ClientConfig {
     /// does. Fixed for the life of the connection, because a replica belongs
     /// to the identity it was named from.
     caller: Option<(String, String)>,
+    /// What a translated policy means by the caller's subject set: the SQLite
+    /// function name the deployment mapped its subjects setting onto, and the
+    /// packed set it returns.
+    ///
+    /// Packed once here through [`CapabilityKey::pack`], the same rendering
+    /// the server binds into the setting, so the replica's local answer and
+    /// the server's cannot disagree about which keys the caller holds. `None`
+    /// when no policy names the set.
+    subjects: Option<(String, Option<String>)>,
     /// Percentage of `page_count` the freelist must reach before the trimming
     /// pass runs. Local to this device and never sent to the server: trimming
     /// is a whole-replica operation, not a handshake input. Defaults to
@@ -647,6 +657,7 @@ impl ClientConfig {
             policy_tables: PolicyTables::default(),
             unrecorded_tables: HashSet::new(),
             caller: None,
+            subjects: None,
             trim_threshold: DEFAULT_TRIM_THRESHOLD,
             trim_budget: DEFAULT_TRIM_BUDGET,
             rested_statistics_cap: DEFAULT_RESTED_STATISTICS_CAP,
@@ -676,6 +687,33 @@ impl ClientConfig {
     #[must_use]
     pub fn with_caller(mut self, function: impl Into<String>, identity: impl Into<String>) -> Self {
         self.caller = Some((function.into(), identity.into()));
+        self
+    }
+
+    /// What the replica's translated policies mean by the caller's subject
+    /// set: the share keys it holds beside its identity.
+    ///
+    /// `function` is the SQLite function name the build mapped the subjects
+    /// setting onto, and `subjects` are the keys the caller holds, packed
+    /// through their own `Key`. That type is the deployment's and carries
+    /// its separator and its packing, which is what makes the replica unable
+    /// to disagree with the server about which keys are held: both ends call
+    /// one rendering rather than spelling it twice. Holding none is stated by
+    /// passing none, which leaves the function answering `NULL` and every
+    /// membership over the set admitting nothing.
+    ///
+    /// Distinct from [`with_capabilities`](Self::with_capabilities), which is
+    /// what the handshake presents to the server. This is what the replica
+    /// answers its own policies with, and a deployment sets both.
+    #[must_use]
+    pub fn with_subjects<Key: CapabilityKey>(
+        mut self,
+        function: impl Into<String>,
+        subjects: &[CapabilitySubject<Key>],
+    ) -> Self {
+        let packed = connetto_core::auth::ContentCaller::new(None, Key::subjects(subjects))
+            .packed_subjects(Key::SEPARATOR);
+        self.subjects = Some((function.into(), packed));
         self
     }
 
@@ -1257,6 +1295,27 @@ fn register_caller(
         move || identity.clone(),
     )
     .map_err(|e| ClientError::Session(format!("registering the caller function: {e}")))
+}
+
+/// Register the no-argument function a translated policy calls for the
+/// caller's subject set.
+///
+/// It answers the packed set rather than one value, because that is what the
+/// server binds into the setting and what the membership test the policy
+/// compiles unpacks. `NULL` for a caller holding no key, which is what makes
+/// an absent capability fail closed: a comparison against `NULL` is `NULL`
+/// rather than true.
+fn register_subjects(
+    db: &mut SqliteConnection,
+    function: &str,
+    packed: Option<String>,
+) -> Result<(), ClientError> {
+    db.register_noarg_sql_function::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _, _>(
+        function,
+        SqliteFunctionBehavior::DETERMINISTIC | SqliteFunctionBehavior::INNOCUOUS,
+        move || packed.clone(),
+    )
+    .map_err(|e| ClientError::Session(format!("registering the subjects function: {e}")))
 }
 
 /// The SQLite function a translated schema's write guards call to let
@@ -2322,6 +2381,9 @@ where
             .map_err(|e| ClientError::Session(e.to_string()))?;
         if let Some((function, identity)) = &config.caller {
             register_caller(&mut db, function, identity.clone())?;
+        }
+        if let Some((function, packed)) = &config.subjects {
+            register_subjects(&mut db, function, packed.clone())?;
         }
         // Beside the caller function and for the same reach: the generated
         // write guards call it, so it exists before any trigger can run. A

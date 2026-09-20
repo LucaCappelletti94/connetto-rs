@@ -31,6 +31,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, MaybeSend, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
+use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoSigner, OidcProviderConfig, PgReadConnector,
@@ -43,7 +44,6 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
 use openfga_client::tonic::transport::Channel;
-use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -1024,7 +1024,7 @@ pub struct ServerConfig {
     translator: Option<Translator>,
     /// The caller mapping reverse translation rewrites the client's local caller
     /// function with. `None` when no policy names the caller.
-    caller: Option<SessionVariableMapping>,
+    caller: Option<CallerMappings>,
     /// Tables to set up for logical replication before CDC starts. When
     /// non-empty, `spawn_server` calls `start_replication` using the admin URL
     /// so the slot and publication exist before the ingest loop connects.
@@ -1078,7 +1078,7 @@ impl ServerConfig {
     pub fn with_translation(
         mut self,
         translator: Translator,
-        caller: Option<SessionVariableMapping>,
+        caller: Option<CallerMappings>,
     ) -> Self {
         self.translator = Some(translator);
         self.caller = caller;
