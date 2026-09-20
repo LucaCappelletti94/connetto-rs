@@ -562,15 +562,16 @@
 
   <!-- ==================== APPS AND BOTS (R91) ==================== -->
   <g id="apps-and-bots">
-    <rect x="620" y="1360" width="540" height="150" rx="8" fill="#FFEBEE" fill-opacity="0.6" stroke="#EF5350" stroke-width="1.5" />
+    <rect x="620" y="1360" width="540" height="162" rx="8" fill="#FFEBEE" fill-opacity="0.6" stroke="#EF5350" stroke-width="1.5" />
     <text x="640" y="1384" font-size="12" font-weight="600" fill="#C62828">Apps and bots: designed, not started</text>
     <g transform="translate(640, 1396)">
-      <rect width="500" height="100" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <text x="250" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Apps, installations and bots</text>
-      <text x="250" y="40" text-anchor="middle" font-size="9" fill="#C62828">not started: R91 (chapters 12, 11, 13, 16, template examples/bot-template)</text>
-      <text x="250" y="58" text-anchor="middle" font-size="9" fill="#555">an app is a key and a manifest, its bot is one user per deployment, an installation is one owner's grant</text>
-      <text x="250" y="74" text-anchor="middle" font-size="9" fill="#555">registry as synced tables under RLS, one route: an app-signed assertion buys an ordinary login grant</text>
-      <text x="250" y="90" text-anchor="middle" font-size="9" fill="#555">the share row picks the shared or the isolated view, meters charge the installer or the owner's app bucket</text>
+      <rect width="500" height="114" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
+      <text x="250" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Third-party programs that read and write a user's data</text>
+      <text x="250" y="36" text-anchor="middle" font-size="9" fill="#C62828">not started, R91. The design is in chapter 12, the login in chapter 11, the client side in chapter 13</text>
+      <text x="250" y="53" text-anchor="middle" font-size="9" fill="#555">a developer registers an app: its public key and the tables it wants. A user installs it on their own data</text>
+      <text x="250" y="69" text-anchor="middle" font-size="9" fill="#555">the app runs as a bot user of the deployment, logging in with a signed assertion, no browser and no password</text>
+      <text x="250" y="85" text-anchor="middle" font-size="9" fill="#555">a bot sees only the rows its installers shared with it, either one user at a time or all together</text>
+      <text x="250" y="101" text-anchor="middle" font-size="9" fill="#555">its traffic is charged to the user it acts for, or to the developer's app allowance, never to the bot</text>
     </g>
   </g>
 
