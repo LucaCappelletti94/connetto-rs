@@ -488,7 +488,23 @@ where
     /// `current_setting('app.user_id', true)`, so a membership subquery reaches
     /// Postgres as SQL the classifier reads. `None` for a deployment serving no
     /// membership term, where a subscription never names the caller.
-    caller: Option<SessionVariableMapping>,
+    caller: Option<CallerMappings>,
+}
+
+/// How a deployment's two caller settings reach the replica.
+///
+/// Two because the database holds them separately, one session value naming
+/// the caller and one holding the set of subjects it carries, and a filter
+/// reads one or the other rather than both.
+#[derive(Clone, Debug)]
+pub struct CallerMappings {
+    /// The identity setting, which every caller-aware deployment binds.
+    pub identity: SessionVariableMapping,
+    /// The subject-set setting, when the deployment binds share keys. Its
+    /// mapping has to declare the delimiter with `holding_set`, or a
+    /// membership test over it reverse translates as one value against the
+    /// whole joined list and matches nobody.
+    pub subjects: Option<SessionVariableMapping>,
 }
 
 impl Materializer<ParserDB, RuntimeWritableCatalog> {
@@ -543,7 +559,7 @@ impl<W: WritableCatalog> Materializer<ParserDB, W> {
         pg_ddl: &str,
         write: W,
         translator: Translator,
-        caller: Option<SessionVariableMapping>,
+        caller: Option<CallerMappings>,
     ) -> Result<Self, MaterializerError> {
         Self::build(
             pg_ddl,
@@ -568,7 +584,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         pg_ddl: &str,
         write: W,
         translator: Option<Translator>,
-        caller: Option<SessionVariableMapping>,
+        caller: Option<CallerMappings>,
         connector: C,
     ) -> Result<Self, MaterializerError> {
         Self::build(pg_ddl, write, translator, caller, connector)
@@ -578,7 +594,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         pg_ddl: &str,
         write: W,
         translator: Option<Translator>,
-        caller: Option<SessionVariableMapping>,
+        caller: Option<CallerMappings>,
         connector: C,
     ) -> Result<Self, MaterializerError> {
         let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
@@ -654,7 +670,10 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         let statement = statements.remove(0);
         let mut options = Pg2SqliteOptions::default();
         if let Some(caller) = &self.caller {
-            options = options.with_session_variable(caller.clone());
+            options = options.with_session_variable(caller.identity.clone());
+            if let Some(subjects) = &caller.subjects {
+                options = options.with_session_variable(subjects.clone());
+            }
         }
         let context = TranslationContext::new(&options);
         let pg = statement
@@ -663,12 +682,22 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
         Ok(pg.to_string())
     }
 
-    /// The client-dialect name of the deployment's caller function, or `None`
-    /// for a deployment serving no membership term.
+    /// The client-dialect name of the deployment's identity function, or
+    /// `None` for a deployment serving no membership term.
     #[must_use]
     pub fn caller_function(&self) -> Option<&str> {
         self.caller
             .as_ref()
+            .map(|caller| caller.identity.sqlite_function.as_str())
+    }
+
+    /// The client-dialect name of the deployment's subject-set function, or
+    /// `None` when it binds no subject set.
+    #[must_use]
+    pub fn subject_set_function(&self) -> Option<&str> {
+        self.caller
+            .as_ref()
+            .and_then(|caller| caller.subjects.as_ref())
             .map(|mapping| mapping.sqlite_function.as_str())
     }
 }
@@ -2388,7 +2417,7 @@ mod membership_term_tests {
     /// The client's own SQLite spelling of the motivating filter.
     const CLIENT_SQL: &str = "SELECT * FROM docs WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = current_app_user())";
 
-    fn materializer(caller: Option<SessionVariableMapping>) -> Materializer {
+    fn materializer(caller: Option<CallerMappings>) -> Materializer {
         let translator = Translated::of::<String>(SCHEMA, POLICIES, DEFAULT_USER_SETTING)
             .expect("the motivating policy translates")
             .into_parts()
@@ -2402,8 +2431,14 @@ mod membership_term_tests {
         .expect("the schema parses")
     }
 
-    fn mapping() -> SessionVariableMapping {
-        SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, "current_app_user")
+    fn mapping() -> CallerMappings {
+        CallerMappings {
+            identity: SessionVariableMapping::current_setting(
+                DEFAULT_USER_SETTING,
+                "current_app_user",
+            ),
+            subjects: None,
+        }
     }
 
     // The whole happy path at this seam: the caller rewrites, the canonical
@@ -2438,11 +2473,19 @@ mod membership_term_tests {
             "the seed reads the membership table, got {}",
             membership.seed_sql
         );
+        assert_eq!(
+            membership.caller,
+            subql::term::TermCaller::Identity,
+            "this filter's subquery reads one session value"
+        );
         let subject = typed_subscriber("alice", membership.subject_kind)
             .expect("a text subject takes any string");
+        // Seeded from the subscriber, because the term says that is what its
+        // own SQL reads. Handing it the subject set instead would admit rows
+        // a key grants that this query never returns.
         let seed = TermSeed {
             subscriber: Some(subject.clone()),
-            subjects: vec![subject.clone()],
+            subjects: Vec::new(),
             term_values: vec![(
                 vec![membership.pairs[0].column.clone()],
                 vec![(subject, vec![PgValue::Int(7)])],

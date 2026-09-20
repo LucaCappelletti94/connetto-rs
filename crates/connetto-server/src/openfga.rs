@@ -55,9 +55,9 @@ use subql::visibility::store::{
 };
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
-use crate::capability::CapabilityKey;
 use crate::counters::{AUTHORIZATION_CALLS, add};
 use crate::reach::GrantReach;
+use connetto_core::auth::CapabilityKey;
 
 /// A transport that counts the calls that ask whether a row is visible.
 ///

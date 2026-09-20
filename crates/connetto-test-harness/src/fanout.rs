@@ -18,8 +18,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use connetto_core::auth::CapabilityKey;
 use connetto_core::messages::BulkMessage;
 use connetto_core::traits::IncomingFrame;
+use connetto_server::CallerMappings;
 use connetto_server::counters::{self, CountersSnapshot};
 use connetto_server::openfga::{Counted, FgaAuth, ModelSubject, StoreUpkeep, Translated};
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
@@ -69,6 +71,9 @@ const READER: &str = "r0_reader";
 /// delivered as well as what is asked, and the run would measure two things at
 /// once.
 const OWNER: &str = "fanout-owner";
+/// The share key the team is granted to under [`PolicyShape::SubjectSet`],
+/// spelled the way the handshake's grant checker reads one.
+pub const SHARE_KEY: &str = "key:fanout-share";
 /// The team every row belongs to under [`PolicyShape::CrossTable`].
 const TEAM: i32 = 1;
 /// The key [`PolicyShape::KeyedShare`] grants paper 1 to, held by a caller with
@@ -104,6 +109,10 @@ pub enum PolicyShape {
     /// subscribed table, and the grant names one bearer, so this is the shape a
     /// narrowed announcement is observable on.
     KeyedShare,
+    /// The cross-table catalog with a membership matched against the set of
+    /// subjects the caller holds rather than its identity, which is what a
+    /// share key grants through.
+    SubjectSet,
 }
 
 impl PolicyShape {
@@ -175,6 +184,29 @@ impl PolicyShape {
                 format!("INSERT INTO paper_shares (paper_id, viewer) VALUES (1, '{SHARE_KEY_A}')"),
                 format!("INSERT INTO paper_shares (paper_id, viewer) VALUES (2, '{SHARE_KEY_B}')"),
             ],
+            Self::SubjectSet => vec![
+                "CREATE TABLE teams (id INT PRIMARY KEY)".into(),
+                format!("INSERT INTO teams (id) VALUES ({TEAM})"),
+                // `member` is declared first on purpose: the seed projects `team_id`,
+                // so a reader that took the first decoded cell instead of the
+                // projected one would pass on any table whose key came first.
+                "CREATE TABLE team_members (member TEXT NOT NULL, \
+                   team_id INT REFERENCES teams(id), PRIMARY KEY (team_id, member))"
+                    .into(),
+                format!(
+                    "INSERT INTO team_members (team_id, member) VALUES ({TEAM}, '{SHARE_KEY}')"
+                ),
+                "CREATE TABLE items (id INT PRIMARY KEY, owner TEXT NOT NULL, \
+                   team_id INT NOT NULL REFERENCES teams(id), label TEXT)"
+                    .into(),
+                "ALTER TABLE items ENABLE ROW LEVEL SECURITY".into(),
+                "CREATE POLICY items_p ON items FOR SELECT USING (\
+                   EXISTS (SELECT 1 FROM team_members \
+                           WHERE team_members.team_id = items.team_id \
+                             AND team_members.member = ANY(string_to_array(\
+                                 current_setting('app.subjects', true), ','))))"
+                    .into(),
+            ],
         }
     }
 
@@ -182,7 +214,7 @@ impl PolicyShape {
     fn ddl(self) -> &'static str {
         match self {
             Self::Row => FANOUT_PG_DDL,
-            Self::CrossTable | Self::OwnerOverTeams => CROSS_TABLE_PG_DDL,
+            Self::CrossTable | Self::OwnerOverTeams | Self::SubjectSet => CROSS_TABLE_PG_DDL,
             Self::KeyedShare => KEYED_SHARE_PG_DDL,
         }
     }
@@ -194,6 +226,7 @@ impl PolicyShape {
             Self::CrossTable => CROSS_TABLE_PG_POLICIES,
             Self::OwnerOverTeams => OWNER_OVER_TEAMS_PG_POLICIES,
             Self::KeyedShare => KEYED_SHARE_PG_POLICIES,
+            Self::SubjectSet => SUBJECT_SET_PG_POLICIES,
         }
     }
 
@@ -204,7 +237,7 @@ impl PolicyShape {
             Self::Row => format!(
                 "INSERT INTO items (id, owner, label) VALUES ({n}, '{OWNER}', 'row-{n}{filler}')"
             ),
-            Self::CrossTable | Self::OwnerOverTeams => format!(
+            Self::CrossTable | Self::OwnerOverTeams | Self::SubjectSet => format!(
                 "INSERT INTO items (id, owner, team_id, label) \
                  VALUES ({n}, '{OWNER}', {TEAM}, 'row-{n}{filler}')"
             ),
@@ -218,7 +251,9 @@ impl PolicyShape {
     fn published(self) -> &'static [&'static str] {
         match self {
             Self::Row => &["items"],
-            Self::CrossTable | Self::OwnerOverTeams => &["items", "team_members"],
+            Self::CrossTable | Self::OwnerOverTeams | Self::SubjectSet => {
+                &["items", "team_members"]
+            }
             Self::KeyedShare => &["papers", "paper_shares"],
         }
     }
@@ -227,7 +262,9 @@ impl PolicyShape {
     fn drop_order(self) -> &'static [&'static str] {
         match self {
             Self::Row => &["items"],
-            Self::CrossTable | Self::OwnerOverTeams => &["items", "team_members", "teams"],
+            Self::CrossTable | Self::OwnerOverTeams | Self::SubjectSet => {
+                &["items", "team_members", "teams"]
+            }
             Self::KeyedShare => &["paper_shares", "papers"],
         }
     }
@@ -235,7 +272,7 @@ impl PolicyShape {
     /// The table a subscriber reads and a mutation writes.
     fn data_table(self) -> &'static str {
         match self {
-            Self::Row | Self::CrossTable | Self::OwnerOverTeams => "items",
+            Self::Row | Self::CrossTable | Self::OwnerOverTeams | Self::SubjectSet => "items",
             Self::KeyedShare => "papers",
         }
     }
@@ -309,6 +346,14 @@ CREATE POLICY papers_p ON papers FOR SELECT USING (
   OR EXISTS (SELECT 1 FROM paper_shares s
              WHERE s.paper_id = papers.id
                AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')))
+);";
+/// A membership matched against the caller's subject set rather than its
+/// identity, which is how a share key reaches rows nobody owns.
+pub const SUBJECT_SET_PG_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;
+CREATE POLICY items_p ON items FOR SELECT USING (
+  EXISTS (SELECT 1 FROM team_members
+          WHERE team_members.team_id = items.team_id
+            AND team_members.member = ANY(string_to_array(current_setting('app.subjects', true), ',')))
 );";
 /// How long one live patch may take to arrive before the run is declared hung.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -660,6 +705,18 @@ pub async fn membership_term_fixture(fixture: &Fixture) -> Server {
     .await
 }
 
+/// The term whose membership is matched against the caller's subject set, so
+/// a share key reaches rows its holder does not own.
+pub async fn subject_set_term_fixture(fixture: &Fixture) -> Server {
+    provision_with(
+        fixture,
+        PolicyShape::SubjectSet,
+        Executor::Shipped,
+        Some(caller_mapping()),
+    )
+    .await
+}
+
 /// The term over a policy that never reads the membership, so R27's
 /// intersection is observable in both directions.
 pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
@@ -674,11 +731,20 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
 
 /// The pairing every example build uses: `current_setting('app.user_id')`
 /// spelled `current_app_user()` on the replica.
-fn caller_mapping() -> SessionVariableMapping {
-    SessionVariableMapping::current_setting(
-        connetto_server::capability::DEFAULT_USER_SETTING,
-        "current_app_user",
-    )
+fn caller_mapping() -> CallerMappings {
+    CallerMappings {
+        identity: SessionVariableMapping::current_setting(
+            connetto_server::capability::DEFAULT_USER_SETTING,
+            "current_app_user",
+        ),
+        subjects: Some(
+            SessionVariableMapping::current_setting(
+                <String as CapabilityKey>::SETTING,
+                "current_app_subjects",
+            )
+            .holding_set(<String as CapabilityKey>::SEPARATOR),
+        ),
+    }
 }
 
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
@@ -705,7 +771,7 @@ async fn provision_with(
     fixture: &Fixture,
     shape: PolicyShape,
     executor: Executor,
-    caller: Option<SessionVariableMapping>,
+    caller: Option<CallerMappings>,
 ) -> Server {
     let mut statements: Vec<String> = shape
         .drop_order()

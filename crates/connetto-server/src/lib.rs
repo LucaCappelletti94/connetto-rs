@@ -51,7 +51,8 @@ pub use abuse::{
 };
 pub use auth::{RlsAuth, RlsAuthError};
 pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
-pub use capability::{CapabilityIssuer, CapabilityKey, IssuedCapability, ShareError, ShareLevel};
+pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel};
+pub use connetto_core::auth::CapabilityKey;
 pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.
@@ -75,9 +76,9 @@ pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };
 pub use materializer::{
-    ComputedCapture, ComputedChange, Dispatched, FoldSeeded, MatchedPatch, Materializer,
-    MaterializerError, ReadConnector, Registration, RuntimeVersionColumn, RuntimeWritableCatalog,
-    RuntimeWritableCatalogBuilder, SeedPlan, SqliteRegistration,
+    CallerMappings, ComputedCapture, ComputedChange, Dispatched, FoldSeeded, MatchedPatch,
+    Materializer, MaterializerError, ReadConnector, Registration, RuntimeVersionColumn,
+    RuntimeWritableCatalog, RuntimeWritableCatalogBuilder, SeedPlan, SqliteRegistration,
 };
 pub use oplog::{
     CHANGE_OP_TYPE, CatchupDecision, ChangeOp, ChangeOpSql, ChangeRecord, InMemoryOplog, Oplog,
@@ -90,7 +91,7 @@ pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
     NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, subject_set_reach,
 };
 pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};

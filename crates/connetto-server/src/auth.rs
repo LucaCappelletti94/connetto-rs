@@ -26,8 +26,9 @@ mod rls {
     use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
     use subql::{DatabaseLike, ParserDB, TableLike};
 
-    use crate::capability::{CallerBinding, CapabilityKey};
+    use crate::capability::CallerBinding;
     use crate::key_filter::{KeyError, KeyFilter};
+    use connetto_core::auth::CapabilityKey;
     use connetto_core::quote_ident;
 
     /// How long a locking read waits for a conflicting writer.

@@ -1775,7 +1775,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#29868bf2d8f27923b3469c577e2e90afb46783d3"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#844ae23de209c25ac089d830983ff6233ace3ed9"
 dependencies = [
  "git2",
  "sql-traits",
@@ -2154,7 +2154,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#d3c375683ee51c48b3a8637ebe49b1d4081128b5"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2167,7 +2167,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#0d08df0dbb28c5eaf8af24ce05df6e78ce026a92"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#d3c375683ee51c48b3a8637ebe49b1d4081128b5"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2660,7 +2660,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#c2223b9f77484a21b478e217ced806a4f38b9a5f"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#35a3ddf51e4212da79be7e02cf36d8c37ead0843"
 dependencies = [
  "arc-swap",
  "async-lock",

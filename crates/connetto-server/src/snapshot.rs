@@ -229,11 +229,12 @@ mod pg {
     use super::{
         RowSource, SnapshotError, SourceRow, page_sql, projection_exposes, table_from_select,
     };
-    use crate::capability::{CallerBinding, CapabilityKey};
+    use crate::capability::CallerBinding;
     use crate::key_filter::KeyFilter;
     use crate::session::{
         PageKey, PageSpec, SnapshotEstimate, SnapshotPage, SnapshotSource, TermSeedRead,
     };
+    use connetto_core::auth::CapabilityKey;
     use connetto_core::quote_ident;
 
     /// A [`SnapshotSource`] that reads initial rows from Postgres over a

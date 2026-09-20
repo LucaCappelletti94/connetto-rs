@@ -22,7 +22,9 @@ use connetto_core::traits::Transport;
 use connetto_core::transport::{LoopbackTransport, loopback};
 use connetto_test_harness::Client;
 use connetto_test_harness::Fixture;
-use connetto_test_harness::fanout::{membership_term_fixture, term_over_owner_fixture};
+use connetto_test_harness::fanout::{
+    SHARE_KEY, membership_term_fixture, subject_set_term_fixture, term_over_owner_fixture,
+};
 use diesel::prelude::*;
 use sqlite_diff_rs::{
     DiffOps, Insert, ParsedDiffSet, PatchSet, PatchsetOp, SimpleTable, Value as WireValue,
@@ -934,4 +936,51 @@ async fn a_direct_caller_comparison_registers_and_self_seeds() {
         .exec("INSERT INTO items (id, owner, team_id, label) VALUES (54, 'bob', 1, 'not-hers')")
         .await;
     no_live_past(&mut alice, "mine", &mut replica, &accounted, QUIET).await;
+}
+
+/// The set half of the same feature: the team is granted to a share key, the
+/// filter names the subjects the caller holds rather than its identity, and
+/// the rows reach a caller who owns none of them.
+///
+/// The client spells the set test the one way that survives the round trip,
+/// since that is the shape pg2sqlite restores to `= ANY(string_to_array(...))`
+/// and the only one subql compiles as a caller-set term.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_share_key_admits_the_rows_its_membership_grants() {
+    // The guarded shape pg2sqlite emits for `= ANY(string_to_array(...))`,
+    // which is the one its reverse direction reads back as that membership.
+    // A bare `instr` search is read as a position query and refused.
+    const SET_QUERY: &str = "SELECT * FROM items WHERE team_id IN \
+        (SELECT team_id FROM team_members WHERE CASE WHEN current_app_subjects() IS NOT NULL \
+          THEN current_app_subjects() <> '' AND instr(member, ',') = 0 \
+          AND instr(',' || current_app_subjects() || ',', ',' || member || ',') > 0 END)";
+
+    let fixture = Fixture::acquire().await;
+    let server = subject_set_term_fixture(&fixture).await;
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (11, 'nobody', 1, 'one')")
+        .await;
+
+    // Owns nothing, is a member of nothing, holds the key the team is
+    // granted to.
+    let mut holder = server.connect();
+    holder
+        .handshake_presenting("r27-holder", &["user:stranger", SHARE_KEY], None)
+        .await;
+    holder.subscribe("docs", SET_QUERY).await;
+    let mut replica = Replica::new();
+    for patch in holder.expect_snapshot("docs").await {
+        replica.apply(&patch.patchset_zstd);
+    }
+    expect_membership_opened(&mut holder).await;
+    while let Some(patch) = holder.try_live(QUIET).await {
+        if patch.sub_id == "docs" {
+            replica.apply(&patch.patchset_zstd);
+        }
+    }
+    assert_eq!(
+        replica.ids(),
+        vec![0, 11],
+        "the key's membership admits the team's rows, which its holder owns none of"
+    );
 }

@@ -54,8 +54,8 @@ use subql::backend::Postgres;
 use subql::visibility::{RowView, Verdict, VisibilityPolicy};
 
 use crate::auth::RlsAuth;
-use crate::capability::CapabilityKey;
 use crate::counters::{VISIBILITY_DISAGREEMENTS, add};
+use connetto_core::auth::CapabilityKey;
 
 /// A second executor asked about the row as it is now, alongside the one that
 /// delivers.
