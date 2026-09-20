@@ -2820,10 +2820,7 @@ where
                 return Ok(None);
             }
         };
-        let key = state
-            .principal
-            .identity()
-            .map_or_else(|| state.session_id.to_string(), |id| id.user_id.to_string());
+        let key = crate::capability::meter_key(&state.principal, state.session_id);
         let patch_len = u64::try_from(patch.patchset_zstd.len()).unwrap_or(u64::MAX);
         match self.guard.bytes().allow_mutation_bytes(&key, patch_len) {
             Ok(()) => {
@@ -3310,12 +3307,7 @@ where
     ) -> Result<(), SessionError> {
         let request_id = req.request_id;
         let caller = crate::capability::rendered_caller(&state.principal);
-        // The byte window keys on whatever names this caller, the identity or
-        // the whole set of subjects it holds, and falls back to the run's own
-        // handle rather than to a shared empty string.
-        let budget_key = caller
-            .storage_key()
-            .unwrap_or_else(|| state.session_id.to_string());
+        let budget_key = crate::capability::meter_key(&state.principal, state.session_id);
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.
