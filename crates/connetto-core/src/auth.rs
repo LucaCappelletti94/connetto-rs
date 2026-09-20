@@ -19,6 +19,29 @@ pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 /// deployment's key type names another.
 pub const DEFAULT_SUBJECTS_SETTING: &str = "app.subjects";
 
+/// The value a binding gives a half of the caller it does not hold.
+///
+/// Postgres cannot express absence on a pooled connection: once a custom
+/// setting has been bound on a session, even transaction-locally, even by a
+/// transaction that rolled back, `current_setting(.., true)` answers `''` for
+/// the rest of that session and neither `RESET` nor `DISCARD ALL` takes the
+/// placeholder away. So a half left unbound reads as a blank identity to the
+/// next caller the pool hands that connection to, which is the one thing
+/// chapter 08 forbids.
+///
+/// Binding this instead makes absence mean the same thing on a fresh and a
+/// reused connection. It is minted once per process and no row can carry it,
+/// so an owner comparison against it is false rather than accidentally true.
+pub fn absent_marker() -> &'static str {
+    static MARKER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u8(0);
+        format!("connetto:absent:{:016x}", hasher.finish())
+    });
+    &MARKER
+}
+
 /// Session-scoped identity: a user id and nothing else.
 ///
 /// Tenant and role belong in the authorization model rather than on the

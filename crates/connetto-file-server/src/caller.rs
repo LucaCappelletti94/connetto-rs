@@ -5,7 +5,9 @@
 //! names this deployment's policies read, so a caller whose rights come from a
 //! share key is answered on its keys rather than refused.
 
-use connetto_core::auth::{ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING};
+use connetto_core::auth::{
+    ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING, absent_marker,
+};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
 use crate::error::ServerError;
@@ -32,35 +34,30 @@ impl Default for CallerSettings {
     }
 }
 
-/// Bind whichever halves `caller` holds for the rest of the transaction.
+/// Bind both halves of `caller` for the rest of the transaction.
 ///
-/// A half the caller does not hold stays unbound, so `current_setting` yields
-/// NULL and a comparison against it fails closed.
+/// A half the caller does not hold takes [`absent_marker`], which no row can
+/// carry, so a comparison against it is false. Leaving it unbound instead
+/// would read as `''` to the next caller on a pooled connection, because
+/// Postgres keeps the placeholder for the life of the session once anything
+/// has bound it.
 pub(crate) async fn bind_caller(
     conn: &mut AsyncPgConnection,
     settings: &CallerSettings,
     caller: &ContentCaller,
 ) -> Result<(), diesel::result::Error> {
-    match (caller.identity(), caller.subjects()) {
-        (None, None) => Ok(()),
-        (Some(user), None) => diesel::select(functions::set_config(&settings.user, user, true))
-            .get_result::<String>(conn)
-            .await
-            .map(drop),
-        (None, Some(subjects)) => {
-            diesel::select(functions::set_config(&settings.subjects, subjects, true))
-                .get_result::<String>(conn)
-                .await
-                .map(drop)
-        }
-        (Some(user), Some(subjects)) => diesel::select((
-            functions::set_config(&settings.user, user, true),
-            functions::set_config(&settings.subjects, subjects, true),
-        ))
-        .get_result::<(String, String)>(conn)
-        .await
-        .map(drop),
-    }
+    let marker = absent_marker();
+    diesel::select((
+        functions::set_config(&settings.user, caller.identity().unwrap_or(marker), true),
+        functions::set_config(
+            &settings.subjects,
+            caller.subjects().unwrap_or(marker),
+            true,
+        ),
+    ))
+    .get_result::<(String, String)>(conn)
+    .await
+    .map(drop)
 }
 
 /// The key `caller` owns manifest rows under, and the value the deployment

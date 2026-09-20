@@ -3750,14 +3750,16 @@ where
         &self,
         state: &SessionState<Id, Key>,
     ) -> Option<crate::reexec::ConnettoReadSetup> {
-        let statements =
-            crate::capability::CallerBinding::of(&state.principal, self.target.user_setting())
-                .setup_statements();
-        (!statements.is_empty()).then(|| {
+        let binding =
+            crate::capability::CallerBinding::of(&state.principal, self.target.user_setting());
+        // Both settings are bound either way, an unheld half taking the absent
+        // marker, so what decides the offer is what the caller holds rather
+        // than how many statements the binding renders.
+        binding.binds_a_caller().then(|| {
             crate::reexec::ConnettoReadSetup::of(ReadBudget::new(
                 self.guard.reexec_budget().timeout,
             ))
-            .with_statements(statements)
+            .with_statements(binding.setup_statements())
         })
     }
 

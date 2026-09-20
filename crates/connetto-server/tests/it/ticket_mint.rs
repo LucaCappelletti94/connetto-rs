@@ -178,6 +178,60 @@ async fn unidentified_caller_binds_nothing() {
     server.await.expect("join").expect("session ok");
 }
 
+/// A connection that already served an identified caller must not let the next
+/// caller, holding nothing, be read as the blank identity.
+///
+/// Postgres keeps a custom setting's placeholder for the life of the session
+/// once anything has bound it, so the pool hands the next caller a connection
+/// where an unbound identity reads as `''` rather than NULL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reused_connection_carries_no_blank_identity() {
+    let fixture = Fixture::acquire().await;
+    let reader_pool = setup_reader_admitting(&fixture, ADMITS_BLANK_IDENTITY).await;
+
+    // Alice first, so the pooled connection has the setting bound once, which
+    // is what leaves the placeholder behind.
+    let (mut alice, alice_server) = open_session_with_grants(
+        reader_pool.clone(),
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        OkSigner,
+        &ThrottleConfig::default(),
+        "alice",
+        &["user:alice"],
+    )
+    .await;
+    let _ = request_ticket(&mut alice, "req-alice", FILE_ID, ContentVerb::Read).await;
+    alice.close().await.expect("close");
+    alice_server.await.expect("join").expect("session ok");
+
+    let (mut anon, anon_server) = open_session_with_grants(
+        reader_pool,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        OkSigner,
+        &ThrottleConfig::default(),
+        "anon-after-alice",
+        &[],
+    )
+    .await;
+    let resp = request_ticket(&mut anon, "req-after", FILE_ID, ContentVerb::Read).await;
+
+    let ControlMessage::NonFatalError(NonFatalError { related_to, detail }) = resp else {
+        panic!("a caller holding nothing must be refused on a reused connection, got {resp:?}");
+    };
+    assert_eq!(
+        related_to.as_deref(),
+        Some("req-after"),
+        "request_id echoed"
+    );
+    assert_eq!(
+        detail, CONTENT_TICKET_REFUSED,
+        "the placeholder must not read as a blank identity"
+    );
+
+    anon.close().await.expect("close");
+    anon_server.await.expect("join").expect("session ok");
+}
+
 /// Identity and capability subjects are a union on the ticket-mint visibility path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn identity_plus_key_is_the_union() {
