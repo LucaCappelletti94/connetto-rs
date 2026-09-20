@@ -694,26 +694,24 @@ impl ClientConfig {
     /// set: the share keys it holds beside its identity.
     ///
     /// `function` is the SQLite function name the build mapped the subjects
-    /// setting onto, and `subjects` are the keys, packed here by the same
-    /// [`CapabilityKey`] rendering the server binds so the replica cannot
-    /// disagree with it about which keys the caller holds. Holding none is
-    /// stated by passing none, which leaves the function answering `NULL` and
-    /// every membership over the set admitting nothing.
+    /// setting onto, and `subjects` are the keys the caller holds, packed
+    /// through their own `Key`. That type is the deployment's and carries
+    /// its separator and its packing, which is what makes the replica unable
+    /// to disagree with the server about which keys are held: both ends call
+    /// one rendering rather than spelling it twice. Holding none is stated by
+    /// passing none, which leaves the function answering `NULL` and every
+    /// membership over the set admitting nothing.
     ///
-    /// A deployment with its own key type packs through that type rather than
-    /// this, since the packing is the contract its policies are written
-    /// against.
+    /// Distinct from [`with_capabilities`](Self::with_capabilities), which is
+    /// what the handshake presents to the server. This is what the replica
+    /// answers its own policies with, and a deployment sets both.
     #[must_use]
-    pub fn with_subjects(
+    pub fn with_subjects<Key: CapabilityKey>(
         mut self,
         function: impl Into<String>,
-        subjects: impl IntoIterator<Item = impl Into<String>>,
+        subjects: &[CapabilitySubject<Key>],
     ) -> Self {
-        let held: Vec<CapabilitySubject> = subjects
-            .into_iter()
-            .map(|subject| CapabilitySubject::new(subject.into()))
-            .collect();
-        self.subjects = Some((function.into(), <String as CapabilityKey>::pack(&held)));
+        self.subjects = Some((function.into(), Key::pack(subjects)));
         self
     }
 

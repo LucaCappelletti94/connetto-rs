@@ -21,6 +21,7 @@ use connetto_client::{
     ClientConfig, ClientError, ClientEvent, ConnettoConnection, PolicyTables, Replica,
 };
 use connetto_core::Cursor;
+use connetto_core::auth::CapabilitySubject;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, MutationPatch,
     SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
@@ -739,10 +740,11 @@ fn the_replica_answers_the_packed_subject_set() {
     use diesel::RunQueryDsl;
 
     let (ddl, tables) = translation();
-    let config = client_config(tables).with_subjects(
-        "current_app_subjects",
-        ["key:a".to_owned(), "key:b".to_owned()],
-    );
+    let held = [
+        CapabilitySubject::<String>::new("key:a"),
+        CapabilitySubject::<String>::new("key:b"),
+    ];
+    let config = client_config(tables).with_subjects("current_app_subjects", &held);
     let mut connection =
         ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
             .expect("the replica opens");
@@ -765,7 +767,8 @@ fn a_caller_holding_no_key_answers_null() {
     use diesel::RunQueryDsl;
 
     let (ddl, tables) = translation();
-    let config = client_config(tables).with_subjects("current_app_subjects", Vec::<String>::new());
+    let config = client_config(tables)
+        .with_subjects("current_app_subjects", &[] as &[CapabilitySubject<String>]);
     let mut connection =
         ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
             .expect("the replica opens");
