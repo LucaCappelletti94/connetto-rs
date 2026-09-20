@@ -335,6 +335,7 @@ async fn start_file_server(
         ),
         verifier: TicketVerifier::new(public_key),
         grace: Duration::from_secs(600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: PhantomData,
     })
     .await
