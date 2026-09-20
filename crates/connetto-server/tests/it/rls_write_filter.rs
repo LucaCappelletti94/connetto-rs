@@ -49,9 +49,8 @@ pub(crate) async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT)",
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
             // The union: a row you own, or a row owned by a share key you hold.
-            // A caller holding no key leaves `app.subjects` unset, so
-            // `string_to_array` yields NULL and the second disjunct is NULL
-            // rather than true.
+            // A caller holding no key binds the absent marker, so the second
+            // disjunct compares the owner against that one value and is false.
             "CREATE POLICY notes_p ON notes USING ( \
                owner = current_setting('app.user_id', true) \
                OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')))",

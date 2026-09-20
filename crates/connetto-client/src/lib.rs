@@ -678,15 +678,29 @@ impl ClientConfig {
     ///
     /// `function` is the SQLite function name the build mapped
     /// `current_setting('app.user_id')` onto through pg2sqlite's
-    /// `with_session_variable`, and `identity` is what it returns: the same
-    /// value the server binds as that setting, so both ends of the policy
-    /// compare against one identity. connetto registers it on the replica
-    /// connection beside the application's own functions, because the
+    /// `with_session_variable`, and `identity` is who the caller is, or `None`
+    /// when nobody is signed in. connetto registers the function on the
+    /// replica connection beside the application's own functions, because the
     /// generated view and its three `INSTEAD OF` triggers call it and would
     /// otherwise fail to resolve on the first read.
+    ///
+    /// An unheld identity renders as [`absent_marker`], the same shape the
+    /// server binds, rather than as `""`. An empty string is a real identity
+    /// that a row can carry, so a replica answering `""` would show its holder
+    /// rows the server hides.
+    ///
+    /// [`absent_marker`]: connetto_core::auth::absent_marker
     #[must_use]
-    pub fn with_caller(mut self, function: impl Into<String>, identity: impl Into<String>) -> Self {
-        self.caller = Some((function.into(), identity.into()));
+    pub fn with_caller(
+        mut self,
+        function: impl Into<String>,
+        identity: Option<impl Into<String>>,
+    ) -> Self {
+        let identity = identity.map_or_else(
+            || connetto_core::auth::absent_marker().to_owned(),
+            Into::into,
+        );
+        self.caller = Some((function.into(), identity));
         self
     }
 

@@ -311,7 +311,7 @@ CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
             [("orders", "orders_rls")],
             ["orders"],
         ))
-        .with_caller("connetto_user", "alice".to_owned());
+        .with_caller("connetto_user", Some("alice".to_owned()));
     let replica = Replica::in_memory();
     let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
         &replica, ddl, &config, None,

@@ -226,7 +226,7 @@ diesel::table! {
 fn client_config(tables: PolicyTables) -> ClientConfig {
     ClientConfig::new("r40-rls-sync")
         .with_login(Some(connetto_client::Grant::new("user:alice")))
-        .with_caller(CALLER_FUNCTION, ALICE)
+        .with_caller(CALLER_FUNCTION, Some(ALICE))
         .with_policy_tables(tables)
 }
 

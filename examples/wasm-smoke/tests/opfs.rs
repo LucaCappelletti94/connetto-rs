@@ -99,7 +99,7 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, &user_id);
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id));
     let conn = connect(&config, Some(REPLICA_DDL)).await;
 
     // The pump under spawn_local: the wasm driving mode for the same client

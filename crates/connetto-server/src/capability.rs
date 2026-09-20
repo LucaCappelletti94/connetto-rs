@@ -75,6 +75,26 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
     )
 }
 
+/// The bucket a per-caller meter charges: whatever names this caller, else
+/// the run's own handle.
+///
+/// Namespaced by [`ContentCaller::storage_key`], so an identity and a share
+/// key that render alike meter separately. A caller holding nothing has no
+/// name to carry across runs, so it meters per run rather than sharing one
+/// bucket with every other anonymous caller.
+///
+/// The one keying for every meter. Keying on the identity alone would hand a
+/// key-only caller a fresh allowance on every reconnect, because the fallback
+/// is per run while the grants it presents are not.
+pub(crate) fn meter_key<Id: Display, Key: CapabilityKey>(
+    caller: &Principal<Id, Key>,
+    run: impl Display,
+) -> String {
+    rendered_caller(caller)
+        .storage_key()
+        .unwrap_or_else(|| run.to_string())
+}
+
 /// The caller rendered for one RLS transaction, under the setting names this
 /// deployment binds them to.
 ///
@@ -603,5 +623,54 @@ mod tests {
     #[test]
     fn two_mints_never_collide() {
         assert_ne!(String::mint(), <String as MintCapabilityKey>::mint());
+    }
+
+    /// A key-only caller meters under its keys, so reconnecting does not hand
+    /// it a fresh allowance, and a caller holding nothing meters per run.
+    #[test]
+    fn a_meter_bucket_follows_the_caller_across_runs() {
+        use connetto_core::SessionId;
+        use connetto_core::auth::{AuthContext, Subject, VerifiedSession};
+
+        fn handle(byte: u8) -> SessionId {
+            SessionId::from_uuid(uuid::Uuid::from_bytes([byte; 16]))
+        }
+
+        fn key_only(run: u8) -> Principal {
+            let mut principal = Principal::unidentified(handle(run));
+            principal
+                .accept(Subject::Capability(CapabilitySubject::new("key:k1")))
+                .expect("a capability never conflicts");
+            principal
+        }
+
+        let first = key_only(1);
+        let second = key_only(2);
+        assert_eq!(
+            meter_key(&first, first.session_id()),
+            meter_key(&second, second.session_id()),
+            "the same key holder meters in one bucket across two runs"
+        );
+
+        let nothing_held: Principal = Principal::unidentified(handle(3));
+        let other_run: Principal = Principal::unidentified(handle(4));
+        assert_ne!(
+            meter_key(&nothing_held, nothing_held.session_id()),
+            meter_key(&other_run, other_run.session_id()),
+            "a caller holding nothing meters per run rather than sharing one bucket"
+        );
+
+        let mut identified: Principal = Principal::unidentified(handle(5));
+        identified
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("key:k1"),
+                session_id: handle(5),
+            }))
+            .expect("one identity is accepted");
+        assert_ne!(
+            meter_key(&identified, identified.session_id()),
+            meter_key(&first, first.session_id()),
+            "an identity spelled like the key meters apart from the key holder"
+        );
     }
 }

@@ -84,7 +84,7 @@ fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
     let conn = ConnettoConnection::<FakeTransport>::open(
         &replica,
         synced_ddl,
-        &ClientConfig::new("import-test".to_owned()).with_caller("current_app_user", account),
+        &ClientConfig::new("import-test".to_owned()).with_caller("current_app_user", Some(account)),
         None,
     )
     .expect("open replica");

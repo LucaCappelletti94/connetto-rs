@@ -123,7 +123,7 @@ pub async fn connect_tab(
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity));
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -150,7 +150,7 @@ pub async fn connect_server(
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity);
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity));
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

@@ -10,7 +10,7 @@
 
 Define how a caller proves who it is, end to end, from the moment a user logs in to the moment the server binds a verified identity onto a session. This chapter is about authentication only, proving identity. Authorization, deciding which rows an identity may read or write, is a separate concern that already has its own chapter (`08-authorization.md`) and is not redesigned here.
 
-The single fact that connects the two chapters: authentication produces a `Principal`, and the authorization layer consumes it. Where that `Principal` carries an identity, `PgSnapshotSource` and `PgWriteTarget` bind its user id into `SELECT set_config('app.user_id', $1, true)`, so whatever this chapter resolves as the identity becomes the RLS principal directly. Where it carries none, the setting is left unbound for the whole transaction, which is what makes an owner-scoped policy hide every row while a public one still returns its own. That is why authentication is load-bearing for security.
+The single fact that connects the two chapters: authentication produces a `Principal`, and the authorization layer consumes it. Where that `Principal` carries an identity, `PgSnapshotSource` and `PgWriteTarget` bind its user id into `SELECT set_config('app.user_id', $1, true)`, so whatever this chapter resolves as the identity becomes the RLS principal directly. Where it carries none, that setting takes the absent marker chapter 08 describes, a value no row can carry, which is what makes an owner-scoped policy hide every row while a public one still returns its own. That is why authentication is load-bearing for security.
 
 ---
 

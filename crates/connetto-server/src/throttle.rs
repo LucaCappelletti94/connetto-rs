@@ -62,24 +62,32 @@ impl Limit {
 
 /// Which set of limits a caller gets.
 ///
-/// An authenticated caller is accountable: there is a user to attribute cost to,
-/// a session to revoke, and a login that already cost them something. An
-/// unidentified caller has none of that by definition, so its allowance is
+/// An accountable caller is one connetto can attribute cost to and cut off:
+/// there is a session to revoke and a grant that already cost somebody
+/// something, whether that grant is a login or a share key. A caller that
+/// presented neither has none of that by definition, so its allowance is
 /// smaller rather than absent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// A caller whose handshake resolved an identity.
+    /// A caller whose handshake resolved an identity or a share key.
     Identified,
-    /// A caller with no identity, which is a supported way to connect.
+    /// A caller that presented no grant at all, which is a supported way to
+    /// connect.
     Anonymous,
 }
 
 impl Tier {
-    /// The tier `principal` gets: identified when its handshake resolved an
-    /// identity, anonymous otherwise.
+    /// The tier `principal` gets: identified when its handshake resolved
+    /// anything at all, anonymous when it resolved nothing.
+    ///
+    /// A share key is as accountable as a login. It is connetto-signed, the
+    /// permission behind it is a row the application can delete, and the
+    /// caller holding it is named in every policy it passes. Keying this on
+    /// the identity alone would put a caller whose whole authorization comes
+    /// from a key on the allowance meant for a caller that proved nothing.
     #[must_use]
     pub fn of<Id, Key>(principal: &connetto_core::auth::Principal<Id, Key>) -> Self {
-        if principal.identity().is_some() {
+        if principal.identity().is_some() || !principal.capabilities().is_empty() {
             Self::Identified
         } else {
             Self::Anonymous
@@ -1023,6 +1031,30 @@ mod tests {
 
     fn handle() -> SessionId {
         SessionId::from_uuid(uuid::Uuid::new_v4())
+    }
+
+    /// A caller holding a share key is accountable, so it draws the
+    /// identified allowance rather than the anonymous one.
+    #[test]
+    fn a_share_key_carries_the_same_standing_as_a_login() {
+        use connetto_core::auth::{CapabilitySubject, Principal, Subject};
+
+        let nothing_held: Principal = Principal::unidentified(handle());
+        assert_eq!(
+            Tier::of(&nothing_held),
+            Tier::Anonymous,
+            "a caller that proved nothing takes the smaller allowance"
+        );
+
+        let mut key_only: Principal = Principal::unidentified(handle());
+        key_only
+            .accept(Subject::Capability(CapabilitySubject::new("key:k1")))
+            .expect("a capability never conflicts");
+        assert_eq!(
+            Tier::of(&key_only),
+            Tier::Identified,
+            "a connetto-signed key names a caller the deployment can cut off"
+        );
     }
 
     /// The map is capped, and a caller being limited survives the flood.
