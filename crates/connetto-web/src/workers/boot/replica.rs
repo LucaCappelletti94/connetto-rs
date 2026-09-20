@@ -312,13 +312,9 @@ pub(super) fn build_boot_client_config<Id: core::fmt::Display>(
         .with_sql_functions(config.sql_functions.clone())
         .with_policy_tables(config.policy_tables.clone());
     if !config.caller_function.is_empty() {
-        // Empty string means no owner match, hiding every row, matching server behaviour.
         client_config = client_config.with_caller(
             config.caller_function,
-            spec.identity
-                .as_ref()
-                .map(ToString::to_string)
-                .unwrap_or_default(),
+            spec.identity.as_ref().map(ToString::to_string),
         );
     }
     client_config

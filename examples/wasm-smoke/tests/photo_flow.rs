@@ -132,7 +132,7 @@ async fn connect_tab(
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(CALLER_FUNCTION, identity);
+        .with_caller(CALLER_FUNCTION, Some(identity));
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

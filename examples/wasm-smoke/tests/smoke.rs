@@ -85,7 +85,7 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity.as_str()));
     let mut conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

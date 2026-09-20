@@ -89,7 +89,7 @@ async fn connect(
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity.as_str()));
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -202,7 +202,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity.as_str()));
     let tab = ConnettoConnection::connect(
         tab_end,
         &Replica::in_memory(),
@@ -302,7 +302,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity.as_str()));
     let mut tab = ConnettoConnection::connect(
         MessageTransport::<MessagePort>::new(channel.port2()),
         &Replica::in_memory(),

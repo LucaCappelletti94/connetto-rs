@@ -58,7 +58,7 @@ async fn connect(name: &str, token: String, identity: String) -> ConnettoConnect
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, identity.as_str());
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity.as_str()));
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
