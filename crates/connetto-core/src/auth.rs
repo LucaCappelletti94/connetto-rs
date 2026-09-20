@@ -282,8 +282,7 @@ impl ContentCaller {
     /// let one caller resume or commit the other's manifest. The kind is part
     /// of the key so two different callers can never share one row.
     ///
-    /// `separator` MUST be the deployment's own
-    /// [`CapabilityKey::SEPARATOR`](crate::auth::CapabilityKey::SEPARATOR),
+    /// `separator` MUST be the deployment's own [`CapabilityKey::SEPARATOR`],
     /// which no single key may contain. Joining under any other character
     /// would let one key rendered `a,b` and two keys rendered `a` and `b`
     /// produce one value, so two distinct callers would share a row and a
