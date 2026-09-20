@@ -1336,11 +1336,7 @@ impl Replayed {
     fn note_keys(&mut self, naming: &SubjectNaming, reports: &[Reconciled]) {
         for report in reports {
             note_named_keys(naming, report.added.iter(), &mut self.granted);
-            for fact in &report.removed {
-                if let GrantHolder::Subject(key) = naming.withdrawn_holder(fact) {
-                    self.granted.insert(fact.object.clone(), key);
-                }
-            }
+            note_withdrawn_keys(naming, report.removed.iter(), &mut self.granted);
         }
     }
 }
@@ -1360,6 +1356,39 @@ fn note_named_keys<'a>(
         if let GrantHolder::Subject(key) = naming.holder(record) {
             out.insert(record.object.clone(), key);
         }
+    }
+}
+
+/// The key each withdrawn fact in one batch named, keyed by the object it hung
+/// on.
+///
+/// The deleted facts of one grant travel together, so a deleted link is read
+/// through the deleted gate beside it.
+fn note_withdrawn_keys<'a>(
+    naming: &SubjectNaming,
+    facts: impl Iterator<Item = &'a WithdrawnFact>,
+    out: &mut BTreeMap<String, String>,
+) {
+    for fact in facts {
+        if let GrantHolder::Subject(key) = naming.withdrawn_holder(fact) {
+            out.insert(fact.object.clone(), key);
+        }
+    }
+}
+
+/// Who one withdrawn fact concerned, read against the keys its own batch named.
+fn withdrawn_in_batch(
+    naming: &SubjectNaming,
+    fact: &WithdrawnFact,
+    named: &BTreeMap<String, String>,
+) -> GrantHolder {
+    match naming.withdrawn_holder(fact) {
+        GrantHolder::Everybody => named
+            .get(fact.subject.as_str())
+            .map_or(GrantHolder::Everybody, |key| {
+                GrantHolder::Subject(key.clone())
+            }),
+        named_holder => named_holder,
     }
 }
 
@@ -1610,6 +1639,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         let mut named: BTreeMap<String, String> = BTreeMap::new();
         for report in reports {
             note_named_keys(&self.naming, report.added.iter(), &mut named);
+            note_withdrawn_keys(&self.naming, report.removed.iter(), &mut named);
         }
         let mut holders: Vec<GrantHolder> = Vec::new();
         for report in reports {
@@ -1621,7 +1651,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                     report
                         .removed
                         .iter()
-                        .map(|fact| self.naming.withdrawn_holder(fact)),
+                        .map(|fact| withdrawn_in_batch(&self.naming, fact, &named)),
                 );
             for holder in reported {
                 if !holders.contains(&holder) {
@@ -1708,7 +1738,7 @@ mod tests {
     use subql::backend::Postgres;
     use subql::catalog_helpers;
 
-    use super::{BTreeMap, GrantHolder, SubjectNaming, Translated};
+    use super::{BTreeMap, GrantHolder, SubjectNaming, Translated, WithdrawnFact};
     use crate::capability::DEFAULT_USER_SETTING;
 
     /// The shape every connetto table carries: one permissive policy whose
@@ -1949,6 +1979,42 @@ mod tests {
             GrantHolder::Everybody,
             "no fact in this batch says who that object grants to, so the move \
              stays as wide as connetto's knowledge of it"
+        );
+    }
+
+    /// **A withdrawal names its bearer even when both of its facts were
+    /// deleted.** A reconcile can remove the gate fact and the link fact
+    /// together, and the link names only the share object, so it has to be read
+    /// through the gate fact beside it exactly as an added pair is.
+    ///
+    /// Getting this wrong is invisible in the narrow direction. The wide link
+    /// swallows the narrow gate when the two are collapsed, and every
+    /// subscriber replaces its rows over one bearer's withdrawal.
+    #[test]
+    fn a_withdrawn_link_is_read_through_the_withdrawn_gate_beside_it() {
+        let (naming, records) = share_records("key:shared-with-me");
+        let gate_record = records
+            .first()
+            .expect("one share row grants over one paper");
+        let gate = WithdrawnFact {
+            subject: gate_record.subject.clone(),
+            relation: gate_record.relation.as_str().to_owned(),
+            object: gate_record.object.clone(),
+            context: gate_record.context.clone(),
+        };
+        let link = WithdrawnFact {
+            subject: gate.object.clone(),
+            relation: "paper_shares_share".to_owned(),
+            object: "papers:1".to_owned(),
+            context: None,
+        };
+        let mut named = BTreeMap::new();
+        super::note_withdrawn_keys(&naming, [&gate, &link].into_iter(), &mut named);
+        assert_eq!(
+            super::withdrawn_in_batch(&naming, &link, &named),
+            GrantHolder::Subject("key:shared-with-me".to_owned()),
+            "the deleted link hangs off the object the deleted gate named, so \
+             the pair concerns that bearer and nobody else"
         );
     }
 
