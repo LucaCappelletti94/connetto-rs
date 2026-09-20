@@ -66,6 +66,11 @@ CREATE INDEX IF NOT EXISTS _cfs_chunk_registry_deleting_idx
 -- The SET search_path pins the search path so the function body cannot
 -- be redirected through a different schema.
 --
+-- The file server binds both halves of the caller, the identity under
+-- app.user_id and the packed share keys under app.subjects, so a template
+-- reading only the identity refuses every caller whose rights come from a
+-- share key.  An unheld half is left unbound, so comparing against it is NULL.
+--
 -- Example template (adapt to the deployment's metadata table):
 --
 -- CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
@@ -76,7 +81,9 @@ CREATE INDEX IF NOT EXISTS _cfs_chunk_registry_deleting_idx
 --         WHERE EXISTS (
 --             SELECT 1 FROM your_metadata_table m
 --             WHERE m.file_id = f
---               AND m.uploaded_by = current_setting('app.user_id', TRUE)
+--               AND (m.uploaded_by = current_setting('app.user_id', TRUE)
+--                    OR m.uploaded_by = ANY(
+--                        string_to_array(current_setting('app.subjects', TRUE), ',')))
 --         )
 --     )
 -- $$;

@@ -711,7 +711,9 @@ impl ClientConfig {
         function: impl Into<String>,
         subjects: &[CapabilitySubject<Key>],
     ) -> Self {
-        self.subjects = Some((function.into(), Key::pack(subjects)));
+        let packed = connetto_core::auth::ContentCaller::new(None, Key::subjects(subjects))
+            .packed_subjects(Key::SEPARATOR);
+        self.subjects = Some((function.into(), packed));
         self
     }
 

@@ -14,6 +14,37 @@ use serde::{Deserialize, Serialize};
 
 use crate::SessionId;
 
+/// The setting an application's policies read the caller's identity from,
+/// unless it names another.
+pub const DEFAULT_USER_SETTING: &str = "app.user_id";
+
+/// The setting the packed capability subjects are bound to, unless the
+/// deployment's key type names another.
+pub const DEFAULT_SUBJECTS_SETTING: &str = "app.subjects";
+
+/// The value a binding gives a half of the caller it does not hold.
+///
+/// Postgres cannot express absence on a pooled connection: once a custom
+/// setting has been bound on a session, even transaction-locally, even by a
+/// transaction that rolled back, `current_setting(.., true)` answers `''` for
+/// the rest of that session and neither `RESET` nor `DISCARD ALL` takes the
+/// placeholder away. So a half left unbound reads as a blank identity to the
+/// next caller the pool hands that connection to, which is the one thing
+/// chapter 08 forbids.
+///
+/// Binding this instead makes absence mean the same thing on a fresh and a
+/// reused connection. It is minted once per process and no row can carry it,
+/// so an owner comparison against it is false rather than accidentally true.
+pub fn absent_marker() -> &'static str {
+    static MARKER: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+        use std::hash::{BuildHasher, Hasher, RandomState};
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u8(0);
+        format!("connetto:absent:{:016x}", hasher.finish())
+    });
+    &MARKER
+}
+
 /// Session-scoped identity: a user id and nothing else.
 ///
 /// Tenant and role belong in the authorization model rather than on the
@@ -178,13 +209,98 @@ impl<Id, Key> Principal<Id, Key> {
     }
 }
 
-/// The deployment's share-key type: how one is minted, and how the keys a
-/// caller holds reach Postgres.
+/// The caller a content ticket carries: the identity, and the capability
+/// subjects it holds.
+///
+/// Both halves travel so the file server binds what the mint bound, and an
+/// unheld half stays unheld rather than becoming `""`, which would be a real
+/// identity a policy could match. The subjects ride as the list they are,
+/// because a commit is attributed to each of them and only the binding needs
+/// them joined, under the separator that deployment's key type chose.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCaller {
+    identity: Option<String>,
+    subjects: Vec<String>,
+}
+
+impl ContentCaller {
+    /// Name both halves.
+    #[must_use]
+    pub fn new(identity: Option<String>, subjects: impl IntoIterator<Item = String>) -> Self {
+        Self {
+            identity,
+            subjects: subjects.into_iter().collect(),
+        }
+    }
+
+    /// The identity, when a login grant resolved.
+    #[must_use]
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// The capability subjects the caller holds, sorted and without repeats,
+    /// empty when it holds none.
+    #[must_use]
+    pub fn subjects(&self) -> &[String] {
+        &self.subjects
+    }
+
+    /// The subjects joined for the one Postgres setting a policy reads them
+    /// from, or `None` when the caller holds none.
+    #[must_use]
+    pub fn packed_subjects(&self, separator: char) -> Option<String> {
+        (!self.subjects.is_empty()).then(|| {
+            self.subjects
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(&separator.to_string())
+        })
+    }
+
+    /// Everyone this commit is attributed to: the identity when a login
+    /// resolved, else every subject the caller holds, each as the deployment's
+    /// own policies spell it.
+    ///
+    /// A key holder is attributed once per key rather than once for the set,
+    /// because a row owned by the joined list matches no single subject and
+    /// would hide the file from the caller that uploaded it.
+    #[must_use]
+    pub fn attributions(&self) -> Vec<&str> {
+        self.identity().map_or_else(
+            || self.subjects.iter().map(String::as_str).collect(),
+            |identity| vec![identity],
+        )
+    }
+
+    /// The key a manifest row is owned under, which names the half it came
+    /// from as well as its value.
+    ///
+    /// An identity and a capability subject can render alike, and a deployment
+    /// whose user ids look like its key renderings would otherwise let one
+    /// caller resume or commit the other's manifest. The kind is part of the
+    /// key so two different callers can never share one row.
+    ///
+    /// A caller holding neither half has no key, so it owns no manifest.
+    #[must_use]
+    pub fn storage_key(&self) -> Option<String> {
+        self.identity()
+            .map(|identity| format!("user:{identity}"))
+            .or_else(|| {
+                self.packed_subjects(',')
+                    .map(|subjects| format!("keys:{subjects}"))
+            })
+    }
+}
+
+/// The deployment's share-key type: how the keys a caller holds reach
+/// Postgres.
 ///
 /// A policy can only compare against a value the transaction bound, and a
 /// caller may hold several keys, so the set travels as one text value under
-/// [`SETTING`](Self::SETTING). The default packing joins the keys with
-/// [`SEPARATOR`](Self::SEPARATOR), which a policy unpacks:
+/// [`SETTING`](Self::SETTING), joined by [`SEPARATOR`](Self::SEPARATOR), which
+/// a policy unpacks:
 ///
 /// ```sql
 /// viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))
@@ -192,46 +308,40 @@ impl<Id, Key> Principal<Id, Key> {
 ///
 /// Whatever a deployment chooses is the contract its policies are written
 /// against, so choose before writing policies rather than after. A deployment
-/// wanting its own key type, setting, or packing implements this for that type
-/// and everything downstream follows from
-/// [`Principal`]'s key parameter.
+/// wanting its own key type, setting, or rendering implements this for that
+/// type and everything downstream follows from [`Principal`]'s key parameter.
 /// Minting lives beside the issuer rather than here, because a replica needs
 /// the rendering to answer its own policies and never needs to make a key.
 pub trait CapabilityKey:
     Clone + Display + Serialize + DeserializeOwned + Send + Sync + 'static
 {
-    /// The Postgres setting the packed keys are bound to.
-    const SETTING: &'static str = "app.subjects";
+    /// The Postgres setting the joined keys are bound to.
+    const SETTING: &'static str = DEFAULT_SUBJECTS_SETTING;
 
-    /// The character joining packed keys. A key whose rendering contains it is
+    /// The character joining the keys. A key whose rendering contains it is
     /// refused at minting, because one that slipped through would split into
     /// two and grant a neighbouring key's access.
     const SEPARATOR: char = ',';
 
-    /// Pack the keys a caller holds, or `None` to leave the setting unbound.
+    /// The subjects a caller holds, sorted and without repeats, empty when it
+    /// holds none.
     ///
-    /// Unbound rather than empty is what makes an absent capability fail
-    /// closed: `current_setting` yields NULL, and a comparison against NULL is
-    /// NULL rather than true.
-    fn pack(keys: &[CapabilitySubject<Self>]) -> Option<String> {
-        if keys.is_empty() {
-            return None;
-        }
-        let mut packed = String::new();
-        for key in keys {
-            if !packed.is_empty() {
-                packed.push(Self::SEPARATOR);
-            }
-            packed.push_str(&key.key().to_string());
-        }
-        Some(packed)
+    /// The list rather than one joined value, because a commit is attributed
+    /// to each subject and only the binding needs them joined. Sorting and
+    /// dropping repeats give one holder one value whatever order its grants
+    /// arrived in and however many copies of one grant it presented, so a
+    /// manifest or a byte window keyed on that value stays put across runs.
+    fn subjects(keys: &[CapabilitySubject<Self>]) -> Vec<String> {
+        let mut rendered: Vec<String> = keys.iter().map(|key| key.key().to_string()).collect();
+        rendered.sort_unstable();
+        rendered.dedup();
+        rendered
     }
 }
 
 /// The default share-key: `key:` followed by a version 4 UUID, which no
 /// rendering of can contain the separator.
 impl CapabilityKey for String {}
-
 /// More than one login grant resolved on one handshake.
 ///
 /// The identity is dropped rather than picked, so the caller proceeds

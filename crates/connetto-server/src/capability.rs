@@ -19,7 +19,9 @@ use core::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use connetto_core::auth::{CapabilityKey, CapabilitySubject, Principal};
+use connetto_core::auth::{
+    CapabilityKey, CapabilitySubject, ContentCaller, Principal, absent_marker,
+};
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use subql::backend::{Postgres, Value};
@@ -56,18 +58,35 @@ diesel::define_sql_function! {
     fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
 }
 
-/// The caller rendered for one RLS transaction: the identity, and the share
-/// keys packed by the deployment's [`CapabilityKey`].
+/// Render the two halves of `caller`: the identity, and the share keys packed
+/// by the deployment's [`CapabilityKey`].
+///
+/// The one renderer of a caller's values. A half the caller does not hold
+/// stays absent, never `""`, so an owner comparison is NULL and hides the row
+/// while a public predicate still returns its own.
+pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
+    caller: &Principal<Id, Key>,
+) -> ContentCaller {
+    ContentCaller::new(
+        caller
+            .identity()
+            .map(|identity| identity.user_id.to_string()),
+        Key::subjects(caller.capabilities()),
+    )
+}
+
+/// The caller rendered for one RLS transaction, under the setting names this
+/// deployment binds them to.
 ///
 /// Built outside the transaction (the values are owned so the apply future
 /// stays `Send`) and applied as its first statement. Every path that runs SQL
 /// as a caller goes through this, so the snapshot, the write, and the per-row
 /// visibility check cannot answer differently about what the caller holds.
 pub(crate) struct CallerBinding {
-    user_id: Option<String>,
+    caller: ContentCaller,
     user_setting: Arc<str>,
     setting: &'static str,
-    subjects: Option<String>,
+    separator: char,
 }
 
 impl CallerBinding {
@@ -78,41 +97,36 @@ impl CallerBinding {
         user_setting: Arc<str>,
     ) -> Self {
         Self {
-            // A caller with no identity binds nothing, leaving the setting
-            // unset for the whole transaction, so an owner comparison is NULL
-            // and hides the row while a public predicate still returns its own.
-            // An empty string would be a real identity that happens to be
-            // blank, which a policy could match.
-            user_id: caller
-                .identity()
-                .map(|identity| identity.user_id.to_string()),
+            caller: rendered_caller(caller),
             user_setting,
             setting: Key::SETTING,
-            subjects: Key::pack(caller.capabilities()),
+            separator: Key::SEPARATOR,
         }
     }
 
     /// Bind both values for the rest of the transaction, in one statement.
+    ///
+    /// Both settings are always bound, a half the caller does not hold taking
+    /// [`absent_marker`]. Leaving one unbound would read as `''` rather than
+    /// NULL to the next caller on a pooled connection, which is the blank
+    /// identity chapter 08 forbids.
     pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
         let user_setting = self.user_setting.to_string();
-        match (self.user_id, self.subjects) {
-            (None, None) => Ok(()),
-            (Some(user), None) => diesel::select(set_config(user_setting, user, true))
-                .execute(conn)
-                .await
-                .map(drop),
-            (None, Some(subjects)) => diesel::select(set_config(self.setting, subjects, true))
-                .execute(conn)
-                .await
-                .map(drop),
-            (Some(user), Some(subjects)) => diesel::select((
-                set_config(user_setting, user, true),
-                set_config(self.setting, subjects, true),
-            ))
-            .execute(conn)
-            .await
-            .map(drop),
-        }
+        let subjects = self
+            .caller
+            .packed_subjects(self.separator)
+            .unwrap_or_else(|| absent_marker().to_owned());
+        let user = self
+            .caller
+            .identity()
+            .map_or_else(|| absent_marker().to_owned(), ToOwned::to_owned);
+        diesel::select((
+            set_config(user_setting, user, true),
+            set_config(self.setting, subjects, true),
+        ))
+        .execute(conn)
+        .await
+        .map(drop)
     }
 
     /// The same binding as [`apply`](Self::apply), rendered as SQL statement
@@ -125,33 +139,34 @@ impl CallerBinding {
         fn quoted(value: &str) -> String {
             value.replace('\'', "''")
         }
-        let mut statements = Vec::with_capacity(2);
-        if let Some(user) = &self.user_id {
-            statements.push(format!(
+        let marker = absent_marker();
+        let subjects = self
+            .caller
+            .packed_subjects(self.separator)
+            .unwrap_or_else(|| marker.to_owned());
+        [
+            (
+                &*self.user_setting,
+                self.caller.identity().unwrap_or(marker),
+            ),
+            (self.setting, subjects.as_str()),
+        ]
+        .into_iter()
+        .map(|(setting, value)| {
+            format!(
                 "SELECT set_config('{}', '{}', true)",
-                quoted(&self.user_setting),
-                quoted(user)
-            ));
-        }
-        if let Some(subjects) = &self.subjects {
-            statements.push(format!(
-                "SELECT set_config('{}', '{}', true)",
-                quoted(self.setting),
-                quoted(subjects)
-            ));
-        }
-        statements
+                quoted(setting),
+                quoted(value)
+            )
+        })
+        .collect()
+    }
+
+    /// Whether this caller holds anything to be read as.
+    pub(crate) fn binds_a_caller(&self) -> bool {
+        self.caller.identity().is_some() || !self.caller.subjects().is_empty()
     }
 }
-
-/// The setting an application's policies read the caller's identity from,
-/// unless it names another.
-///
-/// The share-key setting has been the application's choice since R4, through
-/// [`CapabilityKey::SETTING`]. This one was fixed in connetto's source until
-/// 2026-08-06, for no reason beyond the key setting having somewhere obvious to
-/// live and this one not.
-pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 
 /// The write verbs a share certifies, beside the reading every share certifies.
 ///
@@ -550,16 +565,32 @@ mod tests {
 
     #[test]
     fn nothing_held_leaves_the_setting_unbound() {
-        assert!(String::pack(&[]).is_none());
+        assert_eq!(String::subjects(&[]), Vec::<String>::new());
+        assert!(
+            ContentCaller::new(None, String::subjects(&[]))
+                .packed_subjects(',')
+                .is_none()
+        );
     }
 
     #[test]
-    fn held_keys_pack_in_order_under_one_separator() {
+    fn held_keys_join_in_order_under_one_separator() {
         let keys = [
-            CapabilitySubject::new("key:a"),
             CapabilitySubject::new("key:b"),
+            CapabilitySubject::new("key:a"),
+            CapabilitySubject::new("key:a"),
         ];
-        assert_eq!(String::pack(&keys).as_deref(), Some("key:a,key:b"));
+        let caller = ContentCaller::new(None, String::subjects(&keys));
+        assert_eq!(
+            caller.packed_subjects(',').as_deref(),
+            Some("key:a,key:b"),
+            "sorted, deduped, and joined by the deployment's separator"
+        );
+        assert_eq!(
+            caller.attributions(),
+            vec!["key:a", "key:b"],
+            "and a commit is attributed to each key rather than to the list"
+        );
     }
 
     #[test]

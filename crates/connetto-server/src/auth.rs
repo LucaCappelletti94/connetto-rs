@@ -152,7 +152,7 @@ mod rls {
             let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
                 .map_err(|err| RlsAuthError::Catalog(format!("{err:?}")))?;
             Ok(Self {
-                user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
                 pool,
                 catalog,
                 key: PhantomData,

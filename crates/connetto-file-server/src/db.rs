@@ -10,6 +10,9 @@ use connetto_file_core::{ChunkHash, ChunkMeta, FileId, Manifest};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
 use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl};
 
+use connetto_core::auth::ContentCaller;
+
+use crate::caller::{CallerSettings, bind_caller};
 use crate::functions;
 use crate::needed;
 use crate::schema::ConnettoFileSchema;
@@ -182,22 +185,22 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
 
 /// Returns `true` when the deployment's visibility function admits `file_id` for `caller`.
 ///
-/// Runs inside a transaction on the reader connection so `set_config(is_local = true)`
-/// stays in scope for the duration of the `connetto_visible_files` call. The reader
-/// role does not own the tables, so RLS fires inside SECURITY INVOKER functions;
-/// running this on the admin connection would bypass RLS and silently admit everything.
+/// Runs inside a transaction on the reader connection so the binding stays in
+/// scope for the `connetto_visible_files` call. The reader role does not own
+/// the tables, so RLS fires inside SECURITY INVOKER functions; running this on
+/// the admin connection would bypass RLS and silently admit everything.
 pub(crate) async fn file_visible_to_caller(
     reader_conn: &mut AsyncPgConnection,
+    settings: &CallerSettings,
     file_id: &FileId,
-    caller: &str,
+    caller: &ContentCaller,
 ) -> Result<bool, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
-    let caller = caller.to_owned();
+    let caller = caller.clone();
+    let settings = settings.clone();
     reader_conn
         .transaction::<bool, diesel::result::Error, _>(async move |conn| {
-            diesel::select(functions::set_config("app.user_id", &caller, true))
-                .get_result::<String>(conn)
-                .await?;
+            bind_caller(conn, &settings, &caller).await?;
             let visible: Vec<Vec<u8>> = diesel::select(functions::connetto_visible_files(vec![
                 file_id_bytes.clone(),
             ]))
@@ -317,8 +320,10 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
     Ok(ChunkPutResult::Accepted)
 }
 
-/// Returns `true` when every chunk for `(file_id, caller)` is either stored through this
+/// Returns `true` when every chunk for `(file_id, key)` is either stored through this
 /// manifest OR is present in a committed manifest visible to `caller`.
+///
+/// `key` is the manifest key `caller` owns rows under.
 ///
 /// Runs on the reader connection so the deployment's row-level security applies
 /// inside `connetto_visible_files`.  The admin role owns the tables and bypasses
@@ -327,27 +332,28 @@ pub(crate) async fn account_chunk_put<S: ConnettoFileSchema>(
 /// accept invisible dedup targets, reopening the original critical hole.
 pub(crate) async fn all_chunks_satisfied<S: ConnettoFileSchema>(
     reader_conn: &mut AsyncPgConnection,
+    settings: &CallerSettings,
     file_id: &FileId,
-    caller: &str,
+    caller: &ContentCaller,
+    key: &str,
 ) -> Result<bool, diesel::result::Error> {
-    let caller = caller.to_owned();
+    let key = key.to_owned();
+    let caller = caller.clone();
+    let settings = settings.clone();
     let file_id_bytes = file_id.as_bytes().to_vec();
     reader_conn
         .transaction::<bool, diesel::result::Error, _>(async move |conn| {
             // Step 1: collect hashes of chunk rows with stored = FALSE for
-            // this specific (file_id, caller) manifest.
-            let unstored: Vec<Vec<u8>> =
-                S::all_unstored_chunk_hashes_stmt(file_id_bytes, caller.clone())
-                    .load(conn)
-                    .await?;
+            // this specific (file_id, key) manifest.
+            let unstored: Vec<Vec<u8>> = S::all_unstored_chunk_hashes_stmt(file_id_bytes, key)
+                .load(conn)
+                .await?;
             if unstored.is_empty() {
                 return Ok(true);
             }
 
-            // Step 2: thread caller identity so RLS fires for this transaction.
-            diesel::select(functions::set_config("app.user_id", &caller, true))
-                .get_result::<String>(conn)
-                .await?;
+            // Step 2: bind the caller so RLS fires for this transaction.
+            bind_caller(conn, &settings, &caller).await?;
 
             // Steps 3-5: reuse needed.rs's three-step visibility machinery.
             let candidate_ids = needed::committed_file_ids_for::<S>(conn, &unstored).await?;
@@ -392,6 +398,11 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
 /// Atomically marks the manifest committed and calls the deployment setter,
 /// all inside one Postgres transaction.
 ///
+/// The setter is called once per name in `attributions`, so a caller whose
+/// rights come from several share keys is attributed under each of them and
+/// can see the file afterwards under any one. A deployment setter is
+/// therefore called more than once for one commit and must be idempotent.
+///
 /// When the manifest is already committed (zero rows from the guarded UPDATE),
 /// returns [`CommitOutcome::AlreadyCommitted`] without re-calling the setter.
 ///
@@ -400,11 +411,12 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
 pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
-    caller: &str,
+    key: &str,
+    attributions: &[&str],
 ) -> Result<CommitOutcome, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
-    let caller_owned = caller.to_owned();
-    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), caller_owned.clone());
+    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), key.to_owned());
+    let attributions: Vec<String> = attributions.iter().map(|to| (*to).to_owned()).collect();
     let setter_arg = file_id_bytes;
 
     conn.transaction::<CommitOutcome, CommitTxError, _>(async move |c| {
@@ -416,14 +428,16 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
 
         // Call the deployment setter inside the transaction.  A raise rolls
         // back the committed flag so the client can retry.
-        diesel::select(crate::functions::connetto_set_content_state(
-            setter_arg.as_slice(),
-            "available",
-            caller_owned.as_str(),
-        ))
-        .get_result::<Option<Vec<u8>>>(c)
-        .await
-        .map_err(CommitTxError::Setter)?;
+        for attribution in &attributions {
+            diesel::select(crate::functions::connetto_set_content_state(
+                setter_arg.as_slice(),
+                "available",
+                attribution.as_str(),
+            ))
+            .get_result::<Option<Vec<u8>>>(c)
+            .await
+            .map_err(CommitTxError::Setter)?;
+        }
 
         Ok(CommitOutcome::Committed)
     })

@@ -1746,7 +1746,7 @@ mod tests {
     use super::{
         BTreeMap, GrantHolder, GrantMove, Reconciled, SubjectNaming, Translated, WithdrawnFact,
     };
-    use crate::capability::DEFAULT_USER_SETTING;
+    use connetto_core::auth::DEFAULT_USER_SETTING;
 
     /// The shape every connetto table carries: one permissive policy whose
     /// `USING` is the caller's identity or the keys the caller holds.

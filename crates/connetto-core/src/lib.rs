@@ -56,7 +56,8 @@ pub mod version;
 pub mod write;
 
 pub use auth::{
-    AmbiguousIdentity, AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession,
+    AmbiguousIdentity, AuthContext, CapabilitySubject, ContentCaller, Principal, Subject,
+    VerifiedSession,
 };
 pub use backoff::RetryPolicy;
 pub use cursor::Cursor;

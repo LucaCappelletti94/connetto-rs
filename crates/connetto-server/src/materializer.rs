@@ -2404,8 +2404,8 @@ mod membership_term_tests {
     //! cannot serve is refused rather than served half-way.
 
     use super::*;
-    use crate::capability::DEFAULT_USER_SETTING;
     use crate::openfga::Translated;
+    use connetto_core::auth::DEFAULT_USER_SETTING;
     use subql::term::TermDescription;
 
     /// The motivating pair: a guarded table filtered through a membership.

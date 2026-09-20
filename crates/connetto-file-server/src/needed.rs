@@ -13,10 +13,12 @@
 
 use std::collections::HashSet;
 
+use connetto_core::auth::ContentCaller;
 use connetto_file_core::{ChunkHash, ChunkMeta};
 use diesel::prelude::*;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 
+use crate::caller::{CallerSettings, bind_caller};
 use crate::functions;
 use crate::schema::ConnettoFileSchema;
 
@@ -26,20 +28,20 @@ use crate::schema::ConnettoFileSchema;
 /// `connetto_visible_files`) are excluded from the answer.
 pub(crate) async fn needed_hashes<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
-    caller: &str,
+    settings: &CallerSettings,
+    caller: &ContentCaller,
     chunks: &[ChunkMeta],
 ) -> Result<Vec<ChunkHash>, diesel::result::Error> {
     if chunks.is_empty() {
         return Ok(Vec::new());
     }
     let declared: Vec<Vec<u8>> = chunks.iter().map(|m| m.hash.as_bytes().to_vec()).collect();
-    let caller = caller.to_owned();
+    let caller = caller.clone();
+    let settings = settings.clone();
     let chunks_snap: Vec<ChunkMeta> = chunks.to_vec();
     conn.transaction::<Vec<ChunkHash>, diesel::result::Error, _>(async move |c| {
-        // Step 1: set caller identity so RLS fires inside connetto_visible_files.
-        diesel::select(functions::set_config("app.user_id", &caller, true))
-            .get_result::<String>(c)
-            .await?;
+        // Step 1: bind the caller so RLS fires inside connetto_visible_files.
+        bind_caller(c, &settings, &caller).await?;
 
         // Step 2: map declared chunk hashes to committed file ids.
         let candidate_ids = committed_file_ids_for::<S>(c, &declared).await?;

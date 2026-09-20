@@ -304,8 +304,8 @@ fn walk_userset(
 #[cfg(test)]
 mod tests {
     use super::GrantReach;
-    use crate::capability::DEFAULT_USER_SETTING;
     use crate::openfga::Translated;
+    use connetto_core::auth::DEFAULT_USER_SETTING;
 
     /// The harness's own cross-table shape, which is what this phase exists
     /// for: the grant is a membership row and the rows that vanish are in

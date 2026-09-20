@@ -265,7 +265,7 @@ mod pg {
             Ok(Self {
                 pool,
                 catalog,
-                user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
                 publication: None,
             })
         }
@@ -299,7 +299,7 @@ mod pg {
             Self {
                 pool,
                 catalog,
-                user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+                user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
                 publication: None,
             }
         }

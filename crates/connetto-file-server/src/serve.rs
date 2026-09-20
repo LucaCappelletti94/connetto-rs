@@ -59,7 +59,13 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
     // Reader connection acquired first: a saturated reader pool must not stall
     // while an admin connection holds manifest locks.
     let mut reader_conn = state.pools.reader.get().await?;
-    let visible = db::file_visible_to_caller(&mut reader_conn, &file_id, &ticket.caller).await?;
+    let visible = db::file_visible_to_caller(
+        &mut reader_conn,
+        &state.caller_settings,
+        &file_id,
+        &ticket.caller,
+    )
+    .await?;
     if !visible {
         return Err(ServerError::NotFound);
     }

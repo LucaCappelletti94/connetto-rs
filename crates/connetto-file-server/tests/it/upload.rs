@@ -9,7 +9,7 @@ use diesel_async::RunQueryDsl;
 use tower::ServiceExt;
 
 use crate::fixture::{
-    Pg, build_router, connect_admin, fail_once_write_store, fs_store,
+    Pg, build_router, connect_admin, fail_once_write_store, fs_store, identified,
     insert_manifest_bypassing_intent, object_store_local, register_file_ownership,
 };
 
@@ -24,7 +24,7 @@ fn write_payload(
             verb: Verb::Write,
             ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap()
 }
@@ -41,7 +41,7 @@ fn read_payload(
             verb: Verb::Read,
             ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: caller.into(),
+            caller: crate::fixture::identified(caller),
         })
         .unwrap()
 }
@@ -226,7 +226,7 @@ async fn a_caller_b_sees_all_needed_while_caller_a_sees_none() {
             verb: Verb::Write,
             ceiling: 1024 * 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -453,7 +453,8 @@ async fn mid_stream_ceiling_crossing_refused() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &identified("alice"), &chunks)
+        .await;
 
     let ticket = signer
         .mint(&TicketPayload {
@@ -461,7 +462,7 @@ async fn mid_stream_ceiling_crossing_refused() {
             verb: Verb::Write,
             ceiling: 120,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
 
@@ -537,7 +538,8 @@ async fn re_put_does_not_double_count() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &identified("alice"), &chunks)
+        .await;
 
     // ceiling = 200 = sum(100, 100). Double-counting A would make PUT B fail.
     let ticket = signer
@@ -546,7 +548,7 @@ async fn re_put_does_not_double_count() {
             verb: Verb::Write,
             ceiling: 200,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
 
@@ -1124,7 +1126,7 @@ async fn commit_setter_failure_rolls_back_retry_succeeds() {
     let committed: bool = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
             "SELECT committed FROM _cfs_manifests \
-             WHERE file_id = $1 AND uploaded_by = 'alice'",
+             WHERE file_id = $1 AND uploaded_by = 'user:alice'",
         )
         .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref()),
         &mut admin_conn,
@@ -1561,7 +1563,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
             verb: Verb::Write,
             ceiling: chunk_a.len + chunk_b.len + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let body_x = serde_json::json!({
@@ -1630,7 +1632,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
             verb: Verb::Write,
             ceiling: chunk_a.len + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
     let body_b = serde_json::json!({
@@ -1694,7 +1696,7 @@ async fn commit_without_put_refused_same_as_chunk_never_stored() {
             verb: Verb::Write,
             ceiling: 1024 * 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "carol".into(),
+            caller: crate::fixture::identified("carol"),
         })
         .unwrap();
     let carol_hex = "03".repeat(32);
@@ -1821,7 +1823,7 @@ async fn commit_by_non_declarer_refused() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap() + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "dave".into(),
+            caller: crate::fixture::identified("dave"),
         })
         .unwrap();
     let resp = app
@@ -1961,7 +1963,7 @@ async fn dedup_commit_round_trip() {
             verb: Verb::Write,
             ceiling: target_ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
 
@@ -2147,7 +2149,7 @@ async fn dedup_commit_rejected_for_invisible_file() {
             verb: Verb::Write,
             ceiling: bob_ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
 
@@ -2360,7 +2362,7 @@ async fn intent_refuses_too_many_chunks() {
             verb: Verb::Write,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let file_hex = format!("{file_id}");
@@ -2511,7 +2513,7 @@ async fn dedup_commit_rejected_for_invisible_file_rls_only() {
             verb: Verb::Write,
             ceiling: bob_ceiling,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
 
@@ -2797,7 +2799,7 @@ async fn two_callers_identical_content_both_commit() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let bob_ticket = signer
@@ -2806,7 +2808,7 @@ async fn two_callers_identical_content_both_commit() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
 
@@ -3000,7 +3002,7 @@ async fn non_declarer_cannot_commit_after_composite_key_fix() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap() + 256,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "dave".into(),
+            caller: crate::fixture::identified("dave"),
         })
         .unwrap();
     let resp = app
@@ -3044,7 +3046,7 @@ async fn get_file_scoped_to_committed_caller() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
 
@@ -3109,7 +3111,7 @@ async fn get_file_scoped_to_committed_caller() {
             verb: Verb::Read,
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let resp = app
@@ -3140,7 +3142,7 @@ async fn get_file_scoped_to_committed_caller() {
             verb: Verb::Read,
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
     let resp = app
@@ -3171,7 +3173,7 @@ async fn get_file_scoped_to_committed_caller() {
             verb: Verb::Read,
             ceiling: u64::try_from(data.len()).unwrap() + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "charlie".into(),
+            caller: crate::fixture::identified("charlie"),
         })
         .unwrap();
     let resp = app
@@ -3303,7 +3305,8 @@ async fn put_chunk_with_u64_max_ceiling_succeeds() {
     let chunks: Vec<ChunkMeta> = manifest.chunks().to_vec();
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &identified("alice"), &chunks)
+        .await;
     drop(admin_conn);
 
     let ticket = signer
@@ -3312,7 +3315,7 @@ async fn put_chunk_with_u64_max_ceiling_succeeds() {
             verb: connetto_file_server::ticket::Verb::Write,
             ceiling: u64::MAX,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
 
@@ -3331,4 +3334,366 @@ async fn put_chunk_with_u64_max_ceiling_succeeds() {
         StatusCode::NO_CONTENT,
         "PUT with u64::MAX ceiling must succeed (204), not 500"
     );
+}
+
+/// A key-only caller dedups against what its key may see, and not against
+/// what it may not, and commits on that dedup.
+#[tokio::test]
+async fn intent_and_commit_under_a_key_only_caller() {
+    use crate::fixture::insert_committed_manifest;
+
+    const SUBJECT: &str = "key:k1";
+
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // Two committed files, one visible to the key and one only to alice. Both
+    // are keyed to alice's manifest, so the key-only caller declares its own.
+    let visible_bytes = b"bytes the share key may see".to_vec();
+    let invisible_bytes = b"bytes only alice may see".to_vec();
+    let mem = MemStore::new();
+    let visible = process_file(&visible_bytes, MimeClass::Generic, &mem)
+        .await
+        .unwrap();
+    let invisible = process_file(&invisible_bytes, MimeClass::Generic, &mem)
+        .await
+        .unwrap();
+    {
+        let fs = connetto_file_server::FsStore::new(dir.path()).unwrap();
+        for chunk in visible.chunks().iter().chain(invisible.chunks()) {
+            let data = mem.read_chunk(&chunk.hash).await.unwrap();
+            fs.write_chunk(&chunk.hash, &data).await.unwrap();
+        }
+    }
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(
+        &mut admin_conn,
+        &visible.file_id(),
+        &identified("alice"),
+        visible.chunks(),
+    )
+    .await;
+    insert_committed_manifest(
+        &mut admin_conn,
+        &invisible.file_id(),
+        &identified("alice"),
+        invisible.chunks(),
+    )
+    .await;
+    register_file_ownership(&mut admin_conn, &visible.file_id(), SUBJECT).await;
+    register_file_ownership(&mut admin_conn, &invisible.file_id(), "alice").await;
+    drop(admin_conn);
+
+    let key_ticket = |file_id: &FileId| {
+        signer
+            .mint(&TicketPayload {
+                file_id: *file_id.as_bytes(),
+                verb: Verb::Write,
+                ceiling: 1 << 20,
+                expiry: chrono::Utc::now().timestamp() + 3600,
+                caller: crate::fixture::keyed([SUBJECT]),
+            })
+            .unwrap()
+    };
+
+    let mut answers = Vec::new();
+    for manifest in [&visible, &invisible] {
+        answers.push(needed_count(&app, &key_ticket(&manifest.file_id()), manifest).await);
+    }
+
+    assert_eq!(
+        answers[0], 0,
+        "every chunk dedups from the file the key may see"
+    );
+    assert_eq!(
+        answers[1],
+        invisible.chunks().len(),
+        "a file the key cannot see dedups nothing"
+    );
+
+    // The deduped manifest commits without a single chunk PUT.
+    let file_id = visible.file_id();
+    let ticket = key_ticket(&file_id);
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_id}/commit?t={ticket}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "dedup satisfaction must admit the key-only commit"
+    );
+}
+
+/// A ticket whose caller binds neither half owns no manifest, so intent is refused.
+#[tokio::test]
+async fn an_unnamed_caller_cannot_declare_a_manifest() {
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"content nobody owns";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let ticket = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: 1 << 20,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: connetto_file_server::ContentCaller::default(),
+        })
+        .unwrap();
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let body = serde_json::json!({ "total_len": data.len(), "chunks": chunks_json });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_id}/intent?t={ticket}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a caller with no name must not key a manifest on the empty string"
+    );
+}
+
+/// Declare `manifest` under `ticket` and answer how many chunks it must upload.
+async fn needed_count(
+    app: &axum::Router,
+    ticket: &str,
+    manifest: &connetto_file_core::Manifest,
+) -> usize {
+    let file_id = manifest.file_id();
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let total: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+    let body = serde_json::json!({ "total_len": total, "chunks": chunks_json });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_id}/intent?t={ticket}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "intent must be answered");
+    let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let answer: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    answer["needed"]
+        .as_array()
+        .expect("the answer names needed hashes")
+        .len()
+}
+
+/// An identity that renders like a share key owns its own manifest rows, not
+/// the key holder's.
+///
+/// The two callers are distinct and a deployment whose user ids look like its
+/// key renderings must not let one resume or commit the other's upload.
+#[tokio::test]
+async fn an_identity_shaped_like_a_key_owns_its_own_manifest() {
+    use crate::fixture::keyed;
+
+    const SHARED: &str = "key:k1";
+
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"bytes two callers both declare";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+
+    let key_needed = needed_count(
+        &app,
+        &write_ticket(&signer, &file_id, &keyed([SHARED])),
+        &manifest,
+    )
+    .await;
+    assert_eq!(
+        key_needed,
+        manifest.chunks().len(),
+        "the key holder uploads its own chunks"
+    );
+
+    // The identity spelled the same way declares the same file. It owns a
+    // separate manifest, so it is told to upload every chunk itself rather
+    // than finding the key holder's declaration already in place.
+    let identity_needed = needed_count(
+        &app,
+        &write_ticket(&signer, &file_id, &identified(SHARED)),
+        &manifest,
+    )
+    .await;
+    assert_eq!(
+        identity_needed,
+        manifest.chunks().len(),
+        "an identity spelled like the key owns nothing the key declared"
+    );
+
+    // Neither may commit on the other's declaration: the chunks are unstored.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/files/{file_id}/commit?t={}",
+            write_ticket(&signer, &file_id, &keyed([SHARED]))
+        ))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "neither caller may commit on the other's declaration"
+    );
+}
+
+/// A write ticket for `caller` over `file_id`.
+fn write_ticket(
+    signer: &connetto_file_server::TicketSigner,
+    file_id: &FileId,
+    caller: &connetto_file_server::ContentCaller,
+) -> String {
+    signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: 1 << 20,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: caller.clone(),
+        })
+        .unwrap()
+}
+
+/// A caller holding several share keys is attributed under each of them, so
+/// it can see its own upload afterwards.
+///
+/// The deployment stores what the setter is told as the owner and compares
+/// one subject at a time against it, which is how the shipped policy is
+/// written. A row owned by the joined list would match no single key and the
+/// file would be invisible to the very caller that uploaded it.
+#[tokio::test]
+async fn a_caller_holding_two_keys_sees_its_own_upload() {
+    use crate::fixture::keyed;
+
+    const FIRST: &str = "key:k1";
+    const SECOND: &str = "key:k2";
+
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"bytes uploaded by a caller holding two keys";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+    let both = keyed([FIRST, SECOND]);
+    let ticket = write_ticket(&signer, &file_id, &both);
+
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .map(|c| serde_json::json!({ "hash": format!("{}", c.hash), "len": c.len }))
+        .collect();
+    let body = serde_json::json!({ "total_len": data.len(), "chunks": chunks_json });
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(serde_json::to_vec(&body).unwrap()))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "intent must succeed"
+    );
+
+    for chunk in manifest.chunks() {
+        use connetto_file_core::ChunkStore;
+        let bytes = mem.read_chunk(&chunk.hash).await.unwrap();
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/chunks/{}?t={ticket}", chunk.hash))
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(bytes))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NO_CONTENT,
+            "chunk PUT must succeed"
+        );
+    }
+
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_hex}/commit?t={ticket}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(req).await.unwrap().status(),
+        StatusCode::OK,
+        "commit must succeed"
+    );
+
+    // The uploader reads its own bytes back, which only a visible file serves.
+    let read = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: 1 << 20,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: both,
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .uri(format!("/files/{file_hex}?t={read}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the caller that uploaded the file must see it"
+    );
+
+    // And so does a caller holding only one of the two keys, because each key
+    // owns the file rather than the pair owning it jointly.
+    for key in [FIRST, SECOND] {
+        let read = signer
+            .mint(&TicketPayload {
+                file_id: *file_id.as_bytes(),
+                verb: Verb::Read,
+                ceiling: 1 << 20,
+                expiry: chrono::Utc::now().timestamp() + 3600,
+                caller: keyed([key]),
+            })
+            .unwrap();
+        let req = axum::http::Request::builder()
+            .uri(format!("/files/{file_hex}?t={read}"))
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::OK,
+            "{key} alone must see the file it was attributed"
+        );
+    }
 }

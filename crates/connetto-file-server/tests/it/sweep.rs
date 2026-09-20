@@ -6,7 +6,7 @@ use connetto_file_server::ticket::{TicketPayload, Verb};
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 use tower::ServiceExt;
 
-use crate::fixture::{Pg, build_router};
+use crate::fixture::{Pg, build_router, identified};
 
 mod race_schema {
     connetto_file_server::connetto_file_tables!();
@@ -36,7 +36,7 @@ async fn sweep_removes_orphaned_upload_and_its_chunks() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "sweeptest".into(),
+            caller: crate::fixture::identified("sweeptest"),
         })
         .unwrap();
 
@@ -97,7 +97,7 @@ async fn sweep_removes_orphaned_upload_and_its_chunks() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "sweeptest".into(),
+            caller: crate::fixture::identified("sweeptest"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -145,7 +145,7 @@ async fn sweep_fail_once_delete_keeps_candidate_retry_succeeds() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "sweepretry".into(),
+            caller: crate::fixture::identified("sweepretry"),
         })
         .unwrap();
 
@@ -240,7 +240,7 @@ async fn sweep_does_not_collect_committed_manifest() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "committer".into(),
+            caller: crate::fixture::identified("committer"),
         })
         .unwrap();
 
@@ -302,7 +302,7 @@ async fn sweep_does_not_collect_committed_manifest() {
             verb: Verb::Read,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "committer".into(),
+            caller: crate::fixture::identified("committer"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -355,7 +355,7 @@ async fn deleting_hash_blocks_new_intent_with_503() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "racer".into(),
+            caller: crate::fixture::identified("racer"),
         })
         .unwrap();
 
@@ -420,7 +420,7 @@ async fn deleting_hash_blocks_new_intent_with_503() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "racer".into(),
+            caller: crate::fixture::identified("racer"),
         })
         .unwrap();
     let chunks_json2 = manifest
@@ -482,7 +482,7 @@ async fn deleting_hash_blocks_put_with_503() {
     insert_manifest_bypassing_intent(
         &mut admin_conn,
         &file_id2,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: chunk_hash,
             len: chunk.len,
@@ -505,7 +505,7 @@ async fn deleting_hash_blocks_put_with_503() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "putter".into(),
+            caller: crate::fixture::identified("putter"),
         })
         .unwrap();
     let chunk_data = mem.read_chunk(&chunk_hash).await.unwrap();
@@ -550,7 +550,7 @@ async fn crash_window_1_intent_no_store_write_sweep_cleans_registry() {
     insert_manifest_bypassing_intent(
         &mut admin_conn,
         &file_id,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: chunk_hash,
             len: chunk.len,
@@ -620,7 +620,7 @@ async fn crash_window_2_store_written_registry_pending_sweep_cleans_up() {
     insert_manifest_bypassing_intent(
         &mut admin_conn,
         &file_id,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: chunk_hash,
             len: chunk.len,
@@ -738,7 +738,7 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let intent = axum::http::Request::builder()
@@ -872,7 +872,7 @@ async fn sweep_waits_for_overlapping_put_before_deleting_bytes() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let chunks_json = vec![serde_json::json!({
@@ -995,7 +995,7 @@ async fn sweep_waits_for_overlapping_commit_verification() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let chunks_json = vec![serde_json::json!({
@@ -1112,7 +1112,7 @@ async fn sweep_does_not_lock_live_content_held_by_an_active_put() {
             verb: Verb::Write,
             ceiling: u64::try_from(data.len()).unwrap(),
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let intent = axum::http::Request::builder()
@@ -1205,7 +1205,7 @@ async fn sweep_ignores_a_held_lock_on_a_committed_hash() {
     crate::fixture::insert_committed_manifest(
         &mut holder,
         &file_id,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: live_hash,
             len: chunk.len,
