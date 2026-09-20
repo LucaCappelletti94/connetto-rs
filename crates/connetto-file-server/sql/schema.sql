@@ -69,7 +69,9 @@ CREATE INDEX IF NOT EXISTS _cfs_chunk_registry_deleting_idx
 -- The file server binds both halves of the caller, the identity under
 -- app.user_id and the packed share keys under app.subjects, so a template
 -- reading only the identity refuses every caller whose rights come from a
--- share key.  An unheld half is left unbound, so comparing against it is NULL.
+-- share key.  An unheld half takes an unguessable marker, a value no row can
+-- carry, so comparing against it is false rather than NULL.  Recognise a
+-- caller holding nothing by its own rows, never by testing for NULL.
 --
 -- Example template (adapt to the deployment's metadata table):
 --
@@ -93,9 +95,10 @@ CREATE INDEX IF NOT EXISTS _cfs_chunk_registry_deleting_idx
 --
 -- The deployment implements connetto_set_content_state as SECURITY DEFINER
 -- so the file server role can write the application metadata table without a
--- direct UPDATE grant.  The third argument carries the uploader identity so
--- the deployment can attribute the commit.  SET search_path prevents privilege
--- escalation through a crafted search path.
+-- direct UPDATE grant.  The third argument names who the commit belongs to,
+-- which is the identity when the caller has one and each share key it holds
+-- otherwise, one call per key, so the setter must be idempotent.  SET
+-- search_path prevents privilege escalation through a crafted search path.
 --
 -- Example template:
 --

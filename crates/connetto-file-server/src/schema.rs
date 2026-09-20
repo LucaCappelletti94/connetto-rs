@@ -360,7 +360,7 @@ macro_rules! connetto_file_tables {
                 accepted_bytes -> diesel::sql_types::BigInt,
                 /// Whether the manifest is committed.
                 committed -> diesel::sql_types::Bool,
-                /// Caller identity from the write ticket.
+                /// The write ticket's caller, namespaced by the half it came from.
                 uploaded_by -> diesel::sql_types::Text,
                 /// When the intent was declared, read by the sweep grace window.
                 created_at -> diesel::sql_types::Timestamptz,
