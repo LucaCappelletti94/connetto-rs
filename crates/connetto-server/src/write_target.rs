@@ -36,8 +36,9 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::ParserDB;
 use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 
-use crate::capability::{CallerBinding, CapabilityKey};
+use crate::capability::CallerBinding;
 use crate::watermark_schema::ConnettoWatermarkSchema;
+use connetto_core::auth::CapabilityKey;
 
 use crate::materializer::{
     ConflictProbe, MaterializerError, PlannedConflict, ServerRow, WritePlan, probe_conflict_pg,
