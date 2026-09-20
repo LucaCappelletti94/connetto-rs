@@ -97,7 +97,9 @@ use connetto_core::{SchemaVersion, SessionId};
 use connetto_file_server::{
     self as files, DbPool, DefaultFileSchema, TicketSigner, TicketVerifier,
 };
+use connetto_server::CallerMappings;
 use connetto_server::audit::pg_audit_hook;
+use connetto_server::capability::CapabilityKey;
 use connetto_server::capability::DEFAULT_USER_SETTING;
 use connetto_server::openfga::{
     Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,
@@ -845,10 +847,26 @@ async fn prepare_change_log(
 /// function `CONNETTO_CALLER_FUNCTION` names, paired against the identity
 /// setting. Empty means unset, and without it a subscription naming the
 /// caller's local function is refused at registration.
-fn caller_mapping() -> Option<SessionVariableMapping> {
+///
+/// `CONNETTO_SUBJECTS_FUNCTION` names the second one, paired against the
+/// setting the caller's share keys are bound to. It declares the delimiter
+/// those keys are joined with, so a membership test over the set reverse
+/// translates as one, rather than as a comparison against the joined text
+/// that matches nobody. Empty leaves a deployment with no share keys exactly
+/// as it was.
+fn caller_mapping() -> Option<CallerMappings> {
     let function = var_or("CONNETTO_CALLER_FUNCTION", "");
-    (!function.is_empty())
-        .then(|| SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, function))
+    if function.is_empty() {
+        return None;
+    }
+    let subjects = var_or("CONNETTO_SUBJECTS_FUNCTION", "");
+    Some(CallerMappings {
+        identity: SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, function),
+        subjects: (!subjects.is_empty()).then(|| {
+            SessionVariableMapping::current_setting(<String as CapabilityKey>::SETTING, subjects)
+                .holding_set(<String as CapabilityKey>::SEPARATOR)
+        }),
+    })
 }
 
 /// The concrete manager this binary serves.

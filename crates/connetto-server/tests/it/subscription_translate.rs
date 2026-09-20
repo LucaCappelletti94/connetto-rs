@@ -12,7 +12,11 @@
 //! unparseable query fails as `Translate` rather than reaching subql.
 
 use connetto_core::messages::BindValue;
-use connetto_server::{Materializer, MaterializerError, ReadBudget, Registration, SeedPlan};
+use connetto_server::{
+    CallerMappings, Materializer, MaterializerError, NoConnector, ReadBudget, Registration,
+    RuntimeWritableCatalog, SeedPlan, subject_set_reach,
+};
+use pg2sqlite::prelude::SessionVariableMapping;
 
 const PG_DDL: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT, price FLOAT, tag BYTEA);";
@@ -280,4 +284,40 @@ fn every_aggregate_survives_the_reverse_translation() {
             "{name} should reach Postgres under its own name, got {pg}"
         );
     }
+}
+
+/// The mirror's own spelling has to be the one pg2sqlite reads back as a
+/// membership over the delimited setting, and the obvious spelling is not.
+///
+/// A bare `instr` search reverse translates as a position query and the
+/// set-valued guard refuses it, which cost this feature a wrong upstream
+/// report. The authority for the shape is pg2sqlite's `src/impls/idioms.rs`,
+/// so this asserts against the translator rather than against a literal: a
+/// change there fails here instead of silently widening what the mirror
+/// admits.
+#[test]
+fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
+    const DDL: &str = "CREATE TABLE members (member TEXT NOT NULL);";
+    let materializer: Materializer<_, _, NoConnector> = Materializer::with_read_connector(
+        DDL,
+        RuntimeWritableCatalog::default(),
+        None,
+        Some(CallerMappings {
+            identity: SessionVariableMapping::current_setting("app.user_id", "current_app_user"),
+            subjects: Some(
+                SessionVariableMapping::current_setting("app.subjects", "current_app_subjects")
+                    .holding_set(','),
+            ),
+        }),
+        NoConnector,
+    )
+    .expect("the catalog parses");
+    let reach = subject_set_reach("current_app_subjects", "member", ',');
+    let pg = materializer
+        .translate_subscription_sql(&format!("SELECT * FROM members WHERE {reach}"))
+        .expect("the mirror's own spelling has to translate");
+    assert!(
+        pg.contains("member = ANY(string_to_array(current_setting('app.subjects', true), ','))"),
+        "the reach has to read back as the membership it stands for, got {pg}"
+    );
 }

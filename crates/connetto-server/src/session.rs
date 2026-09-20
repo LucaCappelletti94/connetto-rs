@@ -39,7 +39,7 @@ use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
 use subql::backend::{CdcEvent, Postgres, ScalarFamily, Value as PgValue};
-use subql::term::TermDescription;
+use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId, TableLike};
@@ -64,7 +64,7 @@ use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
-use connetto_core::auth::CapabilitySubject;
+use connetto_core::auth::{AuthContext, CapabilitySubject};
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
 pub struct SnapshotPage {
@@ -145,8 +145,37 @@ pub struct TermSeedRead {
     pub published: Option<bool>,
 }
 
+/// Which of the caller's values a described term reads.
+const fn caller_of(term: &TermDescription) -> TermCaller {
+    match term {
+        TermDescription::Membership(membership) => membership.caller,
+        TermDescription::Caller(caller) => caller.caller,
+    }
+}
+
+/// The one kind every term reading `side` compares at.
+///
+/// The engine builds one subscriber and one subject set per registration, so
+/// two terms reading the same side at different kinds cannot share it. They
+/// are refused rather than served at whichever kind came first, which would
+/// admit nobody in silence for the other.
+fn one_kind(terms: &[TermDescription], side: TermCaller) -> Result<ScalarFamily, SubscribeRefusal> {
+    let mut kinds = terms
+        .iter()
+        .filter(|term| caller_of(term) == side)
+        .map(|term| match term {
+            TermDescription::Membership(membership) => membership.subject_kind,
+            TermDescription::Caller(caller) => caller.kind,
+        });
+    let first = kinds.next().ok_or(SubscribeRefusal::Mistyped)?;
+    if kinds.any(|kind| kind != first) {
+        return Err(SubscribeRefusal::Mistyped);
+    }
+    Ok(first)
+}
+
 /// Every subject the caller holds, typed at the compared column's kind, the
-/// identity first and then each capability key.
+/// identity first when it has one and then each capability key.
 ///
 /// A caller is a set, the same set [`CallerBinding`](crate::capability) hands
 /// Postgres, so a membership row naming any of them moves what the filter
@@ -163,13 +192,21 @@ pub struct TermSeedRead {
 /// registration rather than being dropped from the set, because a seed short
 /// one subject admits fewer rows than the query the caller registered
 /// returns, and nothing later repairs that.
-fn caller_subjects<Key: CapabilityKey>(
-    identity: &str,
+///
+/// An empty set is refused too: a filter reading the subject set could never
+/// deliver to a caller holding none.
+fn caller_subjects<Id: core::fmt::Display, Key: CapabilityKey>(
+    identity: Option<&AuthContext<Id>>,
     capabilities: &[CapabilitySubject<Key>],
     kind: ScalarFamily,
 ) -> Result<Vec<PgValue<Postgres>>, SubscribeRefusal> {
     let mut subjects = Vec::with_capacity(1 + capabilities.len());
-    subjects.push(typed_subscriber(identity, kind).ok_or(SubscribeRefusal::Mistyped)?);
+    if let Some(identity) = identity {
+        subjects.push(
+            typed_subscriber(&identity.user_id.to_string(), kind)
+                .ok_or(SubscribeRefusal::Mistyped)?,
+        );
+    }
     for capability in capabilities {
         let subject = typed_subscriber(&capability.key().to_string(), kind)
             .ok_or(SubscribeRefusal::Mistyped)?;
@@ -177,7 +214,82 @@ fn caller_subjects<Key: CapabilityKey>(
             subjects.push(subject);
         }
     }
+    if subjects.is_empty() {
+        return Err(SubscribeRefusal::Anonymous);
+    }
     Ok(subjects)
+}
+
+/// The client-dialect test for "this column names one of the caller's
+/// subjects", in the one shape the reverse translation reads as a membership
+/// over a delimited setting.
+///
+/// Spelled the way pg2sqlite emits it rather than the obvious way, because
+/// the recognizer matches this guarded form and reads a bare `instr` search
+/// as a position query instead. The guards are what make it agree with
+/// `= ANY(string_to_array(...))` on the cases a plain substring search gets
+/// wrong: an unset setting, an empty one, and a column value that itself
+/// contains the delimiter.
+pub fn subject_set_reach(function: &str, column: &str, separator: char) -> String {
+    format!(
+        "CASE WHEN {function}() IS NOT NULL THEN {function}() <> '' \
+         AND instr({column}, '{separator}') = 0 \
+         AND instr('{separator}' || {function}() || '{separator}', \
+         '{separator}' || {column} || '{separator}') > 0 END"
+    )
+}
+
+/// A mapping the mirror needed and the deployment did not bind.
+#[derive(Debug, PartialEq, Eq)]
+enum MirrorGap {
+    /// No identity function, and a term over the table reads the identity.
+    Identity,
+    /// No subject-set function, and a term over the table reads the set.
+    Subjects,
+}
+
+/// What the mirror over `member` reads under: one reach per caller kind a
+/// term over that table declares, joined by `OR`.
+///
+/// Joined rather than one mirror per kind, because the mirror is keyed by
+/// table and opened once. A table watched by an identity term and a
+/// subject-set term at once is mirrored under both, and dropping either
+/// would leave that kind's membership moves undelivered with nothing said.
+fn mirror_predicate(
+    member: &MemberTable,
+    identity_function: Option<&str>,
+    subjects_function: Option<&str>,
+    separator: char,
+) -> Result<String, MirrorGap> {
+    let subject = connetto_core::quote_ident(&member.subject);
+    let mut reaches: Vec<String> = Vec::new();
+    if member.identity {
+        let function = identity_function.ok_or(MirrorGap::Identity)?;
+        reaches.push(format!("{subject} = {function}()"));
+    }
+    if member.subjects {
+        let function = subjects_function.ok_or(MirrorGap::Subjects)?;
+        reaches.push(subject_set_reach(function, &subject, separator));
+    }
+    Ok(reaches.join(" OR "))
+}
+
+/// One membership table a subscription's term watches, and how the mirror
+/// over it has to name the caller.
+///
+/// The caller kind rides along because the mirror is written per term: a term
+/// reading the identity mirrors the caller's own rows, and one reading the
+/// subject set mirrors every row any subject it holds grants.
+#[derive(Clone, Debug)]
+struct MemberTable {
+    /// The membership table, by catalog name.
+    table: String,
+    /// The column naming the subject a row admits.
+    subject: String,
+    /// Whether a term over this table compares that column to the identity.
+    identity: bool,
+    /// Whether a term over this table compares it to the subject set.
+    subjects: bool,
 }
 
 /// Why a subscription was not registered, beyond the materializer's own
@@ -369,7 +481,7 @@ struct RowRegistration {
     pg_sql: String,
     /// The membership tables the subscription's terms watch, empty for a
     /// filter naming none (R27).
-    member_tables: std::sync::Arc<[(String, String)]>,
+    member_tables: std::sync::Arc<[MemberTable]>,
 }
 
 /// Per-session server configuration.
@@ -762,7 +874,7 @@ struct Route<Id, Key> {
     /// filter naming none. A grant moved by a change to one of these tables is
     /// served incrementally by the term's own move (R27 decision 2), so the
     /// R7 resend is suppressed for exactly these tables.
-    member_tables: std::sync::Arc<[(String, String)]>,
+    member_tables: std::sync::Arc<[MemberTable]>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -2166,7 +2278,7 @@ where
                     if route
                         .member_tables
                         .iter()
-                        .any(|(member, _)| member == &moved_table)
+                        .any(|member| member.table == moved_table)
                     {
                         return None;
                     }
@@ -3293,18 +3405,18 @@ where
                     self.materializer.lock().await.unregister(row.reg.sub_id);
                     // R27 decision 7: a membership subscription is torn down
                     // with the last term subscription that needed it.
-                    for (member_table, _) in row.reg.member_tables.iter() {
+                    for member in row.reg.member_tables.iter() {
                         let still_needed = state.subs.values().any(|sibling| {
                             sibling
                                 .reg
                                 .member_tables
                                 .iter()
-                                .any(|(table, _)| table == member_table)
+                                .any(|other| other.table == member.table)
                         });
                         if still_needed {
                             continue;
                         }
-                        if let Some(hidden) = state.subs.remove(&membership_label(member_table)) {
+                        if let Some(hidden) = state.subs.remove(&membership_label(&member.table)) {
                             self.remove_route(hidden.reg.consumer_id).await;
                             self.materializer.lock().await.unregister(hidden.reg.sub_id);
                         }
@@ -3583,17 +3695,16 @@ where
     /// Build the term seed one described filter needs, or `None` when it
     /// names no term.
     ///
-    /// Refuses rather than narrows. A caller whose subjects cannot all be
-    /// built at the compared column's kind, or whose terms compare at
-    /// different kinds, is turned away, because a seed missing a subject
-    /// admits fewer rows than the query the caller registered returns.
+    /// Each term says which of the caller's values its own SQL reads.
+    /// A term written against the identity is seeded from the subscriber and
+    /// a term written against the subject set from the subjects, because
+    /// seeding one from the other would admit rows the registered query does
+    /// not return, or refuse rows it does.
     ///
-    /// A caller holding keys and no identity is turned away here, which is
-    /// the honest limit of the set. The membership mirror
-    /// [`open_membership_subscription`](Self::open_membership_subscription)
-    /// reads `WHERE <member_subject> = <caller function>()`, which renders
-    /// the identity and has no spelling for a subject, so letting a key-only
-    /// caller register would install its term and then fail it a step later.
+    /// Refuses rather than narrows. A value that cannot be built at the
+    /// compared column's kind turns the registration away, since a seed short
+    /// one subject admits fewer rows than the query the caller sent returns
+    /// and no later membership change repairs it.
     async fn seed_for_terms(
         &self,
         terms: &[TermDescription],
@@ -3602,41 +3713,43 @@ where
         let seed = match terms {
             [] => None,
             all => {
-                let identity = state
-                    .principal
-                    .identity()
-                    .ok_or(SubscribeRefusal::Anonymous)?;
-                // One subject kind across every term, membership or caller.
-                // One subject set serves every membership subquery and the
-                // caller comparison reads the same identity, so terms
-                // comparing at different kinds cannot share them.
-                let mut kinds = all.iter().map(|term| match term {
-                    TermDescription::Membership(membership) => membership.subject_kind,
-                    TermDescription::Caller(caller) => caller.kind,
-                });
-                let first_kind = kinds.next().expect("the slice is non-empty");
-                if kinds.any(|kind| kind != first_kind) {
-                    return Err(SubscribeRefusal::Mistyped);
-                }
-                let subjects = caller_subjects(
-                    &identity.user_id.to_string(),
-                    state.principal.capabilities(),
-                    first_kind,
-                )?;
-                let identity_value = subjects
-                    .first()
-                    .cloned()
-                    .expect("the identity is the first subject");
-                // A caller comparison admits the one session value, never the
-                // set, so it is stated only when a term actually compares it.
-                let subscriber = all
+                let reads_identity = all
                     .iter()
-                    .any(|term| matches!(term, TermDescription::Caller(_)))
-                    .then_some(identity_value);
+                    .any(|term| caller_of(term) == TermCaller::Identity);
+                let reads_subjects = all
+                    .iter()
+                    .any(|term| caller_of(term) == TermCaller::Subjects);
+                // One kind per side, checked only among the terms that read
+                // that side: the engine builds one subscriber and one subject
+                // set per registration, and a filter may legitimately compare
+                // the identity on one column's kind and the set on another.
+                let subscriber = if reads_identity {
+                    let identity = state
+                        .principal
+                        .identity()
+                        .ok_or(SubscribeRefusal::Anonymous)?;
+                    let kind = one_kind(all, TermCaller::Identity)?;
+                    Some(
+                        typed_subscriber(&identity.user_id.to_string(), kind)
+                            .ok_or(SubscribeRefusal::Mistyped)?,
+                    )
+                } else {
+                    None
+                };
+                let subjects = if reads_subjects {
+                    let kind = one_kind(all, TermCaller::Subjects)?;
+                    caller_subjects(
+                        state.principal.identity(),
+                        state.principal.capabilities(),
+                        kind,
+                    )?
+                } else {
+                    Vec::new()
+                };
                 let mut term_values = Vec::new();
                 for term in all {
-                    // A caller comparison seeds itself from the subscriber:
-                    // there is no membership table to read.
+                    // A caller comparison seeds itself from the value it
+                    // admits: there is no membership table to read.
                     let TermDescription::Membership(membership) = term else {
                         continue;
                     };
@@ -3712,7 +3825,7 @@ where
         consumer_id: u64,
         sub: &Subscribe,
         state: &SessionState<Id, Key>,
-    ) -> Result<(SqliteRegistration, std::sync::Arc<[(String, String)]>), SubscribeRefusal> {
+    ) -> Result<(SqliteRegistration, std::sync::Arc<[MemberTable]>), SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
         // Describing asks the plain compiler, which refuses shapes the
@@ -3771,18 +3884,38 @@ where
 
     /// The membership tables a registration's terms read, paired with the member
     /// subject column, for the session's term-move routing.
-    fn member_tables_of(terms: &[TermDescription]) -> std::sync::Arc<[(String, String)]> {
-        terms
-            .iter()
-            .filter_map(|term| match term {
-                TermDescription::Membership(membership) => Some((
-                    membership.member_table.clone(),
-                    membership.member_subject.clone(),
-                )),
-                TermDescription::Caller(_) => None,
-            })
-            .collect::<Vec<_>>()
-            .into()
+    /// The membership tables a filter's terms watch, one entry per table and
+    /// column, carrying every caller kind the terms over it read.
+    ///
+    /// Collapsed rather than one entry per term, because the mirror is keyed
+    /// by table and opened once. Two terms over one table under different
+    /// caller kinds would otherwise open the first and silently skip the
+    /// second, leaving that kind's membership moves undelivered.
+    fn member_tables_of(terms: &[TermDescription]) -> std::sync::Arc<[MemberTable]> {
+        let mut tables: Vec<MemberTable> = Vec::new();
+        for term in terms {
+            let TermDescription::Membership(membership) = term else {
+                continue;
+            };
+            let held = tables.iter().position(|held| {
+                held.table == membership.member_table && held.subject == membership.member_subject
+            });
+            let at = held.unwrap_or_else(|| {
+                tables.push(MemberTable {
+                    table: membership.member_table.clone(),
+                    subject: membership.member_subject.clone(),
+                    identity: false,
+                    subjects: false,
+                });
+                tables.len() - 1
+            });
+            let entry = &mut tables[at];
+            match membership.caller {
+                TermCaller::Identity => entry.identity = true,
+                TermCaller::Subjects => entry.subjects = true,
+            }
+        }
+        tables.into()
     }
 
     async fn handle_subscribe<T: Transport>(
@@ -3910,8 +4043,8 @@ where
         // is counted against the same allowance before anything is served, so
         // a caller at its ceiling is refused as a unit rather than served
         // half.
-        for (member_table, _) in reg.member_tables.iter() {
-            if state.subs.contains_key(&membership_label(member_table)) {
+        for member in reg.member_tables.iter() {
+            if state.subs.contains_key(&membership_label(&member.table)) {
                 continue;
             }
             if let Some(wait) = self.guard.subscription(state.session_id, tier) {
@@ -3954,15 +4087,9 @@ where
                 // R27 decision 7: the server opens the membership
                 // subscription the term needs, after the term's own frames so
                 // the announce precedes the hidden subscription's snapshot.
-                for (member_table, member_subject) in members.iter() {
-                    self.open_membership_subscription(
-                        transport,
-                        state,
-                        tier,
-                        member_table,
-                        member_subject,
-                    )
-                    .await?;
+                for member in members.iter() {
+                    self.open_membership_subscription(transport, state, tier, member)
+                        .await?;
                 }
                 Ok(())
             }
@@ -4027,18 +4154,18 @@ where
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         tier: Tier,
-        member_table: &str,
-        member_subject: &str,
+        member: &MemberTable,
     ) -> Result<(), SessionError> {
-        let label = membership_label(member_table);
+        let label = membership_label(&member.table);
         if state.subs.contains_key(&label) {
             return Ok(());
         }
-        // `register_subscription` requires an identified caller for any term,
-        // so the membership subscription always has an identity to seed with.
-        if state.principal.identity().is_none() {
+        // A term reading the identity has nothing to mirror for a caller with
+        // none, and `register_subscription` refuses it for the same reason.
+        if member.identity && state.principal.identity().is_none() {
             return Err(SessionError::Snapshot(
-                "a membership subscription needs an identified caller".to_owned(),
+                "a membership subscription over an identity term needs an identified caller"
+                    .to_owned(),
             ));
         }
         // The caller's own rows only (decision 12): a membership table
@@ -4050,22 +4177,31 @@ where
         // identity. A term subscription only exists because the application's
         // query named this function, so the mapping is present whenever this
         // runs, and its absence is a server-side defect.
-        let Some(caller_function) = self
-            .materializer
-            .lock()
-            .await
-            .caller_function()
-            .map(str::to_owned)
-        else {
-            return Err(SessionError::Snapshot(
-                "a membership subscription needs the deployment's caller mapping".to_owned(),
-            ));
+        let (identity_function, subjects_function) = {
+            let materializer = self.materializer.lock().await;
+            (
+                materializer.caller_function().map(str::to_owned),
+                materializer.subject_set_function().map(str::to_owned),
+            )
         };
-        let query = format!(
-            "SELECT * FROM {} WHERE {} = {caller_function}()",
-            connetto_core::quote_ident(member_table),
-            connetto_core::quote_ident(member_subject),
-        );
+        let table = connetto_core::quote_ident(&member.table);
+        let predicate = mirror_predicate(
+            member,
+            identity_function.as_deref(),
+            subjects_function.as_deref(),
+            Key::SEPARATOR,
+        )
+        .map_err(|gap| {
+            SessionError::Snapshot(match gap {
+                MirrorGap::Identity => {
+                    "a membership subscription needs the deployment's caller mapping".to_owned()
+                }
+                MirrorGap::Subjects => "a membership subscription over a subject-set term needs \
+                     the deployment's subject mapping"
+                    .to_owned(),
+            })
+        })?;
+        let query = format!("SELECT * FROM {table} WHERE {predicate}");
         let hidden = Subscribe {
             sub_id: label.clone(),
             spec: SubscriptionSpec::new(query),
@@ -4073,7 +4209,7 @@ where
         transport
             .send_control(ControlMessage::MembershipOpened(MembershipOpened {
                 sub_id: label.clone(),
-                member_table: member_table.to_owned(),
+                member_table: member.table.clone(),
             }))
             .await
             .map_err(transport_err)?;
@@ -5013,10 +5149,55 @@ async fn flush<T: Transport>(
 
 #[cfg(test)]
 mod tests {
-    use connetto_core::auth::CapabilitySubject;
+    use connetto_core::auth::{AuthContext, CapabilitySubject};
     use subql::backend::{ScalarFamily, Value as PgValue};
 
-    use super::{SubscribeRefusal, caller_subjects, page_rows};
+    use super::{
+        MemberTable, MirrorGap, SubscribeRefusal, caller_subjects, mirror_predicate, page_rows,
+    };
+
+    /// A membership table watched under the given caller kinds.
+    fn watched(identity: bool, subjects: bool) -> MemberTable {
+        MemberTable {
+            table: "team_members".to_owned(),
+            subject: "member".to_owned(),
+            identity,
+            subjects,
+        }
+    }
+
+    /// One mirror serves a table two terms watch under different caller
+    /// kinds, because the mirror is keyed by table and opened once. Dropping
+    /// either reach would leave that kind's membership moves undelivered
+    /// with nothing reported.
+    #[test]
+    fn a_table_watched_under_both_caller_kinds_mirrors_under_both() {
+        let predicate =
+            mirror_predicate(&watched(true, true), Some("caller"), Some("subjects"), ',')
+                .expect("both mappings are bound");
+        let (identity, set) = predicate.split_once(" OR ").expect("both reaches, joined");
+        assert_eq!(identity, "\"member\" = caller()");
+        assert!(
+            set.contains("subjects()") && set.contains("instr("),
+            "the set reach is the guarded search, got {set}"
+        );
+    }
+
+    /// A term reading a set the deployment binds no function for is a
+    /// server-side defect, and it is named rather than mirrored as an
+    /// identity comparison that would admit the wrong rows.
+    #[test]
+    fn a_set_term_without_its_mapping_names_the_gap() {
+        assert_eq!(
+            mirror_predicate(&watched(false, true), Some("caller"), None, ','),
+            Err(MirrorGap::Subjects)
+        );
+    }
+
+    /// The identity half of a caller, as a handshake resolves it.
+    fn identity(user: &str) -> AuthContext<String> {
+        AuthContext::new(user.to_owned())
+    }
 
     /// A caller is a set, so every key it holds is seeded beside the
     /// identity. A membership row naming a key admits rows in the database,
@@ -5027,7 +5208,7 @@ mod tests {
             CapabilitySubject::<String>::new("key:a"),
             CapabilitySubject::<String>::new("key:b"),
         ];
-        let subjects = caller_subjects("alice", &keys, ScalarFamily::String)
+        let subjects = caller_subjects(Some(&identity("alice")), &keys, ScalarFamily::String)
             .expect("a text subject column takes any of them");
         assert_eq!(
             subjects,
@@ -5046,7 +5227,7 @@ mod tests {
     fn a_key_the_subject_column_cannot_hold_refuses_rather_than_being_dropped() {
         let keys = [CapabilitySubject::<String>::new("key:a")];
         let refusal = caller_subjects(
-            "0193c8e5-1111-7abc-8def-000000000000",
+            Some(&identity("0193c8e5-1111-7abc-8def-000000000000")),
             &keys,
             ScalarFamily::Uuid,
         )
