@@ -152,6 +152,13 @@ pub struct TermSeedRead {
 /// Postgres, so a membership row naming any of them moves what the filter
 /// admits here exactly as it does in the database.
 ///
+/// Each key has to render here exactly as `CallerBinding` packs it into
+/// `app.subjects` through [`CapabilityKey::pack`], because that packed list
+/// is what the membership subquery compares against in SQL. A change to
+/// either rendering that the other does not follow leaves the seed matching
+/// no membership row while the database still matches one, which admits
+/// fewer rows in silence.
+///
 /// A subject that cannot be built at the column's kind refuses the whole
 /// registration rather than being dropped from the set, because a seed short
 /// one subject admits fewer rows than the query the caller registered
