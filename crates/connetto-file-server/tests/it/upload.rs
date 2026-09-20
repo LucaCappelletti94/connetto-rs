@@ -9,7 +9,7 @@ use diesel_async::RunQueryDsl;
 use tower::ServiceExt;
 
 use crate::fixture::{
-    Pg, build_router, connect_admin, fail_once_write_store, fs_store,
+    Pg, build_router, connect_admin, fail_once_write_store, fs_store, identified,
     insert_manifest_bypassing_intent, object_store_local, register_file_ownership,
 };
 
@@ -453,7 +453,8 @@ async fn mid_stream_ceiling_crossing_refused() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &identified("alice"), &chunks)
+        .await;
 
     let ticket = signer
         .mint(&TicketPayload {
@@ -537,7 +538,8 @@ async fn re_put_does_not_double_count() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &identified("alice"), &chunks)
+        .await;
 
     // ceiling = 200 = sum(100, 100). Double-counting A would make PUT B fail.
     let ticket = signer
@@ -1124,7 +1126,7 @@ async fn commit_setter_failure_rolls_back_retry_succeeds() {
     let committed: bool = diesel_async::RunQueryDsl::get_result(
         diesel::sql_query(
             "SELECT committed FROM _cfs_manifests \
-             WHERE file_id = $1 AND uploaded_by = 'alice'",
+             WHERE file_id = $1 AND uploaded_by = 'user:alice'",
         )
         .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_ref()),
         &mut admin_conn,
@@ -3303,7 +3305,8 @@ async fn put_chunk_with_u64_max_ceiling_succeeds() {
     let chunks: Vec<ChunkMeta> = manifest.chunks().to_vec();
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_manifest_bypassing_intent(&mut admin_conn, &file_id, &identified("alice"), &chunks)
+        .await;
     drop(admin_conn);
 
     let ticket = signer
@@ -3367,14 +3370,14 @@ async fn intent_and_commit_under_a_key_only_caller() {
     insert_committed_manifest(
         &mut admin_conn,
         &visible.file_id(),
-        "alice",
+        &identified("alice"),
         visible.chunks(),
     )
     .await;
     insert_committed_manifest(
         &mut admin_conn,
         &invisible.file_id(),
-        "alice",
+        &identified("alice"),
         invisible.chunks(),
     )
     .await;
@@ -3496,4 +3499,85 @@ async fn needed_count(
         .as_array()
         .expect("the answer names needed hashes")
         .len()
+}
+
+/// An identity that renders like a share key owns its own manifest rows, not
+/// the key holder's.
+///
+/// The two callers are distinct and a deployment whose user ids look like its
+/// key renderings must not let one resume or commit the other's upload.
+#[tokio::test]
+async fn an_identity_shaped_like_a_key_owns_its_own_manifest() {
+    use crate::fixture::keyed;
+
+    const SHARED: &str = "key:k1";
+
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let data = b"bytes two callers both declare";
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+
+    let key_needed = needed_count(
+        &app,
+        &write_ticket(&signer, &file_id, &keyed(SHARED)),
+        &manifest,
+    )
+    .await;
+    assert_eq!(
+        key_needed,
+        manifest.chunks().len(),
+        "the key holder uploads its own chunks"
+    );
+
+    // The identity spelled the same way declares the same file. It owns a
+    // separate manifest, so it is told to upload every chunk itself rather
+    // than finding the key holder's declaration already in place.
+    let identity_needed = needed_count(
+        &app,
+        &write_ticket(&signer, &file_id, &identified(SHARED)),
+        &manifest,
+    )
+    .await;
+    assert_eq!(
+        identity_needed,
+        manifest.chunks().len(),
+        "an identity spelled like the key owns nothing the key declared"
+    );
+
+    // Neither may commit on the other's declaration: the chunks are unstored.
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!(
+            "/files/{file_id}/commit?t={}",
+            write_ticket(&signer, &file_id, &keyed(SHARED))
+        ))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "neither caller may commit on the other's declaration"
+    );
+}
+
+/// A write ticket for `caller` over `file_id`.
+fn write_ticket(
+    signer: &connetto_file_server::TicketSigner,
+    file_id: &FileId,
+    caller: &connetto_file_server::ContentCaller,
+) -> String {
+    signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: 1 << 20,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: caller.clone(),
+        })
+        .unwrap()
 }

@@ -237,13 +237,30 @@ impl ContentCaller {
         self.subjects.as_deref()
     }
 
-    /// The one string a manifest row and a commit attribution key on: the
-    /// identity, else the subjects, which are deterministic per subject set.
+    /// What the deployment attributes a commit to: the identity, else the
+    /// subjects, as the deployment's own policies already spell them, so a row
+    /// storing it can be compared against the caller settings directly.
     ///
-    /// A caller holding neither has no key, so it cannot own a manifest.
+    /// A caller holding neither is nobody to attribute to.
     #[must_use]
     pub fn attribution(&self) -> Option<&str> {
         self.identity().or_else(|| self.subjects())
+    }
+
+    /// The key a manifest row is owned under, which names the half it came
+    /// from as well as its value.
+    ///
+    /// An identity and a capability subject can render alike, and a deployment
+    /// whose user ids look like its key renderings would otherwise let one
+    /// caller resume or commit the other's manifest. The kind is part of the
+    /// key so two different callers can never share one row.
+    ///
+    /// A caller holding neither half has no key, so it owns no manifest.
+    #[must_use]
+    pub fn storage_key(&self) -> Option<String> {
+        self.identity()
+            .map(|identity| format!("user:{identity}"))
+            .or_else(|| self.subjects().map(|subjects| format!("keys:{subjects}")))
     }
 
     /// Take both halves out.

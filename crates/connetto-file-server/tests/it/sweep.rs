@@ -6,7 +6,7 @@ use connetto_file_server::ticket::{TicketPayload, Verb};
 use diesel_async::{RunQueryDsl, SimpleAsyncConnection};
 use tower::ServiceExt;
 
-use crate::fixture::{Pg, build_router};
+use crate::fixture::{Pg, build_router, identified};
 
 mod race_schema {
     connetto_file_server::connetto_file_tables!();
@@ -482,7 +482,7 @@ async fn deleting_hash_blocks_put_with_503() {
     insert_manifest_bypassing_intent(
         &mut admin_conn,
         &file_id2,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: chunk_hash,
             len: chunk.len,
@@ -550,7 +550,7 @@ async fn crash_window_1_intent_no_store_write_sweep_cleans_registry() {
     insert_manifest_bypassing_intent(
         &mut admin_conn,
         &file_id,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: chunk_hash,
             len: chunk.len,
@@ -620,7 +620,7 @@ async fn crash_window_2_store_written_registry_pending_sweep_cleans_up() {
     insert_manifest_bypassing_intent(
         &mut admin_conn,
         &file_id,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: chunk_hash,
             len: chunk.len,
@@ -1205,7 +1205,7 @@ async fn sweep_ignores_a_held_lock_on_a_committed_hash() {
     crate::fixture::insert_committed_manifest(
         &mut holder,
         &file_id,
-        "alice",
+        &identified("alice"),
         &[ChunkMeta {
             hash: live_hash,
             len: chunk.len,

@@ -60,16 +60,27 @@ pub(crate) async fn bind_caller(
     .map(drop)
 }
 
-/// The key `caller` owns manifest rows under, and the value the deployment
-/// attributes a commit to.
+/// The key `caller` owns manifest rows under.
 ///
-/// The identity when a login resolved, else the packed subjects, which are one
-/// value per subject set. A caller holding neither has no key, so it owns no
-/// manifest and is refused the way an absent file is.
+/// Namespaced by the half it came from, so an identity and a capability
+/// subject that render alike cannot own one another's rows. The deployment is
+/// attributed the plain value instead, through
+/// [`ContentCaller::attribution`], because that is what its own policies
+/// compare against.
+///
+/// # Errors
+///
+/// [`ServerError::NotFound`] when the ticket's caller holds neither half, so
+/// it owns no manifest and is refused the way an absent file is.
+pub(crate) fn manifest_key(caller: &ContentCaller) -> Result<String, ServerError> {
+    caller.storage_key().ok_or(ServerError::NotFound)
+}
+
+/// The value the deployment's content-state setter is given for the commit.
 ///
 /// # Errors
 ///
 /// [`ServerError::NotFound`] when the ticket's caller holds neither half.
-pub(crate) fn manifest_key(caller: &ContentCaller) -> Result<&str, ServerError> {
+pub(crate) fn attribution(caller: &ContentCaller) -> Result<&str, ServerError> {
     caller.attribution().ok_or(ServerError::NotFound)
 }

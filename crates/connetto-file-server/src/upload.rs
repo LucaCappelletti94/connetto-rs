@@ -11,8 +11,14 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    caller::manifest_key, db, error::ServerError, needed, router::AppState,
-    schema::ConnettoFileSchema, store::AnyStore, ticket::Verb,
+    caller::{attribution, manifest_key},
+    db,
+    error::ServerError,
+    needed,
+    router::AppState,
+    schema::ConnettoFileSchema,
+    store::AnyStore,
+    ticket::Verb,
 };
 
 // ---------------------------------------------------------------------------
@@ -104,7 +110,7 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
         .map_err(|_| ServerError::BadParam("total_len overflows i64".into()))?;
     let key = manifest_key(&ticket.caller)?;
     let mut admin_conn = state.pools.admin.get().await?;
-    match db::insert_manifest::<S>(&mut admin_conn, &file_id, total_len, key, &chunks).await? {
+    match db::insert_manifest::<S>(&mut admin_conn, &file_id, total_len, &key, &chunks).await? {
         db::InsertManifestOutcome::RegistryConflict => return Err(ServerError::RegistryConflict),
         db::InsertManifestOutcome::Inserted | db::InsertManifestOutcome::AlreadyPresent => {}
     }
@@ -130,7 +136,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let chunk_hash = parse_chunk_hash(&hash_hex)?;
     let file_id = FileId::from_bytes(ticket.file_id);
-    let caller = manifest_key(&ticket.caller)?.to_owned();
+    let caller = manifest_key(&ticket.caller)?;
     let body_len = u64::try_from(body.len())
         .map_err(|_| ServerError::BadParam("body length overflows u64".into()))?;
     // A ceiling above i64::MAX cannot be exceeded by any real upload; clamp once
@@ -197,7 +203,8 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
-    let key = manifest_key(&ticket.caller)?.to_owned();
+    let key = manifest_key(&ticket.caller)?;
+    let attribution = attribution(&ticket.caller)?.to_owned();
     let store = &state.store;
     // Ordering: acquire reader before admin so a saturated reader pool never
     // blocks a holder of the manifest FOR UPDATE lock.
@@ -237,7 +244,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     diesel::select(crate::functions::connetto_set_content_state(
                         file_id.as_bytes().to_vec().as_slice(),
                         "available",
-                        key.as_str(),
+                        attribution.as_str(),
                     ))
                     .get_result::<Option<Vec<u8>>>(conn)
                     .await?;
@@ -246,7 +253,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                 Some(db::ManifestState::Uncommitted(manifest)) => manifest,
             };
             verify_file_identity(store, &manifest).await?;
-            db::commit_manifest_atomic::<S>(conn, &file_id, &key).await?;
+            db::commit_manifest_atomic::<S>(conn, &file_id, &key, &attribution).await?;
             Ok(StatusCode::OK)
         })
         .await

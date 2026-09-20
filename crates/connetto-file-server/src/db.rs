@@ -406,11 +406,12 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
 pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     file_id: &FileId,
-    caller: &str,
+    key: &str,
+    attribution: &str,
 ) -> Result<CommitOutcome, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
-    let caller_owned = caller.to_owned();
-    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), caller_owned.clone());
+    let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), key.to_owned());
+    let attribution = attribution.to_owned();
     let setter_arg = file_id_bytes;
 
     conn.transaction::<CommitOutcome, CommitTxError, _>(async move |c| {
@@ -425,7 +426,7 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
         diesel::select(crate::functions::connetto_set_content_state(
             setter_arg.as_slice(),
             "available",
-            caller_owned.as_str(),
+            attribution.as_str(),
         ))
         .get_result::<Option<Vec<u8>>>(c)
         .await

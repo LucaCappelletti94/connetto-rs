@@ -4,7 +4,7 @@ use axum::http::StatusCode;
 use connetto_file_server::ticket::{TicketPayload, Verb};
 use tower::ServiceExt;
 
-use crate::fixture::{Pg, build_router, fs_store, make_signer};
+use crate::fixture::{Pg, build_router, fs_store, identified, keyed, make_signer};
 
 #[tokio::test]
 async fn absent_file_answers_404() {
@@ -46,7 +46,7 @@ async fn bad_ticket_answers_404() {
     let file_id = FileId::from_bytes(file_id_bytes);
     let id_hex = connetto_file_server::hex_32(&file_id_bytes);
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &[]).await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     // A valid read ticket for the committed file must serve 200, proving that
@@ -106,7 +106,7 @@ async fn expired_ticket_answers_404() {
     let file_id = FileId::from_bytes(file_id_bytes);
     let id_hex = connetto_file_server::hex_32(&file_id_bytes);
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &[]).await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     // A valid (non-expired) read ticket for the committed file must serve 200,
@@ -166,7 +166,7 @@ async fn write_ticket_on_read_endpoint_answers_404() {
     let file_id = FileId::from_bytes(file_id_bytes);
     let id_hex = connetto_file_server::hex_32(&file_id_bytes);
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &[]).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &[]).await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     // A read ticket for the committed file must serve 200, proving that the
@@ -245,7 +245,13 @@ async fn empty_file_serves_200_with_empty_body() {
     }
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(
+        &mut admin_conn,
+        &file_id,
+        &identified("alice"),
+        manifest.chunks(),
+    )
+    .await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     let token = signer
@@ -296,7 +302,13 @@ async fn empty_file_range_request_answers_416() {
     }
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(
+        &mut admin_conn,
+        &file_id,
+        &identified("alice"),
+        manifest.chunks(),
+    )
+    .await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
     let token = signer
@@ -385,7 +397,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         },
     ];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &chunks).await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
     drop(admin_conn);
 
@@ -466,7 +478,7 @@ async fn content_length_present_on_full_response() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, &identified("alice"), manifest.chunks()).await;
     register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
@@ -531,7 +543,7 @@ async fn content_length_present_on_partial_response() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, &identified("alice"), manifest.chunks()).await;
     register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
@@ -605,7 +617,7 @@ async fn content_length_present_on_empty_file_response() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, &identified("alice"), manifest.chunks()).await;
     register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
@@ -677,7 +689,7 @@ async fn suffix_byte_range_serves_206() {
         fs.write_chunk(&c.hash, &bytes).await.unwrap();
     }
     let mut conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(&mut conn, &file_id, &identified("alice"), manifest.chunks()).await;
     register_file_ownership(&mut conn, &file_id, "alice").await;
 
     let token = signer
@@ -759,7 +771,7 @@ async fn short_store_read_terminates_stream_with_error() {
     let file_id = FileId::from_bytes([0xEEu8; 32]);
     let chunks = vec![ChunkMeta { hash, len: 64 }];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &chunks).await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
     drop(admin_conn);
 
@@ -822,7 +834,13 @@ async fn cross_caller_read_with_visible_file_serves_200() {
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     // alice holds the only committed manifest row for this file_id
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", manifest.chunks()).await;
+    insert_committed_manifest(
+        &mut admin_conn,
+        &file_id,
+        &identified("alice"),
+        manifest.chunks(),
+    )
+    .await;
     // the deployment's visibility function admits bob for this file_id
     register_file_ownership(&mut admin_conn, &file_id, "bob").await;
 
@@ -873,7 +891,7 @@ async fn unauthorized_caller_gets_404_even_with_own_manifest_row() {
 
     let mut admin_conn = connect_admin(&pg.url_admin).await;
     // dave has his own committed manifest row (an empty file) for this file_id
-    insert_committed_manifest(&mut admin_conn, &file_id, "dave", &[]).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("dave"), &[]).await;
     // the visibility function admits alice only; dave is not admitted
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
 
@@ -922,7 +940,7 @@ async fn a_key_only_ticket_serves() {
     let file_id = FileId::from_bytes([0xC1u8; 32]);
     let chunks = vec![ChunkMeta { hash, len: 96 }];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, SUBJECT, &chunks).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &keyed(SUBJECT), &chunks).await;
     register_file_ownership(&mut admin_conn, &file_id, SUBJECT).await;
     drop(admin_conn);
 
@@ -979,7 +997,7 @@ async fn a_renamed_identity_setting_serves() {
     let file_id = FileId::from_bytes([0xC2u8; 32]);
     let chunks = vec![ChunkMeta { hash, len: 32 }];
     let mut admin_conn = connect_admin(&pg.url_admin).await;
-    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &chunks).await;
     register_file_ownership(&mut admin_conn, &file_id, "alice").await;
     drop(admin_conn);
 
