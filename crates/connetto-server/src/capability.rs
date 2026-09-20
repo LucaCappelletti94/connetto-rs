@@ -91,7 +91,7 @@ pub(crate) fn meter_key<Id: Display, Key: CapabilityKey>(
     run: impl Display,
 ) -> String {
     rendered_caller(caller)
-        .storage_key()
+        .storage_key(Key::SEPARATOR)
         .unwrap_or_else(|| run.to_string())
 }
 

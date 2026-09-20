@@ -358,7 +358,7 @@ async fn the_ticket_carries_the_whole_caller() {
         "so there is nobody to attribute a commit to"
     );
     assert_eq!(
-        anonymous.storage_key(),
+        anonymous.storage_key(','),
         None,
         "and it has no manifest key at all"
     );

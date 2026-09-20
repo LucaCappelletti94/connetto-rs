@@ -108,7 +108,7 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     }
     let total_len = i64::try_from(body.total_len)
         .map_err(|_| ServerError::BadParam("total_len overflows i64".into()))?;
-    let key = manifest_key(&ticket.caller)?;
+    let key = manifest_key(&state.caller_settings, &ticket.caller)?;
     let mut admin_conn = state.pools.admin.get().await?;
     match db::insert_manifest::<S>(&mut admin_conn, &file_id, total_len, &key, &chunks).await? {
         db::InsertManifestOutcome::RegistryConflict => return Err(ServerError::RegistryConflict),
@@ -136,7 +136,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let chunk_hash = parse_chunk_hash(&hash_hex)?;
     let file_id = FileId::from_bytes(ticket.file_id);
-    let caller = manifest_key(&ticket.caller)?;
+    let caller = manifest_key(&state.caller_settings, &ticket.caller)?;
     let body_len = u64::try_from(body.len())
         .map_err(|_| ServerError::BadParam("body length overflows u64".into()))?;
     // A ceiling above i64::MAX cannot be exceeded by any real upload; clamp once
@@ -203,7 +203,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
-    let key = manifest_key(&ticket.caller)?;
+    let key = manifest_key(&state.caller_settings, &ticket.caller)?;
     let attributions: Vec<String> = attributions(&ticket.caller)?
         .into_iter()
         .map(ToOwned::to_owned)

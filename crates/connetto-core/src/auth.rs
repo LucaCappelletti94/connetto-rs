@@ -274,21 +274,28 @@ impl ContentCaller {
         )
     }
 
-    /// The key a manifest row is owned under, which names the half it came
-    /// from as well as its value.
+    /// The key a caller owns rows and meters under, which names the half it
+    /// came from as well as its value.
     ///
-    /// An identity and a capability subject can render alike, and a deployment
-    /// whose user ids look like its key renderings would otherwise let one
-    /// caller resume or commit the other's manifest. The kind is part of the
-    /// key so two different callers can never share one row.
+    /// An identity and a capability subject can render alike, and a
+    /// deployment whose user ids look like its key renderings would otherwise
+    /// let one caller resume or commit the other's manifest. The kind is part
+    /// of the key so two different callers can never share one row.
     ///
-    /// A caller holding neither half has no key, so it owns no manifest.
+    /// `separator` MUST be the deployment's own
+    /// [`CapabilityKey::SEPARATOR`](crate::auth::CapabilityKey::SEPARATOR),
+    /// which no single key may contain. Joining under any other character
+    /// would let one key rendered `a,b` and two keys rendered `a` and `b`
+    /// produce one value, so two distinct callers would share a row and a
+    /// meter.
+    ///
+    /// A caller holding neither half has no key, so it owns nothing.
     #[must_use]
-    pub fn storage_key(&self) -> Option<String> {
+    pub fn storage_key(&self, separator: char) -> Option<String> {
         self.identity()
             .map(|identity| format!("user:{identity}"))
             .or_else(|| {
-                self.packed_subjects(',')
+                self.packed_subjects(separator)
                     .map(|subjects| format!("keys:{subjects}"))
             })
     }
@@ -424,5 +431,28 @@ mod tests {
 
         assert!(first.identity().is_none());
         assert!(second.identity().is_none());
+    }
+
+    /// Two callers under a deployment whose separator is not a comma keep
+    /// separate keys, even when one holds a key spelled like the other's pair.
+    ///
+    /// Only the deployment's own separator is barred from a key's rendering,
+    /// so joining under any other character lets `a,b` and the pair `a`, `b`
+    /// render alike, and the two callers would share a manifest row and a
+    /// meter bucket.
+    #[test]
+    fn a_key_spelled_like_a_pair_owns_its_own_rows() {
+        let one_key = ContentCaller::new(None, ["a,b".to_owned()]);
+        let two_keys = ContentCaller::new(None, ["a".to_owned(), "b".to_owned()]);
+        assert_ne!(
+            one_key.storage_key('|'),
+            two_keys.storage_key('|'),
+            "the deployment's own separator keeps the two apart"
+        );
+        assert_eq!(
+            two_keys.storage_key('|').as_deref(),
+            Some("keys:a|b"),
+            "and the pair joins under that separator"
+        );
     }
 }
