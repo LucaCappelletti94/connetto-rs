@@ -726,3 +726,53 @@ fn an_unaccounted_policy_view_refuses_to_open() {
         "both the policy view and the translation's own view are named",
     );
 }
+
+/// The replica answers the caller's subject set the way the server binds it,
+/// because a policy compiled against the set is evaluated on both ends and
+/// the two renderings have to agree.
+///
+/// Packed through the one `CapabilityKey` rendering rather than spelled
+/// again here: a second spelling is how the replica starts admitting rows the
+/// server does not, or refusing rows it does, with nothing reported.
+#[test]
+fn the_replica_answers_the_packed_subject_set() {
+    use diesel::RunQueryDsl;
+
+    let (ddl, tables) = translation();
+    let config = client_config(tables).with_subjects(
+        "current_app_subjects",
+        ["key:a".to_owned(), "key:b".to_owned()],
+    );
+    let mut connection =
+        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
+            .expect("the replica opens");
+    let answered: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+        "current_app_subjects()",
+    ))
+    .get_result(connection.conn())
+    .expect("the registered function answers");
+    assert_eq!(
+        answered, "key:a,key:b",
+        "the replica packs the set exactly as the server binds it"
+    );
+}
+
+/// A caller holding no key answers NULL rather than the empty string, which
+/// is what makes an absent capability fail closed: a membership over the set
+/// compares against NULL and admits nothing.
+#[test]
+fn a_caller_holding_no_key_answers_null() {
+    use diesel::RunQueryDsl;
+
+    let (ddl, tables) = translation();
+    let config = client_config(tables).with_subjects("current_app_subjects", Vec::<String>::new());
+    let mut connection =
+        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
+            .expect("the replica opens");
+    let answered: Option<String> = diesel::select(diesel::dsl::sql::<
+        diesel::sql_types::Nullable<diesel::sql_types::Text>,
+    >("current_app_subjects()"))
+    .get_result(connection.conn())
+    .expect("the registered function answers");
+    assert_eq!(answered, None, "no key held is unbound, never empty");
+}
