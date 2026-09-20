@@ -21,7 +21,7 @@ use connetto_client::{
     ClientConfig, ClientError, ClientEvent, ConnettoConnection, PolicyTables, Replica,
 };
 use connetto_core::Cursor;
-use connetto_core::auth::CapabilitySubject;
+use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, MutationPatch,
     SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
@@ -778,4 +778,51 @@ fn a_caller_holding_no_key_answers_null() {
     .get_result(connection.conn())
     .expect("the registered function answers");
     assert_eq!(answered, None, "no key held is unbound, never empty");
+}
+
+/// A deployment's own key type carries its own separator, and the replica
+/// joins on that one rather than on the default.
+///
+/// The generic makes this true by construction, since `Key::pack` cannot
+/// reach another type's separator. The test exists because nothing else
+/// fails if the body is ever written back to one concrete type: the replica
+/// would then join on a comma while the policy unpacks on something else,
+/// and the two ends would disagree about which keys are held with nothing
+/// reported.
+#[test]
+fn the_replica_joins_on_the_deployments_own_separator() {
+    use diesel::RunQueryDsl;
+
+    /// A share key joined by a character the default packing never uses.
+    #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+    struct PipeKey(String);
+
+    impl std::fmt::Display for PipeKey {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.0)
+        }
+    }
+
+    impl CapabilityKey for PipeKey {
+        const SEPARATOR: char = '|';
+    }
+
+    let (ddl, tables) = translation();
+    let held: [CapabilitySubject<PipeKey>; 2] = [
+        CapabilitySubject::new(PipeKey("key:a".to_owned())),
+        CapabilitySubject::new(PipeKey("key:b".to_owned())),
+    ];
+    let config = client_config(tables).with_subjects("current_app_subjects", &held);
+    let mut connection =
+        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
+            .expect("the replica opens");
+    let answered: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+        "current_app_subjects()",
+    ))
+    .get_result(connection.conn())
+    .expect("the registered function answers");
+    assert_eq!(
+        answered, "key:a|key:b",
+        "the replica joins on the key type's separator, never on the default"
+    );
 }
