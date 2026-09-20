@@ -19,9 +19,9 @@ The numbering records the order chapters were written, not a reading order and n
 | `08-authorization.md` | Which caller may see which row, on reads, on changes and on writes. The two executors and the revocation path |
 | `09-wasm.md` | Running the client in a browser: the worker topology, storage, and what the platform does and does not offer |
 | `10-subscription-materializer.md` | The server component that hosts `subql` and turns its per-consumer output into per-session wire output |
-| `11-authentication.md` | How a caller proves who it is, from login to a verified identity bound onto a session |
-| `12-identity-session-capability.md` | **The canonical chapter for identity.** The three concepts, what each keys, the status-marker discipline, and the threat model that bounds the encryption design. It governs where other chapters disagree with it |
-| `13-client-connection.md` | The client-side Diesel connection, reactivity, and the two framework adapters |
+| `11-authentication.md` | How a caller proves who it is, from login to a verified identity bound onto a session, and the app login an app-signed assertion buys a bot. **Decided, not built** for the app login, R91 |
+| `12-identity-session-capability.md` | **The canonical chapter for identity.** The three concepts, what each keys, the status-marker discipline, the threat model that bounds the encryption design, and apps, bots and installations. It governs where other chapters disagree with it. **Decided, not built** for apps and bots, R91 |
+| `13-client-connection.md` | The client-side Diesel connection, reactivity, the two framework adapters, and the headless reactor and app credential. **Decided, not built** for the reactor, R91 |
 | `14-at-rest-encryption.md` | The replica page codec, key custody, ordering constraints, and what the encryption does and does not defend |
 | `15-replica-retention.md` | Why the replica grows, and eviction and physical trimming |
 | `16-server-capacity.md` | What the server holds in flight at once, the two connection pools, and the share reserved for identified callers |

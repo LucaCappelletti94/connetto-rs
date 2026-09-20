@@ -141,6 +141,7 @@ A structured inventory of every component that must exist. This is not a depende
 | Write gate | Applied to every mutation before it is executed. *(Reliability: see §10.)* |
 | Auth batching | Policies are evaluated in batch per CDC event to avoid per-row round-trips. |
 | File session token | Short-lived token issued for a specific file; gates chunk upload/download without per-chunk auth calls. |
+| App registry and bot login | **Decided (R91, 2026-09-18).** Three synced registry tables under row-level security (`connetto_apps`, `connetto_app_grants`, `connetto_installations`), two server-only tables for what the exchange writes, one route `POST /auth/app-token` exchanging an app-signed assertion for a login grant naming the app's bot user at this deployment, a registry cache the change-log hook keeps, and the manifest filter at subscribe and per op. Chapter 12 for the entities and the two views, chapter 11 for the exchange, chapter 16 for the budget keys. |
 
 ---
 
@@ -180,6 +181,7 @@ A structured inventory of every component that must exist. This is not a depende
 | `connetto-file-core` | Chunking, identity, per-chunk encryption, and the `ChunkStore` and `ChunkInventory` seams. Builds for wasm. | **Built (R64)** |
 | `connetto-file-server` | Chunk storage on a filesystem or an object store, the two-phase upload, ranged serving, sweep, and the `ContentTicketSigner` the server mints through. | **Built (R65)** |
 | `connetto-file-client` | The encrypted store, manifests and outbox in the replica, the upload walk, the resolver, and content pins, natively and in the browser. | **Built (R67, R68)** |
+| `examples/bot-template` | The bot deliverable a bot author copies: the app credential, a `Reactor`, one ingest verb, and the scripted, semantics, property and bench tiers all present. Two demo apps are built from it, an isolated importer and a shared totaliser. | **Decided (R91)** |
 
 ---
 

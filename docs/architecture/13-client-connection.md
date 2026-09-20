@@ -234,6 +234,20 @@ One consequence reaches the application: trusted schema off means a function the
 
 ---
 
+## A headless consumer: the reactor and the app credential (R91, decided 2026-09-18)
+
+**Decided (R91).** A bot (chapter 12, "Apps, bots and installations") is a program with no screen that holds a query, is told when it changed and writes values back. It runs on the same `ConnettoClient`, the same live handles and the same `with_conn` write path as a screen, one client per login, and the two pieces it needs are added to `connetto-client` rather than to a crate of their own.
+
+**The reactor reacts at the query level and receives the whole snapshot.** A `Reactor` names a query and a `react` that is called with the current rows every time the handle's `changed` fires, the same contract a screen has, because `changed` coalesces several moves into one wake and the handle holds only the current answer, so a per-row change is not something the client has to give. A reactor that wants added, removed and changed rows keeps its previous snapshot and calls `diff_by_key`, a helper rather than a trait obligation, and its first call after a restart is the whole answer under any signature. `reactor_task` returns the future for any target and `spawn_reactor` spawns it natively, mirroring `with_pump` and `start`. `insert_awaited` inserts under the state lock, pushes through `ConnettoConnection::push` and awaits that sequence's verdict, which `with_conn` cannot do because its closure is synchronous. A reactor that must run exactly once runs in one process, since two processes presenting the same session evict each other.
+
+**The app credential lives beside `NativeAuthenticator`.** It holds the app's private key, the app id, the deployment's exchange URL and issuer, the subject it logs in as, the app for a shared-view login or an installation for an isolated one, and the session id it keeps. It signs the assertion chapter 11 records, exchanges it, hands the grant to the client as an `AccessTokenSource`, re-signs before expiry, persists the session id beside the replica, keeps it across the re-login close reason a key rotation sends, and drops it only when the exchange answers that the session is not live. `ClientConfig::with_caller` takes both halves of the caller, the bot identity and `inst:<id>` for an isolated login, so the replica's own translated policy answers an isolated session exactly as the server does.
+
+**A bot's replica is `Replica::in_memory()` per login.** A restart resnapshots, an offline commit dies with the process, and a bot that must not lose a write treats its source as the durable store and re-derives. A bot may declare device-local tables like any client and then needs the file replica, encrypted under the replica key chapter 14 describes, whose Linux custody across a reboot is R71's unsolved question, so the file replica for bots arrives with R71 and not before. The credential file is the operator's and is not a replica.
+
+**The template is the deliverable.** `examples/bot-template` is copied rather than read, with the scripted tier over `FakeTransport` and an in-memory replica, the semantics tier against the harness server, property tests and a criterion bench all present and green, so a second bot written from it needs no change to `connetto-client`. Two apps built from it run in the demos, an isolated importer that inserts `orders` and `photos` rows for each installer and uploads bytes, and a shared totaliser that holds a sum over every installer's `order_lines` and writes it back into `orders`.
+
+---
+
 ## Open Questions
 
 1. ~~**Query serialization for `ConnettoProxyConnection`**: what is the format for serializing a Diesel query + bind parameters over `postMessage`? Raw SQL string + binds as MessagePack? Or a higher-level representation?~~ **Decided (Q2.1, `crates/connetto-web/src/port.rs`):** The tab-to-worker channel uses the same binary framing as the WebSocket transport: one tag byte followed by MessagePack-encoded payload (`ControlMessage` or `BulkMessage`). Query messages are `ControlMessage` frames carrying the SQL text and typed binds.

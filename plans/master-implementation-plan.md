@@ -1,6 +1,6 @@
 # Master implementation plan: identity, session, capability, and the change path
 
-This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. Both halves are built: the identity phases and whole change path (R5b, R6, R7, R9, R27, R48, R49, R50) are done, as are export and import, multi-account, retention, browser unlock, CI, the aggregate programme R81 to R86 (folded groups, re-executed rows, durable client rest, typed handles, and per-viewer RLS reads), and the file programme complete through R69, the twelve questions raised before it having been settled and the nine needing code built 2026-09-14 to 2026-09-16 as pull requests #18 to #27, each recorded in its chapter. What remains is recorded in the Status table below and nowhere else: the platform gates R51 to R53, the demo gaps R57 and R69, the quotas R87, the peer programme R74 to R80, and R11, R21, R31, R61, R70 to R73, R88 to R90. (This paragraph was frozen at the 2026-08-06 state until 2026-08-21, refreshed through 2026-09-01, and stripped of its "immediate remaining work" sentence on 2026-09-12 after it named R60 as pending ten days after R60 landed: a third hand-maintained status view, retired.)
+This programme closes a security defect in how connetto decides who a caller is, then moves the change path off Postgres RLS onto an authorization service that can answer about a row as it was rather than only as it is now. Both halves are built: the identity phases and whole change path (R5b, R6, R7, R9, R27, R48, R49, R50) are done, as are export and import, multi-account, retention, browser unlock, CI, the aggregate programme R81 to R86 (folded groups, re-executed rows, durable client rest, typed handles, and per-viewer RLS reads), and the file programme complete through R69, the twelve questions raised before it having been settled and the nine needing code built 2026-09-14 to 2026-09-16 as pull requests #18 to #27, each recorded in its chapter. What remains is recorded in the Status table below and nowhere else: the platform gates R51 to R53, the demo gap R57, the quotas R87, the peer programme R74 to R80, and R11, R21, R31, R61, R70 to R73, R88 to R91. (This paragraph was frozen at the 2026-08-06 state until 2026-08-21, refreshed through 2026-09-01, and stripped of its "immediate remaining work" sentence on 2026-09-12 after it named R60 as pending ten days after R60 landed: a third hand-maintained status view, retired.)
 
 ## How to read this
 
@@ -163,6 +163,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
 | any | R89 | A failing re-execution read ends its subscription, not live delivery. A running defect, needs nothing |
 | any | R90 | The browser's refresh token into an `HttpOnly` cookie. Needs nothing, touches no native path |
+| any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots waits on R71 and is R71's to ship |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
 
 ## Status and blockers
@@ -206,6 +207,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | NOT STARTED, minted 2026-09-13 | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the single retry |
 | R90 the browser's refresh token in an `HttpOnly` cookie | NOT STARTED, minted 2026-09-13 | nothing. One decision in the section, the 2026-08-06 parked BFF entry absorbed | no |
+| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R71's. Every decision is in `plans/apps-and-bots.md` | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -372,6 +374,7 @@ graph TD
   R77 --> R80[R80 peer sync in every demo]
   R78 --> R80
   R79 --> R80
+  R71 -.->|bot file replica| R91[R91 apps, installations and the bot template]
   R55[R55 containerised test services and CI]
   R2 -.->|registry only| R8
   R48[R48 a truncate empties the client's copy]
@@ -5096,6 +5099,45 @@ The browser suites: a cold start resumes through the cookie with no credential i
 ### Done when
 
 No durable credential exists in browser storage, the three auth endpoints serve browser and native clients through one service, and the chapters name the pattern the code implements.
+
+---
+
+## R91: apps, installations and the bot template
+
+**Status.** NOT STARTED. Designed 2026-09-18 with the maintainer over one session, after an earlier attempt drifted, then reviewed twice the same night and corrected, recorded as decisions 2, 3, 11 and 12 below. Unblocked 2026-09-20 when the two caller fixes it waited on landed. The design record is `plans/apps-and-bots.md`, which carries every settled point with its date, the state table, the superseded shapes and the reasons, and outranks this section where they differ. `docs/prompt-apps-and-bots.md` is the superseded starting prompt.
+
+**Blocked on nothing.** The content-ticket caller fix (PR #41, 2026-09-20) carries both caller halves on the ticket and in the file server's rechecks, so an isolated session whose visibility comes from `inst:<id>` uploads with nothing more. The grant-move narrowing (PR #42, 2026-09-20) announces a moved grant to the subject it names, so an isolated uninstall resyncs that installation's session and no other. Both settings are always bound since PR #41's correction of chapter 08, a half the caller does not hold taking the absent marker, and every meter charges `meter_key` since the same day, which decision 10 overrides for a bot session. The file replica for bots is gated on R71 and ships with it, not here.
+
+### Purpose
+
+connetto has no way for a program to hold a query, be told when it changed and write values back under rights a user granted it. This phase gives a deployment the backend and shared logic for that, registering apps, installing them, and running them, and leaves the screens to the deployment. Three entities. An app is code, one private key and a manifest, a row in `connetto_apps` at every deployment where it is registered. A bot is the app's user at one deployment, so lab A's grant to app X and lab B's are two bots sharing a key and nothing else. An installation is one resource owner at that deployment granting the bot a view of what they own, a row in `connetto_installations` plus the deployment's own sharing rows. A bot is a user, authorship is its identity in the audit row, ownership is the row's owner column.
+
+### Decided, 2026-09-18
+
+1. **Two views, the share row chooses.** A bot session binds the bot user as identity and, for an isolated login, the installation as capability subject, rendered `inst:<id>` so it can never spell a share key. A share row naming the bot user admits every login of the bot, the shared view, one login per deployment, the Slack bot-user shape. A share row naming `inst:<id>` admits that installation's login and no other, the isolated view, one login per installation, the GitHub installation-token shape. No view lets a bot see an owner's rows without that owner's own share row, the view decides only whether grants already received land in one session or one per installation. Rejected: identity only, which loses isolation, and capability only, which loses the shared view and authorship.
+2. **Registry as synced tables under row-level security, one route.** `connetto_apps`, `connetto_app_grants` and `connetto_installations` are policy-bearing synced tables in the publication with `REPLICA IDENTITY FULL`, carrying only what clients write. `connetto_app_bots` and `connetto_installation_sessions` are server-only, unpublished, written by the exchange on the privileged connection. No column privileges, `owner` and `installer` are immutable through `WITH CHECK`, the generation through the trigger, and grant rows repeat `owner` so their policy settles from the row. Who may publish, install and see what are those policies and nothing else. Publish and install are plain inserts, nothing is minted at insert, and the one route on `app_router` beside `auth_router`, backed by `AppRegistry`, is the login exchange. Rejected: a config switch for who may register, routes for every operation, library calls only, install as a route minting a capability key, publish minting the bot through mutation inspection, server-written columns on the synced tables under column privileges.
+3. **The bot is resolved at first login** through the deployment's `IdentityResolver` with connetto's issuer and the app id as subject, and the exchange writes `connetto_app_bots`, as it writes `connetto_installation_sessions` at an isolated login.
+4. **The manifest is the child table** `connetto_app_grants (app, owner, table_name, verb, accepted)`, tables and verbs only, verbs read and write only, columns never, the one connetto check being that the table exists. The effective filter is the accepted rows, a narrowing bites at once, a widening waits for acceptance. Rejected: a share verb, since connetto serves no mint route and could not enforce it.
+5. **Login is the exchange** at `POST /auth/app-token`, an EdDSA assertion with `iss`, `sub` (the app for shared, the installation for isolated), `aud` the deployment's issuer, `sid` to resume, `jti` refused on replay, producing a `GrantClaims::User` grant with `gen` and `inst` claims against a session the bot keeps across restarts. An exchange slides the idle window, the bot never refreshes, the ninety-day ceiling stands. A login without `sid` replaces an isolated installation's session and adds a shared one. Rejected: one session per process, one session per installation always.
+6. **Rotation is a generation bump** by trigger on the public key, held grants below it refused at handshake, live sessions evicted with a re-login reason distinct from `SessionRevoked` so the credential keeps its `sid`, sessions survive. Rejected: rotation as revocation.
+7. **Ban and departure.** A ban on the owner refuses every login of the app, a ban on an installer refuses and evicts that installer's isolated logins and leaves shared-view grants as share links are left, a ban on the bot user itself is the operator's lever to disable an app at their deployment, lifting restores any. Deletion of an installer is the deployment's cascade on the installation row.
+8. **`react` takes the whole snapshot**, `diff_by_key` is a helper.
+9. **Bots run on `Replica::in_memory()`** per login. A bot with device-local tables needs the file replica, which is R71's.
+10. **Budgets, two keys and none for the bot.** Every meter charges `meter_key` (`capability.rs`, since 2026-09-20), `user:<identity>` for a caller holding one, and any user may publish, so a bucket per bot would hand one user a bucket per app. A bot session overrides the key by its kind. An isolated session meters under `user:<installer>` as if the user had acted. A shared session meters under `app:<owner>`, a bucket separate from the owner's personal `user:<owner>` that every shared-view session of the owner's apps draws from, defaulting to one identity's allowance and raised by the deployment for a vendor it accepted. The bot identity carries no bucket. R87's quotas follow the same keys. Rejected: charging the bot alone, which multiplies, and charging the owner's personal bucket, which makes a publisher pay for their users.
+11. **The handshake reads no table.** The session manager keeps a registry cache of key generation, accepted grant rows and installations, seeded at boot and maintained by the change-log hook on the three synced tables, the same hook that revokes on uninstall and deletion and evicts on rotation. The three registry tables are exempt from the manifest filter so the bot's own installations query runs.
+12. **Audit.** `BotLogin` from the exchange on session open or resume after a gap, `Uninstalled`, `KeyRotated` and `AppDeleted` from the hook with the session it touched. Publish and install are the rows' own existence.
+
+### Steps
+
+Each test-first, in this order. The registry DDL with its five tables, policies and the generation trigger, the catalog check on grant rows at mutation inspection, and the rls2fga grading of the grant-row and installations policies. The `gen` and `inst` claims, the idle-slide and revoke-by-user store operations on both stores. `AppRegistry` and `app_router` with the exchange, bot resolution at first login, the two server-only writes and `jti` refusal. The registry cache and its change-log hook. The accepted-rows filter at subscribe and per op with the registry exemption. The two budget keys on every meter. The app credential, the two-halves caller, `Reactor`, `diff_by_key`, `insert_awaited` and `testing` in `connetto-client`. `examples/bot-template` green in all four commands. The two demo apps, the isolated importer and the shared totaliser, with the browser-stack scenario. The four-place sync, chapters 01, 11, 12 and 13.
+
+### Proof
+
+Every row of the record's state table has a test. A refused publish is refused and an admitted one syncs to a live query, a grant row naming an unknown table is refused, an owner cannot reassign their app nor a client set its generation, the first login resolves and writes the bot user, a banned owner's, a banned installer's and a banned bot's logins are refused and evicted, a lost-credential login replaces an isolated session, a replayed assertion is refused, real client sessions receive `SessionRevoked` on uninstall and deletion and the re-login reason on rotation and stay quiet otherwise, the filter's negatives hold and the registry exemption admits the bot's installations query, an isolated session's bytes land on its installer's meter and a shared session's on its owner's app budget with the bot and the owner's personal meters untouched, fifty isolated logins subscribing at startup fit their installers' allowances, a thousand self-published shared apps share one app budget, and in the browser stack the importer's session for one installer never sees the other's rows while the totaliser's sees both.
+
+### Done when
+
+The template's scripted, semantics, property and bench targets pass in CI, the two demo apps run in the browser stack through registration, install, rotation, narrowing, uninstall and deletion as the state table says, and a second bot written from the template by someone other than the author needed no change to `connetto-client`.
 
 ---
 
