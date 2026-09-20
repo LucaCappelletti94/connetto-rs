@@ -1414,6 +1414,53 @@ fn holder_in_batch(
     }
 }
 
+/// The moves a replay's reports ask for, over the tables it reaches.
+///
+/// Both halves of every report feed one map before any holder is read, because
+/// one grant travels as two facts and either of them can be the one carrying
+/// the key. A fact naming no key at all keeps its wide reading, which reaches
+/// every subscriber and never leaves a row on a device.
+fn moves_for(naming: &SubjectNaming, tables: &[String], reports: &[Reconciled]) -> Vec<GrantMove> {
+    if tables.is_empty() {
+        return Vec::new();
+    }
+    let mut named: BTreeMap<String, String> = BTreeMap::new();
+    for report in reports {
+        note_named_keys(naming, report.added.iter(), &mut named);
+        note_withdrawn_keys(naming, report.removed.iter(), &mut named);
+    }
+    let mut holders: Vec<GrantHolder> = Vec::new();
+    for report in reports {
+        let reported = report
+            .added
+            .iter()
+            .map(|record| holder_in_batch(naming, record, &named))
+            .chain(
+                report
+                    .removed
+                    .iter()
+                    .map(|fact| withdrawn_in_batch(naming, fact, &named)),
+            );
+        for holder in reported {
+            if !holders.contains(&holder) {
+                holders.push(holder);
+            }
+        }
+    }
+    // Everybody reaches those sessions anyway, so a narrower holder beside it
+    // would announce the same replacement twice.
+    if holders.contains(&GrantHolder::Everybody) {
+        holders.retain(|holder| *holder == GrantHolder::Everybody);
+    }
+    holders
+        .into_iter()
+        .map(|holder| GrantMove {
+            tables: tables.to_vec(),
+            holder,
+        })
+        .collect()
+}
+
 /// Runs one whole-shape member's SQL against the deployment's Postgres and
 /// converts the result rows to [`Record`]s via the translation outputs.
 struct ConnettoReplayer<'a> {
@@ -1627,50 +1674,8 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
 
     /// One move per distinct holder the reports name, over the tables a replay
     /// reaches.
-    ///
-    /// A fact the replay added and a fact it deleted both carry the condition
-    /// context that names the key, so each names its bearer. What is left wide
-    /// is a fact naming no key at all, which reaches every subscriber and never
-    /// leaves a row on a device.
     fn announce_to(&self, tables: &[String], reports: &[Reconciled]) -> Vec<GrantMove> {
-        if tables.is_empty() {
-            return Vec::new();
-        }
-        let mut named: BTreeMap<String, String> = BTreeMap::new();
-        for report in reports {
-            note_named_keys(&self.naming, report.added.iter(), &mut named);
-            note_withdrawn_keys(&self.naming, report.removed.iter(), &mut named);
-        }
-        let mut holders: Vec<GrantHolder> = Vec::new();
-        for report in reports {
-            let reported = report
-                .added
-                .iter()
-                .map(|record| holder_in_batch(&self.naming, record, &named))
-                .chain(
-                    report
-                        .removed
-                        .iter()
-                        .map(|fact| withdrawn_in_batch(&self.naming, fact, &named)),
-                );
-            for holder in reported {
-                if !holders.contains(&holder) {
-                    holders.push(holder);
-                }
-            }
-        }
-        // Everybody swallows every narrower holder beside it, so keeping those
-        // would announce the same replacement twice to the same session.
-        if holders.contains(&GrantHolder::Everybody) {
-            holders.retain(|holder| *holder == GrantHolder::Everybody);
-        }
-        holders
-            .into_iter()
-            .map(|holder| GrantMove {
-                tables: tables.to_vec(),
-                holder,
-            })
-            .collect()
+        moves_for(&self.naming, tables, reports)
     }
 
     /// What this difference changed about who can reach what, outside the table
@@ -1738,7 +1743,9 @@ mod tests {
     use subql::backend::Postgres;
     use subql::catalog_helpers;
 
-    use super::{BTreeMap, GrantHolder, SubjectNaming, Translated, WithdrawnFact};
+    use super::{
+        BTreeMap, GrantHolder, GrantMove, Reconciled, SubjectNaming, Translated, WithdrawnFact,
+    };
     use crate::capability::DEFAULT_USER_SETTING;
 
     /// The shape every connetto table carries: one permissive policy whose
@@ -2015,6 +2022,47 @@ mod tests {
             GrantHolder::Subject("key:shared-with-me".to_owned()),
             "the deleted link hangs off the object the deleted gate named, so \
              the pair concerns that bearer and nobody else"
+        );
+    }
+
+    /// **The announcement itself, not the helpers under it.** A reconcile that
+    /// deletes both facts of one grant announces one move, naming the bearer.
+    ///
+    /// The helper tests above pass even when the announcement reads only its
+    /// added half, because nothing calls them on that path. This is the
+    /// assertion that fails if the two halves stop feeding one map, which is
+    /// the shape the wide announcement came back as.
+    #[test]
+    fn a_reconcile_deleting_both_facts_announces_one_narrow_move() {
+        let (naming, records) = share_records("key:shared-with-me");
+        let gate_record = records
+            .first()
+            .expect("one share row grants over one paper");
+        let gate = WithdrawnFact {
+            subject: gate_record.subject.clone(),
+            relation: gate_record.relation.as_str().to_owned(),
+            object: gate_record.object.clone(),
+            context: gate_record.context.clone(),
+        };
+        let link = WithdrawnFact {
+            subject: gate.object.clone(),
+            relation: "paper_shares_share".to_owned(),
+            object: "papers:1".to_owned(),
+            context: None,
+        };
+        let report = Reconciled {
+            added: Vec::new(),
+            removed: vec![gate, link],
+        };
+        let tables = vec!["papers".to_owned()];
+        assert_eq!(
+            super::moves_for(&naming, &tables, std::slice::from_ref(&report)),
+            vec![GrantMove {
+                tables,
+                holder: GrantHolder::Subject("key:shared-with-me".to_owned()),
+            }],
+            "one grant deleted as two facts is one move for its bearer, and \
+             an Everybody beside it would reach every subscriber anyway"
         );
     }
 
