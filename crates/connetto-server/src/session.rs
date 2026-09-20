@@ -874,6 +874,29 @@ fn page_rows(budget: u64, width: u32) -> u32 {
     u32::try_from(rows).unwrap_or(u32::MAX).max(1)
 }
 
+/// Whether a moved grant concerns this caller.
+///
+/// A key-shaped grantee is compared against the keys the session holds, in the
+/// rendering [`ModelSubject`](crate::openfga::ModelSubject) asks questions
+/// with, so a share or an installation withdrawn reaches its bearer and
+/// disturbs no other subscriber.
+fn concerns<Id, Key>(principal: &Principal<Id, Key>, holder: &GrantHolder) -> bool
+where
+    Id: core::fmt::Display,
+    Key: core::fmt::Display,
+{
+    match holder {
+        GrantHolder::Everybody => true,
+        GrantHolder::Person(person) => principal
+            .identity()
+            .is_some_and(|identity| identity.user_id.to_string() == *person),
+        GrantHolder::Subject(subject) => principal
+            .capabilities()
+            .iter()
+            .any(|held| held.key().to_string() == *subject),
+    }
+}
+
 /// Count what one subscription has delivered, and say once when a standing
 /// request has grown far past what its first delivery was allowed.
 ///
@@ -2010,7 +2033,7 @@ where
                 .table
                 .as_deref()
                 .is_some_and(|table| moved.tables.iter().any(|reached| reached == table))
-                && Self::concerns(&route.principal, &moved.holder)
+                && concerns(&route.principal, &moved.holder)
         });
         if !policy_moved {
             return true;
@@ -2153,7 +2176,7 @@ where
                     let table = route.table.as_deref()?;
                     let concerned = moves.iter().any(|moved| {
                         moved.tables.iter().any(|reached| reached == table)
-                            && Self::concerns(&route.principal, &moved.holder)
+                            && concerns(&route.principal, &moved.holder)
                     });
                     if !concerned {
                         return None;
@@ -2199,16 +2222,6 @@ where
                 AuthEvent::new(session, user_id, AuthOp::PermissionChange)
                     .about_row(grant_row.clone(), grant_key.clone()),
             );
-        }
-    }
-
-    /// Whether a moved grant concerns this caller.
-    fn concerns(principal: &Principal<Id, Key>, holder: &GrantHolder) -> bool {
-        match holder {
-            GrantHolder::Everybody => true,
-            GrantHolder::Person(person) => principal
-                .identity()
-                .is_some_and(|identity| identity.user_id.to_string() == *person),
         }
     }
 
@@ -3627,12 +3640,9 @@ where
                     .first()
                     .cloned()
                     .expect("the identity is the first subject");
-                // A caller comparison admits the one session value, never the
-                // set, so it is stated only when a term actually compares it.
-                let subscriber = all
-                    .iter()
-                    .any(|term| matches!(term, TermDescription::Caller(_)))
-                    .then_some(identity_value);
+                // subql reads this for a term comparing the one identity and
+                // `subjects` for a term comparing the set, so both are stated.
+                let subscriber = Some(identity_value);
                 let mut term_values = Vec::new();
                 for term in all {
                     // A caller comparison seeds itself from the subscriber:
@@ -5013,10 +5023,13 @@ async fn flush<T: Transport>(
 
 #[cfg(test)]
 mod tests {
-    use connetto_core::auth::CapabilitySubject;
+    use connetto_core::SessionId;
+    use connetto_core::auth::{
+        AuthContext, CapabilitySubject, Principal, Subject, VerifiedSession,
+    };
     use subql::backend::{ScalarFamily, Value as PgValue};
 
-    use super::{SubscribeRefusal, caller_subjects, page_rows};
+    use super::{GrantHolder, SubscribeRefusal, caller_subjects, concerns, page_rows};
 
     /// A caller is a set, so every key it holds is seeded beside the
     /// identity. A membership row naming a key admits rows in the database,
@@ -5071,5 +5084,75 @@ mod tests {
     fn a_page_always_carries_at_least_one_row() {
         assert_eq!(page_rows(8192, 100_000), 1);
         assert_eq!(page_rows(8192, 0), 8192);
+    }
+
+    /// A caller holding keys, an identity, or both, as a handshake leaves it.
+    fn caller(user: Option<&str>, keys: &[&str]) -> Principal {
+        let handle = SessionId::from_token_hash(user.unwrap_or("anonymous"));
+        let mut principal = Principal::unidentified(handle);
+        if let Some(user) = user {
+            principal
+                .accept(Subject::Identity(VerifiedSession {
+                    context: AuthContext::new(user),
+                    session_id: handle,
+                }))
+                .expect("one identity");
+        }
+        for key in keys {
+            principal
+                .accept(Subject::Capability(CapabilitySubject::new(*key)))
+                .expect("a capability always folds in");
+        }
+        principal
+    }
+
+    /// **The narrowing's second half.** A move naming one key reaches the
+    /// session holding that key, and no other.
+    ///
+    /// The negative halves are the load-bearing ones. A caller holding a
+    /// different key, and a caller holding none, both already pass the wide
+    /// behaviour, so only their exclusion proves the narrowing.
+    #[test]
+    fn a_keyed_move_concerns_the_bearer_alone() {
+        let holder = GrantHolder::Subject("key:a".to_owned());
+        assert!(
+            concerns(&caller(None, &["key:a"]), &holder),
+            "the session holding the key lost or gained the access, so it has \
+             to replace what it holds"
+        );
+        assert!(
+            !concerns(&caller(None, &["key:b"]), &holder),
+            "another bearer's access did not change, and a replacement there \
+             re-reads a set that is unaltered"
+        );
+        assert!(
+            !concerns(&caller(Some("alice"), &[]), &holder),
+            "a caller holding no key is granted by no key"
+        );
+    }
+
+    /// A move naming a person still reaches that person alone.
+    #[test]
+    fn a_person_move_concerns_that_person_alone() {
+        let holder = GrantHolder::Person("alice".to_owned());
+        assert!(concerns(&caller(Some("alice"), &[]), &holder));
+        assert!(
+            !concerns(&caller(Some("bob"), &[]), &holder),
+            "one person's grant says nothing about another's"
+        );
+        assert!(
+            !concerns(&caller(None, &["key:a"]), &holder),
+            "a key is not a person, so an identity move leaves it alone"
+        );
+    }
+
+    /// A wildcard carrying nothing still reaches every subscriber, which is
+    /// what keeps the unnarrowable case safe.
+    #[test]
+    fn an_everybody_move_concerns_every_caller() {
+        let holder = GrantHolder::Everybody;
+        assert!(concerns(&caller(Some("alice"), &[]), &holder));
+        assert!(concerns(&caller(None, &["key:a"]), &holder));
+        assert!(concerns(&caller(None, &[]), &holder));
     }
 }

@@ -2441,7 +2441,7 @@ mod membership_term_tests {
         let subject = typed_subscriber("alice", membership.subject_kind)
             .expect("a text subject takes any string");
         let seed = TermSeed {
-            subscriber: None,
+            subscriber: Some(subject.clone()),
             subjects: vec![subject.clone()],
             term_values: vec![(
                 vec![membership.pairs[0].column.clone()],

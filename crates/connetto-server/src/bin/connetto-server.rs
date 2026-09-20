@@ -99,9 +99,7 @@ use connetto_file_server::{
 };
 use connetto_server::audit::pg_audit_hook;
 use connetto_server::capability::DEFAULT_USER_SETTING;
-use connetto_server::openfga::{
-    Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,
-};
+use connetto_server::openfga::{Counted, FgaAuth, ModelState, ModelSubject, Translated};
 use connetto_server::reach::GrantReach;
 use connetto_server::{
     AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
@@ -1286,8 +1284,8 @@ async fn build_authorization(
         }
     }
 
+    let naming = translated.naming();
     let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),

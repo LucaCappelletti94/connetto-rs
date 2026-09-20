@@ -21,9 +21,7 @@ use std::time::{Duration, Instant};
 use connetto_core::messages::BulkMessage;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::counters::{self, CountersSnapshot};
-use connetto_server::openfga::{
-    Counted, FgaAuth, ModelSubject, StoreUpkeep, SubjectNaming, Translated,
-};
+use connetto_server::openfga::{Counted, FgaAuth, ModelSubject, StoreUpkeep, Translated};
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
@@ -73,6 +71,12 @@ const READER: &str = "r0_reader";
 const OWNER: &str = "fanout-owner";
 /// The team every row belongs to under [`PolicyShape::CrossTable`].
 const TEAM: i32 = 1;
+/// The key [`PolicyShape::KeyedShare`] grants paper 1 to, held by a caller with
+/// no identity at all, which is what a share link produces.
+pub const SHARE_KEY_A: &str = "key:r7-share-a";
+/// The key [`PolicyShape::KeyedShare`] grants paper 2 to, whose own access no
+/// test touches.
+pub const SHARE_KEY_B: &str = "key:r7-share-b";
 
 /// Which policy the fixture serves, and so which half of the criterion the run
 /// measures.
@@ -95,6 +99,11 @@ pub enum PolicyShape {
     /// interest through `team_members` while permission ignores it, so the two
     /// can disagree and R27's intersection is observable in both directions.
     OwnerOverTeams,
+    /// A share written as a row of a join table, granted to a key the caller
+    /// holds rather than to a person. Withdrawing one produces no event on the
+    /// subscribed table, and the grant names one bearer, so this is the shape a
+    /// narrowed announcement is observable on.
+    KeyedShare,
 }
 
 impl PolicyShape {
@@ -147,6 +156,25 @@ impl PolicyShape {
                    owner = current_setting('app.user_id', true))"
                     .into(),
             ],
+            Self::KeyedShare => vec![
+                "CREATE TABLE papers (id INT PRIMARY KEY, owner TEXT NOT NULL)".into(),
+                // Row-level security stays off the share table. The guarded
+                // form is refused by the translator for a different reason,
+                // and the unguarded one is the shape deployments write.
+                "CREATE TABLE paper_shares (paper_id INT NOT NULL, viewer TEXT NOT NULL, \
+                   PRIMARY KEY (paper_id, viewer))"
+                    .into(),
+                "ALTER TABLE papers ENABLE ROW LEVEL SECURITY".into(),
+                KEYED_SHARE_POLICY.into(),
+                // The papers and the shares that grant two of them, written
+                // before the slot exists so no test reads its own seed off the
+                // change stream and mistakes it for the grant under test.
+                format!("INSERT INTO papers (id, owner) VALUES (1, '{OWNER}')"),
+                format!("INSERT INTO papers (id, owner) VALUES (2, '{OWNER}')"),
+                format!("INSERT INTO papers (id, owner) VALUES (3, '{OWNER}')"),
+                format!("INSERT INTO paper_shares (paper_id, viewer) VALUES (1, '{SHARE_KEY_A}')"),
+                format!("INSERT INTO paper_shares (paper_id, viewer) VALUES (2, '{SHARE_KEY_B}')"),
+            ],
         }
     }
 
@@ -155,6 +183,7 @@ impl PolicyShape {
         match self {
             Self::Row => FANOUT_PG_DDL,
             Self::CrossTable | Self::OwnerOverTeams => CROSS_TABLE_PG_DDL,
+            Self::KeyedShare => KEYED_SHARE_PG_DDL,
         }
     }
 
@@ -164,6 +193,7 @@ impl PolicyShape {
             Self::Row => FANOUT_PG_POLICIES,
             Self::CrossTable => CROSS_TABLE_PG_POLICIES,
             Self::OwnerOverTeams => OWNER_OVER_TEAMS_PG_POLICIES,
+            Self::KeyedShare => KEYED_SHARE_PG_POLICIES,
         }
     }
 
@@ -178,6 +208,9 @@ impl PolicyShape {
                 "INSERT INTO items (id, owner, team_id, label) \
                  VALUES ({n}, '{OWNER}', {TEAM}, 'row-{n}{filler}')"
             ),
+            Self::KeyedShare => {
+                format!("INSERT INTO papers (id, owner) VALUES ({n}, '{OWNER}{filler}')")
+            }
         }
     }
 
@@ -186,6 +219,24 @@ impl PolicyShape {
         match self {
             Self::Row => &["items"],
             Self::CrossTable | Self::OwnerOverTeams => &["items", "team_members"],
+            Self::KeyedShare => &["papers", "paper_shares"],
+        }
+    }
+
+    /// The tables this shape creates, in an order that drops cleanly.
+    fn drop_order(self) -> &'static [&'static str] {
+        match self {
+            Self::Row => &["items"],
+            Self::CrossTable | Self::OwnerOverTeams => &["items", "team_members", "teams"],
+            Self::KeyedShare => &["paper_shares", "papers"],
+        }
+    }
+
+    /// The table a subscriber reads and a mutation writes.
+    fn data_table(self) -> &'static str {
+        match self {
+            Self::Row | Self::CrossTable | Self::OwnerOverTeams => "items",
+            Self::KeyedShare => "papers",
         }
     }
 }
@@ -239,6 +290,26 @@ CREATE POLICY items_p ON items FOR SELECT USING (
 /// half of R27's proof.
 pub const OWNER_OVER_TEAMS_PG_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;
 CREATE POLICY items_p ON items FOR SELECT USING (owner = current_setting('app.user_id', true));";
+
+/// The catalog the keyed-share shape serves: the rows a subscriber reads, and
+/// the join table whose rows grant them.
+pub const KEYED_SHARE_PG_DDL: &str = "CREATE TABLE papers (id INT PRIMARY KEY, owner TEXT NOT NULL);
+CREATE TABLE paper_shares (paper_id INT NOT NULL, viewer TEXT NOT NULL, PRIMARY KEY (paper_id, viewer));";
+
+/// The share policy on its own, for the statement list that creates the shape.
+pub const KEYED_SHARE_POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (owner = current_setting('app.user_id', true) \
+     OR EXISTS (SELECT 1 FROM paper_shares s WHERE s.paper_id = papers.id \
+     AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ','))))";
+
+/// The keyed-share policy document the translator reads: a paper is visible to
+/// its owner, or to a caller holding a key the share table names.
+pub const KEYED_SHARE_PG_POLICIES: &str = "ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+CREATE POLICY papers_p ON papers FOR SELECT USING (
+  owner = current_setting('app.user_id', true)
+  OR EXISTS (SELECT 1 FROM paper_shares s
+             WHERE s.paper_id = papers.id
+               AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')))
+);";
 /// How long one live patch may take to arrive before the run is declared hung.
 const LIVE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long to let routes settle after the last snapshot. The route is
@@ -546,6 +617,16 @@ pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
     (server, reachable)
 }
 
+/// A server whose policy grants through a key rather than through a person.
+///
+/// A paper is visible to its owner, and to a caller holding a key the share
+/// table names. A grant is a `paper_shares` row, so giving or taking one away
+/// produces no event on `papers` at all, and the fact that moved names one
+/// bearer rather than everybody.
+pub async fn keyed_share_fixture(fixture: &Fixture) -> Server {
+    provision_with(fixture, PolicyShape::KeyedShare, Executor::Shipped, None).await
+}
+
 /// The row-shaped fixture served through the shipped executor, for a test that
 /// drives what visibility delivers rather than measuring what it costs.
 ///
@@ -626,11 +707,11 @@ async fn provision_with(
     executor: Executor,
     caller: Option<SessionVariableMapping>,
 ) -> Server {
-    let mut statements: Vec<String> = vec![
-        "DROP TABLE IF EXISTS items CASCADE".into(),
-        "DROP TABLE IF EXISTS team_members CASCADE".into(),
-        "DROP TABLE IF EXISTS teams CASCADE".into(),
-    ];
+    let mut statements: Vec<String> = shape
+        .drop_order()
+        .iter()
+        .map(|table| format!("DROP TABLE IF EXISTS {table} CASCADE"))
+        .collect();
     statements.extend(shape.setup());
     statements.push(
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'r0_reader') \
@@ -659,7 +740,11 @@ async fn provision_with(
     };
     let server = spawn_server(
         ServerConfig::new(shape.ddl(), fixture.admin_url())
-            .with_writable(RuntimeWritableCatalog::builder().writable("items").build())
+            .with_writable(
+                RuntimeWritableCatalog::builder()
+                    .writable(shape.data_table())
+                    .build(),
+            )
             .with_translation(translator, caller)
             .with_replication(shape.published().iter().copied()),
         snapshot,
@@ -711,8 +796,8 @@ async fn fga_auth(
         .await
         .expect("the generated queries ran and the facts loaded");
 
+    let naming = translated.naming();
     let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     // The questions go through the counted transport and the setup above does
     // not, so the counter reads change-path round trips alone.

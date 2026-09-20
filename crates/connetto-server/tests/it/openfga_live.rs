@@ -28,11 +28,11 @@ use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::counters;
 use connetto_server::openfga::{
-    Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated, UpkeepError,
+    Counted, FgaAuth, ModelState, ModelSubject, Translated, UpkeepError,
 };
 use connetto_server::row_view::ValuesRow;
 use connetto_test_harness::Fixture;
-use diesel::prelude::ExpressionMethods;
+use diesel::prelude::{ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use openfga_client::client::OpenFgaServiceClient;
@@ -118,7 +118,7 @@ async fn the_row_settles_the_verdict_and_it_costs_no_round_trip() {
     );
 
     let shapes = translated.shapes_arc();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    let naming = translated.naming();
     let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
         setup,
@@ -229,8 +229,8 @@ async fn a_table_with_row_level_security_and_no_policy_grants_nobody() {
         .await
         .expect("the rules are written");
 
+    let naming = translated.naming();
     let shapes = translated.shapes();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
         OpenFgaServiceClient::new(Counted::new(channel)),
@@ -309,8 +309,8 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
         .await
         .expect("the facts load");
 
+    let naming = translated.naming();
     let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -436,8 +436,8 @@ async fn cross_executor(
         .await
         .expect("the facts load");
 
+    let naming = translated.naming();
     let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -616,7 +616,7 @@ async fn a_uuid_primary_key_is_named_so_an_owned_write_is_authorized() {
         .await
         .expect("the rules are written");
     let shapes = translated.shapes_arc();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
+    let naming = translated.naming();
     let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
         Arc::clone(&shapes),
         setup,
@@ -747,8 +747,8 @@ async fn replay_executor(
         .await
         .expect("the facts load");
 
+    let naming = translated.naming();
     let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -1165,8 +1165,8 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
         .await
         .expect("the facts load");
 
+    let naming = translated.naming();
     let (shapes, translator, reach) = translated.into_parts();
-    let naming = Arc::new(SubjectNaming::resolve::<String>(&shapes));
 
     let delegate = OpenFgaPolicy::new(
         Arc::clone(&shapes),
@@ -1245,4 +1245,237 @@ async fn a_composite_key_share_is_withdrawn_through_the_re_run() {
             .expect("the composition answered");
         assert_eq!(verdicts, [want], "{why}");
     }
+}
+
+diesel::table! {
+    /// The keyed replay fixture's share table, so the rows a test writes are
+    /// typed rather than spelled twice.
+    r86k_shares (paper_id, viewer) {
+        /// The paper the share is over.
+        paper_id -> Integer,
+        /// The key the share grants to.
+        viewer -> Text,
+        /// What the residual compares against the average.
+        weight -> Integer,
+    }
+}
+
+const KEYED_REPLAY_SCHEMA_STATEMENTS: [&str; 3] = [
+    "CREATE TABLE r86k_papers (id INT PRIMARY KEY, owner TEXT NOT NULL)",
+    "CREATE TABLE r86k_shares (paper_id INT NOT NULL, viewer TEXT NOT NULL, \
+       weight INT NOT NULL, PRIMARY KEY (paper_id, viewer))",
+    "ALTER TABLE r86k_papers ENABLE ROW LEVEL SECURITY",
+];
+
+/// The replay shape granted to a key the caller holds rather than to a person.
+///
+/// The residual on the average is what makes the facts travel as a query to
+/// re-run instead of settling from the changed row, which is the path this
+/// fixture exists to reach.
+const KEYED_REPLAY_POLICY: &str = "CREATE POLICY r86k_papers_p ON r86k_papers FOR ALL USING (\
+    EXISTS (SELECT 1 FROM r86k_shares s WHERE s.paper_id = r86k_papers.id \
+      AND s.viewer = ANY(string_to_array(current_setting('app.subjects', true), ',')) \
+      AND s.weight > (SELECT avg(weight) FROM r86k_shares)))";
+
+/// The key whose share is withdrawn on the replay path.
+const REPLAY_KEY_A: &str = "key:r86k-a";
+/// The key that gains a share on the replay path.
+const REPLAY_KEY_B: &str = "key:r86k-b";
+
+/// Provision the keyed replay fixture, dropping whatever a previous run left.
+async fn provision_keyed_replay(pool: &Pool<AsyncPgConnection>) {
+    let mut conn = pool.get().await.expect("a connection");
+    let mut statements = vec!["DROP TABLE IF EXISTS r86k_papers, r86k_shares CASCADE"];
+    statements.extend(KEYED_REPLAY_SCHEMA_STATEMENTS);
+    statements.push(KEYED_REPLAY_POLICY);
+    statements.push("INSERT INTO r86k_papers (id, owner) VALUES (1, 'zoe')");
+    for statement in statements {
+        diesel::sql_query(statement)
+            .execute(&mut conn)
+            .await
+            .unwrap_or_else(|err| panic!("{statement}: {err}"));
+    }
+    // Two shares above the average, one per key, so each key's own withdrawal
+    // leaves the other's grant standing.
+    diesel::insert_into(r86k_shares::table)
+        .values(&[
+            (
+                r86k_shares::paper_id.eq(1),
+                r86k_shares::viewer.eq(REPLAY_KEY_A),
+                r86k_shares::weight.eq(10),
+            ),
+            (
+                r86k_shares::paper_id.eq(1),
+                r86k_shares::viewer.eq("key:r86k-filler"),
+                r86k_shares::weight.eq(1),
+            ),
+        ])
+        .execute(&mut conn)
+        .await
+        .expect("the shares load");
+}
+
+/// Build the upkeep over the keyed replay fixture.
+///
+/// Only the upkeep comes back. What these tests read is the moves it reports,
+/// and the executor's own answers over this shape are already covered by the
+/// identity-keyed replay tests above.
+async fn keyed_replay_executor(
+    fixture: &Fixture,
+    pool: &Pool<AsyncPgConnection>,
+) -> Arc<dyn connetto_server::openfga::StoreUpkeep> {
+    let (channel, store) = fixture.fga_store().await;
+    let schema = KEYED_REPLAY_SCHEMA_STATEMENTS.join(";\n") + ";";
+    let translated = Translated::of::<String>(&schema, KEYED_REPLAY_POLICY, "app.user_id")
+        .expect("a keyed share whose replay declares its slice boots since R86");
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("the rules are written");
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
+        setup,
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    translated
+        .load_into(pool, &loader)
+        .await
+        .expect("the facts load");
+
+    let naming = translated.naming();
+    let (shapes, translator, reach) = translated.into_parts();
+    let delegate = OpenFgaPolicy::new(
+        Arc::clone(&shapes),
+        OpenFgaServiceClient::new(Counted::new(channel)),
+        store,
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    let auth: FgaAuth<String, String, _> = FgaAuth::new(Arc::clone(&shapes), delegate, naming);
+    auth.upkeep(reach, translator, pool.clone())
+}
+
+/// **The replay path's half of the narrowing.** A keyed grant whose facts
+/// travel as a query to re-run names the bearer it reached.
+///
+/// The replay reports what it added as records, and a record carries the
+/// condition context that names the key. The second assertion is the one that
+/// earns its place. A narrow move announced beside a wide one buys nothing,
+/// because the wide one reaches every subscriber anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_keyed_grant_names_the_bearer_it_reached() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    provision_keyed_replay(&pool).await;
+    let upkeep = keyed_replay_executor(&fixture, &pool).await;
+
+    // The grant. The database is changed first, because the replay asks it what
+    // is true now rather than what the event says.
+    {
+        let mut conn = pool.get().await.expect("a connection");
+        diesel::insert_into(r86k_shares::table)
+            .values((
+                r86k_shares::paper_id.eq(1),
+                r86k_shares::viewer.eq(REPLAY_KEY_B),
+                r86k_shares::weight.eq(10),
+            ))
+            .execute(&mut conn)
+            .await
+            .expect("the share row lands");
+    }
+    let granted = upkeep
+        .keep_current(&ChangeEvent::insert(
+            "public",
+            "r86k_shares",
+            0,
+            row_data(&[
+                ("paper_id", "1"),
+                ("viewer", REPLAY_KEY_B),
+                ("weight", "10"),
+            ]),
+            Lsn::new(2),
+        ))
+        .await
+        .expect("the grant reached the store");
+    assert!(
+        granted.iter().any(|moved| moved.holder
+            == connetto_server::openfga::GrantHolder::Subject(REPLAY_KEY_B.to_owned())),
+        "the replay's added fact carries the key it grants to: {granted:?}"
+    );
+    assert!(
+        !granted
+            .iter()
+            .any(|moved| moved.holder == connetto_server::openfga::GrantHolder::Everybody),
+        "and nothing wider is announced beside it, or the narrowing buys \
+         nothing: {granted:?}"
+    );
+}
+
+/// **The withdrawal half of the replay path, narrowed since the upstream
+/// landed.** A keyed grant taken away names the bearer that lost it, and
+/// nothing wider is announced beside it.
+///
+/// `subql`'s `Reconciled::removed` carries the condition context the deleted
+/// tuple was stored with, so the wildcard subject no longer hides the bearer.
+/// Before that, a withdrawal here cost one full snapshot per unconcerned
+/// subscriber, and `upstream/subql-withdrawn-fact-drops-the-context.md` records
+/// the finding and its adoption.
+///
+/// The second assertion is the one that earns its place. A narrow move
+/// announced beside a wide one buys nothing, because the wide one reaches every
+/// subscriber anyway.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replayed_keyed_withdrawal_names_the_bearer_that_lost_it() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    provision_keyed_replay(&pool).await;
+    let upkeep = keyed_replay_executor(&fixture, &pool).await;
+
+    // The database is changed first, because the replay asks it what is true
+    // now rather than what the event says.
+    {
+        let mut conn = pool.get().await.expect("a connection");
+        diesel::delete(
+            r86k_shares::table
+                .filter(r86k_shares::paper_id.eq(1))
+                .filter(r86k_shares::viewer.eq(REPLAY_KEY_A)),
+        )
+        .execute(&mut conn)
+        .await
+        .expect("the share row goes");
+    }
+    let withdrawn = upkeep
+        .keep_current(&ChangeEvent::delete(
+            "public",
+            "r86k_shares",
+            0,
+            row_data(&[
+                ("paper_id", "1"),
+                ("viewer", REPLAY_KEY_A),
+                ("weight", "10"),
+            ]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("paper_id"), Arc::from("viewer")],
+            Lsn::new(3),
+        ))
+        .await
+        .expect("the withdrawal reached the store");
+    assert!(
+        withdrawn.iter().any(|moved| moved.holder
+            == connetto_server::openfga::GrantHolder::Subject(REPLAY_KEY_A.to_owned())
+            && moved.tables.iter().any(|table| table == "r86k_papers")),
+        "the bearer that lost the share is the one to tell, over the table \
+         whose rows it can no longer read: {withdrawn:?}"
+    );
+    assert!(
+        !withdrawn
+            .iter()
+            .any(|moved| moved.holder == connetto_server::openfga::GrantHolder::Everybody),
+        "and the other bearers must not be told, which is what makes a \
+         withdrawal cost one snapshot rather than every subscriber's: \
+         {withdrawn:?}"
+    );
 }

@@ -20,6 +20,7 @@
 //! implementations to satisfy a coherence rule rather than a requirement.
 
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -42,10 +43,10 @@ use openfga_client::tonic::codegen::{Body as ResponseBody, Bytes, StdError, http
 use rls2fga::classifier::function_registry::{SessionAttribute, SessionAttributeKind};
 use rls2fga::generator::tuple_generator::{TupleCondition, TupleRow};
 use rls2fga::translator::Translator;
-use rls2fga::types::{Record, ReplayScope};
+use rls2fga::types::{Record, RecordContextValue, RelationShapes, ReplayScope, RowDecision};
 use subql::ParserDB;
 use subql::backend::{Postgres, Value};
-use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy};
+use subql::visibility::openfga::{OpenFgaError, OpenFgaPolicy, Reconciled, WithdrawnFact};
 use subql::visibility::policy::{RequestValues, RowPolicy, Subject};
 use subql::visibility::shapes::Shapes;
 use subql::visibility::store::{
@@ -125,6 +126,14 @@ pub struct SubjectNaming {
     /// [`None`] when the model carries no grant a caller's own values complete,
     /// in which case there is nothing for a watcher to answer.
     subjects_parameter: Option<String>,
+    /// For each relation the translation reported as gated on the caller's own
+    /// keys, the context key its records carry the granted key under.
+    ///
+    /// Keyed by relation rather than read out of whichever context key happens
+    /// to be present, because a condition unrelated to the keys may carry a
+    /// parameter spelled like a grantee column. Reading that as a grantee would
+    /// announce a move to one bearer and leave the row on every other device.
+    gated_keys: BTreeMap<String, String>,
 }
 
 impl SubjectNaming {
@@ -140,16 +149,30 @@ impl SubjectNaming {
     ///
     /// The parameter is matched by the setting it mirrors, `Key::SETTING`,
     /// which is the contract the deployment already declared to the translator.
-    #[must_use]
-    pub fn resolve<Key: CapabilityKey>(shapes: &Shapes<ParserDB>) -> Self {
+    /// The per-relation context keys come from the translation's own report of
+    /// which relations a caller's request value completes, so neither half is
+    /// spelled here.
+    fn resolve<Key: CapabilityKey>(
+        shapes: &Shapes<ParserDB>,
+        relations: &[RelationShapes],
+    ) -> Self {
         let subjects_parameter = shapes
             .required_parameters()
             .iter()
             .find(|required| required.setting_key.as_deref() == Some(Key::SETTING))
             .map(|required| required.parameter.clone());
+        let mut gated_keys = BTreeMap::new();
+        if let Some(parameter) = subjects_parameter.as_deref() {
+            for entry in relations {
+                if let Some(decision) = entry.decision.as_ref() {
+                    collect_gated_keys(decision, parameter, &mut gated_keys);
+                }
+            }
+        }
         Self {
             user_type: Self::USER_TYPE.to_owned(),
             subjects_parameter,
+            gated_keys,
         }
     }
 
@@ -159,19 +182,93 @@ impl SubjectNaming {
         self.subjects_parameter.is_some()
     }
 
-    /// Read one subject back as who it names.
+    /// Read one fact back as who it concerned.
     ///
-    /// The inverse of [`ModelSubject::subjects`], which is the one rendering
-    /// every question uses, so this compares against exactly what a live
-    /// caller is named by.
+    /// The inverse of [`ModelSubject::subjects`] and
+    /// [`ModelSubject::request_value`], which are the two renderings every
+    /// question uses, so this compares against exactly what a live caller is
+    /// named by.
+    ///
+    /// A held-key grant never arrives as its own subject. `rls2fga` renders it
+    /// as the wildcard under a condition, and the key the row grants to sits in
+    /// the record's condition context, so reading the context is the only way
+    /// to name the one bearer the fact concerns.
     #[must_use]
-    pub fn holder(&self, subject: &str) -> GrantHolder {
+    pub fn holder(&self, record: &Record) -> GrantHolder {
+        self.named(
+            &record.subject,
+            record.relation.as_str(),
+            record.context.as_ref(),
+        )
+    }
+
+    /// Read one withdrawn fact back as who it concerned.
+    ///
+    /// A withdrawn fact carries the condition context the deleted tuple was
+    /// stored with, so a grant taken away names its bearer exactly as a grant
+    /// given does. It spells its relation as the server does rather than as a
+    /// [`RelationName`](rls2fga::types::RelationName), which is the same text.
+    #[must_use]
+    pub fn withdrawn_holder(&self, fact: &WithdrawnFact) -> GrantHolder {
+        self.named(&fact.subject, &fact.relation, fact.context.as_ref())
+    }
+
+    /// Read a subject back as who it names, with nothing to narrow it.
+    #[must_use]
+    pub fn subject_holder(&self, subject: &str) -> GrantHolder {
         match subject.split_once(':') {
             Some((kind, key)) if kind == self.user_type && key != Self::WILDCARD_KEY => {
                 GrantHolder::Person(key.to_owned())
             }
             _ => GrantHolder::Everybody,
         }
+    }
+
+    /// Who one fact concerned, from the three things that say so.
+    ///
+    /// A tuple naming a person says who it concerned outright, whatever else
+    /// its condition narrows. Otherwise the key is read under the context key
+    /// the translation reported for that relation, so the fact and the question
+    /// cannot disagree about which value is the grantee.
+    fn named(
+        &self,
+        subject: &str,
+        relation: &str,
+        context: Option<&RecordContextValue>,
+    ) -> GrantHolder {
+        match self.subject_holder(subject) {
+            GrantHolder::Person(person) => GrantHolder::Person(person),
+            wider => self
+                .gated_keys
+                .get(relation)
+                .and_then(|key| context?.values.get(key).cloned())
+                .map_or(wider, GrantHolder::Subject),
+        }
+    }
+}
+
+/// Every relation `decision` grants through a comparison the caller's own
+/// `parameter` completes, with the context key its records carry the row's side
+/// under.
+///
+/// Walked rather than read off the top, because a policy with several arms
+/// composes its decision and the gated arm sits under the composition.
+fn collect_gated_keys(decision: &RowDecision, parameter: &str, out: &mut BTreeMap<String, String>) {
+    match decision {
+        RowDecision::RequestGated {
+            relation,
+            context_key,
+            request_parameter,
+            ..
+        } if request_parameter == parameter => {
+            out.insert(relation.as_str().to_owned(), context_key.clone());
+        }
+        RowDecision::Any(children) | RowDecision::All(children) => {
+            for child in children {
+                collect_gated_keys(child, parameter, out);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -436,6 +533,9 @@ pub struct Translated {
     /// The index every reader shares, built once at startup so the boot guard
     /// and the change path cannot hold two opinions about the same policies.
     shapes: Arc<Shapes<ParserDB>>,
+    /// What the model calls a caller, resolved from this same translation so
+    /// the questions and the moved facts are read through one naming.
+    subjects: Arc<SubjectNaming>,
     translator: Translator,
     model: rls2fga::generator::json_model::AuthorizationModel,
     tuples: Vec<rls2fga::generator::tuple_generator::TupleQuery>,
@@ -561,8 +661,11 @@ impl Translated {
             return Err(SetupError::Unwithdrawable(uncovered.join("; ")));
         }
 
+        let subjects = Arc::new(SubjectNaming::resolve::<Key>(&shapes, &relations));
+
         Ok(Self {
             shapes,
+            subjects,
             translator,
             model,
             tuples,
@@ -591,6 +694,16 @@ impl Translated {
     #[must_use]
     pub fn tuple_queries(&self) -> &[rls2fga::generator::tuple_generator::TupleQuery] {
         &self.tuples
+    }
+
+    /// A cloned handle to what the model calls a caller.
+    ///
+    /// Read from here rather than resolved again, because naming the caller
+    /// takes both halves of this translation and one built from the index
+    /// alone cannot tell which relations a caller's own keys complete.
+    #[must_use]
+    pub fn naming(&self) -> Arc<SubjectNaming> {
+        Arc::clone(&self.subjects)
     }
 
     /// The index every reader of this translation shares.
@@ -1097,11 +1210,18 @@ pub enum GrantHolder {
     /// prefix taken off so the session layer compares it against the identity
     /// it already holds.
     Person(String),
-    /// Everybody subscribed to the reached tables. A wildcard subject, whether
-    /// or not a condition narrows it, and any subject connetto cannot resolve to
-    /// a person: wider than necessary never leaves a row on a device, and
-    /// narrower silently does.
+    /// Everybody subscribed to the reached tables.
+    ///
+    /// What is left once the narrower readings are taken. A wildcard subject
+    /// whose context names no key, and a subject naming another object whose
+    /// own grants no fact in the same batch named. Wider than necessary never
+    /// leaves a row on a device, and narrower silently does, so this is the
+    /// reading every unresolved fact falls back to.
     Everybody,
+    /// One subject that is not a person, spelled as the policy spells it and as
+    /// a caller's own held key renders, which is a share key or an app
+    /// installation.
+    Subject(String),
 }
 
 /// Bring the authorization store level with one changed row, before that row
@@ -1182,10 +1302,86 @@ where
             // Read after the store is level, never before: a replacement
             // snapshot produced against the old facts would hand back exactly
             // the rows the change took away.
-            let mut moves = self.moved(event, &diff);
-            moves.extend(replayed);
+            let mut moves = self.moved(event, &diff, &replayed.granted);
+            moves.extend(replayed.moves);
             Ok(moves)
         })
+    }
+}
+
+/// What one event's replay pass moved, and the keys its facts named.
+///
+/// The keys travel beside the moves because a replayed fact and a row-settled
+/// one can describe the same grant. A join table row produces a link fact the
+/// changed row settles, whose subject is the share object and which names no
+/// caller, while the gate fact that does name the key is decided by the replay.
+/// Carrying the pair lets the link be read as the grant it belongs to instead
+/// of as a move for everybody.
+#[derive(Debug, Default)]
+struct Replayed {
+    /// What to announce, already narrowed to the holders the reports named.
+    moves: Vec<GrantMove>,
+    /// For each object a replayed fact granted through, the key it granted to.
+    granted: BTreeMap<String, String>,
+}
+
+impl Replayed {
+    /// Record the key each report's facts name, in both directions.
+    ///
+    /// A withdrawn fact carries the condition context the deleted tuple was
+    /// stored with, so a grant taken away names its bearer as precisely as a
+    /// grant given. Both halves are recorded because the link fact that needs
+    /// the name travels in the difference while the gate fact that carries it
+    /// travels here.
+    fn note_keys(&mut self, naming: &SubjectNaming, reports: &[Reconciled]) {
+        for report in reports {
+            note_named_keys(naming, report.added.iter(), &mut self.granted);
+            for fact in &report.removed {
+                if let GrantHolder::Subject(key) = naming.withdrawn_holder(fact) {
+                    self.granted.insert(fact.object.clone(), key);
+                }
+            }
+        }
+    }
+}
+
+/// The key each fact in one batch grants to, keyed by the object the fact hangs
+/// on.
+///
+/// Accumulated across a whole batch rather than per fact, because the fact that
+/// names the key and the fact that needs it are two different facts about one
+/// grant and arrive together.
+fn note_named_keys<'a>(
+    naming: &SubjectNaming,
+    records: impl Iterator<Item = &'a Record>,
+    out: &mut BTreeMap<String, String>,
+) {
+    for record in records {
+        if let GrantHolder::Subject(key) = naming.holder(record) {
+            out.insert(record.object.clone(), key);
+        }
+    }
+}
+
+/// Who one fact concerned, read against the keys its own batch named.
+///
+/// A fact whose subject names a model object rather than a caller concerns
+/// whoever that object's own grants name. When a gate fact in the same batch
+/// named it, that is the key. When none did, the object's grants are not in
+/// hand and the fact keeps its wide reading, which never leaves a row on a
+/// device.
+fn holder_in_batch(
+    naming: &SubjectNaming,
+    record: &Record,
+    named: &BTreeMap<String, String>,
+) -> GrantHolder {
+    match naming.holder(record) {
+        GrantHolder::Everybody => named
+            .get(record.subject.as_str())
+            .map_or(GrantHolder::Everybody, |key| {
+                GrantHolder::Subject(key.clone())
+            }),
+        named_holder => named_holder,
     }
 }
 
@@ -1247,21 +1443,17 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     /// the replay no longer states, which is what makes a two-table share
     /// withdrawable and therefore bootable at all (`R86`).
     ///
-    /// **The move is announced wide, because the reconcile does not say who.**
-    /// It reports no delta, and the alternative is reading the slice a second
-    /// time to difference it here. `GrantHolder::Everybody` is what this file
-    /// already uses for a fact whose holder it cannot resolve, on the recorded
-    /// grounds that wider than necessary never leaves a row on a device while
-    /// narrower silently does. What that costs is `R86` D2's measurement.
+    /// **What it reports is what is announced.** Both halves name their bearer.
+    /// An added fact is a record carrying the condition context that names the
+    /// key it grants to, and a withdrawn fact carries the context the deleted
+    /// tuple was stored with, so a grant given and a grant taken away each
+    /// reach one session. `R86` D2 measures what a replayed change costs.
     ///
     /// # Errors
     ///
     /// [`UpkeepError::Replay`] when the query cannot be run or its rows cannot
     /// be read, and [`UpkeepError::Write`] when the reconcile is refused.
-    async fn reconcile(
-        &self,
-        requeries: Requeries<'_, Postgres>,
-    ) -> Result<Vec<GrantMove>, UpkeepError>
+    async fn reconcile(&self, requeries: Requeries<'_, Postgres>) -> Result<Replayed, UpkeepError>
     where
         Id: Display + Send + Sync,
         Key: CapabilityKey,
@@ -1274,7 +1466,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         use diesel_async::RunQueryDsl as _;
 
         if requeries.is_empty() {
-            return Ok(Vec::new());
+            return Ok(Replayed::default());
         }
         let outputs = self
             .translator
@@ -1290,7 +1482,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             pool: &self.pool,
             outputs: &outputs,
         };
-        let mut moves = Vec::new();
+        let mut outcome = Replayed::default();
         for requery in requeries.as_slice() {
             match requery {
                 subql::visibility::store::Requery::Keyed(k) => {
@@ -1323,8 +1515,9 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                         removed = report.removed.len(),
                         "reconcile report"
                     );
+                    outcome.note_keys(&self.naming, std::slice::from_ref(&report));
                     if !report.added.is_empty() || !report.removed.is_empty() {
-                        moves.extend(self.reached_by_keyed(k));
+                        outcome.moves.extend(self.reached_by_keyed(k, &report));
                     }
                 }
                 subql::visibility::store::Requery::Whole(m) => {
@@ -1339,20 +1532,26 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                             subql::visibility::openfga::MaterialiseError::Replay(inner) => inner,
                             other => UpkeepError::Write(other.to_string()),
                         })?;
+                    outcome.note_keys(&self.naming, &reports);
                     if reports
                         .iter()
                         .any(|r| !r.added.is_empty() || !r.removed.is_empty())
                     {
-                        moves.extend(self.reached_by_whole(m));
+                        outcome.moves.extend(self.reached_by_whole(m, &reports));
                     }
                 }
             }
         }
-        Ok(moves)
+        Ok(outcome)
     }
 
-    /// The tables a keyed replay's scope can have moved, named for the replacement notice.
-    fn reached_by_keyed(&self, k: &KeyedRequery<'_, Postgres>) -> Vec<GrantMove> {
+    /// The tables a keyed replay's scope can have moved, announced to the
+    /// holders the reconcile named.
+    fn reached_by_keyed(
+        &self,
+        k: &KeyedRequery<'_, Postgres>,
+        report: &Reconciled,
+    ) -> Vec<GrantMove> {
         let mut tables: Vec<String> = match k.query.scope() {
             ReplayScope::Object {
                 object_type,
@@ -1376,17 +1575,12 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
         };
         tables.sort_unstable();
         tables.dedup();
-        if tables.is_empty() {
-            return Vec::new();
-        }
-        vec![GrantMove {
-            tables,
-            holder: GrantHolder::Everybody,
-        }]
+        self.announce_to(&tables, std::slice::from_ref(report))
     }
 
-    /// The tables a whole-shape reconcile can have moved, named for the replacement notice.
-    fn reached_by_whole(&self, m: &Materialisation) -> Vec<GrantMove> {
+    /// The tables a whole-shape reconcile can have moved, announced to the
+    /// holders the reconcile named.
+    fn reached_by_whole(&self, m: &Materialisation, reports: &[Reconciled]) -> Vec<GrantMove> {
         let mut tables: Vec<String> = m
             .region()
             .parts()
@@ -1399,13 +1593,54 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             .collect();
         tables.sort_unstable();
         tables.dedup();
+        self.announce_to(&tables, reports)
+    }
+
+    /// One move per distinct holder the reports name, over the tables a replay
+    /// reaches.
+    ///
+    /// A fact the replay added and a fact it deleted both carry the condition
+    /// context that names the key, so each names its bearer. What is left wide
+    /// is a fact naming no key at all, which reaches every subscriber and never
+    /// leaves a row on a device.
+    fn announce_to(&self, tables: &[String], reports: &[Reconciled]) -> Vec<GrantMove> {
         if tables.is_empty() {
             return Vec::new();
         }
-        vec![GrantMove {
-            tables,
-            holder: GrantHolder::Everybody,
-        }]
+        let mut named: BTreeMap<String, String> = BTreeMap::new();
+        for report in reports {
+            note_named_keys(&self.naming, report.added.iter(), &mut named);
+        }
+        let mut holders: Vec<GrantHolder> = Vec::new();
+        for report in reports {
+            let reported = report
+                .added
+                .iter()
+                .map(|record| holder_in_batch(&self.naming, record, &named))
+                .chain(
+                    report
+                        .removed
+                        .iter()
+                        .map(|fact| self.naming.withdrawn_holder(fact)),
+                );
+            for holder in reported {
+                if !holders.contains(&holder) {
+                    holders.push(holder);
+                }
+            }
+        }
+        // Everybody swallows every narrower holder beside it, so keeping those
+        // would announce the same replacement twice to the same session.
+        if holders.contains(&GrantHolder::Everybody) {
+            holders.retain(|holder| *holder == GrantHolder::Everybody);
+        }
+        holders
+            .into_iter()
+            .map(|holder| GrantMove {
+                tables: tables.to_vec(),
+                holder,
+            })
+            .collect()
     }
 
     /// What this difference changed about who can reach what, outside the table
@@ -1414,14 +1649,31 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     /// A grant given counts as much as a grant taken away: rows the caller may
     /// now see exist already and no row event will announce them, so only a
     /// replacement carries them.
-    fn moved(&self, event: &subql::ChangeEvent, diff: &StoreDiff) -> Vec<GrantMove> {
+    ///
+    /// One grant can travel as two facts. A share row written as a join table
+    /// row produces the gate fact, whose condition context names the key, and
+    /// a link fact joining the shared row to that same share object. The link
+    /// names no caller on its own, so it is read through the object a gate fact
+    /// named, and the pair announces one move rather than a narrow one beside a
+    /// wide one that undoes it. `replayed` carries the gate facts a re-run
+    /// named, because a shape with a residual settles the link from the row and
+    /// leaves the gate to the replay.
+    fn moved(
+        &self,
+        event: &subql::ChangeEvent,
+        diff: &StoreDiff,
+        replayed: &BTreeMap<String, String>,
+    ) -> Vec<GrantMove> {
         use subql::backend::CdcEvent as _;
 
         let catalog = self.shapes.catalog();
         let arrived_on = subql::catalog_helpers::table_name(catalog, event.table_id(catalog))
             .unwrap_or_default();
+        let records = || diff.added.iter().chain(diff.removed.iter());
+        let mut granted: BTreeMap<String, String> = replayed.clone();
+        note_named_keys(&self.naming, records(), &mut granted);
         let mut moves: Vec<GrantMove> = Vec::new();
-        for record in diff.added.iter().chain(diff.removed.iter()) {
+        for record in records() {
             let tables: Vec<String> = self
                 .reach
                 .tables_for(&record.object, record.relation.as_str())
@@ -1432,7 +1684,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
             if tables.is_empty() {
                 continue;
             }
-            let holder = self.naming.holder(&record.subject);
+            let holder = holder_in_batch(&self.naming, record, &granted);
             let candidate = GrantMove { tables, holder };
             // Two records of one kind about one person say one thing, and a
             // shape emitting a record per element of a list column emits many.
@@ -1446,11 +1698,17 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
 
 #[cfg(test)]
 mod tests {
-    use rls2fga::types::ActionStatement;
+    use std::borrow::Cow;
+    use std::sync::Arc;
+
+    use rls2fga::types::{
+        ActionStatement, ColumnKind, Record, RelationName, RowCell, RowList, RowValues,
+        records_from_row,
+    };
     use subql::backend::Postgres;
     use subql::catalog_helpers;
 
-    use super::{SubjectNaming, Translated};
+    use super::{BTreeMap, GrantHolder, SubjectNaming, Translated};
     use crate::capability::DEFAULT_USER_SETTING;
 
     /// The shape every connetto table carries: one permissive policy whose
@@ -1527,12 +1785,204 @@ mod tests {
     /// is denied with nothing naming the cause.
     #[test]
     fn the_share_key_parameter_is_read_from_the_translation() {
-        let shapes = translated(OWN_SHAPE).shapes();
-        let naming = SubjectNaming::resolve::<String>(&shapes);
+        let naming = translated(OWN_SHAPE).naming();
         assert!(
             naming.asks_the_caller(),
             "the held-key arm is a grant the caller's own values complete, so the \
              translation must report a parameter for it"
+        );
+    }
+
+    /// One row of the share table, read the way the change path reads a row
+    /// image.
+    struct ShareRow {
+        paper_id: &'static str,
+        viewer: &'static str,
+    }
+
+    impl RowValues for ShareRow {
+        fn cell(&self, column: &str, kind: ColumnKind) -> RowCell<'_> {
+            match (column, kind) {
+                ("paper_id", ColumnKind::Integer) => RowCell::Integer(Cow::Borrowed(self.paper_id)),
+                ("viewer", ColumnKind::Text) => RowCell::Text(Cow::Borrowed(self.viewer)),
+                _ => RowCell::Absent,
+            }
+        }
+
+        fn list(&self, _column: &str, _kind: ColumnKind) -> RowList<'_> {
+            RowList::Absent
+        }
+
+        fn json_text(&self, _column: &str, _path: &[String]) -> RowCell<'_> {
+            RowCell::Absent
+        }
+    }
+
+    /// The naming and the records one share row implies, produced through the
+    /// translation rather than written out here.
+    ///
+    /// Which context key carries the viewer is the translation's to decide, so
+    /// reading it back from a rendered record is the only way this asserts
+    /// about the tuples a deployment really writes.
+    fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
+        let translated = Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING)
+            .expect("the share shape settles from one row");
+        let description = translated
+            .tuples
+            .iter()
+            .filter_map(|query| query.description.as_ref())
+            .find(|description| {
+                description
+                    .row_table()
+                    .is_some_and(|table| table.name() == "paper_shares")
+            })
+            .expect("the share grant is described per row of the join table");
+        let records = records_from_row(
+            description,
+            &ShareRow {
+                paper_id: "1",
+                viewer,
+            },
+        )
+        .expect("a share row renders its own records");
+        (translated.naming(), records)
+    }
+
+    /// **The narrowing's first half.** A share row names the one subject it
+    /// grants to, and the rendered tuple carries that subject in its condition
+    /// context rather than in its subject column.
+    ///
+    /// Reading it is what lets a withdrawal reach the bearer alone. Announcing
+    /// such a move to everybody costs one whole snapshot per unconcerned
+    /// subscriber, which is the dominant cost of a feature whose grants change
+    /// often.
+    #[test]
+    fn a_conditional_share_record_names_the_key_it_grants_to() {
+        let (naming, records) = share_records("key:shared-with-me");
+        let record = records
+            .first()
+            .expect("one share row grants over one paper");
+        assert_eq!(
+            naming.holder(record),
+            GrantHolder::Subject("key:shared-with-me".to_owned()),
+            "the key the row grants to is on the record, so the move it \
+             produces names that key and nobody else"
+        );
+    }
+
+    /// A record whose relation gates on nothing the caller supplies keeps its
+    /// wide reading, whatever its context carries.
+    ///
+    /// This is the arm that must not be narrowed by a name that merely looks
+    /// right. A residual condition can carry a parameter spelled like another
+    /// policy's grantee column, and reading that as a grantee would leave the
+    /// row on a device whose access has gone.
+    #[test]
+    fn a_context_on_an_ungated_relation_narrows_nothing() {
+        let (naming, records) = share_records("key:shared-with-me");
+        let mut elsewhere = records
+            .into_iter()
+            .next()
+            .expect("one share row grants over one paper");
+        elsewhere.relation = RelationName::canonicalized("some_other_relation");
+        assert_eq!(
+            naming.holder(&elsewhere),
+            GrantHolder::Everybody,
+            "only the relation the translation reported as gated on the \
+             caller's keys carries a grantee in its context"
+        );
+    }
+
+    /// **One grant travels as two facts, and the pair announces one move.** The
+    /// gate fact carries the key. The link fact joining the shared row to the
+    /// share object names that object and no caller, so it is read through the
+    /// gate fact beside it.
+    ///
+    /// Without this the narrow move is announced beside a wide one, and the
+    /// wide one reaches every subscriber anyway, so the narrowing buys nothing.
+    #[test]
+    fn a_link_fact_is_read_through_the_gate_fact_beside_it() {
+        let (naming, records) = share_records("key:shared-with-me");
+        let gate = records
+            .first()
+            .expect("one share row grants over one paper")
+            .clone();
+        let link = Record {
+            object: "papers:1".to_owned(),
+            relation: RelationName::canonicalized("paper_shares_share"),
+            subject: gate.object.clone(),
+            context: None,
+        };
+        let mut named = BTreeMap::new();
+        super::note_named_keys(&naming, [&gate, &link].into_iter(), &mut named);
+        assert_eq!(
+            super::holder_in_batch(&naming, &link, &named),
+            GrantHolder::Subject("key:shared-with-me".to_owned()),
+            "the link hangs off the object the gate fact named, so it concerns \
+             that object's bearer"
+        );
+    }
+
+    /// **The conservative half, which is the one that must never narrow by
+    /// accident.** A link fact whose object no gate fact in the batch named
+    /// keeps its wide reading.
+    ///
+    /// Its object's own grants are not in hand, so guessing a bearer here would
+    /// leave the row on every other device whose access moved.
+    #[test]
+    fn a_link_fact_no_gate_fact_named_stays_wide() {
+        let (naming, records) = share_records("key:shared-with-me");
+        let gate = records
+            .first()
+            .expect("one share row grants over one paper")
+            .clone();
+        let orphan = Record {
+            object: "papers:1".to_owned(),
+            relation: RelationName::canonicalized("paper_shares_share"),
+            subject: "paper_shares_share:7|~unnamed".to_owned(),
+            context: None,
+        };
+        let mut named = BTreeMap::new();
+        super::note_named_keys(&naming, [&gate, &orphan].into_iter(), &mut named);
+        assert_eq!(
+            super::holder_in_batch(&naming, &orphan, &named),
+            GrantHolder::Everybody,
+            "no fact in this batch says who that object grants to, so the move \
+             stays as wide as connetto's knowledge of it"
+        );
+    }
+
+    /// A wildcard with nothing narrowing it grants everybody, and that is the
+    /// one case left for [`GrantHolder::Everybody`].
+    #[test]
+    fn an_unconditional_wildcard_still_concerns_everybody() {
+        let naming = translated(OWN_SHAPE).naming();
+        assert_eq!(
+            naming.holder(&Record {
+                object: "items:1".to_owned(),
+                relation: RelationName::canonicalized("viewer"),
+                subject: "user:*".to_owned(),
+                context: None,
+            }),
+            GrantHolder::Everybody,
+            "nothing narrows a wildcard carrying no context, so every \
+             subscriber of the reached tables is concerned"
+        );
+    }
+
+    /// An identity subject is still read as the person it names.
+    #[test]
+    fn an_identity_subject_is_read_as_that_person() {
+        let naming = translated(OWN_SHAPE).naming();
+        assert_eq!(
+            naming.holder(&Record {
+                object: "items:1".to_owned(),
+                relation: RelationName::canonicalized("viewer"),
+                subject: "user:alice".to_owned(),
+                context: None,
+            }),
+            GrantHolder::Person("alice".to_owned()),
+            "a person's own grant concerns that person"
         );
     }
 
