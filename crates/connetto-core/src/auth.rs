@@ -11,6 +11,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::SessionId;
 
+/// The setting an application's policies read the caller's identity from,
+/// unless it names another.
+pub const DEFAULT_USER_SETTING: &str = "app.user_id";
+
+/// The setting the packed capability subjects are bound to, unless the
+/// deployment's key type names another.
+pub const DEFAULT_SUBJECTS_SETTING: &str = "app.subjects";
+
 /// Session-scoped identity: a user id and nothing else.
 ///
 /// Tenant and role belong in the authorization model rather than on the
@@ -172,6 +180,53 @@ impl<Id, Key> Principal<Id, Key> {
     #[must_use]
     pub fn capabilities(&self) -> &[CapabilitySubject<Key>] {
         &self.capabilities
+    }
+}
+
+/// The caller a content ticket carries: the identity, and the capability
+/// subjects packed by the deployment's key type.
+///
+/// Both halves travel so the file server binds what the mint bound, and an
+/// absent half stays absent rather than becoming `""`, which would be a real
+/// identity a policy could match.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContentCaller {
+    identity: Option<String>,
+    subjects: Option<String>,
+}
+
+impl ContentCaller {
+    /// Name the two halves.
+    #[must_use]
+    pub const fn new(identity: Option<String>, subjects: Option<String>) -> Self {
+        Self { identity, subjects }
+    }
+
+    /// The identity, when a login grant resolved.
+    #[must_use]
+    pub fn identity(&self) -> Option<&str> {
+        self.identity.as_deref()
+    }
+
+    /// The packed capability subjects, when the caller holds any.
+    #[must_use]
+    pub fn subjects(&self) -> Option<&str> {
+        self.subjects.as_deref()
+    }
+
+    /// The one string a manifest row and a commit attribution key on: the
+    /// identity, else the subjects, which are deterministic per subject set.
+    ///
+    /// A caller holding neither has no key, so it cannot own a manifest.
+    #[must_use]
+    pub fn attribution(&self) -> Option<&str> {
+        self.identity().or_else(|| self.subjects())
+    }
+
+    /// Take both halves out.
+    #[must_use]
+    pub fn into_parts(self) -> (Option<String>, Option<String>) {
+        (self.identity, self.subjects)
     }
 }
 

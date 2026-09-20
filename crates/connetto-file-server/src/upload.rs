@@ -11,8 +11,8 @@ use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    db, error::ServerError, needed, router::AppState, schema::ConnettoFileSchema, store::AnyStore,
-    ticket::Verb,
+    caller::manifest_key, db, error::ServerError, needed, router::AppState,
+    schema::ConnettoFileSchema, store::AnyStore, ticket::Verb,
 };
 
 // ---------------------------------------------------------------------------
@@ -102,22 +102,20 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
     }
     let total_len = i64::try_from(body.total_len)
         .map_err(|_| ServerError::BadParam("total_len overflows i64".into()))?;
+    let key = manifest_key(&ticket.caller)?;
     let mut admin_conn = state.pools.admin.get().await?;
-    match db::insert_manifest::<S>(
-        &mut admin_conn,
-        &file_id,
-        total_len,
-        &ticket.caller,
-        &chunks,
-    )
-    .await?
-    {
+    match db::insert_manifest::<S>(&mut admin_conn, &file_id, total_len, key, &chunks).await? {
         db::InsertManifestOutcome::RegistryConflict => return Err(ServerError::RegistryConflict),
         db::InsertManifestOutcome::Inserted | db::InsertManifestOutcome::AlreadyPresent => {}
     }
     let mut reader_conn = state.pools.reader.get().await?;
-    let needed_hashes =
-        needed::needed_hashes::<S>(&mut reader_conn, &ticket.caller, &chunks).await?;
+    let needed_hashes = needed::needed_hashes::<S>(
+        &mut reader_conn,
+        &state.caller_settings,
+        &ticket.caller,
+        &chunks,
+    )
+    .await?;
     let needed: Vec<String> = needed_hashes.iter().map(hex_hash).collect();
     Ok((StatusCode::OK, Json(IntentResponse { needed })))
 }
@@ -132,7 +130,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let chunk_hash = parse_chunk_hash(&hash_hex)?;
     let file_id = FileId::from_bytes(ticket.file_id);
-    let caller = ticket.caller;
+    let caller = manifest_key(&ticket.caller)?.to_owned();
     let body_len = u64::try_from(body.len())
         .map_err(|_| ServerError::BadParam("body length overflows u64".into()))?;
     // A ceiling above i64::MAX cannot be exceeded by any real upload; clamp once
@@ -182,7 +180,7 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
 /// marks the manifest committed, and calls the state setter atomically.
 ///
 /// Four outcomes by manifest state:
-/// - Absent (`file_id`, `caller`) row: 404.
+/// - Absent (`file_id`, manifest key) row: 404.
 /// - Already committed (sequential retry after a lost response, or a second
 ///   session staging bytes identical to a file a previous session committed):
 ///   idempotent 200, with the state setter re-run so metadata rows inserted
@@ -199,7 +197,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     let ticket = state.verifier.verify_verb(&q.t, Verb::Write)?;
     let file_id = parse_file_id(&id)?;
     check_ids_match(&file_id, &ticket.file_id)?;
-    let caller = ticket.caller;
+    let key = manifest_key(&ticket.caller)?.to_owned();
     let store = &state.store;
     // Ordering: acquire reader before admin so a saturated reader pool never
     // blocks a holder of the manifest FOR UPDATE lock.
@@ -215,13 +213,21 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
     // already exists between the intent answer and this call, and a committed
     // manifest referenced by any chunk row cannot be collected by the sweep
     // while that reference exists, so the deduped bytes are stable.
-    if !db::all_chunks_satisfied::<S>(&mut reader_conn, &file_id, &caller).await? {
+    if !db::all_chunks_satisfied::<S>(
+        &mut reader_conn,
+        &state.caller_settings,
+        &file_id,
+        &ticket.caller,
+        &key,
+    )
+    .await?
+    {
         return Err(ServerError::CommitRefused);
     }
     let mut admin_conn = state.pools.admin.get().await?;
     admin_conn
         .transaction::<StatusCode, ServerError, _>(async move |conn| {
-            let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &caller).await? {
+            let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &key).await? {
                 None => return Err(ServerError::NotFound),
                 Some(db::ManifestState::Committed) => {
                     // Already committed from a previous call or session: re-run the
@@ -231,7 +237,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     diesel::select(crate::functions::connetto_set_content_state(
                         file_id.as_bytes().to_vec().as_slice(),
                         "available",
-                        caller.as_str(),
+                        key.as_str(),
                     ))
                     .get_result::<Option<Vec<u8>>>(conn)
                     .await?;
@@ -240,7 +246,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                 Some(db::ManifestState::Uncommitted(manifest)) => manifest,
             };
             verify_file_identity(store, &manifest).await?;
-            db::commit_manifest_atomic::<S>(conn, &file_id, &caller).await?;
+            db::commit_manifest_atomic::<S>(conn, &file_id, &key).await?;
             Ok(StatusCode::OK)
         })
         .await

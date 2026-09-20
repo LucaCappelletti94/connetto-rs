@@ -384,11 +384,6 @@ pub struct SessionConfig {
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
     schema_version: Option<SchemaVersion>,
-    /// The Postgres setting a per-viewer re-execution binds the caller's
-    /// identity to (R85), the same one the deployment's row policies read.
-    /// Must match the snapshot source's and write target's setting when a
-    /// deployment overrides theirs.
-    rls_user_setting: std::sync::Arc<str>,
 }
 
 impl Default for SessionConfig {
@@ -396,7 +391,6 @@ impl Default for SessionConfig {
         Self {
             initial_credits: 64,
             schema_version: None,
-            rls_user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
         }
     }
 }
@@ -419,13 +413,6 @@ impl SessionConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
-        self
-    }
-
-    /// Sets the identity setting a per-viewer re-execution binds (R85).
-    #[must_use]
-    pub fn with_rls_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
-        self.rls_user_setting = setting.into();
         self
     }
 
@@ -650,7 +637,7 @@ impl ContentTicketSigner for NoSigner {
 
     fn mint(
         &self,
-        _caller: &str,
+        _caller: &connetto_core::auth::ContentCaller,
         _file_id: [u8; 32],
         _verb: ContentVerb,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
@@ -3197,8 +3184,13 @@ where
         state: &SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
         let request_id = req.request_id;
-        let caller = state.principal.identity().map(|id| id.user_id.to_string());
-        let caller_str = caller.as_deref().unwrap_or("");
+        let caller = crate::capability::rendered_caller(&state.principal);
+        // The byte window keys on whatever names this caller, the identity or
+        // the subjects it holds, and falls back to the run's own handle rather
+        // than to a shared empty string.
+        let budget_key = caller
+            .attribution()
+            .map_or_else(|| state.session_id.to_string(), ToOwned::to_owned);
 
         // Reader permit: visibility checks out a reader-pool connection, so
         // the same gate that protects subscriptions and mutations applies here.
@@ -3213,7 +3205,7 @@ where
         // SECURITY INVOKER function body.
         let visible = self
             .target
-            .file_visible_to_caller(req.file_id, caller_str)
+            .file_visible_to_caller(req.file_id, &state.principal)
             .await;
         let visible = match visible {
             Ok(v) => v,
@@ -3239,7 +3231,7 @@ where
         }
 
         // Mint before charging so a signer failure costs the caller nothing.
-        let url = match self.signer.mint(caller_str, req.file_id, req.verb).await {
+        let url = match self.signer.mint(&caller, req.file_id, req.verb).await {
             Ok(url) => url,
             Err(err) => {
                 tracing::warn!(request_id, %err, "content ticket signing failed");
@@ -3259,7 +3251,7 @@ where
             && !self
                 .guard
                 .bytes()
-                .allow_content_bytes(caller_str, declared_len)
+                .allow_content_bytes(&budget_key, declared_len)
         {
             return transport
                 .send_control(ControlMessage::NonFatalError(NonFatalError {
@@ -3747,25 +3739,25 @@ where
 
     /// The read setup a per-consumer registration would run under: the shared
     /// re-execution budget plus this caller's own binding, or `None` for a
-    /// caller whose handshake resolved no identity. An aggregate over a
+    /// caller that binds nothing at all. An aggregate over a
     /// row-level-security table cannot share one fold, and offering this is
     /// what lets registration retry it with per-consumer reads that answer as
     /// this viewer (R85); with nobody to read as, the refusal stands.
+    ///
+    /// A share key is somebody to read as, so only a caller holding neither an
+    /// identity nor a subject is refused.
     fn viewer_read_setup(
         &self,
         state: &SessionState<Id, Key>,
     ) -> Option<crate::reexec::ConnettoReadSetup> {
-        state.principal.identity().is_some().then(|| {
+        let statements =
+            crate::capability::CallerBinding::of(&state.principal, self.target.user_setting())
+                .setup_statements();
+        (!statements.is_empty()).then(|| {
             crate::reexec::ConnettoReadSetup::of(ReadBudget::new(
                 self.guard.reexec_budget().timeout,
             ))
-            .with_statements(
-                crate::capability::CallerBinding::of(
-                    &state.principal,
-                    std::sync::Arc::clone(&self.config.rls_user_setting),
-                )
-                .setup_statements(),
-            )
+            .with_statements(statements)
         })
     }
 

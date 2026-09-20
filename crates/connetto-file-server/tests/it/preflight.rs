@@ -313,6 +313,7 @@ async fn serve_refuses_when_chunk_registry_absent() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -353,6 +354,7 @@ async fn serve_refuses_when_sweep_index_absent() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -391,6 +393,7 @@ async fn serve_refuses_when_grace_index_absent() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -436,6 +439,7 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -468,6 +472,7 @@ async fn serve_refuses_superuser_reader_role() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -524,6 +529,7 @@ async fn serve_refuses_bypassrls_reader_role() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -584,6 +590,7 @@ async fn serve_refuses_table_owner_reader_role() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -613,6 +620,7 @@ async fn serve_accepts_correctly_configured_reader_role() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)
@@ -647,6 +655,7 @@ async fn serve_refuses_when_content_state_fn_absent() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -676,6 +685,7 @@ async fn serve_accepts_when_content_state_fn_valid() {
         store: AnyStore::Fs(FsStore::new(dir.path()).expect("fs store")),
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)

@@ -6,6 +6,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::PROTOCOL_VERSION;
+use connetto_core::auth::ContentCaller;
+use connetto_core::auth::DEFAULT_USER_SETTING;
 use connetto_core::messages::{
     ContentTicketRequest, ContentVerb, ControlMessage, Grant, Handshake,
 };
@@ -30,6 +32,35 @@ pub(crate) const FILE_ID: [u8; 32] = [0xAB; 32];
 
 /// Window long enough that no budget rolls within one test.
 pub(crate) const WINDOW: Duration = Duration::from_secs(300);
+
+/// The share-key grant `TestGrantChecker` resolves to a capability subject.
+/// The subject is the whole token rather than the part after the prefix, so a
+/// policy predicate matches `key:k1` and not `k1`.
+pub(crate) const KEY_GRANT: &str = "key:k1";
+
+/// The predicate every identity-only case installs: the fixture's
+/// `connetto_visible_files` admits a file when the bound identity is alice.
+pub(crate) const ADMITS_ALICE: &str = "current_setting('app.user_id', true) = 'alice'";
+
+/// Admits when [`KEY_GRANT`]'s subject is among the packed subjects, in the
+/// `ANY(string_to_array(..))` form chapter 12 gives a capability predicate.
+pub(crate) const ADMITS_KEY: &str =
+    "'key:k1' = ANY(string_to_array(current_setting('app.subjects', true), ','))";
+
+/// Admits a caller whose identity is bound to the empty string, the blank
+/// identity chapter 08 forbids. An unbound setting reads as NULL and fails
+/// this comparison, so only a path that binds `""` is admitted here.
+pub(crate) const ADMITS_BLANK_IDENTITY: &str = "current_setting('app.user_id', true) = ''";
+
+/// Admits either half, which is the union row of chapter 08's arrival table.
+pub(crate) const ADMITS_ALICE_OR_KEY: &str = "current_setting('app.user_id', true) = 'alice' OR 'key:k1' = ANY(string_to_array(current_setting('app.subjects', true), ','))";
+
+/// [`ADMITS_ALICE`] for a deployment that named its own identity setting.
+pub(crate) const ADMITS_ALICE_UNDER_OWN_SETTING: &str =
+    "current_setting('app.who', true) = 'alice'";
+
+/// The setting name [`ADMITS_ALICE_UNDER_OWN_SETTING`] reads.
+pub(crate) const OWN_SETTING: &str = "app.who";
 
 /// A snapshot source that is never invoked.
 pub(crate) struct NeverSnapshot;
@@ -76,6 +107,12 @@ impl SnapshotSource for NeverSnapshot {
     }
 }
 
+/// The caller as a signer renders it into a URL: whatever names it, or
+/// `nobody` when it binds neither half.
+pub(crate) fn rendered(caller: &ContentCaller) -> &str {
+    caller.attribution().unwrap_or("nobody")
+}
+
 /// A signer that returns a deterministic URL encoding the caller and the
 /// first byte of the file id, so a test can assert the URL without magic strings.
 pub(crate) struct OkSigner;
@@ -85,11 +122,40 @@ impl ContentTicketSigner for OkSigner {
 
     fn mint(
         &self,
-        caller: &str,
+        caller: &ContentCaller,
         file_id: [u8; 32],
         _verb: ContentVerb,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
-        let url = format!("https://cdn.example.com/files/{:02x}/{caller}", file_id[0]);
+        let url = format!(
+            "https://cdn.example.com/files/{:02x}/{}",
+            file_id[0],
+            rendered(caller)
+        );
+        async move { Ok(url) }
+    }
+}
+
+/// A signer that records every caller it was asked to mint for.
+pub(crate) struct RecordingSigner(pub(crate) Arc<std::sync::Mutex<Vec<ContentCaller>>>);
+
+impl ContentTicketSigner for RecordingSigner {
+    type Error = Infallible;
+
+    fn mint(
+        &self,
+        caller: &ContentCaller,
+        file_id: [u8; 32],
+        _verb: ContentVerb,
+    ) -> impl Future<Output = Result<String, Self::Error>> + Send {
+        self.0
+            .lock()
+            .expect("the recording signer's mutex is never poisoned")
+            .push(caller.clone());
+        let url = format!(
+            "https://cdn.example.com/files/{:02x}/{}",
+            file_id[0],
+            rendered(caller)
+        );
         async move { Ok(url) }
     }
 }
@@ -102,7 +168,7 @@ impl ContentTicketSigner for BrokenSigner {
 
     fn mint(
         &self,
-        _caller: &str,
+        _caller: &ContentCaller,
         _file_id: [u8; 32],
         _verb: ContentVerb,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
@@ -129,7 +195,7 @@ impl ContentTicketSigner for FlakyFirstSigner {
 
     fn mint(
         &self,
-        caller: &str,
+        caller: &ContentCaller,
         file_id: [u8; 32],
         _verb: ContentVerb,
     ) -> impl Future<Output = Result<String, Self::Error>> + Send {
@@ -137,18 +203,33 @@ impl ContentTicketSigner for FlakyFirstSigner {
         if prev == 0 {
             core::future::ready(Err("key not loaded".to_owned()))
         } else {
-            let url = format!("https://cdn.example.com/files/{:02x}/{caller}", file_id[0]);
+            let url = format!(
+                "https://cdn.example.com/files/{:02x}/{}",
+                file_id[0],
+                rendered(caller)
+            );
             core::future::ready(Ok(url))
         }
     }
 }
 
-/// Install the test-fixture schema: non-superuser reader, `connetto_visible_files`
-/// that admits alice only, and the necessary grants.
+/// Install the test-fixture schema whose `connetto_visible_files` admits a
+/// file when `predicate` holds, plus the non-superuser reader and its grants.
 ///
 /// Returns a pool authenticated as `app_reader` (the non-owning role the
 /// visibility check must use so RLS fires inside the SECURITY INVOKER function).
-pub(crate) async fn setup_reader(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+/// The predicate is the only thing the ticket cases vary, and it is the only
+/// place a test can observe which settings the ticket path bound.
+pub(crate) async fn setup_reader_admitting(
+    fixture: &Fixture,
+    predicate: &str,
+) -> Pool<AsyncPgConnection> {
+    let visible_files = format!(
+        "CREATE OR REPLACE FUNCTION connetto_visible_files(file_ids bytea[]) \
+         RETURNS bytea[] LANGUAGE sql SECURITY INVOKER SET search_path = public AS $$ \
+             SELECT ARRAY(SELECT id FROM unnest($1) AS id WHERE {predicate}) \
+         $$"
+    );
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS _placeholder CASCADE",
@@ -157,14 +238,7 @@ pub(crate) async fn setup_reader(fixture: &Fixture) -> Pool<AsyncPgConnection> {
              IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
              THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; \
              END $$",
-            // Visibility function: admits file_ids when the session user is alice.
-            "CREATE OR REPLACE FUNCTION connetto_visible_files(file_ids bytea[]) \
-             RETURNS bytea[] LANGUAGE sql SECURITY INVOKER SET search_path = public AS $$ \
-                 SELECT ARRAY( \
-                     SELECT id FROM unnest($1) AS id \
-                     WHERE current_setting('app.user_id', true) = 'alice' \
-                 ) \
-             $$",
+            visible_files.as_str(),
             "GRANT USAGE ON SCHEMA public TO app_reader",
             "GRANT EXECUTE ON FUNCTION connetto_visible_files(bytea[]) TO app_reader",
             // The watermark table is provisioned by the fixture; reader needs SELECT
@@ -181,6 +255,11 @@ pub(crate) async fn setup_reader(fixture: &Fixture) -> Pool<AsyncPgConnection> {
         .build(manager)
         .await
         .expect("build reader pool")
+}
+
+/// [`setup_reader_admitting`] under [`ADMITS_ALICE`].
+pub(crate) async fn setup_reader(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+    setup_reader_admitting(fixture, ADMITS_ALICE).await
 }
 
 /// Install the test-fixture schema for the reader-permit saturation test.
@@ -223,10 +302,16 @@ pub(crate) async fn setup_slow_reader(fixture: &Fixture) -> Pool<AsyncPgConnecti
         .expect("build slow reader pool")
 }
 
-/// Complete a handshake for `identity`, consuming the `HandshakeAck`.
-pub(crate) async fn do_handshake(client: &mut LoopbackTransport, identity: &str) {
-    let mut hs = Handshake::new(PROTOCOL_VERSION, identity);
-    hs = hs.with_grant(Grant::new(format!("user:{identity}")));
+/// Complete a handshake presenting `grants`, consuming the `HandshakeAck`.
+pub(crate) async fn do_handshake_with(
+    client: &mut LoopbackTransport,
+    session_id: &str,
+    grants: &[&str],
+) {
+    let mut hs = Handshake::new(PROTOCOL_VERSION, session_id);
+    for grant in grants {
+        hs = hs.with_grant(Grant::new(*grant));
+    }
     client
         .send_control(ControlMessage::Handshake(hs))
         .await
@@ -237,17 +322,14 @@ pub(crate) async fn do_handshake(client: &mut LoopbackTransport, identity: &str)
     }
 }
 
-/// Complete an anonymous handshake (no user grant), consuming the `HandshakeAck`.
+/// Complete a handshake for `identity`, presenting its login grant.
+pub(crate) async fn do_handshake(client: &mut LoopbackTransport, identity: &str) {
+    do_handshake_with(client, identity, &[&format!("user:{identity}")]).await;
+}
+
+/// Complete an anonymous handshake, presenting no grant at all.
 pub(crate) async fn do_handshake_anon(client: &mut LoopbackTransport, session_id: &str) {
-    let hs = Handshake::new(PROTOCOL_VERSION, session_id);
-    client
-        .send_control(ControlMessage::Handshake(hs))
-        .await
-        .expect("send anonymous handshake");
-    match client.recv().await.expect("recv ack") {
-        Some(IncomingFrame::Control(ControlMessage::HandshakeAck(_))) => {}
-        other => panic!("expected HandshakeAck, got {other:?}"),
-    }
+    do_handshake_with(client, session_id, &[]).await;
 }
 
 /// Send a ticket request and return the next control frame the server sends.
@@ -286,12 +368,17 @@ pub(crate) type TicketManager<S> = SessionManager<
     S,
 >;
 
-/// Build a session manager whose guard the caller chooses.
-pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
+/// Build a session manager that binds the caller's identity under
+/// `user_setting`, with the guard the caller chooses.
+///
+/// The name is set once, on the write target that owns it, so nothing here can
+/// paper over a second field disagreeing with it.
+pub(crate) fn build_manager_named_setting<S: ContentTicketSigner>(
     reader_pool: Pool<AsyncPgConnection>,
     roster: RosterAuth,
     guard: Arc<RequestGuard<String>>,
     signer: S,
+    user_setting: &str,
 ) -> Arc<TicketManager<S>> {
     SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
@@ -300,12 +387,24 @@ pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
         Arc::new(TestGrantChecker),
         NoConnector,
         InMemoryOplog::default(),
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL)
+            .expect("build write target")
+            .with_user_setting(user_setting),
         guard,
         SessionConfig::default(),
         None,
         signer,
     )
+}
+
+/// Build a session manager whose guard the caller chooses.
+pub(crate) fn build_manager_with_guard<S: ContentTicketSigner>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    guard: Arc<RequestGuard<String>>,
+    signer: S,
+) -> Arc<TicketManager<S>> {
+    build_manager_named_setting(reader_pool, roster, guard, signer, DEFAULT_USER_SETTING)
 }
 
 /// Build a session manager whose guard carries `throttle`, with the default oplog.
@@ -323,6 +422,51 @@ pub(crate) fn build_standard_manager<S: ContentTicketSigner>(
     )
 }
 
+/// Open one session presenting `grants`, against a manager binding the
+/// identity under `user_setting`.
+pub(crate) async fn open_session_named_setting<S: ContentTicketSigner + Send + Sync + 'static>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    signer: S,
+    throttle: &ThrottleConfig,
+    session_id: &str,
+    grants: &[&str],
+    user_setting: &str,
+) -> (LoopbackTransport, JoinHandle<Result<(), SessionError>>) {
+    let manager = build_manager_named_setting(
+        reader_pool,
+        roster,
+        Arc::new(RequestGuard::new(*throttle, AbuseConfig::default())),
+        signer,
+        user_setting,
+    );
+    let (server_end, mut client) = loopback();
+    let server = tokio::spawn(manager.serve(server_end));
+    do_handshake_with(&mut client, session_id, grants).await;
+    (client, server)
+}
+
+/// Open one session against a standard manager, presenting `grants`.
+pub(crate) async fn open_session_with_grants<S: ContentTicketSigner + Send + Sync + 'static>(
+    reader_pool: Pool<AsyncPgConnection>,
+    roster: RosterAuth,
+    signer: S,
+    throttle: &ThrottleConfig,
+    session_id: &str,
+    grants: &[&str],
+) -> (LoopbackTransport, JoinHandle<Result<(), SessionError>>) {
+    open_session_named_setting(
+        reader_pool,
+        roster,
+        signer,
+        throttle,
+        session_id,
+        grants,
+        DEFAULT_USER_SETTING,
+    )
+    .await
+}
+
 /// Open one session against a standard manager, completing the handshake for `identity`.
 pub(crate) async fn open_session_with_handshake<S: ContentTicketSigner + Send + Sync + 'static>(
     reader_pool: Pool<AsyncPgConnection>,
@@ -331,11 +475,15 @@ pub(crate) async fn open_session_with_handshake<S: ContentTicketSigner + Send + 
     throttle: &ThrottleConfig,
     identity: &str,
 ) -> (LoopbackTransport, JoinHandle<Result<(), SessionError>>) {
-    let manager = build_standard_manager(reader_pool, roster, signer, throttle);
-    let (server_end, mut client) = loopback();
-    let server = tokio::spawn(manager.serve(server_end));
-    do_handshake(&mut client, identity).await;
-    (client, server)
+    open_session_with_grants(
+        reader_pool,
+        roster,
+        signer,
+        throttle,
+        identity,
+        &[&format!("user:{identity}")],
+    )
+    .await
 }
 
 /// Queue a `ContentTicketRequest` on `client` without reading the response.

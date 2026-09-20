@@ -13,7 +13,7 @@ fn payload_for(verb: Verb, ceiling: u64, expiry_offset_secs: i64) -> TicketPaylo
         verb,
         ceiling,
         expiry: chrono::Utc::now().timestamp() + expiry_offset_secs,
-        caller: "alice".into(),
+        caller: crate::fixture::identified("alice"),
     }
 }
 
@@ -24,7 +24,7 @@ async fn valid_read_ticket_verifies() {
     let token = signer.mint(&payload).unwrap();
     let decoded = verifier.verify_verb(&token, Verb::Read).unwrap();
     assert_eq!(decoded.file_id, payload.file_id);
-    assert_eq!(decoded.caller, "alice");
+    assert_eq!(decoded.caller.identity(), Some("alice"));
 }
 
 #[tokio::test]
@@ -146,9 +146,14 @@ fn token_from_url(url: &str) -> &str {
 async fn content_signer_read_ticket_verifies() {
     let (signer, verifier) = make_signer();
     let file_id = [7u8; 32];
-    let url = ContentTicketSigner::mint(&signer, "bob", file_id, ContentVerb::Read)
-        .await
-        .expect("mint must succeed");
+    let url = ContentTicketSigner::mint(
+        &signer,
+        &crate::fixture::identified("bob"),
+        file_id,
+        ContentVerb::Read,
+    )
+    .await
+    .expect("mint must succeed");
     assert!(
         url.contains("/files/"),
         "URL must contain the files path segment"
@@ -158,7 +163,7 @@ async fn content_signer_read_ticket_verifies() {
         .verify_verb(token, Verb::Read)
         .expect("read ticket must verify");
     assert_eq!(payload.file_id, file_id);
-    assert_eq!(payload.caller, "bob");
+    assert_eq!(payload.caller.identity(), Some("bob"));
     assert_eq!(payload.verb, Verb::Read);
     assert_eq!(
         payload.ceiling,
@@ -183,9 +188,14 @@ async fn content_signer_read_ceiling_is_configured_value() {
         .expect("signer");
         (s, connetto_file_server::TicketVerifier::new(pk))
     };
-    let url = ContentTicketSigner::mint(&signer, "eve", [2u8; 32], ContentVerb::Read)
-        .await
-        .expect("mint must succeed");
+    let url = ContentTicketSigner::mint(
+        &signer,
+        &crate::fixture::identified("eve"),
+        [2u8; 32],
+        ContentVerb::Read,
+    )
+    .await
+    .expect("mint must succeed");
     let token = token_from_url(&url);
     let payload = verifier.verify(token).expect("token must verify");
     assert_eq!(
@@ -208,7 +218,7 @@ async fn content_signer_write_ticket_verifies() {
     let declared_len: u64 = 4096;
     let url = ContentTicketSigner::mint(
         &signer,
-        "carol",
+        &crate::fixture::identified("carol"),
         file_id,
         ContentVerb::Write { declared_len },
     )
@@ -223,7 +233,7 @@ async fn content_signer_write_ticket_verifies() {
         .verify_verb(token, Verb::Write)
         .expect("write ticket must verify");
     assert_eq!(payload.file_id, file_id);
-    assert_eq!(payload.caller, "carol");
+    assert_eq!(payload.caller.identity(), Some("carol"));
     assert_eq!(payload.ceiling, declared_len);
 }
 
@@ -233,9 +243,14 @@ async fn content_signer_write_ticket_verifies() {
 async fn content_signer_read_token_refused_as_write() {
     let (signer, verifier) = make_signer();
     let file_id = [3u8; 32];
-    let url = ContentTicketSigner::mint(&signer, "dave", file_id, ContentVerb::Read)
-        .await
-        .expect("mint must succeed");
+    let url = ContentTicketSigner::mint(
+        &signer,
+        &crate::fixture::identified("dave"),
+        file_id,
+        ContentVerb::Read,
+    )
+    .await
+    .expect("mint must succeed");
     let token = token_from_url(&url);
     assert!(
         matches!(
@@ -308,9 +323,14 @@ async fn a_trailing_slash_in_the_base_mints_a_single_slashed_url() {
         1024,
     )
     .expect("a trailing slash in the base must be accepted");
-    let url = ContentTicketSigner::mint(&signer, "alice", [7u8; 32], ContentVerb::Read)
-        .await
-        .expect("minting against the trimmed base must work");
+    let url = ContentTicketSigner::mint(
+        &signer,
+        &crate::fixture::identified("alice"),
+        [7u8; 32],
+        ContentVerb::Read,
+    )
+    .await
+    .expect("minting against the trimmed base must work");
     let (path, _) = url.split_once("?t=").expect("the token rides the query");
     assert_eq!(
         path,
@@ -389,7 +409,7 @@ async fn https_base_accepted_and_preserved_in_grant() {
     .expect("https base must be accepted");
     let url = connetto_core::traits::ContentTicketSigner::mint(
         &signer,
-        "alice",
+        &crate::fixture::identified("alice"),
         [1u8; 32],
         connetto_core::messages::ContentVerb::Read,
     )

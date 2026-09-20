@@ -38,9 +38,21 @@ const QUERY: &str = "SELECT COUNT(*) FROM notes";
 /// A manager whose computed reads run as `app_reader`, subject to RLS.
 type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
 
+/// The policy every identity-only case installs.
+const OWNER_IS_CALLER: &str = "owner = current_setting('app.user_id', true)";
+
+/// A policy admitting the identity or any packed capability subject, which is
+/// chapter 08's union row.
+const OWNER_IS_CALLER_OR_SUBJECT: &str = "owner = current_setting('app.user_id', true) OR owner = ANY(string_to_array(current_setting('app.subjects', true), ','))";
+
 /// Provision the RLS table and the reader role, then build the manager whose
 /// connector reads as that role.
 async fn manager(fixture: &Fixture) -> Arc<Manager> {
+    manager_under(fixture, OWNER_IS_CALLER).await
+}
+
+/// [`manager`] whose `notes` policy is `policy`.
+async fn manager_under(fixture: &Fixture, policy: &str) -> Arc<Manager> {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
@@ -48,8 +60,7 @@ async fn manager(fixture: &Fixture) -> Arc<Manager> {
              THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT)",
             "ALTER TABLE notes ENABLE ROW LEVEL SECURITY",
-            "CREATE POLICY notes_p ON notes USING ( \
-               owner = current_setting('app.user_id', true))",
+            format!("CREATE POLICY notes_p ON notes USING ({policy})").as_str(),
             "GRANT USAGE ON SCHEMA public TO app_reader",
             "GRANT SELECT ON notes TO app_reader",
         ])
@@ -200,4 +211,26 @@ async fn an_unidentified_caller_keeps_the_rls_aggregate_refusal() {
         panic!("an unidentified caller's RLS aggregate must be refused");
     };
     assert_eq!(refusal.detail, SUBSCRIPTION_REFUSED);
+}
+
+/// A share key is somebody to read as, so a key-only viewer takes the
+/// per-viewer read instead of the refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_only_viewer_gets_its_own_statistic() {
+    let fixture = Fixture::acquire().await;
+    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT).await;
+    fixture
+        .exec("INSERT INTO notes VALUES (1, 'key:k1'), (2, 'key:k1'), (10, 'alice')")
+        .await;
+
+    let mut holder = connect(&manager);
+    holder.handshake_with("holder-k1", "key:k1").await;
+    holder.subscribe("mine", QUERY).await;
+    let seed = next_aggregate(&mut holder, "mine").await;
+
+    assert_eq!(
+        count_of(&seed),
+        2,
+        "the key holder counts the rows its subject grants, and no others"
+    );
 }

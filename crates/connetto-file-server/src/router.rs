@@ -49,6 +49,8 @@ pub struct Config<S: ConnettoFileSchema> {
     pub verifier: TicketVerifier,
     /// Grace window for the GC sweep.
     pub grace: Duration,
+    /// The session settings this deployment's policies read the caller from.
+    pub caller_settings: crate::caller::CallerSettings,
     /// Carries the schema type without a runtime value.
     pub _schema: PhantomData<fn() -> S>,
 }

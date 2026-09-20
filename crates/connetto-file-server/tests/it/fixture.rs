@@ -9,8 +9,8 @@ use axum::Router;
 use bytes::Bytes;
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
 use connetto_file_server::{
-    AnyStore, AppPools, Config, CustomStore, DEPLOYMENT_DDL, DefaultFileSchema, FsStore,
-    ObjectStoreBackend, StoreError, TicketSigner, TicketVerifier, serve,
+    AnyStore, AppPools, Config, ContentCaller, CustomStore, DEPLOYMENT_DDL, DefaultFileSchema,
+    FsStore, ObjectStoreBackend, StoreError, TicketSigner, TicketVerifier, serve,
 };
 use diesel_async::{
     AsyncConnection, AsyncPgConnection, RunQueryDsl,
@@ -132,6 +132,102 @@ pub const FIXTURE_STMTS_RLS_ONLY: &[&str] = &[
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
 ];
 
+/// DDL for a deployment whose policy and visibility function read the packed
+/// capability subjects beside the identity, which is chapter 08's union row.
+pub const FIXTURE_STMTS_SUBJECTS: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS test_file_metadata (
+         file_id     BYTEA NOT NULL,
+         uploaded_by TEXT  NOT NULL,
+         PRIMARY KEY (file_id, uploaded_by)
+     )",
+    "ALTER TABLE test_file_metadata ENABLE ROW LEVEL SECURITY",
+    "CREATE POLICY test_metadata_rls ON test_file_metadata FOR SELECT
+         USING (uploaded_by = current_setting('app.user_id', TRUE)
+                OR uploaded_by = ANY(string_to_array(current_setting('app.subjects', TRUE), ',')))",
+    "DO $$ BEGIN
+         CREATE ROLE connetto_file_server LOGIN PASSWORD 'cfs_reader' NOINHERIT;
+     EXCEPTION WHEN duplicate_object THEN NULL;
+     END $$",
+    "GRANT SELECT ON _cfs_manifests        TO connetto_file_server",
+    "GRANT SELECT ON _cfs_manifest_chunks  TO connetto_file_server",
+    "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
+    "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
+     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
+         SELECT ARRAY(
+             SELECT f FROM UNNEST(p_file_ids) AS f
+             WHERE EXISTS (
+                 SELECT 1 FROM public.test_file_metadata m
+                 WHERE m.file_id = f
+                   AND (m.uploaded_by = current_setting('app.user_id', TRUE)
+                        OR m.uploaded_by = ANY(
+                            string_to_array(current_setting('app.subjects', TRUE), ',')))
+             )
+         )
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
+    "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+         p_file_id   BYTEA,
+         p_new_state TEXT,
+         p_caller    TEXT
+     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+         SET search_path TO '' AS $$
+     BEGIN
+         INSERT INTO public.test_file_metadata (file_id, uploaded_by)
+         VALUES (p_file_id, p_caller)
+         ON CONFLICT DO NOTHING;
+         RETURN p_file_id;
+     END;
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+];
+
+/// DDL for a deployment that named its own identity setting, `app.who`.
+pub const FIXTURE_STMTS_OWN_SETTING: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS test_file_metadata (
+         file_id     BYTEA NOT NULL,
+         uploaded_by TEXT  NOT NULL,
+         PRIMARY KEY (file_id, uploaded_by)
+     )",
+    "ALTER TABLE test_file_metadata ENABLE ROW LEVEL SECURITY",
+    "CREATE POLICY test_metadata_rls ON test_file_metadata FOR SELECT
+         USING (uploaded_by = current_setting('app.who', TRUE))",
+    "DO $$ BEGIN
+         CREATE ROLE connetto_file_server LOGIN PASSWORD 'cfs_reader' NOINHERIT;
+     EXCEPTION WHEN duplicate_object THEN NULL;
+     END $$",
+    "GRANT SELECT ON _cfs_manifests        TO connetto_file_server",
+    "GRANT SELECT ON _cfs_manifest_chunks  TO connetto_file_server",
+    "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
+    "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
+     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
+         SELECT ARRAY(
+             SELECT f FROM UNNEST(p_file_ids) AS f
+             WHERE EXISTS (
+                 SELECT 1 FROM public.test_file_metadata m
+                 WHERE m.file_id = f
+                   AND m.uploaded_by = current_setting('app.who', TRUE)
+             )
+         )
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
+    "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+         p_file_id   BYTEA,
+         p_new_state TEXT,
+         p_caller    TEXT
+     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+         SET search_path TO '' AS $$
+     BEGIN
+         INSERT INTO public.test_file_metadata (file_id, uploaded_by)
+         VALUES (p_file_id, p_caller)
+         ON CONFLICT DO NOTHING;
+         RETURN p_file_id;
+     END;
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+];
+
 pub struct Pg {
     pub _container: ContainerAsync<GenericImage>,
     pub url_admin: String,
@@ -146,6 +242,16 @@ impl Pg {
     /// Starts a container whose `connetto_visible_files` relies on RLS alone.
     pub async fn start_rls_only() -> Self {
         Self::start_with_fixture_stmts(FIXTURE_STMTS_RLS_ONLY).await
+    }
+
+    /// Starts a container whose policy reads the packed subjects beside the identity.
+    pub async fn start_with_subjects() -> Self {
+        Self::start_with_fixture_stmts(FIXTURE_STMTS_SUBJECTS).await
+    }
+
+    /// Starts a container whose policy reads the deployment's own identity setting.
+    pub async fn start_with_own_setting() -> Self {
+        Self::start_with_fixture_stmts(FIXTURE_STMTS_OWN_SETTING).await
     }
 
     async fn start_with_fixture_stmts(fixture_stmts: &[&str]) -> Self {
@@ -475,6 +581,16 @@ pub fn short_read_store(inner: FsStore, truncate_to: usize) -> AnyStore {
 }
 
 pub async fn build_router(pg: &Pg, store: AnyStore) -> (Router, TicketSigner) {
+    build_router_with_settings(pg, store, connetto_file_server::CallerSettings::default()).await
+}
+
+/// A router that binds the caller under `caller_settings`, which is how a
+/// deployment that renamed either setting is configured.
+pub async fn build_router_with_settings(
+    pg: &Pg,
+    store: AnyStore,
+    caller_settings: connetto_file_server::CallerSettings,
+) -> (Router, TicketSigner) {
     let (signer, verifier) = make_signer();
     let cfg: Config<DefaultFileSchema> = Config {
         pools: AppPools {
@@ -484,6 +600,7 @@ pub async fn build_router(pg: &Pg, store: AnyStore) -> (Router, TicketSigner) {
         store,
         verifier,
         grace: Duration::from_secs(3600),
+        caller_settings,
         _schema: std::marker::PhantomData,
     };
     (
@@ -659,4 +776,14 @@ pub async fn registry_row_count(
     .await
     .expect("count registry rows");
     rows.into_iter().next().map_or(0, |r| r.n)
+}
+
+/// A ticket caller carrying an identity and no share key.
+pub fn identified(user_id: &str) -> ContentCaller {
+    ContentCaller::new(Some(user_id.to_owned()), None)
+}
+
+/// A ticket caller carrying share-key subjects and no identity.
+pub fn keyed(subjects: &str) -> ContentCaller {
+    ContentCaller::new(None, Some(subjects.to_owned()))
 }

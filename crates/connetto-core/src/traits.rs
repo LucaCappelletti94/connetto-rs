@@ -274,14 +274,16 @@ pub trait ContentTicketSigner {
 
     /// The address `caller` may use for `verb` on `file_id`, ticket included.
     ///
-    /// `caller` is the identity the ticket binds to, not whoever presents it.
+    /// `caller` is what the ticket binds to, not whoever presents it. Both of
+    /// its halves ride, so a caller whose rights come from a share key rather
+    /// than a login is served.
     ///
     /// # Errors
     ///
     /// [`Self::Error`] when no address can be minted, for instance a missing key.
     fn mint(
         &self,
-        caller: &str,
+        caller: &crate::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + MaybeSend;

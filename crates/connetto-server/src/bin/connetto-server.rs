@@ -89,6 +89,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::auth::DEFAULT_USER_SETTING;
 use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
@@ -98,7 +99,6 @@ use connetto_file_server::{
     self as files, DbPool, DefaultFileSchema, TicketSigner, TicketVerifier,
 };
 use connetto_server::audit::pg_audit_hook;
-use connetto_server::capability::DEFAULT_USER_SETTING;
 use connetto_server::openfga::{
     Counted, FgaAuth, ModelState, ModelSubject, SubjectNaming, Translated,
 };
@@ -657,6 +657,9 @@ async fn build_content(
         store: open_store(&spec)?,
         verifier: TicketVerifier::new(public),
         grace: settings.grace,
+        // This binary binds the caller under connetto's default names, which
+        // is what its session manager is left configured with.
+        caller_settings: files::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -895,7 +898,7 @@ impl ContentTicketSigner for ServerSigner {
 
     async fn mint(
         &self,
-        caller: &str,
+        caller: &connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> Result<String, Self::Error> {
@@ -1460,12 +1463,21 @@ mod tests {
     use axum::http::{Method, Request, StatusCode};
     use tower::ServiceExt;
 
+    /// A caller carrying only an identity, which is what these mints exercise.
+    fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
+        connetto_core::auth::ContentCaller::new(Some(user_id.to_owned()), None)
+    }
+
     #[tokio::test]
     async fn an_unset_deployment_refuses_every_ticket() {
-        let err =
-            ContentTicketSigner::mint(&ServerSigner::None, "u-1", [0u8; 32], ContentVerb::Read)
-                .await
-                .expect_err("no signer is configured");
+        let err = ContentTicketSigner::mint(
+            &ServerSigner::None,
+            &identified("u-1"),
+            [0u8; 32],
+            ContentVerb::Read,
+        )
+        .await
+        .expect_err("no signer is configured");
         assert!(matches!(err, SignerError::NotConfigured));
     }
 
@@ -1624,15 +1636,20 @@ mod tests {
                 1 << 20,
             )
             .expect("a keypair from its DER");
-            let url = ContentTicketSigner::mint(&signer, "caller-1", [7u8; 32], ContentVerb::Read)
-                .await
-                .expect("a minted read url");
+            let url = ContentTicketSigner::mint(
+                &signer,
+                &identified("caller-1"),
+                [7u8; 32],
+                ContentVerb::Read,
+            )
+            .await
+            .expect("a minted read url");
             let token = url.split_once("?t=").expect("the token rides the url").1;
             let payload = TicketVerifier::new(public)
                 .verify(token)
                 .expect("the minted token verifies");
             assert_eq!(payload.file_id, [7u8; 32]);
-            assert_eq!(payload.caller, "caller-1");
+            assert_eq!(payload.caller.identity(), Some("caller-1"));
         }
 
         #[tokio::test]
@@ -1646,7 +1663,7 @@ mod tests {
             .expect("an ephemeral keypair");
             let url = ContentTicketSigner::mint(
                 &signer,
-                "caller-2",
+                &identified("caller-2"),
                 [9u8; 32],
                 ContentVerb::Write { declared_len: 128 },
             )
@@ -1764,9 +1781,14 @@ mod tests {
             let (signer, router) = build_content(Some(settings), &admin_url, &reader_url, 2)
                 .await
                 .expect("a configured deployment builds");
-            let url = ContentTicketSigner::mint(&signer, "caller-9", [3u8; 32], ContentVerb::Read)
-                .await
-                .expect("the deployment signer mints");
+            let url = ContentTicketSigner::mint(
+                &signer,
+                &identified("caller-9"),
+                [3u8; 32],
+                ContentVerb::Read,
+            )
+            .await
+            .expect("the deployment signer mints");
             assert!(url.starts_with("http://127.0.0.1:8099/files/"));
             assert!(router.is_some(), "the file router rides the auth listener");
             // One sweep tick at the cadence, so the reclaim arm runs.

@@ -928,7 +928,7 @@ pub struct BoxSignerError(String);
 trait SignerInner: Send + Sync {
     fn mint_boxed<'a>(
         &'a self,
-        caller: &'a str,
+        caller: &'a connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>>;
@@ -942,7 +942,7 @@ where
 {
     fn mint_boxed<'a>(
         &'a self,
-        caller: &'a str,
+        caller: &'a connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> std::pin::Pin<Box<dyn Future<Output = Result<String, BoxSignerError>> + Send + 'a>> {
@@ -981,12 +981,12 @@ impl ContentTicketSigner for BoxSigner {
 
     fn mint(
         &self,
-        caller: &str,
+        caller: &connetto_core::auth::ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> impl Future<Output = Result<String, Self::Error>> + MaybeSend {
         let inner = Arc::clone(&self.0);
-        let caller = caller.to_owned();
+        let caller = caller.clone();
         async move { inner.mint_boxed(&caller, file_id, verb).await }
     }
 }

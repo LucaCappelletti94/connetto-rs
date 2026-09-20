@@ -595,7 +595,7 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
 /// spelled `current_app_user()` on the replica.
 fn caller_mapping() -> SessionVariableMapping {
     SessionVariableMapping::current_setting(
-        connetto_server::capability::DEFAULT_USER_SETTING,
+        connetto_core::auth::DEFAULT_USER_SETTING,
         "current_app_user",
     )
 }
@@ -691,7 +691,7 @@ async fn fga_auth(
     let translated = Translated::of::<String>(
         shape.ddl(),
         shape.policies(),
-        connetto_server::capability::DEFAULT_USER_SETTING,
+        connetto_core::auth::DEFAULT_USER_SETTING,
     )
     .expect("the fixture's policy is one rls2fga classifies");
     let mut setup = OpenFgaServiceClient::new(channel.clone());

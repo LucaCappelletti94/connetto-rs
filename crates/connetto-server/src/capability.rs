@@ -19,7 +19,7 @@ use core::fmt::Display;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use connetto_core::auth::{CapabilitySubject, Principal};
+use connetto_core::auth::{CapabilitySubject, ContentCaller, Principal};
 use diesel::sql_types::{Bool, Text};
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use serde::Serialize;
@@ -54,7 +54,7 @@ pub trait CapabilityKey:
     Clone + Display + Serialize + DeserializeOwned + Send + Sync + 'static
 {
     /// The Postgres setting the packed keys are bound to.
-    const SETTING: &'static str = "app.subjects";
+    const SETTING: &'static str = connetto_core::auth::DEFAULT_SUBJECTS_SETTING;
 
     /// The character joining packed keys. A key whose rendering contains it is
     /// refused at minting, because one that slipped through would split into
@@ -68,17 +68,21 @@ pub trait CapabilityKey:
     ///
     /// Unbound rather than empty is what makes an absent capability fail
     /// closed: `current_setting` yields NULL, and a comparison against NULL is
-    /// NULL rather than true.
+    /// NULL rather than true. Packing sorts, so one holder packs one value
+    /// whatever order its grants arrived in and a manifest keyed on that value
+    /// stays put across runs.
     fn pack(keys: &[CapabilitySubject<Self>]) -> Option<String> {
         if keys.is_empty() {
             return None;
         }
+        let mut rendered: Vec<String> = keys.iter().map(|key| key.key().to_string()).collect();
+        rendered.sort_unstable();
         let mut packed = String::new();
-        for key in keys {
+        for key in rendered {
             if !packed.is_empty() {
                 packed.push(Self::SEPARATOR);
             }
-            packed.push_str(&key.key().to_string());
+            packed.push_str(&key);
         }
         Some(packed)
     }
@@ -100,18 +104,34 @@ diesel::define_sql_function! {
     fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
 }
 
-/// The caller rendered for one RLS transaction: the identity, and the share
-/// keys packed by the deployment's [`CapabilityKey`].
+/// Render the two halves of `caller`: the identity, and the share keys packed
+/// by the deployment's [`CapabilityKey`].
+///
+/// The one renderer of a caller's values. A half the caller does not hold
+/// stays absent, never `""`, so an owner comparison is NULL and hides the row
+/// while a public predicate still returns its own.
+pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
+    caller: &Principal<Id, Key>,
+) -> ContentCaller {
+    ContentCaller::new(
+        caller
+            .identity()
+            .map(|identity| identity.user_id.to_string()),
+        Key::pack(caller.capabilities()),
+    )
+}
+
+/// The caller rendered for one RLS transaction, under the setting names this
+/// deployment binds them to.
 ///
 /// Built outside the transaction (the values are owned so the apply future
 /// stays `Send`) and applied as its first statement. Every path that runs SQL
 /// as a caller goes through this, so the snapshot, the write, and the per-row
 /// visibility check cannot answer differently about what the caller holds.
 pub(crate) struct CallerBinding {
-    user_id: Option<String>,
+    caller: ContentCaller,
     user_setting: Arc<str>,
     setting: &'static str,
-    subjects: Option<String>,
 }
 
 impl CallerBinding {
@@ -122,24 +142,16 @@ impl CallerBinding {
         user_setting: Arc<str>,
     ) -> Self {
         Self {
-            // A caller with no identity binds nothing, leaving the setting
-            // unset for the whole transaction, so an owner comparison is NULL
-            // and hides the row while a public predicate still returns its own.
-            // An empty string would be a real identity that happens to be
-            // blank, which a policy could match.
-            user_id: caller
-                .identity()
-                .map(|identity| identity.user_id.to_string()),
+            caller: rendered_caller(caller),
             user_setting,
             setting: Key::SETTING,
-            subjects: Key::pack(caller.capabilities()),
         }
     }
 
     /// Bind both values for the rest of the transaction, in one statement.
     pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
         let user_setting = self.user_setting.to_string();
-        match (self.user_id, self.subjects) {
+        match self.caller.into_parts() {
             (None, None) => Ok(()),
             (Some(user), None) => diesel::select(set_config(user_setting, user, true))
                 .execute(conn)
@@ -170,14 +182,14 @@ impl CallerBinding {
             value.replace('\'', "''")
         }
         let mut statements = Vec::with_capacity(2);
-        if let Some(user) = &self.user_id {
+        if let Some(user) = self.caller.identity() {
             statements.push(format!(
                 "SELECT set_config('{}', '{}', true)",
                 quoted(&self.user_setting),
                 quoted(user)
             ));
         }
-        if let Some(subjects) = &self.subjects {
+        if let Some(subjects) = self.caller.subjects() {
             statements.push(format!(
                 "SELECT set_config('{}', '{}', true)",
                 quoted(self.setting),
@@ -187,15 +199,6 @@ impl CallerBinding {
         statements
     }
 }
-
-/// The setting an application's policies read the caller's identity from,
-/// unless it names another.
-///
-/// The share-key setting has been the application's choice since R4, through
-/// [`CapabilityKey::SETTING`]. This one was fixed in connetto's source until
-/// 2026-08-06, for no reason beyond the key setting having somewhere obvious to
-/// live and this one not.
-pub const DEFAULT_USER_SETTING: &str = "app.user_id";
 
 /// The write verbs a share certifies, beside the reading every share certifies.
 ///

@@ -133,7 +133,7 @@ pub fn pg_write_target<W: ConnettoWatermarkSchema>(
     let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
     Ok(PgWriteTarget {
-        user_setting: crate::capability::DEFAULT_USER_SETTING.into(),
+        user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
         pool,
         catalog,
         _watermark: PhantomData,
@@ -170,6 +170,15 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     pub fn with_user_setting(mut self, setting: impl Into<std::sync::Arc<str>>) -> Self {
         self.user_setting = setting.into();
         self
+    }
+
+    /// The setting this target binds the caller's identity to.
+    ///
+    /// The one configured name for it, so the per-viewer read and the ticket
+    /// path cannot bind under a different name than the write and the
+    /// visibility check.
+    pub(crate) fn user_setting(&self) -> std::sync::Arc<str> {
+        std::sync::Arc::clone(&self.user_setting)
     }
 
     /// Probe conflicts, apply one upload, and advance the durable watermark in
@@ -270,19 +279,18 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     /// Whether `caller` may see `file_id` per the deployment's
     /// `connetto_visible_files` function.
     ///
-    /// Runs inside a transaction on the pool so the `set_config` call that
-    /// threads the caller identity in stays in scope for the duration. The pool
-    /// must be the reader (non-owner) role: the admin role bypasses RLS, so
-    /// running this check as admin makes it decorative.
-    pub(crate) async fn file_visible_to_caller(
+    /// Runs inside a transaction on the pool so the binding stays in scope for
+    /// the duration, through the same [`CallerBinding`] the write takes, so a
+    /// caller holding only a share key is answered on its keys. The pool must
+    /// be the reader (non-owner) role: the admin role bypasses RLS, so running
+    /// this check as admin makes it decorative.
+    pub(crate) async fn file_visible_to_caller<Key: CapabilityKey>(
         &self,
         file_id: [u8; 32],
-        caller: &str,
+        caller: &Principal<W::Id, Key>,
     ) -> Result<bool, WriteError> {
-        use crate::capability::set_config;
         use visibility::connetto_visible_files;
-        let caller = caller.to_owned();
-        let user_setting = std::sync::Arc::clone(&self.user_setting);
+        let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
         let mut conn = self
             .pool
             .get()
@@ -291,9 +299,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         // file_id is [u8; 32] (Copy): derive bytes twice inside the async
         // block so no clone is needed across the await.
         conn.transaction::<bool, diesel::result::Error, _>(async move |c| {
-            diesel::select(set_config(&*user_setting, &caller, true))
-                .get_result::<String>(c)
-                .await?;
+            binding.apply(c).await?;
             let visible: Vec<Vec<u8>> =
                 diesel::select(connetto_visible_files(vec![file_id.to_vec()]))
                     .get_result(c)

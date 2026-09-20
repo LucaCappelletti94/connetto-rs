@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_core::auth::ContentCaller;
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::ContentTicketSigner;
 use postcard;
@@ -38,8 +39,8 @@ pub struct TicketPayload {
     pub ceiling: u64,
     /// Unix timestamp (seconds) after which the ticket is expired.
     pub expiry: i64,
-    /// Caller identity carried for attribution.
-    pub caller: String,
+    /// The caller this ticket binds to, both halves of it.
+    pub caller: ContentCaller,
 }
 
 /// Error produced by ticket operations.
@@ -235,7 +236,7 @@ impl ContentTicketSigner for TicketSigner {
 
     fn mint(
         &self,
-        caller: &str,
+        caller: &ContentCaller,
         file_id: [u8; 32],
         verb: ContentVerb,
     ) -> impl core::future::Future<Output = Result<String, Self::Error>> + Send {
@@ -255,7 +256,7 @@ impl ContentTicketSigner for TicketSigner {
                 verb: local_verb,
                 ceiling,
                 expiry,
-                caller: caller.into(),
+                caller: caller.clone(),
             };
             let token = TicketSigner::mint(self, &payload)?;
             let hex_id = crate::hex_32(&file_id);

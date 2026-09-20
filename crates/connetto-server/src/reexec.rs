@@ -12,10 +12,10 @@
 //! shapes, budgeted pages, and the held cursors a whole-answer read needs) and
 //! takes a [`SessionSetup`] whose statements run inside every transaction it
 //! opens, the cursor's held transaction included. connetto's setup carries the
-//! one statement its ceilings need today, the timeout, and is where the R85
-//! per-viewer identity (`set_config('app.user_id', ...)`) will ride later.
-//! The value cannot live upstream because it is per tier, and a tier is
-//! whether the handshake resolved an identity, which subql does not model.
+//! one statement its ceilings need today, the timeout, and the R85 per-viewer
+//! binding rides beside it, the identity and the packed subjects the caller
+//! holds. The timeout cannot live upstream because it is per tier, and a tier
+//! is whether the handshake resolved an identity, which subql does not model.
 //!
 //! The setup travels as the connector's `AuthContext`, stored per registered
 //! subscription and passed verbatim to each call, so the caller of the moment

@@ -19,7 +19,7 @@ async fn absent_file_answers_404() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let id_hex = connetto_file_server::hex_32(&file_id);
@@ -57,7 +57,7 @@ async fn bad_ticket_answers_404() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -78,7 +78,7 @@ async fn bad_ticket_answers_404() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -117,7 +117,7 @@ async fn expired_ticket_answers_404() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -138,7 +138,7 @@ async fn expired_ticket_answers_404() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() - 1,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -177,7 +177,7 @@ async fn write_ticket_on_read_endpoint_answers_404() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -198,7 +198,7 @@ async fn write_ticket_on_read_endpoint_answers_404() {
             verb: Verb::Write,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -254,7 +254,7 @@ async fn empty_file_serves_200_with_empty_body() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -305,7 +305,7 @@ async fn empty_file_range_request_answers_416() {
             verb: Verb::Read,
             ceiling: 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -367,6 +367,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         store,
         verifier,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -395,7 +396,7 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
             verb: Verb::Read,
             ceiling: 128,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
 
@@ -474,7 +475,7 @@ async fn content_length_present_on_full_response() {
             verb: Verb::Read,
             ceiling: total + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -539,7 +540,7 @@ async fn content_length_present_on_partial_response() {
             verb: Verb::Read,
             ceiling: total + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     // Request bytes 0-4 (5 bytes).
@@ -613,7 +614,7 @@ async fn content_length_present_on_empty_file_response() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -685,7 +686,7 @@ async fn suffix_byte_range_serves_206() {
             verb: Verb::Read,
             ceiling: total,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     // Request the last 4 bytes via suffix range.
@@ -749,6 +750,7 @@ async fn short_store_read_terminates_stream_with_error() {
         store,
         verifier,
         grace: std::time::Duration::from_secs(3600),
+        caller_settings: connetto_file_server::CallerSettings::default(),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -767,7 +769,7 @@ async fn short_store_read_terminates_stream_with_error() {
             verb: Verb::Read,
             ceiling: 64,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "alice".into(),
+            caller: crate::fixture::identified("alice"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -830,7 +832,7 @@ async fn cross_caller_read_with_visible_file_serves_200() {
             verb: Verb::Read,
             ceiling: total + 1024,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "bob".into(),
+            caller: crate::fixture::identified("bob"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -881,7 +883,7 @@ async fn unauthorized_caller_gets_404_even_with_own_manifest_row() {
             verb: Verb::Read,
             ceiling: 0,
             expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: "dave".into(),
+            caller: crate::fixture::identified("dave"),
         })
         .unwrap();
     let req = axum::http::Request::builder()
@@ -894,5 +896,113 @@ async fn unauthorized_caller_gets_404_even_with_own_manifest_row() {
         resp.status(),
         StatusCode::NOT_FOUND,
         "dave must be refused even though his manifest row exists; only the visibility function may authorize reads"
+    );
+}
+
+/// A ticket carrying only a share key serves the file that key may see.
+#[tokio::test]
+async fn a_key_only_ticket_serves() {
+    use crate::fixture::{connect_admin, insert_committed_manifest, register_file_ownership};
+    use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
+    use connetto_file_server::FsStore;
+    use http_body_util::BodyExt;
+
+    const SUBJECT: &str = "key:k1";
+
+    let pg = Pg::start_with_subjects().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let bytes = vec![0x5Au8; 96];
+    let hash = ChunkHash::from_bytes(*blake3::hash(&bytes).as_bytes());
+    {
+        let fs = FsStore::new(dir.path()).unwrap();
+        fs.write_chunk(&hash, &bytes).await.unwrap();
+    }
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let file_id = FileId::from_bytes([0xC1u8; 32]);
+    let chunks = vec![ChunkMeta { hash, len: 96 }];
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, SUBJECT, &chunks).await;
+    register_file_ownership(&mut admin_conn, &file_id, SUBJECT).await;
+    drop(admin_conn);
+
+    let token = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: u64::MAX,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: crate::fixture::keyed(SUBJECT),
+        })
+        .unwrap();
+    let id_hex = connetto_file_server::hex_32(file_id.as_bytes());
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a share-key holder's ticket must serve"
+    );
+    let body = resp.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(body.as_ref(), bytes.as_slice(), "the bytes are the file's");
+}
+
+/// The serve check binds the identity under the setting the deployment named.
+#[tokio::test]
+async fn a_renamed_identity_setting_serves() {
+    use crate::fixture::{
+        build_router_with_settings, connect_admin, insert_committed_manifest,
+        register_file_ownership,
+    };
+    use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
+    use connetto_file_server::{CallerSettings, FsStore};
+
+    let pg = Pg::start_with_own_setting().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let bytes = vec![0x77u8; 32];
+    let hash = ChunkHash::from_bytes(*blake3::hash(&bytes).as_bytes());
+    {
+        let fs = FsStore::new(dir.path()).unwrap();
+        fs.write_chunk(&hash, &bytes).await.unwrap();
+    }
+    let settings = CallerSettings {
+        user: "app.who".to_owned(),
+        ..CallerSettings::default()
+    };
+    let (app, signer) = build_router_with_settings(&pg, fs_store(&dir), settings).await;
+
+    let file_id = FileId::from_bytes([0xC2u8; 32]);
+    let chunks = vec![ChunkMeta { hash, len: 32 }];
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, "alice", &chunks).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
+    drop(admin_conn);
+
+    let token = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Read,
+            ceiling: u64::MAX,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: crate::fixture::identified("alice"),
+        })
+        .unwrap();
+    let id_hex = connetto_file_server::hex_32(file_id.as_bytes());
+    let req = axum::http::Request::builder()
+        .method("GET")
+        .uri(format!("/files/{id_hex}?t={token}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the file server must bind the identity under app.who"
     );
 }

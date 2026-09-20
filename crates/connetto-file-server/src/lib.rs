@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+mod caller;
 mod db;
 mod error;
 mod functions;
@@ -13,6 +14,8 @@ mod sweep;
 pub mod ticket;
 mod upload;
 
+pub use caller::CallerSettings;
+pub use connetto_core::auth::ContentCaller;
 pub use error::ServerError;
 pub use preflight::{PreflightError, preflight, preflight_reader};
 pub use router::{AppPools, Config, DbPool, serve};
