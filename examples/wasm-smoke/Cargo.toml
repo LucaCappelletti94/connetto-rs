@@ -11,6 +11,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# The deployment every browser demo here runs against, documents and all.
+connetto-demo-deployment = { path = "../deployment" }
 # The browser platform crate: transports, locks, leader election, the relay
 # hub, and the DB worker orchestration. This crate is its thin consumer,
 # supplying the demo schema and the baked template through DbWorkerConfig.
@@ -52,14 +54,7 @@ web-sys = { version = "0.3", features = [
 # The build script translates schema.sql through pg2sqlite and applies the
 # result to the replica template database shipped into the OPFS test.
 [build-dependencies]
-diesel = { version = "2", features = ["sqlite"] }
-# Held at the same major as the runtime dependency connetto-client pulls, because
-# cargo allows one package with `links = "sqlite3"` across the whole graph, host
-# build scripts included.
-libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = [
-  "std",
-] }
+connetto-demo-deployment = { path = "../deployment", features = ["build"] }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

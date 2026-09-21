@@ -14,35 +14,19 @@ pub use connetto_web::{
     RelayError, RelayHub, TabId, locks,
 };
 
-/// The Postgres schema source the demo server is launched with
-/// (`CONNETTO_PG_DDL_FILE`). Hashing it yields the version the server
-/// advertises, so a client that bakes the same source presents a matching
-/// version at handshake.
-pub const DEMO_SCHEMA_SQL: &str = include_str!("../../deployment/schema.sql");
+pub const DEMO_SCHEMA_SQL: &str = connetto_demo_deployment::SCHEMA_SQL;
 
 /// The policy source the same translation read, hashed into the version beside
 /// the schema because a changed policy changes the replica's own views.
-pub const DEMO_POLICIES_SQL: &str = include_str!("../../deployment/policies.sql");
+pub const DEMO_POLICIES_SQL: &str = connetto_demo_deployment::POLICIES_SQL;
 
 // The logical-to-physical table map and view list the build's translation
 // produced, as `POLICY_TABLES` and `POLICY_VIEWS`.
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
-/// The replica's local name for `current_setting('app.user_id')`, which
-/// `policies.sql` compares `orders.owner_id` against. connetto registers a
-/// function of this name returning the identity the replica belongs to, so the
-/// same policy filters the same rows locally and on the server.
-pub const CALLER_FUNCTION: &str = "current_app_user";
+pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
 
-/// The replica's local name for `current_setting('app.subjects')`, which
-/// `policies.sql` searches for `photos.owner_id`. connetto registers a
-/// function of this name returning the share keys the replica's caller holds,
-/// joined the way the server binds them, so the membership arm of that policy
-/// admits the same rows locally and on the server.
-///
-/// A caller holding no key answers NULL, and the translated search is NULL
-/// with it, so the arm admits nothing rather than everything.
-pub const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 
 /// Where the browser stack serves the share key it minted for this run.
 ///
@@ -116,7 +100,7 @@ pub fn demo_policy_tables() -> connetto_client::PolicyTables {
 /// relay) presents this so its handshake is not rejected as stale.
 #[must_use]
 pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_core::SchemaVersion::from_sources([DEMO_SCHEMA_SQL, DEMO_POLICIES_SQL])
+    connetto_demo_deployment::schema_version()
 }
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a

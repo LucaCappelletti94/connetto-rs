@@ -5,14 +5,9 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
-// SchemaVersion hashes this string, so it is the one document the deployment
-// applies rather than a copy of it: examples/deployment holds the schema, the
-// policies and the roles every demo here shares with the browser-stack server.
-pub const SCHEMA_SQL: &str = include_str!("../../deployment/schema.sql");
+pub const SCHEMA_SQL: &str = connetto_demo_deployment::SCHEMA_SQL;
 
-/// The policy source the translation read beside the schema, hashed into the
-/// version with it because a changed policy changes the replica's own views.
-pub const POLICIES_SQL: &str = include_str!("../../deployment/policies.sql");
+pub const POLICIES_SQL: &str = connetto_demo_deployment::POLICIES_SQL;
 
 pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
@@ -25,12 +20,9 @@ pub const DEMO_TAB_DDL: &str = concat!(
 pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
-pub const CALLER_FUNCTION: &str = "current_app_user";
+pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
 
-/// The replica's local name for the share keys the caller holds, which the
-/// membership arm of `photos_p` searches. A boot holding no key answers NULL,
-/// so that arm admits nothing.
-pub const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 
 // Each test gets unique OPFS filenames so Chrome's delayed handle release after
 // Worker.terminate() never blocks the next worker's file open.
@@ -45,7 +37,7 @@ const PHOTO_AUTH_DB: &str = "connetto-yew-photo-auth.sqlite";
 /// The schema version this build was compiled against.
 #[must_use]
 pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_core::SchemaVersion::from_sources([SCHEMA_SQL, POLICIES_SQL])
+    connetto_demo_deployment::schema_version()
 }
 
 #[diesel::declare_sql_function]

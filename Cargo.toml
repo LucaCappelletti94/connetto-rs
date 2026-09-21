@@ -10,6 +10,9 @@ members = [
   "crates/connetto-file-core",
   "crates/connetto-file-server",
   "crates/connetto-file-client",
+  # The documents and the build-time translation every browser demo shares.
+  # A member rather than an exclusion, so the root gate lints it with the rest.
+  "examples/deployment",
 ]
 exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
 

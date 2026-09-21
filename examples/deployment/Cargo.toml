@@ -1,0 +1,31 @@
+[package]
+name = "connetto-demo-deployment"
+description = "The one deployment the browser demos share: its schema, its policies, its roles, and the build-time translation that turns them into a replica."
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+publish = false
+repository = "https://github.com/LucaCappelletti94/connetto-rs"
+
+[dependencies]
+# SchemaVersion, so every demo and the server hash the same documents the same
+# way. A demo that computed its own would drift from the deployment it talks to.
+connetto-core = { path = "../../crates/connetto-core", default-features = false }
+
+# The build-time half. Optional because a demo depends on this crate twice, once
+# to read the documents at run time and once from its build script to translate
+# them, and only the second needs a translator. The resolver keeps the features
+# of a build dependency out of the normal one, so nothing here reaches wasm.
+diesel = { version = "2.3", default-features = false, features = [
+  "sqlite",
+  "returning_clauses_for_sqlite_3_35",
+], optional = true }
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, optional = true }
+
+[features]
+default = []
+build = ["dep:diesel", "dep:pg2sqlite"]
+
+[lints.rust]
+missing_docs = "deny"

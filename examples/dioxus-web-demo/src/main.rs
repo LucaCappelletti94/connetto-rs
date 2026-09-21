@@ -62,14 +62,6 @@ type Tab = MessageTransport<BroadcastChannel>;
 
 /// The demo server the DB worker connects upstream to.
 const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
-/// The Postgres schema source the demo server is launched with. Hashing it
-/// yields the version the server advertises, so this build presents a matching
-/// version at handshake and is not rejected as stale.
-const SCHEMA_SQL: &str = include_str!("../../deployment/schema.sql");
-
-/// The policy source hashed into the advertised version beside the schema,
-/// because a changed policy changes the replica's own views.
-const POLICIES_SQL: &str = include_str!("../../deployment/policies.sql");
 /// The synced replica schema (worker first boot, policy-split by build.rs from schema.sql +
 /// policies.sql). The tab mirror uses a simpler non-split DDL below.
 const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
@@ -84,12 +76,12 @@ const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The extra upstream subscription for photos.
 const PHOTO_QUERY: &str = "SELECT * FROM photos";
 /// SQLite function name a translated policy calls for the caller identity.
-const CALLER_FUNCTION: &str = "current_app_user";
+const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
 
 /// The replica's local name for the share keys the caller holds, which the
 /// membership arm of `photos_p` searches. A boot holding no key answers NULL,
 /// so that arm admits nothing.
-const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 /// The OPFS file holding the worker's durable synced replica (base name; the
 /// worker appends the identity hash so each account gets its own encrypted file).
 const DB_NAME: &str = "connetto-relay.sqlite";
@@ -430,30 +422,27 @@ async fn run_db_worker() -> Result<(), JsValue> {
         .with_login_base_url(Some(AUTH_ORIGIN.to_owned())),
     );
     let booted = workers::boot_db_worker::<String>(
-        &workers::DbWorkerConfig::new(connetto_core::SchemaVersion::from_sources([
-            SCHEMA_SQL,
-            POLICIES_SQL,
-        ]))
-        .with_ws_url(DEMO_WS_URL)
-        .with_replica_db_prefix(DB_NAME)
-        .with_replica_ddl(DEMO_SQLITE_DDL)
-        .with_frontend_ddl(FRONTEND_DDL)
-        .with_upstream_sub_id("db-upstream")
-        .with_upstream_query(DEMO_QUERY)
-        .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-        .with_hub_meta_name("connetto-hub-meta.sqlite")
-        .with_content_namespace("connetto-photo-content")
-        .with_sql_functions(uuidv4_functions())
-        .with_policy_tables(PolicyTables::from_translation(
-            POLICY_TABLES.iter().copied(),
-            POLICY_VIEWS.iter().copied(),
-        ))
-        .with_caller_function(CALLER_FUNCTION)
-        .with_subjects_function(SUBJECTS_FUNCTION)
-        .with_auth(auth)
-        .with_auth_db_name(AUTH_DB_NAME)
-        .with_unlock(true)
-        .with_pick_account(true),
+        &workers::DbWorkerConfig::new(connetto_demo_deployment::schema_version())
+            .with_ws_url(DEMO_WS_URL)
+            .with_replica_db_prefix(DB_NAME)
+            .with_replica_ddl(DEMO_SQLITE_DDL)
+            .with_frontend_ddl(FRONTEND_DDL)
+            .with_upstream_sub_id("db-upstream")
+            .with_upstream_query(DEMO_QUERY)
+            .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
+            .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_content_namespace("connetto-photo-content")
+            .with_sql_functions(uuidv4_functions())
+            .with_policy_tables(PolicyTables::from_translation(
+                POLICY_TABLES.iter().copied(),
+                POLICY_VIEWS.iter().copied(),
+            ))
+            .with_caller_function(CALLER_FUNCTION)
+            .with_subjects_function(SUBJECTS_FUNCTION)
+            .with_auth(auth)
+            .with_auth_db_name(AUTH_DB_NAME)
+            .with_unlock(true)
+            .with_pick_account(true),
     )
     .await?;
     // Post all three session fields in one JS object so the page can show the
@@ -544,10 +533,7 @@ async fn boot_window() -> Result<Boot, JsValue> {
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let content = Rc::new(TabContent::new(&mut transport));
     let config = ClientConfig::new(client_id.clone())
-        .with_schema_version(Some(connetto_core::SchemaVersion::from_sources([
-            SCHEMA_SQL,
-            POLICIES_SQL,
-        ])))
+        .with_schema_version(Some(connetto_demo_deployment::schema_version()))
         .with_sql_functions(uuidv4_functions())
         // No with_policy_tables: the tab mirror uses the simple non-split DDL and the
         // server's CDC already filters rows to the authenticated user's identity.
