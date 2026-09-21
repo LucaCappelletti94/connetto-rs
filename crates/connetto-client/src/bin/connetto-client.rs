@@ -52,10 +52,13 @@ async fn main() -> Result<()> {
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
     // Declared only when a shared canonical source is provided, matching the
     // server's version. Absent, the client declares nothing and a versioned
-    // server rejects it.
-    let schema_version = read_ddl("CONNETTO_SCHEMA_SQL")
-        .ok()
-        .map(|source| connetto_core::SchemaVersion::from_source(&source));
+    // server rejects it. The policy source belongs in the hash beside the
+    // schema, because a policy decides which view a logical name resolves to
+    // on the replica, and a deployment with no policies states none.
+    let schema_version = read_ddl("CONNETTO_SCHEMA_SQL").ok().map(|schema| {
+        let policies = read_ddl("CONNETTO_POLICIES_SQL").unwrap_or_default();
+        connetto_core::SchemaVersion::from_sources([schema.as_str(), policies.as_str()])
+    });
     let client_id = var_or("CONNETTO_CLIENT_ID", "anonymous");
     let config = ClientConfig::new(client_id)
         // CONNETTO_TOKEN carries the caller's identity grant. Unset means no

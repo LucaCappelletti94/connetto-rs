@@ -984,10 +984,6 @@ async fn main() -> Result<()> {
     let bind = var_or("CONNETTO_BIND", "127.0.0.1:8080");
     let database_url = std::env::var("DATABASE_URL").context("set DATABASE_URL")?;
     let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
-    // Beside the schema in the advertised version: a policy decides which view
-    // a logical name resolves to on a replica, so a changed policy makes an
-    // existing replica stale and a client holding one has to be told.
-    let pg_policies = read_ddl("CONNETTO_PG_POLICIES")?;
     let slot = var_or("CONNETTO_SLOT", "connetto_slot");
     let publication = var_or("CONNETTO_PUBLICATION", "connetto_pub");
     let oplog_table = var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog");
@@ -1041,6 +1037,12 @@ async fn main() -> Result<()> {
     let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
         .map_err(|err| anyhow!("building snapshot source: {err}"))?
         .with_publication(publication.as_str());
+    // Read here rather than at the top, so the startup refusals that come
+    // before this one keep their order. It goes into the version the server
+    // advertises beside the schema, because a policy decides which view a
+    // logical name resolves to on a replica, so a changed policy makes an
+    // existing replica stale and a client holding one has to be told.
+    let pg_policies = read_ddl("CONNETTO_PG_POLICIES")?;
     let (auth, translator, reach) =
         build_authorization(&pool, &reader_pool, &pg_ddl, &pg_policies, &publication).await?;
     // The membership term's subquery classifies against the deployment's own

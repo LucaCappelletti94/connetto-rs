@@ -297,7 +297,16 @@ fn spawn_client(
     write: Option<&str>,
 ) -> ChildGuard {
     spawn_client_env(
-        ws, db_path, client_id, SQLITE_DDL, PG_DDL, "orders", QUERY, token, write,
+        ws,
+        db_path,
+        client_id,
+        SQLITE_DDL,
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+        QUERY,
+        token,
+        write,
     )
 }
 
@@ -311,6 +320,7 @@ fn spawn_client_env(
     client_id: &str,
     sqlite_ddl: &str,
     schema_sql: &str,
+    policies_sql: &str,
     sub_id: &str,
     query: &str,
     token: &str,
@@ -324,6 +334,9 @@ fn spawn_client_env(
         // The client hashes the SAME canonical source the server does, so the
         // handshake schema versions match. Distinct from the SQLite replica DDL.
         .env("CONNETTO_SCHEMA_SQL", schema_sql)
+        // Beside it, because the server hashes both into the version it
+        // advertises: a policy decides what the replica's own views admit.
+        .env("CONNETTO_POLICIES_SQL", policies_sql)
         .env("CONNETTO_CLIENT_ID", client_id)
         .env("CONNETTO_TOKEN", token)
         .env("CONNETTO_SUB_ID", sub_id)
@@ -870,6 +883,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         "alice",
         OWNED_SQLITE_DDL,
         OWNED_PG_DDL,
+        OWNED_POLICIES,
         "owned",
         OWNED_QUERY,
         &alice_token,
