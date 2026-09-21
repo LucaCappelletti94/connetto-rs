@@ -18,6 +18,15 @@ use pg2sqlite::prelude::{
 /// connetto opens, returning the identity the replica was opened for.
 const CALLER_FUNCTION: &str = "current_app_user";
 
+/// The replica's local name for the share keys the caller holds, which the
+/// membership arm of `photos_p` searches.
+const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+
+/// The character joining those keys, mirroring the deployment key type's
+/// `CapabilityKey::SEPARATOR`, hardcoded for the same reason the write
+/// exemption name is: a build script cannot cheaply depend on the server.
+const SUBJECTS_SEPARATOR: char = ',';
+
 diesel::table! {
     /// SQLite's own catalogue, read to list the views the translation created.
     /// Deducing them from the table names instead would bake pg2sqlite's
@@ -40,6 +49,10 @@ fn options() -> Pg2SqliteOptions {
             "app.user_id",
             CALLER_FUNCTION,
         ))
+        .with_session_variable(
+            SessionVariableMapping::current_setting("app.subjects", SUBJECTS_FUNCTION)
+                .holding_set(SUBJECTS_SEPARATOR),
+        )
         .with_rls_audit_table_name("rls_audit".to_string())
         // connetto_client::WRITE_EXEMPTION_FUNCTION, hardcoded because a build
         // script cannot cheaply depend on the client crate. connetto registers

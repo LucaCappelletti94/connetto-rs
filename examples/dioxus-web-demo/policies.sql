@@ -22,5 +22,15 @@ CREATE POLICY order_lines_p ON order_lines USING (owner_id = current_setting('ap
 -- owner is repeated on the row as it is on order_lines, so the comparison
 -- settles from the row itself. The file server's visibility function consults
 -- exactly this table under the caller's identity.
+--
+-- This one also admits a caller holding a share key naming the owner, which
+-- is chapter 12's union row. The keys arrive as one delimited setting because
+-- a policy compares against bound values, and both ends read that setting the
+-- same way: Postgres splits it with string_to_array, and the replica's
+-- translation turns the whole membership test into a search over the same
+-- string.
 ALTER TABLE photos ENABLE ROW LEVEL SECURITY;
-CREATE POLICY photos_p ON photos USING (owner_id = current_setting('app.user_id', true));
+CREATE POLICY photos_p ON photos USING (
+  owner_id = current_setting('app.user_id', true)
+  OR owner_id = ANY(string_to_array(current_setting('app.subjects', true), ','))
+);

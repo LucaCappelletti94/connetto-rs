@@ -26,6 +26,11 @@ pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
 pub const CALLER_FUNCTION: &str = "current_app_user";
 
+/// The replica's local name for the share keys the caller holds, which the
+/// membership arm of `photos_p` searches. A boot holding no key answers NULL,
+/// so that arm admits nothing.
+pub const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+
 // Each test gets unique OPFS filenames so Chrome's delayed handle release after
 // Worker.terminate() never blocks the next worker's file open.
 const ALIGN_DB_PREFIX: &str = "connetto-yew-align";
@@ -111,6 +116,7 @@ async fn boot_with(
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(demo_policy_tables())
             .with_caller_function(CALLER_FUNCTION)
+            .with_subjects_function(SUBJECTS_FUNCTION)
             .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                 "http://127.0.0.1:18099",
                 "dev-idp",

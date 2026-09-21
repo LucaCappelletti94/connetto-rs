@@ -305,7 +305,8 @@ async fn connect_tab(
         .with_schema_version(Some(demo_schema_version()))
         .with_sql_functions(uuidv4_functions())
         .with_policy_tables(demo_policy_tables())
-        .with_caller(CALLER_FUNCTION, Some(identity));
+        .with_caller(CALLER_FUNCTION, Some(identity))
+        .with_share_keys::<String>(connetto_dioxus_web_demo::SUBJECTS_FUNCTION, []);
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

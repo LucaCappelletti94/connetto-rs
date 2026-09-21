@@ -87,6 +87,11 @@ const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 const PHOTO_QUERY: &str = "SELECT * FROM photos";
 /// SQLite function name a translated policy calls for the caller identity.
 const CALLER_FUNCTION: &str = "current_app_user";
+
+/// The replica's local name for the share keys the caller holds, which the
+/// membership arm of `photos_p` searches. A boot holding no key answers NULL,
+/// so that arm admits nothing.
+const SUBJECTS_FUNCTION: &str = "current_app_subjects";
 /// The OPFS file holding the worker's durable synced replica.
 const DB_NAME: &str = "connetto-relay.sqlite";
 /// The shared leader lock every window of this app races.
@@ -345,6 +350,7 @@ async fn run_db_worker() -> Result<(), JsValue> {
             POLICY_VIEWS.iter().copied(),
         ))
         .with_caller_function(CALLER_FUNCTION)
+        .with_subjects_function(SUBJECTS_FUNCTION)
         .with_auth(auth)
         .with_auth_db_name("connetto-auth.sqlite")
         .with_unlock(true)
