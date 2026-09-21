@@ -107,20 +107,32 @@ async fn maybe_spawn_server() -> Option<ServerGuard> {
     Some(ServerGuard(child))
 }
 
-/// The upstream schema version, hashed from the very file the server was started
-/// with. A client that presents no version is refused rather than waved through,
-/// which is right: not knowing its schema is not evidence of being current.
+/// The upstream schema version, hashed from the very files the server was
+/// started with, the schema and the policies both. A client that presents no
+/// version is refused rather than waved through, which is right: not knowing
+/// its schema is not evidence of being current.
 fn schema_version() -> connetto_core::SchemaVersion {
-    let path = std::env::var("CONNETTO_TEST_PG_DDL_FILE").unwrap_or_else(|_| {
+    fn source(var: &str, fallback: &str) -> String {
+        let path = std::env::var(var).unwrap_or_else(|_| fallback.to_owned());
+        std::fs::read_to_string(&path)
+            .unwrap_or_else(|err| panic!("reading the upstream source at {path}: {err}"))
+    }
+
+    let ddl = source(
+        "CONNETTO_TEST_PG_DDL_FILE",
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/wasm-smoke/schema.sql"
-        )
-        .to_owned()
-    });
-    let ddl = std::fs::read_to_string(&path)
-        .unwrap_or_else(|err| panic!("reading the upstream DDL at {path}: {err}"));
-    connetto_core::SchemaVersion::from_source(&ddl)
+            "/../../examples/deployment/schema.sql"
+        ),
+    );
+    let policies = source(
+        "CONNETTO_TEST_PG_POLICIES_FILE",
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../examples/deployment/policies.sql"
+        ),
+    );
+    connetto_core::SchemaVersion::from_sources([ddl.as_str(), policies.as_str()])
 }
 
 /// A high-entropy value for the PKCE verifier and the CSRF state, both of which

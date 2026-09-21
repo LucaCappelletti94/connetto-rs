@@ -11,6 +11,8 @@ publish = false
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
+# The deployment every browser demo here runs against, documents and all.
+connetto-demo-deployment = { path = "../deployment" }
 # The browser platform: transports, leader election, locks, the relay hub,
 # and the DB worker orchestration. The demo supplies its schema and baked
 # template through DbWorkerConfig.
@@ -78,14 +80,8 @@ connetto-file-client = { path = "../../crates/connetto-file-client" }
 # bakes a template per tier, so the app ships every tier's schema pre-applied
 # and never executes DDL at startup. Same pipeline as the dioxus demo.
 [build-dependencies]
-diesel = { version = "2", features = ["sqlite"] }
-# Held at the same major as the runtime dependency connetto-client pulls, because
-# cargo allows one package with `links = "sqlite3"` across the whole graph, host
-# build scripts included.
-libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+connetto-demo-deployment = { path = "../deployment", features = ["build"] }
 
-# Standalone workspace: a wasm app built by trunk, never entering the root gate.
 [workspace]
 
 # Verbatim mirror of the root workspace patch blocks. Cargo patches do not

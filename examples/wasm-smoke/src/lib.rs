@@ -14,21 +14,76 @@ pub use connetto_web::{
     RelayError, RelayHub, TabId, locks,
 };
 
-/// The Postgres schema source the demo server is launched with
-/// (`CONNETTO_PG_DDL_FILE`). Hashing it yields the version the server
-/// advertises, so a client that bakes the same source presents a matching
-/// version at handshake.
-pub const DEMO_SCHEMA_SQL: &str = include_str!("../schema.sql");
+pub const DEMO_SCHEMA_SQL: &str = connetto_demo_deployment::SCHEMA_SQL;
+
+/// The policy source the same translation read, hashed into the version beside
+/// the schema because a changed policy changes the replica's own views.
+pub const DEMO_POLICIES_SQL: &str = connetto_demo_deployment::POLICIES_SQL;
 
 // The logical-to-physical table map and view list the build's translation
 // produced, as `POLICY_TABLES` and `POLICY_VIEWS`.
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
-/// The replica's local name for `current_setting('app.user_id')`, which
-/// `policies.sql` compares `orders.owner_id` against. connetto registers a
-/// function of this name returning the identity the replica belongs to, so the
-/// same policy filters the same rows locally and on the server.
-pub const CALLER_FUNCTION: &str = "current_app_user";
+pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
+
+pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
+
+/// Where the browser stack serves the share key it minted for this run.
+///
+/// A real deployment hands a key to whoever opened a share link. A demo has
+/// no sharing surface of its own, so it asks the stack, at run time rather
+/// than at build time: a value baked into the binary survives a rebuild that
+/// the database's own rows do not.
+pub const SHARE_URL: &str = "http://127.0.0.1:18099/dev/share";
+
+/// The share key this run minted, as the signed grant and the subject it
+/// names, with the photo only that key reaches.
+///
+/// # Errors
+///
+/// The fetch or the answer's shape, as text, when the stack is not serving.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_share() -> Result<(String, String, String), String> {
+    use wasm_bindgen::JsCast as _;
+
+    fn field(body: &str, name: &str) -> Option<String> {
+        let opening = body.find(&format!("\"{name}\":\""))? + name.len() + 4;
+        let rest = body.get(opening..)?;
+        let closing = rest.find('"')?;
+        Some(rest.get(..closing)?.to_owned())
+    }
+
+    let scope: web_sys::WorkerGlobalScope = js_sys::global()
+        .dyn_into()
+        .map_err(|_| "the share key is fetched from a worker".to_owned())?;
+    let response: web_sys::Response =
+        wasm_bindgen_futures::JsFuture::from(scope.fetch_with_str(SHARE_URL))
+            .await
+            .map_err(|err| format!("{err:?}"))?
+            .dyn_into()
+            .map_err(|_| "the share route answered no response".to_owned())?;
+    let body =
+        wasm_bindgen_futures::JsFuture::from(response.text().map_err(|err| format!("{err:?}"))?)
+            .await
+            .map_err(|err| format!("{err:?}"))?
+            .as_string()
+            .ok_or_else(|| "the share route answered no text".to_owned())?;
+    let grant = field(&body, "grant").ok_or_else(|| format!("no grant in {body}"))?;
+    let subject = field(&body, "subject").ok_or_else(|| format!("no subject in {body}"))?;
+    let photo = field(&body, "photo").ok_or_else(|| format!("no photo in {body}"))?;
+    Ok((grant, subject, photo))
+}
+
+/// The grant and subject halves of [`fetch_share`].
+///
+/// # Errors
+///
+/// As [`fetch_share`].
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_share_key() -> Result<(String, String), String> {
+    let (grant, subject, _) = fetch_share().await?;
+    Ok((grant, subject))
+}
 
 /// The tables `schema.sql` plus `policies.sql` split, for
 /// `ClientConfig::with_policy_tables`.
@@ -45,7 +100,7 @@ pub fn demo_policy_tables() -> connetto_client::PolicyTables {
 /// relay) presents this so its handshake is not rejected as stale.
 #[must_use]
 pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_core::SchemaVersion::from_source(DEMO_SCHEMA_SQL)
+    connetto_demo_deployment::schema_version()
 }
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
@@ -194,6 +249,7 @@ pub mod workers {
                 .with_sql_functions(crate::uuidv4_functions())
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
+                .with_subjects_function(crate::SUBJECTS_FUNCTION)
                 .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                     "http://127.0.0.1:18099",
                     "dev-idp",
@@ -228,6 +284,52 @@ pub mod workers {
                 .with_sql_functions(crate::uuidv4_functions())
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
+                .with_subjects_function(crate::SUBJECTS_FUNCTION)
+                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
+                    "http://127.0.0.1:18099",
+                    "dev-idp",
+                    "http://127.0.0.1:18099/dev/landing",
+                )))
+                .with_auth_db_name("connetto-auth.sqlite"),
+        )
+        .await
+        .map(drop)
+        .map_err(JsValue::from)
+    }
+
+    /// DB worker entry point for the share-key test binary: the same photo
+    /// tier, booted holding the key the stack minted.
+    ///
+    /// The key stands for one a user obtained by opening a share link. This
+    /// demo takes it from the environment the browser stack exported, because
+    /// a test needs the same key the stack seeded a row for.
+    ///
+    /// # Errors
+    ///
+    /// A string describing the VFS, upstream connect, or subscribe failure.
+    #[wasm_bindgen]
+    pub async fn db_worker_share_boot() -> Result<(), JsValue> {
+        connetto_web::logging::init_console();
+        let (grant, subject) = crate::fetch_share_key()
+            .await
+            .map_err(|err| JsValue::from_str(&format!("fetching the demo share key: {err}")))?;
+        let share_keys = [(grant, subject)];
+        connetto_web::workers::boot_db_worker::<String>(
+            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
+                .with_ws_url(DEMO_WS_URL)
+                .with_replica_db_prefix(DB_NAME)
+                .with_replica_ddl(DEMO_SQLITE_DDL)
+                .with_frontend_ddl(DEMO_FRONTEND_DDL)
+                .with_upstream_sub_id("db-upstream")
+                .with_upstream_query(DEMO_QUERY)
+                .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
+                .with_hub_meta_name("connetto-hub-meta.sqlite")
+                .with_content_namespace("connetto-photo-content")
+                .with_sql_functions(crate::uuidv4_functions())
+                .with_policy_tables(crate::demo_policy_tables())
+                .with_caller_function(crate::CALLER_FUNCTION)
+                .with_subjects_function(crate::SUBJECTS_FUNCTION)
+                .with_share_keys(share_keys)
                 .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                     "http://127.0.0.1:18099",
                     "dev-idp",
@@ -262,6 +364,7 @@ pub mod workers {
                 .with_sql_functions(crate::uuidv4_functions())
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
+                .with_subjects_function(crate::SUBJECTS_FUNCTION)
                 .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                     "http://127.0.0.1:18099",
                     "dev-idp",
@@ -296,6 +399,7 @@ pub mod workers {
                 .with_sql_functions(crate::uuidv4_functions())
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
+                .with_subjects_function(crate::SUBJECTS_FUNCTION)
                 .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                     "http://127.0.0.1:18099",
                     "dev-idp",

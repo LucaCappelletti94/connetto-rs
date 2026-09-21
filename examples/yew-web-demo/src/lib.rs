@@ -5,9 +5,9 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
-// SchemaVersion hashes this string; it must be byte-identical to
-// examples/wasm-smoke/schema.sql, which the browser-stack server uses.
-pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
+pub const SCHEMA_SQL: &str = connetto_demo_deployment::SCHEMA_SQL;
+
+pub const POLICIES_SQL: &str = connetto_demo_deployment::POLICIES_SQL;
 
 pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
@@ -20,7 +20,9 @@ pub const DEMO_TAB_DDL: &str = concat!(
 pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
-pub const CALLER_FUNCTION: &str = "current_app_user";
+pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
+
+pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 
 // Each test gets unique OPFS filenames so Chrome's delayed handle release after
 // Worker.terminate() never blocks the next worker's file open.
@@ -35,7 +37,7 @@ const PHOTO_AUTH_DB: &str = "connetto-yew-photo-auth.sqlite";
 /// The schema version this build was compiled against.
 #[must_use]
 pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_core::SchemaVersion::from_source(SCHEMA_SQL)
+    connetto_demo_deployment::schema_version()
 }
 
 #[diesel::declare_sql_function]
@@ -107,6 +109,7 @@ async fn boot_with(
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(demo_policy_tables())
             .with_caller_function(CALLER_FUNCTION)
+            .with_subjects_function(SUBJECTS_FUNCTION)
             .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
                 "http://127.0.0.1:18099",
                 "dev-idp",

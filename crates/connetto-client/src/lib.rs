@@ -560,6 +560,43 @@ pub struct ResidualPressure {
     pub freelist_percent: u8,
 }
 
+/// The subject set a replica answers its membership arms with.
+///
+/// Holds the grants beside their subjects so the rendering can drop a key
+/// whose grant has died, which is what keeps the replica from admitting rows
+/// the server refuses.
+#[derive(Debug, Clone)]
+struct SubjectSource {
+    function: String,
+    separator: char,
+    keys: Vec<(Grant, String)>,
+}
+
+impl SubjectSource {
+    /// The value the registered function answers at `now`, or `None` when the
+    /// caller holds no key that is still alive.
+    ///
+    /// Sorted and deduplicated, so one holder renders one value whatever order
+    /// its keys arrived in, and joined by the deployment's own separator, which
+    /// no single key may contain.
+    fn rendered(&self, now: i64) -> Option<String> {
+        let mut alive: Vec<&str> = self
+            .keys
+            .iter()
+            .filter(|(grant, _)| !grant_expiry::has_expired(grant, now))
+            .map(|(_, subject)| subject.as_str())
+            .collect();
+        alive.sort_unstable();
+        alive.dedup();
+        (!alive.is_empty()).then(|| alive.join(&self.separator.to_string()))
+    }
+
+    /// Every grant the handshake should present for these keys.
+    fn grants(&self) -> impl Iterator<Item = &Grant> {
+        self.keys.iter().map(|(grant, _)| grant)
+    }
+}
+
 /// What the client presents at the handshake.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -608,14 +645,20 @@ pub struct ClientConfig {
     /// to the identity it was named from.
     caller: Option<(String, String)>,
     /// What a translated policy means by the caller's subject set: the SQLite
-    /// function name the deployment mapped its subjects setting onto, and the
-    /// packed set it returns.
+    /// function name the deployment mapped its subjects setting onto, the
+    /// separator it joins the set with, and each key the caller holds as the
+    /// grant that proves it beside the subject it renders as.
     ///
-    /// Packed once here through [`CapabilityKey::pack`], the same rendering
-    /// the server binds into the setting, so the replica's local answer and
-    /// the server's cannot disagree about which keys the caller holds. `None`
-    /// when no policy names the set.
-    subjects: Option<(String, Option<String>)>,
+    /// The pair travels rather than the rendering alone, because the two
+    /// halves answer different ends and may not disagree: the grant is what
+    /// the handshake presents, so the server reads the key into the setting it
+    /// binds, and the subject is what the replica compares locally. Registering
+    /// a subject whose grant has died would leave a durable replica serving
+    /// rows the server no longer admits, so the set is rendered from the same
+    /// live grants the handshake presents.
+    ///
+    /// `None` when no policy names the set.
+    subjects: Option<SubjectSource>,
     /// Percentage of `page_count` the freelist must reach before the trimming
     /// pass runs. Local to this device and never sent to the server: trimming
     /// is a whole-replica operation, not a handshake input. Defaults to
@@ -705,29 +748,39 @@ impl ClientConfig {
     }
 
     /// What the replica's translated policies mean by the caller's subject
-    /// set: the share keys it holds beside its identity.
+    /// set: the share keys it holds, each as the grant that proves it beside
+    /// the subject it names.
     ///
     /// `function` is the SQLite function name the build mapped the subjects
-    /// setting onto, and `subjects` are the keys the caller holds, packed
-    /// through their own `Key`. That type is the deployment's and carries
-    /// its separator and its packing, which is what makes the replica unable
-    /// to disagree with the server about which keys are held: both ends call
-    /// one rendering rather than spelling it twice. Holding none is stated by
-    /// passing none, which leaves the function answering `NULL` and every
-    /// membership over the set admitting nothing.
+    /// setting onto. The keys are rendered through their own `Key`, which is
+    /// the deployment's type and carries the separator its translation
+    /// declared, so the replica's local answer and the server's binding cannot
+    /// disagree about which keys are held. Holding none is stated by passing
+    /// none, which leaves the function answering `NULL` and every membership
+    /// over the set admitting nothing.
     ///
-    /// Distinct from [`with_capabilities`](Self::with_capabilities), which is
-    /// what the handshake presents to the server. This is what the replica
-    /// answers its own policies with, and a deployment sets both.
+    /// Both halves of a key travel together because they answer different
+    /// ends, and neither is sufficient. The grant is what the handshake
+    /// presents, so the server reads the key into the setting it binds, and
+    /// these grants are presented beside any set through
+    /// [`with_capabilities`](Self::with_capabilities). The subject is what the
+    /// replica compares locally, and a subject whose grant has died is left
+    /// out of the rendering, so a durable replica cannot keep serving rows the
+    /// server has stopped admitting.
     #[must_use]
-    pub fn with_subjects<Key: CapabilityKey>(
+    pub fn with_share_keys<Key: CapabilityKey>(
         mut self,
         function: impl Into<String>,
-        subjects: &[CapabilitySubject<Key>],
+        keys: impl IntoIterator<Item = (Grant, CapabilitySubject<Key>)>,
     ) -> Self {
-        let packed = connetto_core::auth::ContentCaller::new(None, Key::subjects(subjects))
-            .packed_subjects(Key::SEPARATOR);
-        self.subjects = Some((function.into(), packed));
+        self.subjects = Some(SubjectSource {
+            function: function.into(),
+            separator: Key::SEPARATOR,
+            keys: keys
+                .into_iter()
+                .map(|(grant, subject)| (grant, subject.key().to_string()))
+                .collect(),
+        });
         self
     }
 
@@ -2038,6 +2091,7 @@ where
         config
             .capabilities
             .iter()
+            .chain(config.subjects.iter().flat_map(SubjectSource::grants))
             .filter(|grant| !grant_expiry::has_expired(grant, now))
             .cloned(),
     );
@@ -2396,8 +2450,12 @@ where
         if let Some((function, identity)) = &config.caller {
             register_caller(&mut db, function, identity.clone())?;
         }
-        if let Some((function, packed)) = &config.subjects {
-            register_subjects(&mut db, function, packed.clone())?;
+        if let Some(subjects) = &config.subjects {
+            // Rendered against the replica's own clock, the one this crate
+            // reads, so a key whose grant has died is left out here exactly as
+            // the handshake leaves it out of what it presents.
+            let now = crate::clock::now_secs(&mut db)?;
+            register_subjects(&mut db, &subjects.function, subjects.rendered(now))?;
         }
         // Beside the caller function and for the same reach: the generated
         // write guards call it, so it exists before any trigger can run. A

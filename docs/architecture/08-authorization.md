@@ -188,6 +188,8 @@ Two constraints, both verified. The preference is chosen per request and not per
 
 `FatalErrorReason::SessionRevoked` (`crates/connetto-core/src/messages/error.rs`) is **Built**: it is constructed at `crates/connetto-server/src/bin/connetto-server.rs:597` and in `AuthService::revoke` (`crates/connetto-server/src/authn/service.rs:376-379`), which is R2's wiring landing as the sentence here predicted.
 
+**The store must accept a duplicate write, which sets a minimum OpenFGA version. Measured 2026-09-21.** A row-settled fact is applied straight from the change stream without reading the store first, deliberately, because the read would cost a round trip per event to learn what the stream already said. So a row whose fact is re-derived is written again, and where a policy compiles to a per-row conditional gate that rewrite is the same tuple. Every write `subql` sends carries `on_duplicate: ignore` for exactly this, and a server predating that field drops it silently, because protobuf ignores unknown fields, and refuses with "cannot write a tuple which already exists". The upkeep loop then holds the event and retries it with a five second backoff forever, so authorization stops advancing while the server stays up and answers. Measured against the same store, model and tuple written twice: `v1.8.13` refuses the second write, `v1.11.6` accepts it. The fixture pins the accepting version, and a deployment on an older server has this waiting for its first policy with a conditional gate.
+
 ---
 
 ## Write authorization

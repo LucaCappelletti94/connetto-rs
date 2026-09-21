@@ -10,6 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
 use axum::routing::get;
+use connetto_core::auth::CapabilitySubject;
+use connetto_server::capability::MintCapabilityKey;
 use connetto_server::{
     AuthConfig, AuthService, DbAuthStore, DefaultUuidResolver, GenericOidcProvider,
     ProviderRegistry, RedirectPolicy, RequestGuard, TokenAuthority, auth_router,
@@ -33,12 +35,15 @@ const CONTENT_BIND: &str = "127.0.0.1:18100";
 const CONTENT_BASE: &str = "http://127.0.0.1:18100";
 const CALLBACK: &str = "http://127.0.0.1:18099/auth/callback";
 const LANDING_PATH: &str = "/dev/landing";
+/// Where a suite fetches the share key this run minted, standing in for
+/// whatever a deployment's own sharing hands a user.
+const SHARE_PATH: &str = "/dev/share";
 const CALLER_FUNCTION: &str = "current_app_user";
 const BROWSER_PROVIDER: &str = "dev-idp";
 
-const SCHEMA_SQL: &str = include_str!("../../../../examples/wasm-smoke/schema.sql");
-const POLICIES_SQL: &str = include_str!("../../../../examples/wasm-smoke/policies.sql");
-const ROLES_SQL: &str = include_str!("../../../../examples/wasm-smoke/roles.sql");
+const SCHEMA_SQL: &str = include_str!("../../../../examples/deployment/schema.sql");
+const POLICIES_SQL: &str = include_str!("../../../../examples/deployment/policies.sql");
+const ROLES_SQL: &str = include_str!("../../../../examples/deployment/roles.sql");
 const DEPLOYMENT_SQL: &str = include_str!("../../../../crates/connetto-file-server/sql/schema.sql");
 const CONTENT_SQL: &str = include_str!("../../../../examples/wasm-smoke/content.sql");
 connetto_auth_tables!(String, diesel::sql_types::Text);
@@ -72,6 +77,7 @@ struct Services {
     keys: KeyDir,
     server_bin: PathBuf,
     envs: Vec<(String, String)>,
+    share: Arc<Share>,
     #[expect(dead_code, reason = "the value's Drop removes the store directory")]
     content_store: StoreDir,
 }
@@ -209,6 +215,7 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
         .await;
     let (fga_url, fga_store) = fixture_fga(&fixture).await;
     let keys = generate_keys().await?;
+    let share = seed_share(&fixture, &keys).await?;
     let content_dir = std::env::temp_dir().join(format!(
         "connetto-browser-content-{}-{}",
         std::process::id(),
@@ -220,8 +227,8 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
     let content_store = StoreDir { dir: content_dir };
     let idp = MockOauth::start().await;
     let reader_url = with_user_url(fixture.admin_url(), "connetto_reader", "connetto_reader");
-    let schema_file = repo_path(&["examples", "wasm-smoke", "schema.sql"])?;
-    let policies_file = repo_path(&["examples", "wasm-smoke", "policies.sql"])?;
+    let schema_file = repo_path(&["examples", "deployment", "schema.sql"])?;
+    let policies_file = repo_path(&["examples", "deployment", "policies.sql"])?;
 
     let mut envs = vec![
         ("DATABASE_URL".to_owned(), fixture.admin_url().to_owned()),
@@ -290,6 +297,7 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
         keys,
         server_bin,
         envs,
+        share: Arc::new(share),
         content_store,
     })
 }
@@ -365,10 +373,26 @@ async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
+    // The share route stands in for whatever a deployment's sharing does. A
+    // suite fetches it rather than reading a value baked at compile time,
+    // because a stale binary would otherwise carry the previous run's key
+    // while the database holds this run's row.
+    let share = services.share.clone();
     let app = auth_router(service, registry, RedirectPolicy::default())
         .route(
             LANDING_PATH,
             get(|| async { "connetto dev landing: the code is in this URL" }),
+        )
+        .route(
+            SHARE_PATH,
+            get(|| async move {
+                // Hand-built rather than serialized, so the stack keeps its
+                // dependency list to what it already needs.
+                format!(
+                    "{{\"grant\":\"{}\",\"subject\":\"{}\",\"photo\":\"{}\"}}",
+                    share.token, share.subject, share.photo
+                )
+            }),
         )
         .layer(cors);
     let handle = tokio::spawn(async move {
@@ -697,6 +721,65 @@ async fn ensure_server_bin() -> Result<PathBuf> {
     } else {
         Err(anyhow!("connetto-server was not found after the build"))
     }
+}
+
+/// A minted share key, the row only its holder can see, and the token a tab
+/// presents to claim it.
+#[derive(Clone)]
+struct Share {
+    subject: String,
+    token: String,
+    photo: String,
+}
+
+/// Mint one share key, and seed a photo owned by it.
+///
+/// The demo's `photos_p` admits a row whose owner is among the caller's keys,
+/// so a row owned by the key's own rendering is reachable by its holder and
+/// by nobody else. The sharer writing that row is the application's business,
+/// which here is this fixture: connetto mints the key and the deployment
+/// decides what it names.
+///
+/// The token is minted with the same key material and the default issuer and
+/// audience the server binary runs with, so the handshake it is presented to
+/// resolves it into the caller's subject set.
+async fn seed_share(fixture: &Fixture, keys: &KeyDir) -> Result<Share> {
+    let subject = <String as MintCapabilityKey>::mint();
+    let photo = uuid::Uuid::new_v4().to_string();
+    let order = uuid::Uuid::new_v4().to_string();
+    fixture
+        .setup(&[
+            &format!(
+                "INSERT INTO orders (id, owner_id, quantity) \
+                 VALUES ('{order}', '{subject}', 1)"
+            ),
+            &format!(
+                "INSERT INTO photos (id, order_id, owner_id, content_id, content_state) \
+                 VALUES ('{photo}', '{order}', '{subject}', '\\x00', NULL)"
+            ),
+        ])
+        .await;
+    let private = tokio::fs::read(&keys.private)
+        .await
+        .with_context(|| format!("reading {}", keys.private.display()))?;
+    let public = tokio::fs::read(&keys.public)
+        .await
+        .with_context(|| format!("reading {}", keys.public.display()))?;
+    let config = AuthConfig::default();
+    let authority = TokenAuthority::from_ed_pem(&private, &public, &config)
+        .map_err(|err| anyhow!("building the token authority: {err}"))?;
+    let token = authority
+        .mint_capability(
+            &CapabilitySubject::<String>::new(subject.clone()),
+            SystemTime::now(),
+            config.capability_ttl(),
+        )
+        .map_err(|err| anyhow!("minting the demo share key: {err}"))?;
+    Ok(Share {
+        subject,
+        token,
+        photo,
+    })
 }
 
 async fn generate_keys() -> Result<KeyDir> {

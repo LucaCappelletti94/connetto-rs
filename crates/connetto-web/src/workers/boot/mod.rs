@@ -162,6 +162,12 @@ pub struct DbWorkerConfig {
     pub(crate) policy_tables: connetto_client::PolicyTables,
     /// SQLite function name a translated policy calls for the caller identity.
     pub(crate) caller_function: &'static str,
+    /// SQLite function name a translated policy calls for the caller's keys.
+    pub(crate) subjects_function: &'static str,
+    /// Share keys this boot holds, each a signed grant and the subject it
+    /// names. A deployment obtains them however its own sharing works, a link
+    /// a user opened being the usual way, and hands them here.
+    pub(crate) share_keys: Vec<(String, String)>,
     /// Browser OAuth acquisition config; `None` uses a placeholder token.
     pub(crate) auth: Option<crate::auth::WorkerAuthConfig>,
     /// OPFS database holding the worker-only refresh token.
@@ -207,6 +213,8 @@ impl DbWorkerConfig {
             sql_functions: connetto_client::SqlFunctions::default(),
             policy_tables: connetto_client::PolicyTables::new(),
             caller_function: "",
+            subjects_function: "",
+            share_keys: Vec::new(),
             auth: None,
             auth_db_name: "",
             unlock: false,
@@ -312,6 +320,37 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_caller_function(mut self, caller_function: &'static str) -> Self {
         self.caller_function = caller_function;
+        self
+    }
+
+    /// SQLite function name a translated policy calls for the share keys the
+    /// caller holds.
+    ///
+    /// A deployment whose policies carry a membership arm MUST name it, or
+    /// the replica's first read fails on the missing function. A boot holding
+    /// no key answers NULL, so the arm admits nothing, which is what the
+    /// server's own binding answers for the same caller.
+    #[must_use]
+    pub fn with_subjects_function(mut self, subjects_function: &'static str) -> Self {
+        self.subjects_function = subjects_function;
+        self
+    }
+
+    /// The share keys this boot holds, each the signed grant and the subject
+    /// it names.
+    ///
+    /// The grant is what the handshake presents, so the server reads the key
+    /// into the caller it binds. The subject is what the replica answers its
+    /// own membership arms with, so the same rows are admitted locally. Both
+    /// halves are needed: a grant alone leaves the replica blind to the rows
+    /// the server sends, and a subject alone claims a key the server never
+    /// checked.
+    #[must_use]
+    pub fn with_share_keys(
+        mut self,
+        share_keys: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        self.share_keys = share_keys.into_iter().collect();
         self
     }
 

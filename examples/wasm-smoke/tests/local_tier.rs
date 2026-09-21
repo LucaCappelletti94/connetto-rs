@@ -109,7 +109,8 @@ async fn local_tier_placement_dispatch_and_persistence() {
         .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id));
+        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id))
+        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
     let mut conn = connect(&config, true).await;
     assert!(
         conn.local_tables().contains("notes"),
