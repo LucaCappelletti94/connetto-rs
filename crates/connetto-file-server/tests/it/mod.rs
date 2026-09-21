@@ -8,6 +8,7 @@
 mod fixture;
 mod macro_hygiene;
 mod preflight;
+mod quotas;
 mod serve;
 mod sweep;
 mod ticket;

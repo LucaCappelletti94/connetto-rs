@@ -38,6 +38,22 @@ CREATE INDEX IF NOT EXISTS _cfs_manifests_uncommitted_created_at_idx
     ON _cfs_manifests (created_at)
     WHERE NOT committed;
 
+-- The per-identity storage quota (R87) sums this uploader's committed
+-- manifests at commit time, so the reverse lookup must be indexed.
+CREATE INDEX IF NOT EXISTS _cfs_manifests_uploaded_by_committed_idx
+    ON _cfs_manifests (uploaded_by)
+    WHERE committed;
+
+-- Deployment traffic ledger (R87): one row per UTC day carrying the bytes
+-- actually served and accepted.  Every replica upserts the same day row, so
+-- the rolling bandwidth window is shared across the deployment with no
+-- replica-local counter.
+CREATE TABLE IF NOT EXISTS _cfs_traffic (
+    day            DATE   NOT NULL PRIMARY KEY,
+    served_bytes   BIGINT NOT NULL DEFAULT 0,
+    accepted_bytes BIGINT NOT NULL DEFAULT 0
+);
+
 -- Per-hash state registry.  Each chunk hash has a lifecycle row:
 --   pending   - declared by intent, not yet written to the object store
 --   stored    - durably written to the object store

@@ -84,6 +84,23 @@
 //!   spared by the sweep (default: the ticket lifetime).
 //! - `CONNETTO_CONTENT_SWEEP_SECS`: how often the sweep runs
 //!   (default 3600, `0` turns it off).
+//! - `CONNETTO_CONTENT_QUOTA_BYTES`: storage a single uploader may hold
+//!   across their committed manifests; a commit past it answers `507`.
+//!   `0` (default) is unlimited.
+//! - `CONNETTO_CONTENT_STORAGE_CEILING`: deployment-wide stored bytes over
+//!   distinct committed chunks; commits past it answer `503` with
+//!   `Retry-After`. `0` (default) is unlimited.
+//! - `CONNETTO_CONTENT_BANDWIDTH_CEILING`: deployment-wide bytes served
+//!   plus accepted inside the window; reads and commits past it answer
+//!   `503` with `Retry-After`. `0` (default) is unlimited.
+//! - `CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS`: trailing window length in
+//!   UTC day rows (default 30).
+//! - `CONNETTO_CONTENT_WARN_FRACTION`: fraction of each ceiling where one
+//!   structured warning fires per crossing, re-armed below (default 0.8).
+//! - `CONNETTO_CONTENT_CEILING_REFRESH_SECS`: how often each file-server
+//!   replica re-reads the cached deployment totals; the overshoot a ceiling
+//!   allows is bounded by this interval times the deployment's throughput
+//!   (default 10).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -562,6 +579,12 @@ struct ContentSettings {
     read_ceiling: u64,
     grace: Duration,
     cadence: Duration,
+    quota_identity: u64,
+    storage_ceiling: u64,
+    bandwidth_ceiling: u64,
+    bandwidth_window_days: i32,
+    warn_fraction: f64,
+    ceiling_refresh: Duration,
     owner_pool_size: u32,
     store_setting: String,
     key_path: Option<std::path::PathBuf>,
@@ -592,6 +615,28 @@ impl ContentSettings {
                 ttl.as_secs(),
             )?),
             cadence: Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_SECS", 3_600)?),
+            quota_identity: env_u64("CONNETTO_CONTENT_QUOTA_BYTES", 0)?,
+            storage_ceiling: env_u64("CONNETTO_CONTENT_STORAGE_CEILING", 0)?,
+            bandwidth_ceiling: env_u64("CONNETTO_CONTENT_BANDWIDTH_CEILING", 0)?,
+            bandwidth_window_days: i32::try_from(env_u64(
+                "CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS",
+                30,
+            )?)
+            .map_err(|_| {
+                anyhow!("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS is out of range for an i32")
+            })?,
+            warn_fraction: match std::env::var("CONNETTO_CONTENT_WARN_FRACTION") {
+                Err(_) => 0.8,
+                Ok(text) => text
+                    .trim()
+                    .parse::<f64>()
+                    .map(|fraction| fraction.clamp(0.0, 1.0))
+                    .with_context(|| format!("parsing CONNETTO_CONTENT_WARN_FRACTION: {text:?}"))?,
+            },
+            ceiling_refresh: Duration::from_secs(env_u64(
+                "CONNETTO_CONTENT_CEILING_REFRESH_SECS",
+                10,
+            )?),
             owner_pool_size: env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?,
             store_setting: var_nonempty("CONNETTO_CONTENT_STORE")
                 .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?,
@@ -659,6 +704,15 @@ async fn build_content(
         // This binary binds the caller under connetto's default names, which
         // is what its session manager is left configured with.
         caller_settings: files::CallerSettings::default(),
+        quotas: files::QuotaSettings {
+            identity_quota: settings.quota_identity,
+            storage_ceiling: settings.storage_ceiling,
+            bandwidth_ceiling: settings.bandwidth_ceiling,
+            window_days: settings.bandwidth_window_days,
+            warn_fraction: settings.warn_fraction,
+            refresh: settings.ceiling_refresh,
+        },
+        ceilings: files::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -669,6 +723,10 @@ async fn build_content(
         store = %settings.store_setting,
         ticket_ttl_secs = settings.ttl.as_secs(),
         sweep_secs = settings.cadence.as_secs(),
+        quota_bytes = settings.quota_identity,
+        storage_ceiling = settings.storage_ceiling,
+        bandwidth_ceiling = settings.bandwidth_ceiling,
+        bandwidth_window_days = settings.bandwidth_window_days,
         "file routes mounted on the auth listener",
     );
     Ok((ServerSigner::Files(Box::new(signer)), Some(router)))
@@ -1741,6 +1799,7 @@ mod tests {
                 "DROP TABLE IF EXISTS _cfs_manifest_chunks CASCADE",
                 "DROP TABLE IF EXISTS _cfs_manifests CASCADE",
                 "DROP TABLE IF EXISTS _cfs_chunk_registry CASCADE",
+                "DROP TABLE IF EXISTS _cfs_traffic CASCADE",
                 "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
                 "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
             ] {
@@ -1792,6 +1851,12 @@ mod tests {
                 owner_pool_size: 2,
                 store_setting: format!("fs:{}", dir.path().display()),
                 key_path: None,
+                quota_identity: 0,
+                storage_ceiling: 0,
+                bandwidth_ceiling: 0,
+                bandwidth_window_days: 30,
+                warn_fraction: 0.8,
+                ceiling_refresh: Duration::from_secs(10),
             };
             let (signer, router) = build_content(Some(settings), &admin_url, &reader_url, 2)
                 .await

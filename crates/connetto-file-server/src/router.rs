@@ -51,6 +51,12 @@ pub struct Config<S: ConnettoFileSchema> {
     pub grace: Duration,
     /// The session settings this deployment's policies read the caller from.
     pub caller_settings: crate::caller::CallerSettings,
+    /// R87 quotas and deployment ceilings.  Zero ceilings and a zero quota,
+    /// the default, leave every request path exactly as R87 found it.
+    pub quotas: crate::quotas::QuotaSettings,
+    /// The cached deployment totals behind the ceiling checks, refreshed by
+    /// the task `serve` spawns whenever any ceiling is configured.
+    pub ceilings: crate::quotas::CeilingCache,
     /// Carries the schema type without a runtime value.
     pub _schema: PhantomData<fn() -> S>,
 }
@@ -92,6 +98,25 @@ pub async fn serve<S: ConnettoFileSchema>(config: Config<S>) -> Result<Router, P
         .map_err(|e| PreflightError::Pool(e.to_string()))?;
     preflight::preflight_reader::<S>(&mut reader_conn).await?;
     drop(reader_conn);
+    if config.quotas.deployment_metered() {
+        // Seed the cache before the first request can check it, then keep it
+        // fresh on the cadence.  The overshoot a check allows is bounded by
+        // this interval times the deployment's throughput, which is what the
+        // cadence setting documents.
+        crate::quotas::refresh_once::<S>(&config.pools.admin, &config.quotas, &config.ceilings)
+            .await;
+        let pool = config.pools.admin.clone();
+        let settings = config.quotas.clone();
+        let cache = config.ceilings.clone();
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(settings.refresh);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                crate::quotas::refresh_once::<S>(&pool, &settings, &cache).await;
+            }
+        });
+    }
     Ok(router(config))
 }
 
