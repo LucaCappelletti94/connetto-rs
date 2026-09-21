@@ -606,7 +606,7 @@
       <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">mark and sweep from the chunk registry, grace equal to the ticket lifetime</text>
       <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ContentTicketSigner, the one trait connetto-core gained</text>
       <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#555">the intent answers the hashes it lacks, so a resumed upload sends only those</text>
-      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#C62828">storage quotas and deployment ceilings: not started, R87</text>
+      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#555">storage quotas and deployment ceilings, 507 quota and 503 ceilings with Retry-After, R87</text>
     </g>
 
     <g transform="translate(1130, 1586)">
