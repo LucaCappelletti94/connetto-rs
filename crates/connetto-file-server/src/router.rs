@@ -99,12 +99,16 @@ pub async fn serve<S: ConnettoFileSchema>(config: Config<S>) -> Result<Router, P
     preflight::preflight_reader::<S>(&mut reader_conn).await?;
     drop(reader_conn);
     if config.quotas.deployment_metered() {
-        // Seed the cache before the first request can check it, then keep it
-        // fresh on the cadence.  The overshoot a check allows is bounded by
-        // this interval times the deployment's throughput, which is what the
-        // cadence setting documents.
+        // Seed the cache before the first request can check it, and refuse
+        // to serve when that seed fails: every check against the all-zero
+        // default reads unlimited, so a metered deployment that never read
+        // its numbers would enforce nothing while claiming to.  The steady
+        // overshoot a successful seed allows is bounded by the cadence times
+        // the deployment's throughput, which is what the cadence setting
+        // documents.
         crate::quotas::refresh_once::<S>(&config.pools.admin, &config.quotas, &config.ceilings)
-            .await;
+            .await
+            .map_err(PreflightError::CeilingSeed)?;
         let pool = config.pools.admin.clone();
         let settings = config.quotas.clone();
         let cache = config.ceilings.clone();
@@ -113,7 +117,9 @@ pub async fn serve<S: ConnettoFileSchema>(config: Config<S>) -> Result<Router, P
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                crate::quotas::refresh_once::<S>(&pool, &settings, &cache).await;
+                if let Err(err) = crate::quotas::refresh_once::<S>(&pool, &settings, &cache).await {
+                    tracing::warn!(error = %err, "ceiling refresh failed, last totals stay in force");
+                }
             }
         });
     }

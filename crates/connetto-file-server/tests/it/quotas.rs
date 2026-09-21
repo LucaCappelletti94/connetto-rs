@@ -130,6 +130,34 @@ async fn upload(app: &axum::Router, signer: &connetto_file_server::TicketSigner,
     assert_eq!(status, StatusCode::OK, "upload commit, body was {body:?}");
 }
 
+/// Posts commit again for the file `data` names, under a fresh write ticket.
+/// Committed bytes were made true earlier, so the answer must stay 200 no
+/// matter what the quota or the ceilings say now.
+async fn recommit(
+    app: &axum::Router,
+    signer: &connetto_file_server::TicketSigner,
+    data: &[u8],
+) -> StatusCode {
+    let mem = MemStore::new();
+    let manifest = process_file(data, MimeClass::Generic, &mem).await.unwrap();
+    let file_id = manifest.file_id();
+    let ticket = signer
+        .mint(&TicketPayload {
+            file_id: *file_id.as_bytes(),
+            verb: Verb::Write,
+            ceiling: u64::try_from(data.len()).unwrap() + 1024,
+            expiry: chrono::Utc::now().timestamp() + 3600,
+            caller: identified("alice"),
+        })
+        .unwrap();
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/files/{file_id}/commit?t={ticket}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
 fn read_ticket(
     signer: &connetto_file_server::TicketSigner,
     file_id: &FileId,
@@ -161,7 +189,8 @@ async fn await_traffic(pg: &Pg, served: i64, accepted: i64) -> TrafficRow {
     let mut conn = connect_admin(&pg.url_admin).await;
     for _ in 0..100 {
         let rows: Vec<TrafficRow> = diesel::sql_query(
-            "SELECT served_bytes, accepted_bytes FROM _cfs_traffic WHERE day = CURRENT_DATE",
+            "SELECT served_bytes, accepted_bytes FROM _cfs_traffic
+             WHERE day = ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date)",
         )
         .load(&mut conn)
         .await
@@ -182,6 +211,22 @@ fn chunked(tag: u8, n: usize) -> Vec<u8> {
     vec![tag; 4096 * n]
 }
 
+/// xorshift pseudo-random noise, `len` bytes from `seed`. The bytes are
+/// incompressible, so every chunk the chunker cuts is distinct and a
+/// committed file's share of the distinct stored total is its length
+/// exactly, wherever the chunker cuts.
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut out: Vec<u8> = Vec::with_capacity(len + 8);
+    let mut state = seed;
+    while out.len() < len {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        out.extend_from_slice(&state.to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
 fn fast_refresh() -> QuotaSettings {
     QuotaSettings {
         refresh: Duration::from_millis(100),
@@ -222,31 +267,9 @@ async fn commit_past_the_identity_quota_answers_507() {
     assert!(!committed, "a refused commit must not mark the manifest");
 
     // Re-committing an already-committed file stays 200 under a full quota:
-    // it makes no new bytes true. Fresh write ticket for the first upload.
-    let first_bytes = chunked(1, 1);
-    let mem = MemStore::new();
-    let manifest = process_file(&first_bytes, MimeClass::Generic, &mem)
-        .await
-        .unwrap();
-    let first_id = manifest.file_id();
-    let ticket = fx
-        .signer
-        .mint(&TicketPayload {
-            file_id: *first_id.as_bytes(),
-            verb: Verb::Write,
-            ceiling: 4096 + 1024,
-            expiry: chrono::Utc::now().timestamp() + 3600,
-            caller: identified("alice"),
-        })
-        .unwrap();
-    let req = axum::http::Request::builder()
-        .method("POST")
-        .uri(format!("/files/{first_id}/commit?t={ticket}"))
-        .body(axum::body::Body::empty())
-        .unwrap();
-    let resp = fx.app.clone().oneshot(req).await.unwrap();
+    // it makes no new bytes true.
     assert_eq!(
-        resp.status(),
+        recommit(&fx.app, &fx.signer, &chunked(1, 1)).await,
         StatusCode::OK,
         "re-committing committed bytes must stay idempotent under a full quota"
     );
@@ -259,21 +282,29 @@ struct CommittedFlag {
 }
 
 /// A commit while the cached deployment storage sits at the ceiling answers
-/// 503 with `Retry-After`, and an already-committed file still re-commits.
+/// 503 with `Retry-After`, an already-committed file still re-commits, and
+/// a file reusing chunks committed where the caller can see them is
+/// projected at its new bytes only, so it still settles where projecting
+/// the declared bytes would refuse it forever.
 #[tokio::test]
 async fn commit_past_the_storage_ceiling_answers_503_with_retry_after() {
     let mut settings = fast_refresh();
-    settings.storage_ceiling = 12288;
+    // Five committed MiB plus a headroom of exactly six MiB, the most a
+    // file reusing the committed file's chunks can add: its new bytes are
+    // the appended two MiB plus the one chunk the chunker merges with it,
+    // and a chunk never exceeds the four MiB maximum.
+    settings.storage_ceiling = 11 * 1024 * 1024;
     let fx = fixture(settings).await;
 
-    upload(&fx.app, &fx.signer, &chunked(4, 1)).await;
-    upload(&fx.app, &fx.signer, &chunked(5, 1)).await;
-    upload(&fx.app, &fx.signer, &chunked(6, 1)).await;
+    let x_data = noise(1, 5 * 1024 * 1024);
+    upload(&fx.app, &fx.signer, &x_data).await;
 
-    // Wait for the refresh task to see the full 12288 stored.
+    // Wait for the refresh task to see the stored five MiB. Before it does
+    // a seven new-MiB commit passes, after it the ceiling refuses one.
+    let w_data = noise(2, 7 * 1024 * 1024);
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        let staged = stage(&fx.app, &fx.signer, &chunked(7, 1)).await;
+        let staged = stage(&fx.app, &fx.signer, &w_data).await;
         let resp = commit(&fx.app, &staged).await;
         if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
             let retry = resp
@@ -285,12 +316,38 @@ async fn commit_past_the_storage_ceiling_answers_503_with_retry_after() {
                 .parse::<u64>()
                 .expect("Retry-After is seconds");
             assert!(retry >= 1);
+            // Re-committing an already-committed file stays 200 under the
+            // ceiling, the idempotency the outbox relies on when a commit
+            // response was lost and the entry walks again later.
+            assert_eq!(
+                recommit(&fx.app, &fx.signer, &x_data).await,
+                StatusCode::OK,
+                "re-committing committed bytes must stay idempotent under a full ceiling"
+            );
+            // Y replays the committed bytes as its prefix and appends a
+            // two MiB tail, so its new bytes fit the headroom while the
+            // same commit projected at its seven declared MiB is refused
+            // under this very cache state.
+            let mut y_data = x_data.clone();
+            let tail = noise(3, 2 * 1024 * 1024);
+            y_data.extend_from_slice(&tail);
+            let deduped = stage(&fx.app, &fx.signer, &y_data).await;
+            let resp = commit(&fx.app, &deduped).await;
+            let status = resp.status();
+            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(
+                status,
+                StatusCode::OK,
+                "a deduplicated commit projects its new bytes and must pass, body was {body:?}"
+            );
             return;
         }
         assert_eq!(
             resp.status(),
             StatusCode::OK,
-            "until the refresh notices the full store the commit passes"
+            "until the refresh notices the stored bytes the commit passes"
         );
     }
     panic!("the storage ceiling never refused a commit");

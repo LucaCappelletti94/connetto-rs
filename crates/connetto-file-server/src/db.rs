@@ -544,3 +544,34 @@ fn manifest_from_rows(
         .collect();
     Ok(Manifest::new(file_id, metas?))
 }
+
+/// The `(chunk_hash, chunk_len)` pairs the manifest's rows declare, as
+/// recorded at intent time. Read on the admin connection: these are the
+/// server's own bookkeeping rows for this caller's key, and visibility
+/// applies only to deciding whether OTHER files' chunks already count.
+pub(crate) async fn manifest_chunk_pairs<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+    caller: &str,
+) -> Result<Vec<(Vec<u8>, i64)>, diesel::result::Error> {
+    #[derive(diesel::QueryableByName)]
+    struct Pair {
+        #[diesel(sql_type = diesel::sql_types::Bytea)]
+        chunk_hash: Vec<u8>,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        chunk_len: i64,
+    }
+    let sql = format!(
+        "SELECT chunk_hash, chunk_len FROM {} WHERE file_id = $1 AND uploaded_by = $2",
+        S::MANIFEST_CHUNKS_SQL
+    );
+    let rows: Vec<Pair> = diesel::sql_query(&sql)
+        .bind::<diesel::sql_types::Bytea, _>(file_id.as_bytes().as_slice())
+        .bind::<diesel::sql_types::Text, _>(caller)
+        .load(conn)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| (r.chunk_hash, r.chunk_len))
+        .collect())
+}

@@ -3697,3 +3697,116 @@ async fn a_caller_holding_two_keys_sees_its_own_upload() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// R87: own-manifest stored chunks are not re-requested
+// ---------------------------------------------------------------------------
+
+/// A re-declaration answers only the chunks this upload has not yet stored.
+/// A retry whose commit was refused by quota or ceiling is then told to
+/// transfer nothing, so it cannot re-bill its bytes to the bandwidth window
+/// or move them across the wire a second time.
+#[tokio::test]
+async fn reintent_answers_only_chunks_this_upload_has_not_stored() {
+    async fn ask(
+        app: &axum::Router,
+        file_hex: &str,
+        ticket: &str,
+        body: &serde_json::Value,
+    ) -> Vec<String> {
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/files/{file_hex}/intent?t={ticket}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(serde_json::to_vec(body).unwrap()))
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "re-declaration");
+        let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        serde_json::from_value::<Vec<String>>(json["needed"].clone()).unwrap()
+    }
+
+    async fn put_chunk(
+        app: &axum::Router,
+        ticket: &str,
+        mem: &MemStore,
+        manifest: &connetto_file_core::Manifest,
+        idx: usize,
+    ) {
+        let hash = format!("{}", manifest.chunks()[idx].hash);
+        let data = mem.read_chunk(&manifest.chunks()[idx].hash).await.unwrap();
+        let req = axum::http::Request::builder()
+            .method("PUT")
+            .uri(format!("/chunks/{hash}?t={ticket}"))
+            .header("content-type", "application/octet-stream")
+            .body(axum::body::Body::from(data))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(req).await.unwrap().status(),
+            StatusCode::NO_CONTENT,
+            "chunk PUT"
+        );
+    }
+
+    let pg = Pg::start().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    // Five MiB of xorshift pseudo-random bytes. Generic content chunks at a
+    // four MiB maximum, so this is at least two chunks, and the bytes are
+    // incompressible noise, so every chunk is distinct.
+    let mut words: Vec<u8> = Vec::with_capacity(5 * 1024 * 1024 + 8);
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    while words.len() < 5 * 1024 * 1024 {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        words.extend_from_slice(&state.to_le_bytes());
+    }
+    let data = words;
+    let mem = MemStore::new();
+    let manifest = process_file(&data, MimeClass::Generic, &mem).await.unwrap();
+    assert!(
+        manifest.chunks().len() >= 2,
+        "fixture: above the four MiB maximum must chunk at least twice"
+    );
+    let file_id = manifest.file_id();
+    let file_hex = format!("{file_id}");
+    let declared: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+    let ticket = write_payload(&signer, &file_id, declared + 1024);
+    let all: Vec<String> = manifest
+        .chunks()
+        .iter()
+        .map(|c| format!("{}", c.hash))
+        .collect();
+    let chunks_json: Vec<serde_json::Value> = manifest
+        .chunks()
+        .iter()
+        .zip(&all)
+        .map(|(c, hash)| serde_json::json!({ "hash": hash, "len": c.len }))
+        .collect();
+    let body = serde_json::json!({ "total_len": declared, "chunks": chunks_json });
+
+    let needed = ask(&app, &file_hex, &ticket, &body).await;
+    assert_eq!(needed, all, "a fresh upload is told every chunk");
+
+    put_chunk(&app, &ticket, &mem, &manifest, 0).await;
+    let needed = ask(&app, &file_hex, &ticket, &body).await;
+    assert_eq!(
+        needed,
+        all[1..],
+        "the stored chunk drops out and every other chunk stays requested"
+    );
+
+    for idx in 1..manifest.chunks().len() {
+        put_chunk(&app, &ticket, &mem, &manifest, idx).await;
+    }
+    let needed = ask(&app, &file_hex, &ticket, &body).await;
+    assert!(
+        needed.is_empty(),
+        "a fully staged retry is told nothing is needed"
+    );
+}

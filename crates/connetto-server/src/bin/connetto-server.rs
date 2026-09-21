@@ -618,13 +618,21 @@ impl ContentSettings {
             quota_identity: env_u64("CONNETTO_CONTENT_QUOTA_BYTES", 0)?,
             storage_ceiling: env_u64("CONNETTO_CONTENT_STORAGE_CEILING", 0)?,
             bandwidth_ceiling: env_u64("CONNETTO_CONTENT_BANDWIDTH_CEILING", 0)?,
-            bandwidth_window_days: i32::try_from(env_u64(
-                "CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS",
-                30,
-            )?)
-            .map_err(|_| {
-                anyhow!("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS is out of range for an i32")
-            })?,
+            bandwidth_window_days: {
+                let days = env_u64("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS", 30)?;
+                // A zero window makes the predicate match no day row, the
+                // meter reads zero forever and the ceiling can never trip,
+                // silently. A window of a day is the minimum that measures
+                // anything.
+                if days == 0 {
+                    return Err(anyhow!(
+                        "CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS must be at least 1"
+                    ));
+                }
+                i32::try_from(days).map_err(|_| {
+                    anyhow!("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS is out of range for an i32")
+                })?
+            },
             warn_fraction: match std::env::var("CONNETTO_CONTENT_WARN_FRACTION") {
                 Err(_) => 0.8,
                 Ok(text) => text
