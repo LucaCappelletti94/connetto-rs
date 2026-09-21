@@ -133,9 +133,13 @@ impl From<diesel::result::Error> for StageCommitError {
 /// What the outbox walk does with a failed upload attempt, decided by where the fact came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AttemptOutcome {
-    /// Keep the entry and walk it again later.
+    /// Keep the entry and walk it again later. Deployment ceilings answer
+    /// 503 with a `Retry-After`, and they land here.
     Retry,
-    /// Keep the entry in the outbox, marked with its refusal detail.
+    /// Keep the entry in the outbox, marked with its refusal detail. The
+    /// uploader's storage quota (507) lands here: no later attempt changes
+    /// it while the committed bytes stand, and the application hears about
+    /// it as `ContentEvent::UploadRefused`.
     Refused,
     /// Retire the entry, because its bytes are gone from this device.
     Lost,
@@ -148,7 +152,7 @@ impl ContentError {
         match self {
             Self::NoManifest { .. } | Self::LostChunk { .. } => AttemptOutcome::Lost,
             Self::Http {
-                status: 400 | 413 | 422,
+                status: 400 | 413 | 422 | 507,
                 ..
             }
             | Self::Decode { .. }
@@ -197,7 +201,10 @@ mod tests {
             .outcome(),
             AttemptOutcome::Lost,
         );
-        for status in [400, 413, 422] {
+        // 507 is the R87 storage quota. Retrying cannot change it while the
+        // uploader's committed bytes stand, so the walk refuses rather than
+        // retrying the entry forever.
+        for status in [400, 413, 422, 507] {
             assert_eq!(
                 ContentError::Http {
                     stage: "commit",
