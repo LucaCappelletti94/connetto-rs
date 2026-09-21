@@ -18,11 +18,11 @@ pub use connetto_web::{
 /// (`CONNETTO_PG_DDL_FILE`). Hashing it yields the version the server
 /// advertises, so a client that bakes the same source presents a matching
 /// version at handshake.
-pub const DEMO_SCHEMA_SQL: &str = include_str!("../schema.sql");
+pub const DEMO_SCHEMA_SQL: &str = include_str!("../../deployment/schema.sql");
 
 /// The policy source the same translation read, hashed into the version beside
 /// the schema because a changed policy changes the replica's own views.
-pub const DEMO_POLICIES_SQL: &str = include_str!("../policies.sql");
+pub const DEMO_POLICIES_SQL: &str = include_str!("../../deployment/policies.sql");
 
 // The logical-to-physical table map and view list the build's translation
 // produced, as `POLICY_TABLES` and `POLICY_VIEWS`.

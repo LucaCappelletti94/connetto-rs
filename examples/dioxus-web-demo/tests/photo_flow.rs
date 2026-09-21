@@ -1,11 +1,10 @@
 //! Photo surface browser tests for the dioxus web demo.
 //!
-//! COUPLING: `SchemaVersion` is a hash of `schema.sql`.  This file must be
-//! byte-identical to `examples/wasm-smoke/schema.sql`, which the browser-stack
-//! server uses.  The first test is the permanent drift detector: it fails at
-//! the WebSocket handshake the instant the two schemas diverge.  Maintain
-//! identity with `cp examples/wasm-smoke/schema.sql
-//! examples/dioxus-web-demo/schema.sql`.
+//! COUPLING: `SchemaVersion` hashes the schema and the policies this demo
+//! includes, and they are the same documents in `examples/deployment` that the
+//! browser-stack server applies, so there is nothing to keep in sync. The
+//! first test still detects drift: it fails at the WebSocket handshake the
+//! instant the client's version stops matching the server's.
 //!
 //! ISOLATION: each test uses a distinct `db_worker_boot_*` function whose OPFS
 //! filenames are unique, so Chrome's delayed `FileSystemSyncAccessHandle`

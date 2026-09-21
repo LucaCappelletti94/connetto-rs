@@ -41,9 +41,9 @@ const SHARE_PATH: &str = "/dev/share";
 const CALLER_FUNCTION: &str = "current_app_user";
 const BROWSER_PROVIDER: &str = "dev-idp";
 
-const SCHEMA_SQL: &str = include_str!("../../../../examples/wasm-smoke/schema.sql");
-const POLICIES_SQL: &str = include_str!("../../../../examples/wasm-smoke/policies.sql");
-const ROLES_SQL: &str = include_str!("../../../../examples/wasm-smoke/roles.sql");
+const SCHEMA_SQL: &str = include_str!("../../../../examples/deployment/schema.sql");
+const POLICIES_SQL: &str = include_str!("../../../../examples/deployment/policies.sql");
+const ROLES_SQL: &str = include_str!("../../../../examples/deployment/roles.sql");
 const DEPLOYMENT_SQL: &str = include_str!("../../../../crates/connetto-file-server/sql/schema.sql");
 const CONTENT_SQL: &str = include_str!("../../../../examples/wasm-smoke/content.sql");
 connetto_auth_tables!(String, diesel::sql_types::Text);
@@ -227,8 +227,8 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
     let content_store = StoreDir { dir: content_dir };
     let idp = MockOauth::start().await;
     let reader_url = with_user_url(fixture.admin_url(), "connetto_reader", "connetto_reader");
-    let schema_file = repo_path(&["examples", "wasm-smoke", "schema.sql"])?;
-    let policies_file = repo_path(&["examples", "wasm-smoke", "policies.sql"])?;
+    let schema_file = repo_path(&["examples", "deployment", "schema.sql"])?;
+    let policies_file = repo_path(&["examples", "deployment", "policies.sql"])?;
 
     let mut envs = vec![
         ("DATABASE_URL".to_owned(), fixture.admin_url().to_owned()),

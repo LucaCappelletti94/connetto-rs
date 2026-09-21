@@ -122,14 +122,14 @@ fn schema_version() -> connetto_core::SchemaVersion {
         "CONNETTO_TEST_PG_DDL_FILE",
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/wasm-smoke/schema.sql"
+            "/../../examples/deployment/schema.sql"
         ),
     );
     let policies = source(
         "CONNETTO_TEST_PG_POLICIES_FILE",
         concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../examples/wasm-smoke/policies.sql"
+            "/../../examples/deployment/policies.sql"
         ),
     );
     connetto_core::SchemaVersion::from_sources([ddl.as_str(), policies.as_str()])

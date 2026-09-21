@@ -5,13 +5,14 @@ use wasm_bindgen::prelude::wasm_bindgen;
 
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 
-// SchemaVersion hashes this string; it must be byte-identical to
-// examples/wasm-smoke/schema.sql, which the browser-stack server uses.
-pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
+// SchemaVersion hashes this string, so it is the one document the deployment
+// applies rather than a copy of it: examples/deployment holds the schema, the
+// policies and the roles every demo here shares with the browser-stack server.
+pub const SCHEMA_SQL: &str = include_str!("../../deployment/schema.sql");
 
 /// The policy source the translation read beside the schema, hashed into the
 /// version with it because a changed policy changes the replica's own views.
-pub const POLICIES_SQL: &str = include_str!("../policies.sql");
+pub const POLICIES_SQL: &str = include_str!("../../deployment/policies.sql");
 
 pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));

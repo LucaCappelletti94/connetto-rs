@@ -40,7 +40,7 @@ const SUBJECTS_SEPARATOR: char = ',';
 
 /// The synced tier's documents. A table splits only when a policy applies to
 /// it, so the schema and its policies translate as one universe.
-const SYNCED: &[&str] = &["schema.sql", "policies.sql"];
+const SYNCED: &[&str] = &["../deployment/schema.sql", "../deployment/policies.sql"];
 
 diesel::table! {
     /// SQLite's own catalogue, read to list the views the translation created.
@@ -138,8 +138,8 @@ fn write_policy_tables(documents: &[&str], views: &[String], out: &std::path::Pa
 }
 
 fn main() {
-    println!("cargo::rerun-if-changed=schema.sql");
-    println!("cargo::rerun-if-changed=policies.sql");
+    println!("cargo::rerun-if-changed=../deployment/schema.sql");
+    println!("cargo::rerun-if-changed=../deployment/policies.sql");
     println!("cargo::rerun-if-changed=frontend.sql");
     let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let synced_views = translate(SYNCED, &out_dir.join("replica-ddl.sql"));

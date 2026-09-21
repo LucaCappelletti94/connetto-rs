@@ -72,16 +72,16 @@ fn spawn_share_worker(glue_url: &str) -> web_sys::Worker {
     worker
 }
 
-/// A tab holding the same key the worker booted with.
+/// A tab, holding the key the worker booted with or holding none.
 ///
-/// The tab reads its own replica, so it registers the key too. A tab given
-/// only the identity would be shown nothing, whatever the worker holds.
+/// The tab reads its own replica, so it registers what it holds. A tab given
+/// only the identity is shown nothing of the key's rows, whatever the worker
+/// holds, which is the second half of this suite.
 async fn connect_tab(
     client_id: &str,
     token: String,
     identity: &str,
-    grant: &str,
-    subject: &str,
+    key: Option<(&str, &str)>,
 ) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await.expect("announce the tab");
@@ -94,10 +94,12 @@ async fn connect_tab(
         .with_caller(CALLER_FUNCTION, Some(identity))
         .with_share_keys::<String>(
             connetto_wasm_smoke::SUBJECTS_FUNCTION,
-            [(
-                Grant::new(grant.to_owned()),
-                connetto_core::auth::CapabilitySubject::new(subject.to_owned()),
-            )],
+            key.map(|(grant, subject)| {
+                (
+                    Grant::new(grant.to_owned()),
+                    connetto_core::auth::CapabilitySubject::new(subject.to_owned()),
+                )
+            }),
         );
     ConnettoConnection::connect(
         transport,
@@ -110,8 +112,13 @@ async fn connect_tab(
     .expect("tab connect through the wire channel")
 }
 
-/// A caller holding only a share key sees the row that key owns, and a caller
-/// holding no key sees nothing of it.
+/// A caller holding only a share key sees the row that key owns, and the same
+/// caller without the key does not.
+///
+/// The row is owned by the key's own rendering, so the signed-in identity
+/// reaches it by no route at all. Presence rather than exclusivity is what is
+/// asserted, because the demo identity owns photos other suites wrote against
+/// the same deployment, and those are its own rows by the identity arm.
 #[wasm_bindgen_test]
 async fn a_key_holder_sees_the_row_its_key_owns() {
     harness::relay_worker_breadcrumbs();
@@ -124,12 +131,10 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
     let worker = spawn_share_worker(&harness::glue_url());
     await_db_worker_ready(&[]).await.expect("db worker ready");
 
-    // The signed-in user owns nothing here, so every row it sees arrives
-    // through the key rather than through the identity.
     let (token, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let mut conn = connect_tab(&client_id, token, &identity, &grant, &subject).await;
+    let mut conn = connect_tab(&client_id, token, &identity, Some((&grant, &subject))).await;
     conn.subscribe("photo-share-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");
@@ -151,26 +156,61 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
         .live(&client)
         .await
         .expect("photo live query");
-    let rows = live.rows().to_vec();
-
+    let held = live
+        .rows()
+        .iter()
+        .find(|row| row.id.to_string() == shared)
+        .cloned()
+        .expect("the key's holder sees the row its key owns");
     assert_eq!(
-        rows.iter()
-            .map(|row| row.id.to_string())
-            .collect::<Vec<_>>(),
-        vec![shared.clone()],
-        "the key's holder sees exactly the row its key owns"
-    );
-    assert_eq!(
-        rows[0].owner_id, subject,
+        held.owner_id, subject,
         "the row is owned by the key itself, not by the signed-in user"
     );
     assert_ne!(
-        rows[0].owner_id, identity,
+        held.owner_id, identity,
         "nothing about the identity reaches this row"
     );
 
     drop(live);
     drop(client);
     let _ = pump_done.await;
+
+    // The same identity, the same worker, no key: the row goes away. This is
+    // what makes the assertion above about the key rather than about the row
+    // existing at all.
+    let bare_id = rosetta_uuid::Uuid::new_v4().to_string();
+    let _bare_lock = locks::hold_lock(&locks::tab_lock_name(&bare_id)).await;
+    let (bare_token, bare_identity) = common::mint_session().await;
+    let mut bare = connect_tab(&bare_id, bare_token, &bare_identity, None).await;
+    bare.subscribe("photo-share-bare", "SELECT * FROM photos")
+        .await
+        .expect("photo subscribe");
+    harness::pump_until(&mut bare, |event| {
+        matches!(event, ClientEvent::SnapshotEnd { .. })
+    })
+    .await;
+    let (bare_client, bare_pump) = ConnettoClient::with_pump(bare);
+    let (bare_done_tx, bare_done) = oneshot::channel::<()>();
+    spawn_local(async move {
+        bare_pump.await;
+        let _ = bare_done_tx.send(());
+    });
+    let bare_live: LiveQuery<Photo> = photos::table
+        .order(photos::id)
+        .select(Photo::as_select())
+        .live(&bare_client)
+        .await
+        .expect("photo live query");
+    assert!(
+        !bare_live
+            .rows()
+            .iter()
+            .any(|row| row.id.to_string() == shared),
+        "a caller holding no key does not see the row the key owns"
+    );
+
+    drop(bare_live);
+    drop(bare_client);
+    let _ = bare_done.await;
     worker.terminate();
 }

@@ -67,11 +67,11 @@ const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 /// The Postgres schema source the demo server is launched with. Hashing it
 /// yields the version the server advertises, so this build presents a matching
 /// version at handshake and is not rejected as stale.
-const SCHEMA_SQL: &str = include_str!("../schema.sql");
+const SCHEMA_SQL: &str = include_str!("../../deployment/schema.sql");
 
 /// The policy source hashed into the advertised version beside the schema,
 /// because a changed policy changes the replica's own views.
-const POLICIES_SQL: &str = include_str!("../policies.sql");
+const POLICIES_SQL: &str = include_str!("../../deployment/policies.sql");
 /// The synced replica schema (worker first boot, policy-split by build.rs from schema.sql +
 /// policies.sql). The tab mirror uses a simpler non-split DDL below.
 const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
