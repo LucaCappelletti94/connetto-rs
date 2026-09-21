@@ -380,6 +380,8 @@ async fn streaming_serve_first_chunk_arrives_before_second_read_released() {
         verifier,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     })
     .await
@@ -763,6 +765,8 @@ async fn short_store_read_terminates_stream_with_error() {
         verifier,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     })
     .await

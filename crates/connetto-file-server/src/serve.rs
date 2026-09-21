@@ -9,6 +9,7 @@ use bytes::Bytes;
 use futures_util::stream;
 use thiserror::Error;
 
+use crate::quotas::{self, bandwidth_retry_after_secs};
 use crate::router::AppState;
 use crate::schema::ConnettoFileSchema;
 use crate::upload::TicketQuery;
@@ -52,6 +53,30 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
     headers: HeaderMap,
 ) -> Result<Response, ServerError> {
     let ticket = state.verifier.verify_verb(&q.t, Verb::Read)?;
+    // R87: a deployment over its bandwidth window refuses reads with 503
+    // before touching the database or the store.  A ceiling is a deployment
+    // fact, not a fact about the file, so this reveals nothing the refusal
+    // rules protect.  The storage ceiling deliberately does not refuse
+    // reads: content already stored stays readable.
+    {
+        let totals = state.ceilings.read().await;
+        if state.quotas.bandwidth_ceiling > 0
+            && totals.window_bytes >= state.quotas.bandwidth_ceiling
+        {
+            tracing::warn!(
+                ceiling = state.quotas.bandwidth_ceiling,
+                window_bytes = totals.window_bytes,
+                "read refused over the bandwidth ceiling",
+            );
+            return Err(ServerError::BandwidthCeiling {
+                retry_after_secs: bandwidth_retry_after_secs(
+                    totals.oldest_day,
+                    state.quotas.window_days,
+                    chrono::Utc::now(),
+                ),
+            });
+        }
+    }
     let file_id = parse_file_id(&id)?;
     if file_id.as_bytes() != &ticket.file_id {
         return Err(ServerError::NotFound);
@@ -113,7 +138,10 @@ pub(crate) async fn get_file<S: ConnettoFileSchema>(
     // Non-empty: determine the inclusive byte range and build a streaming body.
     let (lo, hi) = range.unwrap_or((0, total - 1)); // safe: total > 0 checked above
     let chunks: Vec<connetto_file_core::ChunkMeta> = manifest.chunks().to_vec();
-    let body_stream = serving_stream(state.clone(), chunks, lo, hi);
+    let body_stream = quotas::counted_serving::<S, _>(
+        state.pools.admin.clone(),
+        Box::pin(serving_stream(state.clone(), chunks, lo, hi)),
+    );
     builder
         .body(axum::body::Body::from_stream(body_stream))
         .map_err(|_| ServerError::NotFound)

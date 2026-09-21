@@ -591,6 +591,28 @@ pub async fn build_router_with_settings(
     store: AnyStore,
     caller_settings: connetto_file_server::CallerSettings,
 ) -> (Router, TicketSigner) {
+    build_router_with_quotas(
+        pg,
+        store,
+        connetto_file_server::QuotaSettings::default(),
+        connetto_file_server::CeilingCache::default(),
+        caller_settings,
+    )
+    .await
+}
+
+/// A router configured with R87 quotas and a caller-supplied ceiling cache.
+///
+/// The cache handle lets a test seed deployment totals deterministically
+/// instead of racing the refresh task; pass a fresh cache plus a short
+/// `refresh` cadence to exercise the real summation path.
+pub async fn build_router_with_quotas(
+    pg: &Pg,
+    store: AnyStore,
+    quotas: connetto_file_server::QuotaSettings,
+    ceilings: connetto_file_server::CeilingCache,
+    caller_settings: connetto_file_server::CallerSettings,
+) -> (Router, TicketSigner) {
     let (signer, verifier) = make_signer();
     let cfg: Config<DefaultFileSchema> = Config {
         pools: AppPools {
@@ -601,6 +623,8 @@ pub async fn build_router_with_settings(
         verifier,
         grace: Duration::from_secs(3600),
         caller_settings,
+        quotas,
+        ceilings,
         _schema: std::marker::PhantomData,
     };
     (

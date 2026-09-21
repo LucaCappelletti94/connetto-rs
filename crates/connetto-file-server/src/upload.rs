@@ -6,6 +6,7 @@ use axum::{
     http::StatusCode,
 };
 use bytes::Bytes;
+use chrono::Utc;
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
 use diesel_async::{AsyncConnection, RunQueryDsl};
 use serde::{Deserialize, Serialize};
@@ -15,6 +16,7 @@ use crate::{
     db,
     error::ServerError,
     needed,
+    quotas::{self, bandwidth_retry_after_secs},
     router::AppState,
     schema::ConnettoFileSchema,
     store::AnyStore,
@@ -175,6 +177,9 @@ pub(crate) async fn put_chunk<S: ConnettoFileSchema>(
             {
                 db::ChunkPutResult::WouldExceedCeiling => Err(ServerError::CeilingExceeded),
                 db::ChunkPutResult::Accepted | db::ChunkPutResult::AlreadyStored => {
+                    // The wire bytes were accepted either way: a retry of a
+                    // chunk this upload already stored still moved them.
+                    quotas::ledger_add::<S>(conn, 0, body_len).await?;
                     Ok(StatusCode::NO_CONTENT)
                 }
             }
@@ -209,6 +214,8 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
         .map(ToOwned::to_owned)
         .collect();
     let store = &state.store;
+    let ceilings = state.ceilings.clone();
+    let quota_settings = state.quotas.clone();
     // Ordering: acquire reader before admin so a saturated reader pool never
     // blocks a holder of the manifest FOR UPDATE lock.
     let mut reader_conn = state.pools.reader.get().await?;
@@ -255,7 +262,51 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     }
                     return Ok(StatusCode::OK);
                 }
-                Some(db::ManifestState::Uncommitted(manifest)) => manifest,
+                Some(db::ManifestState::Uncommitted(manifest)) => {
+                    // R87's checks guard new bytes only: an already-committed
+                    // manifest made its bytes true earlier and re-committing
+                    // it must stay idempotent even if a ceiling or the
+                    // uploader's quota filled since.  The deployment numbers
+                    // are the cached in-memory totals; the uploader's own sum
+                    // takes the per-uploader advisory lock first, because the
+                    // manifest row lock only serializes this file and two
+                    // concurrent commits of different files would otherwise
+                    // each SUM past the other's pending flip.
+                    {
+                        let totals = ceilings.read().await;
+                        if quota_settings.storage_ceiling > 0
+                            && totals.stored_bytes >= quota_settings.storage_ceiling
+                        {
+                            return Err(ServerError::StorageCeiling {
+                                retry_after_secs: quota_settings
+                                    .refresh
+                                    .as_secs()
+                                    .saturating_mul(6)
+                                    .max(1),
+                            });
+                        }
+                        if quota_settings.bandwidth_ceiling > 0
+                            && totals.window_bytes >= quota_settings.bandwidth_ceiling
+                        {
+                            return Err(ServerError::BandwidthCeiling {
+                                retry_after_secs: bandwidth_retry_after_secs(
+                                    totals.oldest_day,
+                                    quota_settings.window_days,
+                                    Utc::now(),
+                                ),
+                            });
+                        }
+                    }
+                    quotas::serialize_uploader(conn, &key).await?;
+                    let used = quotas::uploader_committed_bytes::<S>(conn, &key).await?;
+                    let declared: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+                    if quota_settings.identity_quota > 0
+                        && used.saturating_add(declared) > quota_settings.identity_quota
+                    {
+                        return Err(ServerError::QuotaExceeded);
+                    }
+                    manifest
+                }
             };
             verify_file_identity(store, &manifest).await?;
             let attributions: Vec<&str> = attributions.iter().map(String::as_str).collect();

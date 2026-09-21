@@ -201,6 +201,12 @@ where
     /// SQL name of the `chunk_registry` table.
     const CHUNK_REGISTRY_SQL: &'static str;
 
+    /// SQL name of the `traffic` day ledger (R87).  The shipped
+    /// `DEPLOYMENT_DDL` always creates it as `_cfs_traffic`, so the default
+    /// fits every deployment that applies it; a deployment with its own DDL
+    /// overrides the constant to match its name.
+    const TRAFFIC_SQL: &'static str = "_cfs_traffic";
+
     /// Build `manifests.file_id = file_id AND manifests.uploaded_by = caller`.
     fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq;
     /// Build `manifest_chunks.file_id = file_id AND manifest_chunks.uploaded_by = caller`.

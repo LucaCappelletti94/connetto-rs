@@ -232,6 +232,12 @@ const CHUNKS_COLS: &[(&str, &str)] = &[
 
 const REGISTRY_COLS: &[(&str, &str)] = &[("chunk_hash", "bytea"), ("state", "text")];
 
+const TRAFFIC_COLS: &[(&str, &str)] = &[
+    ("day", "date"),
+    ("served_bytes", "bigint"),
+    ("accepted_bytes", "bigint"),
+];
+
 /// Verifies all deployment artifacts.  Returns `Err` naming the first missing
 /// or misconfigured artifact.
 ///
@@ -289,6 +295,7 @@ async fn check_reader_role<S: ConnettoFileSchema>(
             S::MANIFESTS_SQL,
             S::MANIFEST_CHUNKS_SQL,
             S::CHUNK_REGISTRY_SQL,
+            S::TRAFFIC_SQL,
         ] {
             let owns: bool = diesel::select(diesel::dsl::exists(
                 pg_class::table
@@ -333,6 +340,17 @@ async fn check_own_tables<S: ConnettoFileSchema>(
         S::MANIFESTS_SQL,
         "created_at",
         IndexScope::TotalOr("(NOT committed)"),
+    )
+    .await?;
+    // R87: the traffic ledger the bandwidth window sums, and the per-uploader
+    // partial index the storage-quota SUM at commit depends on.
+    check_table_exists(conn, S::TRAFFIC_SQL).await?;
+    check_column_types(conn, S::TRAFFIC_SQL, TRAFFIC_COLS).await?;
+    check_leading_index(
+        conn,
+        S::MANIFESTS_SQL,
+        "uploaded_by",
+        IndexScope::TotalOr("committed"),
     )
     .await?;
 

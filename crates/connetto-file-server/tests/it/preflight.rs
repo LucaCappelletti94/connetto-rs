@@ -314,6 +314,8 @@ async fn serve_refuses_when_chunk_registry_absent() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -355,6 +357,8 @@ async fn serve_refuses_when_sweep_index_absent() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -394,6 +398,8 @@ async fn serve_refuses_when_grace_index_absent() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -440,6 +446,8 @@ async fn serve_refuses_a_degenerate_partial_grace_index() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -473,6 +481,8 @@ async fn serve_refuses_superuser_reader_role() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -530,6 +540,8 @@ async fn serve_refuses_bypassrls_reader_role() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -591,6 +603,8 @@ async fn serve_refuses_table_owner_reader_role() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -621,6 +635,8 @@ async fn serve_accepts_correctly_configured_reader_role() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)
@@ -656,6 +672,8 @@ async fn serve_refuses_when_content_state_fn_absent() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let err = serve(cfg)
@@ -686,6 +704,8 @@ async fn serve_accepts_when_content_state_fn_valid() {
         verifier: crate::fixture::make_signer().1,
         grace: std::time::Duration::from_secs(3600),
         caller_settings: connetto_file_server::CallerSettings::default(),
+        quotas: connetto_file_server::QuotaSettings::default(),
+        ceilings: connetto_file_server::CeilingCache::default(),
         _schema: std::marker::PhantomData,
     };
     let _router = serve(cfg)

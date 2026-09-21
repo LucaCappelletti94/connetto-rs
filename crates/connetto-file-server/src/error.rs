@@ -46,6 +46,31 @@ pub enum ServerError {
     #[error("range not satisfiable")]
     RangeNotSatisfiable,
 
+    /// The uploader's committed storage plus this commit exceeds the
+    /// configured per-identity quota.  Answers 507: unlike a ceiling this is
+    /// the user's own fullness, something deleting their own content fixes,
+    /// so they are owed a distinguishable answer (R87).
+    #[error("storage quota exceeded")]
+    QuotaExceeded,
+
+    /// The deployment's stored bytes reached the storage ceiling.  Answers
+    /// 503 with a fixed-interval `Retry-After`: nothing the caller did caused
+    /// it and the cached number re-measures on the refresh cadence (R87).
+    #[error("deployment storage ceiling reached")]
+    StorageCeiling {
+        /// Seconds to wait before the next attempt.
+        retry_after_secs: u64,
+    },
+
+    /// The deployment's served-plus-accepted bytes filled the bandwidth
+    /// window.  Answers 503 with `Retry-After` set to the moment the oldest
+    /// counted day rolls out of the window (R87).
+    #[error("deployment bandwidth window exhausted")]
+    BandwidthCeiling {
+        /// Seconds to wait before the next attempt.
+        retry_after_secs: u64,
+    },
+
     /// Diesel query error.
     #[error("database: {0}")]
     Db(#[from] diesel::result::Error),
@@ -78,19 +103,34 @@ where
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        let status = match self {
-            Self::NotFound | Self::Ticket(_) => StatusCode::NOT_FOUND,
-            Self::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+        let (status, retry_after) = match &self {
+            Self::NotFound | Self::Ticket(_) => (StatusCode::NOT_FOUND, None),
+            Self::RangeNotSatisfiable => (StatusCode::RANGE_NOT_SATISFIABLE, None),
             Self::CeilingExceeded | Self::BodyTooLarge | Self::TooManyChunks => {
-                StatusCode::PAYLOAD_TOO_LARGE
+                (StatusCode::PAYLOAD_TOO_LARGE, None)
             }
-            Self::HashMismatch => StatusCode::UNPROCESSABLE_ENTITY,
-            Self::CommitRefused => StatusCode::CONFLICT,
+            Self::HashMismatch => (StatusCode::UNPROCESSABLE_ENTITY, None),
+            Self::CommitRefused => (StatusCode::CONFLICT, None),
             // 503: transient condition; the client should retry after a delay.
-            Self::RegistryConflict => StatusCode::SERVICE_UNAVAILABLE,
-            Self::BadParam(_) => StatusCode::BAD_REQUEST,
-            Self::Db(_) | Self::Pool(_) | Self::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            Self::RegistryConflict => (StatusCode::SERVICE_UNAVAILABLE, None),
+            Self::QuotaExceeded => (StatusCode::INSUFFICIENT_STORAGE, None),
+            Self::StorageCeiling { retry_after_secs }
+            | Self::BandwidthCeiling { retry_after_secs } => {
+                (StatusCode::SERVICE_UNAVAILABLE, Some(*retry_after_secs))
+            }
+            Self::BadParam(_) => (StatusCode::BAD_REQUEST, None),
+            Self::Db(_) | Self::Pool(_) | Self::Store(_) => {
+                (StatusCode::INTERNAL_SERVER_ERROR, None)
+            }
         };
-        status.into_response()
+        let mut response = status.into_response();
+        if let Some(secs) = retry_after
+            && let Ok(value) = axum::http::HeaderValue::from_str(&secs.to_string())
+        {
+            response
+                .headers_mut()
+                .insert(axum::http::header::RETRY_AFTER, value);
+        }
+        response
     }
 }
