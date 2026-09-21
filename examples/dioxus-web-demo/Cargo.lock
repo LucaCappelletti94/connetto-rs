@@ -3560,7 +3560,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#d3c375683ee51c48b3a8637ebe49b1d4081128b5"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#af9d8706aefc1bf96b843d3599f1184ac5e70f01"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -3573,7 +3573,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#d3c375683ee51c48b3a8637ebe49b1d4081128b5"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#af9d8706aefc1bf96b843d3599f1184ac5e70f01"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -4100,7 +4100,7 @@ dependencies = [
 [[package]]
 name = "sqlparser-canonicalize"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#50cc6a4a7223b2cb86096529466bdcce779f75b4"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#bec4fd1fc464c5ada922c341cd63754420b9f2b0"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -4160,7 +4160,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#35a3ddf51e4212da79be7e02cf36d8c37ead0843"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#884b80e657a251f55157715ff726d9a6867f3540"
 dependencies = [
  "arc-swap",
  "async-lock",
