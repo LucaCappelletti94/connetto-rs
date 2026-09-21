@@ -25,6 +25,19 @@ use pg2sqlite::prelude::{
 /// connetto opens, returning the identity the replica was opened for.
 const CALLER_FUNCTION: &str = "current_app_user";
 
+/// The replica's local name for the share keys the caller holds, which a
+/// translated membership test searches. `connetto_client::ClientConfig`
+/// registers it, answering the joined set the server binds under
+/// `app.subjects`.
+const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+
+/// The character joining those keys, mirroring the deployment key type's
+/// `CapabilityKey::SEPARATOR`, hardcoded for the same reason the write
+/// exemption name below is: a build script cannot cheaply depend on the
+/// server crate. A key whose rendering contains it is refused at minting, so
+/// the joined value splits back into exactly the keys that went in.
+const SUBJECTS_SEPARATOR: char = ',';
+
 /// The synced tier's documents. A table splits only when a policy applies to
 /// it, so the schema and its policies translate as one universe.
 const SYNCED: &[&str] = &["schema.sql", "policies.sql"];
@@ -51,6 +64,10 @@ fn options() -> Pg2SqliteOptions {
             "app.user_id",
             CALLER_FUNCTION,
         ))
+        .with_session_variable(
+            SessionVariableMapping::current_setting("app.subjects", SUBJECTS_FUNCTION)
+                .holding_set(SUBJECTS_SEPARATOR),
+        )
         .with_rls_audit_table_name("rls_audit".to_string())
         // connetto_client::WRITE_EXEMPTION_FUNCTION, hardcoded because a build
         // script cannot cheaply depend on the client crate. connetto registers
