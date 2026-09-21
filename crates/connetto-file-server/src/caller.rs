@@ -66,7 +66,9 @@ pub(crate) async fn bind_caller(
 /// The key `caller` owns manifest rows under.
 ///
 /// Namespaced by the half it came from, so an identity and a capability
-/// subject that render alike cannot own one another's rows. The deployment is
+/// subject that render alike cannot own one another's rows, and joined under
+/// the deployment's own separator, which no single key may contain, so two
+/// callers holding different keys cannot render one value. The deployment is
 /// attributed the plain values instead, through [`attributions`], because
 /// that is what its own policies compare against.
 ///
@@ -74,8 +76,13 @@ pub(crate) async fn bind_caller(
 ///
 /// [`ServerError::NotFound`] when the ticket's caller holds neither half, so
 /// it owns no manifest and is refused the way an absent file is.
-pub(crate) fn manifest_key(caller: &ContentCaller) -> Result<String, ServerError> {
-    caller.storage_key().ok_or(ServerError::NotFound)
+pub(crate) fn manifest_key(
+    settings: &CallerSettings,
+    caller: &ContentCaller,
+) -> Result<String, ServerError> {
+    caller
+        .storage_key(settings.separator)
+        .ok_or(ServerError::NotFound)
 }
 
 /// Everyone the deployment's content-state setter is told the commit belongs

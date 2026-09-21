@@ -62,32 +62,33 @@ impl Limit {
 
 /// Which set of limits a caller gets.
 ///
-/// An accountable caller is one connetto can attribute cost to and cut off:
-/// there is a session to revoke and a grant that already cost somebody
-/// something, whether that grant is a login or a share key. A caller that
-/// presented neither has none of that by definition, so its allowance is
-/// smaller rather than absent.
+/// An identified caller is accountable: there is a user to attribute cost to,
+/// a session to revoke, and a login that already cost them something. A
+/// caller with none of that by definition gets a smaller allowance rather
+/// than none.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tier {
-    /// A caller whose handshake resolved an identity or a share key.
+    /// A caller whose handshake resolved an identity.
     Identified,
-    /// A caller that presented no grant at all, which is a supported way to
-    /// connect.
+    /// A caller with no identity, which is a supported way to connect.
     Anonymous,
 }
 
 impl Tier {
-    /// The tier `principal` gets: identified when its handshake resolved
-    /// anything at all, anonymous when it resolved nothing.
+    /// The tier `principal` gets: identified when its handshake resolved an
+    /// identity, anonymous otherwise.
     ///
-    /// A share key is as accountable as a login. It is connetto-signed, the
-    /// permission behind it is a row the application can delete, and the
-    /// caller holding it is named in every policy it passes. Keying this on
-    /// the identity alone would put a caller whose whole authorization comes
-    /// from a key on the allowance meant for a caller that proved nothing.
+    /// A share key does not lift a caller here, however well it authorizes
+    /// the rows it reads. Withdrawing a key is deleting the relation behind
+    /// it, and the grant check makes no store call, so a withdrawn key keeps
+    /// resolving until it expires (`12-identity-session-capability.md`). A
+    /// tier taken from a key would therefore hand a leaked one a reserved
+    /// connection for the rest of its lifetime, at the exact moment the
+    /// deployment is trying to cut it off. The reserve is for callers the
+    /// deployment can actually remove.
     #[must_use]
     pub fn of<Id, Key>(principal: &connetto_core::auth::Principal<Id, Key>) -> Self {
-        if principal.identity().is_some() || !principal.capabilities().is_empty() {
+        if principal.identity().is_some() {
             Self::Identified
         } else {
             Self::Anonymous
@@ -1033,18 +1034,16 @@ mod tests {
         SessionId::from_uuid(uuid::Uuid::new_v4())
     }
 
-    /// A caller holding a share key is accountable, so it draws the
-    /// identified allowance rather than the anonymous one.
+    /// A share key leaves its holder in the unreserved share, because a
+    /// withdrawn key keeps resolving until it expires and the reserve is for
+    /// callers a deployment can remove.
     #[test]
-    fn a_share_key_carries_the_same_standing_as_a_login() {
-        use connetto_core::auth::{CapabilitySubject, Principal, Subject};
+    fn a_share_key_confers_no_reserved_standing() {
+        use connetto_core::auth::VerifiedSession;
+        use connetto_core::auth::{AuthContext, CapabilitySubject, Principal, Subject};
 
         let nothing_held: Principal = Principal::unidentified(handle());
-        assert_eq!(
-            Tier::of(&nothing_held),
-            Tier::Anonymous,
-            "a caller that proved nothing takes the smaller allowance"
-        );
+        assert_eq!(Tier::of(&nothing_held), Tier::Anonymous);
 
         let mut key_only: Principal = Principal::unidentified(handle());
         key_only
@@ -1052,8 +1051,22 @@ mod tests {
             .expect("a capability never conflicts");
         assert_eq!(
             Tier::of(&key_only),
+            Tier::Anonymous,
+            "a key the deployment cannot cut off buys no reserved connection"
+        );
+
+        let mut signed_in: Principal = Principal::unidentified(handle());
+        let session = handle();
+        signed_in
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("alice"),
+                session_id: session,
+            }))
+            .expect("one identity is accepted");
+        assert_eq!(
+            Tier::of(&signed_in),
             Tier::Identified,
-            "a connetto-signed key names a caller the deployment can cut off"
+            "a login names a run the deployment can revoke"
         );
     }
 

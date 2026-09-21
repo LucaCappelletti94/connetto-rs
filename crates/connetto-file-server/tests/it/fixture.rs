@@ -630,7 +630,9 @@ pub async fn insert_manifest_bypassing_intent(
     caller: &ContentCaller,
     chunks: &[ChunkMeta],
 ) {
-    let caller = &caller.storage_key().expect("the caller owns manifest rows");
+    let caller = &caller
+        .storage_key(',')
+        .expect("the caller owns manifest rows");
     let total_len: i64 = chunks
         .iter()
         .map(|c| i64::try_from(c.len).expect("chunk len fits i64"))
@@ -691,7 +693,9 @@ pub async fn insert_committed_manifest(
     chunks: &[ChunkMeta],
 ) {
     insert_manifest_bypassing_intent(conn, file_id, caller, chunks).await;
-    let caller = &caller.storage_key().expect("the caller owns manifest rows");
+    let caller = &caller
+        .storage_key(',')
+        .expect("the caller owns manifest rows");
 
     // Mark all chunk rows stored for this (file_id, caller) pair.
     diesel::sql_query(
