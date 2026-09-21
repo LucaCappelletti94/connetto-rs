@@ -68,6 +68,10 @@ const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 /// yields the version the server advertises, so this build presents a matching
 /// version at handshake and is not rejected as stale.
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
+
+/// The policy source hashed into the advertised version beside the schema,
+/// because a changed policy changes the replica's own views.
+const POLICIES_SQL: &str = include_str!("../policies.sql");
 /// The synced replica schema (worker first boot, policy-split by build.rs from schema.sql +
 /// policies.sql). The tab mirror uses a simpler non-split DDL below.
 const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
@@ -322,26 +326,29 @@ async fn run_db_worker() -> Result<(), JsValue> {
         .with_login_base_url(Some(AUTH_ORIGIN.to_owned())),
     );
     let session = workers::boot_db_worker::<String>(
-        &workers::DbWorkerConfig::new(connetto_core::SchemaVersion::from_source(SCHEMA_SQL))
-            .with_ws_url(DEMO_WS_URL)
-            .with_replica_db_prefix(DB_NAME)
-            .with_replica_ddl(DEMO_SQLITE_DDL)
-            .with_frontend_ddl(FRONTEND_DDL)
-            .with_upstream_sub_id("db-upstream")
-            .with_upstream_query(DEMO_QUERY)
-            .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-            .with_hub_meta_name("connetto-hub-meta.sqlite")
-            .with_content_namespace("connetto-photo-content")
-            .with_sql_functions(uuidv4_functions())
-            .with_policy_tables(PolicyTables::from_translation(
-                POLICY_TABLES.iter().copied(),
-                POLICY_VIEWS.iter().copied(),
-            ))
-            .with_caller_function(CALLER_FUNCTION)
-            .with_auth(auth)
-            .with_auth_db_name("connetto-auth.sqlite")
-            .with_unlock(true)
-            .with_pick_account(true),
+        &workers::DbWorkerConfig::new(connetto_core::SchemaVersion::from_sources([
+            SCHEMA_SQL,
+            POLICIES_SQL,
+        ]))
+        .with_ws_url(DEMO_WS_URL)
+        .with_replica_db_prefix(DB_NAME)
+        .with_replica_ddl(DEMO_SQLITE_DDL)
+        .with_frontend_ddl(FRONTEND_DDL)
+        .with_upstream_sub_id("db-upstream")
+        .with_upstream_query(DEMO_QUERY)
+        .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
+        .with_hub_meta_name("connetto-hub-meta.sqlite")
+        .with_content_namespace("connetto-photo-content")
+        .with_sql_functions(uuidv4_functions())
+        .with_policy_tables(PolicyTables::from_translation(
+            POLICY_TABLES.iter().copied(),
+            POLICY_VIEWS.iter().copied(),
+        ))
+        .with_caller_function(CALLER_FUNCTION)
+        .with_auth(auth)
+        .with_auth_db_name("connetto-auth.sqlite")
+        .with_unlock(true)
+        .with_pick_account(true),
     )
     .await?;
     // Broadcast so every tab can show the account, expiry info, and custody level.
@@ -489,7 +496,10 @@ async fn boot_window() -> Result<Boot, JsValue> {
             .map_err(|err| JsValue::from_str(&err.to_string()))?;
     let content = Rc::new(TabContent::new(&mut transport));
     let config = ClientConfig::new(client_id.clone())
-        .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
+        .with_schema_version(Some(connetto_core::SchemaVersion::from_sources([
+            SCHEMA_SQL,
+            POLICIES_SQL,
+        ])))
         .with_sql_functions(uuidv4_functions())
         // No with_policy_tables: the tab mirror uses the simple non-split DDL and the
         // server's CDC already filters rows to the authenticated user's identity.

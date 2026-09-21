@@ -984,6 +984,10 @@ async fn main() -> Result<()> {
     let bind = var_or("CONNETTO_BIND", "127.0.0.1:8080");
     let database_url = std::env::var("DATABASE_URL").context("set DATABASE_URL")?;
     let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
+    // Beside the schema in the advertised version: a policy decides which view
+    // a logical name resolves to on a replica, so a changed policy makes an
+    // existing replica stale and a client holding one has to be told.
+    let pg_policies = read_ddl("CONNETTO_PG_POLICIES")?;
     let slot = var_or("CONNETTO_SLOT", "connetto_slot");
     let publication = var_or("CONNETTO_PUBLICATION", "connetto_pub");
     let oplog_table = var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog");
@@ -1038,7 +1042,7 @@ async fn main() -> Result<()> {
         .map_err(|err| anyhow!("building snapshot source: {err}"))?
         .with_publication(publication.as_str());
     let (auth, translator, reach) =
-        build_authorization(&pool, &reader_pool, &pg_ddl, &publication).await?;
+        build_authorization(&pool, &reader_pool, &pg_ddl, &pg_policies, &publication).await?;
     // The membership term's subquery classifies against the deployment's own
     // policies, so the materializer's engine gets the translator that read them.
     let upkeep_translator = translator.clone();
@@ -1063,7 +1067,10 @@ async fn main() -> Result<()> {
         oplog,
         write,
         Arc::clone(&guard),
-        SessionConfig::new().with_schema_version(Some(SchemaVersion::from_source(&pg_ddl))),
+        SessionConfig::new().with_schema_version(Some(SchemaVersion::from_sources([
+            pg_ddl.as_str(),
+            pg_policies.as_str(),
+        ]))),
         Some(upkeep),
         signer,
     );
@@ -1234,10 +1241,10 @@ async fn build_authorization(
     owner_pool: &Pool<AsyncPgConnection>,
     reader_pool: &Pool<AsyncPgConnection>,
     pg_ddl: &str,
+    policies: &str,
     publication: &str,
 ) -> Result<(ServerAuth, Translator, GrantReach)> {
-    let policies = read_ddl("CONNETTO_PG_POLICIES")?;
-    let translated = Translated::of::<String>(pg_ddl, &policies, DEFAULT_USER_SETTING)?;
+    let translated = Translated::of::<String>(pg_ddl, policies, DEFAULT_USER_SETTING)?;
 
     // A policy reading a table the change stream does not carry never hears
     // that a grant was given or taken away, so the store goes stale and then

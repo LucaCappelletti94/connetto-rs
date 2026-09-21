@@ -42,6 +42,24 @@ impl SchemaVersion {
         Self(schema_hash(source))
     }
 
+    /// Build a schema version from every source a replica is translated from,
+    /// in one fixed order.
+    ///
+    /// A replica's shape comes from more than its tables: a policy decides
+    /// which view a logical name resolves to and what its `INSTEAD OF`
+    /// triggers admit, so a changed policy changes the replica as surely as a
+    /// changed column does. Hashing the policy source beside the schema is
+    /// what makes an existing replica read as stale when a deployment edits a
+    /// policy, which is the only signal that reaches a client holding a
+    /// durable one.
+    ///
+    /// Order is part of the identity, so both ends list their sources the same
+    /// way: the schema first, then the policies.
+    pub fn from_sources<'a>(sources: impl IntoIterator<Item = &'a str>) -> Self {
+        let joined = sources.into_iter().collect::<Vec<_>>().join("\n");
+        Self(schema_hash(&joined))
+    }
+
     /// The content hash bytes.
     #[inline]
     pub fn hash(&self) -> &[u8] {

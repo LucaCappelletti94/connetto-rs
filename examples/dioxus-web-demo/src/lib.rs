@@ -9,6 +9,10 @@ include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 // examples/wasm-smoke/schema.sql, which the browser-stack server uses.
 pub const SCHEMA_SQL: &str = include_str!("../schema.sql");
 
+/// The policy source the translation read beside the schema, hashed into the
+/// version with it because a changed policy changes the replica's own views.
+pub const POLICIES_SQL: &str = include_str!("../policies.sql");
+
 pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
 pub const DEMO_TAB_DDL: &str = concat!(
@@ -35,7 +39,7 @@ const PHOTO_AUTH_DB: &str = "connetto-dioxus-photo-auth.sqlite";
 /// The schema version this build was compiled against.
 #[must_use]
 pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_core::SchemaVersion::from_source(SCHEMA_SQL)
+    connetto_core::SchemaVersion::from_sources([SCHEMA_SQL, POLICIES_SQL])
 }
 
 #[diesel::declare_sql_function]
