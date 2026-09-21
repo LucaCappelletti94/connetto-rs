@@ -24,13 +24,13 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Clients | Native Diesel connection, browser client on a worker over OPFS, Dioxus and Yew hooks |
 | At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock, a device-private tier, retention, several accounts |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
-| Files | Chunked, encrypted content with a file server and a client for both platforms |
+| Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
 | Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over seven workspaces |
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 87 phases, 65 done and 22 open. The core is built and proven, and what remains is the last mile around it.
+The plan in `plans/master-implementation-plan.md` tracks 93 phases, 70 done and 23 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -39,6 +39,7 @@ The plan in `plans/master-implementation-plan.md` tracks 87 phases, 65 done and 
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline, failover verification | R70, R72, R73 |
 | Refresh token in an `HttpOnly` cookie, re-execution read failure scope, demo gaps | R90, R89, R57 |
+| Apps, installations and the bot template | R91 |
 | Device-to-device sync without a server | R74 to R80 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).

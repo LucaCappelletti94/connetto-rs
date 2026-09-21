@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
-     viewBox="0 0 1680 1806" width="1680" height="1806"
+     viewBox="0 0 1680 1720" width="1680" height="1720"
      font-family="system-ui, -apple-system, 'Segoe UI', sans-serif"
      role="img" aria-labelledby="diagram-title diagram-desc" focusable="false">
   <title id="diagram-title">connetto-rs architecture</title>
@@ -14,17 +14,17 @@
     <marker id="arrow-teal" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
       <polygon points="0 0, 10 3.5, 0 7" fill="#26A69A" />
     </marker>
-    <marker id="arrow-orange" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
-      <polygon points="0 0, 10 3.5, 0 7" fill="#FFA726" />
+    <marker id="arrow-red" viewBox="0 0 10 7" refX="10" refY="3.5" markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#EF5350" />
     </marker>
   </defs>
 
   <!-- Background -->
-  <rect width="1680" height="1550" fill="#FAFAFA" rx="4" />
+  <rect width="1680" height="1720" fill="#FAFAFA" rx="4" />
 
   <!-- ==================== BACKEND ZONE ==================== -->
   <g id="backend-zone">
-    <rect x="20" y="20" width="850" height="1160" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
+    <rect x="20" y="20" width="850" height="1260" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
     <text x="445" y="46" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Backend</text>
 
     <!-- ===== PostgreSQL panel ===== -->
@@ -45,24 +45,24 @@
       <text x="14" y="114" font-size="9.5" fill="#78909C">WAL / CDC out (pgoutput)</text>
     </g>
 
-    <!-- Mesh part: open question X7, planned color -->
+    <!-- Mesh part: open question X7, R73 -->
     <g transform="translate(300, 110)">
-      <rect width="175" height="56" rx="6" fill="#fff" stroke="#FFA726" stroke-width="1.5" />
-      <rect width="4" height="56" rx="1" fill="#FFA726" />
+      <rect width="175" height="56" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
+      <rect width="4" height="56" rx="1" fill="#EF5350" />
       <text x="87" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#333">PG instance 2</text>
-      <text x="87" y="40" text-anchor="middle" font-size="9" fill="#E65100">multi-server shape</text>
+      <text x="87" y="40" text-anchor="middle" font-size="9" fill="#C62828">multi-server shape, R73</text>
     </g>
     <g transform="translate(300, 186)">
-      <rect width="175" height="56" rx="6" fill="#fff" stroke="#FFA726" stroke-width="1.5" />
-      <rect width="4" height="56" rx="1" fill="#FFA726" />
+      <rect width="175" height="56" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
+      <rect width="4" height="56" rx="1" fill="#EF5350" />
       <text x="87" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#333">PG instance N</text>
-      <text x="87" y="40" text-anchor="middle" font-size="9" fill="#E65100">multi-server shape</text>
+      <text x="87" y="40" text-anchor="middle" font-size="9" fill="#C62828">multi-server shape, R73</text>
     </g>
-    <line x1="275" y1="138" x2="300" y2="138" stroke="#FFA726" stroke-width="1.5" marker-start="url(#arrow-orange)" marker-end="url(#arrow-orange)" />
-    <line x1="275" y1="214" x2="300" y2="214" stroke="#FFA726" stroke-width="1.5" marker-start="url(#arrow-orange)" marker-end="url(#arrow-orange)" />
-    <text x="287" y="130" text-anchor="middle" font-size="8" fill="#E65100">(8)</text>
-    <text x="265" y="272" text-anchor="middle" font-size="10" font-weight="600" fill="#E65100">mesh: open question X7, reframed as R73 failover verification (exploratory, not started)</text>
-    <text x="265" y="286" text-anchor="middle" font-size="9" fill="#E65100">the hard parts are existing Postgres features, the phase is verification and a deployment recipe</text>
+    <line x1="275" y1="138" x2="300" y2="138" stroke="#EF5350" stroke-width="1.5" marker-start="url(#arrow-red)" marker-end="url(#arrow-red)" />
+    <line x1="275" y1="214" x2="300" y2="214" stroke="#EF5350" stroke-width="1.5" marker-start="url(#arrow-red)" marker-end="url(#arrow-red)" />
+    <text x="287" y="130" text-anchor="middle" font-size="8" fill="#C62828">(8)</text>
+    <text x="265" y="272" text-anchor="middle" font-size="10" font-weight="600" fill="#C62828">mesh: open question X7, reframed as R73 failover verification</text>
+    <text x="265" y="286" text-anchor="middle" font-size="9" fill="#C62828">the hard parts are existing Postgres features, the phase is verification and a deployment recipe</text>
 
     <!-- PG panel to connetto-server arrows -->
     <line x1="495" y1="150" x2="537" y2="150" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
@@ -96,7 +96,7 @@
       <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
       <rect width="4" height="50" rx="1" fill="#EF5350" />
       <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Shared public store</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R11</text>
+      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R11</text>
     </g>
 
     <!-- ===== Backup and restore (R70) ===== -->
@@ -104,7 +104,7 @@
       <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
       <rect width="4" height="50" rx="1" fill="#EF5350" />
       <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Deployment backup and restore</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R70</text>
+      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R70</text>
     </g>
 
     <!-- ===== Clock discipline (R72) ===== -->
@@ -112,7 +112,37 @@
       <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
       <rect width="4" height="50" rx="1" fill="#EF5350" />
       <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Clock discipline (open question X6)</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">not started, R72</text>
+      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R72</text>
+    </g>
+
+    <!-- ===== connetto-file-server ===== -->
+    <g transform="translate(35, 866)">
+      <rect width="460" height="156" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="156" rx="1" fill="#4CAF50" />
+      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-server</text>
+      <text x="230" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo, beside connetto-server on the same deployment: chunk storage, upload, serving, collection</text>
+      <text x="230" y="54" text-anchor="middle" font-size="8.5" fill="#555">chunks in a filesystem directory or an object store, never in Postgres</text>
+      <text x="230" y="70" text-anchor="middle" font-size="8.5" fill="#555">reached over HTTP under a ticket connetto-server mints, metadata stays ordinary synced rows</text>
+      <text x="230" y="86" text-anchor="middle" font-size="8.5" fill="#555">two-phase upload: intent, needed hashes, chunk PUTs, commit</text>
+      <text x="230" y="102" text-anchor="middle" font-size="8.5" fill="#555">ranged GET with a strong ETag, immutable caching, 404 for absent or forbidden</text>
+      <text x="230" y="118" text-anchor="middle" font-size="8.5" fill="#555">mark and sweep from the chunk registry, grace equal to the ticket lifetime</text>
+      <text x="230" y="134" text-anchor="middle" font-size="8.5" fill="#555">seam: ContentTicketSigner, the one trait connetto-core gained</text>
+      <text x="230" y="150" text-anchor="middle" font-size="8.5" fill="#555">storage quotas and deployment ceilings, 507 quota and 503 ceilings with Retry-After, R87</text>
+    </g>
+
+    <!-- ===== connetto-file-core ===== -->
+    <g transform="translate(35, 1040)">
+      <rect width="460" height="156" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="156" rx="1" fill="#4CAF50" />
+      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-core</text>
+      <text x="230" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo, the library the file server and both file clients share, tested under wasm too</text>
+      <text x="230" y="54" text-anchor="middle" font-size="8.5" fill="#555">identity is blake3 of the bytes, computed in the chunking pass</text>
+      <text x="230" y="70" text-anchor="middle" font-size="8.5" fill="#555">FastCDC per mime class, zstd then XChaCha20-Poly1305</text>
+      <text x="230" y="86" text-anchor="middle" font-size="8.5" fill="#555">the chunk's plaintext hash is the store key and the AEAD aad</text>
+      <text x="230" y="102" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkStore (write, read, has, delete) by content hash</text>
+      <text x="230" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkInventory, for the stores that can list what they hold</text>
+      <text x="230" y="134" text-anchor="middle" font-size="8.5" fill="#555">a manifest is the ordered (hash, length) list, transport metadata only</text>
+      <text x="230" y="150" text-anchor="middle" font-size="8.5" fill="#555">the same bytes chunk and hash identically on native and wasm</text>
     </g>
 
     <!-- (5) FGA arrows: change-path checks and model write, both built -->
@@ -122,8 +152,8 @@
     <text x="499" y="860" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(-90 499 860)">(5) FGA model write (startup)</text>
 
     <!-- ==================== connetto-server ==================== -->
-    <rect x="537" y="60" width="326" height="1100" rx="8" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
-    <rect x="537" y="60" width="5" height="1100" rx="2" fill="#4CAF50" />
+    <rect x="537" y="60" width="326" height="1200" rx="8" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+    <rect x="537" y="60" width="5" height="1200" rx="2" fill="#4CAF50" />
     <text x="700" y="82" text-anchor="middle" font-size="13" font-weight="600" fill="#2E7D32">connetto-server</text>
     <text x="700" y="96" text-anchor="middle" font-size="10" fill="#4CAF50">in this repo: sessions, materializer, RLS writes</text>
 
@@ -209,7 +239,7 @@
       <text x="142" y="13" text-anchor="middle" font-size="10.5" font-weight="500" fill="#333">Re-execution read tier</text>
       <text x="142" y="25" text-anchor="middle" font-size="8" fill="#555">MIN, MAX, joins, row shapes via the server's connector</text>
       <text x="142" y="37" text-anchor="middle" font-size="8" fill="#4CAF50">per-viewer runs on RLS tables: each viewer's own answer</text>
-      <text x="142" y="49" text-anchor="middle" font-size="8" fill="#C62828">a failing read ends its subscription, not live delivery: not started, R89</text>
+      <text x="142" y="49" text-anchor="middle" font-size="8" fill="#C62828">a failing read ends its subscription, not live delivery: R89</text>
     </g>
 
     <g transform="translate(558, 724)">
@@ -264,6 +294,18 @@
       <text x="150" y="72" text-anchor="middle" font-size="9" fill="#555">each grant resolves into a Principal</text>
     </g>
 
+    <!-- App registry and bot login (R91) -->
+    <g transform="translate(550, 1146)">
+      <rect width="300" height="108" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
+      <rect width="4" height="108" rx="1" fill="#EF5350" />
+      <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#C62828">App registry and bot login</text>
+      <text x="150" y="36" text-anchor="middle" font-size="9" fill="#C62828">R91 (chapters 12 and 11)</text>
+      <text x="150" y="53" text-anchor="middle" font-size="8.5" fill="#555">a developer registers an app: its public key and the tables it wants</text>
+      <text x="150" y="68" text-anchor="middle" font-size="8.5" fill="#555">a user installs it on their own data, three synced tables under RLS</text>
+      <text x="150" y="83" text-anchor="middle" font-size="8.5" fill="#555">one route: a signed assertion buys an ordinary login grant</text>
+      <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#555">the bot is a user of the deployment, no browser and no password</text>
+    </g>
+
     <!-- PG read/write arrow labels, painted after the zone fill so they stay legible -->
     <text x="516" y="178" text-anchor="middle" font-size="8" fill="#2E7D32">snapshot + re-execution reads</text>
     <text x="516" y="188" text-anchor="middle" font-size="8" fill="#2E7D32">(reader role, bounded)</text>
@@ -273,7 +315,7 @@
 
   <!-- ==================== TRANSPORT ==================== -->
   <g id="transport-layer">
-    <rect x="880" y="60" width="90" height="1080" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1" stroke-dasharray="6 3" />
+    <rect x="880" y="60" width="90" height="1140" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1" stroke-dasharray="6 3" />
     <text x="925" y="82" text-anchor="middle" font-size="11" font-weight="600" fill="#2E7D32">Transport</text>
     <text x="925" y="96" text-anchor="middle" font-size="10" font-family="monospace" fill="#4CAF50">wss://</text>
     <text x="925" y="1108" text-anchor="middle" font-size="8" fill="#4CAF50">content ticket</text>
@@ -300,8 +342,8 @@
     <path d="M 863 190 L 995 190" fill="none" stroke="#26A69A" stroke-width="1.5" stroke-dasharray="5 3" marker-end="url(#arrow-teal)" />
     <rect x="892" y="164" width="70" height="14" rx="2" fill="#FAFAFA" opacity="0.9" />
     <text x="927" y="174" text-anchor="middle" fill="#26A69A" font-weight="600">(6) Schema</text>
-    <text x="927" y="206" text-anchor="middle" font-size="7.5" fill="#E65100">application schema majors:</text>
-    <text x="927" y="216" text-anchor="middle" font-size="7.5" fill="#E65100">R31, not started</text>
+    <text x="927" y="206" text-anchor="middle" font-size="7.5" fill="#C62828">application schema majors:</text>
+    <text x="927" y="216" text-anchor="middle" font-size="7.5" fill="#C62828">R31</text>
 
     <!-- WS into native sync engine -->
     <line x1="970" y1="278" x2="995" y2="278" stroke="#4CAF50" stroke-width="2" marker-end="url(#arrow-green)" />
@@ -322,12 +364,17 @@
     <text x="930" y="384" text-anchor="middle" fill="#4CAF50" font-weight="600">(3) Aggregates</text>
 
     <!-- WS into browser DB worker -->
-    <line x1="970" y1="1064" x2="1008" y2="1064" stroke="#4CAF50" stroke-width="2" marker-end="url(#arrow-green)" />
+    <line x1="970" y1="1184" x2="1008" y2="1184" stroke="#4CAF50" stroke-width="2" marker-end="url(#arrow-green)" />
+
+    <!-- HTTP from the native file client, under a ticket, to connetto-file-server -->
+    <path d="M 995 711 L 970 711" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <text x="925" y="700" text-anchor="middle" font-size="8" fill="#4CAF50">file bytes, HTTP</text>
+    <text x="925" y="712" text-anchor="middle" font-size="8" fill="#4CAF50">under one ticket</text>
   </g>
 
   <!-- ==================== NATIVE CLIENT ZONE ==================== -->
   <g id="native-client-zone">
-    <rect x="980" y="20" width="660" height="640" rx="10" fill="#FFF8E1" stroke="#FFB74D" stroke-width="1.5" />
+    <rect x="980" y="20" width="660" height="760" rx="10" fill="#FFF8E1" stroke="#FFB74D" stroke-width="1.5" />
     <text x="1310" y="46" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Native client (Dioxus app)</text>
     <text x="1310" y="62" text-anchor="middle" font-size="10" fill="#4CAF50">connetto-client, in this repo, built and verified</text>
 
@@ -390,9 +437,9 @@
       <text x="315" y="16" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
       <text x="315" y="32" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
       <text x="315" y="46" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
-      <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
+      <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
       <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates R51 and R52 wait for the mobile demo build R88, R53 blocked on hardware</text>
-      <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">Linux keyring custody across a reboot: not started, R71</text>
+      <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">Linux keyring custody across a reboot: R71</text>
     </g>
 
     <!-- Schema pipeline (build time) -->
@@ -426,7 +473,7 @@
       <text x="150" y="16" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Local data export and import</text>
       <text x="150" y="30" text-anchor="middle" font-size="8.5" fill="#4CAF50">zipped change records and unsent content, one entry at a time</text>
       <text x="150" y="43" text-anchor="middle" font-size="8.5" fill="#4CAF50">import restores device tier and unsent writes, same account</text>
-      <text x="150" y="56" text-anchor="middle" font-size="8.5" fill="#C62828">portability download: not started, R61</text>
+      <text x="150" y="56" text-anchor="middle" font-size="8.5" fill="#C62828">portability download: R61</text>
     </g>
     <g transform="translate(1325, 588)">
       <rect width="300" height="52" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
@@ -434,11 +481,37 @@
       <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Several accounts signed in at once</text>
       <text x="150" y="38" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: a switch replaces the DB worker, own account index</text>
     </g>
+
+    <!-- connetto-file-client (native) -->
+    <g transform="translate(995, 656)">
+      <rect width="300" height="110" rx="6" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="110" rx="1" fill="#4CAF50" />
+      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">connetto-file-client</text>
+      <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo: the store, the outbox, the resolver, the pins</text>
+      <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#555">manifests, outbox and pins in the replica, committed with the row</text>
+      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#555">encrypted store on std::fs, bytes over HTTP under one ticket</text>
+      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#555">outbox walk with a boot pass, a server refusal stays queued</text>
+      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the demos drive the content surface end to end, R69</text>
+    </g>
+
+    <!-- Device-to-device sync (R74 to R80) -->
+    <g transform="translate(1325, 656)">
+      <rect width="300" height="110" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
+      <rect width="4" height="110" rx="1" fill="#EF5350" />
+      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#C62828">Device-to-device sync</text>
+      <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#C62828">R74 to R80 (design concluded as R25, chapter 19)</text>
+      <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#555">two devices exchange signed writes over the LAN with no server</text>
+      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#555">mTLS with device certificates, the server still adjudicates later</text>
+      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#555">a lost device's signed queue is recovered through a courier</text>
+      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#555">one dedup domain, the (device key, sequence) frontier</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#555">BLE beacon bootstrap later, phones need R88 first</text>
+    </g>
   </g>
 
   <!-- ==================== BROWSER / WASM CLIENT ZONE ==================== -->
-  <g id="wasm-client-zone">
-    <rect x="980" y="680" width="660" height="640" rx="10" fill="#F3E5F5" stroke="#BA68C8" stroke-width="1.5" />
+  <g id="wasm-client-zone" transform="translate(0, 120)">
+    <rect x="980" y="680" width="660" height="700" rx="10" fill="#F3E5F5" stroke="#BA68C8" stroke-width="1.5" />
     <text x="1310" y="706" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Browser / WASM client</text>
     <text x="1310" y="722" text-anchor="middle" font-size="10" fill="#4CAF50">connetto-web, in this repo, built and browser-verified</text>
 
@@ -458,7 +531,7 @@
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
       <text x="148" y="14" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">OAuth login (frontend)</text>
       <text x="148" y="27" text-anchor="middle" font-size="8.5" fill="#4CAF50">auth code + PKCE, token store, refresh</text>
-      <text x="148" y="40" text-anchor="middle" font-size="8" fill="#C62828">refresh token into an HttpOnly cookie: not started, R90</text>
+      <text x="148" y="40" text-anchor="middle" font-size="8" fill="#C62828">refresh token into an HttpOnly cookie: R90</text>
     </g>
     <g transform="translate(1008, 816)">
       <rect width="608" height="52" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
@@ -473,8 +546,8 @@
     <text x="1322" y="902" font-size="9" font-weight="600" fill="#9C27B0">(7) BroadcastChannel</text>
 
     <!-- DB worker sub-zone -->
-    <rect x="995" y="916" width="630" height="388" rx="8" fill="#EDE7F6" stroke="#7E57C2" stroke-width="1" />
-    <rect x="995" y="916" width="5" height="388" rx="2" fill="#4CAF50" />
+    <rect x="995" y="916" width="630" height="440" rx="8" fill="#EDE7F6" stroke="#7E57C2" stroke-width="1" />
+    <rect x="995" y="916" width="5" height="440" rx="2" fill="#4CAF50" />
     <text x="1310" y="936" text-anchor="middle" font-size="12" font-weight="600" fill="#2E7D32">Dedicated DB worker</text>
     <text x="1310" y="950" text-anchor="middle" font-size="9" fill="#888">leader tab owns it: OPFS replica, server connection, relay hub</text>
 
@@ -515,7 +588,7 @@
       <text x="304" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
       <text x="304" y="36" text-anchor="middle" font-size="9.5" fill="#555">sqlite3mc over OPFS, SQLCipher v4 file format, per-replica key</text>
       <text x="304" y="52" text-anchor="middle" font-size="9" fill="#555">IndexedDB custody, device key wraps the pre-identity refresh store</text>
-      <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#E65100">R21: one page codec on both targets (planned)</text>
+      <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
       <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#4CAF50">unlock gate built: passkey-derived key (WebAuthn PRF), enrolment re-wraps custody</text>
     </g>
 
@@ -540,122 +613,51 @@
       <text x="304" y="15" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">Local data export and import</text>
       <text x="304" y="29" text-anchor="middle" font-size="8.5" fill="#4CAF50">the same archive through the DB worker, a Blob in and out, same account only</text>
     </g>
+
+    <!-- connetto-file-client (browser) -->
+    <g transform="translate(1008, 1318)">
+      <rect width="608" height="32" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="3" height="32" rx="1" fill="#4CAF50" />
+      <text x="304" y="13" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">connetto-file-client in the browser</text>
+      <text x="304" y="26" text-anchor="middle" font-size="8.5" fill="#4CAF50">the same crate on a worker-owned encrypted OPFS store, same outbox, resolver and pins, R68</text>
+    </g>
   </g>
 
   <!-- Codec format pin link between the two encryption boxes -->
-  <path d="M 1625 374 L 1648 374 L 1648 1158 L 1616 1158" fill="none" stroke="#4CAF50" stroke-width="1.5" stroke-dasharray="5 3" />
-  <text x="1658" y="766" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(90 1658 766)">same file format both sides: PRAGMA cipher 'sqlcipher', legacy 4 (R21 removes the pin)</text>
+  <path d="M 1625 374 L 1648 374 L 1648 1278 L 1616 1278" fill="none" stroke="#4CAF50" stroke-width="1.5" stroke-dasharray="5 3" />
+  <text x="1658" y="826" text-anchor="middle" font-size="9" fill="#2E7D32" transform="rotate(90 1658 826)">same file format both sides: PRAGMA cipher 'sqlcipher', legacy 4 (R21 removes the pin)</text>
 
-  <!-- ==================== BEYOND-THE-CORE STRIP ==================== -->
-  <g id="exploratory-strip">
-    <rect x="20" y="1360" width="580" height="150" rx="8" fill="#FFF8E1" fill-opacity="0.6" stroke="#FFA726" stroke-width="1.5" stroke-dasharray="8 4" />
-    <text x="40" y="1384" font-size="12" font-weight="600" fill="#E65100">Beyond the core: designed peer sync</text>
-    <g transform="translate(40, 1396)">
-      <rect width="540" height="100" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <text x="270" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Device-to-device sync</text>
-      <text x="270" y="40" text-anchor="middle" font-size="9" fill="#C62828">committed, not started: R74 to R80 (design concluded as R25, chapter 19)</text>
-      <text x="270" y="58" text-anchor="middle" font-size="9" fill="#555">signed provisional exchange over LAN mTLS with device certificates</text>
-      <text x="270" y="74" text-anchor="middle" font-size="9" fill="#555">server still adjudicates, courier recovery of a lost device's signed queue</text>
-      <text x="270" y="90" text-anchor="middle" font-size="9" fill="#555">one dedup domain, the (device key, sequence) frontier. BLE beacon bootstrap later</text>
+  <!-- ==================== HEADLESS CLIENT (BOT) ZONE ==================== -->
+  <g id="bot-client-zone">
+    <rect x="980" y="1520" width="660" height="150" rx="10" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
+    <text x="1310" y="1546" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Headless client (a bot)</text>
+    <text x="1310" y="1562" text-anchor="middle" font-size="10" fill="#C62828">connetto-client with no screen, R91 (chapter 13, template examples/bot-template)</text>
+    <g transform="translate(995, 1574)">
+      <rect width="630" height="84" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
+      <text x="315" y="18" text-anchor="middle" font-size="9" fill="#555">a program holds a query, is told when it changed, and writes values back through the same client as a screen</text>
+      <text x="315" y="34" text-anchor="middle" font-size="9" fill="#555">it logs in with a key it holds, as the app's bot user, and keeps that session across restarts</text>
+      <text x="315" y="50" text-anchor="middle" font-size="9" fill="#555">it sees only the rows its installers shared with it, either one user at a time or all together</text>
+      <text x="315" y="66" text-anchor="middle" font-size="9" fill="#555">its traffic is charged to the user it acts for, or to the developer's app allowance, never to the bot</text>
+      <text x="315" y="80" text-anchor="middle" font-size="9" fill="#555">its replica lives in memory, a durable one waits on Linux key custody, R71</text>
     </g>
-  </g>
-
-  <!-- ==================== APPS AND BOTS (R91) ==================== -->
-  <g id="apps-and-bots">
-    <rect x="620" y="1360" width="540" height="162" rx="8" fill="#FFEBEE" fill-opacity="0.6" stroke="#EF5350" stroke-width="1.5" />
-    <text x="640" y="1384" font-size="12" font-weight="600" fill="#C62828">Apps and bots: designed, not started</text>
-    <g transform="translate(640, 1396)">
-      <rect width="500" height="114" rx="6" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <text x="250" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Third-party programs that read and write a user's data</text>
-      <text x="250" y="36" text-anchor="middle" font-size="9" fill="#C62828">not started, R91. The design is in chapter 12, the login in chapter 11, the client side in chapter 13</text>
-      <text x="250" y="53" text-anchor="middle" font-size="9" fill="#555">a developer registers an app: its public key and the tables it wants. A user installs it on their own data</text>
-      <text x="250" y="69" text-anchor="middle" font-size="9" fill="#555">the app runs as a bot user of the deployment, logging in with a signed assertion, no browser and no password</text>
-      <text x="250" y="85" text-anchor="middle" font-size="9" fill="#555">a bot sees only the rows its installers shared with it, either one user at a time or all together</text>
-      <text x="250" y="101" text-anchor="middle" font-size="9" fill="#555">its traffic is charged to the user it acts for, or to the developer's app allowance, never to the bot</text>
-    </g>
-  </g>
-
-  <!-- ==================== FILE CRATES ZONE ==================== -->
-  <g id="file-crates-zone">
-    <rect x="20" y="1530" width="1620" height="232" rx="10" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
-    <text x="830" y="1556" text-anchor="middle" font-size="15" font-weight="700" fill="#555">File crates</text>
-    <text x="830" y="1572" text-anchor="middle" font-size="10" fill="#4CAF50">in this repo, beside the demos: they depend on connetto and never the reverse. Metadata travels as ordinary synced rows, content travels here</text>
-
-    <g transform="translate(40, 1586)">
-      <rect width="490" height="156" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="156" rx="1" fill="#4CAF50" />
-      <text x="245" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-core</text>
-      <text x="245" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo, tested under wasm too</text>
-      <text x="245" y="54" text-anchor="middle" font-size="8.5" fill="#555">identity is blake3 of the bytes, computed in the chunking pass</text>
-      <text x="245" y="70" text-anchor="middle" font-size="8.5" fill="#555">FastCDC per mime class, zstd then XChaCha20-Poly1305</text>
-      <text x="245" y="86" text-anchor="middle" font-size="8.5" fill="#555">the chunk's plaintext hash is the store key and the AEAD aad</text>
-      <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkStore (write, read, has, delete) by content hash</text>
-      <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ChunkInventory, for the stores that can list what they hold</text>
-      <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#555">a manifest is the ordered (hash, length) list, transport metadata only</text>
-      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#555">the same bytes chunk and hash identically on native and wasm</text>
-    </g>
-
-    <g transform="translate(585, 1586)">
-      <rect width="490" height="156" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="156" rx="1" fill="#4CAF50" />
-      <text x="245" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-server</text>
-      <text x="245" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo: chunk storage, upload, serving, collection</text>
-      <text x="245" y="54" text-anchor="middle" font-size="8.5" fill="#555">chunks in a filesystem directory or an object store, never in Postgres</text>
-      <text x="245" y="70" text-anchor="middle" font-size="8.5" fill="#555">two-phase upload: intent, needed hashes, chunk PUTs, commit</text>
-      <text x="245" y="86" text-anchor="middle" font-size="8.5" fill="#555">ranged GET with a strong ETag, immutable caching, 404 for absent or forbidden</text>
-      <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">mark and sweep from the chunk registry, grace equal to the ticket lifetime</text>
-      <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">seam: ContentTicketSigner, the one trait connetto-core gained</text>
-      <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#555">the intent answers the hashes it lacks, so a resumed upload sends only those</text>
-      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#555">storage quotas and deployment ceilings, 507 quota and 503 ceilings with Retry-After, R87</text>
-    </g>
-
-    <g transform="translate(1130, 1586)">
-      <rect width="490" height="156" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
-      <rect width="4" height="156" rx="1" fill="#4CAF50" />
-      <text x="245" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">connetto-file-client</text>
-      <text x="245" y="36" text-anchor="middle" font-size="8.5" fill="#4CAF50">in this repo, native and browser: the store, the outbox, the resolver, the pins</text>
-      <text x="245" y="54" text-anchor="middle" font-size="8.5" fill="#555">manifests, outbox and pins in the replica, committed with the entry row</text>
-      <text x="245" y="70" text-anchor="middle" font-size="8.5" fill="#555">encrypted store on std::fs natively, worker-owned OPFS in the browser</text>
-      <text x="245" y="86" text-anchor="middle" font-size="8.5" fill="#555">outbox walk with a boot pass: a server refusal stays queued, a local loss is retired</text>
-      <text x="245" y="102" text-anchor="middle" font-size="8.5" fill="#555">transfers bounded by silence, never by elapsed time. No redirect is followed</text>
-      <text x="245" y="118" text-anchor="middle" font-size="8.5" fill="#555">resolver: a signed URL by default, local bytes when unsent or pinned</text>
-      <text x="245" y="134" text-anchor="middle" font-size="8.5" fill="#555">query-shaped content pins, a sweep that asks the store what it holds, a wipe with the replica</text>
-      <text x="245" y="150" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the demos drive the content surface end to end, R69</text>
-    </g>
-
-    <path d="M 1130 1660 L 1075 1660" fill="none" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
-    <text x="1102" y="1636" text-anchor="middle" font-size="8" fill="#2E7D32">HTTP under</text>
-    <text x="1102" y="1648" text-anchor="middle" font-size="8" fill="#2E7D32">one ticket</text>
   </g>
 
   <!-- ==================== STATUS LEGEND ==================== -->
-  <g id="status-legend" transform="translate(1180, 1360)">
-    <rect width="460" height="150" rx="6" fill="#fff" stroke="#E0E0E0" stroke-width="1" />
+  <g id="status-legend" transform="translate(20, 1340)">
+    <rect width="460" height="92" rx="6" fill="#fff" stroke="#E0E0E0" stroke-width="1" />
     <text x="230" y="22" text-anchor="middle" font-size="12" font-weight="600" fill="#444">Status legend</text>
     <g transform="translate(14, 34)">
       <rect width="16" height="14" rx="2" fill="#E8F5E9" stroke="#4CAF50" />
-      <text x="24" y="11" font-size="10" fill="#2E7D32">Built / complete</text>
+      <text x="24" y="11" font-size="10" fill="#2E7D32">Built</text>
     </g>
     <g transform="translate(238, 34)">
-      <rect width="16" height="14" rx="2" fill="#E3F2FD" stroke="#42A5F5" />
-      <text x="24" y="11" font-size="10" fill="#1565C0">Exists, in development</text>
-    </g>
-    <g transform="translate(14, 58)">
-      <rect width="16" height="14" rx="2" fill="#FFF3E0" stroke="#FFA726" />
-      <text x="24" y="11" font-size="10" fill="#E65100">Planned / research only</text>
-    </g>
-    <g transform="translate(238, 58)">
       <rect width="16" height="14" rx="2" fill="#FFEBEE" stroke="#EF5350" />
-      <text x="24" y="11" font-size="10" fill="#C62828">Not started, no code</text>
+      <text x="24" y="11" font-size="10" fill="#C62828">Not built, carries its R-number</text>
     </g>
-    <g transform="translate(14, 82)">
-      <rect width="16" height="14" rx="2" fill="#FFF3E0" stroke="#FFA726" stroke-dasharray="4 2" />
-      <text x="24" y="11" font-size="10" fill="#E65100">Exploratory (dashed border)</text>
-    </g>
-    <text x="14" y="118" font-size="8.5" fill="#777">Unbuilt boxes carry their R-number. Seam defects: one document per finding in upstream/.</text>
-    <text x="14" y="132" font-size="8.5" fill="#777">Phase status: plans/master-implementation-plan.md, Status and Sequence tables.</text>
+    <text x="14" y="64" font-size="8.5" fill="#777">Seam defects: one document per finding in upstream/.</text>
+    <text x="14" y="78" font-size="8.5" fill="#777">Phase status: plans/master-implementation-plan.md, Status and Sequence tables.</text>
   </g>
 
   <!-- Title -->
-  <text x="20" y="1790" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-09-20 to the plan's current state.</text>
+  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-09-21 to the plan's current state.</text>
 </svg>
