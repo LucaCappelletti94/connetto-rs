@@ -271,7 +271,9 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                     // takes the per-uploader advisory lock first, because the
                     // manifest row lock only serializes this file and two
                     // concurrent commits of different files would otherwise
-                    // each SUM past the other's pending flip.
+                    // each SUM past the other's pending flip.  No quota means
+                    // no lock and no sum: an unconfigured deployment commits
+                    // exactly as it did before the quota existed.
                     {
                         let totals = ceilings.read().await;
                         if quota_settings.storage_ceiling > 0
@@ -297,13 +299,13 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                             });
                         }
                     }
-                    quotas::serialize_uploader(conn, &key).await?;
-                    let used = quotas::uploader_committed_bytes::<S>(conn, &key).await?;
-                    let declared: u64 = manifest.chunks().iter().map(|c| c.len).sum();
-                    if quota_settings.identity_quota > 0
-                        && used.saturating_add(declared) > quota_settings.identity_quota
-                    {
-                        return Err(ServerError::QuotaExceeded);
+                    if quota_settings.identity_quota > 0 {
+                        quotas::serialize_uploader(conn, &key).await?;
+                        let used = quotas::uploader_committed_bytes::<S>(conn, &key).await?;
+                        let declared: u64 = manifest.chunks().iter().map(|c| c.len).sum();
+                        if used.saturating_add(declared) > quota_settings.identity_quota {
+                            return Err(ServerError::QuotaExceeded);
+                        }
                     }
                     manifest
                 }

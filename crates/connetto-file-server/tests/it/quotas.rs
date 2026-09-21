@@ -357,7 +357,11 @@ async fn the_ledger_counts_both_directions_and_the_window_refuses_reads() {
 /// by one uploader each SUM past the other and the quota is double-spent.
 #[tokio::test]
 async fn a_commit_waits_on_the_uploaders_advisory_lock() {
-    let fx = fixture(fast_refresh()).await;
+    // The lock exists so the quota sum is honest, so it is taken only when a
+    // quota is configured. Generous quota, so the commit passes when it runs.
+    let mut settings = fast_refresh();
+    settings.identity_quota = 1 << 30;
+    let fx = fixture(settings).await;
     let staged = stage(&fx.app, &fx.signer, &chunked(10, 1)).await;
 
     // A separate session takes the uploader's advisory lock in a held
