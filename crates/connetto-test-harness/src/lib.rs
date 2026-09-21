@@ -86,14 +86,11 @@ pub const PUBLICATION: &str = "connetto_pub";
 const POSTGRES_IMAGE: &str = "postgres";
 const POSTGRES_TAG: &str = "16";
 const FGA_IMAGE: &str = "openfga/openfga";
-/// Not floating, and not older than this: the fact writer sends
-/// `on_duplicate: ignore` on every write, and a server without that field
-/// drops it silently and refuses a tuple it already holds. A row-settled fact
-/// is applied without reading the store first, so re-deriving one conditional
-/// gate tuple for a row is a duplicate by construction, and on an older
-/// server the upkeep loop retries it forever. Measured: `v1.8.13` refuses the
-/// second identical write, `v1.11.6` accepts it.
-const FGA_TAG: &str = "v1.11.6";
+/// The current release. A server older than `on_duplicate` refuses a tuple it
+/// already holds, and the fact writer needs that write to succeed: a
+/// row-settled fact is applied without reading the store first, so
+/// re-deriving one conditional gate tuple for a row writes a duplicate.
+const FGA_TAG: &str = "v1.21.0";
 const MOCK_OAUTH_IMAGE: &str = "ghcr.io/navikt/mock-oauth2-server";
 const MOCK_OAUTH_TAG: &str = "6.0.2";
 

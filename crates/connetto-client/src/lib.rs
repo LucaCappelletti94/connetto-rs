@@ -654,8 +654,8 @@ pub struct ClientConfig {
     /// the handshake presents, so the server reads the key into the setting it
     /// binds, and the subject is what the replica compares locally. Registering
     /// a subject whose grant has died would leave a durable replica serving
-    /// rows the server no longer admits, so the set is rendered from the same
-    /// live grants the handshake presents.
+    /// rows the server refuses, so the set is rendered from the same live
+    /// grants the handshake presents.
     ///
     /// `None` when no policy names the set.
     subjects: Option<SubjectSource>,
@@ -765,8 +765,8 @@ impl ClientConfig {
     /// these grants are presented beside any set through
     /// [`with_capabilities`](Self::with_capabilities). The subject is what the
     /// replica compares locally, and a subject whose grant has died is left
-    /// out of the rendering, so a durable replica cannot keep serving rows the
-    /// server has stopped admitting.
+    /// out of the rendering, so a durable replica serves only what the server
+    /// still admits.
     #[must_use]
     pub fn with_share_keys<Key: CapabilityKey>(
         mut self,
