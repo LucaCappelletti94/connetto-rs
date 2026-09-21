@@ -82,6 +82,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 ring = "0.17"
+# Ids for the fixture rows the browser stack seeds.
+uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
 # The smoke test reads a table back through the admin pool with a typed row.
