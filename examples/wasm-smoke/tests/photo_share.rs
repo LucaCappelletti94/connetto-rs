@@ -80,6 +80,7 @@ async fn connect_tab(
     client_id: &str,
     token: String,
     identity: &str,
+    grant: &str,
     subject: &str,
 ) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
@@ -91,10 +92,11 @@ async fn connect_tab(
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
         .with_caller(CALLER_FUNCTION, Some(identity))
-        .with_subjects::<String>(
+        .with_share_keys::<String>(
             connetto_wasm_smoke::SUBJECTS_FUNCTION,
-            &[connetto_core::auth::CapabilitySubject::new(
-                subject.to_owned(),
+            [(
+                Grant::new(grant.to_owned()),
+                connetto_core::auth::CapabilitySubject::new(subject.to_owned()),
             )],
         );
     ConnettoConnection::connect(
@@ -127,7 +129,7 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
     let (token, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let mut conn = connect_tab(&client_id, token, &identity, &subject).await;
+    let mut conn = connect_tab(&client_id, token, &identity, &grant, &subject).await;
     conn.subscribe("photo-share-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");
@@ -156,7 +158,7 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
             .map(|row| row.id.to_string())
             .collect::<Vec<_>>(),
         vec![shared.clone()],
-        "the key's holder sees exactly the row its key owns, and the grant is {grant:.12}"
+        "the key's holder sees exactly the row its key owns"
     );
     assert_eq!(
         rows[0].owner_id, subject,

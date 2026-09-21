@@ -20,6 +20,10 @@ pub use connetto_web::{
 /// version at handshake.
 pub const DEMO_SCHEMA_SQL: &str = include_str!("../schema.sql");
 
+/// The policy source the same translation read, hashed into the version beside
+/// the schema because a changed policy changes the replica's own views.
+pub const DEMO_POLICIES_SQL: &str = include_str!("../policies.sql");
+
 // The logical-to-physical table map and view list the build's translation
 // produced, as `POLICY_TABLES` and `POLICY_VIEWS`.
 include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
@@ -112,7 +116,7 @@ pub fn demo_policy_tables() -> connetto_client::PolicyTables {
 /// relay) presents this so its handshake is not rejected as stale.
 #[must_use]
 pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_core::SchemaVersion::from_source(DEMO_SCHEMA_SQL)
+    connetto_core::SchemaVersion::from_sources([DEMO_SCHEMA_SQL, DEMO_POLICIES_SQL])
 }
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a

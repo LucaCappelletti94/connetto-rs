@@ -26,11 +26,11 @@ pub(crate) struct BootReplicaSpec<Id> {
     pub(crate) identity: Option<Id>,
     pub(crate) session_expires_at: Option<u64>,
     pub(crate) login: Option<Grant>,
-    /// The share keys this boot holds, which the replica answers its own
-    /// membership arms with. A tab has no way to acquire one yet, so this is
-    /// empty and the replica admits nothing through a key, exactly as the
-    /// server does for the same caller.
-    pub(crate) subjects: Vec<connetto_core::auth::CapabilitySubject<String>>,
+    /// The share keys this boot holds, each the signed grant and the subject
+    /// it names. Empty when the deployment named none, and the replica then
+    /// admits nothing through a key, exactly as the server does for that same
+    /// caller.
+    pub(crate) share_keys: Vec<(String, String)>,
 }
 
 impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
@@ -68,11 +68,7 @@ impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
             identity,
             session_expires_at,
             login,
-            subjects: config
-                .share_keys
-                .iter()
-                .map(|(_, subject)| connetto_core::auth::CapabilitySubject::new(subject.clone()))
-                .collect(),
+            share_keys: config.share_keys.clone(),
         })
     }
 }
@@ -328,15 +324,17 @@ pub(super) fn build_boot_client_config<Id: core::fmt::Display>(
         );
     }
     if !config.subjects_function.is_empty() {
-        client_config =
-            client_config.with_subjects::<String>(config.subjects_function, &spec.subjects);
-    }
-    if !config.share_keys.is_empty() {
-        client_config = client_config.with_capabilities(
-            config
-                .share_keys
-                .iter()
-                .map(|(grant, _)| Grant::new(grant.clone())),
+        // Pairs rather than two lists: the client renders the set from the
+        // grants that are still alive and presents those same grants, so an
+        // expired key cannot linger in a durable replica's own answer.
+        client_config = client_config.with_share_keys::<String>(
+            config.subjects_function,
+            spec.share_keys.iter().cloned().map(|(grant, subject)| {
+                (
+                    Grant::new(grant),
+                    connetto_core::auth::CapabilitySubject::new(subject),
+                )
+            }),
         );
     }
     client_config
@@ -504,7 +502,7 @@ mod tests {
             identity: None,
             session_expires_at: None,
             login: None,
-            subjects: Vec::new(),
+            share_keys: Vec::new(),
         }
     }
 

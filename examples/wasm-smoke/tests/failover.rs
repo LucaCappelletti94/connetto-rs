@@ -107,7 +107,7 @@ async fn connect_server(
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
         .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity))
-        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
+        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -214,7 +214,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
         .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
         .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id))
-        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
+        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
     let conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

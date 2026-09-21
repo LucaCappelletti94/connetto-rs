@@ -93,7 +93,7 @@ async fn connect(
             connetto_wasm_smoke::CALLER_FUNCTION,
             Some(identity.as_str()),
         )
-        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
+        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
@@ -210,7 +210,7 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
             connetto_wasm_smoke::CALLER_FUNCTION,
             Some(identity.as_str()),
         )
-        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
+        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
     let tab = ConnettoConnection::connect(
         tab_end,
         &Replica::in_memory(),
@@ -314,7 +314,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
             connetto_wasm_smoke::CALLER_FUNCTION,
             Some(identity.as_str()),
         )
-        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
+        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
     let mut tab = ConnettoConnection::connect(
         MessageTransport::<MessagePort>::new(channel.port2()),
         &Replica::in_memory(),

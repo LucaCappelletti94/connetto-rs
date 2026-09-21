@@ -728,6 +728,49 @@ fn an_unaccounted_policy_view_refuses_to_open() {
     );
 }
 
+/// A grant with nothing readable in it, which the client presents rather than
+/// withholding, so it stands for a key that is still alive.
+fn live_grant() -> connetto_client::Grant {
+    connetto_client::Grant::new("opaque-to-this-side".to_owned())
+}
+
+/// A grant whose payload says it died in 1970.
+fn dead_grant() -> connetto_client::Grant {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"exp":1}"#);
+    connetto_client::Grant::new(format!("header.{payload}.signature"))
+}
+
+/// A key whose grant has died is left out of what the replica answers.
+///
+/// The handshake already withholds a dead grant, so the server stops binding
+/// that subject. A durable replica registering it anyway would keep serving
+/// the rows it had cached under that key, which is the one direction this
+/// must never fail in.
+#[test]
+fn a_dead_grants_subject_is_left_out_of_the_set() {
+    use diesel::RunQueryDsl;
+
+    let (ddl, tables) = translation();
+    let held = [
+        (live_grant(), CapabilitySubject::<String>::new("key:alive")),
+        (dead_grant(), CapabilitySubject::<String>::new("key:dead")),
+    ];
+    let config = client_config(tables).with_share_keys("current_app_subjects", held);
+    let mut connection =
+        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
+            .expect("the replica opens");
+    let answered: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
+        "current_app_subjects()",
+    ))
+    .get_result(connection.conn())
+    .expect("the registered function answers");
+    assert_eq!(
+        answered, "key:alive",
+        "the dead key is absent from the set the replica compares against"
+    );
+}
+
 /// The replica answers the caller's subject set the way the server binds it,
 /// because a policy compiled against the set is evaluated on both ends and
 /// the two renderings have to agree.
@@ -741,10 +784,10 @@ fn the_replica_answers_the_packed_subject_set() {
 
     let (ddl, tables) = translation();
     let held = [
-        CapabilitySubject::<String>::new("key:a"),
-        CapabilitySubject::<String>::new("key:b"),
+        (live_grant(), CapabilitySubject::<String>::new("key:a")),
+        (live_grant(), CapabilitySubject::<String>::new("key:b")),
     ];
-    let config = client_config(tables).with_subjects("current_app_subjects", &held);
+    let config = client_config(tables).with_share_keys("current_app_subjects", held);
     let mut connection =
         ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
             .expect("the replica opens");
@@ -767,8 +810,7 @@ fn a_caller_holding_no_key_answers_null() {
     use diesel::RunQueryDsl;
 
     let (ddl, tables) = translation();
-    let config = client_config(tables)
-        .with_subjects("current_app_subjects", &[] as &[CapabilitySubject<String>]);
+    let config = client_config(tables).with_share_keys::<String>("current_app_subjects", []);
     let mut connection =
         ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
             .expect("the replica opens");
@@ -808,11 +850,17 @@ fn the_replica_joins_on_the_deployments_own_separator() {
     }
 
     let (ddl, tables) = translation();
-    let held: [CapabilitySubject<PipeKey>; 2] = [
-        CapabilitySubject::new(PipeKey("key:a".to_owned())),
-        CapabilitySubject::new(PipeKey("key:b".to_owned())),
+    let held: [(connetto_client::Grant, CapabilitySubject<PipeKey>); 2] = [
+        (
+            live_grant(),
+            CapabilitySubject::new(PipeKey("key:a".to_owned())),
+        ),
+        (
+            live_grant(),
+            CapabilitySubject::new(PipeKey("key:b".to_owned())),
+        ),
     ];
-    let config = client_config(tables).with_subjects("current_app_subjects", &held);
+    let config = client_config(tables).with_share_keys("current_app_subjects", held);
     let mut connection =
         ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
             .expect("the replica opens");
