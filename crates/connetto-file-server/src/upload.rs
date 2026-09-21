@@ -122,6 +122,8 @@ pub(crate) async fn post_intent<S: ConnettoFileSchema>(
         &state.caller_settings,
         &ticket.caller,
         &chunks,
+        file_id.as_bytes(),
+        &key,
     )
     .await?;
     let needed: Vec<String> = needed_hashes.iter().map(hex_hash).collect();
@@ -242,75 +244,84 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
         return Err(ServerError::CommitRefused);
     }
     let mut admin_conn = state.pools.admin.get().await?;
+    // What this commit would actually add to the deployment's stored
+    // bytes: the distinct declared chunks that no committed manifest
+    // visible to this caller already carries. The ceiling judges this
+    // margin rather than the declared size, so a commit whose bulk
+    // deduplicates against committed content still settles whenever its
+    // new bytes fit the headroom. The measurement runs on the reader
+    // connection because the visibility predicate is the caller's. It
+    // can only over-count, a chunk can become committed between this
+    // read and the flip but never un-committed, the same conservative
+    // direction as the refresh staleness of the cached total it joins.
+    // Zero cost when no ceiling is configured.
+    let storage_new_bytes: u64 = if quota_settings.storage_ceiling > 0 {
+        let pairs = db::manifest_chunk_pairs::<S>(&mut admin_conn, &file_id, &key).await?;
+        needed::new_declared_bytes::<S>(
+            &mut reader_conn,
+            &state.caller_settings,
+            &ticket.caller,
+            &pairs,
+        )
+        .await?
+    } else {
+        0
+    };
     admin_conn
         .transaction::<StatusCode, ServerError, _>(async move |conn| {
-            let manifest = match db::load_manifest_locked::<S>(conn, &file_id, &key).await? {
-                None => return Err(ServerError::NotFound),
-                Some(db::ManifestState::Committed) => {
-                    // Already committed from a previous call or session: re-run the
-                    // setter so metadata rows inserted since the first commit are
-                    // updated. The setter is UPDATE ... WHERE content_id = $1 and
-                    // is idempotent for rows already at the target state.
-                    for attribution in &attributions {
-                        diesel::select(crate::functions::connetto_set_content_state(
-                            file_id.as_bytes().to_vec().as_slice(),
-                            "available",
-                            attribution.as_str(),
-                        ))
-                        .get_result::<Option<Vec<u8>>>(conn)
-                        .await?;
+            let (manifest, declared) =
+                match db::load_manifest_locked::<S>(conn, &file_id, &key).await? {
+                    None => return Err(ServerError::NotFound),
+                    Some(db::ManifestState::Committed) => {
+                        // Already committed from a previous call or session: re-run the
+                        // setter so metadata rows inserted since the first commit are
+                        // updated. The setter is UPDATE ... WHERE content_id = $1 and
+                        // is idempotent for rows already at the target state.
+                        for attribution in &attributions {
+                            diesel::select(crate::functions::connetto_set_content_state(
+                                file_id.as_bytes().to_vec().as_slice(),
+                                "available",
+                                attribution.as_str(),
+                            ))
+                            .get_result::<Option<Vec<u8>>>(conn)
+                            .await?;
+                        }
+                        return Ok(StatusCode::OK);
                     }
-                    return Ok(StatusCode::OK);
-                }
-                Some(db::ManifestState::Uncommitted(manifest)) => {
-                    // R87's checks guard new bytes only: an already-committed
-                    // manifest made its bytes true earlier and re-committing
-                    // it must stay idempotent even if a ceiling or the
-                    // uploader's quota filled since.  The deployment numbers
-                    // are the cached in-memory totals; the uploader's own sum
-                    // takes the per-uploader advisory lock first, because the
-                    // manifest row lock only serializes this file and two
-                    // concurrent commits of different files would otherwise
-                    // each SUM past the other's pending flip.  No quota means
-                    // no lock and no sum: an unconfigured deployment commits
-                    // exactly as it did before the quota existed.
-                    {
-                        let totals = ceilings.read().await;
-                        if quota_settings.storage_ceiling > 0
-                            && totals.stored_bytes >= quota_settings.storage_ceiling
+                    Some(db::ManifestState::Uncommitted(manifest)) => {
+                        // R87's checks guard new bytes only: an already-committed
+                        // manifest made its bytes true earlier and re-committing
+                        // it must stay idempotent even if a ceiling or the
+                        // uploader's quota filled since.  The deployment numbers
+                        // are the cached in-memory totals, so the overshoot they
+                        // allow is bounded by the refresh cadence times the
+                        // deployment's throughput.
+                        let declared: u64 = manifest
+                            .chunks()
+                            .iter()
+                            .fold(0u64, |acc, c| acc.saturating_add(c.len));
                         {
-                            return Err(ServerError::StorageCeiling {
-                                retry_after_secs: quota_settings
-                                    .refresh
-                                    .as_secs()
-                                    .saturating_mul(6)
-                                    .max(1),
-                            });
+                            let totals = ceilings.read().await;
+                            check_deployment_ceilings(&totals, &quota_settings, storage_new_bytes)?;
                         }
-                        if quota_settings.bandwidth_ceiling > 0
-                            && totals.window_bytes >= quota_settings.bandwidth_ceiling
-                        {
-                            return Err(ServerError::BandwidthCeiling {
-                                retry_after_secs: bandwidth_retry_after_secs(
-                                    totals.oldest_day,
-                                    quota_settings.window_days,
-                                    Utc::now(),
-                                ),
-                            });
-                        }
+                        (manifest, declared)
                     }
-                    if quota_settings.identity_quota > 0 {
-                        quotas::serialize_uploader(conn, &key).await?;
-                        let used = quotas::uploader_committed_bytes::<S>(conn, &key).await?;
-                        let declared: u64 = manifest.chunks().iter().map(|c| c.len).sum();
-                        if used.saturating_add(declared) > quota_settings.identity_quota {
-                            return Err(ServerError::QuotaExceeded);
-                        }
-                    }
-                    manifest
-                }
-            };
+                };
             verify_file_identity(store, &manifest).await?;
+            // The uploader's own quota check takes its advisory lock last,
+            // after the store reads above, so verifying a large file never
+            // makes that uploader's other commits queue behind disk or
+            // object-store latency. The guarantee is unchanged: every
+            // committer takes this lock before flipping its manifest, the
+            // verification mutates nothing in the database, so the SUM under
+            // the lock still sees every flip that happened before it.
+            if quota_settings.identity_quota > 0 {
+                quotas::serialize_uploader(conn, &key).await?;
+                let used = quotas::uploader_committed_bytes::<S>(conn, &key).await?;
+                if used.saturating_add(declared) > quota_settings.identity_quota {
+                    return Err(ServerError::QuotaExceeded);
+                }
+            }
             let attributions: Vec<&str> = attributions.iter().map(String::as_str).collect();
             db::commit_manifest_atomic::<S>(conn, &file_id, &key, &attributions).await?;
             Ok(StatusCode::OK)
@@ -321,6 +332,46 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The metered commit check, taken under the manifest lock. The deployment
+/// numbers are the cached totals shared by every replica, so the overshoot
+/// they allow is bounded by the refresh cadence times the deployment's
+/// throughput.
+fn check_deployment_ceilings(
+    totals: &crate::quotas::CeilingTotals,
+    settings: &crate::quotas::QuotaSettings,
+    new_bytes: u64,
+) -> Result<(), ServerError> {
+    // The storage ceiling projects this file's NEW bytes, so one commit
+    // cannot overshoot the ceiling by its whole size while chunks committed
+    // by visible files still cost nothing. Committed duplicates the caller
+    // cannot see are charged whole, the same conservative direction the
+    // per-identity quota takes.
+    if settings.storage_ceiling > 0
+        && totals.stored_bytes.saturating_add(new_bytes) > settings.storage_ceiling
+    {
+        // A storage refusal is not self-healing the way the window is. The
+        // interval only waits out a refresh and any concurrent deletes, and
+        // a deployment full until an operator or a sweeper frees bytes
+        // keeps refusing.
+        return Err(ServerError::StorageCeiling {
+            retry_after_secs: settings.refresh.as_secs().saturating_mul(6).max(1),
+        });
+    }
+    // The bandwidth window needs no projection. Every chunk PUT of this
+    // upload already billed its bytes today, so the cached window contains
+    // this file.
+    if settings.bandwidth_ceiling > 0 && totals.window_bytes >= settings.bandwidth_ceiling {
+        return Err(ServerError::BandwidthCeiling {
+            retry_after_secs: bandwidth_retry_after_secs(
+                totals.oldest_day,
+                settings.window_days,
+                Utc::now(),
+            ),
+        });
+    }
+    Ok(())
+}
 
 async fn verify_file_identity(
     store: &AnyStore,
@@ -425,4 +476,49 @@ fn check_ids_match(url_id: &FileId, ticket_id: &[u8; 32]) -> Result<(), ServerEr
 /// Encodes a [`ChunkHash`] as a 64-character lowercase hex string.
 pub(crate) fn hex_hash(h: &ChunkHash) -> String {
     crate::hex_32(h.as_bytes())
+}
+
+#[cfg(test)]
+mod ceiling_tests {
+    use super::check_deployment_ceilings;
+    use crate::error::ServerError;
+    use crate::quotas::{CeilingTotals, QuotaSettings};
+
+    #[test]
+    fn the_storage_ceiling_judges_new_bytes_not_declared_bytes() {
+        let settings = QuotaSettings {
+            storage_ceiling: 12_288,
+            ..Default::default()
+        };
+        let totals = CeilingTotals {
+            stored_bytes: 8_192,
+            ..Default::default()
+        };
+        // New bytes exactly filling the headroom pass, one byte more
+        // refuses. A commit declared far above the headroom but mostly
+        // deduplicated lives or dies on this margin.
+        assert!(check_deployment_ceilings(&totals, &settings, 4_096).is_ok());
+        assert!(matches!(
+            check_deployment_ceilings(&totals, &settings, 4_097),
+            Err(ServerError::StorageCeiling { .. })
+        ));
+    }
+
+    #[test]
+    fn the_bandwidth_window_refuses_at_its_ceiling_without_projection() {
+        let settings = QuotaSettings {
+            bandwidth_ceiling: 8_192,
+            ..Default::default()
+        };
+        let totals = CeilingTotals {
+            window_bytes: 8_192,
+            ..Default::default()
+        };
+        // The window needs no projection, this upload's PUTs already
+        // billed themselves, so even zero new bytes refuse at the cap.
+        assert!(matches!(
+            check_deployment_ceilings(&totals, &settings, 0),
+            Err(ServerError::BandwidthCeiling { .. })
+        ));
+    }
 }

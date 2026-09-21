@@ -40,7 +40,10 @@ use crate::router::DbPool;
 use crate::schema::ConnettoFileSchema;
 
 /// The configured ceilings. A zero ceiling or quota means unlimited, which is
-/// the default: an unconfigured deployment behaves exactly as before R87.
+/// the default. An unconfigured deployment never consults a ceiling and takes
+/// neither the uploader lock nor either SUM; it does carry the shared costs
+/// of the feature, the per-transfer ledger row decided 2026-09-13 and the
+/// preflight that requires the shipped DDL.
 #[derive(Debug, Clone)]
 pub struct QuotaSettings {
     /// Bytes one uploader may hold across their committed manifests.
@@ -161,7 +164,8 @@ pub(crate) async fn window_bytes<S: ConnettoFileSchema>(
 ) -> Result<(u64, Option<NaiveDate>), diesel::result::Error> {
     let sql = format!(
         "SELECT COALESCE(SUM(served_bytes + accepted_bytes), 0)::bigint AS total, \
-         MIN(day) AS oldest FROM {traffic} WHERE day > CURRENT_DATE - $1::int",
+         MIN(day) AS oldest FROM {traffic} \
+         WHERE day > ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date - $1::int)",
         traffic = S::TRAFFIC_SQL,
     );
     let row: WindowRow = diesel::sql_query(&sql)
@@ -172,6 +176,10 @@ pub(crate) async fn window_bytes<S: ConnettoFileSchema>(
 }
 
 /// Adds served and accepted bytes to today's ledger row.
+///
+/// "Today" is the UTC day regardless of the server's timezone, the day the
+/// plan fixes for the window and what [`bandwidth_retry_after_secs`] assumes
+/// when it names the midnight the oldest day leaves the window at.
 ///
 /// Runs inside the transaction that moved the bytes where one exists, so an
 /// accounting row never claims a transfer a rollback undid. A read that
@@ -186,7 +194,7 @@ pub(crate) async fn ledger_add<S: ConnettoFileSchema>(
     let accepted_i64 = i64::try_from(accepted).unwrap_or(i64::MAX);
     let sql = format!(
         "INSERT INTO {traffic} (day, served_bytes, accepted_bytes) \
-         VALUES (CURRENT_DATE, $1, $2) \
+         VALUES ((CURRENT_TIMESTAMP AT TIME ZONE 'UTC')::date, $1, $2) \
          ON CONFLICT (day) DO UPDATE SET \
            served_bytes = {traffic}.served_bytes + EXCLUDED.served_bytes, \
            accepted_bytes = {traffic}.accepted_bytes + EXCLUDED.accepted_bytes",
@@ -227,10 +235,12 @@ pub(crate) fn spawn_ledger_add<S: ConnettoFileSchema>(pool: &DbPool, served: u64
     }
 }
 
-/// Wraps a served body so the bytes that actually reached the response are
-/// ledgered once when the body is dropped, whether it ran to completion or
-/// the client hung up half way.  This is why bandwidth is "bytes served"
-/// rather than the `Content-Length` of a refusal-or-abort.
+/// Wraps a served body so the bytes it carried are ledgered once when the
+/// body is dropped, whether it ran to completion or the client hung up half
+/// way. The count is what was polled into the body, which a client abort can
+/// overstate by what the transport had buffered but not flushed. This is why
+/// bandwidth is "bytes served" rather than the `Content-Length` of a
+/// refusal-or-abort.
 pub(crate) struct CountedServing<S: ConnettoFileSchema, E> {
     inner: BoxStream<'static, Result<Bytes, E>>,
     pool: DbPool,
@@ -309,9 +319,10 @@ pub(crate) async fn uploader_committed_bytes<S: ConnettoFileSchema>(
 }
 
 /// The UTC instant the day `oldest` rolls out of a `window_days`-day
-/// trailing window. The window predicate is `day > CURRENT_DATE - days`, so
-/// the oldest counted day leaves the window when `CURRENT_DATE` reaches
-/// `oldest + days`, at the midnight opening that date.
+/// trailing window. The window predicate is `day >` the UTC date minus
+/// days, and ledger rows are UTC days, so the oldest counted day leaves
+/// the window when the UTC date reaches `oldest + days`, at the midnight
+/// opening that date.
 fn window_exit_instant(oldest: NaiveDate, window_days: i32) -> Option<DateTime<Utc>> {
     oldest
         .checked_add_signed(chrono::TimeDelta::days(i64::from(window_days)))?
@@ -334,56 +345,70 @@ pub fn bandwidth_retry_after_secs(
 }
 
 /// Refreshes the cached deployment totals and applies the once-per-crossing
-/// saturation logging for both ceilings.
+/// saturation logging for both ceilings. Each meter is read, published and
+/// logged independently: a broken ledger cannot freeze the storage total,
+/// nor a broken chunk sum freeze the window.
+///
+/// # Errors
+///
+/// Names each meter that could not be read. The boot seed treats this as
+/// fatal, a deployment that asked for enforcement must not serve without
+/// having read it once; the periodic loop only logs, because a blip must
+/// not take a serving replica down and the last published totals stay in
+/// force meanwhile.
 pub(crate) async fn refresh_once<S: ConnettoFileSchema>(
     pool: &DbPool,
     settings: &QuotaSettings,
     cache: &CeilingCache,
-) {
+) -> Result<(), String> {
     let mut conn = match pool.get().await {
         Ok(conn) => conn,
-        Err(err) => {
-            tracing::warn!(error = %err, "ceiling refresh found no connection");
-            return;
-        }
+        Err(err) => return Err(format!("ceiling refresh found no connection: {err}")),
     };
-    let stored = match stored_chunk_bytes::<S>(&mut conn).await {
-        Ok(v) => v,
+    let mut failures: Vec<&str> = Vec::new();
+    match stored_chunk_bytes::<S>(&mut conn).await {
+        Ok(stored) => {
+            let mut totals = cache.write().await;
+            totals.stored_bytes = stored;
+            cross(
+                settings.storage_ceiling,
+                settings.warn_fraction,
+                stored,
+                "storage",
+                &mut totals.storage_crossing,
+            );
+        }
         Err(err) => {
             tracing::warn!(error = %err, "ceiling refresh could not sum stored bytes");
-            return;
+            failures.push("stored bytes");
         }
-    };
-    let (window, oldest_day) = match window_bytes::<S>(&mut conn, settings.window_days).await {
-        Ok(pair) => pair,
+    }
+    match window_bytes::<S>(&mut conn, settings.window_days).await {
+        Ok((window, oldest_day)) => {
+            let mut totals = cache.write().await;
+            totals.window_bytes = window;
+            totals.oldest_day = oldest_day;
+            cross(
+                settings.bandwidth_ceiling,
+                settings.warn_fraction,
+                window,
+                "bandwidth",
+                &mut totals.bandwidth_crossing,
+            );
+        }
         Err(err) => {
             tracing::warn!(error = %err, "ceiling refresh could not sum the window");
-            return;
+            failures.push("bandwidth window");
         }
-    };
-    let mut totals = cache.write().await;
-    totals.stored_bytes = stored;
-    totals.window_bytes = window;
-    totals.oldest_day = oldest_day;
-    let CeilingTotals {
-        storage_crossing,
-        bandwidth_crossing,
-        ..
-    } = &mut *totals;
-    cross(
-        settings.storage_ceiling,
-        settings.warn_fraction,
-        stored,
-        "storage",
-        storage_crossing,
-    );
-    cross(
-        settings.bandwidth_ceiling,
-        settings.warn_fraction,
-        window,
-        "bandwidth",
-        bandwidth_crossing,
-    );
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "ceiling refresh failed for: {}",
+            failures.join(", ")
+        ))
+    }
 }
 
 /// One ceiling's crossing bookkeeping: a warning the first time the total

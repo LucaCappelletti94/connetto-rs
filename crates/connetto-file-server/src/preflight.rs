@@ -199,6 +199,12 @@ pub enum PreflightError {
         /// Name of the table the reader role owns.
         table: String,
     },
+    /// A metered deployment could not read its ceilings at boot.
+    ///
+    /// A deployment that configured enforcement must not serve while every
+    /// ceiling check would read the all-zero default, which means unlimited.
+    #[error("ceiling seed: {0}")]
+    CeilingSeed(String),
     /// Database query error.
     #[error("database: {0}")]
     Db(#[from] diesel::result::Error),
