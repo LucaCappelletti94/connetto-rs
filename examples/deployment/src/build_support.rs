@@ -105,11 +105,15 @@ fn parsed(documents: &[&str]) -> Pg2Sqlite {
 /// Translate one tier, write its SQLite DDL to `ddl_path`, and report the
 /// views the translation created.
 ///
+/// Public because a demo with its own documents translates them itself: the
+/// desktop demo has its own schema and no local tier, and calls this with the
+/// pieces it has rather than through [`emit`].
+///
 /// The DDL is also applied to a throwaway in-memory database, which is the only
 /// check that SQLite accepts what pg2sqlite emitted. That same database is what
 /// the view list is read from, so the artifact records what the translation
 /// actually built rather than what it was expected to.
-fn translate(documents: &[&str], ddl_path: &Path) -> Vec<String> {
+pub fn translate(documents: &[&str], ddl_path: &Path) -> Vec<String> {
     let statements = parsed(documents)
         .translate_to_sql(&options())
         .expect("translate the schema to SQLite");
@@ -129,7 +133,14 @@ fn translate(documents: &[&str], ddl_path: &Path) -> Vec<String> {
 
 /// Write the logical-to-physical map and the view list the client is
 /// configured with, as Rust source the demo includes.
-fn write_policy_tables(documents: &[&str], views: &[String], out: &Path) {
+///
+/// Public for the same reason [`translate`] is.
+///
+/// # Panics
+///
+/// When the documents do not parse or the artifact cannot be written, both of
+/// which are broken builds.
+pub fn write_policy_tables(documents: &[&str], views: &[String], out: &Path) {
     let manifest = parsed(documents)
         .translation_manifest(&options())
         .expect("report the translation manifest");

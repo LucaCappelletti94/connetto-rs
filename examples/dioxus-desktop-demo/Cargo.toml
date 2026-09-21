@@ -49,12 +49,9 @@ required-features = []
 # result to the shipped replica template database, so the schema pipeline
 # runs at build time, never at startup.
 [build-dependencies]
-diesel = { version = "2", features = ["sqlite", "chrono"] }
-# Held at the same major as the runtime dependency connetto-client pulls, because
-# cargo allows one package with `links = "sqlite3"` across the whole graph, host
-# build scripts included.
-libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled"] }
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+# The shared demo pipeline: this demo brings its own schema and uses the
+# translate and policy-table pieces rather than the whole shared tier.
+connetto-demo-deployment = { path = "../deployment", features = ["build"] }
 
 [workspace]
 
