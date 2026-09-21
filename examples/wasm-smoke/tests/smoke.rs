@@ -88,7 +88,8 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         .with_caller(
             connetto_wasm_smoke::CALLER_FUNCTION,
             Some(identity.as_str()),
-        );
+        )
+        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
     let mut conn = ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),

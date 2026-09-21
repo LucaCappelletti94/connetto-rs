@@ -61,7 +61,8 @@ async fn connect(name: &str, token: String, identity: String) -> ConnettoConnect
         .with_caller(
             connetto_wasm_smoke::CALLER_FUNCTION,
             Some(identity.as_str()),
-        );
+        )
+        .with_subjects::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, &[]);
     ConnettoConnection::connect(
         transport,
         &Replica::in_memory(),
