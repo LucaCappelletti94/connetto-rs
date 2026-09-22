@@ -161,7 +161,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R78 | Courier recovery. Needs R75 and R77 |
 | any | R79 | Media over the peer link. Needs R77 and R67 |
 | any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
-| any | R89 | A failing re-execution read ends its subscription, not live delivery. A running defect, needs nothing |
+| done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | any | R90 | The browser's refresh token into an `HttpOnly` cookie. Needs nothing, touches no native path |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots waits on R71 and is R71's to ship |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
@@ -205,7 +205,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R51 native Apple gate | NOT STARTED | R88's iOS leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured on macOS, first step verifies iOS (probe I5) | no |
 | R52 native Android gate | NOT STARTED | R88's Android leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
 | R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
-| R89 a failing re-execution read ends its subscription, not live delivery | NOT STARTED, minted 2026-09-13 | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the single retry |
+| R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | NOT STARTED, minted 2026-09-13 | nothing. One decision in the section, the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R71's. Every decision is in `plans/apps-and-bots.md` | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
@@ -248,10 +248,10 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R65 file server | **DONE** (2026-09-08) | nothing. Storage backends, the two-phase upload, ticket serving, sweep, and byte metering. Reads are authorized by the deployment's own visibility function on the reader role, so row level security decides them | landed on `feat/r65-file-server` |
 | R81 aggregate read time bound | **DONE** (2026-08-22) | nothing | no. Confirmed: the upstream request assigns read ceilings to the caller, and this phase makes true a sentence it already states |
 | R66 file seam in connetto | **DONE** (2026-09-08) | nothing. `FileStore` deleted, the ticket request and grant on the control plane, `ContentTicketSigner` as the only trait core gained and implemented by the file server's real signer, the mint answering visibility through the deployment's own function on the non-owning reader role, and a per-identity upload token bucket | landed on `feat/r66-connetto-seam` |
-| R87 storage quotas and deployment ceilings | **BUILT** (2026-09-21, as pull requests #46 and #47) | nothing. Per-identity commit quotas answered `507` under a per-uploader advisory lock, cached storage and bandwidth ceilings answered `503` with `Retry-After`, a per-day `_cfs_traffic` ledger counts accepted bytes inside the commit transaction and served bytes from the response body, one warning and one error per crossing, six `CONNETTO_CONTENT_*` settings all defaulting to unlimited, and the client treats `507` as permanent and `503` as transient | no |
+| R87 storage quotas and deployment ceilings | **DONE** (2026-09-21, as pull requests #46 and #47, hardened as #49, merged `28cb292`) | nothing. Per-identity commit quotas answered `507` under a per-uploader advisory lock, cached storage and bandwidth ceilings answered `503` with `Retry-After`, a per-day `_cfs_traffic` ledger counts accepted bytes inside the commit transaction and served bytes from the response body, one warning and one error per crossing, six `CONNETTO_CONTENT_*` settings all defaulting to unlimited, and the client treats `507` as permanent and `503` as transient | no |
 | R67 native file client | **DONE** (2026-09-08) | nothing. `connetto-file-client`: the `std::fs` encrypted chunk store, the manifests and outbox in the replica committed with the entry row, the outbox walk with a boot integrity pass, the resolver over a `LocalContentSource` list, the query-shaped pin surface with a whole-file fetch, and `tidy_content`. Thirteen decisions recorded above, three of them defects found by grounding: the tier cannot be atomic with the replica, `MemStore` answered empty bytes for an absent chunk, and a double-quoted pin column silently became a string literal. 28 tests, the offline photo case among them, end to end against a real Postgres, a real file server on a socket and two real devices | no |
 | R68 browser file client | **DONE** (2026-09-10) | nothing. Worker-owned encrypted OPFS with memory fallback, browser fetch, reference-counted object URLs, and version 3 archives that restore unsent content through the production worker relay. The offline photo survives export, import under another key, local display and later upload. The browser stack passed and the full release suite passed 738 tests with 3 skipped | no |
-| R69 files in every demo | **BUILT** (A through F complete 2026-09-19), designed (2026-09-12) | nothing. A is #28, B is #29, C is #30, G is #31, the browser stack boots the executable's file half with the online photo flow proven by `photo_flow.rs` and F's offline and two-viewer proofs by `photo_offline.rs` and `photo_visibility.rs`. E is #34, the photos surface in both web demos, and D is #35, the desktop photos surface on the native content client proven by the Docker-gated `demo_photos_flow.rs` | no |
+| R69 files in every demo | **DONE** (A through G complete 2026-09-19), designed (2026-09-12) | nothing. A is #28, B is #29, C is #30, G is #31, the browser stack boots the executable's file half with the online photo flow proven by `photo_flow.rs` and F's offline and two-viewer proofs by `photo_offline.rs` and `photo_visibility.rs`. E is #34, the photos surface in both web demos, and D is #35, the desktop photos surface on the native content client proven by the Docker-gated `demo_photos_flow.rs` | no |
 | R70 backup and restore story | NOT STARTED | nothing | no |
 | R71 Linux key custody survives reboot | NOT STARTED | nothing for grounding. One custody decision to take with the maintainer at execution | no |
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
@@ -4557,7 +4557,7 @@ One definition exists per job for steps 1 through 7, step 8's three items are di
 
 ## R64: the file core
 
-**Status.** NOT STARTED. First of the six phases R24's design derived on 2026-08-21. Chapter `18-file-handling.md` (written 2026-08-22) is the normative record of the decisions, and R24's ten recorded positions carry their reasoning and rejected alternatives, normative wherever these six sections and the chapter are silent.
+**Status.** **DONE** (2026-09-08). First of the six phases R24's design derived on 2026-08-21. Chapter `18-file-handling.md` (written 2026-08-22) is the normative record of the decisions, and R24's ten recorded positions carry their reasoning and rejected alternatives, normative wherever these six sections and the chapter are silent.
 
 **Blocked on nothing.**
 
@@ -4582,7 +4582,7 @@ Chunk, encrypt, store, read, decrypt, reassemble round-trips under property test
 
 ## R65: the file server
 
-**Status.** NOT STARTED.
+**Status.** **DONE** (2026-09-08).
 
 **Blocked on** R64.
 
@@ -4635,7 +4635,7 @@ Storage quotas and the deployment-wide ceilings are NOT in this phase. They are 
 
 ## R87: storage quotas and the deployment ceilings
 
-**Status.** BUILT (2026-09-21, as pull requests #46 and #47). Raised 2026-09-08 while scoping R66, because the maintainer asked for a deployment-wide maximum and the mechanism turned out to belong in the file server rather than in connetto. The four points the 2026-09-12 review found undefined were decided 2026-09-13 and are recorded under Decided.
+**Status.** **DONE** (2026-09-21, as pull requests #46 and #47, hardened as pull request #49 merged `28cb292`). Raised 2026-09-08 while scoping R66, because the maintainer asked for a deployment-wide maximum and the mechanism turned out to belong in the file server rather than in connetto. The four points the 2026-09-12 review found undefined were decided 2026-09-13 and are recorded under Decided.
 
 **Blocked on** nothing as of 2026-09-19. The blocker was R69's pull request A, which put the file routes in the shipped executable, and #28 landed it, so a deployment serves files and saturation has somewhere to be observed. R67 and R68 do NOT depend on this phase.
 
@@ -5040,9 +5040,11 @@ One demo builds and runs on both mobile platforms from a written recipe, the And
 
 ## R89: a failing re-execution read ends its subscription, not live delivery
 
-**Status.** NOT STARTED. Minted 2026-09-13 by the survey of the plan's open sections, from the finding R81 recorded and deliberately left unowned. Designed the same day with the maintainer, two decisions below.
+**Status.** **DONE** (2026-09-22, as pull request #51 merged `09f6996`). Minted 2026-09-13 by the survey of the plan's open sections, from the finding R81 recorded and deliberately left unowned. Designed the same day with the maintainer, two decisions below.
 
 **Blocked on nothing.** A running defect: it needs no phase before it and everything computed is exposed to it.
+
+**Upstream cleanup note (2026-09-21).** R89 owns `crates/connetto-server/src/reexec.rs`, and the current state of the subql surface it touches is recorded here. The own-connector era is already closed upstream. subql's `SessionSetup` seam (U8, `docs/upstream-subql-connector-session-setup.md`) landed and was adopted at the pin `884b80e`, the connector connetto wrote under R82 decision 1 is gone, and `PgReadConnector` is now only a type alias to `PgAsyncDieselConnector<ConnettoReadSetup>` (`reexec.rs:105`). Keep the alias or retire the name, but do not reintroduce a wrapper, and do not replicate R82's "connetto writes its own connector" framing, which is obsolete prose. The cleanup R89 owes instead is on the error surface. subql's `DieselAsyncError` (`reexec/async_diesel/mod.rs:87` at the pin) is `#[non_exhaustive]` and already separates `Pool(bb8::RunError)`, `Diesel(diesel::result::Error)` and `RowsUnsupported`, while today's `TimedOutRead` impl answers `false` for everything that is not `Diesel`, so a pool exhaustion is currently classified as neither timeout nor outage. The `ReadFailure` mapping must dispatch on that variant split, `Pool` belongs to `Transient`, and the `#[non_exhaustive]` marker means the classification keeps a catch-all arm rather than exhausting the match. The remaining unknown lives inside the `Diesel` arm and is the SQLSTATE gap recorded in `upstream/diesel-sqlstate-not-recoverable-from-database-error-information.md`, in flight on the launched session for the diesel fork. Until `sqlstate()` exists the bounded three-class floor stands on its own and no new prose match is added. When the classification becomes code-driven, `is_statement_timeout` is deleted. `RowsUnsupported` is the upstream-reserved `execute_rows` producer gap (R82's recorded deviation) and needs nothing from R89 because the pinned connector does not implement it. U9's row-cost item (`RowPage::row_bytes_of`) is verified resolved at the pin (`connector/mod.rs:301`, now `pub`) and is listed here only so nobody re-files it.
 
 ### Purpose
 
