@@ -65,6 +65,8 @@ What the seam buys over the rename is one caller. `crates/connetto-client/tests/
 
 The concrete implementation shipped for production on native is `connetto_client::auth::KeyringKeyStore` in `crates/connetto-client/src/auth.rs`, which uses OS secure storage: Keychain on macOS, Credential Manager on Windows, and the kernel keyutils keyring on Linux. On Linux the key lives in the session keyring. That keyring survives logout but not a reboot, so a rebooted Linux device reports `ClientError::ReplicaKeyMissing` and recovers by wiping and re-syncing.
 
+**Decided (R71, 2026-09-22), not built.** Every durable Linux secret, the replica key, the refresh token and R74's device key, survives a reboot. A desktop session keeps them in the Secret Service. A headless host keeps them in files under the unit's state directory, sealed under a wrap key the operator supplies as a systemd credential. With neither reachable the client refuses with a typed error unless the application explicitly chooses keyutils and accepts losing its keys at reboot, which the custody report then states. A key already in keyutils moves once to the new store.
+
 The test implementation is `connetto_client::auth::MemoryKeyStore`, an in-memory `HashMap`.
 
 ### The refresh store
@@ -184,7 +186,9 @@ PRAGMA cipher = 'sqlcipher'; PRAGMA legacy = 4;
 
 Phase E0 verified the pinning by having the browser codec read a file the native codec wrote, and confirmed that without `legacy = 4` it cannot. The native codec is SQLCipher itself and needs no pinning, so `cipher::unlock` applies these only on wasm.
 
-**Decided (R21): the native side moves to SQLite3 Multiple Ciphers too**, so both backends run one codec on one SQLite version and the pin stops being load-bearing. The two-codebase arrangement is compatible today only because the pin forces agreement, which means correctness rests on a setting that nothing obliges a future version bump to preserve. If the two ever drift, a file written on one device stops opening on another, and the failure appears at a user's device rather than in a test. Phase E0 established that the switch works and recorded why the alternative, staying on `bundled-sqlcipher`, does not remove the split.
+**Decided (R21): the native side moves to SQLite3 Multiple Ciphers too**, so both backends run one codec on one SQLite version and the pin stops being load-bearing. The two-codebase arrangement is compatible today only because the pin forces agreement, which means correctness rests on a setting that nothing obliges a future version bump to preserve. If the two ever drift, a file written on one device stops opening on another, and the failure appears at a user's device rather than in a test. Phase E0 measured the browser codec reading a file the native codec wrote under the pin, and recorded why the alternative, staying on `bundled-sqlcipher`, does not remove the split. Native running SQLite3MC is unmeasured until R21's step 0.
+
+**Decided (R21, 2026-09-22): the format becomes ChaCha20-Poly1305.** Both backends declare SQLite3MC's `chacha20` scheme explicitly rather than relying on its default, keyed with the same raw 32 bytes. Files in the SQLCipher v4 layout stop opening, a break accepted before any deployment exists, and a device-local tier crosses it only through export and import. The SQLCipher v4 construction above holds until R21 lands.
 
 The browser codec intercepts as a VFS shim, so a database must be opened through a URI that names the codec layer. `connetto_client::cipher::cipher_url` in `crates/connetto-client/src/cipher.rs` composes `file:<name>?vfs=multipleciphers-<vfs>` over the installed VFS (`opfs-sahpool` for OPFS, `memvfs` for the in-memory fallback). Both backends are covered, so the OPFS-unavailable fallback stays encrypted rather than silently degrading.
 
@@ -274,7 +278,7 @@ The replica filename is `prefix-sha256(canonical(user_id))` truncated to 128 bit
 
 ## No open decisions
 
-Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07. R42, the multi-account credential store with enumeration, landed on 2026-08-19. The browser gate is built (R23). One item remains decided rather than built: R21, which moves the native side onto the browser's page codec. R51, R52, and R53 carry the native gating surfaces for Apple, Android, and Windows respectively. An unidentified run introduces no encryption decision at all: its local copy is SQLite's own `:memory:` and carries no key (chapter 12, **Built (R3)**), so nothing of it is at rest. (Corrected 2026-09-12: this paragraph used to say the unauthenticated replica is encrypted under a device-scoped key built in phase E5, a discarded series and a shape R3 replaced with in-memory.)
+Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07. R42, the multi-account credential store with enumeration, landed on 2026-08-19. The browser gate is built (R23). Two items remain decided rather than built: R21, which moves the native side onto the browser's page codec, and R71, which makes Linux custody survive a reboot. R51, R52, and R53 carry the native gating surfaces for Apple, Android, and Windows respectively. An unidentified run introduces no encryption decision at all: its local copy is SQLite's own `:memory:` and carries no key (chapter 12, **Built (R3)**), so nothing of it is at rest. (Corrected 2026-09-12: this paragraph used to say the unauthenticated replica is encrypted under a device-scoped key built in phase E5, a discarded series and a shape R3 replaced with in-memory.)
 
 ---
 

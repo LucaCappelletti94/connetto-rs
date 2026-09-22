@@ -145,7 +145,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R51 | Native Apple gate. Needs R88's iOS leg, and nothing depends on it |
 | any | R52 | Native Android gate. Needs R88's Android leg, and nothing depends on it |
 | blocked | R53 | Windows gate. Blocked on hardware |
-| any | R21 | One page codec. Its step zero decides whether the phase proceeds at all |
+| any | R21 | One page codec. Its step zero decides whether the phase proceeds at all, and its foreign-key step waits for R92 |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
 | any | R11 | The shared public store. Off the critical path |
@@ -163,7 +163,9 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | any | R90 | The browser's refresh token into an `HttpOnly` cookie. Needs nothing, touches no native path |
-| any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots waits on R71 and is R71's to ship |
+| any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
+| any | R92 | Tier references as triggers connetto generates from SQLite's catalog. Needs nothing, and R21's foreign-key step waits for it |
+| any | R93 | The file replica for bots. Needs R71's headless custody and R91's template |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
 
 ## Status and blockers
@@ -207,7 +209,9 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | NOT STARTED, minted 2026-09-13 | nothing. One decision in the section, the 2026-08-06 parked BFF entry absorbed | no |
-| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R71's. Every decision is in `plans/apps-and-bots.md` | no |
+| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
+| R92 tier references enforced by generated triggers | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Three decisions in the section | no |
+| R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R71 and R91. One decision in the section | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -219,7 +223,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R45 reconciliation fix bundle | **DONE** (2026-08-09) | nothing | no |
 | R46 the wasm-smoke intermittent hang | **DONE** (2026-08-09, upstream finding) | nothing | **yes, wasm-bindgen** (finding written, workaround local) |
 | R47 one helper per job | **DONE** (2026-08-09) | nothing | no |
-| R21 one page codec on both backends | NOT STARTED | nothing | no |
+| R21 one page codec on both backends | NOT STARTED, designed 2026-09-22 | R92, for its foreign-key step only. Ten decisions in the section | **yes, `libsqlite3-sys`** (a bundled SQLite3MC feature and the agreed option set) **and `sqlite-wasm-rs`** (the agreed option set), carried on a fork meanwhile, and the phase closes on the fork |
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
 | R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
@@ -253,7 +257,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R68 browser file client | **DONE** (2026-09-10) | nothing. Worker-owned encrypted OPFS with memory fallback, browser fetch, reference-counted object URLs, and version 3 archives that restore unsent content through the production worker relay. The offline photo survives export, import under another key, local display and later upload. The browser stack passed and the full release suite passed 738 tests with 3 skipped | no |
 | R69 files in every demo | **DONE** (A through G complete 2026-09-19), designed (2026-09-12) | nothing. A is #28, B is #29, C is #30, G is #31, the browser stack boots the executable's file half with the online photo flow proven by `photo_flow.rs` and F's offline and two-viewer proofs by `photo_offline.rs` and `photo_visibility.rs`. E is #34, the photos surface in both web demos, and D is #35, the desktop photos surface on the native content client proven by the Docker-gated `demo_photos_flow.rs` | no |
 | R70 backup and restore story | NOT STARTED | nothing | no |
-| R71 Linux key custody survives reboot | NOT STARTED | nothing for grounding. One custody decision to take with the maintainer at execution | no |
+| R71 Linux key custody survives reboot | NOT STARTED, designed 2026-09-22 | nothing. Nine decisions in the section | no |
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
 | R74 device identity and certificates | NOT STARTED | nothing | no |
 | R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
@@ -374,7 +378,10 @@ graph TD
   R77 --> R80[R80 peer sync in every demo]
   R78 --> R80
   R79 --> R80
-  R71 -.->|bot file replica| R91[R91 apps, installations and the bot template]
+  R71 --> R93[R93 the file replica for bots]
+  R91[R91 apps, installations and the bot template] --> R93
+  R92[R92 tier references by generated triggers] -->|foreign-key step| R21
+  U7[upstream libsqlite3-sys and sqlite-wasm-rs:<br/>SQLite3MC feature, one option set] -.->|fork until released| R21
   R55[R55 containerised test services and CI]
   R2 -.->|registry only| R8
   R48[R48 a truncate empties the client's copy]
@@ -3763,9 +3770,22 @@ A row that stops matching a subscription is removed from that subscriber's repli
 
 ## R21: one page codec on both backends
 
-**Status.** NOT STARTED
+**Status.** NOT STARTED, designed 2026-09-22.
 
-**Blocked on nothing.** Phase E0 of an earlier series already proved the switch works.
+**Blocked on R92, for the foreign-key step only.** Phase E0 of an earlier series measured the browser codec reading a file the native codec wrote under the pin, and nothing has measured native running SQLite3MC, which is step 0's job. Ten decisions were taken with the maintainer on 2026-09-22, listed below.
+
+### Decisions
+
+1. **The page format is ChaCha20-Poly1305** (2026-09-22), SQLite3MC's `chacha20` scheme, which takes the raw 32-byte key through `sqlite3mcExtractRawKey` exactly as its `sqlcipher` scheme does. The browser build has no AES instructions (`AES_HARDWARE_NONE` on wasm), ChaCha20 runs in constant time in software, Poly1305 authenticates in the same pass where SQLCipher v4 adds an HMAC-SHA512 pass, a page reserves 32 bytes instead of 80, and the chunk store already uses XChaCha20-Poly1305. Rejected: SQLCipher v4 on both backends, which survives only as the format of step 0's fallback, since native SQLCipher reads nothing else. Step 0 measures browser page throughput under both schemes, and a result where ChaCha20 is not the faster reopens this decision.
+2. **The scheme is declared, never left to a default** (2026-09-22). One declaration naming `chacha20` is applied on both backends. With one library at one version the two sides cannot drift apart, and a declaration survives a later SQLite3MC release changing its default where a bare default would not. This replaces the earlier aim of deleting the pin outright.
+3. **Files written before R21 stop opening, as a named and recorded break** (2026-09-22). No deployment exists. A pre-R21 replica reports `ReplicaUndecryptable` and takes the recovery chapter 14 describes, then re-syncs. A device-local tier is lost unless it is exported before the update and imported after, which works because the R26 archive holds unencrypted rows. No migration code ships.
+4. **Native SQLite3MC comes from an upstream `libsqlite3-sys` feature** (2026-09-22), a bundled SQLite3MC feature requested from rusqlite through the upstream procedure and carried meanwhile on a fork through `[patch.crates-io]`. The tracker held no issue or pull request for SQLite3MC on 2026-09-22. Accepted costs: the crate grows toward crates.io's 10 MB cap (0.38.2 publishes at 5.36 MB with two amalgamations), a feature released in 0.39 needs the diesel fork's `<0.39` bound moved, and a published `connetto-client` waits for the release because a patch does not reach downstream builds. Native also stops linking the system `libcrypto`. Rejected: linking a prebuilt library through `SQLITE3_LIB_DIR`, which every application would have to build per target.
+5. **Both backends compile the same SQLite options, asserted by a test** (2026-09-22), apart from the options the platform forces (threading, the OS layer, temp storage).
+6. **Parity comes from upstream alignment, with runtime parity meanwhile** (2026-09-22). The `libsqlite3-sys` request and a second one to `sqlite-wasm-rs` ask both builds for the set of decision 7. Until both release, connetto sets the runtime-settable options identically on both backends (foreign keys per decision 8, page size at creation per decision 9, cache size), and chapter 13 lists the remaining compile-time differences for application authors. Rejected: runtime parity with a permanent residue, which leaves `pow()` failing natively and `soundex()` failing in the browser.
+7. **The agreed set is the union of today's two builds, with loadable extensions omitted** (2026-09-22). The math functions, FTS3, FTS5, SOUNDEX, STAT4, RTREE, the session extension and the introspection virtual tables on both, and `SQLITE_OMIT_LOAD_EXTENSION` on both in line with R18's closed-by-default posture. Rejected: the intersection, which breaks any query using a function one backend has today.
+8. **Foreign keys are off on both backends, and tier references are enforced by generated triggers** (2026-09-22). A replica is a partial copy, so connection-wide enforcement would refuse server rows whose parent is absent and local writes whose parent was paged out or evicted, while the server already enforces synced tables. The setting is connection-wide and the native tier shares the replica's connection, so tier references, `ON DELETE CASCADE` included, move to triggers connetto generates from SQLite's own catalog when it creates the tier (amended the same day by R92's decision 1, which first read pg2sqlite). That work is R92, and the explicit `PRAGMA foreign_keys = OFF` lands with or after it, so native tiers never lose enforcement in between. Today native enforces by compile default (`SQLITE_DEFAULT_FOREIGN_KEYS=1`) and the browser does not. Rejected: off with no tier enforcement, and on everywhere.
+9. **One page size on both backends, chosen by measurement** (2026-09-22). Step 0 times browser page reads and writes at 4096 and 8192 bytes under ChaCha20, and the faster becomes the size both set at creation. Today native defaults to 4096 and the browser to 8192.
+10. **The phase closes on the fork** (2026-09-22). Retiring the fork when both upstream releases land is a pin move tracked in the status table's Upstream column, as the diesel fork already is.
 
 ### Purpose
 
@@ -3775,18 +3795,20 @@ The saved database is encrypted by **two different libraries**: SQLCipher native
 
 ### Steps
 
-0. **Find or build the native vendoring, and stop if there is none** (added 2026-09-12): no crate in the tree or named here vendors SQLite3 Multiple Ciphers for native (`libsqlite3-sys` ships SQLCipher under `bundled-sqlcipher`, `sqlite-wasm-rs` is wasm-only), so feasibility is unverified. This step finds a sys crate or builds one, proves it links under the pinned diesel fork's own `libsqlite3-sys` requirement, and re-measures every knob `hardening.rs` asserts (R18) against the new build. If nothing links, the phase stops and reports, and the fallback recorded for that case is two codecs by decision, native on SQLCipher and the browser on SQLite3MC with the `cipher.rs` pin promoted from stopgap to contract. Rejected now: taking the fallback without trying, since the split is what makes the pin load-bearing.
+0. **Prove the native build on a fork, and stop if it cannot be made** (added 2026-09-12, route decided 2026-09-22). A fork of `libsqlite3-sys`, carried through `[patch.crates-io]`, gains a bundled SQLite3MC feature compiling SQLite3MC 2.3.3 on SQLite 3.53.0 with decision 7's option set. It passes when it links under the diesel fork's `libsqlite3-sys` range (`>=0.17.2, <0.39.0` with `bundled_bindings`), carries the session extension and the preupdate hook so `diesel-sqlite-session`'s `sqlite3changeset_apply_v3` resolves, accepts the raw-key `PRAGMA key` form under `chacha20`, lets `cipher::unlock`'s codec probe work on native through the check the browser uses, and re-measures every knob `hardening.rs` asserts (R18) green. The step also takes decision 1's and decision 9's browser measurements, then writes the two upstream requests through the upstream procedure, each after a prior-art search. If the fork cannot pass, the phase stops and reports, and the fallback recorded for that case is two codecs by decision, native on SQLCipher and the browser on SQLite3MC with the `cipher.rs` pin promoted from stopgap to contract, which keeps the SQLCipher v4 format. Rejected now: taking the fallback without trying, since the split is what makes the pin load-bearing.
 1. Replace the native vendoring so both backends run SQLite3 Multiple Ciphers on one SQLite version.
-2. **Keep the pin until the split is actually gone**, then remove it in the same change that removes the second library, never before, because it is what holds compatibility together in the meantime.
-3. Record the version both backends now pin, since one version was the point.
+2. **Keep the pin until the split is actually gone**, then replace it with decision 2's single `chacha20` declaration in the same change that removes the second library, never before, because the pin is what holds compatibility together in the meantime.
+3. Record the version both backends now pin, since one version was the point. It is the browser's, SQLite 3.53.0 with SQLite3MC 2.3.3 at `sqlite-wasm-rs` 0.5.5, because the diesel fork caps `sqlite-wasm-rs` below 0.6. A test on each backend asserts `sqlite_version()`, the SQLite3MC version and the compile options against one constant, so a bump on one side alone fails.
+4. Set the runtime options of decision 6 identically at every open on both backends, and the page size of decision 9 at creation. The explicit `PRAGMA foreign_keys = OFF` lands with or after R92.
+5. Record decision 3's break in chapter 14, and the compile-time differences that remain until both upstream releases land in chapter 13.
 
 ### Proof
 
-A file written natively opens in the browser and the reverse, with the pin removed.
+A file written natively opens in the browser and the reverse, under the single declaration. A file in the SQLCipher v4 layout fails to open on both backends, as decision 3 records. The version and option assertions pass on both.
 
 ### Done when
 
-One library and one SQLite version on both backends, and the pin deleted rather than merely unused.
+One library, one SQLite version and one cipher declaration on both backends on the fork, the browser-only pin gone, the runtime options set identically, the break of decision 3 recorded in chapter 14, and the version and option assertions green on both.
 
 ---
 
@@ -4808,7 +4830,19 @@ The story is written, and a Docker-gated test drives a client against a server r
 
 **Status.** NOT STARTED. Minted 2026-08-21: the 14-at-rest-encryption chapter records the behavior, the review found nobody owning it, and the same day's crypto discussion named it the one real safety failure the encryption has caused.
 
-**Blocked on** one custody decision to take with the maintainer at execution, because every candidate has a named cost: the Secret Service (gnome-keyring or KWallet) survives reboots but carries the lock hazard that has already wedged this repository's own test runs, the kernel persistent keyring does not survive a reboot either and is out, and a wrapped file under XDG needs its wrap source named or it is plaintext-equivalent.
+**Blocked on nothing.** Nine decisions were taken with the maintainer on 2026-09-22, listed below.
+
+### Decisions
+
+1. **Every durable Linux secret survives a reboot** (2026-09-22). The replica key, the refresh token and R74's device key share one Linux custody, as they share one on macOS and Windows.
+2. **A desktop session keeps them in the Secret Service** (2026-09-22), through `zbus-secret-service-keyring-store`. Corrected the same day. This section used to charge the Secret Service with "the lock hazard that has already wedged this repository's own test runs", and the gate record of 2026-08-22 traced that wedge to a missing `keyctl session`, not to a locked collection. Its real costs are a D-Bus session bus and a collection that PAM unlocks at graphical login and that stays locked after an auto-login or over SSH.
+3. **A headless host keeps them under a systemd credential** (2026-09-22). The operator's unit declares `LoadCredentialEncrypted=` and connetto reads from `$CREDENTIALS_DIRECTORY`.
+4. **The credential holds a wrap key, and the secrets live beside it** (2026-09-22). The credential is a 32-byte key-encryption key. Each secret (replica key, refresh token, device key) is its own file under the unit's `$STATE_DIRECTORY`, sealed with XChaCha20-Poly1305 with the record name as associated data. `$CREDENTIALS_DIRECTORY` is read-only to the service, and the client writes a rotated refresh token and an enrolled device key, so a credential holding the secrets themselves has nowhere to put them.
+5. **Detect, else refuse unless the application opts in** (2026-09-22). A credential wins when the unit provides one, the Secret Service is used otherwise, and with neither reachable the client refuses with a typed error naming what it probed. An application may name its store explicitly, keyutils included, and choosing keyutils accepts losing every key at reboot, which the custody report then states. Rejected: refusing with no opt-in, which leaves a tool over SSH unable to sign in, and falling back to keyutils on its own, which keeps the loss R71 exists to end.
+6. **A key already in keyutils moves once** (2026-09-22). The first open after R71 reads it, writes it to the new store, reads it back, and only then clears the keyutils copy.
+7. **The gate and CI run the real Secret Service** (2026-09-22). The Secret Service test group runs an unlocked `gnome-keyring-daemon` under `dbus-run-session`, locally and on the CI runners. The systemd path is tested with `$CREDENTIALS_DIRECTORY` pointing at a temporary wrap key, since sealing it is systemd's own job. Every other test names its store explicitly.
+8. **The bot file replica is not R71's** (2026-09-22). It edits the bot template, which only R91 produces, while `plans/apps-and-bots.md` (on R91's branch) said it "is gated on R71 and arrives with it" and the R91 rows here called it R71's to ship. No hard cycle existed, since R91 ships in-memory bots without it and R71's custody needs nothing from R91, but a template feature had been assigned to a custody phase. It is R93, which needs both, so R71 and R91 each close on their own. Rejected: a gated step inside R91, and one inside R71, either of which holds a phase open on the other.
+9. **The store is chosen per instance, not per process** (2026-09-22). Today `ensure_keyring_store` (`auth.rs`) installs one default store per process behind a `OnceLock`, so the choice is made once and cannot differ between two stores in one binary. Decisions 5 and 7 need both, an application naming its store and one test binary driving the Secret Service and the credential paths. So `KeyringKeyStore` and `KeyringStore` each hold the store they were constructed with, detection is the default constructor, and the process-global default stops being the mechanism.
 
 ### Purpose
 
@@ -4816,14 +4850,13 @@ On Linux the replica key lives in the kernel session keyring, which does not sur
 
 ### Steps
 
-1. Take the custody decision with the maintainer, grounded in what each backend actually guarantees on a headless and a desktop Linux.
-2. Implement it in `KeyringKeyStore`'s Linux arm, leaving the other platforms untouched.
-3. Prove it: a reboot-equivalent test (drop the session keyring, reopen) shows the replica and the tier reopening without a re-mint.
-4. Amend chapter 14's Linux row when the maintainer names the doc.
+1. Implement decisions 2 to 6 and 9 in `KeyringKeyStore`'s and `KeyringStore`'s Linux arms, leaving the other platforms' stores untouched.
+2. Prove it. A reboot-equivalent test (drop the session keyring, reopen) shows the replica and the tier reopening without a re-mint, for a freshly minted key and for one moved from keyutils, under the Secret Service and under a credential. After `wipe_replica` or logout, a fresh process finds nothing in the durable store, so a durable key never outlives chapter 14's crypto-shredding.
+3. Amend chapter 14's Linux custody paragraph.
 
 ### Done when
 
-A fresh Linux session reopens the replica and the device tier without re-minting, proven by test, and the chapter states the new custody.
+A fresh Linux session reopens the replica and the device tier without re-minting under both durable stores, a moved key survives, a wiped key is gone from the durable store, proven by test, and chapter 14 states the new custody.
 
 ---
 
@@ -5126,7 +5159,7 @@ connetto has no way for a program to hold a query, be told when it changed and w
 6. **Rotation is a generation bump** by trigger on the public key, held grants below it refused at handshake, live sessions evicted with a re-login reason distinct from `SessionRevoked` so the credential keeps its `sid`, sessions survive. Rejected: rotation as revocation.
 7. **Ban and departure.** A ban on the owner refuses every login of the app, a ban on an installer refuses and evicts that installer's isolated logins and leaves shared-view grants as share links are left, a ban on the bot user itself is the operator's lever to disable an app at their deployment, lifting restores any. Deletion of an installer is the deployment's cascade on the installation row.
 8. **`react` takes the whole snapshot**, `diff_by_key` is a helper.
-9. **Bots run on `Replica::in_memory()`** per login. A bot with device-local tables needs the file replica, which is R71's.
+9. **Bots run on `Replica::in_memory()`** per login. A bot with device-local tables needs the file replica, which is R93's, after R71 and this phase.
 10. **Budgets, two keys and none for the bot.** Every meter charges `meter_key` (`capability.rs`, since 2026-09-20), `user:<identity>` for a caller holding one, and any user may publish, so a bucket per bot would hand one user a bucket per app. A bot session overrides the key by its kind. An isolated session meters under `user:<installer>` as if the user had acted. A shared session meters under `app:<owner>`, a bucket separate from the owner's personal `user:<owner>` that every shared-view session of the owner's apps draws from, defaulting to one identity's allowance and raised by the deployment for a vendor it accepted. The bot identity carries no bucket. R87's quotas follow the same keys. Rejected: charging the bot alone, which multiplies, and charging the owner's personal bucket, which makes a publisher pay for their users.
 11. **The handshake reads no table.** The session manager keeps a registry cache of key generation, accepted grant rows and installations, seeded at boot and maintained by the change-log hook on the three synced tables, the same hook that revokes on uninstall and deletion and evicts on rotation. The three registry tables are exempt from the manifest filter so the bot's own installations query runs.
 12. **Audit.** `BotLogin` from the exchange on session open or resume after a gap, `Uninstalled`, `KeyRotated` and `AppDeleted` from the hook with the session it touched. Publish and install are the rows' own existence.
@@ -5142,6 +5175,74 @@ Every row of the record's state table has a test. The three registry policies gr
 ### Done when
 
 The template's scripted, semantics, property and bench targets pass in CI, the two demo apps run in the browser stack through registration, install, rotation, narrowing, uninstall and deletion as the state table says, and a second bot written from the template by someone other than the author needed no change to `connetto-client`.
+
+---
+
+## R92: tier references enforced by generated triggers
+
+**Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R21's decision 8.
+
+**Blocked on nothing.** Three decisions were taken with the maintainer on 2026-09-22, listed below.
+
+### Purpose
+
+R21 turns SQLite's foreign-key enforcement off on both backends, because a replica is a partial copy and a connection-wide check would refuse server rows whose parent is absent and local writes whose parent was paged out or evicted. The setting is connection-wide and the native tier is attached to the replica's connection, so the device-local tier would lose its only enforcement, `ON DELETE CASCADE` included. No server ever sees tier rows, so nothing else enforces those references.
+
+### Decisions
+
+1. **connetto generates the triggers from SQLite's own catalog when it creates the tier** (2026-09-22), on both backends, from `pragma_foreign_key_list` of each tier table. This amends R21's decision 8, which named pg2sqlite. `with_tier` takes SQLite DDL from any source, hand-written included (`local_import.rs`), so generation from the tier document would miss every tier not baked through pg2sqlite, while the catalog describes the tier that was actually created. Generation reads only the tier schema, so no trigger ever lands on a synced table, where its writes would be captured and uploaded. Rejected: pg2sqlite generating them from the tier document, on coverage.
+2. **All five referential actions, checked row by row, and a deferred constraint refused** (2026-09-22). `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` and `NO ACTION`, on delete and on update, with a reference holding a NULL in any column skipped as SQLite and Postgres both skip it. SQLite has no `DEFAULT` keyword inside an `UPDATE`, so a `SET DEFAULT` trigger inlines the child column's default expression as `pragma_table_info` stores it, and the reset row is then checked like any other. A trigger fires per row, so a `DEFERRABLE INITIALLY DEFERRED` constraint cannot be honoured, and tier creation refuses it with a named error. The catalog does not report deferrability, so it is read from the table's stored `CREATE TABLE` text. `RESTRICT` and `NO ACTION` differ in SQLite only by when a statement checks, and both become a per-row check. Rejected: covering `CASCADE` and `RESTRICT` alone.
+3. **The import checks references once, at the end** (2026-09-22). The triggers skip their checks while a guard row in a `_connetto`-prefixed tier table is set, a prefix the export already excludes. The import sets it inside its transaction, writes every row, clears it, and runs one orphan query per reference before commit, and an orphan aborts the import naming the table. Any table order and any self-referencing table work. Rejected: writing parent tables first, which no row order satisfies for a self-reference or a cycle.
+
+**Found while grounding, inferred and not run.** The export orders tier tables by name (`ORDER BY name` in `archive/rows.rs`) and the import upserts row by row, so under today's native compile-default enforcement an archive whose child table sorts before its parent should fail to import natively. Decision 3 removes the dependence on order.
+
+A tier created before R92 gains no triggers and needs none. Native still enforces by compile default until R21 turns enforcement off, and R21's format break recreates every tier.
+
+The guard table and the triggers live in the tier schema. The guard table carries a primary key, and its `_connetto` prefix keeps it out of `local_tier_tables` (`GLOB '_connetto*'`), so it enters neither the relay's session diff nor the export. The generator emits each `CREATE TRIGGER` already qualified into the tier schema, because `qualify_tier_statement` accepts only `CREATE TABLE` and `PRAGMA`, and executes each as one whole statement, never appended to the caller's DDL, whose creation loop splits on `;` (`lib.rs`) and would cut a trigger body apart.
+
+### Steps
+
+1. At tier creation on both backends, generate decision 2's triggers from `pragma_foreign_key_list`, and refuse a deferred constraint by name.
+2. Add decision 3's guard row and end check to `apply_import_with_bookkeeping`.
+3. Remove the hand-set `PRAGMA foreign_keys = ON` from `local_import.rs`, whose upsert test then relies on the triggers.
+4. R21's explicit `PRAGMA foreign_keys = OFF` lands with or after step 1.
+
+### Proof
+
+On both backends with enforcement off, a tier insert or update whose parent is missing is refused, a NULL reference is accepted, a parent delete and a parent key update each apply all five declared actions, a deferred declaration is refused at tier creation, an import whose child table sorts before its parent and one holding a self-referencing table both succeed, an archive holding an orphan aborts naming the table, and a replica row whose parent is absent applies.
+
+### Done when
+
+Tier references are enforced identically on both backends by triggers connetto generates from the catalog while connection-wide enforcement is off, the import checks references once at its end, and a synced child whose parent is absent applies on both.
+
+---
+
+## R93: the file replica for bots
+
+**Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R71's decision 8.
+
+**Blocked on** R71 for durable headless custody and R91 for the bot template. One decision, listed below.
+
+### Purpose
+
+A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that declares device-local tables needs the file replica, encrypted under the replica key, whose Linux custody across a reboot R71's systemd credential provides. The template that has to offer it is R91's. This phase joins the two.
+
+### Decision
+
+1. **An isolated login's replica is named from the bot user and the installation** (2026-09-22). `replica_db_name` derives the name from the identity, and every isolated login of one bot carries the bot user as its identity (R91 decision 1), so two installations' logins would open one file and read each other's rows. The isolated login's name is derived through the same serde-then-SHA-256 path from the pair of bot user and installation id, which can never equal an identity-only name, and a shared-view login keeps the identity-only name, one login per deployment. The key record, the tier and the content directory all derive from the replica name, so they separate with it. This extends chapter 14's rule that a wrong identity opens a different file rather than adopting another's rows. Rejected: an operator-chosen path per login, which makes the collision representable again.
+
+### Steps
+
+1. The template opens `Replica::encrypted_file` with a tier when the bot declares device-local tables, and stays in memory otherwise.
+2. Its key custody is R71's detection, so the operator's unit supplies the wrap-key credential and `StateDirectory=`, and the template's guidance names both unit lines.
+
+### Proof
+
+A bot declaring device-local tables restarts with `$CREDENTIALS_DIRECTORY` pointing at a wrap key and finds its tier rows, two isolated logins of one bot keep separate replicas, and a bot without device-local tables stays in memory.
+
+### Done when
+
+The template ships the file-replica path for bots with device-local tables, proven by the restart test, and chapter 13's bot paragraph names it.
 
 ---
 

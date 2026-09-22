@@ -151,7 +151,7 @@ The identity is deliberately **not** in that list. It stays bound once, at `app.
 
 **Budgets.** A bot identity carries no bucket of its own. Every meter charges `meter_key`, and any user may publish, so a bucket per bot would hand one user a bucket per app. An isolated session meters under its installer as if the user had acted, and under nothing else. A shared session meters under an app bucket per owner, separate from the owner's personal bucket, defaulting to one identity's allowance and raised by the deployment for a vendor it accepted. Chapter 16 records the same rule from the capacity side.
 
-**Not designed.** A UI app acting as a person, a bot minting share keys, a durable replica for a bot before R71 settles Linux key custody, and columns in a manifest.
+**Not designed.** A UI app acting as a person, a bot minting share keys, a durable replica for a bot before R93, and columns in a manifest.
 
 ---
 
