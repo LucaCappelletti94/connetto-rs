@@ -34,7 +34,7 @@ use connetto_core::messages::{
     SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
+use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
@@ -57,7 +57,7 @@ use crate::materializer::{
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
-use crate::reexec::{NoConnector, ReadBudget, TimedOutRead};
+use crate::reexec::{FailedRead, NoConnector, ReadBudget, ReadFailure};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
 use crate::throttle::{ReadLimits, Tier};
@@ -394,10 +394,9 @@ fn membership_label(member_table: &str) -> String {
 pub trait SnapshotSource<Id = String, Key = String>: Send + Sync {
     /// Snapshot-source error.
     ///
-    /// [`TimedOutRead`] because the session has to tell a read that ran out of
-    /// time from one that failed: the first is policy and ends the
-    /// subscription, the second is an outage and is retried (R81 decision 3).
-    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static + TimedOutRead;
+    /// [`FailedRead`] because the session answers each failure class
+    /// differently (R89 decision 1).
+    type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static + FailedRead;
 
     /// What the backend predicts `select_sql` will produce, as `caller`.
     ///
@@ -599,10 +598,20 @@ impl ReconnectPolicy {
         self.retry.max_attempts()
     }
 
-    /// Backoff before the `attempt`-th retry (1-based), delegating to
-    /// [`RetryPolicy::backoff`](connetto_core::RetryPolicy::backoff).
-    fn backoff(&self, attempt: u32) -> Duration {
-        self.retry.backoff(attempt)
+    /// Start a reconnect episode under the shared schedule.
+    #[must_use]
+    pub fn start(&self) -> Backoff<'_> {
+        self.retry.start()
+    }
+}
+
+/// Whether a reconnect episode must stop: the loop counts every failed
+/// connect, including the one that opened the episode, so `Some(n)` gives up
+/// on failure number n.
+const fn attempt_limit_reached(max_attempts: Option<u32>, failures: u32) -> bool {
+    match max_attempts {
+        Some(max) => failures >= max,
+        None => false,
     }
 }
 
@@ -635,6 +644,16 @@ pub enum ReconnectEvent<'a> {
         /// Delay before the next authorization attempt.
         backoff: Duration,
         /// The error from the authorization service.
+        error: &'a str,
+    },
+    /// A re-execution read could not be served, so the ingest loop retries
+    /// the same event after `backoff` without reconnecting the change stream.
+    ReadRetrying {
+        /// Consecutive failed-attempt count (1-based) for this event.
+        attempt: u32,
+        /// Delay before the next read.
+        backoff: Duration,
+        /// The connector's failure text.
         error: &'a str,
     },
 }
@@ -702,6 +721,12 @@ pub enum SessionError {
     /// past it.
     #[error("auth service unreachable: {0}")]
     AuthUnavailable(String),
+    /// A computed subscription's read could not be served by a database the
+    /// connector itself called unreachable. The ingest loop holds the event
+    /// and retries it in place, pausing delivery (R89 decision 2), never
+    /// reconnecting the change stream.
+    #[error("database unreachable for a computed read: {0}")]
+    ReadUnavailable(String),
     /// The change stream cannot answer what a row looked like before it
     /// changed, for the table named.
     ///
@@ -1221,6 +1246,9 @@ pub struct SessionManager<
     /// pipeline. When `may_see` or `may_write` returns an error, the ingest
     /// loop retries the same event using this schedule before moving on.
     auth_retry: RetryPolicy,
+    /// Backoff for the re-execution read paths: the one retry of the
+    /// unknown class and the in-place retry of the transient class.
+    read_retry: RetryPolicy,
     /// Brings the authorization store level with each changed row before that
     /// row reaches anybody.
     ///
@@ -1296,7 +1324,7 @@ where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
     C: ReadConnector,
-    C::Error: TimedOutRead,
+    C::Error: FailedRead,
     W: ConnettoWatermarkSchema<Id = String>,
 {
     /// Build a manager with a re-execution connector and a default in-memory
@@ -1338,7 +1366,7 @@ where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
     C: ReadConnector,
-    C::Error: TimedOutRead,
+    C::Error: FailedRead,
     O: Oplog,
     W: ConnettoWatermarkSchema<Id = String>,
     S: ContentTicketSigner,
@@ -1379,6 +1407,7 @@ where
             config,
             guard,
             auth_retry: RetryPolicy::new(),
+            read_retry: RetryPolicy::new(),
             upkeep,
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
@@ -1393,7 +1422,7 @@ where
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     Auth::Error: core::fmt::Display,
     C: ReadConnector,
-    C::Error: TimedOutRead,
+    C::Error: FailedRead,
     O: Oplog,
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
@@ -1796,12 +1825,18 @@ where
         event: &ChangeEvent,
         grant_moves: &[GrantMove],
     ) -> Result<(), SessionError> {
-        // A read the database cancelled at connetto's own limit is policy
-        // rather than an outage, so retrying it replaces nothing: every later
-        // change would meet the same read. The offending subscription ends and
-        // the event is redispatched without it (R81 decision 3). Terminates
-        // because each pass removes one subscription. A read that failed for
-        // any other reason bubbles up, and the ingest loop holds the event.
+        // Three classes, three dispositions (R89 decision 1). A timeout is
+        // policy and ends its subscription, retrying it replaces nothing. The
+        // unknown class gets one retry per subscription and a second failure
+        // ends it, so a poisoned query costs one extra read and a blip costs
+        // one read and survives. Each retry draws the policy's
+        // first-attempt wait from a fresh episode rather than one shared
+        // escalating schedule, so one poisoned migration ending many
+        // subscriptions costs one short wait each. A transient failure
+        // returns to the ingest loop, which pauses delivery in place (R89
+        // decision 2), never a change-stream teardown. Each pass ends at most
+        // one subscription, so the loop terminates.
+        let mut unknown_attempts: HashMap<SubscriptionId, u32> = HashMap::new();
         let dispatched = loop {
             let outcome = {
                 counters::timed_lock(&self.materializer)
@@ -1813,11 +1848,31 @@ where
                 Ok(dispatched) => break dispatched,
                 Err(MaterializerError::Read {
                     subscription,
-                    timed_out: true,
+                    class: ReadFailure::Timeout,
                     detail,
                 }) => {
-                    self.refuse_computed(subscription, &detail).await;
+                    self.refuse_computed(subscription, ReadFailure::Timeout, 1, &detail)
+                        .await;
                 }
+                Err(MaterializerError::Read {
+                    subscription,
+                    class: ReadFailure::Other,
+                    detail,
+                }) => {
+                    let seen = unknown_attempts.entry(subscription).or_insert(0);
+                    *seen = seen.saturating_add(1);
+                    if *seen > Self::UNKNOWN_READ_RETRIES {
+                        self.refuse_computed(subscription, ReadFailure::Other, *seen, &detail)
+                            .await;
+                    } else if let Some(wait) = self.read_retry.start().next_wait() {
+                        tokio::time::sleep(wait).await;
+                    }
+                }
+                Err(MaterializerError::Read {
+                    class: ReadFailure::Transient,
+                    detail,
+                    ..
+                }) => return Err(SessionError::ReadUnavailable(detail)),
                 Err(err) => return Err(err.into()),
             }
         };
@@ -1970,6 +2025,10 @@ where
     /// How many times a membership move read retries in place before the
     /// subscription is replaced through the R7 machinery instead.
     const MOVE_ATTEMPTS: u32 = 3;
+
+    /// How many short-backoff retries the unknown read class gets before its
+    /// subscription ends (R89 decision 1).
+    const UNKNOWN_READ_RETRIES: u32 = 1;
 
     /// Serve the rows one membership move affects (R27 step 4): a value that
     /// entered a subscription's set is answered with the subscription's own
@@ -2327,13 +2386,14 @@ where
     /// Drive a CDC source to completion, dispatching every event and acking its
     /// checkpoint so the upstream can recycle its log.
     ///
-    /// When `dispatch_event` returns [`SessionError::AuthUnavailable`] the loop
-    /// holds the event, broadcasts [`ControlMessage::DeliveryPaused`] to every
-    /// live session (once per outage, not per retry), and retries after
-    /// its own retry backoff. On recovery it broadcasts
+    /// When `dispatch_event` returns [`SessionError::AuthUnavailable`] or
+    /// [`SessionError::ReadUnavailable`] the loop holds the event, broadcasts
+    /// [`ControlMessage::DeliveryPaused`] to every live session with the
+    /// matching cause (once per outage, not per retry), and retries after the
+    /// shared backoff. On recovery it broadcasts
     /// [`ControlMessage::DeliveryResumed`] and moves on. The source checkpoint
     /// is not acknowledged until dispatch succeeds, so the replication slot never
-    /// advances past an unanswered event.
+    /// advances past an unanswered event. Neither pause touches the stream.
     ///
     /// # Errors
     ///
@@ -2350,8 +2410,13 @@ where
         loop {
             match source.next_event().await {
                 Ok(Some(event)) => {
-                    let mut auth_attempt: u32 = 0;
-                    let mut paused = false;
+                    // One hold loop for both pause causes (R89 decision 2):
+                    // an unreachable auth service and a transient computed
+                    // read share the arm, each with its own cause and shared
+                    // schedule, and the change stream is never touched.
+                    let mut auth_backoff = self.auth_retry.start();
+                    let mut read_backoff = self.read_retry.start();
+                    let mut paused: Option<PauseCause> = None;
                     // Applied once, then only the question is retried. See
                     // `keep_store_current` for why re-applying is refused.
                     let mut levelled = false;
@@ -2375,24 +2440,45 @@ where
                         };
                         match attempt.await {
                             Ok(()) => {
-                                if paused {
+                                if paused.take().is_some() {
                                     self.broadcast_control(ControlMessage::DeliveryResumed)
                                         .await;
                                 }
                                 break;
                             }
                             Err(SessionError::AuthUnavailable(err)) => {
-                                auth_attempt = auth_attempt.saturating_add(1);
-                                if !paused {
+                                // The internal schedules carry no attempt cap. A capped one
+                                // would keep the pause held at the ceiling.
+                                let backoff = auth_backoff
+                                    .next_wait()
+                                    .unwrap_or_else(|| self.auth_retry.max_backoff());
+                                if paused != Some(PauseCause::AuthServiceUnreachable) {
                                     self.broadcast_control(ControlMessage::DeliveryPaused {
                                         cause: PauseCause::AuthServiceUnreachable,
                                     })
                                     .await;
-                                    paused = true;
+                                    paused = Some(PauseCause::AuthServiceUnreachable);
                                 }
-                                let backoff = self.auth_retry.backoff(auth_attempt);
                                 on_event(ReconnectEvent::AuthRetrying {
-                                    attempt: auth_attempt,
+                                    attempt: auth_backoff.attempt(),
+                                    backoff,
+                                    error: &err,
+                                });
+                                tokio::time::sleep(backoff).await;
+                            }
+                            Err(SessionError::ReadUnavailable(err)) => {
+                                let backoff = read_backoff
+                                    .next_wait()
+                                    .unwrap_or_else(|| self.read_retry.max_backoff());
+                                if paused != Some(PauseCause::DatabaseUnreachable) {
+                                    self.broadcast_control(ControlMessage::DeliveryPaused {
+                                        cause: PauseCause::DatabaseUnreachable,
+                                    })
+                                    .await;
+                                    paused = Some(PauseCause::DatabaseUnreachable);
+                                }
+                                on_event(ReconnectEvent::ReadRetrying {
+                                    attempt: read_backoff.attempt(),
                                     backoff,
                                     error: &err,
                                 });
@@ -2441,7 +2527,7 @@ where
         F: core::future::Future<Output = Result<Src, E>>,
         E: core::fmt::Display,
     {
-        let mut attempt: u32 = 0;
+        let mut episode = policy.start();
         loop {
             let error = match connect().await {
                 Ok(mut source) => {
@@ -2455,7 +2541,7 @@ where
                         Err(err @ SessionError::ChangeStreamUnusable(_)) => return Err(err),
                         Err(err) => {
                             if started.elapsed() >= policy.healthy_after {
-                                attempt = 0;
+                                episode.reset();
                             }
                             err.to_string()
                         }
@@ -2463,21 +2549,25 @@ where
                 }
                 Err(err) => err.to_string(),
             };
-            attempt = attempt.saturating_add(1);
-            if let Some(max) = policy.max_attempts()
-                && attempt >= max
-            {
+            // The failed connect is itself an attempt, so Some(n) stops on
+            // the nth failure. The driver's own cap counts the waits it
+            // hands out, one fewer than this loop's failures, so the limit
+            // is checked against the failures here.
+            let failures = episode.attempt() + 1;
+            let Some(backoff) = episode
+                .next_wait()
+                .filter(|_| !attempt_limit_reached(policy.max_attempts(), failures))
+            else {
                 on_event(ReconnectEvent::GaveUp {
-                    attempts: attempt,
+                    attempts: failures,
                     error: &error,
                 });
                 return Err(SessionError::Transport(format!(
-                    "cdc ingest gave up after {attempt} attempts: {error}"
+                    "cdc ingest gave up after {failures} attempts: {error}"
                 )));
-            }
-            let backoff = policy.backoff(attempt);
+            };
             on_event(ReconnectEvent::Retrying {
-                attempt,
+                attempt: episode.attempt(),
                 backoff,
                 error: &error,
             });
@@ -2521,6 +2611,8 @@ where
     async fn refuse_computed<E: core::fmt::Display>(
         &self,
         subscription_id: SubscriptionId,
+        class: ReadFailure,
+        attempts: u32,
         cause: &E,
     ) {
         let route = { self.computed_routes.lock().await.remove(&subscription_id) };
@@ -2528,6 +2620,8 @@ where
         let Some(route) = route else { return };
         tracing::warn!(
             sub_id = %route.label,
+            class = %class,
+            attempts,
             cause = %cause,
             "a computed subscription's read was refused, ending the subscription"
         );
@@ -4445,7 +4539,7 @@ where
             )
             .await
             .map_err(|err| {
-                if err.timed_out() {
+                if err.read_failure() == ReadFailure::Timeout {
                     SessionError::ReadRefused(err.to_string())
                 } else {
                     SessionError::Snapshot(err.to_string())
@@ -5155,8 +5249,8 @@ mod tests {
     use subql::backend::{ScalarFamily, Value as PgValue};
 
     use super::{
-        GrantHolder, MemberTable, MirrorGap, SubscribeRefusal, caller_subjects, concerns,
-        mirror_predicate, page_rows,
+        GrantHolder, MemberTable, MirrorGap, SubscribeRefusal, attempt_limit_reached,
+        caller_subjects, concerns, mirror_predicate, page_rows,
     };
 
     /// A membership table watched under the given caller kinds.
@@ -5329,5 +5423,16 @@ mod tests {
         assert!(concerns(&caller(Some("alice"), &[]), &holder));
         assert!(concerns(&caller(None, &["key:a"]), &holder));
         assert!(concerns(&caller(None, &[]), &holder));
+    }
+
+    /// The failed connect that opened the episode is itself one of the
+    /// attempts, so a capped policy stops on the nth failure and an uncapped
+    /// one never does.
+    #[test]
+    fn a_capped_policy_stops_on_the_nth_failure() {
+        assert!(!attempt_limit_reached(None, u32::MAX));
+        assert!(attempt_limit_reached(Some(1), 1));
+        assert!(!attempt_limit_reached(Some(3), 2));
+        assert!(attempt_limit_reached(Some(3), 3));
     }
 }

@@ -104,53 +104,91 @@ impl SessionSetup for ConnettoReadSetup {
 /// wrapper, because the seam made the downstream reimplementation deletable.
 pub type PgReadConnector = PgAsyncDieselConnector<ConnettoReadSetup>;
 
-/// Whether a connector failure was the read exceeding the budget connetto set.
-///
-/// The distinction is load-bearing rather than cosmetic: a failure is an outage
-/// and retrying it can succeed, while a timeout is policy, so retrying it
-/// replaces nothing and the subscription ends instead (R81 decision 3, the
-/// split R58 introduced for the row path). Asking the connector's own error
-/// type keeps the classification where the limit was set.
-pub trait TimedOutRead {
-    /// `true` when this failure is Postgres cancelling at the set limit.
-    fn timed_out(&self) -> bool;
+/// The disposition one connector failure earns (R89 decision 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadFailure {
+    /// Postgres cancelled at connetto's own limit. Policy, the subscription ends at once (R81 decision 3).
+    Timeout,
+    /// The database or its pool was unreachable or cut off. Delivery pauses and retries in place (R89 decision 2).
+    Transient,
+    /// Everything unnamed, including transients whose SQLSTATE diesel drops. One retry, then the subscription ends.
+    Other,
 }
 
-/// The shipped connector's failure: a timeout is the database cancelling the
-/// statement at the limit the setup installed.
-impl TimedOutRead for DieselAsyncError {
-    fn timed_out(&self) -> bool {
+impl core::fmt::Display for ReadFailure {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Timeout => "timeout",
+            Self::Transient => "transient",
+            Self::Other => "unknown",
+        })
+    }
+}
+
+/// The failure class of a connector error, asked where the limit and the
+/// connection live.
+pub trait FailedRead {
+    /// The class this failure belongs to.
+    fn read_failure(&self) -> ReadFailure;
+}
+
+/// upstream's `#[non_exhaustive]` forces the catch-all, so rows-unsupported
+/// and future variants arrive as `Other`, the class that costs one retry and
+/// no stall.
+impl FailedRead for DieselAsyncError {
+    fn read_failure(&self) -> ReadFailure {
         match self {
-            Self::Diesel(err) => is_statement_timeout(err),
-            _ => false,
+            Self::Pool(_) => ReadFailure::Transient,
+            Self::Diesel(err) => diesel_failure(err),
+            _ => ReadFailure::Other,
         }
     }
 }
 
-/// A connector that cannot time out because it never reaches a database.
-impl TimedOutRead for std::io::Error {
-    fn timed_out(&self) -> bool {
-        false
+/// Bounded floor until the SQLSTATE reaches a diesel error
+/// (`upstream/diesel-sqlstate-not-recoverable-from-database-error-information.md`).
+/// Deadlock arrives as `Unknown`, so it classifies as `Other`, one retry rather than an outage loop.
+fn diesel_failure(err: &diesel::result::Error) -> ReadFailure {
+    use diesel::result::{DatabaseErrorKind, Error};
+    if is_statement_timeout(err) {
+        return ReadFailure::Timeout;
+    }
+    match err {
+        Error::DatabaseError(
+            DatabaseErrorKind::SerializationFailure
+            | DatabaseErrorKind::ReadOnlyTransaction
+            | DatabaseErrorKind::ClosedConnection
+            | DatabaseErrorKind::UnableToSendCommand,
+            _,
+        ) => ReadFailure::Transient,
+        _ => ReadFailure::Other,
     }
 }
 
-/// A source that cannot fail cannot have timed out.
-impl TimedOutRead for core::convert::Infallible {
-    fn timed_out(&self) -> bool {
+impl FailedRead for std::io::Error {
+    fn read_failure(&self) -> ReadFailure {
+        ReadFailure::Other
+    }
+}
+
+impl FailedRead for core::convert::Infallible {
+    fn read_failure(&self) -> ReadFailure {
         match *self {}
     }
 }
 
-/// A source whose error is only its text says nothing about a limit.
-impl TimedOutRead for String {
-    fn timed_out(&self) -> bool {
-        false
+impl FailedRead for String {
+    fn read_failure(&self) -> ReadFailure {
+        ReadFailure::Other
     }
 }
 
-impl TimedOutRead for crate::snapshot::SnapshotError {
-    fn timed_out(&self) -> bool {
-        matches!(self, Self::TimedOut(_))
+impl FailedRead for crate::snapshot::SnapshotError {
+    fn read_failure(&self) -> ReadFailure {
+        match self {
+            Self::TimedOut(_) => ReadFailure::Timeout,
+            _ => ReadFailure::Other,
+        }
     }
 }
 
@@ -227,7 +265,12 @@ impl AsyncConnector for NoConnector {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConnettoReadSetup, Duration, ReadBudget, SessionSetup, statement_timeout_ms};
+    use super::{
+        ConnettoReadSetup, Duration, FailedRead, ReadBudget, ReadFailure, SessionSetup,
+        statement_timeout_ms,
+    };
+    use diesel::result::{DatabaseErrorKind, Error};
+    use subql::reexec::DieselAsyncError;
 
     /// The floor is the one that would fail silently: `statement_timeout = 0`
     /// is Postgres for "no limit", so a budget already spent would buy an
@@ -255,5 +298,97 @@ mod tests {
             setup.setup_statements(),
             ["SET LOCAL statement_timeout = 1500".to_owned()]
         );
+    }
+
+    /// Stands in for a diesel database error once the SQLSTATE is dropped, `String` being diesel's own information type.
+    fn db_error(kind: DatabaseErrorKind, message: &str) -> Error {
+        Error::DatabaseError(kind, Box::new(message.to_owned()))
+    }
+
+    /// A pool that cannot hand out a connection is an outage, not an unknown.
+    #[test]
+    fn pool_exhaustion_is_transient() {
+        let err = DieselAsyncError::Pool(diesel_async::pooled_connection::bb8::RunError::TimedOut);
+        assert_eq!(err.read_failure(), ReadFailure::Transient);
+    }
+
+    #[test]
+    fn the_statement_cancellation_text_is_the_timeout_class() {
+        let err = DieselAsyncError::Diesel(db_error(
+            DatabaseErrorKind::Unknown,
+            "canceling statement due to statement timeout",
+        ));
+        assert_eq!(err.read_failure(), ReadFailure::Timeout);
+    }
+
+    /// A user cancellation spells a different cause in the same sentence.
+    #[test]
+    fn a_user_cancellation_is_not_the_timeout_class() {
+        let err = DieselAsyncError::Diesel(db_error(
+            DatabaseErrorKind::Unknown,
+            "canceling statement due to user request",
+        ));
+        assert_eq!(err.read_failure(), ReadFailure::Other);
+    }
+
+    /// The outage kinds diesel-async names, `ReadOnlyTransaction` being the standby recovery conflict.
+    #[test]
+    fn the_named_outage_kinds_are_transient() {
+        for kind in [
+            DatabaseErrorKind::SerializationFailure,
+            DatabaseErrorKind::ReadOnlyTransaction,
+            DatabaseErrorKind::ClosedConnection,
+            DatabaseErrorKind::UnableToSendCommand,
+        ] {
+            let err = DieselAsyncError::Diesel(db_error(kind, "whatever the server said"));
+            assert_eq!(
+                err.read_failure(),
+                ReadFailure::Transient,
+                "for kind {kind:?}"
+            );
+        }
+    }
+
+    /// A dropped view arrives as `Unknown`, the poisoned query that must cost one retry and end.
+    #[test]
+    fn unnamed_database_errors_are_other() {
+        let dropped_view = DieselAsyncError::Diesel(db_error(
+            DatabaseErrorKind::Unknown,
+            "relation \"v\" does not exist",
+        ));
+        assert_eq!(dropped_view.read_failure(), ReadFailure::Other);
+        let syntax = DieselAsyncError::Diesel(Error::QueryBuilderError(Box::new(
+            std::io::Error::other("nope"),
+        )));
+        assert_eq!(syntax.read_failure(), ReadFailure::Other);
+    }
+
+    /// Constraint violations are deterministic refusals of the query.
+    #[test]
+    fn constraint_violations_are_other() {
+        let err = DieselAsyncError::Diesel(db_error(
+            DatabaseErrorKind::UniqueViolation,
+            "duplicate key value violates unique constraint",
+        ));
+        assert_eq!(err.read_failure(), ReadFailure::Other);
+    }
+
+    /// Configuration refusals clear no retry.
+    #[test]
+    fn configuration_refusals_are_other() {
+        assert_eq!(
+            DieselAsyncError::RowsUnsupported.read_failure(),
+            ReadFailure::Other
+        );
+        let err = std::io::Error::other("no re-execution connector configured");
+        assert_eq!(err.read_failure(), ReadFailure::Other);
+        assert_eq!("boom".to_owned().read_failure(), ReadFailure::Other);
+    }
+
+    /// The snapshot path keeps its own timeout marker and classifies with it.
+    #[test]
+    fn the_snapshot_timeout_keeps_the_timeout_class() {
+        let timed_out = crate::snapshot::SnapshotError::TimedOut(Duration::from_millis(1));
+        assert_eq!(timed_out.read_failure(), ReadFailure::Timeout);
     }
 }

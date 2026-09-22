@@ -287,10 +287,14 @@ fn every_pause_cause() -> Vec<PauseCause> {
         PauseCause::AuthServiceUnreachable,
         // R5b: change feed connected but silent (absence of events).
         PauseCause::ChangeStreamStalled,
+        // R89: re-execution reads cannot reach the database.
+        PauseCause::DatabaseUnreachable,
     ];
     for cause in &causes {
         match cause {
-            PauseCause::AuthServiceUnreachable | PauseCause::ChangeStreamStalled => {}
+            PauseCause::AuthServiceUnreachable
+            | PauseCause::ChangeStreamStalled
+            | PauseCause::DatabaseUnreachable => {}
         }
     }
     causes
