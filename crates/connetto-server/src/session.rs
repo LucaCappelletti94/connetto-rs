@@ -605,6 +605,16 @@ impl ReconnectPolicy {
     }
 }
 
+/// Whether a reconnect episode must stop: the loop counts every failed
+/// connect, including the one that opened the episode, so `Some(n)` gives up
+/// on failure number n.
+const fn attempt_limit_reached(max_attempts: Option<u32>, failures: u32) -> bool {
+    match max_attempts {
+        Some(max) => failures >= max,
+        None => false,
+    }
+}
+
 /// An event from [`SessionManager::ingest_with_reconnect`], for logging or
 /// metrics. The loop is otherwise silent, so a caller wanting visibility into
 /// reconnect churn observes it here.
@@ -1817,14 +1827,16 @@ where
     ) -> Result<(), SessionError> {
         // Three classes, three dispositions (R89 decision 1). A timeout is
         // policy and ends its subscription, retrying it replaces nothing. The
-        // unknown class gets one short-backoff retry per subscription and a
-        // second failure ends it, so a poisoned query costs one extra read and
-        // a blip costs one read and survives. A transient failure returns to
-        // the ingest loop, which pauses delivery in place (R89 decision 2),
-        // never a change-stream teardown. Each pass ends at most one
-        // subscription, so the loop terminates as today's does.
+        // unknown class gets one retry per subscription and a second failure
+        // ends it, so a poisoned query costs one extra read and a blip costs
+        // one read and survives. Each retry draws the policy's
+        // first-attempt wait from a fresh episode rather than one shared
+        // escalating schedule, so one poisoned migration ending many
+        // subscriptions costs one short wait each. A transient failure
+        // returns to the ingest loop, which pauses delivery in place (R89
+        // decision 2), never a change-stream teardown. Each pass ends at most
+        // one subscription, so the loop terminates.
         let mut unknown_attempts: HashMap<SubscriptionId, u32> = HashMap::new();
-        let mut unknown_backoff = self.read_retry.start();
         let dispatched = loop {
             let outcome = {
                 counters::timed_lock(&self.materializer)
@@ -1852,7 +1864,7 @@ where
                     if *seen > Self::UNKNOWN_READ_RETRIES {
                         self.refuse_computed(subscription, ReadFailure::Other, *seen, &detail)
                             .await;
-                    } else if let Some(wait) = unknown_backoff.next_wait() {
+                    } else if let Some(wait) = self.read_retry.start().next_wait() {
                         tokio::time::sleep(wait).await;
                     }
                 }
@@ -2537,14 +2549,21 @@ where
                 }
                 Err(err) => err.to_string(),
             };
-            let Some(backoff) = episode.next_wait() else {
+            // The failed connect is itself an attempt, so Some(n) stops on
+            // the nth failure. The driver's own cap counts the waits it
+            // hands out, one fewer than this loop's failures, so the limit
+            // is checked against the failures here.
+            let failures = episode.attempt() + 1;
+            let Some(backoff) = episode
+                .next_wait()
+                .filter(|_| !attempt_limit_reached(policy.max_attempts(), failures))
+            else {
                 on_event(ReconnectEvent::GaveUp {
-                    attempts: episode.attempt(),
+                    attempts: failures,
                     error: &error,
                 });
-                let attempts = episode.attempt();
                 return Err(SessionError::Transport(format!(
-                    "cdc ingest gave up after {attempts} attempts: {error}"
+                    "cdc ingest gave up after {failures} attempts: {error}"
                 )));
             };
             on_event(ReconnectEvent::Retrying {
@@ -5230,8 +5249,8 @@ mod tests {
     use subql::backend::{ScalarFamily, Value as PgValue};
 
     use super::{
-        GrantHolder, MemberTable, MirrorGap, SubscribeRefusal, caller_subjects, concerns,
-        mirror_predicate, page_rows,
+        GrantHolder, MemberTable, MirrorGap, SubscribeRefusal, attempt_limit_reached,
+        caller_subjects, concerns, mirror_predicate, page_rows,
     };
 
     /// A membership table watched under the given caller kinds.
@@ -5404,5 +5423,16 @@ mod tests {
         assert!(concerns(&caller(Some("alice"), &[]), &holder));
         assert!(concerns(&caller(None, &["key:a"]), &holder));
         assert!(concerns(&caller(None, &[]), &holder));
+    }
+
+    /// The failed connect that opened the episode is itself one of the
+    /// attempts, so a capped policy stops on the nth failure and an uncapped
+    /// one never does.
+    #[test]
+    fn a_capped_policy_stops_on_the_nth_failure() {
+        assert!(!attempt_limit_reached(None, u32::MAX));
+        assert!(attempt_limit_reached(Some(1), 1));
+        assert!(!attempt_limit_reached(Some(3), 2));
+        assert!(attempt_limit_reached(Some(3), 3));
     }
 }
