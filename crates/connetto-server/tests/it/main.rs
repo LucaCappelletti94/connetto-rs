@@ -63,6 +63,7 @@ mod read_filter;
 mod reconnect;
 
 mod reexec;
+mod reexec_failure;
 
 mod mutation_budget;
 

@@ -129,14 +129,14 @@ pub enum MaterializerError {
     #[error("subscription query translation failed: {0}")]
     Translate(String),
     /// A database read the engine drove through its connector failed for one
-    /// subscription. `timed_out` distinguishes policy from outage (R81
-    /// decision 3): a timeout ends that subscription, an outage is retried.
+    /// subscription, carrying the class the session's three dispositions act
+    /// on (R89 decision 1).
     #[error("re-execution read failed for subscription {subscription}: {detail}")]
     Read {
         /// The subscription whose triggered read failed.
         subscription: SubscriptionId,
-        /// Whether the database cancelled the read at connetto's own limit.
-        timed_out: bool,
+        /// How the failure should be answered.
+        class: crate::reexec::ReadFailure,
         /// The connector's failure text.
         detail: String,
     },
@@ -451,7 +451,7 @@ pub trait ReadConnector:
         Backend = Postgres,
         Checkpoint = subql::PgLsn,
         AuthContext = crate::reexec::ConnettoReadSetup,
-        Error: core::fmt::Display + crate::reexec::TimedOutRead + Send,
+        Error: core::fmt::Display + crate::reexec::FailedRead + Send,
     > + Send
     + Sync
 {
@@ -462,7 +462,7 @@ impl<C> ReadConnector for C where
             Backend = Postgres,
             Checkpoint = subql::PgLsn,
             AuthContext = crate::reexec::ConnettoReadSetup,
-            Error: core::fmt::Display + crate::reexec::TimedOutRead + Send,
+            Error: core::fmt::Display + crate::reexec::FailedRead + Send,
         > + Send
         + Sync
 {
@@ -1926,7 +1926,7 @@ pub struct FoldSeeded {
 /// which the session's refusal paths act on (R81 decision 3).
 fn reexec_error<E>(err: ReExecError<E>) -> MaterializerError
 where
-    E: core::fmt::Display + crate::reexec::TimedOutRead,
+    E: core::fmt::Display + crate::reexec::FailedRead,
 {
     match err {
         ReExecError::Dispatch(err) => MaterializerError::Dispatch(err),
@@ -1935,7 +1935,7 @@ where
             error,
         } => MaterializerError::Read {
             subscription,
-            timed_out: error.timed_out(),
+            class: error.read_failure(),
             detail: error.to_string(),
         },
         ReExecError::Cursor {
@@ -1943,14 +1943,12 @@ where
             error,
         } => MaterializerError::Read {
             subscription,
-            // A cursor failure wraps the connector error one level deeper,
-            // and "this connector holds no cursors" is a configuration
-            // refusal that no retry clears, so it ends the subscription the
-            // same way a timeout does.
-            timed_out: matches!(
-                &error,
-                subql::reexec::CursorError::Connector(inner) if inner.timed_out()
-            ) || matches!(error, subql::reexec::CursorError::Unsupported),
+            // upstream's `#[non_exhaustive]` forces the catch-all, and a
+            // cursor bookkeeping failure is one retry rather than an outage.
+            class: match &error {
+                subql::reexec::CursorError::Connector(inner) => inner.read_failure(),
+                _ => crate::reexec::ReadFailure::Other,
+            },
             detail: error.to_string(),
         },
         other => MaterializerError::Install(other.to_string()),

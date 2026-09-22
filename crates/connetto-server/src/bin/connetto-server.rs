@@ -1423,6 +1423,16 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
             error,
             "authorization service unreachable, holding the event and retrying"
         ),
+        ReconnectEvent::ReadRetrying {
+            attempt,
+            backoff,
+            error,
+        } => tracing::warn!(
+            attempt,
+            backoff_ms = millis(backoff),
+            error,
+            "computed read unreachable, holding the event and retrying"
+        ),
     }
 }
 

@@ -59,7 +59,7 @@ pub use auth::{
     AmbiguousIdentity, AuthContext, CapabilitySubject, ContentCaller, Principal, Subject,
     VerifiedSession,
 };
-pub use backoff::RetryPolicy;
+pub use backoff::{Backoff, RetryPolicy};
 pub use cursor::Cursor;
 pub use custody::{Custody, NoGate};
 pub use error::CodecError;

@@ -86,7 +86,9 @@ pub use oplog::{
 };
 pub use oplog::{PgOplog, PgOplogError};
 pub use preflight::{Artifact, PreflightError};
-pub use reexec::{ConnettoReadSetup, NoConnector, PgReadConnector, ReadBudget, TimedOutRead};
+pub use reexec::{
+    ConnettoReadSetup, FailedRead, NoConnector, PgReadConnector, ReadBudget, ReadFailure,
+};
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{

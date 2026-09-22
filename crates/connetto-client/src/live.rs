@@ -2791,18 +2791,15 @@ where
     F: TransportFactory<Transport = T>,
     S: Sleeper,
 {
-    let mut attempt: u32 = 0;
+    let mut episode = driver.policy.start();
     loop {
-        attempt = attempt.saturating_add(1);
-        if driver
-            .policy
-            .max_attempts()
-            .is_some_and(|max| attempt > max)
-        {
+        let Some(wait) = episode.next_wait() else {
             return Recovery::Exhausted;
-        }
-        let _ = shared.events.send(ClientEvent::Reconnecting { attempt });
-        driver.sleeper.sleep(driver.policy.backoff(attempt)).await;
+        };
+        let _ = shared.events.send(ClientEvent::Reconnecting {
+            attempt: episode.attempt(),
+        });
+        driver.sleeper.sleep(wait).await;
 
         let Ok(transport) = driver.factory.connect().await else {
             continue;

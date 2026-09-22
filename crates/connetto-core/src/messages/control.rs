@@ -42,6 +42,9 @@ pub enum PauseCause {
     /// This is an absence of events rather than an event, which is why no
     /// log line catches it: the stream is alive but silent.
     ChangeStreamStalled,
+    /// The database cannot serve a read the pipeline needs, so delivery is held (R89 decision 2).
+    /// The change stream itself stays connected, which is what separates this from [`Self::ChangeStreamStalled`].
+    DatabaseUnreachable,
 }
 
 use super::{

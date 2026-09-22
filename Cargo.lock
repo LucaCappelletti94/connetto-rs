@@ -851,7 +851,6 @@ dependencies = [
  "parking_lot",
  "pg2sqlite",
  "pg_walstream",
- "postcard",
  "ring",
  "rls2fga",
  "rmp-serde",
@@ -5739,7 +5738,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f8c94d24b75470d5468949f6edbc963950f95070"
 dependencies = [
  "log",
  "recursive",
@@ -5769,7 +5768,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f8c94d24b75470d5468949f6edbc963950f95070"
 dependencies = [
  "proc-macro2",
  "quote",

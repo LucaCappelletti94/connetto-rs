@@ -155,7 +155,9 @@ Three responses, all connetto's. Startup refuses when the slot or the publicatio
 
 ### Shared retry primitive
 
-The materializer and the client connector use one backoff abstraction: exponential with jitter, a hard attempt cap, and a hard total-duration cap, parameterizable per failure class. Per-piece policies live next to the piece (in the table) but call into the same primitive, with no ad-hoc loops scattered across files.
+The materializer and the client connector use one backoff abstraction, exponential with jitter, a hard attempt cap, and a hard total-duration cap, parameterizable per failure class. Per-piece policies live next to the piece (in the table) but call into the same primitive, with no ad-hoc loops scattered across files.
+
+**Built (R89, 2026-09-22).** `connetto_core` carries the pair. `RetryPolicy` holds one schedule's parameters, 200 ms doubling to a 5 s ceiling by default with optional attempt and total-wait caps and jitter on, and `Backoff` is the episode driver started from it: each `next_wait` counts an attempt, spreads the wait uniformly over `[wait / 2, wait]`, and answers `None` once a cap ends the episode. The client's reconnect loop (behind its `Sleeper` seam), the change-stream reconnect, and the ingest hold arm (an auth outage and a transient computed read alike, each with its own `PauseCause`) all drive it. The browser hub loop in `crates/connetto-web/src/relay.rs` still doubles its own waits and is the one loop left to bring onto the primitive.
 
 ### Coalescing, the subql interaction
 

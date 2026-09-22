@@ -1786,7 +1786,7 @@ async fn drain_events<S, C, O>(
     C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ConnettoReadSetup>
         + Send
         + Sync,
-    C::Error: core::fmt::Display + connetto_server::TimedOutRead,
+    C::Error: core::fmt::Display + connetto_server::FailedRead,
     O: Oplog,
 {
     while let Some(event) = source.next_event().await.expect("poll event") {
