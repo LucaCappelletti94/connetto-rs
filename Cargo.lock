@@ -731,6 +731,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-demo-deployment"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "diesel",
+ "pg2sqlite",
+]
+
+[[package]]
 name = "connetto-dioxus"
 version = "0.0.0"
 dependencies = [
@@ -898,6 +907,7 @@ dependencies = [
  "tokio",
  "tower-http",
  "tracing-subscriber",
+ "uuid",
  "zstd",
 ]
 
