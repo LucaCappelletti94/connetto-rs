@@ -78,6 +78,10 @@ connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
 # (#109), so a mutation deepens one index instead of rebuilding the set, and
 # seeds the streaming task's position so a slot that only ever sees
 # keepalives still reports what it holds (#111).
+# Moved to `884b80e` by the lock follow-to-heads, carrying the upstream
+# hardening in between: the mutation run's unguarded boundaries, one record
+# per predicate in place of three maps, a range probe that costs its answer,
+# and deep nesting refused before anything walks the tree.
 # The base features stay minimal here, each crate states the feature set it
 # consumes.
 subql = { git = "https://github.com/LucaCappelletti94/subql", branch = "main", default-features = false, features = [
