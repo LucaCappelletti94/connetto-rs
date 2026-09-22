@@ -236,12 +236,17 @@ async fn main() -> Result<()> {
         .allow_origin(Any)
         .allow_methods(Any)
         .allow_headers(Any);
-    let connetto = auth_router(service, Arc::new(registry), RedirectPolicy::default())
-        .route(
-            LANDING_PATH,
-            get(|| async { "connetto dev landing: the code is in this URL" }),
-        )
-        .layer(cors);
+    let connetto = auth_router(
+        service,
+        Arc::new(registry),
+        RedirectPolicy::default(),
+        connetto_server::CookieSameSite::Strict,
+    )
+    .route(
+        LANDING_PATH,
+        get(|| async { "connetto dev landing: the code is in this URL" }),
+    )
+    .layer(cors);
 
     let app = connetto;
 

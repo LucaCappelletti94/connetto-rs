@@ -10,13 +10,10 @@
 
 mod common;
 
-use common::{REFRESH_DB, auth_config, play_the_tab, worker_config};
-use connetto_core::traits::RefreshTokenStore;
+use common::{ACCOUNT_DB, auth_config, play_the_tab, worker_config};
 use connetto_wasm_smoke::workers::DB_NAME;
-use connetto_web::auth::{
-    IdbKeyStore, LogoutOutcome, RefreshStore, request_logout, request_unsynced,
-};
-use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key, take_pending_wipes};
+use connetto_web::auth::{AccountStore, LogoutOutcome, request_logout, request_unsynced};
+use connetto_web::storage::{ReplicaStorage, take_pending_wipes};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -25,12 +22,10 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 #[wasm_bindgen_test]
 async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
     let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
     take_pending_wipes().await.expect("drain any earlier wipes");
-    clear_device_key(&keys).await.expect("clear the device key");
     storage
-        .delete_db(REFRESH_DB)
-        .expect("clear an earlier refresh store");
+        .delete_db(ACCOUNT_DB)
+        .expect("clear an earlier account index");
 
     let logins_served = play_the_tab();
     connetto_web::workers::boot_db_worker::<String>(&worker_config(Some(auth_config())))
@@ -60,9 +55,8 @@ async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
         take_pending_wipes().await.expect("drain").is_empty(),
         "keeping the data asks for no deletion"
     );
-    let device = device_key(&keys).await.expect("the device key survives");
     let store =
-        RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("the store still opens");
+        AccountStore::open(&storage.db_url(ACCOUNT_DB)).expect("the account index still opens");
     assert!(
         store.accounts().expect("list accounts").is_empty(),
         "the credential is gone, so the next boot cannot refresh silently"

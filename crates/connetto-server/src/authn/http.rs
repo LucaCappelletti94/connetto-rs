@@ -19,14 +19,28 @@
 //!
 //! The BFF boundary holds: provider tokens never reach the client, only
 //! connetto's own tokens do, and the loopback exchange is PKCE-protected.
+//!
+//! R90 adds the browser contract on `/auth/token`, `/auth/refresh`, and
+//! `/auth/logout`. A request marked with `X-Connetto-Client: browser` carries
+//! its refresh credential in a per-account `HttpOnly` cookie named
+//! `__Host-Http-connetto-refresh-` plus the base64url of the id's serde form,
+//! and its JSON body never carries or receives the refresh token. The marker
+//! is the CSRF latch RFC 10017 section 6.1.3.3.2 requires: a cookie-endpoint
+//! request that omits it takes the native path and cannot authenticate with
+//! the cookie, and a mixed or unknown marker is a `400`. Unmarked requests
+//! keep today's JSON-body contract exactly and never see a `Set-Cookie`.
+//! Refresh rotation under the marker binds account to credential: the body's
+//! `user_id` selects the cookie by exact name, and a rotated pair naming a
+//! different account revokes the presented session before the generic `401`.
 
 use std::sync::Arc;
 
 use axum::extract::{Query, State};
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use axum_extra::extract::cookie::{Cookie, CookieJar, SameSite as JarSameSite};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::percent::percent_encode;
@@ -37,7 +51,7 @@ use crate::authn::provider::{
     AuthCodes, IssuedAuthCode, PendingLogin, PendingLogins, ProviderError, ProviderRegistry,
 };
 use crate::authn::service::{AuthError, AuthService, TokenPair};
-use crate::authn::store::AuthStore;
+use crate::authn::store::{AuthStore, split_refresh};
 
 /// Which client redirect URIs the auth endpoints may deliver a minted
 /// authorization code to.
@@ -138,20 +152,32 @@ pub struct TokenExchangeRequest {
 }
 
 /// The `POST /auth/refresh` body.
+///
+/// The native contract fills `refresh_token`. The browser contract (a marked
+/// request) fills `user_id` and must not fill `refresh_token`: its credential
+/// rides the cookie named by that id.
 #[derive(Debug, Deserialize)]
-pub struct RefreshRequest {
-    /// The refresh token to rotate.
-    pub refresh_token: String,
+pub struct RefreshRequest<Id> {
+    /// The refresh token to rotate. Native contract only.
+    pub refresh_token: Option<String>,
+    /// The account whose cookie carries the credential. Browser contract only.
+    pub user_id: Option<Id>,
 }
 
 /// The `POST /auth/logout` body.
+///
+/// The native contract fills `refresh_token`. The browser contract fills
+/// `user_id` and revokes through that account's cookie.
 #[derive(Debug, Deserialize)]
-pub struct LogoutRequest {
+pub struct LogoutRequest<Id> {
     /// The refresh token whose session is to be revoked. It authenticates the
     /// request as well as naming the session, which is why no access token is
     /// needed: a device logging out holds the credential it is destroying, and
-    /// its access token may already have expired.
-    pub refresh_token: String,
+    /// its access token may already have expired. Native contract only.
+    pub refresh_token: Option<String>,
+    /// The account whose cookie carries the credential to revoke. Browser
+    /// contract only.
+    pub user_id: Option<Id>,
 }
 
 /// The token pair returned by the callback, the token exchange, and refresh.
@@ -162,8 +188,11 @@ pub struct LogoutRequest {
 pub struct TokenResponse<Id> {
     /// The short-lived access token, presented as one grant on the handshake.
     pub access_token: String,
-    /// The rotating refresh token.
-    pub refresh_token: String,
+    /// The rotating refresh token. Absent under the browser contract, where
+    /// the credential rides the `Set-Cookie` instead and never enters script
+    /// or a body the page can read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
     /// The access token lifetime in seconds.
     pub expires_in: u64,
     /// The typed `user_id` this session belongs to, serialized as the
@@ -179,7 +208,7 @@ impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
     fn from(pair: TokenPair<Id>) -> Self {
         Self {
             access_token: pair.access_token,
-            refresh_token: pair.refresh_token,
+            refresh_token: Some(pair.refresh_token),
             expires_in: pair.expires_in_secs,
             user_id: pair.user_id,
             session_expires_at: pair.session_expires_at_secs,
@@ -190,6 +219,8 @@ impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
 /// Shared state for the auth endpoints. Cloned per request (all fields are
 /// `Arc`), so it is implemented by hand to avoid an `S: Clone` bound.
 pub struct AuthState<S: AuthStore> {
+    /// The `SameSite` attribute the refresh cookie renders with.
+    pub cookie_same_site: CookieSameSite,
     service: Arc<AuthService<S>>,
     registry: Arc<ProviderRegistry>,
     pending: Arc<PendingLogins>,
@@ -205,6 +236,7 @@ impl<S: AuthStore> Clone for AuthState<S> {
             pending: Arc::clone(&self.pending),
             codes: Arc::clone(&self.codes),
             redirect_policy: self.redirect_policy.clone(),
+            cookie_same_site: self.cookie_same_site,
         }
     }
 }
@@ -214,6 +246,7 @@ impl<S: AuthStore> Clone for AuthState<S> {
 /// or replayed state `400`, a bad or PKCE-mismatched grant `400`, a rejected
 /// redirect `400`, an upstream provider fault `502`, and a store or mint fault
 /// `500`.
+#[derive(Debug)]
 enum AuthApiError {
     /// The service (store or token mint) failed.
     Service(AuthError),
@@ -229,6 +262,15 @@ enum AuthApiError {
     /// The client redirect URI was not a loopback address or an allowlisted
     /// entry, or a redirect and PKCE challenge were not supplied as a pair.
     InvalidRedirect,
+    /// The browser contract was mixed or incomplete: an unknown marker value,
+    /// a marked request that also carries a body token, or a marked request
+    /// with no account to name.
+    InvalidRequest,
+    /// A marked request carried no cookie under the name its account derives,
+    /// or the cookie's session turned out to name a different account. The
+    /// answer is the generic `401` so the client falls through to an
+    /// interactive login and nothing on the wire says which.
+    InvalidCredential,
 }
 
 impl AuthApiError {
@@ -243,6 +285,8 @@ impl AuthApiError {
             Self::UnknownState => "no in-flight authorization matched the callback".to_owned(),
             Self::InvalidGrant => "unknown, expired, or PKCE-mismatched grant".to_owned(),
             Self::InvalidRedirect => "the client redirect uri was refused".to_owned(),
+            Self::InvalidRequest => "the browser cookie contract was mixed".to_owned(),
+            Self::InvalidCredential => "no credential rode the marked request".to_owned(),
         }
     }
 }
@@ -267,7 +311,9 @@ impl IntoResponse for AuthApiError {
                 AuthError::Store(crate::authn::store::AuthStoreError::Backend(_))
                 | AuthError::Token(_),
             ) => StatusCode::INTERNAL_SERVER_ERROR,
-            Self::Service(AuthError::Store(_)) => StatusCode::UNAUTHORIZED,
+            Self::Service(AuthError::Store(_)) | Self::InvalidCredential => {
+                StatusCode::UNAUTHORIZED
+            }
             Self::Service(AuthError::Provider(err)) | Self::Provider(err) => match err {
                 ProviderError::Verification(_)
                 | ProviderError::Assurance(_)
@@ -277,9 +323,10 @@ impl IntoResponse for AuthApiError {
                 | ProviderError::Refresh(_) => StatusCode::BAD_GATEWAY,
             },
             Self::UnknownProvider => StatusCode::NOT_FOUND,
-            Self::UnknownState | Self::InvalidGrant | Self::InvalidRedirect => {
-                StatusCode::BAD_REQUEST
-            }
+            Self::UnknownState
+            | Self::InvalidGrant
+            | Self::InvalidRedirect
+            | Self::InvalidRequest => StatusCode::BAD_REQUEST,
         };
         tracing::warn!(status = status.as_u16(), detail = %detail, "authentication failed");
         if let Some(secs) = retry_after {
@@ -295,16 +342,105 @@ impl IntoResponse for AuthApiError {
     }
 }
 
+/// The `SameSite` attribute the browser-contract refresh cookie renders
+/// with. Exactly two settings, decided 2026-09-22: the cookie rides only the
+/// three auth `POST`s, so `Lax` earns nothing over `Strict`, and `None` exists
+/// only for deployments whose app origin is a different site than the auth
+/// origin and whose browsers still accept third-party cookies. `None` earns
+/// the cookie on top-level cross-site pages only. An app *embedded* in
+/// another site needs CHIPS `Partitioned`, a distinct attribute rather than
+/// a stricter `None`, and is out of scope here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum CookieSameSite {
+    /// The default. The cookie rides only same-site requests.
+    #[default]
+    Strict,
+    /// Cross-site rides, which modern third-party-cookie blocking may drop.
+    None,
+}
+
+impl CookieSameSite {
+    /// Parse the deployment setting. Only the two lowercase names parse; any
+    /// other value is a configuration error the caller must refuse startup on.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "strict" => Some(Self::Strict),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
+
+    fn jar(self) -> JarSameSite {
+        match self {
+            Self::Strict => JarSameSite::Strict,
+            Self::None => JarSameSite::None,
+        }
+    }
+}
+
+/// The request header whose value names the client contract. The marker is
+/// the CSRF latch RFC 10017 section 6.1.3.3.2 requires on cookie-authenticated
+/// `POST`s: a cross-origin request carrying it forces a preflight, and a form
+/// submission cannot arrive with it.
+pub const CLIENT_KIND_HEADER: &str = "x-connetto-client";
+
+/// The one header value that selects the browser cookie contract.
+pub const BROWSER_CLIENT: &str = "browser";
+
+/// The prefix of the per-account refresh cookie. The `__Host-Http-` prefix
+/// makes the browser itself reject any `Set-Cookie` that drops `Secure` or
+/// `HttpOnly`, deviates from `Path=/`, or adds a `Domain`.
+pub const REFRESH_COOKIE_PREFIX: &str = "__Host-Http-connetto-refresh-";
+
+/// Whether this request carries the browser marker. An absent header is the
+/// native contract. A present header with any other value is a refused
+/// request, never a silent native fallthrough.
+fn is_marked_request(headers: &HeaderMap) -> Result<bool, AuthApiError> {
+    match headers.get(CLIENT_KIND_HEADER) {
+        None => Ok(false),
+        Some(value) if value == BROWSER_CLIENT => Ok(true),
+        Some(_) => Err(AuthApiError::InvalidRequest),
+    }
+}
+
+/// The cookie name for one account: the prefix plus the base64url (no pad) of
+/// the id's serde JSON form. The serde encoding, not `Display`, is the
+/// canonical byte source, matching the replica-name derivation, and base64url
+/// keeps the name inside the RFC 6265 token characters whatever the id type
+/// spells.
+fn refresh_cookie_name<Id: Serialize>(user_id: &Id) -> Result<String, AuthApiError> {
+    let encoded = serde_json::to_vec(user_id).map_err(|_| AuthApiError::InvalidRequest)?;
+    Ok(format!(
+        "{REFRESH_COOKIE_PREFIX}{}",
+        URL_SAFE_NO_PAD.encode(encoded)
+    ))
+}
+
+/// Build the refresh cookie with the full attribute set. The deletion path
+/// passes the same builder so the removal `Set-Cookie` carries the attributes
+/// the prefix rules demand on every header, a bare name-only removal being
+/// rejected by the browser and leaving the account resumable after sign-out.
+fn refresh_cookie(name: String, value: String, same_site: CookieSameSite) -> Cookie<'static> {
+    let mut cookie = Cookie::new(name, value);
+    cookie.set_http_only(true);
+    cookie.set_secure(true);
+    cookie.set_path("/");
+    cookie.set_same_site(same_site.jar());
+    cookie
+}
+
 /// Build the auth router over a shared service and provider registry.
 pub fn auth_router<S: AuthStore + 'static>(
     service: Arc<AuthService<S>>,
     registry: Arc<ProviderRegistry>,
     redirect_policy: RedirectPolicy,
+    cookie_same_site: CookieSameSite,
 ) -> Router {
     let state = AuthState {
         service,
         registry,
         redirect_policy,
+        cookie_same_site,
         pending: Arc::new(PendingLogins::default()),
         codes: Arc::new(AuthCodes::default()),
     };
@@ -404,8 +540,11 @@ async fn callback<S: AuthStore + 'static>(
 
 async fn token<S: AuthStore + 'static>(
     State(state): State<AuthState<S>>,
+    jar: CookieJar,
+    headers: HeaderMap,
     Json(request): Json<TokenExchangeRequest>,
-) -> Result<Json<TokenResponse<S::Id>>, AuthApiError> {
+) -> Result<(CookieJar, Json<TokenResponse<S::Id>>), AuthApiError> {
+    let marked = is_marked_request(&headers)?;
     let issued = state
         .codes
         .redeem(&request.code)
@@ -413,25 +552,99 @@ async fn token<S: AuthStore + 'static>(
     if !verify_pkce_s256(&request.code_verifier, &issued.code_challenge) {
         return Err(AuthApiError::InvalidGrant);
     }
-    Ok(Json(TokenResponse {
-        access_token: issued.access_token,
-        refresh_token: issued.refresh_token,
-        expires_in: issued.expires_in_secs,
-        user_id: issued.user_id,
-        session_expires_at: issued.session_expires_at_secs,
-    }))
+    let (jar, refresh_token) = if marked {
+        let name = refresh_cookie_name(&issued.user_id)?;
+        let cookie = refresh_cookie(name, issued.refresh_token, state.cookie_same_site);
+        (jar.add(cookie), None)
+    } else {
+        (jar, Some(issued.refresh_token))
+    };
+    Ok((
+        jar,
+        Json(TokenResponse {
+            access_token: issued.access_token,
+            refresh_token,
+            expires_in: issued.expires_in_secs,
+            user_id: issued.user_id,
+            session_expires_at: issued.session_expires_at_secs,
+        }),
+    ))
 }
 
 async fn refresh<S: AuthStore + 'static>(
     State(state): State<AuthState<S>>,
-    Json(request): Json<RefreshRequest>,
-) -> Result<Json<TokenResponse<S::Id>>, AuthApiError> {
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(request): Json<RefreshRequest<S::Id>>,
+) -> Result<(CookieJar, Json<TokenResponse<S::Id>>), AuthApiError> {
+    let marked = is_marked_request(&headers)?;
+    let presented = if marked {
+        // The account names the cookie and the cookie carries the credential.
+        // A body token on a marked request mixes the two contracts.
+        let user_id = request
+            .user_id
+            .as_ref()
+            .ok_or(AuthApiError::InvalidRequest)?;
+        if request.refresh_token.is_some() {
+            return Err(AuthApiError::InvalidRequest);
+        }
+        let name = refresh_cookie_name(user_id)?;
+        let cookie = jar
+            .get(&name)
+            .ok_or(AuthApiError::InvalidCredential)?
+            .value()
+            .to_owned();
+        Some((user_id, cookie))
+    } else {
+        // The native contract is unchanged: the body carries the credential.
+        // A cookie riding an unmarked request authenticates nothing, which is
+        // what keeps a cross-site form post out.
+        None
+    };
+    let token = match &presented {
+        Some((_, cookie)) => cookie.as_str(),
+        None => request
+            .refresh_token
+            .as_deref()
+            .ok_or(AuthApiError::InvalidRequest)?,
+    };
     let pair = state
         .service
-        .refresh(&request.refresh_token)
+        .refresh(token)
         .await
         .map_err(AuthApiError::Service)?;
-    Ok(Json(pair.into()))
+    if let Some((user_id, cookie)) = &presented {
+        // The name derivation already ties this cookie to this account, so a
+        // rotated pair naming somebody else means the stored session and its
+        // name disagree. Revoke the presented session and answer the generic
+        // `401`: the audit row and this log line are where an operator learns
+        // what happened.
+        let named = serde_json::to_vec(*user_id).map_err(|_| AuthApiError::InvalidRequest)?;
+        let rotated =
+            serde_json::to_vec(&pair.user_id).map_err(|_| AuthApiError::InvalidRequest)?;
+        if named != rotated {
+            tracing::error!(
+                "refresh cookie named an account the session does not belong to,                  revoking the presented session"
+            );
+            if let Some((session_id, _)) = split_refresh(cookie) {
+                state.service.revoke(session_id).await.ok();
+            }
+            return Err(AuthApiError::InvalidCredential);
+        }
+        let name = refresh_cookie_name(*user_id)?;
+        let cookie = refresh_cookie(name, pair.refresh_token, state.cookie_same_site);
+        return Ok((
+            jar.add(cookie),
+            Json(TokenResponse {
+                access_token: pair.access_token,
+                refresh_token: None,
+                expires_in: pair.expires_in_secs,
+                user_id: pair.user_id,
+                session_expires_at: pair.session_expires_at_secs,
+            }),
+        ));
+    }
+    Ok((jar, Json(pair.into())))
 }
 
 /// Revoke the session the presented refresh token names.
@@ -441,16 +654,48 @@ async fn refresh<S: AuthStore + 'static>(
 /// client's own local teardown does not depend on the answer either: it clears
 /// its stored credential regardless, because a device with no connectivity must
 /// still be able to log out.
+/// The marked path answers `204` whether or not a cookie rode the request,
+/// exactly as the native path answers it whether or not the token named a
+/// live session, and the account's cookie is cleared in the same response.
 async fn logout<S: AuthStore + 'static>(
     State(state): State<AuthState<S>>,
-    Json(request): Json<LogoutRequest>,
-) -> Result<StatusCode, AuthApiError> {
+    jar: CookieJar,
+    headers: HeaderMap,
+    Json(request): Json<LogoutRequest<S::Id>>,
+) -> Result<(CookieJar, StatusCode), AuthApiError> {
+    let marked = is_marked_request(&headers)?;
+    if marked {
+        let user_id = request
+            .user_id
+            .as_ref()
+            .ok_or(AuthApiError::InvalidRequest)?;
+        if request.refresh_token.is_some() {
+            return Err(AuthApiError::InvalidRequest);
+        }
+        let name = refresh_cookie_name(user_id)?;
+        if let Some(cookie) = jar.get(&name) {
+            let token = cookie.value().to_owned();
+            state
+                .service
+                .logout(&token)
+                .await
+                .map_err(AuthApiError::Service)?;
+        }
+        // The removal carries the full attribute set: the prefix rules apply
+        // to every `Set-Cookie`, a deletion included.
+        let removal = refresh_cookie(name, String::new(), state.cookie_same_site);
+        return Ok((jar.remove(removal), StatusCode::NO_CONTENT));
+    }
+    let token = request
+        .refresh_token
+        .as_deref()
+        .ok_or(AuthApiError::InvalidRequest)?;
     state
         .service
-        .logout(&request.refresh_token)
+        .logout(token)
         .await
         .map_err(AuthApiError::Service)?;
-    Ok(StatusCode::NO_CONTENT)
+    Ok((jar, StatusCode::NO_CONTENT))
 }
 
 /// Whether `verifier` hashes (S256) to `challenge`, compared in constant time
@@ -464,7 +709,7 @@ fn verify_pkce_s256(verifier: &str, challenge: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_loopback_host;
+    use super::{CookieSameSite, REFRESH_COOKIE_PREFIX, is_loopback_host, refresh_cookie_name};
 
     fn loopback(url: &str) -> bool {
         url::Url::parse(url).is_ok_and(|parsed| is_loopback_host(&parsed))
@@ -501,5 +746,26 @@ mod tests {
         // `Ipv6Addr::is_loopback` is false for it. A gap both callers have
         // always shared, pinned here so a change to it is deliberate.
         assert!(!loopback("http://[::ffff:127.0.0.1]/"));
+    }
+    #[test]
+    fn the_cookie_name_is_the_prefix_over_base64url_of_the_serde_form() {
+        // The quotes are part of the serde JSON form of a String id, and the
+        // encoding is base64url without padding, a valid cookie-name token.
+        assert_eq!(
+            refresh_cookie_name(&"erin".to_owned()).expect("serializable"),
+            format!("{REFRESH_COOKIE_PREFIX}ImVyaW4i"),
+        );
+    }
+
+    #[test]
+    fn only_the_two_samesite_names_parse() {
+        assert_eq!(
+            CookieSameSite::parse("strict"),
+            Some(CookieSameSite::Strict)
+        );
+        assert_eq!(CookieSameSite::parse("none"), Some(CookieSameSite::None));
+        for rejected in ["Strict", "None", "lax", "", "no-samesite"] {
+            assert_eq!(CookieSameSite::parse(rejected), None, "{rejected}");
+        }
     }
 }

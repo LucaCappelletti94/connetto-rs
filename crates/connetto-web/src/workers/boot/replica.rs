@@ -10,9 +10,7 @@ use connetto_core::custody::{Custody, NoGate};
 use connetto_core::traits::ReplicaKeyStore as _;
 
 use super::super::helpers::sleep_ms;
-use super::super::session::{
-    RefreshStoreHandle, acquire_deferred, acquire_session, persist_deferred,
-};
+use super::super::session::{AccountStoreHandle, acquire_session};
 use super::BootError;
 use super::DbWorkerConfig;
 use crate::BrowserSocket;
@@ -154,49 +152,31 @@ async fn run_unlock_ceremony(
     Ok(())
 }
 
-async fn acquire_or_defer_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
+async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
     config: &DbWorkerConfig,
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     was_enrolled: bool,
-) -> Result<
-    (
-        Option<crate::auth::BrowserSession<Id>>,
-        Option<crate::auth::DeferredRefreshStore>,
-    ),
-    BootError,
-> {
-    let defer = config.unlock
-        && !was_enrolled
-        && config.auth.is_some()
-        && !storage.exists(config.auth_db_name);
-    match &config.auth {
-        Some(auth_config) if defer => {
-            let (session, deferred) = acquire_deferred::<Id>(auth_config)
-                .await
-                .map_err(BootError::SessionAcquisition)?;
-            Ok((Some(session), Some(deferred)))
-        }
-        Some(auth_config) => {
-            let store = RefreshStoreHandle {
-                db_name: config.auth_db_name,
-                storage,
-                key_store,
-            };
-            Ok((
-                Some(
-                    acquire_session::<Id>(auth_config, &store, config.pick_account)
-                        .await
-                        .map_err(BootError::SessionAcquisition)?,
-                ),
-                None,
-            ))
-        }
-        None => {
-            crate::unlock::set_custody(Custody::Ephemeral);
-            Ok((None, None))
-        }
+) -> Result<Option<crate::auth::BrowserSession<Id>>, BootError> {
+    let Some(auth_config) = &config.auth else {
+        crate::unlock::set_custody(Custody::Ephemeral);
+        return Ok(None);
+    };
+    let store = AccountStoreHandle {
+        db_name: config.auth_db_name,
+        storage,
+    };
+    let session = acquire_session::<Id>(auth_config, &store, config.pick_account)
+        .await
+        .map_err(BootError::SessionAcquisition)?;
+    // A first run on an unlocking build enrols only after the login resolved an
+    // account, so the user enrols a profile that exists rather than an empty
+    // one. The account index is plain now, so nothing written by the login has
+    // to wait for the ceremony the way the encrypted refresh store did.
+    if config.unlock && !was_enrolled {
+        run_enrol_ceremony(key_store).await?;
     }
+    Ok(Some(session))
 }
 
 async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), BootError> {
@@ -232,30 +212,6 @@ async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), 
         }
     }
     Ok(())
-}
-
-async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
-    config: &DbWorkerConfig,
-    storage: &crate::storage::ReplicaStorage,
-    key_store: &crate::auth::IdbKeyStore,
-    was_enrolled: bool,
-) -> Result<Option<crate::auth::BrowserSession<Id>>, BootError> {
-    let (session, deferred) =
-        acquire_or_defer_session::<Id>(config, storage, key_store, was_enrolled).await?;
-    if config.unlock && !was_enrolled && session.is_some() {
-        run_enrol_ceremony(key_store).await?;
-    }
-    if let Some(deferred) = &deferred {
-        let store = RefreshStoreHandle {
-            db_name: config.auth_db_name,
-            storage,
-            key_store,
-        };
-        persist_deferred(deferred, &store)
-            .await
-            .map_err(BootError::SessionAcquisition)?;
-    }
-    Ok(session)
 }
 
 pub(super) async fn provision_or_load_key(

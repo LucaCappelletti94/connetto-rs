@@ -35,7 +35,7 @@ use connetto_core::HandshakeAuthority;
 use connetto_core::messages::Grant;
 use connetto_server::authn::identity::deterministic_uuid;
 use connetto_server::{
-    AbuseConfig, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
+    AbuseConfig, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError, CookieSameSite,
     GenericOidcProvider, InMemoryAuthStore, ProviderRegistry, RedirectPolicy, RequestGuard,
     ThrottleConfig, TokenAuthority, auth_router,
 };
@@ -141,6 +141,7 @@ impl Stack {
             Arc::clone(&service),
             Arc::new(registry),
             RedirectPolicy::default(),
+            CookieSameSite::default(),
         );
         tokio::spawn(async move {
             axum::serve(listener, router).await.expect("serve");
@@ -422,6 +423,7 @@ async fn the_login_endpoint_refuses_an_unknown_provider_and_an_offsite_redirect(
         service,
         Arc::new(ProviderRegistry::new()),
         RedirectPolicy::default(),
+        CookieSameSite::default(),
     );
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
@@ -486,6 +488,7 @@ async fn a_guessed_refresh_token_is_rate_limited_after_its_session_runs_out() {
         service,
         Arc::new(ProviderRegistry::new()),
         RedirectPolicy::default(),
+        CookieSameSite::default(),
     );
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");

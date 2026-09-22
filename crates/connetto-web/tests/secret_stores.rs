@@ -1,31 +1,23 @@
-//! R41: the browser half of the two secret-store seams.
+//! The browser store seams.
 //!
-//! The callers are `connetto_core::test_support::two_accounts_keep_their_own_token`
-//! and `..._key`, written against the traits and knowing nothing about
-//! `IndexedDB`, `SubtleCrypto`, or an encrypted OPFS file. `connetto-client`'s
-//! `secret_stores.rs` runs the same two functions against the native stores, so
-//! one caller covers both targets and the seam is proven rather than the rename.
-//!
-//! The pre-login case is here too, because only the browser has one: the device
-//! key is read under a literal name before any account exists, which is why both
-//! stores address the account per call instead of baking it into the object.
+//! The replica-key half runs the shared exercise from
+//! `connetto_core::test_support`, the same one `connetto-client` runs against the
+//! native keyring, so the trait seam is proven on both targets. The credential
+//! half left with R90: the browser holds no credential store, only the plain
+//! account index below, which is checked directly.
 
-use connetto_core::test_support::{
-    every_stored_account_is_listed, two_accounts_keep_their_own_key,
-    two_accounts_keep_their_own_token,
-};
-use connetto_core::traits::ReplicaKeyStore;
-use connetto_web::auth::{IdbKeyStore, RefreshStore};
-use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key};
+use connetto_client::cipher::{ReplicaKey, cipher_url, unlock};
+use connetto_core::test_support::two_accounts_keep_their_own_key;
+use connetto_web::auth::{AccountStore, AuthError, IdbKeyStore};
+use connetto_web::storage::ReplicaStorage;
+use diesel::Connection;
+use diesel::SqliteConnection;
+use diesel::connection::SimpleConnection;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-/// The OPFS file this suite keeps its refresh store in, distinct from every
-/// other suite's so a shared origin cannot cross them.
-const REFRESH_DB: &str = "r41-secret-stores.sqlite";
-/// The OPFS file the account-list exercise uses, kept apart from the one above so
-/// neither test's reserved-record write can be mistaken for the other's.
+/// The OPFS file the account-list exercise uses.
 const ACCOUNTS_DB: &str = "r42-account-list.sqlite";
 
 #[wasm_bindgen_test]
@@ -34,75 +26,67 @@ async fn the_browser_key_store_keeps_two_accounts_apart() {
     two_accounts_keep_their_own_key(&store, "r41-alice", "r41-bob").await;
 }
 
+/// R42: the account list an application's picker is built on, enumerated from
+/// the index rows with the reserved marker excluded.
 #[wasm_bindgen_test]
-async fn the_browser_refresh_store_keeps_two_accounts_apart() {
+async fn the_account_index_lists_every_account_it_holds() {
     let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
-    storage
-        .delete_db(REFRESH_DB)
-        .expect("clear any earlier file");
-    clear_device_key(&keys)
-        .await
-        .expect("clear any earlier key");
-
-    let device = device_key(&keys).await.expect("mint the device key");
-    let store =
-        RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("open the refresh store");
-    two_accounts_keep_their_own_token(&store, "r41-alice", "r41-bob");
-}
-
-/// R42: the account list an application's picker is built on, against the store
-/// that answers it from the rows the tokens live in.
-#[wasm_bindgen_test]
-async fn the_browser_refresh_store_lists_every_account_it_holds() {
-    let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
     storage
         .delete_db(ACCOUNTS_DB)
         .expect("clear any earlier file");
+    let store = AccountStore::open(&storage.db_url(ACCOUNTS_DB)).expect("open the account index");
 
-    let device = device_key(&keys).await.expect("mint the device key");
-    let store =
-        RefreshStore::open(&storage.db_url(ACCOUNTS_DB), &device).expect("open the refresh store");
-    every_stored_account_is_listed(
-        &store,
-        "r42-alice",
-        "r42-bob",
-        connetto_client::IDENTITY_RECORD,
+    let alice = connetto_client::encode_identity(&"r42-alice").expect("encode");
+    let bob = connetto_client::encode_identity(&"r42-bob").expect("encode");
+    store.remember(&alice).expect("list alice");
+    store.remember(&bob).expect("list bob");
+
+    let listed = store.accounts().expect("list the accounts");
+    assert!(
+        listed.contains(&alice) && listed.contains(&bob),
+        "both accounts are offered to a picker, got {listed:?}"
+    );
+    assert!(
+        !listed
+            .iter()
+            .any(|name| connetto_client::is_reserved_record(name)),
+        "the last-used marker is never offered as somebody to sign in as"
+    );
+
+    store.forget(&bob).expect("sign bob out");
+    let after = store.accounts().expect("list again");
+    assert!(
+        after.contains(&alice) && !after.contains(&bob),
+        "signing one account out leaves the other listed, got {after:?}"
     );
 }
 
-/// The case decision 4 of R41 turns on, and the one native has no equivalent of.
-///
-/// A boot reads the device key under a literal name before any account is known,
-/// because the refresh token is what reveals the account. It has to come back
-/// from the same store the per-account records live in, and it has to be the same
-/// key on the boot after that, or the refresh store it wraps stops opening.
+/// The OPFS file left in the pre-R90 encrypted shape.
+const STALE_DB: &str = "r90-stale-encrypted.sqlite";
+
+/// R90's recovery keys on the account-index open failing outright. SQLite
+/// surfaces an unreadable file on the first page read rather than on
+/// establish, so a keyed leftover must be refused by `open` itself and not
+/// one call later, where nothing discards it.
 #[wasm_bindgen_test]
-async fn the_pre_login_record_reads_before_any_account_exists() {
-    let keys = IdbKeyStore::open().await.expect("open the key store");
-    clear_device_key(&keys).await.expect("start from nothing");
-
-    let minted = device_key(&keys).await.expect("mint on first sight");
-    assert_eq!(
-        device_key(&keys).await.expect("read it back"),
-        minted,
-        "the literal record is provision-once, so the wrapped store still opens"
-    );
-
-    // The per-account records live in the same store and neither reaches it.
-    let account = "r41-pre-login-account";
-    let account_key = connetto_web::auth::provision_replica_key(&keys, account)
-        .await
-        .expect("provision an account's key");
-    assert_ne!(
-        account_key, minted,
-        "a derived name and the literal address different records"
-    );
-    keys.clear(account).await.expect("shred the account record");
-    assert_eq!(
-        device_key(&keys).await.expect("the device key survives"),
-        minted,
-        "clearing an account leaves the pre-login record alone"
-    );
+async fn a_stale_encrypted_file_fails_where_the_recovery_lives() {
+    let storage = ReplicaStorage::install().await;
+    storage.delete_db(STALE_DB).expect("clear any earlier file");
+    {
+        let mut conn = SqliteConnection::establish(&cipher_url(STALE_DB, "opfs-sahpool"))
+            .expect("open the stale store");
+        unlock(&mut conn, &ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN]))
+            .expect("apply the old device key");
+        conn.batch_execute(
+            "CREATE TABLE connetto_refresh (token TEXT PRIMARY KEY NOT NULL, account TEXT NOT NULL)",
+        )
+        .expect("write the pre-R90 shape");
+    }
+    let outcome = AccountStore::open(&storage.db_url(STALE_DB));
+    storage.delete_db(STALE_DB).expect("clean up");
+    match outcome {
+        Err(AuthError::Store(_)) => {}
+        Err(other) => panic!("the boot recovery matches on Store, got {other:?}"),
+        Ok(_) => panic!("a keyed file opened as the plain account index"),
+    }
 }

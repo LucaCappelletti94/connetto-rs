@@ -120,14 +120,15 @@ use connetto_server::audit::pg_audit_hook;
 use connetto_server::openfga::{Counted, FgaAuth, ModelState, ModelSubject, Translated};
 use connetto_server::reach::GrantReach;
 use connetto_server::{
-    AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource, ProviderRegistry,
-    ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
-    RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig,
-    SessionError, SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
-    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
-    is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, CookieSameSite,
+    DbAuthStore, DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession,
+    Materializer, OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource,
+    ProviderRegistry, ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
+    RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog,
+    SessionConfig, SessionError, SessionManager, ThrottleConfig, TokenAuthority,
+    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
+    connetto_ban_table, connetto_watermark_table, is_loopback_host, pg_ban_store, pg_write_target,
+    preflight,
 };
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
@@ -143,7 +144,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 /// The change-path executor this binary serves through, named once because the
 /// session manager's type parameter and the function that builds it must agree.
@@ -1167,6 +1168,15 @@ async fn main() -> Result<()> {
             });
         }));
     }
+    let cookie_same_site =
+        CookieSameSite::parse(&var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")).ok_or_else(
+            || {
+                anyhow!(
+                    "unknown CONNETTO_AUTH_COOKIE_SAMESITE {:?}, expected strict or none",
+                    var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")
+                )
+            },
+        )?;
     spawn_auth_endpoints(
         &service,
         registry,
@@ -1174,6 +1184,7 @@ async fn main() -> Result<()> {
         &var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081"),
         &comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")),
         &comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")),
+        cookie_same_site,
     );
     run(
         &manager,
@@ -1191,6 +1202,13 @@ async fn main() -> Result<()> {
 /// `CONNETTO_AUTH_CORS_ORIGINS` lists. The file routes ride the same layer
 /// because a `PUT` or a JSON `POST` from a dev-server origin preflights, and
 /// one origin means a deployment names its origins once.
+///
+/// Credentials are allowed because the R90 browser contract fetches the auth
+/// endpoints with `credentials: "include"`, which needs the echoing
+/// `Access-Control-Allow-Credentials` header even on same-site cross-port
+/// calls. The predicate never returns `*` under this setting: it echoes the
+/// requesting origin only when the predicate accepts it, so the credential
+/// rides only loopback pages and the deployment's listed origins.
 fn cors_layer(cors_origins: &[String]) -> CorsLayer {
     let origins = cors_origins.to_vec();
     CorsLayer::new()
@@ -1199,8 +1217,11 @@ fn cors_layer(cors_origins: &[String]) -> CorsLayer {
                 is_loopback_origin(origin) || origins.iter().any(|allowed| allowed == origin)
             })
         }))
-        .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_credentials(true)
+        // Wildcards are illegal with credentials, so the answer mirrors what
+        // the preflight asked for.
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request())
 }
 
 /// Mount the file router on the auth listener's router before the CORS layer
@@ -1242,12 +1263,14 @@ fn spawn_auth_endpoints(
     auth_bind: &str,
     redirect_allowlist: &[String],
     cors_origins: &[String],
+    cookie_same_site: CookieSameSite,
 ) {
     let router = mount_on_auth_listener(
         auth_router(
             Arc::clone(service),
             registry,
             RedirectPolicy::new(redirect_allowlist.to_vec()),
+            cookie_same_site,
         ),
         file_router,
     )
@@ -1561,7 +1584,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
-    use tower::ServiceExt;
+    use tower::{Layer, ServiceExt};
 
     /// A caller carrying only an identity, which is what these mints exercise.
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
@@ -1593,6 +1616,60 @@ mod tests {
         assert_eq!(comma_list(" , "), Vec::<String>::new());
     }
 
+    /// The credential-bearing listener answers only loopback pages and the
+    /// configured origins. Any other page gets no `Access-Control-Allow-Origin`
+    /// at all, so the browser refuses it the response, and the refresh cookie
+    /// it would have carried stays unspent.
+    #[tokio::test]
+    async fn the_cors_layer_carries_credentials_only_for_trusted_origins() {
+        async fn answer(app: &str, origin: &str) -> axum::response::Response {
+            let layer = cors_layer(&[app.to_owned()]);
+            let router = layer.layer(axum::Router::new().route(
+                "/auth/refresh",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            ));
+            router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/auth/refresh")
+                        .header("origin", origin)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+        }
+
+        let trusted = answer("https://app.example", "https://app.example").await;
+        assert_eq!(
+            trusted.headers()["access-control-allow-origin"],
+            "https://app.example",
+            "the configured origin is answered"
+        );
+        assert_eq!(
+            trusted.headers()["access-control-allow-credentials"],
+            "true",
+            "and the answer permits the cookie to ride"
+        );
+
+        let dev = answer("https://app.example", "http://127.0.0.1:5173").await;
+        assert_eq!(
+            dev.headers()["access-control-allow-origin"],
+            "http://127.0.0.1:5173",
+            "a loopback page is answered without being configured"
+        );
+
+        let hostile = answer("https://app.example", "https://evil.example").await;
+        assert!(
+            !hostile
+                .headers()
+                .contains_key("access-control-allow-origin"),
+            "an unconfigured origin gets no answer, so the browser refuses it the              response whatever else rides, got {:?}",
+            hostile.headers()
+        );
+    }
+
     /// Both bind outcomes of the auth listener are survivable: the bound
     /// router keeps serving, a refused bind is an error line, not a panic.
     #[tokio::test]
@@ -1617,6 +1694,7 @@ mod tests {
             "127.0.0.1:0",
             &["https://app.example".to_owned()],
             &["https://app.example".to_owned()],
+            CookieSameSite::default(),
         );
         spawn_auth_endpoints(
             &service,
@@ -1625,6 +1703,7 @@ mod tests {
             "not a socket address",
             &[],
             &[],
+            CookieSameSite::default(),
         );
         // The bind arms run inside the spawned tasks; give them a turn.
         tokio::time::sleep(Duration::from_millis(50)).await;

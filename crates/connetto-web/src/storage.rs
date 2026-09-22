@@ -24,7 +24,6 @@
 //! independently usable, and the ordering they encode is documented on each.
 
 use connetto_client::cipher::cipher_url;
-use connetto_core::ReplicaKey;
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_file_client::{BrowserStore, BrowserStoreError};
 use indexed_db_futures::database::Database as IdbDatabase;
@@ -315,48 +314,6 @@ pub(crate) async fn remove_content_namespace(namespace: &str) -> Result<WipeProg
             Ok(WipeProgress::ContentPending)
         }
     }
-}
-
-/// The key-store record holding this device's own key, the one that is not
-/// addressed by an identity.
-///
-/// A derived replica name is always a prefix followed by a hash, so it can never
-/// collide with this literal.
-const DEVICE_KEY_RECORD: &str = "connetto-device-key";
-
-/// This device's own key, minted on first use and cached like a replica key.
-///
-/// Distinct from a per-replica key in what it is addressed by, not in how it is
-/// kept: a replica key is named after an identity, and this one cannot be,
-/// because it protects the store that has to be read *before* any identity is
-/// known. The refresh store is exactly that case.
-///
-/// # Errors
-///
-/// [`AuthError::Store`] if the key store cannot be read or written, or
-/// [`AuthError::Context`] if the platform RNG fails.
-pub async fn device_key<S>(key_store: &S) -> Result<ReplicaKey, AuthError>
-where
-    S: ReplicaKeyStore<Error = AuthError>,
-{
-    crate::auth::provision_replica_key(key_store, DEVICE_KEY_RECORD).await
-}
-
-/// Destroy this device's own key, which crypto-shreds the refresh store.
-///
-/// Part of credential teardown rather than data teardown, and safe to leave in
-/// place: the refresh store holds a rotating, server-revocable credential, so
-/// clearing the store is what ends the session and this only makes the leftover
-/// bytes inert. A later boot mints a fresh device key and starts a fresh store.
-///
-/// # Errors
-///
-/// [`AuthError::Store`] if the key store cannot be cleared.
-pub async fn clear_device_key<S>(key_store: &S) -> Result<(), AuthError>
-where
-    S: ReplicaKeyStore<Error = AuthError>,
-{
-    key_store.clear(DEVICE_KEY_RECORD).await
 }
 
 /// `IndexedDB` database naming replicas a wipe has been asked for but not yet

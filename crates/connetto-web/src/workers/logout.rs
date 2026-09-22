@@ -251,21 +251,21 @@ async fn serve_logout(
     Some(LogoutMessage::Done { deleted: delete })
 }
 
-/// Revoke the session and clear the stored credential.
+/// Revoke the session and drop the account from the index.
 ///
-/// Uses the worker's own key store because a fresh store is locked on an enrolled profile.
+/// No key store is involved: the credential this revokes is the `HttpOnly`
+/// cookie the browser carries, and the index beside it is plain.
 async fn logout_locally(
     auth: &crate::auth::WorkerAuthConfig,
     auth_db_name: &str,
     account: Option<&str>,
 ) -> Result<(), crate::auth::AuthError> {
     let storage = crate::storage::ReplicaStorage::install().await;
-    let keys = match crate::unlock::worker_key_store() {
-        Some(keys) => keys,
-        None => std::rc::Rc::new(crate::auth::IdbKeyStore::open().await?),
+    let handle = crate::workers::session::AccountStoreHandle {
+        db_name: auth_db_name,
+        storage: &storage,
     };
-    let device = crate::storage::device_key(&*keys).await?;
-    let store = crate::auth::RefreshStore::open(&storage.db_url(auth_db_name), &device)?;
+    let store = crate::workers::session::open_account_store(&handle)?;
     crate::auth::BrowserAuthenticator::new(auth.clone(), account.map(ToOwned::to_owned))
         .logout(&store)
         .await

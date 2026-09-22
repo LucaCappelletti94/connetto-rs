@@ -118,6 +118,7 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 # carries them while a library consumer opts out with `default-features =
 # false` and never compiles the object_store SDK path (R69 decision 2).
 connetto-file-server = { path = "../connetto-file-server", optional = true }
+axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
 
 [features]
 default = ["content"]

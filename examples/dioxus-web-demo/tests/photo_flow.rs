@@ -25,10 +25,10 @@ use connetto_dioxus_web_demo::{
 };
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, LOGIN_CHANNEL, LoginMessage, RefreshStore,
-    WorkerAuthConfig, deliver_login_code,
+    AccountStore, Acquired, BrowserAuthenticator, LOGIN_CHANNEL, LoginMessage, WorkerAuthConfig,
+    deliver_login_code,
 };
-use connetto_web::storage::{ReplicaStorage, device_key};
+use connetto_web::storage::ReplicaStorage;
 use connetto_web::{MessageTransport, TabContent, TabResolved, locks, workers};
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -190,23 +190,21 @@ async fn walk_login(login_url: &str) -> (String, String) {
 
 async fn mint_session() -> (String, String) {
     let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open key store");
-    let device = device_key(&keys).await.expect("device key");
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db = format!("dioxus-photo-mint-{n}.sqlite");
-    let store = RefreshStore::open(&storage.db_url(&db), &device).expect("refresh store");
+    let store = AccountStore::open(&storage.db_url(&db)).expect("account index");
     let auth = BrowserAuthenticator::new(
         WorkerAuthConfig::new(AUTH_BASE, AUTH_PROVIDER, AUTH_LANDING),
         None,
     );
-    let pending = match auth.acquire::<String, _>(&store).await.expect("acquire") {
+    let pending = match auth.acquire::<String>(&store).await.expect("acquire") {
         Acquired::NeedLogin(p) => p,
-        Acquired::Access(_) => panic!("fresh store cannot refresh silently"),
+        Acquired::Access(_) => panic!("fresh index cannot refresh silently"),
     };
     let (code, state) = walk_login(&pending.login_url).await;
     let session = auth
-        .complete::<String, _>(&pending, &code, &state, &store)
+        .complete::<String>(&pending, &code, &state, &store)
         .await
         .expect("complete login");
     drop(store);

@@ -93,6 +93,7 @@ async fn spawn_auth_server_with_service() -> (String, Arc<AuthService<InMemoryAu
         Arc::clone(&service),
         Arc::new(registry),
         RedirectPolicy::default(),
+        connetto_server::CookieSameSite::Strict,
     );
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
@@ -132,7 +133,12 @@ async fn spawn_typed_auth_server() -> (String, MockOauth) {
     .expect("discover provider");
     registry.register(Arc::new(provider));
 
-    let router = auth_router(service, Arc::new(registry), RedirectPolicy::default());
+    let router = auth_router(
+        service,
+        Arc::new(registry),
+        RedirectPolicy::default(),
+        connetto_server::CookieSameSite::Strict,
+    );
     tokio::spawn(async move {
         axum::serve(listener, router).await.expect("serve");
     });

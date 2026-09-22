@@ -13,15 +13,13 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use connetto_client::cipher::ReplicaKey;
-use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::traits::ReplicaKeyStore;
 use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
-use connetto_web::auth::{
-    AuthError, IdbKeyStore, PendingWork, RefreshStore, provision_replica_key,
-};
+use connetto_web::auth::{IdbKeyStore, PendingWork, provision_replica_key};
 use connetto_web::storage::{
-    PendingWipe, ReplicaStorage, WipeError, WipeProgress, clear_device_key, device_key,
-    mark_wipe_pending, take_pending_wipes, tier_db_name, wipe_replica,
+    PendingWipe, ReplicaStorage, WipeError, WipeProgress, mark_wipe_pending, take_pending_wipes,
+    tier_db_name, wipe_replica,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -38,12 +36,6 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 /// specific value rather than about an open succeeding.
 const MARKER: &str = "connetto-teardown-canary-9d4e21b7";
 
-/// The refresh token the encrypted store round-trips, and the string that must
-/// not appear in the store's bytes at rest.
-const REFRESH_TOKEN: &str = "session-id.connetto-refresh-canary-3f80ba61";
-/// The account key used in store round-trip tests: JSON form of a `String` id.
-const ACCOUNT: &str = "\"tester\"";
-
 diesel::table! {
     /// Table with a marker string to verify encryption at rest
     canary (id) {
@@ -52,17 +44,6 @@ diesel::table! {
         /// Marker string for encryption verification
         note -> Text,
     }
-}
-
-/// The sahpool utility, for reading raw OPFS bytes back. `install` registers once
-/// per worker, so this and [`ReplicaStorage::install`] are handles to one pool.
-async fn pool() -> sqlite_wasm_vfs::sahpool::OpfsSAHPoolUtil {
-    sqlite_wasm_vfs::sahpool::install::<sqlite_wasm_rs::WasmOsCallback>(
-        &sqlite_wasm_vfs::sahpool::OpfsSAHPoolCfg::default(),
-        true,
-    )
-    .await
-    .expect("install the sahpool VFS")
 }
 
 /// Open `name` encrypted under `key` through the storage seam's own URL, which is
@@ -91,11 +72,6 @@ fn read_marker(storage: &ReplicaStorage, name: &str, key: &ReplicaKey) -> String
         .select(canary::note)
         .first(&mut open(storage, name, key))
         .expect("read the canary row back")
-}
-
-/// Whether `haystack` contains `needle` as a contiguous byte run.
-fn contains(haystack: &[u8], needle: &[u8]) -> bool {
-    needle.len() <= haystack.len() && haystack.windows(needle.len()).any(|w| w == needle)
 }
 
 fn work(seqs: &[u64]) -> PendingWork {
@@ -263,101 +239,6 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
         read_marker(&storage, name, &key),
         MARKER,
         "the replica is untouched and still readable"
-    );
-}
-
-/// The refresh store is ciphertext at rest under this device's own key, and it
-/// survives a cold reopen, which is what a worker restart or a leader failover
-/// performs.
-#[wasm_bindgen_test]
-async fn the_refresh_store_is_encrypted_under_the_device_key_and_survives_a_reopen() {
-    let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
-    let name = "e3-refresh.sqlite";
-    storage.delete_db(name).expect("clear any earlier file");
-    clear_device_key(&keys)
-        .await
-        .expect("clear any earlier key");
-
-    let device = device_key(&keys).await.expect("mint the device key");
-    let url = storage.db_url(name);
-    {
-        let store = RefreshStore::open(&url, &device).expect("open the refresh store");
-        store.store(ACCOUNT, REFRESH_TOKEN).expect("save the token");
-        assert_eq!(
-            store.load(ACCOUNT).expect("load").as_deref(),
-            Some(REFRESH_TOKEN),
-            "the token round-trips through the encrypted store"
-        );
-    }
-
-    // Read the OPFS bytes back: the credential must not be sitting there in the
-    // clear, which is what it did before this phase.
-    let bytes = pool().await.export_db(name).expect("export the OPFS bytes");
-    assert!(
-        !contains(&bytes, REFRESH_TOKEN.as_bytes()),
-        "the refresh token must not survive as plaintext in OPFS"
-    );
-    assert!(
-        !contains(&bytes, b"CREATE TABLE"),
-        "nor must the schema text"
-    );
-
-    // A cold reopen finds the same device key cached and reads the token back, so
-    // a worker restart still refreshes silently.
-    let cached = device_key(&keys).await.expect("the device key is cached");
-    assert_eq!(
-        cached, device,
-        "the device key is minted once, not per boot"
-    );
-    let store = RefreshStore::open(&url, &cached).expect("reopen the refresh store");
-    assert_eq!(
-        store.load(ACCOUNT).expect("load").as_deref(),
-        Some(REFRESH_TOKEN),
-        "the stored credential survives a cold reopen"
-    );
-}
-
-/// Destroying the device key makes the refresh store unreadable, which is exactly
-/// what the worker boot recovers from by discarding the store: the credential
-/// inside is unreachable and the only way forward is a fresh login.
-#[wasm_bindgen_test]
-async fn a_destroyed_device_key_makes_the_refresh_store_undecryptable_and_discardable() {
-    let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
-    let name = "e3-refresh-shred.sqlite";
-    storage.delete_db(name).expect("clear any earlier file");
-    clear_device_key(&keys)
-        .await
-        .expect("clear any earlier key");
-
-    let device = device_key(&keys).await.expect("mint the device key");
-    let url = storage.db_url(name);
-    {
-        let store = RefreshStore::open(&url, &device).expect("open the refresh store");
-        store.store(ACCOUNT, REFRESH_TOKEN).expect("save the token");
-    }
-
-    clear_device_key(&keys).await.expect("shred the device key");
-    let reminted = device_key(&keys).await.expect("a later boot mints again");
-    assert_ne!(
-        reminted, device,
-        "the mint is fresh randomness, not a constant"
-    );
-    match RefreshStore::open(&url, &reminted) {
-        Err(AuthError::Undecryptable(_)) => {}
-        Err(other) => panic!("expected Undecryptable, got {other:?}"),
-        Ok(_) => panic!("a re-minted device key must not open the old store"),
-    }
-
-    // The boot's recovery: discard the unreachable store and start an empty one,
-    // which forces the interactive login.
-    storage.delete_db(name).expect("discard the store");
-    let store = RefreshStore::open(&url, &reminted).expect("a fresh store opens");
-    assert_eq!(
-        store.load(ACCOUNT).expect("load"),
-        None,
-        "the discarded credential is gone, so the next boot must log in"
     );
 }
 
