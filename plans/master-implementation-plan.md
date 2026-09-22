@@ -5219,12 +5219,9 @@ SQLite's foreign-key enforcement is one switch per connection, native enforces b
 3. **The import defers every check to its commit** (2026-09-22). `apply_import_with_bookkeeping` sets `PRAGMA defer_foreign_keys = ON` inside its transaction, SQLite checks at commit, and a violation aborts the import. Table order and self-references stop mattering.
 4. **Trigger depth follows a measurement, under R18's D5** (2026-09-22). Every nested frame, a foreign-key action included, counts against `SQLITE_LIMIT_TRIGGER_DEPTH`, which R18 sets to 10. When step 0 shows a tier cascade failing at that bound, R18's row moves to SQLite's stock 1000, as D5 prescribes for a limit measurement forces open.
 
-### Step 0, measured on today's code before any change
-
-Natively, record whether each succeeds. (a) A server patch carrying a synced child whose parent the caller cannot see. (b) A tier cascade 12 levels deep. (c) An import whose child table sorts before its parent, since the export orders tables by name. A failure in (a) or (c) is a live defect, and its reproduction becomes a regression test here.
-
 ### Steps
 
+0. **Measure today's code before any change.** Natively, record whether each succeeds. (a) A server patch carrying a synced child whose parent the caller cannot see. (b) A tier cascade 12 levels deep. (c) An import whose child table sorts before its parent, since the export orders tables by name. A failure in (a) or (c) is a live defect, and its reproduction becomes a regression test here.
 1. Strip synced references at replica creation on both backends (decision 1).
 2. Turn enforcement on at every open on both backends, the browser's tier connection included (decision 2).
 3. Defer the import's checks to its commit (decision 3).
