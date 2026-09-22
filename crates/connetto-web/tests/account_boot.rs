@@ -98,7 +98,7 @@ async fn the_marker_names_the_account_that_signed_in_last() {
     let listed = store.accounts().expect("list the accounts");
     assert!(
         listed.contains(&alice) && listed.contains(&bob),
-        "both are offered to an application that wants to pick, got {listed:?}"
+        "both are offered to an application that wants to pick"
     );
 }
 

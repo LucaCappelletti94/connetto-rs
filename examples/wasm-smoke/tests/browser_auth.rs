@@ -408,7 +408,7 @@ async fn two_real_logins_leave_two_accounts_signed_in_at_once() {
     let listed = store.accounts().expect("list the accounts");
     assert!(
         listed.contains(&first_account) && listed.contains(&second_account),
-        "both accounts are offered to a picker, got {listed:?}"
+        "both accounts are offered to a picker"
     );
 
     // The later login owns the cold-boot default.

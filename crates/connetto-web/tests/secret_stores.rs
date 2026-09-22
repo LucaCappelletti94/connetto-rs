@@ -44,7 +44,7 @@ async fn the_account_index_lists_every_account_it_holds() {
     let listed = store.accounts().expect("list the accounts");
     assert!(
         listed.contains(&alice) && listed.contains(&bob),
-        "both accounts are offered to a picker, got {listed:?}"
+        "both accounts are offered to a picker"
     );
     assert!(
         !listed
@@ -57,7 +57,7 @@ async fn the_account_index_lists_every_account_it_holds() {
     let after = store.accounts().expect("list again");
     assert!(
         after.contains(&alice) && !after.contains(&bob),
-        "signing one account out leaves the other listed, got {after:?}"
+        "signing one account out leaves the other listed"
     );
 }
 
