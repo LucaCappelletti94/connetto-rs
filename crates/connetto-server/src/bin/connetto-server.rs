@@ -1665,7 +1665,7 @@ mod tests {
             !hostile
                 .headers()
                 .contains_key("access-control-allow-origin"),
-            "an unconfigured origin gets no answer, so the browser refuses it the              response whatever else rides, got {:?}",
+            "an unconfigured origin gets no answer, so the browser refuses it the response whatever else rides, got {:?}",
             hostile.headers()
         );
     }

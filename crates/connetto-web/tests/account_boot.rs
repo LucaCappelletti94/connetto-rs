@@ -169,3 +169,21 @@ async fn a_first_run_names_no_account_and_asks_for_a_login() {
         "a first run logs in"
     );
 }
+
+/// An index written by a build whose id type differs names an account this
+/// build cannot decode. That is a login, not a boot failure: the row outlives
+/// the boot, so an error here would refuse every start from then on.
+#[wasm_bindgen_test]
+async fn an_account_this_build_cannot_decode_asks_for_a_login() {
+    let store = fresh_store().await;
+    store.remember("42").expect("an integer-id build's account");
+
+    match BrowserAuthenticator::new(config(), Some("42".to_owned()))
+        .acquire::<String>(&store)
+        .await
+    {
+        Ok(Acquired::NeedLogin(_)) => {}
+        Ok(Acquired::Access(_)) => panic!("an undecodable account cannot resume"),
+        Err(err) => panic!("an undecodable account must ask for a login, got {err}"),
+    }
+}

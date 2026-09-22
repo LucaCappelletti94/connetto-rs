@@ -171,8 +171,7 @@ async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned
         .map_err(BootError::SessionAcquisition)?;
     // A first run on an unlocking build enrols only after the login resolved an
     // account, so the user enrols a profile that exists rather than an empty
-    // one. The account index is plain now, so nothing written by the login has
-    // to wait for the ceremony the way the encrypted refresh store did.
+    // one.
     if config.unlock && !was_enrolled {
         run_enrol_ceremony(key_store).await?;
     }

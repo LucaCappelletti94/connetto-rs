@@ -28,7 +28,7 @@
 //! is the CSRF latch RFC 10017 section 6.1.3.3.2 requires: a cookie-endpoint
 //! request that omits it takes the native path and cannot authenticate with
 //! the cookie, and a mixed or unknown marker is a `400`. Unmarked requests
-//! keep today's JSON-body contract exactly and never see a `Set-Cookie`.
+//! keep the JSON-body contract and never see a `Set-Cookie`.
 //! Refresh rotation under the marker binds account to credential: the body's
 //! `user_id` selects the cookie by exact name, and a rotated pair naming a
 //! different account revokes the presented session before the generic `401`.

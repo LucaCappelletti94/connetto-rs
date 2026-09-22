@@ -122,9 +122,10 @@ async fn a_cookie_only_request_reaches_nothing() {
     let global: WorkerGlobalScope = js_sys::global()
         .dyn_into()
         .expect("this test runs in a worker");
-    // `omit` would drop the cookie too; `include` carries it, which is the
-    // whole point: with the cookie present and no header, the service must
-    // still refuse.
+    // Sent with `include`, the shape a cookie-carrying form post takes. The
+    // browser still withholds the `Strict` cookie cross-site, so this proves
+    // the unmarked cross-site refresh is refused. `mixed_contracts_are_400`
+    // pins the same refusal natively with the cookie present.
     let init = RequestInit::new();
     init.set_method("POST");
     init.set_body(&r#"{"user_id":"someone"}"#.into());

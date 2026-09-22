@@ -79,10 +79,6 @@ pub enum AuthError {
     /// A browser API was unavailable in this context.
     #[error("browser context error: {0}")]
     Context(String),
-    /// An existing database did not decrypt under the key supplied. A wrong key
-    /// and a corrupt file are indistinguishable to the page codec.
-    #[error("the database does not decrypt under the key supplied: {0}")]
-    Undecryptable(String),
     /// A key operation was refused because a credential is enrolled but no
     /// derived key-encryption key is held, or because this build cannot reach
     /// the one that would unlock it. The detail names which.
@@ -185,11 +181,11 @@ impl WorkerAuthConfig {
 /// ever arrives inside a token response, which the network gates, so this small
 /// plain record is what makes a start possible at all.
 ///
-/// Plain rather than encrypted, which its contents allow: an account key is a
-/// serialized id, not a secret, and no key-ordering problem is left that a
-/// device key had to solve. It lives in an OPFS-backed SQLite database like the
-/// replicas; where OPFS is unavailable the same code runs against the in-memory
-/// VFS, and the account list simply does not survive a worker restart there.
+/// Plain rather than encrypted, which its contents allow, since an account key
+/// is a serialized id and not a secret. It lives in an OPFS-backed SQLite
+/// database like the replicas. Where OPFS is unavailable the same code runs
+/// against the in-memory VFS, and the account list does not survive a worker
+/// restart there.
 pub struct AccountStore {
     conn: RefCell<SqliteConnection>,
 }
@@ -1279,17 +1275,18 @@ impl BrowserAuthenticator {
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the account index cannot be read or the account
-    /// does not decode as this build's id type.
+    /// [`AuthError::Store`] if the account index cannot be read.
     pub async fn acquire<Id: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         store: &AccountStore,
     ) -> Result<Acquired<Id>, AuthError> {
+        // An account another build's id type wrote cannot resume here, so it
+        // takes the login that rewrites the marker, as `remembered_identity`
+        // promises, rather than failing every boot the index row outlives.
         if let Some(account) = self.account.as_deref()
             && store.accounts()?.iter().any(|name| name == account)
+            && let Ok(user_id) = connetto_client::decode_identity::<Id>(account)
         {
-            let user_id: Id = connetto_client::decode_identity(account)
-                .map_err(|err| AuthError::Store(err.to_string()))?;
             match self.refresh_tokens(&user_id).await {
                 Ok(tokens) => {
                     persist_session(store, &tokens.user_id)?;
