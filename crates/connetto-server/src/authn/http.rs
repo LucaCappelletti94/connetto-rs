@@ -420,13 +420,28 @@ fn refresh_cookie_name<Id: Serialize>(user_id: &Id) -> Result<String, AuthApiErr
 /// passes the same builder so the removal `Set-Cookie` carries the attributes
 /// the prefix rules demand on every header, a bare name-only removal being
 /// rejected by the browser and leaving the account resumable after sign-out.
-fn refresh_cookie(name: String, value: String, same_site: CookieSameSite) -> Cookie<'static> {
-    let mut cookie = Cookie::new(name, value);
-    cookie.set_http_only(true);
-    cookie.set_secure(true);
-    cookie.set_path("/");
-    cookie.set_same_site(same_site.jar());
-    cookie
+///
+/// `Max-Age` is the time left until `lapses_at_secs`, the instant the session
+/// lapses without a further refresh, so the cookie survives a browser restart
+/// and never outlives what the server would accept. Every rotation sets it
+/// again as the idle window slides.
+fn refresh_cookie(
+    name: String,
+    value: String,
+    same_site: CookieSameSite,
+    lapses_at_secs: u64,
+) -> Cookie<'static> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let remaining = i64::try_from(lapses_at_secs.saturating_sub(now)).unwrap_or(i64::MAX);
+    Cookie::build((name, value))
+        .http_only(true)
+        .secure(true)
+        .path("/")
+        .same_site(same_site.jar())
+        .max_age(time::Duration::seconds(remaining))
+        .build()
 }
 
 /// Build the auth router over a shared service and provider registry.
@@ -554,7 +569,12 @@ async fn token<S: AuthStore + 'static>(
     }
     let (jar, refresh_token) = if marked {
         let name = refresh_cookie_name(&issued.user_id)?;
-        let cookie = refresh_cookie(name, issued.refresh_token, state.cookie_same_site);
+        let cookie = refresh_cookie(
+            name,
+            issued.refresh_token,
+            state.cookie_same_site,
+            issued.session_expires_at_secs,
+        );
         (jar.add(cookie), None)
     } else {
         (jar, Some(issued.refresh_token))
@@ -624,7 +644,7 @@ async fn refresh<S: AuthStore + 'static>(
             serde_json::to_vec(&pair.user_id).map_err(|_| AuthApiError::InvalidRequest)?;
         if named != rotated {
             tracing::error!(
-                "refresh cookie named an account the session does not belong to,                  revoking the presented session"
+                "refresh cookie named an account the session does not belong to, revoking the presented session"
             );
             if let Some((session_id, _)) = split_refresh(cookie) {
                 state.service.revoke(session_id).await.ok();
@@ -632,7 +652,12 @@ async fn refresh<S: AuthStore + 'static>(
             return Err(AuthApiError::InvalidCredential);
         }
         let name = refresh_cookie_name(*user_id)?;
-        let cookie = refresh_cookie(name, pair.refresh_token, state.cookie_same_site);
+        let cookie = refresh_cookie(
+            name,
+            pair.refresh_token,
+            state.cookie_same_site,
+            pair.session_expires_at_secs,
+        );
         return Ok((
             jar.add(cookie),
             Json(TokenResponse {
@@ -662,7 +687,7 @@ async fn logout<S: AuthStore + 'static>(
     jar: CookieJar,
     headers: HeaderMap,
     Json(request): Json<LogoutRequest<S::Id>>,
-) -> Result<(CookieJar, StatusCode), AuthApiError> {
+) -> Result<Response, AuthApiError> {
     let marked = is_marked_request(&headers)?;
     if marked {
         let user_id = request
@@ -673,18 +698,26 @@ async fn logout<S: AuthStore + 'static>(
             return Err(AuthApiError::InvalidRequest);
         }
         let name = refresh_cookie_name(user_id)?;
-        if let Some(cookie) = jar.get(&name) {
-            let token = cookie.value().to_owned();
-            state
-                .service
-                .logout(&token)
-                .await
-                .map_err(AuthApiError::Service)?;
-        }
-        // The removal carries the full attribute set: the prefix rules apply
-        // to every `Set-Cookie`, a deletion included.
-        let removal = refresh_cookie(name, String::new(), state.cookie_same_site);
-        return Ok((jar.remove(removal), StatusCode::NO_CONTENT));
+        let revoked = match jar.get(&name) {
+            Some(cookie) => {
+                let token = cookie.value().to_owned();
+                state.service.logout(&token).await.map(drop)
+            }
+            None => Ok(()),
+        };
+        // The removal rides every outcome, a failed revoke included, because
+        // the worker drops its index row whatever the answer. It carries the
+        // full attribute set since the prefix rules apply to a deletion too.
+        let jar = jar.remove(refresh_cookie(
+            name,
+            String::new(),
+            state.cookie_same_site,
+            0,
+        ));
+        return Ok(match revoked {
+            Ok(()) => (jar, StatusCode::NO_CONTENT).into_response(),
+            Err(err) => (jar, AuthApiError::Service(err)).into_response(),
+        });
     }
     let token = request
         .refresh_token
@@ -695,7 +728,7 @@ async fn logout<S: AuthStore + 'static>(
         .logout(token)
         .await
         .map_err(AuthApiError::Service)?;
-    Ok((jar, StatusCode::NO_CONTENT))
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Whether `verifier` hashes (S256) to `challenge`, compared in constant time
