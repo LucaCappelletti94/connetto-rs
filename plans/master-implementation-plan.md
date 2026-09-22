@@ -145,7 +145,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R51 | Native Apple gate. Needs R88's iOS leg, and nothing depends on it |
 | any | R52 | Native Android gate. Needs R88's Android leg, and nothing depends on it |
 | blocked | R53 | Windows gate. Blocked on hardware |
-| any | R21 | One page codec. Its step zero decides whether the phase proceeds at all, and its foreign-key step waits for R92 |
+| any | R21 | One page codec. Its step zero decides whether the phase proceeds at all |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
 | any | R11 | The shared public store. Off the critical path |
@@ -164,7 +164,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | any | R90 | The browser's refresh token into an `HttpOnly` cookie. Needs nothing, touches no native path |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
-| any | R92 | Tier references as triggers connetto generates from SQLite's catalog. Needs nothing, and R21's foreign-key step waits for it |
+| any | R92 | Synced tables without local references, with SQLite's own enforcement for the tier. Needs nothing |
 | any | R93 | The file replica for bots. Needs R71's headless custody and R91's template |
 | last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
 
@@ -210,8 +210,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | NOT STARTED, minted 2026-09-13 | nothing. One decision in the section, the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
-| R92 tier references enforced by generated triggers | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Three decisions in the section | no |
-| R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R71 and R91. One decision in the section | no |
+| R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
+| R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R71 and R91. Two decisions in the section | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -223,7 +223,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R45 reconciliation fix bundle | **DONE** (2026-08-09) | nothing | no |
 | R46 the wasm-smoke intermittent hang | **DONE** (2026-08-09, upstream finding) | nothing | **yes, wasm-bindgen** (finding written, workaround local) |
 | R47 one helper per job | **DONE** (2026-08-09) | nothing | no |
-| R21 one page codec on both backends | NOT STARTED, designed 2026-09-22 | R92, for its foreign-key step only. Ten decisions in the section | **yes, `libsqlite3-sys`** (a bundled SQLite3MC feature and the agreed option set) **and `sqlite-wasm-rs`** (the agreed option set), carried on a fork meanwhile, and the phase closes on the fork |
+| R21 one page codec on both backends | NOT STARTED, designed 2026-09-22 | nothing. Ten decisions in the section | **yes, `libsqlite3-sys`** (a bundled SQLite3MC feature and the agreed option set) **and `sqlite-wasm-rs`** (the agreed option set), carried on a fork meanwhile, and the phase closes on the fork |
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
 | R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
@@ -380,7 +380,7 @@ graph TD
   R79 --> R80
   R71 --> R93[R93 the file replica for bots]
   R91[R91 apps, installations and the bot template] --> R93
-  R92[R92 tier references by generated triggers] -->|foreign-key step| R21
+  R92[R92 synced tables carry no local references]
   U7[upstream libsqlite3-sys and sqlite-wasm-rs:<br/>SQLite3MC feature, one option set] -.->|fork until released| R21
   R55[R55 containerised test services and CI]
   R2 -.->|registry only| R8
@@ -3772,7 +3772,7 @@ A row that stops matching a subscription is removed from that subscriber's repli
 
 **Status.** NOT STARTED, designed 2026-09-22.
 
-**Blocked on R92, for the foreign-key step only.** Phase E0 of an earlier series measured the browser codec reading a file the native codec wrote under the pin, and nothing has measured native running SQLite3MC, which is step 0's job. Ten decisions were taken with the maintainer on 2026-09-22, listed below.
+**Blocked on nothing.** Phase E0 of an earlier series measured the browser codec reading a file the native codec wrote under the pin, and nothing has measured native running SQLite3MC, which is step 0's job. Ten decisions were taken with the maintainer on 2026-09-22, listed below.
 
 ### Decisions
 
@@ -3781,9 +3781,9 @@ A row that stops matching a subscription is removed from that subscriber's repli
 3. **Files written before R21 stop opening, as a named and recorded break** (2026-09-22). No deployment exists. A pre-R21 replica reports `ReplicaUndecryptable` and takes the recovery chapter 14 describes, then re-syncs. A device-local tier is lost unless it is exported before the update and imported after, which works because the R26 archive holds unencrypted rows. No migration code ships.
 4. **Native SQLite3MC comes from an upstream `libsqlite3-sys` feature** (2026-09-22), a bundled SQLite3MC feature requested from rusqlite through the upstream procedure and carried meanwhile on a fork through `[patch.crates-io]`. The tracker held no issue or pull request for SQLite3MC on 2026-09-22. Accepted costs: the crate grows toward crates.io's 10 MB cap (0.38.2 publishes at 5.36 MB with two amalgamations), a feature released in 0.39 needs the diesel fork's `<0.39` bound moved, and a published `connetto-client` waits for the release because a patch does not reach downstream builds. Native also stops linking the system `libcrypto`. Rejected: linking a prebuilt library through `SQLITE3_LIB_DIR`, which every application would have to build per target.
 5. **Both backends compile the same SQLite options, asserted by a test** (2026-09-22), apart from the options the platform forces (threading, the OS layer, temp storage).
-6. **Parity comes from upstream alignment, with runtime parity meanwhile** (2026-09-22). The `libsqlite3-sys` request and a second one to `sqlite-wasm-rs` ask both builds for the set of decision 7. Until both release, connetto sets the runtime-settable options identically on both backends (foreign keys per decision 8, page size at creation per decision 9, cache size), and chapter 13 lists the remaining compile-time differences for application authors. Rejected: runtime parity with a permanent residue, which leaves `pow()` failing natively and `soundex()` failing in the browser.
+6. **Parity comes from upstream alignment, with runtime parity meanwhile** (2026-09-22). The `libsqlite3-sys` request and a second one to `sqlite-wasm-rs` ask both builds for the set of decision 7. Until both release, connetto sets the runtime-settable options identically on both backends (page size at creation per decision 9, and cache size), and chapter 13 lists the remaining compile-time differences for application authors. Foreign-key enforcement is R92's, per decision 8. Rejected: runtime parity with a permanent residue, which leaves `pow()` failing natively and `soundex()` failing in the browser.
 7. **The agreed set is the union of today's two builds, with loadable extensions omitted** (2026-09-22). The math functions, FTS3, FTS5, SOUNDEX, STAT4, RTREE, the session extension and the introspection virtual tables on both, and `SQLITE_OMIT_LOAD_EXTENSION` on both in line with R18's closed-by-default posture. Rejected: the intersection, which breaks any query using a function one backend has today.
-8. **Foreign keys are off on both backends, and tier references are enforced by generated triggers** (2026-09-22). A replica is a partial copy, so connection-wide enforcement would refuse server rows whose parent is absent and local writes whose parent was paged out or evicted, while the server already enforces synced tables. The setting is connection-wide and the native tier shares the replica's connection, so tier references, `ON DELETE CASCADE` included, move to triggers connetto generates from SQLite's own catalog when it creates the tier (amended the same day by R92's decision 1, which first read pg2sqlite). That work is R92, and the explicit `PRAGMA foreign_keys = OFF` lands with or after it, so native tiers never lose enforcement in between. Today native enforces by compile default (`SQLITE_DEFAULT_FOREIGN_KEYS=1`) and the browser does not. Rejected: off with no tier enforcement, and on everywhere.
+8. **Foreign keys are R92's** (2026-09-22). Native enforces them by compile default (`SQLITE_DEFAULT_FOREIGN_KEYS=1`) and the browser does not, while replica DDL carries the server schema's `REFERENCES` clauses over a partial copy. R92 strips those clauses from synced tables and keeps enforcement on at every open on both backends, so SQLite enforces tier references natively. This phase sets nothing about foreign keys. Rejected: enforcement off with tier references re-implemented by generated triggers, which cascade one level deep without `recursive_triggers`, cannot honour deferred constraints, and need a guard table for the import.
 9. **One page size on both backends, chosen by measurement** (2026-09-22). Step 0 times browser page reads and writes at 4096 and 8192 bytes under ChaCha20, and the faster becomes the size both set at creation. Today native defaults to 4096 and the browser to 8192.
 10. **The phase closes on the fork** (2026-09-22). Retiring the fork when both upstream releases land is a pin move tracked in the status table's Upstream column, as the diesel fork already is.
 
@@ -3799,12 +3799,25 @@ The saved database is encrypted by **two different libraries**: SQLCipher native
 1. Replace the native vendoring so both backends run SQLite3 Multiple Ciphers on one SQLite version.
 2. **Keep the pin until the split is actually gone**, then replace it with decision 2's single `chacha20` declaration in the same change that removes the second library, never before, because the pin is what holds compatibility together in the meantime.
 3. Record the version both backends now pin, since one version was the point. It is the browser's, SQLite 3.53.0 with SQLite3MC 2.3.3 at `sqlite-wasm-rs` 0.5.5, because the diesel fork caps `sqlite-wasm-rs` below 0.6. A test on each backend asserts `sqlite_version()`, the SQLite3MC version and the compile options against one constant, so a bump on one side alone fails.
-4. Set the runtime options of decision 6 identically at every open on both backends, and the page size of decision 9 at creation. The explicit `PRAGMA foreign_keys = OFF` lands with or after R92.
+4. Set the runtime options of decision 6 identically at every open on both backends, and the page size of decision 9 at creation.
 5. Record decision 3's break in chapter 14, and the compile-time differences that remain until both upstream releases land in chapter 13.
 
 ### Proof
 
-A file written natively opens in the browser and the reverse, under the single declaration. A file in the SQLCipher v4 layout fails to open on both backends, as decision 3 records. The version and option assertions pass on both.
+Each of these is a test on both backends unless it names one.
+
+1. A replica and its tier written natively open in the browser and read back identical rows, and the reverse. Removing the `chacha20` declaration on either side fails it.
+2. After unlock `PRAGMA cipher` reports `chacha20`, and a connection that skips the declaration cannot open the file.
+3. A committed SQLCipher v4 fixture written by the pre-R21 code fails to open as `ReplicaUndecryptable`, purge then resync recovers the replica, and export before plus import after carries a tier across.
+4. The raw `x'...'` key opens with no KDF, a wrong key fails at the first schema read, and neither a plaintext marker nor the schema text appears anywhere in the file's bytes.
+5. With the codec linked the codec probe passes, and a build on plain `bundled` reports `CodecMissing`.
+6. `sqlite_version()`, the SQLite3MC version and `PRAGMA compile_options` match one constant, and until both upstream releases land the chapter 13 list of remaining differences is asserted exactly.
+7. Page size at creation and cache size read back identically.
+8. Once decision 7's set ships on both sides, a query calling `pow()` and one calling `soundex()` succeed on both.
+9. `hardening.rs`, the session capture and `apply_v3` path, and `encrypted_replica` pass unchanged.
+10. Natively, the linked test binary carries no `libcrypto`, and the Android cross-build succeeds.
+
+Step 0's browser measurements, ChaCha20 against SQLCipher v4 and 4096 against 8192-byte pages, are recorded here as numbers rather than asserted.
 
 ### Done when
 
@@ -4851,8 +4864,19 @@ On Linux the replica key lives in the kernel session keyring, which does not sur
 ### Steps
 
 1. Implement decisions 2 to 6 and 9 in `KeyringKeyStore`'s and `KeyringStore`'s Linux arms, leaving the other platforms' stores untouched.
-2. Prove it. A reboot-equivalent test (drop the session keyring, reopen) shows the replica and the tier reopening without a re-mint, for a freshly minted key and for one moved from keyutils, under the Secret Service and under a credential. After `wipe_replica` or logout, a fresh process finds nothing in the durable store, so a durable key never outlives chapter 14's crypto-shredding.
+2. Prove it with the list under Proof.
 3. Amend chapter 14's Linux custody paragraph.
+
+### Proof
+
+1. A key, a refresh token and a device key written by one process are read by a fresh process with a fresh session keyring, and the replica and tier reopen without a re-mint, under a real unlocked `gnome-keyring-daemon` and under a credential with `$CREDENTIALS_DIRECTORY` and `$STATE_DIRECTORY` pointing at temporary directories.
+2. A sealed record file holds no key bytes, a flipped byte fails the load with a typed error, a record file renamed to another record's name fails, and a wrong wrap key fails with a typed error and never mints a replacement key.
+3. With a credential and the Secret Service both present the credential wins, with only the Secret Service it is used, with neither the client refuses naming what it probed, and an explicit keyutils choice works with the custody report stating that the keys do not survive a reboot.
+4. A locked collection or an absent bus becomes a typed refusal within a stated bound, never a hang.
+5. A key held only in keyutils moves once and leaves keyutils empty, a failure between the write and the clear leaves both copies and the next open finishes the move, and a read-back that does not match aborts without clearing the old copy.
+6. After `wipe_replica`, logout or `forget_device`, a fresh process finds nothing in either durable store, and clearing the last account removes the index record.
+7. Two accounts stay apart on each store and `accounts()` enumerates them, and two stores on different backends in one process do not interfere.
+8. A rotated refresh token reloads as the latest, a record file is replaced by write then rename and is never torn, and every record file is mode `0600`.
 
 ### Done when
 
@@ -5178,42 +5202,50 @@ The template's scripted, semantics, property and bench targets pass in CI, the t
 
 ---
 
-## R92: tier references enforced by generated triggers
+## R92: synced tables carry no local references
 
 **Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R21's decision 8.
 
-**Blocked on nothing.** Three decisions were taken with the maintainer on 2026-09-22, listed below.
+**Blocked on nothing.** Four decisions were taken with the maintainer on 2026-09-22, listed below.
 
 ### Purpose
 
-R21 turns SQLite's foreign-key enforcement off on both backends, because a replica is a partial copy and a connection-wide check would refuse server rows whose parent is absent and local writes whose parent was paged out or evicted. The setting is connection-wide and the native tier is attached to the replica's connection, so the device-local tier would lose its only enforcement, `ON DELETE CASCADE` included. No server ever sees tier rows, so nothing else enforces those references.
+SQLite's foreign-key enforcement is one switch per connection, native enforces by compile default and the browser does not, and replica DDL carries the server schema's `REFERENCES` clauses. A replica is a partial copy, since visibility, R58 paging and R15 eviction all leave a child without its parent, so local enforcement over those clauses can only refuse what the server already accepted. The device-local tier has no server behind it, so SQLite's enforcement is the only protection its references have, and natively the tier shares the replica's connection.
 
 ### Decisions
 
-1. **connetto generates the triggers from SQLite's own catalog when it creates the tier** (2026-09-22), on both backends, from `pragma_foreign_key_list` of each tier table. This amends R21's decision 8, which named pg2sqlite. `with_tier` takes SQLite DDL from any source, hand-written included (`local_import.rs`), so generation from the tier document would miss every tier not baked through pg2sqlite, while the catalog describes the tier that was actually created. Generation reads only the tier schema, so no trigger ever lands on a synced table, where its writes would be captured and uploaded. Rejected: pg2sqlite generating them from the tier document, on coverage.
-2. **All five referential actions, checked row by row, and a deferred constraint refused** (2026-09-22). `CASCADE`, `SET NULL`, `SET DEFAULT`, `RESTRICT` and `NO ACTION`, on delete and on update, with a reference holding a NULL in any column skipped as SQLite and Postgres both skip it. SQLite has no `DEFAULT` keyword inside an `UPDATE`, so a `SET DEFAULT` trigger inlines the child column's default expression as `pragma_table_info` stores it, and the reset row is then checked like any other. A trigger fires per row, so a `DEFERRABLE INITIALLY DEFERRED` constraint cannot be honoured, and tier creation refuses it with a named error. The catalog does not report deferrability, so it is read from the table's stored `CREATE TABLE` text. `RESTRICT` and `NO ACTION` differ in SQLite only by when a statement checks, and both become a per-row check. Rejected: covering `CASCADE` and `RESTRICT` alone.
-3. **The import checks references once, at the end** (2026-09-22). The triggers skip their checks while a guard row in a `_connetto`-prefixed tier table is set, a prefix the export already excludes. The import sets it inside its transaction, writes every row, clears it, and runs one orphan query per reference before commit, and an orphan aborts the import naming the table. Any table order and any self-referencing table work. Rejected: writing parent tables first, which no row order satisfies for a self-reference or a cycle.
+1. **Synced tables carry no local references** (2026-09-22). connetto parses the replica DDL with sqlparser at replica creation, drops every column `REFERENCES` and table `FOREIGN KEY` clause through `VisitorMut`, and runs the rendered result, so baked and hand-written DDL are covered alike. The server stays the only enforcer for synced data, as it already is in the browser. Tier DDL is left untouched. Rejected: pg2sqlite emitting the synced document without them, which leaves hand-written replica DDL exposed to the partial-replica refusals.
+2. **Foreign keys are on at every open on both backends, and this phase owns the setting** (2026-09-22). `PRAGMA foreign_keys = ON` runs on the replica connection and on the browser's separate tier connection. SQLite then enforces tier references natively, all five actions, cascades at any depth because `OP_Program` disallows recursion only for a real trigger and never for a foreign-key action, and per-constraint `DEFERRABLE INITIALLY DEFERRED` (`FKey.isDeferred`, checked at commit). A tier reference can never reach a synced table, since SQLite foreign keys do not cross attached schemas and pg2sqlite refuses a cross-document reference. Rejected: enforcement off with tier references re-implemented by generated triggers, which cascade one level deep without `recursive_triggers`, cannot honour deferred constraints, and need a guard table for the import.
+3. **The import defers every check to its commit** (2026-09-22). `apply_import_with_bookkeeping` sets `PRAGMA defer_foreign_keys = ON` inside its transaction, SQLite checks at commit, and a violation aborts the import. Table order and self-references stop mattering.
+4. **Trigger depth follows a measurement, under R18's D5** (2026-09-22). Every nested frame, a foreign-key action included, counts against `SQLITE_LIMIT_TRIGGER_DEPTH`, which R18 sets to 10. When step 0 shows a tier cascade failing at that bound, R18's row moves to SQLite's stock 1000, as D5 prescribes for a limit measurement forces open.
 
-**Found while grounding, inferred and not run.** The export orders tier tables by name (`ORDER BY name` in `archive/rows.rs`) and the import upserts row by row, so under today's native compile-default enforcement an archive whose child table sorts before its parent should fail to import natively. Decision 3 removes the dependence on order.
+### Step 0, measured on today's code before any change
 
-A tier created before R92 gains no triggers and needs none. Native still enforces by compile default until R21 turns enforcement off, and R21's format break recreates every tier.
-
-The guard table and the triggers live in the tier schema. The guard table carries a primary key, and its `_connetto` prefix keeps it out of `local_tier_tables` (`GLOB '_connetto*'`), so it enters neither the relay's session diff nor the export. The generator emits each `CREATE TRIGGER` already qualified into the tier schema, because `qualify_tier_statement` accepts only `CREATE TABLE` and `PRAGMA`, and executes each as one whole statement, never appended to the caller's DDL, whose creation loop splits on `;` (`lib.rs`) and would cut a trigger body apart.
+Natively, record whether each succeeds. (a) A server patch carrying a synced child whose parent the caller cannot see. (b) A tier cascade 12 levels deep. (c) An import whose child table sorts before its parent, since the export orders tables by name. A failure in (a) or (c) is a live defect, and its reproduction becomes a regression test here.
 
 ### Steps
 
-1. At tier creation on both backends, generate decision 2's triggers from `pragma_foreign_key_list`, and refuse a deferred constraint by name.
-2. Add decision 3's guard row and end check to `apply_import_with_bookkeeping`.
-3. Remove the hand-set `PRAGMA foreign_keys = ON` from `local_import.rs`, whose upsert test then relies on the triggers.
-4. R21's explicit `PRAGMA foreign_keys = OFF` lands with or after step 1.
+1. Strip synced references at replica creation on both backends (decision 1).
+2. Turn enforcement on at every open on both backends, the browser's tier connection included (decision 2).
+3. Defer the import's checks to its commit (decision 3).
+4. Move R18's trigger depth if step 0 forces it, amending R18's knob row and `hardening.rs` (decision 4).
+5. Drop the hand-set `PRAGMA foreign_keys = ON` from `local_import.rs`, which enforcement at every open makes redundant.
 
 ### Proof
 
-On both backends with enforcement off, a tier insert or update whose parent is missing is refused, a NULL reference is accepted, a parent delete and a parent key update each apply all five declared actions, a deferred declaration is refused at tier creation, an import whose child table sorts before its parent and one holding a self-referencing table both succeed, an archive holding an orphan aborts naming the table, and a replica row whose parent is absent applies.
+Each of these is a test on both backends.
+
+1. A property test over generated DDL removes column `REFERENCES`, table `FOREIGN KEY`, composite, quoted and column-less references, and round-trips everything else exactly (`STRICT`, `WITHOUT ROWID`, `CHECK`, `DEFAULT` expressions, `COLLATE`, generated columns, `AUTOINCREMENT`), compared through `pragma_table_xinfo` and `pragma_index_list`. A rendering loss is a sqlparser finding.
+2. Tier DDL keeps its references, read back through `pragma_foreign_key_list`.
+3. `PRAGMA foreign_keys` reads 1 on every connection connetto opens.
+4. A server patch carrying a child whose parent is absent applies, and a local write of such a child goes up and the server settles it.
+5. Each of the five actions applies on delete and on update, a NULL reference column skips the check, composite references and cross-table chains hold, a self-referencing hierarchy 12 levels deep cascades fully, and a deferred constraint broken mid-transaction and repaired before commit succeeds while one still broken at commit fails.
+6. An import whose child table sorts before its parent and one holding reverse-ordered self-referencing rows succeed, an archive holding an orphan aborts and leaves the tier untouched, and the next ordinary statement after the import is checked immediately.
+7. When decision 4 moved the bound, the 12-level cascade passes and `hardening.rs` asserts the stock value.
 
 ### Done when
 
-Tier references are enforced identically on both backends by triggers connetto generates from the catalog while connection-wide enforcement is off, the import checks references once at its end, and a synced child whose parent is absent applies on both.
+Synced tables carry no references on either backend, enforcement is on at every open, tier references are enforced by SQLite at any depth with deferred constraints honoured, and the import checks at its commit.
 
 ---
 
@@ -5221,15 +5253,16 @@ Tier references are enforced identically on both backends by triggers connetto g
 
 **Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R71's decision 8.
 
-**Blocked on** R71 for durable headless custody and R91 for the bot template. One decision, listed below.
+**Blocked on** R71 for durable headless custody and R91 for the bot template. Two decisions, listed below.
 
 ### Purpose
 
 A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that declares device-local tables needs the file replica, encrypted under the replica key, whose Linux custody across a reboot R71's systemd credential provides. The template that has to offer it is R91's. This phase joins the two.
 
-### Decision
+### Decisions
 
-1. **An isolated login's replica is named from the bot user and the installation** (2026-09-22). `replica_db_name` derives the name from the identity, and every isolated login of one bot carries the bot user as its identity (R91 decision 1), so two installations' logins would open one file and read each other's rows. The isolated login's name is derived through the same serde-then-SHA-256 path from the pair of bot user and installation id, which can never equal an identity-only name, and a shared-view login keeps the identity-only name, one login per deployment. The key record, the tier and the content directory all derive from the replica name, so they separate with it. This extends chapter 14's rule that a wrong identity opens a different file rather than adopting another's rows. Rejected: an operator-chosen path per login, which makes the collision representable again.
+1. **An isolated login's replica is named from the bot user and the installation, domain-separated** (2026-09-22). `replica_db_name` derives the name from the identity, and every isolated login of one bot carries the bot user as its identity (R91 decision 1), so two installations' logins would open one file and read each other's rows. The isolated name hashes, through SHA-256 as today's names do, a fixed label beginning with a NUL byte followed by the bot user's and the installation id's JSON encodings, each length-prefixed. An identity-only name hashes `serde_json::to_vec` of the identity, and JSON text never begins with a NUL byte, so the two inputs can never coincide, whatever shape the identity type serializes to. A shared-view login keeps the identity-only name, one login per deployment. The key record, the tier and the content directory all derive from the replica name, so they separate with it, which extends chapter 14's rule that a wrong identity opens a different file rather than adopting another's rows. Rejected: hashing the bare pair, whose JSON array an identity serializing as a sequence can reproduce, and an operator-chosen path per login, which makes the collision representable again.
+2. **Uninstall wipes the isolated login's replica** (2026-09-22). On the session-revoked close R91 sends at uninstall and at deletion, the bot runs `wipe_replica` for that installation's replica, key first, then tier, replica and content, so no uninstalled user's data outlives the uninstall on the bot's host. Rejected: leaving the files for the operator.
 
 ### Steps
 
@@ -5238,7 +5271,10 @@ A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that
 
 ### Proof
 
-A bot declaring device-local tables restarts with `$CREDENTIALS_DIRECTORY` pointing at a wrap key and finds its tier rows, two isolated logins of one bot keep separate replicas, and a bot without device-local tables stays in memory.
+1. An identity of type `serde_json::Value` shaped like the bare pair never derives the isolated name, and a property test over arbitrary identity values finds no identity-only name equal to any isolated name.
+2. One pair derives one name across processes, two installations derive two, two isolated logins in one process keep separate files, keys, tiers and content directories and neither reads the other's rows, and a shared-view login keeps the identity-only name.
+3. Under a temporary credential a bot with device-local tables restarts and finds its tier rows, and a bot without them creates no file.
+4. The session-revoked close at uninstall leaves no key, tier, replica or content directory for that installation, while the other installation's files stay intact.
 
 ### Done when
 

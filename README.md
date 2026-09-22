@@ -35,7 +35,7 @@ The plan in `plans/master-implementation-plan.md` tracks 95 phases, 71 done and 
 | Remaining | Phases |
 |---|---|
 | Native unlock gates and the mobile demo build | R51 to R53, R88 |
-| One page codec and the tier references it moves to triggers, Linux key custody across a reboot | R21, R92, R71 |
+| One page codec, synced tables without local references, Linux key custody across a reboot | R21, R92, R71 |
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline, failover verification | R70, R72, R73 |
 | Refresh token in an `HttpOnly` cookie, demo gaps | R90, R57 |
