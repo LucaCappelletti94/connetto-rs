@@ -61,6 +61,10 @@ zstd = "0.13"
 sqlite-diff-rs = { version = "0.13", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
+# Reading the database's timeline history over a replication connection
+# (`timeline.rs`, R73). Already in the graph through sqlite-diff-rs, at the same
+# version and default features.
+pg_walstream = "0.8"
 
 # Synchronous lock guarding the SQLite write target (never held across .await).
 parking_lot = "0.12"
@@ -127,10 +131,6 @@ content = ["dep:connetto-file-server"]
 # The e2e content boot tests write the ticket key document the server loads,
 # through the same ring keypair the server's signer parses.
 ring = "0.17"
-# Building a change event by hand, so the store upkeep can be driven without
-# standing up a replication stream. subql re-exports `ChangeEvent` and not the
-# types its fields are made of.
-pg_walstream = "0.8"
 # The handshake authority is a required constructor argument with no production
 # default (R2), so the suites install the test-only stand-in from the core.
 connetto-core = { workspace = true, features = ["test-support"] }

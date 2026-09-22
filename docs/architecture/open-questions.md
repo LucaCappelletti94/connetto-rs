@@ -86,7 +86,7 @@ Principle: JSON is reserved exclusively for data whose shape is not known at com
 
 **Q3.2** ~~**Base version representation**: what exactly is `base_version`? Row-level timestamp? Vector clock? PostgreSQL `xmin`? The choice affects conflict granularity and server-side comparison cost.~~
 
-**Decision: `updated_at TIMESTAMPTZ` as the conflict token.** The application schema already has `updated_at` on all entities. Conflict detection uses `WHERE id = ? AND updated_at = ?`. Zero affected rows means conflict. `xmin` is not suitable (wraps, internal). Vector clocks and HLC are overkill for a single-authority PostgreSQL backend. Clock skew across mesh nodes is an acknowledged open problem, not solved universally in the industry (BDR/PGD takes the same tradeoff). Mitigation: require tight clock sync (NTP/PTP) as an operational prerequisite on the mesh.
+**Decision: `updated_at TIMESTAMPTZ` as the conflict token.** The application schema already has `updated_at` on all entities. Conflict detection uses `WHERE id = ? AND updated_at = ?`. Zero affected rows means conflict. `xmin` is not suitable (wraps, internal). Vector clocks and HLC are overkill for a single-authority PostgreSQL backend. Clock skew between writable nodes does not arise, because multi-master is out of scope (R73).
 
 **Q3.3** ~~**CDC source**: logical replication vs. trigger-based `NOTIFY`, covering tradeoffs in latency, setup complexity, and required PostgreSQL permissions.~~
 
@@ -255,7 +255,7 @@ The goal over time is to expand the fast solver's coverage so fewer HAVING shape
 
 **Q6.5** ~~**Oplog storage backend**: should the oplog live in PostgreSQL (durable, potentially slow under high write volume), a separate fast store (Redis, in-memory ring buffer), or both?~~
 
-**Decision: per-session pending PatchSet buffer in `subql`, scoped to session cookie lifetime.** On disconnect, `subql` continues accumulating changes for the session's subscriptions into a pending PatchSet server-side. On reconnect (session token still valid), the client receives that PatchSet for instant catchup, with no oplog scan. If the session cookie expires before reconnect, the entire session state (subscriptions, cursors, pending PatchSet) is garbage collected. The client must re-authenticate and re-subscribe from scratch (full snapshot). The mesh-visible PostgreSQL oplog table still exists for CDC propagation across nodes, but the reconnect story is session-scoped. The session cookie lifetime is the primary expiry mechanism, not a separate oplog retention window.
+**Decision: per-session pending PatchSet buffer in `subql`, scoped to session cookie lifetime.** On disconnect, `subql` continues accumulating changes for the session's subscriptions into a pending PatchSet server-side. On reconnect (session token still valid), the client receives that PatchSet for instant catchup, with no oplog scan. If the session cookie expires before reconnect, the entire session state (subscriptions, cursors, pending PatchSet) is garbage collected. The client must re-authenticate and re-subscribe from scratch (full snapshot). The PostgreSQL oplog table still exists, and a promoted standby carries it, but the reconnect story is session-scoped. The session cookie lifetime is the primary expiry mechanism, not a separate oplog retention window.
 
 **Q6.6** ~~**Concurrent re-sync and live updates**: during a full re-sync snapshot delivery, live CDC events continue arriving. How does the server buffer or order these relative to the snapshot?~~
 
@@ -437,7 +437,7 @@ See `11-authentication.md`. The architecture is decided (Backend-For-Frontend, c
 
 **Q11.2**: ~~Provider token retention. In scope, or explicitly out?~~
 
-**Decision: retained, not discarded.** The chosen auth store (in-memory or database) holds the user's provider tokens alongside the identity mapping, so an application that configured the right scopes on the provider reuses them to call the provider's own APIs. connetto exposes a lazy refreshing accessor that refreshes a token inline when it is about to be used and persists the rotated refresh token, and it runs no background refresh job, which is fewer provider requests and no mesh-wide scheduler.
+**Decision: retained, not discarded.** The chosen auth store (in-memory or database) holds the user's provider tokens alongside the identity mapping, so an application that configured the right scopes on the provider reuses them to call the provider's own APIs. connetto exposes a lazy refreshing accessor that refreshes a token inline when it is about to be used and persists the rotated refresh token, and it runs no background refresh job, which is fewer provider requests and no scheduler shared between servers.
 
 **Q11.3**: ~~Client-side ID token verification. Is the client-as-OAuth-client alternative supported at all, or is BFF the only sanctioned model?~~
 
@@ -445,7 +445,7 @@ See `11-authentication.md`. The architecture is decided (Backend-For-Frontend, c
 
 **Q11.4**: ~~Mesh revocation propagation. What is the acceptable propagation latency, and is the access-token lifetime a tight enough bound on its own?~~
 
-**Decision: revocation is authoritative because the handshake checks session liveness, and its reach follows the store variant.** A revoked session is refused even with a time-valid access token, and a live connection is dropped when its node sees the invalidation. In the in-memory or single-server case this is an instant local operation, and in the database mesh case it propagates at replication lag on the same replication that carries the oplog. The access-token lifetime is a re-auth cadence, not the revocation bound, and connetto adds no separate revocation channel.
+**Decision: revocation is authoritative because the handshake checks session liveness, and its reach follows the store variant.** A revoked session is refused even with a time-valid access token, and a live connection is dropped when its node sees the invalidation. It is an instant local operation in either store variant, and a revocation not yet replicated when a standby is promoted is lost with any other write (R73). The access-token lifetime is a re-auth cadence, not the revocation bound, and connetto adds no separate revocation channel.
 
 ---
 
@@ -461,4 +461,4 @@ These were called out in the original plan as the most consequential open decisi
 | X4 | ~~Protocol serialization format: MessagePack / Protobuf / FlatBuffers / CBOR / JSON~~ Answered by Q2.1: MessagePack for the control plane, the patchset's own binary format for rows, JSON for aggregate results | Q2.1 |
 | X5 | ~~Oplog retention policy: size, age, and what triggers a forced full re-sync~~ Answered by Q6.1 and Q6.2, built as `FullResyncRequired` and the R32 slot lifecycle | Q6.1, Q6.2 |
 | X6 | Clock discipline, OPEN, owned by R72 (not started): grace countdowns, the session staleness bound, and cache TTLs all assume a sane running clock, and nothing states monotonic versus wall time or what suspend and resume does (a device waking after a week fires every grace expiry at once, while reconnect races catch-up, under the offline eviction pause) | `15-replica-retention.md` (grace), `11-authentication.md` (staleness bound) |
-| X7 | The PostgreSQL mesh, OPEN, reframed 2026-08-22 as R73 failover verification (exploratory, not started): `11-authentication.md` asserts a multi-server deployment where stores and the oplog replicate, but cursors are positions in one server's change log, and client failover between nodes, cursor validity across them, and per-node replication-slot topology are unexamined. The hard parts are existing Postgres features, so the phase is verification and a deployment recipe rather than a design | `11-authentication.md` (mesh), `06-reconnect.md` (cursors) |
+| X7 | ~~The PostgreSQL mesh~~ Closed by R73 (2026-09-22): a deployment is one primary with standbys for failover, multi-master is out of scope, and `06-reconnect.md` holds the recipe and what clients experience. A promotion that lost changes a client was sent is detected by the timeline every cursor carries, and a cursor past where its timeline ended resyncs | `06-reconnect.md` (Failover), `11-authentication.md` (deployment shape) |

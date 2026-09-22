@@ -111,6 +111,8 @@ pub enum FatalErrorReason {
     /// a running total from its source instead of trying to repair one that
     /// accumulated across the gap.
     ChangeStreamGap,
+    /// The database moved to another timeline, so this connection may hold changes it lost (R73).
+    DatabaseTimelineChanged,
 }
 
 /// Session-terminating error frame.

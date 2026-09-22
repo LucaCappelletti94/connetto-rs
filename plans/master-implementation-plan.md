@@ -164,7 +164,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | any | R90 | The browser's refresh token into an `HttpOnly` cookie. Needs nothing, touches no native path |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots waits on R71 and is R71's to ship |
-| last | R73 | Failover verification and the deployment recipe. Exploratory, after everything the recipe must describe |
+| done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
 
@@ -267,7 +267,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R83 client resting table | **DONE** (2026-08-26) | nothing | no: it needed nothing and the design's eight decisions were built as recorded, with decision 1 amending R30's decision 6 (the resting key is query identity, not `sub_id`) |
 | R84 keyed and row-shaped handles | **DONE** (2026-09-01) | nothing | no longer: subql bind fix `c6f75f6` and diesel grouping export `caf515e` are merged, adopted, and proven |
 | R85 per-viewer RLS re-execution | **DONE** (2026-09-01) | nothing | no longer: U6 at `d732331` delivered, adopted, and proven by `rls_computed.rs` |
-| R73 failover verification (X7, reframed) | NOT STARTED, exploratory | nothing | no |
+| R73 failover verification (X7, reframed) | **DONE** (2026-09-22) | nothing. Ten decisions in the section. Every cursor carries its timeline, and one past where that timeline ended resyncs, the divergence verifying found | no. The sqlparser tip needed pg2sqlite to follow #2540 first, done upstream the same day |
 
 ## Dependency graph
 
@@ -353,7 +353,7 @@ graph TD
   R65 -.->|content backup split| R70
   R71[R71 Linux key custody survives reboot]
   R72[R72 clock discipline]
-  R73[R73 the mesh question, exploratory]
+  R73[R73 failover verification]
   R58 -.->|the bound it extends| R81[R81 aggregate read time bound]
   R30 --> R82[R82 grouped and re-executed delivery]
   R30 --> R83[R83 client resting table]
@@ -5653,23 +5653,69 @@ Done as a design, and derived. The subql side is phased in `docs/upstream-subql-
 
 ## R73: the PostgreSQL mesh question, reframed as failover verification
 
-**Status.** NOT STARTED, exploratory. X7 given an owner 2026-08-21 by the full review, then **reframed with the maintainer 2026-08-22**: the hard parts are existing Postgres features, so the phase is verification and a deployment recipe, not a design.
+**Status.** **DONE** (2026-09-22) on `feat/r73-failover-verification`, built ahead of the `last` place the Sequence table gave it at the maintainer's word. X7 given an owner 2026-08-21 by the full review, then **reframed with the maintainer 2026-08-22**. The hard parts are existing Postgres features, and verifying them found one that is not, a divergence connetto detects itself (decisions 4 to 10 below). The Done-when is demonstrated by `crates/connetto-server/tests/it/failover.rs` on Postgres 18.6, red before the timeline check twice over (the connection live through the promotion was never closed, and with that close alone the lost cursor was caught up instead of resynced) and green after, beside 703 passing tests across `connetto-core`, `connetto-server`, `connetto-test-harness` and `connetto-client`.
 
 **Blocked on nothing.**
 
 ### Purpose
 
-`11-authentication.md` asserts a multi-server deployment where stores and the oplog replicate, written before any mechanism existed, and X7 flagged it as promising a topology nothing designs. The maintainer's reframe, checked against what Postgres provides: physical streaming replication already carries every deployment-owned table byte for byte, a client's cursor is a position in the oplog **table** so it stays meaningful on a promoted standby up to replication lag, the lag case is already connetto machinery (rows lost to async lag put clients ahead of the server, exactly what R32's resume-past-delivery detection answers with a resync, the same restored-to-earlier semantics R70 owns), synchronous commit is the existing knob for a deployment that cannot accept lag loss, and Postgres 17's failover slots (`failover = true` with slot synchronization) cover connetto's logical `pgoutput` slot, while on older Postgres a recreated slot lands on R32's built refusal-and-resync path. What was never designed and stays out is true multi-master (many writable instances), which contradicts the single-log foundation everything stands on.
+`11-authentication.md` asserts a multi-server deployment where stores and the oplog replicate, written before any mechanism existed, and X7 flagged it as promising a topology nothing designs. The maintainer's reframe, checked against what Postgres provides. Physical streaming replication already carries every deployment-owned table byte for byte. A client's cursor is a position in the oplog **table**, so it stays meaningful on a promoted standby up to replication lag. Synchronous commit is the existing knob for a deployment that cannot accept lag loss, and failover slots (`failover = true` with slot synchronization) cover connetto's logical `pgoutput` slot. What was never designed and stays out is true multi-master (many writable instances), which contradicts the single-log foundation everything stands on.
+
+**Corrected 2026-09-22, the lag case is not R32's.** This section said rows lost to async lag put clients ahead of the server and that R32's resume-past-delivery detection answers it with a resync. R32 (`SessionManager::reconcile_stream`) compares the change feed's slot position with the reconnect log and never reads a client cursor. The client check is `catchup_decision` in `oplog.rs`, which answers `Catchup` whenever `resume_lsn >= min_lsn` and ignores `current_lsn`, so a cursor past everything the server holds is read as current and sent nothing. Measured on Postgres 18.6 the same day. With the standby cut off, 999 rows written on the primary ending at `0/3054560`, the primary killed and the standby promoted, the new primary's write-ahead log resumed at `0/3034A40` and its first new write landed at `0/3038A70`, 113392 bytes below the lost rows. A client that received those rows keeps them for ever and skips every new change until the new primary's position passes its cursor, silently. The promotion does leave a record, the new timeline's history naming the point where the old one ended (`1  0/3034A08`).
+
+### Decisions, taken with the maintainer 2026-09-22
+
+1. **Built now**, ahead of its `last` place in the Sequence table.
+2. **The recipe lives in `06-reconnect.md`.** The mesh wording is corrected in `06-reconnect.md`, `11-authentication.md` and `architecture-diagram.svg`, and X7 closes in `open-questions.md`.
+3. **The test runs on Postgres 18**, in a primary and standby pair the R73 test starts itself with the harness's container labels, leaving `Fixture::acquire` and its `postgres:16` untouched. Measured the same day on 18.6. A `pgoutput` slot created with `failover = true` becomes sync-ready on a standby running `sync_replication_slots = on` once the consumer advances past the standby's catalog xmin, and after promotion it serves the changes nobody had consumed, then new ones, with no recreation. The synced slot can lag what the old primary confirmed, so the server can receive a change twice, which the reconnect log absorbs (`ON CONFLICT (lsn) DO NOTHING`).
+4. **The divergence is fixed in this phase**, not deferred to R70 or a new phase.
+5. **Only cursors past the switch point resync.** A cursor carries the timeline it was issued on. One from an earlier timeline resyncs only when its position lies beyond where that timeline ended in the current history, so a lossless switchover resyncs nobody. It still closes every live connection under decision 8, and each resumes by catching up.
+6. **A cursor in the old eight-byte layout is fresh.** It already takes the LSN 0 path once the server reads the longer layout, so every existing client resyncs once. No deployment exists to pay for it.
+7. **The resync carries a new `FullResyncReason` variant** naming the cause. A wire change, so clients upgrade with the server.
+8. **Live sessions are closed with a new `FatalErrorReason` variant** when the server sees the timeline change, so a client live through the failover reconnects and meets the handshake check. A wire change shipping with decision 7's.
+9. **The history is read with the replication command `TIMELINE_HISTORY`**, over a short replication connection connetto opens itself, needing only the `REPLICATION` attribute the change feed's role already holds. `pg_control_checkpoint()` was measured unusable, still reporting timeline 1 on 18.6 right after the promotion.
+10. **A history that lacks the stored timeline is served**, with every cursor from a timeline outside it resynced under the new reason and live sessions closed, rather than refusing to serve.
+
+### Design record, the timeline check
+
+A cursor becomes twelve bytes, the timeline as a big-endian `u32` ahead of the position as a big-endian `u64`, so byte order stays issue order across a promotion. Every mint site stamps the timeline the server is on, which is correct for positions carried over from an earlier timeline because the current history contains them.
+
+What the server does at each change-feed connect, the loop in the server binary and the harness that already runs R32's check. The history is read before the stream opens, as R32's position is.
+
+| Event at connect | No live session | Live sessions |
+|---|---|---|
+| First connect of the process | store the history | cannot occur, the history is read before serving |
+| Same timeline as stored | nothing | nothing |
+| A later timeline whose history contains the stored one (a promotion) | store the new history | store it, then close every live session so each reconnects and meets the handshake check |
+| A timeline whose history does not contain the stored one (an old primary resurrected, or another cluster) | store it | store it and close every live session |
+| The history cannot be read | the connect fails and the loop retries, as a slot read failure does | same, delivery pauses until it succeeds |
+
+R32's slot check runs after this, unchanged, and still fires when a synced slot confirmed a change whose reconnect-log row the standby never received.
+
+The client's first `CursorBeyondHistory` notice on a connection empties every table any declared subscription covers, whatever a sibling claims, because every row subscription of the session resyncs and a lost row matching two filters would otherwise be spared by each ordinary clear in turn. Later notices on the same connection clear as an ordinary resync, so they spare the replacements already delivered, and the next connection starts over. Found while testing on 2026-09-22 and pinned in `crates/connetto-client/tests/it/truncate_resync.rs` by three tests, each shown to fail when its half of the rule is removed.
+
+What the handshake does with the presented cursor, against the stored history.
+
+| Cursor | Outcome |
+|---|---|
+| Empty, or any length but twelve (the old eight-byte layout included) | fresh client, LSN 0, full resync as today |
+| Current timeline | today's `catchup_decision`, unchanged |
+| An earlier timeline in the history, position at or before where it ended | resumes at that position, as today |
+| An earlier timeline in the history, position beyond where it ended | full resync with the new reason |
+| A timeline the history does not contain | full resync with the new reason |
+
+Out of this phase and recorded where it belongs. A database restored into another cluster starts at timeline 1 with a different system identifier, which this check does not see, and that is R70's restore story.
 
 ### Steps
 
-1. **Verify, Docker-gated:** a primary with a streaming standby, clients connected under load, the standby promoted, and the observed behavior asserted: cursors within the replicated window resume, clients ahead of the promoted server are forced to resync by R32's detection, and on Postgres 17 with failover slots the feed continues without a slot recreation.
-2. **Write the deployment recipe** into the architecture when the maintainer names the doc: streaming replication, failover slots on 17 and later, synchronous commit as the no-loss option, and the failover runbook in terms of what clients experience.
-3. **Correct chapter 11's sentence** from the replicating-mesh wording to this concrete high-availability story, scope out multi-master explicitly, and close X7 with the pointer.
+1. **Verify, Docker-gated, on Postgres 18:** a primary with a streaming standby, clients connected under load, the standby promoted, and the observed behavior asserted: cursors within the replicated window resume, a client that received changes the promoted server lost is resynced with the new reason (red before the timeline check exists), and with failover slots the feed continues without a slot recreation.
+2. **Build the timeline check** of the design record, red first through step 1's lossy case.
+3. **Write the deployment recipe** into `06-reconnect.md`: streaming replication, failover slots with `sync_replication_slots` and `synchronized_standby_slots`, synchronous commit as the no-loss option, and the failover runbook in terms of what clients experience.
+4. **Correct the mesh wording** in `06-reconnect.md`, `11-authentication.md` and `architecture-diagram.svg` to this concrete high-availability story, scope out multi-master explicitly, and close X7 with the pointer.
 
 ### Done when
 
-The failover test is green against a real primary-standby pair, the recipe is written, chapter 11 matches it, multi-master is scoped out in so many words, and X7 is closed.
+The failover test is green against a real Postgres 18 primary-standby pair with the lossy client resynced, the recipe is written, chapters 06 and 11 and the diagram match it, multi-master is scoped out in so many words, and X7 is closed.
 
 ---
 

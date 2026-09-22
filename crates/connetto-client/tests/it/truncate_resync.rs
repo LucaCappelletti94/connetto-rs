@@ -85,9 +85,18 @@ async fn send_snapshot(
         .expect("end");
 }
 
+/// Rows keyed by id with their quantity, per subscription, low then high.
+type Rows = [&'static [(i64, i64)]; 2];
+
 /// Seed two overlapping subscriptions with the same rows, then replace both for
 /// `reason`, each replacement carrying nothing because the table is empty.
 fn server_replacing_both(reason: FullResyncReason) -> LoopbackTransport {
+    const SEED: &[(i64, i64)] = &[(1, 5), (2, 50)];
+    server_scripted(reason, [SEED, SEED], [&[], &[]])
+}
+
+/// Seed each subscription with its `seeds`, then replace each for `reason` with its `replacements`.
+fn server_scripted(reason: FullResyncReason, seeds: Rows, replacements: Rows) -> LoopbackTransport {
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
@@ -114,9 +123,9 @@ fn server_replacing_both(reason: FullResyncReason) -> LoopbackTransport {
                 _ => return,
             }
         }
-        send_snapshot(&mut server, SUB_LOW, &[(1, 5), (2, 50)], 1).await;
-        send_snapshot(&mut server, SUB_HIGH, &[(1, 5), (2, 50)], 2).await;
-        for (sub, cursor) in [(SUB_LOW, 3), (SUB_HIGH, 4)] {
+        send_snapshot(&mut server, SUB_LOW, seeds[0], 1).await;
+        send_snapshot(&mut server, SUB_HIGH, seeds[1], 2).await;
+        for ((sub, cursor), rows) in [(SUB_LOW, 3), (SUB_HIGH, 4)].into_iter().zip(replacements) {
             server
                 .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
                     sub_id: sub.to_owned(),
@@ -124,7 +133,7 @@ fn server_replacing_both(reason: FullResyncReason) -> LoopbackTransport {
                 }))
                 .await
                 .expect("resync");
-            send_snapshot(&mut server, sub, &[], cursor).await;
+            send_snapshot(&mut server, sub, rows, cursor).await;
         }
         while let Ok(Some(_)) = server.recv().await {}
     });
@@ -157,24 +166,25 @@ where
         .expect("read replica")
 }
 
-/// Connect, declare both overlapping subscriptions, and drain both snapshots.
-async fn seeded(reason: FullResyncReason) -> ConnettoConnection<LoopbackTransport> {
+/// Connect over `server`, declare both overlapping subscriptions, and drain both snapshots.
+async fn connected(server: LoopbackTransport) -> ConnettoConnection<LoopbackTransport> {
     let config = ClientConfig::new("truncate").with_login(Some(Grant::new("user:token")));
-    let mut conn = ConnettoConnection::connect(
-        server_replacing_both(reason),
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn =
+        ConnettoConnection::connect(server, &Replica::in_memory(), SQLITE_DDL, &config, None)
+            .await
+            .expect("connect");
     conn.subscribe(SUB_LOW, QUERY_LOW).await.expect("subscribe");
     conn.subscribe(SUB_HIGH, QUERY_HIGH)
         .await
         .expect("subscribe");
     pump_to_snapshot_end(&mut conn).await;
     pump_to_snapshot_end(&mut conn).await;
+    conn
+}
+
+/// Connect, declare both overlapping subscriptions, and drain both snapshots.
+async fn seeded(reason: FullResyncReason) -> ConnettoConnection<LoopbackTransport> {
+    let mut conn = connected(server_replacing_both(reason)).await;
     assert_eq!(
         replica_ids(&mut conn),
         vec![1, 2],
@@ -215,6 +225,72 @@ async fn an_ordinary_resync_still_spares_what_a_sibling_claims() {
         vec![1, 2],
         "each subscription's clear spares what the other still claims, which is \
          the rule a truncate is the one thing entitled to ignore",
+    );
+}
+
+/// A cursor past where its timeline ended resyncs every subscription, so each
+/// clear has to take what a sibling claims too, or a row the promoted database
+/// lost survives under two overlapping filters (R73).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_beyond_history_takes_what_a_sibling_claims() {
+    let mut conn = seeded(FullResyncReason::CursorBeyondHistory).await;
+
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        Vec::<i64>::new(),
+        "the promoted database holds none of these rows, so no filter entitles one to stay",
+    );
+}
+
+/// The later notice arrives after the first subscription's replacement landed,
+/// so it must spare what that fresh replacement claims while the lost row both
+/// filters matched stays gone (R73).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_beyond_history_keeps_what_an_earlier_replacement_delivered() {
+    let mut conn = connected(server_scripted(
+        FullResyncReason::CursorBeyondHistory,
+        [&[(1, 5), (2, 50), (3, 500)], &[(1, 5), (2, 50)]],
+        [&[(1, 5), (3, 500)], &[(1, 5)]],
+    ))
+    .await;
+    assert_eq!(replica_ids(&mut conn), vec![1, 2, 3]);
+
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        vec![1, 3],
+        "order 3 only the low filter matches came back in its replacement, and order 2 was lost",
+    );
+}
+
+/// Each connection's first notice empties the tables again, so a second
+/// failover in the same process takes its own lost rows too (R73).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_connection_clears_its_own_lost_rows() {
+    const SEED: &[(i64, i64)] = &[(4, 5)];
+    let mut conn = seeded(FullResyncReason::CursorBeyondHistory).await;
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+
+    conn.attach(server_scripted(
+        FullResyncReason::CursorBeyondHistory,
+        [SEED, SEED],
+        [&[], &[]],
+    ))
+    .await
+    .expect("attach again");
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(replica_ids(&mut conn), vec![4]);
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        replica_ids(&mut conn),
+        Vec::<i64>::new(),
+        "the second promotion lost order 4, which both filters match"
     );
 }
 

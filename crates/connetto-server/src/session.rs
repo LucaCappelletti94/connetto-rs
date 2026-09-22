@@ -35,6 +35,8 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
+use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
@@ -60,7 +62,9 @@ use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
 use crate::reexec::{FailedRead, NoConnector, ReadBudget, ReadFailure};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
+use crate::slot::SlotError;
 use crate::throttle::{ReadLimits, Tier};
+use crate::timeline::{Position, TimelineError, TimelineHistory};
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 use connetto_core::auth::CapabilityKey;
@@ -743,6 +747,20 @@ pub enum SessionError {
     ChangeStreamUnusable(String),
 }
 
+/// Why the change feed could not be settled before opening.
+#[derive(Debug, thiserror::Error)]
+pub enum StreamCheckError {
+    /// The database's timeline history could not be read.
+    #[error(transparent)]
+    Timeline(#[from] TimelineError),
+    /// The replication slot's resume position could not be read.
+    #[error("reading the replication slot: {0}")]
+    Slot(#[from] SlotError),
+    /// The reconnect log could not be read or trimmed.
+    #[error("reconciling the change feed: {0}")]
+    Session(#[from] SessionError),
+}
+
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Transport(err.to_string())
 }
@@ -787,17 +805,25 @@ fn retry_ms(wait: Duration) -> u64 {
     u64::try_from(wait.as_millis()).unwrap_or(u64::MAX)
 }
 
-/// Decode a resume cursor into an LSN. The cursor is an 8-byte big-endian LSN;
-/// anything else (empty, absent, or malformed) is a client that never synced,
-/// which maps to LSN 0 and takes the full-resync path.
-fn resume_lsn_from_cursor(cursor: Option<&Cursor>) -> u64 {
-    match cursor.map(Cursor::as_bytes) {
-        Some(bytes) if bytes.len() == 8 => {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(bytes);
-            u64::from_be_bytes(buf)
+/// Where a handshake's cursor lets its subscriptions resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// No position, or one in a layout this server does not read.
+    Fresh,
+    /// A position the database's history still holds.
+    At(u64),
+    /// A position past where its timeline ended, naming changes the database lost (R73).
+    BeyondHistory,
+}
+
+impl Resume {
+    /// Judge `cursor` against the database's `history`.
+    fn of(cursor: Option<&Cursor>, history: &TimelineHistory) -> Self {
+        match cursor.and_then(|cursor| Position::from_cursor_bytes(cursor.as_bytes())) {
+            None | Some(Position { lsn: 0, .. }) => Self::Fresh,
+            Some(position) if history.contains(position) => Self::At(position.lsn),
+            Some(_) => Self::BeyondHistory,
         }
-        _ => 0,
     }
 }
 
@@ -911,7 +937,7 @@ struct LiveSession {
 struct HandshakeOutcome<Id, Key> {
     connection_num: u64,
     principal: Arc<Principal<Id, Key>>,
-    resume_lsn: u64,
+    resume: Resume,
     applied_watermark: Option<u64>,
     /// How many grants were refused, tallied for abuse once the run is
     /// registered so a crossing can close the connection it happened on.
@@ -1183,9 +1209,8 @@ struct SessionState<Id, Key> {
     /// the write target at handshake and advanced per commit. A replayed
     /// sequence at or below it is re-acknowledged, never re-applied.
     applied_watermark: Option<u64>,
-    /// Resume LSN decoded from the handshake cursor. 0 means a fresh session, so
-    /// every re-declared subscription replays from here on reconnect.
-    resume_lsn: u64,
+    /// Where the handshake cursor lets every re-declared subscription resume.
+    resume: Resume,
     /// Set when a per-connection abuse threshold crossed, so the run loop ends
     /// after the frame that crossed it. A caller with no identity has no name
     /// to ban, so closing the socket is the whole outcome.
@@ -1277,6 +1302,8 @@ pub struct SessionManager<
     /// server. Generic rather than boxed so a deployment wires it at compile
     /// time without a vtable allocation on the hot ticket path.
     signer: S,
+    /// The timeline history last read, `None` before the first read and treated as never promoted.
+    history: parking_lot::RwLock<Option<TimelineHistory>>,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -1412,6 +1439,7 @@ where
             second_opinion: OnceLock::new(),
             withdrawal_source: OnceLock::new(),
             signer,
+            history: parking_lot::RwLock::new(None),
         })
     }
 }
@@ -1637,6 +1665,49 @@ where
         self.sessions.lock().await.len()
     }
 
+    /// Store the timeline history read before the feed opens, closing every live connection when it changed.
+    ///
+    /// A live connection never presents its cursor again, so closing it is what gets that cursor judged (R73).
+    pub async fn reconcile_history(&self, history: TimelineHistory) {
+        let to = history.current();
+        let from = {
+            let mut stored = self.history.write();
+            if stored.as_ref() == Some(&history) {
+                return;
+            }
+            match stored.replace(history) {
+                None => return,
+                Some(held) => held.current(),
+            }
+        };
+        let closed = self
+            .close_all(FatalErrorReason::DatabaseTimelineChanged)
+            .await;
+        tracing::warn!(
+            from,
+            to,
+            closed,
+            "the database moved to another timeline, so every live connection \
+             was closed and each cursor past where its timeline ended resyncs"
+        );
+    }
+
+    /// An eight-byte offset cursor stamped with the timeline last read.
+    fn stamp(&self, lsn_cursor: &[u8]) -> Vec<u8> {
+        match self.history.read().as_ref() {
+            Some(history) => history.stamp(lsn_cursor),
+            None => TimelineHistory::default().stamp(lsn_cursor),
+        }
+    }
+
+    /// Where `cursor` lets a connection resume, against the history last read.
+    fn resume_from(&self, cursor: Option<&Cursor>) -> Resume {
+        match self.history.read().as_ref() {
+            Some(history) => Resume::of(cursor, history),
+            None => Resume::of(cursor, &TimelineHistory::default()),
+        }
+    }
+
     /// Reconcile the change feed's resume position against what the log holds,
     /// declaring a resync epoch when the feed skipped a stretch.
     ///
@@ -1701,6 +1772,25 @@ where
              every client will resynchronise"
         );
         Ok(Some(resume_lsn))
+    }
+
+    /// Settle the timeline, then the slot's resume position, before each connect of the change feed (R73, R32).
+    ///
+    /// # Errors
+    ///
+    /// [`StreamCheckError`] when either read fails, and the feed must then stay closed.
+    pub async fn reconcile_before_stream(
+        &self,
+        database_url: &str,
+        pool: &Pool<AsyncPgConnection>,
+        slot: &str,
+    ) -> Result<(), StreamCheckError> {
+        let history = crate::timeline::read_history(database_url).await?;
+        self.reconcile_history(history).await;
+        if let Some(resume) = crate::slot::resume_position(pool, slot).await? {
+            self.reconcile_stream(resume).await?;
+        }
+        Ok(())
     }
 
     /// Close every live connection with `reason`, returning how many were told.
@@ -2010,12 +2100,13 @@ where
                 Transition::Deliver => patch.payload_zstd,
                 Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
             };
+            let cursor = self.stamp(&patch.cursor);
             {
                 counters::timed_lock(&self.materializer)
                     .await
-                    .advance_cursor(route.session_key, route.sub_id, &patch.cursor)?;
+                    .advance_cursor(route.session_key, route.sub_id, &cursor)?;
             }
-            let live = LivePatch::new(route.label, Cursor::new(patch.cursor), payload);
+            let live = LivePatch::new(route.label, Cursor::new(cursor), payload);
             // A dropped session receiver just means the client is gone.
             let _ = route.tx.send(Outbound::Live(live));
         }
@@ -2050,10 +2141,12 @@ where
         if moves.is_empty() {
             return;
         }
-        let cursor = event
-            .checkpoint()
-            .map(|lsn| lsn.0.to_be_bytes().to_vec())
-            .unwrap_or_default();
+        let cursor = self.stamp(
+            &event
+                .checkpoint()
+                .map(|lsn| lsn.0.to_be_bytes().to_vec())
+                .unwrap_or_default(),
+        );
         for term_move in moves {
             let route = {
                 self.routes
@@ -2732,12 +2825,10 @@ where
             return Ok(None);
         }
 
-        // Decode the resume cursor and read the server watermark for the ack. An
-        // 8-byte cursor is the client's resume LSN; anything else is a fresh
-        // client (LSN 0), which takes the full-resync path on subscribe.
-        let resume_lsn = resume_lsn_from_cursor(handshake.last_cursor.as_ref());
+        // Judge the resume cursor and read the server watermark for the ack.
+        let resume = self.resume_from(handshake.last_cursor.as_ref());
         let current_cursor = match self.oplog.current_lsn().await.map_err(oplog_err)? {
-            Some(lsn) => Cursor::new(lsn.to_be_bytes().to_vec()),
+            Some(lsn) => Cursor::new(self.stamp(&lsn.to_be_bytes())),
             None => Cursor::new(Vec::new()),
         };
         // The durable mutation watermark: the client retires pending records
@@ -2795,7 +2886,7 @@ where
         Ok(Some(HandshakeOutcome {
             connection_num,
             principal: Arc::new(principal),
-            resume_lsn,
+            resume,
             applied_watermark,
             refused_grants,
             span,
@@ -3231,7 +3322,7 @@ where
         let HandshakeOutcome {
             connection_num,
             principal,
-            resume_lsn,
+            resume,
             applied_watermark,
             refused_grants,
             span: _,
@@ -3239,7 +3330,7 @@ where
             mut outbound_rx,
         } = outcome;
         let session_id = principal.session_id();
-        tracing::info!(resume_lsn, "connection established");
+        tracing::info!(?resume, "connection established");
 
         // The refusals the handshake collected are tallied here rather than as
         // they happened, because the caller may not be fully resolved until all
@@ -3260,7 +3351,7 @@ where
             deferred: None,
             session_id,
             applied_watermark,
-            resume_lsn,
+            resume,
             closing: refused == Reaction::Close,
         };
 
@@ -4192,12 +4283,12 @@ where
 
     /// Deliver a row subscription, by snapshot or by oplog catchup.
     ///
-    /// A fresh session snapshots. A resuming session (nonzero `resume_lsn`)
-    /// whose cursor is still inside the retained window catches up from the
-    /// oplog instead of re-snapshotting. One outside the window snapshots
-    /// afresh, and the resync notice goes out with the new data rather than
-    /// here, so a failing read reads like any other refusal and costs the
-    /// client nothing.
+    /// A fresh session snapshots. A resuming session whose cursor is still
+    /// inside the retained window catches up from the oplog instead of
+    /// re-snapshotting. One outside the window, or past where its timeline
+    /// ended, snapshots afresh, and the resync notice goes out with the new
+    /// data rather than here, so a failing read reads like any other refusal
+    /// and costs the client nothing.
     async fn subscribe_row<T: Transport>(
         &self,
         transport: &mut T,
@@ -4207,19 +4298,20 @@ where
         tier: Tier,
         permit: Option<ReaderPermit>,
     ) -> Result<(), SessionError> {
-        let mut resync = None;
-        if state.resume_lsn != 0 {
-            let min = self.oplog.min_lsn().await.map_err(oplog_err)?;
-            let current = self.oplog.current_lsn().await.map_err(oplog_err)?;
-            match catchup_decision(state.resume_lsn, min, current) {
-                CatchupDecision::Catchup => {
-                    return self.catch_up_row(transport, sub, state, &reg).await;
-                }
-                CatchupDecision::FullResync => {
-                    resync = Some(FullResyncReason::CursorOutsideRetention);
+        let resync = match state.resume {
+            Resume::Fresh => None,
+            Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
+            Resume::At(lsn) => {
+                let min = self.oplog.min_lsn().await.map_err(oplog_err)?;
+                let current = self.oplog.current_lsn().await.map_err(oplog_err)?;
+                match catchup_decision(lsn, min, current) {
+                    CatchupDecision::Catchup => {
+                        return self.catch_up_row(transport, sub, state, &reg, lsn).await;
+                    }
+                    CatchupDecision::FullResync => Some(FullResyncReason::CursorOutsideRetention),
                 }
             }
-        }
+        };
         self.snapshot_row(
             transport,
             state,
@@ -4546,6 +4638,7 @@ where
                 }
             })?;
         admit_page(&sub.sub_id, &page, max_rows, estimate.width, limits)?;
+        let cursor = Cursor::new(self.stamp(page.cursor.as_bytes()));
         if let Some(reason) = resync {
             transport
                 .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
@@ -4579,7 +4672,7 @@ where
                     max_rows,
                     limits,
                     average_width: estimate.width,
-                    cursor: page.cursor,
+                    cursor,
                     delivered,
                     tier,
                     restarted,
@@ -4588,7 +4681,7 @@ where
                 Ok(())
             }
             None => {
-                self.complete_snapshot(transport, state, sub.sub_id, page.cursor, delivered)
+                self.complete_snapshot(transport, state, sub.sub_id, cursor, delivered)
                     .await
             }
         }
@@ -4852,6 +4945,7 @@ where
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
+        from: u64,
     ) -> Result<(), SessionError> {
         self.attach_row_route(&sub, state, reg).await;
 
@@ -4864,11 +4958,7 @@ where
             .await
             .map_err(oplog_err)?
             .unwrap_or(0);
-        let entries = self
-            .oplog
-            .entries_since(state.resume_lsn)
-            .await
-            .map_err(oplog_err)?;
+        let entries = self.oplog.entries_since(from).await.map_err(oplog_err)?;
         // One watcher, this session's caller, so the buffers hold one verdict
         // each and are reused across the whole replay.
         let watchers = [Arc::clone(&state.principal)];
@@ -4906,7 +4996,7 @@ where
             else {
                 continue;
             };
-            let cursor = record.lsn().to_be_bytes().to_vec();
+            let cursor = self.stamp(&record.lsn().to_be_bytes());
             {
                 self.materializer.lock().await.advance_cursor(
                     state.session_id.as_u64_key(),
@@ -5249,9 +5339,51 @@ mod tests {
     use subql::backend::{ScalarFamily, Value as PgValue};
 
     use super::{
-        GrantHolder, MemberTable, MirrorGap, SubscribeRefusal, attempt_limit_reached,
+        GrantHolder, MemberTable, MirrorGap, Resume, SubscribeRefusal, attempt_limit_reached,
         caller_subjects, concerns, mirror_predicate, page_rows,
     };
+    use crate::timeline::{Position, TimelineHistory};
+    use connetto_core::Cursor;
+
+    fn judged(cursor: &[u8], history: &TimelineHistory) -> Resume {
+        Resume::of(Some(&Cursor::new(cursor.to_vec())), history)
+    }
+
+    fn at(timeline: u32, lsn: u64) -> Vec<u8> {
+        Position { timeline, lsn }.to_cursor_bytes()
+    }
+
+    /// Timeline 3, whose history ended timeline 1 at 0x100 and timeline 2 at 0x200.
+    fn twice_promoted() -> TimelineHistory {
+        TimelineHistory::parse(3, "1\t0/100\tr\n2\t0/200\tr\n").expect("parse")
+    }
+
+    #[test]
+    fn a_cursor_resumes_only_while_the_history_holds_its_position() {
+        let history = twice_promoted();
+        assert_eq!(judged(&at(3, 0x900), &history), Resume::At(0x900));
+        assert_eq!(judged(&at(2, 0x200), &history), Resume::At(0x200));
+        assert_eq!(judged(&at(2, 0x201), &history), Resume::BeyondHistory);
+        assert_eq!(judged(&at(1, 0x101), &history), Resume::BeyondHistory);
+        assert_eq!(
+            judged(&at(4, 0x10), &history),
+            Resume::BeyondHistory,
+            "a timeline this history never had, an old primary brought back or another cluster"
+        );
+    }
+
+    #[test]
+    fn no_position_is_a_fresh_start_whatever_the_history() {
+        let history = twice_promoted();
+        assert_eq!(Resume::of(None, &history), Resume::Fresh);
+        assert_eq!(judged(&[], &history), Resume::Fresh);
+        assert_eq!(
+            judged(&0x150_u64.to_be_bytes(), &history),
+            Resume::Fresh,
+            "the layout without a timeline cannot be judged, so it resyncs"
+        );
+        assert_eq!(judged(&at(1, 0), &history), Resume::Fresh);
+    }
 
     /// A membership table watched under the given caller kinds.
     fn watched(identity: bool, subjects: bool) -> MemberTable {
