@@ -2220,6 +2220,29 @@ enum AttachReplay {
     Pending { watermark: Option<u64> },
 }
 
+/// The label prefix the server gives a hidden membership subscription (R27).
+const MEMBERSHIP_LABEL_PREFIX: &str = "connetto-membership:";
+
+/// Which scoped tables a clear empties whatever a sibling subscription still claims.
+enum Stale {
+    /// None, so each sibling keeps what its filter claims.
+    Nothing,
+    /// The one table a truncate emptied, lowercased (R48).
+    Table(String),
+    /// Every scoped table, because the whole session resyncs past where its timeline ended (R73).
+    Everything,
+}
+
+impl Stale {
+    fn covers(&self, table: &str) -> bool {
+        match self {
+            Self::Nothing => false,
+            Self::Table(emptied) => *emptied == table.to_lowercase(),
+            Self::Everything => true,
+        }
+    }
+}
+
 /// A sync client bound to one local SQLite database, with or without a server.
 ///
 /// It exists before any transport does. Opening the replica, serving reads from
@@ -2293,6 +2316,9 @@ pub struct ConnettoConnection<T: Transport> {
     /// re-apply (R48 decision 3). Held per subscription because two can be
     /// replaced at once, and cleared when each one's `SnapshotEnd` lands.
     resyncing: HashSet<String>,
+    /// Whether this connection already emptied every subscribed table for a
+    /// cursor past where its timeline ended (R73).
+    history_cleared: bool,
     /// Whether the replica is backed by a file rather than `:memory:`. An
     /// in-memory replica has no durable key, so `custody()` overrides the
     /// configured level to `Ephemeral` whenever this is false.
@@ -2534,6 +2560,7 @@ where
             local_tables: HashSet::new(),
             hidden_tables: HashSet::new(),
             resyncing: HashSet::new(),
+            history_cleared: false,
             // A key is what custody is about, so the absence of one is the
             // signal rather than the path: `Replica::in_memory` is the only
             // constructor that carries none, and `encrypted_file` refuses
@@ -2650,6 +2677,7 @@ where
             transport,
             connection_id: ack.connection_id,
         });
+        self.history_cleared = false;
         self.attach_replay = AttachReplay::Pending { watermark };
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
@@ -4029,6 +4057,29 @@ where
         reason: &FullResyncReason,
     ) -> Result<(), ClientError> {
         let declared = subscriptions::declared(&mut self.db)?;
+        let beyond_history = *reason == FullResyncReason::CursorBeyondHistory;
+        // A hidden membership subscription has no declared record to take its tables from.
+        let membership = sub_id
+            .strip_prefix(MEMBERSHIP_LABEL_PREFIX)
+            .filter(|_| beyond_history)
+            .map(str::to_lowercase);
+        // Every row subscription resyncs, so the first notice empties all their tables and later ones spare fresh replacements.
+        if beyond_history && !self.history_cleared {
+            self.history_cleared = true;
+            let mut scope: HashSet<String> = membership.into_iter().collect();
+            for record in &declared {
+                if let Some(coverage) = crate::live::coverage_of(&record.spec)? {
+                    scope.extend(coverage.tables);
+                }
+            }
+            self.delete_uncovered(&scope, None, &Stale::Everything, &HashMap::new())?;
+            return Ok(());
+        }
+        if let Some(table) = membership {
+            let scope = HashSet::from([table]);
+            self.delete_uncovered(&scope, None, &Stale::Nothing, &HashMap::new())?;
+            return Ok(());
+        }
         let Some(resyncing) = declared
             .iter()
             .find(|record| record.sub_id == sub_id)
@@ -4037,20 +4088,16 @@ where
         else {
             return Ok(());
         };
-        // Compared case-insensitively because the server names it from the
-        // catalog and a subscription names it as its query spelled it.
-        let emptied = match reason {
-            FullResyncReason::TableTruncated { table } => Some(table.to_lowercase()),
+        let stale = match reason {
+            // Compared case-insensitively because the server names it from the
+            // catalog and a subscription names it as its query spelled it.
+            FullResyncReason::TableTruncated { table } => Stale::Table(table.to_lowercase()),
             FullResyncReason::CursorOutsideRetention
             | FullResyncReason::AuthorizationChange
-            | FullResyncReason::SnapshotInterrupted => None,
+            | FullResyncReason::SnapshotInterrupted
+            | FullResyncReason::CursorBeyondHistory => Stale::Nothing,
         };
-        self.delete_uncovered(
-            &resyncing.tables,
-            Some(sub_id),
-            emptied.as_deref(),
-            &HashMap::new(),
-        )?;
+        self.delete_uncovered(&resyncing.tables, Some(sub_id), &stale, &HashMap::new())?;
         Ok(())
     }
 
@@ -4061,10 +4108,9 @@ where
     /// contributing a clause, so a row another subscription still wants matches
     /// that clause and survives, and a table no survivor claims takes the whole
     /// delete. `spare` holds extra keep-clauses per physical table (the eviction
-    /// pass passes its pending-write keys, a resync passes none). `emptied`
-    /// names the one table a truncate emptied, which deletes whole regardless of
-    /// a survivor's filter, because every row of an emptied table is stale
-    /// whatever a sibling's predicate says (R48). Returns the rows removed.
+    /// pass passes its pending-write keys, a resync passes none). `stale` names
+    /// the tables that delete whole regardless of a survivor's filter, because
+    /// their every row may be gone upstream (R48, R73). Returns the rows removed.
     ///
     /// Capture is suspended so the deletes are never re-uploaded as a local
     /// mutation.
@@ -4072,7 +4118,7 @@ where
         &mut self,
         scope: &HashSet<String>,
         exclude: Option<&str>,
-        emptied: Option<&str>,
+        stale: &Stale,
         spare: &HashMap<String, Vec<String>>,
     ) -> Result<usize, ClientError> {
         // Every surviving subscription's claim on the scoped tables, as SQL. A
@@ -4106,7 +4152,7 @@ where
         self.db.transaction::<_, ClientError, _>(|conn| {
             let mut removed = 0usize;
             for table in scope {
-                let truncated = emptied == Some(table.to_lowercase().as_str());
+                let truncated = stale.covers(table);
                 if untouchable.contains(table.as_str()) && !truncated {
                     continue;
                 }
@@ -4258,7 +4304,8 @@ where
             return Ok(());
         };
         let spare = self.pending_spare()?;
-        let removed = self.delete_uncovered(&coverage.tables, Some(sub_id), None, &spare)?;
+        let removed =
+            self.delete_uncovered(&coverage.tables, Some(sub_id), &Stale::Nothing, &spare)?;
         if removed > 0 {
             self.trim_replica()?;
         }
@@ -4291,7 +4338,7 @@ where
                 }
             }
             let spare = self.pending_spare()?;
-            self.delete_uncovered(&scope, None, None, &spare)?;
+            self.delete_uncovered(&scope, None, &Stale::Nothing, &spare)?;
         }
         self.trim_replica()?;
         // The pass is the residual measure's reset point (R60 decision 4):

@@ -29,7 +29,7 @@ The client persists the following in local SQLite across process restarts:
 
 | Item | Description |
 |---|---|
-| `last_applied_lsn` | Highest server LSN the client has applied to local SQLite. |
+| `last_applied_lsn` | The cursor of the last frame the client applied to local SQLite, opaque to the client. The server writes twelve bytes, the timeline and then the position (R73, see Failover). |
 | `pending_mutations` | The local mutation queue (see `03-sync-pipeline.md`). |
 | `subscriptions` | The set of subscriptions to re-declare on reconnect (spec + sub_id). |
 | `session_token` | Durable session handle. **Built (R2, R3)**: for an identified run the auth store's session id is the handle, an unidentified run gets one minted at handshake, and the `resume_token` credential returned beside it is what proves the handle on the next connect. The client persists the pair outside the local replica (natively where the refresh token lives, worker-only in the browser). Cursors, the watermark and the connection registry key on it (chapter 12). |
@@ -93,7 +93,7 @@ On reconnect, the client sends:
 ```
 Handshake {
   client_id:     String,
-  last_lsn:      u64,        // client's resume cursor (0 if never connected)
+  last_cursor:   Option<Cursor>, // client's resume cursor, absent if never synced
   session_token: String,     // Built, defective: see note below
   grants:        Vec<Grant>, // Decided (R3): zero or more opaque grants
 }
@@ -135,10 +135,12 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 ### Case 2: Client's LSN is outside the oplog window (or LSN = 0)
 
 1. The client's resume cursor predates the oldest available oplog entry. It cannot catch up incrementally.
-2. Server sends `FullResyncRequired { reason: "lsn_outside_retention_window" }`: the client shows a "re-syncing..." state and clears local data for affected subscriptions.
+2. Server sends `FullResyncRequired { reason: CursorOutsideRetention }`: the client shows a "re-syncing..." state and clears local data for affected subscriptions.
 3. For each re-declared subscription:
    - Server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames carrying the matching rows, then `SnapshotEnd(current_lsn)` (control).
 4. The client applies the snapshot as a full replacement (not a merge).
+
+A cursor past where its timeline ended, or one the server cannot read, takes this path with `CursorBeyondHistory` instead, whatever the window holds (R73, see Failover).
 
 The notice waits for the read (R38). `FullResyncRequired` is sent only once the fresh snapshot has been read, immediately ahead of its frames, because it is also the instruction to discard local rows. A read that fails instead draws the same single bare refusal as any other cause, so the caller learns nothing about the name it guessed and keeps its rows for a snapshot that never arrived.
 
@@ -172,20 +174,44 @@ Tombstones enable delete replay for rows the caller holds locally. Per the read-
 
 ---
 
+## Failover
+
+**One primary and any number of standbys, and connetto reads one change log from whichever is primary. Decided (R73).** Physical streaming replication carries every table connetto reads and writes byte for byte, the reconnect log, the mutation watermark and the auth store with the application's own tables, so a promoted standby holds everything the old primary had sent it. A cursor is a position in the reconnect log table and stays meaningful there. Several writable databases kept in sync, multi-master, is out of scope, because everything in connetto rests on one ordered change log.
+
+### The recipe
+
+1. **Stream to each standby through a physical slot**, `primary_slot_name` on the standby, with `hot_standby_feedback = on`.
+2. **Create connetto's logical slot as a failover slot**, `SELECT pg_create_logical_replication_slot(name, 'pgoutput', false, false, true)`, which needs Postgres 17 or later, and set `sync_replication_slots = on` on the standby, whose `primary_conninfo` must name a database. The standby then holds a copy of the slot that the promotion turns into the primary's, which becomes usable once the consumer has confirmed past the standby's catalog horizon. Without a failover slot the slot is recreated after a promotion, which is the hole `10-subscription-materializer.md` describes and costs every client a full re-download.
+3. **Name the standby's physical slot in `synchronized_standby_slots` on the primary**, so the change feed is never sent a change the standby has not received. Without it connetto can deliver changes a failover then loses, which the timeline check below repairs by re-downloading.
+4. **Choose synchronous commit where a lost write is unacceptable**, `synchronous_standby_names` with `synchronous_commit = on` or stronger. Asynchronous replication loses whatever the standby had not received when the primary failed, writes the primary had acknowledged, rotated refresh tokens and revocations alike.
+5. **Give the servers one address and move it to the promoted standby**, a DNS name, a virtual address or a proxy. connetto does not choose the new primary.
+
+### What clients experience
+
+The server process stays up. Its database connections drop, and its change feed reconnects with backoff until the address answers again. Before the feed reopens the server reads the database's timeline history over a replication connection, and a new timeline closes every live connection with `FatalErrorReason::DatabaseTimelineChanged`, because a live connection never presents its cursor again. A planned switchover that lost nothing closes every connection too, and each resumes by catching up, with no re-download.
+
+Every cursor carries the timeline it was issued on, twelve bytes with the timeline ahead of the position. A reconnecting client whose cursor lies on the current timeline, or on an earlier one at or before the point where that timeline ended, catches up from the reconnect log with no re-download. One past that point was sent changes the promoted database never received, so its subscriptions, hidden membership subscriptions included, get `FullResyncRequired { reason: CursorBeyondHistory }` and a replacement read from the new primary, and those rows leave the device. A nonempty cursor the server cannot read, the earlier eight-byte layout included, takes the same resync. The synced slot can trail what the old primary confirmed, so the feed may be sent a change twice, and the reconnect log keeps one entry per position.
+
+What a restore to an earlier point does to a client whose queued writes are ahead of the watermark is `R70`'s, after `R75`. A database restored into another cluster starts again at timeline 1 and this check does not see it.
+
+**Tested (R73, 2026-09-22)** on Postgres 18 by `crates/connetto-server/tests/it/failover.rs`, which cuts the standby off, commits rows a live client is sent, kills the primary, promotes the standby, moves the address and asserts the three client outcomes above. It leaves `synchronized_standby_slots` unset to produce the lossy case, so steps 3 and 4 of the recipe rest on Postgres's documented behaviour rather than on that test. The client's side of the resync, taking rows that overlapping subscriptions both claim, is tested by `crates/connetto-client/tests/it/truncate_resync.rs`.
+
+---
+
 ## Open Questions
 
 1. ~~**Oplog retention window**: what is the default size (entry count or age)? How does this interact with storage cost on the server?~~ **Decided (Q6.1):** 72 hours or 1M entries, whichever is hit first, both configurable per deployment. Clients whose resume cursor falls outside the window receive a full re-sync.
 2. ~~**Forced full re-sync signal**: should the server send an explicit "you must re-sync" message when the client's LSN is outside the window, rather than silently falling back to a snapshot? This would let the client show a "syncing..." state in the UI.~~ **Decided (Q6.2):** Yes, explicit `FullResyncRequired { reason }` message. The client uses it to show a "re-syncing..." state, clear local data for affected subscriptions, and log the reason.
 3. ~~**Catchup delivery format**: deliver oplog catchup as a stream of `RowUpdate` messages (reusing existing infrastructure) or as a special `CatchupPatch` snapshot-style message? The former reuses code. The latter may be more efficient for ordering guarantees.~~ **Decided (Q6.3):** Dissolved. The delivery format was already decided as SQLite PatchSet for both the live path and the reconnect/catchup path.
 4. ~~**Subscription-level LSN tracking**: should each subscription track its own resume LSN, or is a single global LSN per client sufficient? Per-subscription LSNs enable partial catchup. A global LSN is simpler.~~ **Decided (Q6.4):** Per-subscription cursors, tracked server-side by `subql` and keyed by session token. The client presents only its session token on reconnect and `subql` manages all cursor state.
-5. ~~**Oplog storage**: should the oplog live in PostgreSQL (as a table), in a separate fast store (Redis, in-memory ring buffer), or both? PostgreSQL is durable but may be slow under high write volume. In-memory is fast but lost on restart.~~ **Decided (Q6.5):** Per-session pending PatchSet buffer in `subql`, scoped to session cookie lifetime. The PostgreSQL oplog table still exists for CDC propagation across nodes, but the reconnect story is session-scoped.
+5. ~~**Oplog storage**: should the oplog live in PostgreSQL (as a table), in a separate fast store (Redis, in-memory ring buffer), or both? PostgreSQL is durable but may be slow under high write volume. In-memory is fast but lost on restart.~~ **Decided (Q6.5):** Per-session pending PatchSet buffer in `subql`, scoped to session cookie lifetime. The PostgreSQL oplog table still exists, and a promoted standby carries it (see Failover), but the reconnect story is session-scoped.
 6. ~~**Concurrent re-sync and live updates**: during a full re-sync snapshot delivery, live CDC events continue arriving. How does the server buffer or order these relative to the snapshot delivery?~~ **Decided (Q6.6):** Dissolved. CDC events arriving during snapshot delivery are appended to the new session's pending PatchSet buffer and delivered after the snapshot completes, via an opaque server-issued cursor the client presents on reconnect.
 
 ---
 
 ## Decisions
 
-**Oplog is a PostgreSQL table, replicated across the mesh.** Each row is a change record (table, pk, op, old/new values, LSN/position, timestamp). It must be a PostgreSQL table because the mesh requires all nodes to see it. Retention window is managed by periodic cleanup.
+**Oplog is a PostgreSQL table.** Each row is a change record (table, pk, op, old/new values, LSN/position, timestamp). It is a PostgreSQL table so it survives a restart and a promoted standby carries it with every other table (see Failover). Retention window is managed by periodic cleanup.
 
 **Delivery format is SQLite PatchSet.** The server reads oplog entries relevant to the client's subscriptions and the caller's `Principal`, converts them into a SQLite PatchSet, and sends it. At the wire level, each patchset is Zstd-compressed and carried in a bulk-plane frame: `LivePatch` on the live path, `SnapshotPatch` for a full resync (see `02-protocol.md`). On the live path: CDC event → match subscriptions → authorization check → convert to PatchSet → send. On the reconnect path: query oplog since client's last position → filter by subscriptions and `Principal` → convert to PatchSet → send. The PatchSet format is native to the client (SQLite session extension), so no conversion is needed on the client side.
 

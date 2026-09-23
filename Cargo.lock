@@ -918,6 +918,7 @@ dependencies = [
  "keyutils",
  "openfga-client",
  "openidconnect",
+ "parking_lot",
  "pg2sqlite",
  "ring",
  "rls2fga",

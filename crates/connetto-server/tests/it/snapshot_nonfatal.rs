@@ -21,7 +21,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, NoSigner, OplogConfig, PageKey, PageSpec,
+    InMemoryOplog, Materializer, NoConnector, NoSigner, OplogConfig, PageKey, PageSpec, Position,
     RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
     loopback, pg_write_target,
 };
@@ -397,10 +397,11 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         }
     }
     let resume = Cursor::new(
-        first_lsn
-            .expect("at least one event")
-            .to_be_bytes()
-            .to_vec(),
+        Position {
+            timeline: 1,
+            lsn: first_lsn.expect("at least one event"),
+        }
+        .to_cursor_bytes(),
     );
 
     let (server_end, mut client) = loopback();

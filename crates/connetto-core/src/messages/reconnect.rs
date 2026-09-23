@@ -38,6 +38,8 @@ pub enum FullResyncReason {
     /// client holds is part of a set (R58). The replacement is read afresh
     /// before this notice goes out, so nothing is discarded on a promise.
     SnapshotInterrupted,
+    /// The client's cursor lies past where its timeline ended, naming changes a promotion lost, or the server cannot read it (R73).
+    CursorBeyondHistory,
 }
 
 /// Server tells the client "throw away local state for this subscription and

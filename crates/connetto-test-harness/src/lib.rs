@@ -60,6 +60,7 @@ use tokio::task::JoinHandle;
 
 pub mod fanout;
 pub mod roster;
+pub mod standby;
 
 pub use roster::{RosterAuth, WITHHELD_ID};
 
@@ -268,35 +269,42 @@ fn sweep_abandoned_containers() {
 }
 
 /// The sweep itself. A container goes with its anonymous volume: `docker rm`
-/// alone leaves the volume the image's `VOLUME` declaration created.
+/// alone leaves the volume the image's `VOLUME` declaration created. Networks
+/// go after the containers, because a network with a container attached
+/// cannot be removed.
 fn remove_abandoned_containers() {
-    let Ok(listed) = Command::new("docker")
-        .args([
-            "ps",
-            "-a",
-            "--filter",
-            &format!("label={CONTAINER_LABEL}"),
-            "--format",
-            "{{.ID}} {{.Labels}}",
-        ])
-        .output()
-    else {
-        return;
-    };
+    const KINDS: [(&[&str], &[&str]); 2] = [
+        (&["ps", "-a"], &["rm", "-f", "-v"]),
+        (&["network", "ls"], &["network", "rm"]),
+    ];
     let now = now_secs();
-    for line in String::from_utf8_lossy(&listed.stdout).lines() {
-        let Some((id, labels)) = line.split_once(' ') else {
-            continue;
+    for (list, remove) in KINDS {
+        let Ok(listed) = Command::new("docker")
+            .args(list)
+            .args([
+                "--filter",
+                &format!("label={CONTAINER_LABEL}"),
+                "--format",
+                "{{.ID}} {{.Labels}}",
+            ])
+            .output()
+        else {
+            return;
         };
-        let started = labels
-            .split(',')
-            .find_map(|label| label.strip_prefix(STARTED_LABEL)?.strip_prefix('='))
-            .and_then(|stamp| stamp.parse::<u64>().ok())
-            .unwrap_or(0);
-        if now.saturating_sub(started) < STALE_AFTER.as_secs() {
-            continue;
+        for line in String::from_utf8_lossy(&listed.stdout).lines() {
+            let Some((id, labels)) = line.split_once(' ') else {
+                continue;
+            };
+            let started = labels
+                .split(',')
+                .find_map(|label| label.strip_prefix(STARTED_LABEL)?.strip_prefix('='))
+                .and_then(|stamp| stamp.parse::<u64>().ok())
+                .unwrap_or(0);
+            if now.saturating_sub(started) < STALE_AFTER.as_secs() {
+                continue;
+            }
+            let _ = Command::new("docker").args(remove).arg(id).output();
         }
-        let _ = Command::new("docker").args(["rm", "-f", "-v", id]).output();
     }
 }
 
@@ -1795,5 +1803,54 @@ mod sweep_tests {
             container_exists(live),
             "a container stamped just now was swept: a sibling run would lose its server"
         );
+    }
+
+    /// A network the standby pair left behind goes once it is old, and one a
+    /// concurrent run just created stays.
+    #[test]
+    fn sweep_removes_an_abandoned_network_and_keeps_a_live_one() {
+        let names = [
+            format!("connetto-sweep-old-{}", super::uuid_like()),
+            format!("connetto-sweep-new-{}", super::uuid_like()),
+        ];
+        let _cleanup = NetworkCleanup(names.clone());
+        for (name, started) in names.iter().zip(["0".to_owned(), now_secs().to_string()]) {
+            let out = docker(&[
+                "network",
+                "create",
+                "--label",
+                &format!("{CONTAINER_LABEL}=network"),
+                "--label",
+                &format!("{STARTED_LABEL}={started}"),
+                name,
+            ]);
+            assert!(
+                out.status.success(),
+                "docker network create: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        remove_abandoned_containers();
+
+        let exists = |name: &str| docker(&["network", "inspect", name]).status.success();
+        assert!(
+            !exists(&names[0]),
+            "a network stamped at the epoch was not swept"
+        );
+        assert!(exists(&names[1]), "a network stamped just now was swept");
+    }
+
+    /// Removes the named networks when dropped. `Drop` is infallible.
+    struct NetworkCleanup([String; 2]);
+
+    impl Drop for NetworkCleanup {
+        fn drop(&mut self) {
+            for name in &self.0 {
+                let _ = Command::new("docker")
+                    .args(["network", "rm", name])
+                    .output();
+            }
+        }
     }
 }

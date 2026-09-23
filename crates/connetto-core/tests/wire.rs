@@ -184,12 +184,16 @@ fn every_resync_reason() -> Vec<FullResyncReason> {
         // SessionManager::restart_or_refuse, when a page of an initial read
         // failed part way through and the read starts again (R58).
         FullResyncReason::SnapshotInterrupted,
+        // SessionManager::subscribe_row, when the resume cursor lies beyond
+        // where its timeline ended in the database's history (R73).
+        FullResyncReason::CursorBeyondHistory,
     ];
     for reason in &reasons {
         match reason {
             FullResyncReason::CursorOutsideRetention
             | FullResyncReason::AuthorizationChange
             | FullResyncReason::SnapshotInterrupted
+            | FullResyncReason::CursorBeyondHistory
             | FullResyncReason::TableTruncated { .. } => {}
         }
     }
@@ -244,6 +248,9 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         // SessionManager::reconcile_stream, when the change feed resumed past
         // what it had delivered (R32).
         FatalErrorReason::ChangeStreamGap,
+        // SessionManager::reconcile_history, when the database's timeline
+        // changed under a running server (R73).
+        FatalErrorReason::DatabaseTimelineChanged,
     ];
     for reason in &reasons {
         match reason {
@@ -253,7 +260,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::ProtocolViolation { .. }
             | FatalErrorReason::ServerShuttingDown
             | FatalErrorReason::RateLimited { .. }
-            | FatalErrorReason::ChangeStreamGap => {}
+            | FatalErrorReason::ChangeStreamGap
+            | FatalErrorReason::DatabaseTimelineChanged => {}
         }
     }
     reasons

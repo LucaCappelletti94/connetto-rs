@@ -84,6 +84,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 ring = "0.17"
 # Ids for the fixture rows the browser stack seeds.
 uuid = { version = "1", features = ["v4"] }
+# The standby switchboard's target and open flows, locked briefly and never
+# across an await. Already in the graph through connetto-server.
+parking_lot = "0.12"
 
 [dev-dependencies]
 # The smoke test reads a table back through the admin pool with a typed row.
