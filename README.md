@@ -30,7 +30,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 95 phases, 71 done and 24 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 95 phases, 72 done and 23 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -38,7 +38,7 @@ The plan in `plans/master-implementation-plan.md` tracks 95 phases, 71 done and 
 | One page codec, synced tables without local references, Linux key custody across a reboot | R21, R92, R71 |
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline, failover verification | R70, R72, R73 |
-| Refresh token in an `HttpOnly` cookie, demo gaps | R90, R57 |
+| Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
 

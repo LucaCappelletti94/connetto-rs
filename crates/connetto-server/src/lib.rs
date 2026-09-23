@@ -60,7 +60,10 @@ pub use subql::visibility::WriteOp;
 // Re-exported so the `connetto_auth_tables!` macro can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.
-pub use authn::http::{RedirectPolicy, auth_router, is_loopback_host};
+pub use authn::http::{
+    BROWSER_CLIENT, CLIENT_KIND_HEADER, CookieSameSite, RedirectPolicy, auth_router,
+    is_loopback_host,
+};
 pub use authn::{
     AssuranceRequirement, AuthCodes, AuthConfig, AuthError, AuthService, AuthStore, AuthStoreError,
     ConnettoHandshakeAuthority, DefaultUuidResolver, GenericOidcProvider, IdentityProvider,

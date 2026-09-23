@@ -13,7 +13,7 @@ use axum::routing::get;
 use connetto_core::auth::CapabilitySubject;
 use connetto_server::capability::MintCapabilityKey;
 use connetto_server::{
-    AuthConfig, AuthService, DbAuthStore, DefaultUuidResolver, GenericOidcProvider,
+    AuthConfig, AuthService, CookieSameSite, DbAuthStore, DefaultUuidResolver, GenericOidcProvider,
     ProviderRegistry, RedirectPolicy, RequestGuard, TokenAuthority, auth_router,
     connetto_auth_tables,
 };
@@ -25,7 +25,7 @@ use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 const SYNC_BIND: &str = "127.0.0.1:7777";
 const SYNC_WS: &str = "ws://127.0.0.1:7777/";
@@ -369,32 +369,41 @@ async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
         )
         .with_registry(Arc::clone(&registry)),
     );
+    // The R90 browser contract fetches with `credentials: "include"`, and a
+    // wildcard `Access-Control-Allow-Origin` is hard-rejected with credentials,
+    // so the harness echoes the requesting origin instead of `Any`.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request());
     // The share route stands in for whatever a deployment's sharing does. A
     // suite fetches it rather than reading a value baked at compile time,
     // because a stale binary would otherwise carry the previous run's key
     // while the database holds this run's row.
     let share = services.share.clone();
-    let app = auth_router(service, registry, RedirectPolicy::default())
-        .route(
-            LANDING_PATH,
-            get(|| async { "connetto dev landing: the code is in this URL" }),
-        )
-        .route(
-            SHARE_PATH,
-            get(|| async move {
-                // Hand-built rather than serialized, so the stack keeps its
-                // dependency list to what it already needs.
-                format!(
-                    "{{\"grant\":\"{}\",\"subject\":\"{}\",\"photo\":\"{}\"}}",
-                    share.token, share.subject, share.photo
-                )
-            }),
-        )
-        .layer(cors);
+    let app = auth_router(
+        service,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::Strict,
+    )
+    .route(
+        LANDING_PATH,
+        get(|| async { "connetto dev landing: the code is in this URL" }),
+    )
+    .route(
+        SHARE_PATH,
+        get(|| async move {
+            // Hand-built rather than serialized, so the stack keeps its
+            // dependency list to what it already needs.
+            format!(
+                "{{\"grant\":\"{}\",\"subject\":\"{}\",\"photo\":\"{}\"}}",
+                share.token, share.subject, share.photo
+            )
+        }),
+    )
+    .layer(cors);
     let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
             eprintln!("browser auth stack stopped: {err}");

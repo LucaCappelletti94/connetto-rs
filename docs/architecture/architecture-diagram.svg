@@ -483,8 +483,8 @@
       <rect width="296" height="44" rx="5" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="44" rx="1" fill="#4CAF50" />
       <text x="148" y="14" text-anchor="middle" font-size="10.5" font-weight="700" fill="#2E7D32">OAuth login (frontend)</text>
-      <text x="148" y="27" text-anchor="middle" font-size="8.5" fill="#4CAF50">auth code + PKCE, token store, refresh</text>
-      <text x="148" y="40" text-anchor="middle" font-size="8" fill="#C62828">refresh token into an HttpOnly cookie: R90</text>
+      <text x="148" y="27" text-anchor="middle" font-size="8.5" fill="#4CAF50">auth code + PKCE, account index, silent refresh</text>
+      <text x="148" y="40" text-anchor="middle" font-size="8" fill="#4CAF50">refresh built: HttpOnly per-account cookie</text>
     </g>
     <g transform="translate(1008, 816)">
       <rect width="608" height="52" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
@@ -540,7 +540,7 @@
       <rect width="4" height="104" rx="1" fill="#4CAF50" />
       <text x="304" y="18" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">At-rest encryption</text>
       <text x="304" y="36" text-anchor="middle" font-size="9.5" fill="#555">sqlite3mc over OPFS, SQLCipher v4 file format, per-replica key</text>
-      <text x="304" y="52" text-anchor="middle" font-size="9" fill="#555">IndexedDB custody, device key wraps the pre-identity refresh store</text>
+      <text x="304" y="52" text-anchor="middle" font-size="9" fill="#555">IndexedDB custody, KEK wraps per-identity replica keys, refresh rides an HttpOnly cookie</text>
       <text x="304" y="70" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
       <text x="304" y="86" text-anchor="middle" font-size="8.5" fill="#4CAF50">unlock gate built: passkey-derived key (WebAuthn PRF), enrolment re-wraps custody</text>
     </g>

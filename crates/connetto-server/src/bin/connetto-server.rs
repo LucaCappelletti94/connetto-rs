@@ -120,14 +120,15 @@ use connetto_server::audit::pg_audit_hook;
 use connetto_server::openfga::{Counted, FgaAuth, ModelState, ModelSubject, Translated};
 use connetto_server::reach::GrantReach;
 use connetto_server::{
-    AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession, Materializer,
-    OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource, ProviderRegistry,
-    ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy, RefreshOutcome,
-    RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog, SessionConfig,
-    SessionError, SessionManager, ThrottleConfig, TokenAuthority, WebSocketTransport, auth_router,
-    connetto_audit_table, connetto_auth_tables, connetto_ban_table, connetto_watermark_table,
-    is_loopback_host, pg_ban_store, pg_write_target, preflight,
+    AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, CookieSameSite,
+    DbAuthStore, DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession,
+    Materializer, OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource,
+    ProviderRegistry, ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
+    RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog,
+    SessionConfig, SessionError, SessionManager, ThrottleConfig, TokenAuthority,
+    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
+    connetto_ban_table, connetto_watermark_table, is_loopback_host, pg_ban_store, pg_write_target,
+    preflight,
 };
 use openfga_client::client::OpenFgaServiceClient;
 use openfga_client::tonic::transport::Channel;
@@ -143,7 +144,7 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
-use tower_http::cors::{AllowOrigin, Any, CorsLayer};
+use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 /// The change-path executor this binary serves through, named once because the
 /// session manager's type parameter and the function that builds it must agree.
@@ -1167,6 +1168,15 @@ async fn main() -> Result<()> {
             });
         }));
     }
+    let cookie_same_site =
+        CookieSameSite::parse(&var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")).ok_or_else(
+            || {
+                anyhow!(
+                    "unknown CONNETTO_AUTH_COOKIE_SAMESITE {:?}, expected strict or none",
+                    var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")
+                )
+            },
+        )?;
     spawn_auth_endpoints(
         &service,
         registry,
@@ -1174,6 +1184,7 @@ async fn main() -> Result<()> {
         &var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081"),
         &comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")),
         &comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")),
+        cookie_same_site,
     );
     run(
         &manager,
@@ -1191,16 +1202,30 @@ async fn main() -> Result<()> {
 /// `CONNETTO_AUTH_CORS_ORIGINS` lists. The file routes ride the same layer
 /// because a `PUT` or a JSON `POST` from a dev-server origin preflights, and
 /// one origin means a deployment names its origins once.
+///
+/// Credentials, which the R90 browser contract's `credentials: "include"`
+/// fetches need, ride only the listed origins. A loopback page is answered
+/// without them unless it is listed, whatever address the listener binds, so
+/// under `SameSite=None` no local page can spend a user's refresh cookie and
+/// read the token. A development page lists its own origin to carry one.
 fn cors_layer(cors_origins: &[String]) -> CorsLayer {
-    let origins = cors_origins.to_vec();
+    let answered = cors_origins.to_vec();
+    let credentialed = cors_origins.to_vec();
     CorsLayer::new()
         .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
             origin.to_str().is_ok_and(|origin| {
-                is_loopback_origin(origin) || origins.iter().any(|allowed| allowed == origin)
+                is_loopback_origin(origin) || answered.iter().any(|allowed| allowed == origin)
             })
         }))
-        .allow_methods(Any)
-        .allow_headers(Any)
+        .allow_credentials(AllowCredentials::predicate(move |origin, _parts| {
+            origin
+                .to_str()
+                .is_ok_and(|origin| credentialed.iter().any(|allowed| allowed == origin))
+        }))
+        // Wildcards are illegal with credentials, so the answer mirrors what
+        // the preflight asked for.
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request())
 }
 
 /// Mount the file router on the auth listener's router before the CORS layer
@@ -1242,12 +1267,14 @@ fn spawn_auth_endpoints(
     auth_bind: &str,
     redirect_allowlist: &[String],
     cors_origins: &[String],
+    cookie_same_site: CookieSameSite,
 ) {
     let router = mount_on_auth_listener(
         auth_router(
             Arc::clone(service),
             registry,
             RedirectPolicy::new(redirect_allowlist.to_vec()),
+            cookie_same_site,
         ),
         file_router,
     )
@@ -1561,7 +1588,7 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::{Method, Request, StatusCode};
-    use tower::ServiceExt;
+    use tower::{Layer, ServiceExt};
 
     /// A caller carrying only an identity, which is what these mints exercise.
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
@@ -1593,6 +1620,81 @@ mod tests {
         assert_eq!(comma_list(" , "), Vec::<String>::new());
     }
 
+    /// Credentials ride only the origins `CONNETTO_AUTH_CORS_ORIGINS` lists. A
+    /// loopback page is still answered without being listed, and without
+    /// credentials, whatever address the listener binds, so under
+    /// `SameSite=None` no local page can spend a refresh cookie it was not
+    /// listed for. A development page lists its own origin to carry one.
+    #[tokio::test]
+    async fn the_cors_layer_carries_credentials_only_for_trusted_origins() {
+        async fn answer(listed: &[&str], origin: &str) -> axum::response::Response {
+            let listed: Vec<String> = listed.iter().map(|&origin| origin.to_owned()).collect();
+            let layer = cors_layer(&listed);
+            let router = layer.layer(axum::Router::new().route(
+                "/auth/refresh",
+                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
+            ));
+            router
+                .oneshot(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri("/auth/refresh")
+                        .header("origin", origin)
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+        }
+        fn credentialed(response: &axum::response::Response) -> bool {
+            response
+                .headers()
+                .get("access-control-allow-credentials")
+                .is_some_and(|value| value == "true")
+        }
+        const APP: &str = "https://app.example";
+        const DEV: &str = "http://127.0.0.1:5173";
+
+        let trusted = answer(&[APP], APP).await;
+        assert_eq!(
+            trusted.headers()["access-control-allow-origin"],
+            APP,
+            "the configured origin is answered"
+        );
+        assert!(
+            credentialed(&trusted),
+            "and the answer permits the cookie to ride"
+        );
+
+        let unlisted = answer(&[APP], DEV).await;
+        assert_eq!(
+            unlisted.headers()["access-control-allow-origin"],
+            DEV,
+            "a loopback page is answered without being configured"
+        );
+        assert!(
+            !credentialed(&unlisted),
+            "but its cookie never rides until its origin is listed"
+        );
+
+        let listed = answer(&[APP, DEV], DEV).await;
+        assert!(
+            credentialed(&listed),
+            "a development page that lists its origin carries the cookie"
+        );
+
+        for hostile in ["https://evil.example", "http://evil.localhost:5173"] {
+            let answered = answer(&[APP], hostile).await;
+            assert!(
+                !answered
+                    .headers()
+                    .contains_key("access-control-allow-origin"),
+                "{hostile} gets no answer, so the browser refuses it the response"
+            );
+            assert!(!credentialed(&answered), "and no credentials for {hostile}");
+        }
+    }
+
     /// Both bind outcomes of the auth listener are survivable: the bound
     /// router keeps serving, a refused bind is an error line, not a panic.
     #[tokio::test]
@@ -1617,6 +1719,7 @@ mod tests {
             "127.0.0.1:0",
             &["https://app.example".to_owned()],
             &["https://app.example".to_owned()],
+            CookieSameSite::default(),
         );
         spawn_auth_endpoints(
             &service,
@@ -1625,6 +1728,7 @@ mod tests {
             "not a socket address",
             &[],
             &[],
+            CookieSameSite::default(),
         );
         // The bind arms run inside the spawned tasks; give them a turn.
         tokio::time::sleep(Duration::from_millis(50)).await;
