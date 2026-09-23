@@ -262,9 +262,9 @@ enum AuthApiError {
     /// The client redirect URI was not a loopback address or an allowlisted
     /// entry, or a redirect and PKCE challenge were not supplied as a pair.
     InvalidRedirect,
-    /// The browser contract was mixed or incomplete: an unknown marker value,
-    /// a marked request that also carries a body token, or a marked request
-    /// with no account to name.
+    /// A request broke its contract: an unknown marker value, a marked
+    /// request that also carries a body token or names no account, or an
+    /// unmarked request with no body token.
     InvalidRequest,
     /// A marked request carried no cookie under the name its account derives,
     /// or the cookie's session turned out to name a different account. The
@@ -285,7 +285,9 @@ impl AuthApiError {
             Self::UnknownState => "no in-flight authorization matched the callback".to_owned(),
             Self::InvalidGrant => "unknown, expired, or PKCE-mismatched grant".to_owned(),
             Self::InvalidRedirect => "the client redirect uri was refused".to_owned(),
-            Self::InvalidRequest => "the browser cookie contract was mixed".to_owned(),
+            Self::InvalidRequest => {
+                "the request mixed or omitted its contract's credential".to_owned()
+            }
             Self::InvalidCredential => "no credential rode the marked request".to_owned(),
         }
     }
@@ -360,7 +362,7 @@ pub enum CookieSameSite {
 }
 
 impl CookieSameSite {
-    /// Parse the deployment setting. Only the two lowercase names parse; any
+    /// Parse the deployment setting. Only the two lowercase names parse. Any
     /// other value is a configuration error the caller must refuse startup on.
     pub fn parse(value: &str) -> Option<Self> {
         match value {

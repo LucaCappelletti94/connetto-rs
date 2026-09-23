@@ -64,10 +64,10 @@ async fn the_account_index_lists_every_account_it_holds() {
 /// The OPFS file left in the pre-R90 encrypted shape.
 const STALE_DB: &str = "r90-stale-encrypted.sqlite";
 
-/// R90's recovery keys on the account-index open failing outright. SQLite
-/// surfaces an unreadable file on the first page read rather than on
-/// establish, so a keyed leftover must be refused by `open` itself and not
-/// one call later, where nothing discards it.
+/// R90's recovery discards the account index only when `open` reports the
+/// file is not a database, so a keyed leftover must be refused by `open`
+/// itself as `Undecryptable`, not one call later and not as the `Store`
+/// failure the recovery propagates untouched.
 #[wasm_bindgen_test]
 async fn a_stale_encrypted_file_fails_where_the_recovery_lives() {
     let storage = ReplicaStorage::install().await;
@@ -85,8 +85,8 @@ async fn a_stale_encrypted_file_fails_where_the_recovery_lives() {
     let outcome = AccountStore::open(&storage.db_url(STALE_DB));
     storage.delete_db(STALE_DB).expect("clean up");
     match outcome {
-        Err(AuthError::Store(_)) => {}
-        Err(other) => panic!("the boot recovery matches on Store, got {other:?}"),
+        Err(AuthError::Undecryptable(_)) => {}
+        Err(other) => panic!("the boot recovery matches on Undecryptable, got {other:?}"),
         Ok(_) => panic!("a keyed file opened as the plain account index"),
     }
 }

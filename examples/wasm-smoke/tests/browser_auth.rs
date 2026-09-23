@@ -337,6 +337,9 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
     store
         .remember(&departed)
         .expect("point the marker at the departed account");
+    store
+        .forget(&departed)
+        .expect("sign the departed account out, keeping the marker");
 
     let boot = connetto_web::auth::remembered_account(&store)
         .expect("read the marker")

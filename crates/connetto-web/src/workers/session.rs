@@ -48,7 +48,9 @@ async fn choose_account(
     }
 }
 
-/// Open the account index, discarding a database an earlier build encrypted.
+/// Open the account index, discarding a file an earlier build encrypted and
+/// propagating every other failure, which a discard would only turn into lost
+/// accounts.
 ///
 /// The name is the one the encrypted refresh store used. Such a database
 /// cannot open as the plain index, and discarding it is right rather than a
@@ -60,11 +62,11 @@ pub(crate) fn open_account_store(
     let db_url = ctx.storage.db_url(ctx.db_name);
     match crate::auth::AccountStore::open(&db_url) {
         Ok(store) => Ok(store),
-        Err(err @ AuthError::Store(_)) => {
+        Err(err @ AuthError::Undecryptable(_)) => {
             tracing::warn!(
                 error = %err,
-                "db worker: the account index will not open, discarding it and requiring a \
-                 fresh login"
+                "db worker: the account index is not a readable database, discarding it and \
+                 requiring a fresh login"
             );
             ctx.storage.delete_db(ctx.db_name)?;
             crate::auth::AccountStore::open(&db_url)

@@ -79,6 +79,11 @@ pub enum AuthError {
     /// A browser API was unavailable in this context.
     #[error("browser context error: {0}")]
     Context(String),
+    /// An existing database file is not a database this build can read, as a
+    /// file written under a key reads without it. A wrong key and a corrupt
+    /// file are indistinguishable to the page codec.
+    #[error("the database does not decrypt under the key supplied: {0}")]
+    Undecryptable(String),
     /// A key operation was refused because a credential is enrolled but no
     /// derived key-encryption key is held, or because this build cannot reach
     /// the one that would unlock it. The detail names which.
@@ -201,6 +206,18 @@ diesel::table! {
     }
 }
 
+/// `SQLITE_NOTADB` as `Undecryptable`, every other failure as `Store`. The
+/// match is on SQLite's own message, the one form both diesel error types
+/// carry for it.
+fn unreadable_or_store(context: &str, err: &dyn std::fmt::Display) -> AuthError {
+    let detail = format!("{context}: {err}");
+    if detail.contains("file is not a database") {
+        AuthError::Undecryptable(detail)
+    } else {
+        AuthError::Store(detail)
+    }
+}
+
 impl AccountStore {
     /// Open (creating if needed) the account index at `db_url`, a codec URL
     /// from [`ReplicaStorage::db_url`](crate::storage::ReplicaStorage::db_url)
@@ -210,23 +227,24 @@ impl AccountStore {
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the database cannot be opened or initialized. A
-    /// database left by a pre-cookie build holds an encrypted refresh store
-    /// under this name and fails to open as this table; the caller discards it,
-    /// which is correct because that stored credential is unusable under the
-    /// cookie contract anyway and a fresh login rewrites everything here.
+    /// [`AuthError::Undecryptable`] if a file under this name is not a
+    /// database, which is what a pre-cookie build's encrypted refresh store
+    /// reads as. The caller discards it, since its credential is unusable
+    /// under the cookie contract and a fresh login rewrites everything here.
+    /// [`AuthError::Store`] for any other failure to open or initialize, which
+    /// the caller propagates rather than discarding the index.
     pub fn open(db_url: &str) -> Result<Self, AuthError> {
         let mut conn = SqliteConnection::establish(db_url)
-            .map_err(|err| AuthError::Store(format!("open {db_url}: {err}")))?;
+            .map_err(|err| unreadable_or_store(&format!("open {db_url}"), &err))?;
         conn.batch_execute(
             "CREATE TABLE IF NOT EXISTS connetto_accounts (record TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
         )
-        .map_err(|err| AuthError::Store(format!("init: {err}")))?;
+        .map_err(|err| unreadable_or_store("init", &err))?;
         // One probe read, because SQLite surfaces an unreadable file on the first
         // real page read rather than on establish, and the caller's discard-and-
         // reopen recovery is keyed on this call failing here, not a later read.
         conn.batch_execute("SELECT count(*) FROM connetto_accounts")
-            .map_err(|err| AuthError::Store(format!("probe: {err}")))?;
+            .map_err(|err| unreadable_or_store("probe", &err))?;
         Ok(Self {
             conn: RefCell::new(conn),
         })

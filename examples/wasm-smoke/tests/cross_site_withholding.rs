@@ -9,9 +9,9 @@
 //!
 //! Two refusals. A marked refresh from this page cannot resume: the login
 //! worked and set its cookie, and the silent refresh afterwards still ends at
-//! `Acquired::NeedLogin`, because the browser withholds the cookie. And a
-//! cookie-only request, the form-post shape the latch exists for, never reaches
-//! the service at all: no marker header means the native contract, and the
+//! `Acquired::NeedLogin`, because the browser withholds the cookie. And an
+//! unmarked cross-site refresh, the form-post shape the latch exists for, never
+//! reaches the service: no marker header means the native contract, and the
 //! native contract needs a body token that a cross-site page cannot read.
 
 #![cfg(target_arch = "wasm32")]
@@ -114,9 +114,10 @@ async fn a_cross_site_page_never_carries_the_refresh_cookie() {
     }
 }
 
-/// The latch the RFC demands: a cookie-carrying request without the marker
-/// header is treated as the native contract it pretends to be, and the native
-/// contract without a body token is refused before the session is touched.
+/// The latch the RFC demands: an unmarked cross-site refresh, whose `Strict`
+/// cookie the browser withholds, is treated as the native contract, and the
+/// native contract without a body token is refused before any session is
+/// touched.
 #[wasm_bindgen_test]
 async fn a_cookie_only_request_reaches_nothing() {
     let global: WorkerGlobalScope = js_sys::global()
