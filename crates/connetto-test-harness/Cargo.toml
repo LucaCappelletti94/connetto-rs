@@ -67,6 +67,11 @@ testcontainers = { version = "0.28", features = [
   "http_wait_plain",
   "watchdog",
 ] }
+# A readiness probe client with a per-request timeout, handed to testcontainers'
+# HTTP wait, whose own client has none. The version testcontainers takes.
+reqwest = { version = "0.13", default-features = false }
+# Reading the test binary path out of cargo's build messages.
+serde_json = "1"
 axum = "0.8"
 openidconnect = { version = "4.0.1", default-features = false, features = [
   "reqwest",

@@ -86,6 +86,9 @@ fn which_chromedriver(name: &str) -> bool {
 
 // ── WebDriver client ──────────────────────────────────────────────────────
 
+/// Budget for a new session, chromedriver's own browser-launch limit.
+const SESSION_START: Duration = Duration::from_secs(60);
+
 struct WebDriver {
     client: Client,
     base: String,
@@ -124,8 +127,10 @@ impl WebDriver {
         });
 
         let url = format!("{chromedriver_url}/session");
+        // Chrome launches inside this request, which takes longer than any other command on a loaded runner.
         let resp: Value = client
             .post(&url)
+            .timeout(SESSION_START)
             .json(&body)
             .send()
             .await
