@@ -13,10 +13,10 @@
 //!
 //! Without `--apk` it builds the APK with `dx` for the device's ABI. The demo
 //! and the device's browser are read and driven over the `DevTools` protocol,
-//! because neither exposes web content to `uiautomator`. The login form is
-//! answered from the host with the authorize URL the browser tab shows, and
-//! the browser is sent to the resulting callback so the demo's loopback
-//! listener on the device receives the code. Each step's screenshot and the
+//! because neither exposes web content to `uiautomator`. The demo opens the
+//! login in a Custom Tab, where the driver types the user with trusted input,
+//! so the browser follows the final redirect into the app as it would after a
+//! real tap. Each step's screenshot and the
 //! device log land under `target/android-proof/<serial>-<millis>/`.
 //!
 //! The offline step restarts the host's adb server, which drops every other
@@ -37,7 +37,7 @@ use tokio::process::Command;
 use tokio::time::{Instant, sleep, timeout};
 use tokio_tungstenite::tungstenite::Message;
 
-const PACKAGE: &str = "com.example.ConnettoDioxusDesktopDemo";
+const PACKAGE: &str = "dev.connetto.dioxusdemo";
 const ACTIVITY: &str = "dev.dioxus.main.MainActivity";
 const BROWSER: &str = "com.android.chrome";
 const DEMO_DIR: [&str; 2] = ["examples", "dioxus-desktop-demo"];
@@ -171,23 +171,29 @@ async fn prove(
 
     step("sign in");
     device.launch().await?;
-    let authorize = device.authorize_url(&stack.issuer).await?;
+    // The demo opens the login in a Custom Tab. Typing into it with trusted
+    // input is a user gesture, so the browser follows the final redirect into
+    // the app, which is the path a real tap takes.
+    let mut tab = device.login_tab(&stack.issuer).await?;
     device.screenshot(evidence, "login-page").await?;
-    let callback = answer_login(&authorize).await?;
-    device
-        .adb(&[
-            "shell",
-            "am",
-            "start",
-            "-a",
-            "android.intent.action.VIEW",
-            "-d",
-            &format!("'{callback}'"),
-            BROWSER,
-        ])
+    tab.evaluate("document.querySelector('input[name=username]').focus()")
         .await?;
-    sleep(Duration::from_secs(3)).await;
-    device.launch().await?;
+    tab.call("Input.insertText", serde_json::json!({ "text": USER }))
+        .await?;
+    for kind in ["keyDown", "keyUp"] {
+        tab.call(
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": kind,
+                "key": "Enter",
+                "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+                "text": "\r",
+            }),
+        )
+        .await?;
+    }
+    drop(tab);
     let mut app = device.app().await?;
     app.wait_for_text("status: connected", Duration::from_secs(90))
         .await?;
@@ -323,32 +329,6 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
     Ok(demo.join(
         "target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk",
     ))
-}
-
-/// Submit the dev identity provider's login form as [`USER`] and return
-/// where it redirects, the server's callback carrying the code.
-async fn answer_login(authorize: &str) -> Result<String> {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .context("building the HTTP client")?;
-    let response = http
-        .post(authorize)
-        .form(&[("username", USER)])
-        .send()
-        .await
-        .context("submitting the login form")?;
-    response
-        .headers()
-        .get(reqwest::header::LOCATION)
-        .and_then(|location| location.to_str().ok())
-        .map(ToOwned::to_owned)
-        .ok_or_else(|| {
-            anyhow!(
-                "the login answered {} without a redirect",
-                response.status()
-            )
-        })
 }
 
 async fn order_count(pg_url: &str) -> Result<i64> {
@@ -531,32 +511,25 @@ impl Device {
             .with_context(|| format!("adb forwarded to {port:?}"))
     }
 
-    /// The `DevTools` targets behind one abstract socket on the device.
-    async fn targets(&self, socket: &str) -> Result<Vec<serde_json::Value>> {
-        let port = self.forward(socket).await?;
-        let listing = list_targets(port).await;
-        let _ = self
-            .adb(&["forward", "--remove", &format!("tcp:{port}")])
-            .await;
-        listing
-    }
-
-    /// Wait for the browser tab the demo opened on `issuer`, tapping past
-    /// the browser's first-run screens, and return its full URL.
-    async fn authorize_url(&self, issuer: &str) -> Result<String> {
+    /// A `DevTools` session on the login tab the demo opened on `issuer`,
+    /// tapping past the browser's first-run screens while it appears. The
+    /// forward lives until [`main`] removes every forward.
+    async fn login_tab(&self, issuer: &str) -> Result<Cdp> {
         let prefix = format!("{issuer}/authorize?");
+        let port = self.forward("chrome_devtools_remote").await?;
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let tabs = self
-                .targets("chrome_devtools_remote")
-                .await
-                .unwrap_or_default();
-            if let Some(url) = tabs
+            let tabs = list_targets(port).await.unwrap_or_default();
+            if let Some(ws) = tabs
                 .iter()
-                .filter_map(|tab| tab["url"].as_str())
-                .find(|url| url.starts_with(&prefix))
+                .filter(|tab| {
+                    tab["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with(&prefix))
+                })
+                .find_map(|tab| tab["webSocketDebuggerUrl"].as_str())
             {
-                return Ok(url.to_owned());
+                return Cdp::connect(ws).await;
             }
             self.tap_interstitial().await?;
             if Instant::now() >= deadline {
@@ -636,13 +609,20 @@ impl Cdp {
 
     /// Evaluate `expression` in the page and return its value.
     async fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value> {
+        let result = self
+            .call(
+                "Runtime.evaluate",
+                serde_json::json!({ "expression": expression, "returnByValue": true }),
+            )
+            .await?;
+        Ok(result["result"]["value"].clone())
+    }
+
+    /// Send one `DevTools` request and return its result.
+    async fn call(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
         self.next_id += 1;
         let id = self.next_id;
-        let request = serde_json::json!({
-            "id": id,
-            "method": "Runtime.evaluate",
-            "params": { "expression": expression, "returnByValue": true },
-        });
+        let request = serde_json::json!({ "id": id, "method": method, "params": params });
         self.socket
             .send(Message::Text(request.to_string()))
             .await
@@ -664,7 +644,7 @@ impl Cdp {
                 if let Some(error) = reply.get("error") {
                     bail!("DevTools request {id} failed: {error}");
                 }
-                return Ok(reply["result"]["result"]["value"].clone());
+                return Ok(reply["result"].clone());
             }
         }
     }

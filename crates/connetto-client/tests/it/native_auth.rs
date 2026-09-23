@@ -15,8 +15,9 @@
 use std::sync::Arc;
 
 use connetto_client::{
-    AcquiredSession, BrowserOpener, ClientError, Grant, MemoryKeyStore, MemoryRefreshStore,
-    NativeAuthenticator, encode_identity, provision_replica_key, replica_db_name,
+    AcquiredSession, AuthorizationSession, BrowserOpener, ClientError, Grant, MemoryKeyStore,
+    MemoryRefreshStore, NativeAuthenticator, encode_identity, provision_replica_key,
+    replica_db_name,
 };
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, RefreshTokenStore, ReplicaKeyStore};
 use connetto_server::{
@@ -55,14 +56,15 @@ impl IdentityResolver for TypedResolver {
 /// Serve the auth router on an ephemeral port and return the base URL and idp
 /// guard.
 async fn spawn_auth_server() -> (String, MockOauth) {
-    let (base, _service, idp) = spawn_auth_server_with_service().await;
+    let (base, _service, idp) = spawn_auth_server_with_service(Vec::new()).await;
     (base, idp)
 }
 
 /// As [`spawn_auth_server`], also handing back the service so a test can ask the
 /// real handshake verifier what it makes of a token.
-async fn spawn_auth_server_with_service() -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth)
-{
+async fn spawn_auth_server_with_service(
+    redirect_allowlist: Vec<String>,
+) -> (String, Arc<AuthService<InMemoryAuthStore>>, MockOauth) {
     // Bind connetto's listener first so the callback URL is known.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
@@ -92,7 +94,7 @@ async fn spawn_auth_server_with_service() -> (String, Arc<AuthService<InMemoryAu
     let router = auth_router(
         Arc::clone(&service),
         Arc::new(registry),
-        RedirectPolicy::default(),
+        RedirectPolicy::new(redirect_allowlist),
         connetto_server::CookieSameSite::Strict,
     );
     tokio::spawn(async move {
@@ -416,7 +418,7 @@ async fn a_replica_key_is_provisioned_once_and_cached_per_identity() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, service, _idp) = spawn_auth_server_with_service().await;
+    let (base, service, _idp) = spawn_auth_server_with_service(Vec::new()).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
 
     let login =
@@ -503,7 +505,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_first_login_logout_revokes_its_own_session() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
-    let (base, service, _idp) = spawn_auth_server_with_service().await;
+    let (base, service, _idp) = spawn_auth_server_with_service(Vec::new()).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     let authenticator =
         NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
@@ -578,4 +580,97 @@ fn memory_refresh_store_round_trips() {
     );
     store.clear("any-key").unwrap();
     assert!(store.load("any-key").unwrap().is_none(), "cleared");
+}
+
+/// The redirect a mobile build registers with its operating system.
+const APP_REDIRECT: &str = "dev.connetto.test:/oauth2redirect";
+
+/// Walk the login chain as `subject` and return the redirect the server sends
+/// to `redirect`, where the operating system would hand the app its code.
+async fn walk_to_app_redirect(login_url: String, subject: &str, redirect: &str) -> String {
+    let http = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .expect("http client");
+    let mut next = login_url;
+    for _ in 0..6 {
+        if next.starts_with(redirect) {
+            return next;
+        }
+        let response = if next.ends_with("/authorize") || next.contains("/authorize?") {
+            http.post(&next)
+                .form(&[("username", subject)])
+                .send()
+                .await
+                .expect("submit the login form")
+        } else {
+            http.get(&next).send().await.expect("follow a hop")
+        };
+        response
+            .headers()
+            .get("location")
+            .expect("every hop redirects")
+            .to_str()
+            .expect("utf8 location")
+            .clone_into(&mut next);
+    }
+    panic!("the login never reached {redirect}");
+}
+
+/// A mobile build signs in through its own redirect, which the server allows
+/// by exact match, and the app's session hands back the URL carrying the code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claimed_redirect_login_completes_through_the_apps_session() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let session: AuthorizationSession = Arc::new(|url: String| {
+        Box::pin(async move { Ok(walk_to_app_redirect(url, "mobile-user", APP_REDIRECT).await) })
+    });
+    let panicking: BrowserOpener =
+        Arc::new(|_url: &str| panic!("a claimed redirect never opens the loopback browser"));
+    let authenticator = Arc::new(
+        NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
+            .with_browser_opener(panicking)
+            .with_claimed_redirect(APP_REDIRECT, session),
+    );
+
+    let login = authenticator.login::<String>().await.expect("login");
+
+    let account = encode_identity(&login.user_id).expect("encode account");
+    assert!(
+        store.load(&account).expect("load").is_some(),
+        "the refresh token is stored for the account the login revealed"
+    );
+    let token = authenticator.token_source().token().await.expect("refresh");
+    assert!(!token.is_empty(), "the session refreshes like any other");
+}
+
+/// A callback whose `state` is not the one this login sent is refused, so a
+/// redirect planted by another party cannot complete somebody else's login.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let session: AuthorizationSession = Arc::new(|url: String| {
+        Box::pin(async move {
+            let callback = walk_to_app_redirect(url, "mobile-user", APP_REDIRECT).await;
+            let (before, after) = callback.split_once("state=").expect("a state");
+            let rest = after.split_once('&').map_or("", |(_, rest)| rest);
+            Ok(format!("{before}state=forged&{rest}"))
+        })
+    });
+    let authenticator = NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, store, None)
+        .with_claimed_redirect(APP_REDIRECT, session);
+
+    match authenticator.login::<String>().await {
+        Err(ClientError::Auth(message)) => assert!(message.contains("state"), "{message}"),
+        other => panic!(
+            "expected a state refusal, got {:?}",
+            other.map(|s| s.user_id)
+        ),
+    }
 }

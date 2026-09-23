@@ -1,0 +1,4 @@
+[bundle]
+# The Android applicationId and the iOS bundle identifier. It is also the
+# scheme of the login redirect a phone receives, so it stays lowercase.
+identifier = "dev.connetto.dioxusdemo"
