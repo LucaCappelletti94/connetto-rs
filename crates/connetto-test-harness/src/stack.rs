@@ -231,18 +231,6 @@ pub async fn generate_keys(label: &str) -> Result<KeyDir> {
     })
 }
 
-/// A child process killed on drop.
-pub struct ChildGuard {
-    /// The process.
-    pub child: Child,
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        let _ = self.child.start_kill();
-    }
-}
-
 /// A task aborted on drop.
 pub struct TaskGuard {
     /// The task.
@@ -256,7 +244,8 @@ impl Drop for TaskGuard {
 }
 
 /// Spawn `connetto-server` with `envs`, its auth listener on `auth_bind`,
-/// and wait until both listeners accept.
+/// and wait until both listeners accept. Dropping the returned child, or any
+/// error on the way, kills the server.
 ///
 /// # Errors
 ///
@@ -266,20 +255,21 @@ pub async fn spawn_server(
     envs: &[(String, String)],
     sync_bind: &str,
     auth_bind: &str,
-) -> Result<ChildGuard> {
+) -> Result<Child> {
     let mut child = Command::new(server_bin)
         .envs(envs.iter().cloned())
         .env("CONNETTO_AUTH_BIND", auth_bind)
         // The server logs to stdout. Nulling it hid every server line from CI.
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
+        .kill_on_drop(true)
         .spawn()
         .context("spawning connetto-server")?;
     wait_for_child_port(&mut child, sync_bind, "connetto-server").await?;
     if !wait_for_tcp(auth_bind, Duration::from_secs(20)).await {
         return Err(anyhow!("connetto-server did not open {auth_bind}"));
     }
-    Ok(ChildGuard { child })
+    Ok(child)
 }
 
 /// Build the release `connetto-server` unless `CONNETTO_SERVER_BIN` names

@@ -17,15 +17,15 @@ use connetto_server::{
     connetto_auth_tables,
 };
 use connetto_test_harness::stack::{
-    ChildGuard, Deployment, KeyDir, Provisioned, TaskGuard, display_command, ensure_server_bin,
-    exe_name, provision, repo_path, require_free, require_success, run_process, spawn_server,
-    strings, wait_for_tcp, wait_until_closed,
+    Deployment, KeyDir, Provisioned, TaskGuard, display_command, ensure_server_bin, exe_name,
+    provision, repo_path, require_free, require_success, run_process, spawn_server, strings,
+    wait_for_tcp, wait_until_closed,
 };
 use connetto_test_harness::{Fixture, MockOauth};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use tokio::process::Command;
+use tokio::process::{Child, Command};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 const SYNC_BIND: &str = "127.0.0.1:7777";
@@ -323,7 +323,7 @@ async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
     Ok(TaskGuard { handle })
 }
 
-async fn start_sync_server(services: &Services) -> Result<ChildGuard> {
+async fn start_sync_server(services: &Services) -> Result<Child> {
     // The child's auth listener carries the file routes the suites fetch.
     spawn_server(
         &services.server_bin,

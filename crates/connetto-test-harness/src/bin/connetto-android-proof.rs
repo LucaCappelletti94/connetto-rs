@@ -91,6 +91,8 @@ async fn main() -> Result<()> {
         eprintln!("proof failed: {err:#}");
     }
     let _ = device.adb(&["forward", "--remove-all"]).await;
+    let _ = device.adb(&["reverse", "--remove-all"]).await;
+    let _ = device.adb(&["shell", "am", "force-stop", PACKAGE]).await;
     let restored = match previous.as_deref() {
         Some(holder) => device.set_browser_role_holder(holder).await,
         None => device
