@@ -399,7 +399,7 @@ async fn a_viewer_heals_and_the_uploader_keeps_the_file() {
 
     let (status, body) = download(&app, &signer, &setup.file_id).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body == setup.data);
+    assert_eq!(FileId::from_chunks([&body[..]]), setup.file_id);
     let mut conn = connect_admin(&setup.pg.url_admin).await;
     assert_eq!(
         manifest_rows(&mut conn, &setup.file_id).await,
@@ -467,7 +467,7 @@ async fn a_healer_chunking_the_file_differently_restores_every_manifest_whole() 
     );
     let (status, body) = download(&app, &signer, &setup.file_id).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body == setup.data);
+    assert_eq!(FileId::from_chunks([&body[..]]), setup.file_id);
     let mut conn = connect_admin(&setup.pg.url_admin).await;
     assert_eq!(
         manifest_rows(&mut conn, &setup.file_id).await,

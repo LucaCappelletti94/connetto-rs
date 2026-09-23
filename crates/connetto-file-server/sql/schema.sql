@@ -18,6 +18,8 @@ CREATE TABLE IF NOT EXISTS _cfs_manifests (
     lost           BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (file_id, uploaded_by)
 );
+-- A deployment created before the lost column gains it when this file is applied again.
+ALTER TABLE _cfs_manifests ADD COLUMN IF NOT EXISTS lost BOOLEAN NOT NULL DEFAULT FALSE;
 
 -- Per-chunk records: ordered, referencing the manifest row by composite key.
 CREATE TABLE IF NOT EXISTS _cfs_manifest_chunks (

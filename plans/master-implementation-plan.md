@@ -4888,6 +4888,7 @@ Both listeners open only after the boot rows are settled, so no refresh reaches 
 | Event | Authored entry | Heal entry |
 |---|---|---|
 | A heal query names a held file not in the outbox | not applicable | queued |
+| The same file is staged or imported here | kept | becomes authored, keeping any refusal (2026-09-23, PR #59 review) |
 | The heal query stops naming it, another device having healed it | kept | dropped before upload, so a viewer never becomes an extra uploader of a healed file |
 | Upload succeeds | dequeued | dequeued |
 | Upload refused | kept as refused | kept as refused until the query stops naming it |

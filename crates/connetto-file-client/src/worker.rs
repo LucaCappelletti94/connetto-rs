@@ -2480,6 +2480,41 @@ mod tests {
         );
     }
 
+    /// A file queued to heal and then staged or imported here is authored, so it counts as pending and is never retired quietly.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_heal_entry_whose_file_is_then_authored_here_becomes_authored() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("heal-then-author"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let file_id = file(0xDD);
+        db::enqueue_heal(connection.conn(), file_id).expect("queue a heal");
+        db::refuse(connection.conn(), file_id, "over the quota").expect("refuse the heal");
+        db::enqueue(connection.conn(), file_id).expect("author the same file");
+
+        assert!(!db::is_heal(connection.conn(), file_id).expect("read the kind"));
+        assert_eq!(db::outbox_count(connection.conn()).expect("count"), 1);
+        assert!(
+            db::sendable(connection.conn())
+                .expect("sendable")
+                .is_empty(),
+            "the refusal stays until an explicit retry, as for any authored entry"
+        );
+    }
+
     /// The integrity walk retires a refused entry whose bytes are conclusively gone, so a
     /// refusal does not make a loss invisible.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]

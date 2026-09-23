@@ -308,6 +308,9 @@ where
     fn delete_registry_row_stmt(hash: Vec<u8>)
     -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
+    /// Build `INSERT INTO chunk_registry (chunk_hash, state) VALUES (?, 'deleting') ON CONFLICT DO NOTHING`, claiming an orphan for deletion the way the sweep marks one.
+    fn claim_orphan_stmt(hash: Vec<u8>) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
     /// Build `DELETE FROM manifests WHERE NOT committed AND NOT lost AND created_at < cutoff RETURNING file_id`.
     ///
     /// The `RETURNING` clause is the reason this returns a loadable type: the
@@ -350,7 +353,7 @@ where
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String, i64)> + Send + 'static;
 
     /// Build `UPDATE manifests SET committed = FALSE, lost = TRUE,
-    /// accepted_bytes = accepted_bytes - missing WHERE file_id = ? AND uploaded_by = ?`.
+    /// accepted_bytes = accepted_bytes - missing WHERE file_id = ? AND uploaded_by = ? AND NOT lost`.
     fn mark_manifest_lost_stmt(
         file_id: Vec<u8>,
         caller: String,
@@ -856,6 +859,19 @@ macro_rules! connetto_file_tables {
                     diesel::ExpressionMethods::eq($chunk_registry::chunk_hash, hash),
                 ))
             }
+            fn claim_orphan_stmt(
+                hash: Vec<u8>,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::insert_into($chunk_registry::table)
+                    .values((
+                        diesel::ExpressionMethods::eq($chunk_registry::chunk_hash, hash),
+                        diesel::ExpressionMethods::eq($chunk_registry::state, "deleting"),
+                    ))
+                    .on_conflict_do_nothing()
+            }
             fn delete_orphaned_stmt(
                 cutoff: chrono::DateTime<chrono::Utc>,
             ) -> impl for<'q> diesel_async::methods::LoadQuery<
@@ -995,7 +1011,10 @@ macro_rules! connetto_file_tables {
             + 'static {
                 diesel::update(diesel::QueryDsl::filter(
                     $manifests::table,
-                    Self::manifest_pk_eq(file_id, caller),
+                    diesel::BoolExpressionMethods::and(
+                        Self::manifest_pk_eq(file_id, caller),
+                        diesel::ExpressionMethods::eq($manifests::lost, false),
+                    ),
                 ))
                 .set((
                     diesel::ExpressionMethods::eq($manifests::committed, false),

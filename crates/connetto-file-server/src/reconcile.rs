@@ -68,6 +68,7 @@ pub async fn reconcile_store<S: ConnettoFileSchema>(
         .checked_sub(grace)
         .ok_or(ReconcileError::GracePeriodOutOfRange)?;
     // A PUT writes only under an existing registry row, so every chunk in a listing taken first has its row in the later read.
+    // A declaration landing after that read on another replica is caught by the claim each deletion takes first.
     let listed = store.list().await?;
     let mut conn = pool.get().await?;
     let registry: Vec<(Vec<u8>, String)> = S::registry_rows_stmt().load(&mut conn).await?;
@@ -77,10 +78,23 @@ pub async fn reconcile_store<S: ConnettoFileSchema>(
 
     let mut outcome = StoreReconciled::default();
     for chunk in &listed {
-        if chunk.modified <= cutoff && !known.contains(chunk.hash.as_bytes().as_slice()) {
-            store.delete(&chunk.hash).await?;
-            outcome.orphans_removed += 1;
+        if chunk.modified > cutoff || known.contains(chunk.hash.as_bytes().as_slice()) {
+            continue;
         }
+        let hash = chunk.hash.as_bytes().to_vec();
+        // A `deleting` row makes a concurrent intent or PUT refuse, as during the sweep.
+        if conn
+            .execute_returning_count(S::claim_orphan_stmt(hash.clone()))
+            .await?
+            == 0
+        {
+            continue;
+        }
+        // A failed deletion leaves the claim for the sweep to finish.
+        store.delete(&chunk.hash).await?;
+        conn.execute_returning_count(S::delete_registry_row_stmt(hash))
+            .await?;
+        outcome.orphans_removed += 1;
     }
 
     let mut missing: Vec<Vec<u8>> = Vec::new();
@@ -112,13 +126,15 @@ pub async fn reconcile_store<S: ConnettoFileSchema>(
             continue;
         };
         let id = FileId::from_bytes(bytes);
-        mark_lost::<S>(&mut conn, settings, &file_id, &manifests, &missing)
+        let marked = mark_lost::<S>(&mut conn, settings, &file_id, &manifests, &missing)
             .await
             .map_err(|source| ReconcileError::Setter {
                 file_id: id,
                 source,
             })?;
-        outcome.lost.push(id);
+        if marked {
+            outcome.lost.push(id);
+        }
     }
 
     // Last, so a pass stopped part way finds the same chunks again at the next boot.
@@ -129,22 +145,30 @@ pub async fn reconcile_store<S: ConnettoFileSchema>(
     Ok(outcome)
 }
 
-/// One file's manifests turn lost and the setter hears `lost`, all or nothing.
+/// One file's manifests turn lost and the setter hears `lost`, all or nothing, returning whether any manifest turned.
+///
+/// A manifest another replica's pass already marked is skipped, so its tally and the setter see one transition.
 async fn mark_lost<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
     settings: &CallerSettings,
     file_id: &[u8],
     manifests: &BTreeMap<String, i64>,
     missing: &[Vec<u8>],
-) -> Result<(), diesel::result::Error> {
-    conn.transaction::<(), diesel::result::Error, _>(async move |c| {
+) -> Result<bool, diesel::result::Error> {
+    conn.transaction::<bool, diesel::result::Error, _>(async move |c| {
+        let mut marked = false;
         for (key, missing_bytes) in manifests {
-            c.execute_returning_count(S::mark_manifest_lost_stmt(
+            if c.execute_returning_count(S::mark_manifest_lost_stmt(
                 file_id.to_vec(),
                 key.clone(),
                 *missing_bytes,
             ))
-            .await?;
+            .await?
+                == 0
+            {
+                continue;
+            }
+            marked = true;
             c.execute_returning_count(S::unstore_manifest_chunks_stmt(
                 file_id.to_vec(),
                 key.clone(),
@@ -161,7 +185,7 @@ async fn mark_lost<S: ConnettoFileSchema>(
                 .await?;
             }
         }
-        Ok(())
+        Ok(marked)
     })
     .await
 }

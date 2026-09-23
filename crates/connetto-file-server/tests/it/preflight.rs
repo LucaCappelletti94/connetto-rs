@@ -40,6 +40,34 @@ async fn preflight_happy_path_passes() {
         .expect("preflight must pass with correct DDL");
 }
 
+/// A deployment created before the `lost` column upgrades by applying `DEPLOYMENT_DDL` again.
+#[tokio::test]
+async fn reapplying_the_ddl_upgrades_manifests_from_before_the_lost_column() {
+    let pg = Pg::start().await;
+    let mut conn = connect_admin(&pg.url_admin).await;
+    diesel::sql_query("DROP TABLE _cfs_manifests CASCADE")
+        .execute(&mut conn)
+        .await
+        .expect("drop the fixture's manifests");
+    diesel::sql_query(
+        "CREATE TABLE _cfs_manifests (
+             file_id        BYTEA        NOT NULL,
+             total_len      BIGINT       NOT NULL,
+             accepted_bytes BIGINT       NOT NULL DEFAULT 0,
+             committed      BOOLEAN      NOT NULL DEFAULT FALSE,
+             uploaded_by    TEXT         NOT NULL,
+             created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+             PRIMARY KEY (file_id, uploaded_by))",
+    )
+    .execute(&mut conn)
+    .await
+    .expect("the manifests table as it was deployed");
+    setup_with(&mut conn, &[]).await;
+    preflight::<DefaultFileSchema>(&mut conn)
+        .await
+        .expect("the reapplied DDL adds what preflight requires");
+}
+
 /// `_cfs_manifests.file_id` typed as TEXT instead of BYTEA is refused by name.
 #[tokio::test]
 async fn preflight_refuses_wrong_column_type() {

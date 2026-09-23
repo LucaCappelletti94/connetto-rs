@@ -259,13 +259,16 @@ pub(crate) fn is_heal(
         .map(|n| n > 0)
 }
 
-/// Records that a file is authored here and not yet uploaded.
+/// Records that a file is authored here and not yet uploaded, turning a queued heal of it authored.
 pub(crate) fn enqueue(
     conn: &mut SqliteConnection,
     file_id: FileId,
 ) -> Result<(), diesel::result::Error> {
-    diesel::insert_or_ignore_into(_connetto_content_outbox::table)
+    diesel::insert_into(_connetto_content_outbox::table)
         .values(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .on_conflict(_connetto_content_outbox::file_id)
+        .do_update()
+        .set(_connetto_content_outbox::heal.eq(false))
         .execute(conn)
         .map(|_| ())
 }
