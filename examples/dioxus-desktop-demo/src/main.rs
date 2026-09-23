@@ -588,13 +588,10 @@ enum WipeState {
 
 #[component]
 fn App() -> Element {
-    let restart = use_context::<Restart>();
     let client = use_context::<ConnettoClient<Ws>>();
     let backend = use_context::<Backend>();
     let auth_ctx = use_context::<AuthCtx>();
-    let content = use_context::<Content>();
 
-    // Live queries.
     let rows = use_live::<_, _, Order>(
         &client,
         orders::table.order((orders::created_at.asc(), orders::id.asc())),
@@ -606,7 +603,6 @@ fn App() -> Element {
             .group_by(orders::quantity)
             .select((orders::quantity, diesel::dsl::count_star())),
     );
-    let photos_query = use_live::<_, _, Photo>(&client, photos::table.order(photos::id.asc()));
 
     // Client event status line.
     let mut status: Signal<String> = use_signal(|| "connected".to_owned());
@@ -622,85 +618,9 @@ fn App() -> Element {
         })
     });
 
-    // Content event stream: track uploads, losses, and refusals.
-    let mut content_status: Signal<String> = use_signal(String::new);
-    let mut retired_files: Signal<Vec<FileId>> = use_signal(Vec::new);
-    let mut refused_uploads: Signal<Vec<(FileId, String)>> = use_signal(Vec::new);
-    let content_event_rx = content.events();
-    use_hook(move || {
-        spawn(async move {
-            let mut rx = content_event_rx;
-            while let Ok(event) = rx.recv().await {
-                match event {
-                    ContentEvent::Uploaded { file_id } => {
-                        content_status.set(format!("uploaded {}", short_hex(file_id.as_bytes())));
-                    }
-                    ContentEvent::UploadDeferred { file_id, detail } => {
-                        content_status.set(format!(
-                            "deferred {}: {detail}",
-                            short_hex(file_id.as_bytes())
-                        ));
-                    }
-                    ContentEvent::UploadRefused { file_id, detail } => {
-                        content_status.set(format!(
-                            "refused {}: {detail}",
-                            short_hex(file_id.as_bytes())
-                        ));
-                        refused_uploads.write().push((file_id, detail));
-                    }
-                    ContentEvent::BytesLost {
-                        file_id,
-                        unreadable,
-                    } => {
-                        content_status.set(format!(
-                            "bytes lost {} ({unreadable} unreadable chunks)",
-                            short_hex(file_id.as_bytes())
-                        ));
-                        retired_files.write().push(file_id);
-                    }
-                    ContentEvent::Fetched { file_id } => {
-                        content_status.set(format!("fetched {}", short_hex(file_id.as_bytes())));
-                    }
-                    ContentEvent::IntegrityPassFailed { detail } => {
-                        content_status.set(format!("integrity check failed: {detail}"));
-                    }
-                }
-            }
-        })
-    });
-
-    // Seed the failure lists from what the content client already persists,
-    // so a restart does not hide last run's refusals and lost files.
-    {
-        let cc = content.clone();
-        let mut refused_seed = refused_uploads;
-        let mut retired_seed = retired_files;
-        use_hook(move || {
-            spawn(async move {
-                if let Ok(list) = cc.refused_content().await {
-                    for entry in list {
-                        // The event stream is already live, so a fresh
-                        // refusal may arrive before this query returns.
-                        let seen = refused_seed.read().iter().any(|(id, _)| *id == entry.0);
-                        if !seen {
-                            refused_seed.write().push(entry);
-                        }
-                    }
-                }
-                if let Ok(list) = cc.retired_content().await {
-                    for id in list {
-                        let seen = retired_seed.read().contains(&id);
-                        if !seen {
-                            retired_seed.write().push(id);
-                        }
-                    }
-                }
-            });
-        });
-    }
-
-    // Session expiry warning.
+    // Session expiry warning and replica footprint, both refreshed as rows change.
     let mut expiry_warn: Signal<Option<String>> = use_signal(|| None);
+    let mut footprint: Signal<(i64, i64)> = use_signal(|| (0_i64, 0_i64));
     {
         let client = client.clone();
         let session_expires_at = auth_ctx.session_expires_at;
@@ -708,91 +628,13 @@ fn App() -> Element {
             let _ = rows.value().read().len();
             let client = client.clone();
             spawn(async move {
-                let unsynced = client.with_conn(|c| c.unsynced()).await;
-                let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-                if let Some(w) = expiry_warning(
-                    std::time::SystemTime::now(),
-                    session_expires_at,
-                    lead,
-                    unsynced,
-                    0,
-                ) {
-                    let remaining = w
-                        .session_expires_at
-                        .duration_since(std::time::SystemTime::now())
-                        .unwrap_or_default();
-                    let days = remaining.as_secs() / 86400;
-                    expiry_warn.set(Some(format!(
-                        "Session expires in {days} day(s): {} pending local item(s) at risk. \
-                         Stay connected to extend the deadline automatically.",
-                        w.pending_count()
-                    )));
-                } else {
-                    expiry_warn.set(None);
-                }
-            });
-        });
-    }
-
-    // Replica page footprint.
-    let mut footprint: Signal<(i64, i64)> = use_signal(|| (0_i64, 0_i64));
-    {
-        let client = client.clone();
-        use_effect(move || {
-            let _ = rows.value().read().len();
-            let client = client.clone();
-            spawn(async move {
+                expiry_warn.set(expiry_text(&client, session_expires_at).await);
                 footprint.set(replica_footprint(&client).await);
             });
         });
     }
 
-    // Resolve display srcs for available photos: local bytes become data: URIs,
-    // remote signed URLs go straight to the webview.
-    let mut photo_srcs: Signal<HashMap<Uuid, String>> = use_signal(HashMap::new);
-    {
-        let cc = content.clone();
-        use_effect(move || {
-            let photos = photos_query.value().read().clone();
-            let cc = cc.clone();
-            spawn(async move {
-                let mut srcs = HashMap::new();
-                for photo in &photos {
-                    let available = photo.content_state.as_deref() == Some("available");
-                    let Some(fid) = photo_file_id(&photo.content_id) else {
-                        continue;
-                    };
-                    match cc.resolve(fid).await {
-                        // Local bytes render at every state: content this
-                        // device staged answers as Local while it is still
-                        // unsent, so a freshly picked photo shows immediately.
-                        Ok(Resolved::Local { bytes, .. }) => {
-                            let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
-                            srcs.insert(photo.id, format!("data:image/jpeg;base64,{enc}"));
-                        }
-                        // A signed URL is trustworthy only once the server
-                        // says the content is available for this row.
-                        Ok(Resolved::Remote { url }) if available => {
-                            srcs.insert(photo.id, url);
-                        }
-                        _ => {}
-                    }
-                }
-                photo_srcs.set(srcs);
-            });
-        });
-    }
-
-    let mut wipe_state: Signal<WipeState> = use_signal(|| WipeState::Idle);
-    let mut add_picking: Signal<bool> = use_signal(|| false);
-    let mut export_status: Signal<Option<String>> = use_signal(|| None);
-    let mut import_status: Signal<Option<String>> = use_signal(|| None);
-    let mut photo_pick_msg: Signal<Option<String>> = use_signal(|| None);
-    let mut photo_pin_msg: Signal<Option<String>> = use_signal(|| None);
-
-    let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
-    let current_account = auth_ctx.current_account.clone();
-    let token_store = Arc::clone(&auth_ctx.token_store);
+    let wipe_state: Signal<WipeState> = use_signal(|| WipeState::Idle);
 
     let display_rows: Vec<(Uuid, i64)> = rows
         .value()
@@ -806,72 +648,13 @@ fn App() -> Element {
         .map_or_else(|| "pending".to_owned(), |v| v.to_string());
     let rows_error = rows.error().read().clone();
     let count_error = count.error().read().clone();
-    let mut grouped_counts: Vec<(i64, i64)> = counts_by_quantity
-        .value()
-        .read()
-        .iter()
-        .map(|(quantity, count)| (*quantity, *count))
-        .collect();
-    grouped_counts.sort_unstable();
-    let grouped_text = if grouped_counts.is_empty() {
-        "pending".to_owned()
-    } else {
-        grouped_counts
-            .iter()
-            .map(|(quantity, count)| format!("{quantity}: {count}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
+    let grouped_text = grouped_label(&counts_by_quantity.value().read());
     let grouped_error = counts_by_quantity.error().read().clone();
-
-    let display_photos: Vec<Photo> = photos_query.value().read().iter().cloned().collect();
-    let photos_error = photos_query.error().read().clone();
-    let srcs_snap = photo_srcs.read().clone();
-    let retired_snap = retired_files.read().clone();
-    let refused_snap = refused_uploads.read().clone();
-
-    let (pages, free) = *footprint.read();
-    let kb = pages * 4;
     let pid = std::process::id();
-    let replica_label = auth_ctx.key_name.clone();
 
     let insert_backend = backend.clone();
     let delete_backend = backend;
-    let write_client = client.clone();
-    let tidy_client = client.clone();
-    let wipe_client = client.clone();
-    let force_client = client.clone();
-    let switch_client = client.clone();
-    let add_client = client.clone();
-    let export_content = content.clone();
-    let import_content = content.clone();
-    let pick_content = content.clone();
-    let pin_content = content.clone();
-    let tidy_content_handle = content.clone();
-    let fetch_content = content.clone();
-    let unpin_content = content.clone();
-    let retry_content = content.clone();
-    let forget_content = content.clone();
-
-    let auth_data = (
-        Arc::clone(&auth_ctx.authenticator),
-        auth_ctx.db_path.clone(),
-        Arc::clone(&auth_ctx.key_store),
-        auth_ctx.key_name.clone(),
-    );
-    let auth_data_force = auth_data.clone();
-
-    let token_store_add = Arc::clone(&token_store);
-
-    let accounts_snap = accounts_list.read().clone();
-    let account_items: Vec<(String, String, bool)> = accounts_snap
-        .iter()
-        .map(|key| {
-            let display = decode_identity::<String>(key).unwrap_or_else(|_| key.clone());
-            let is_current = *key == current_account;
-            (key.clone(), display, is_current)
-        })
-        .collect();
+    let write_client = client;
 
     rsx! {
         div {
@@ -891,205 +674,8 @@ fn App() -> Element {
                 }
             }
 
-            div {
-                style: "background: #f0f4ff; border: 1px solid #c0c8e8; \
-                        border-radius: 6px; padding: 10px 14px; margin-bottom: 16px;",
-                p {
-                    style: "margin: 0 0 6px 0; font-size: 0.9em; color: #444;",
-                    "Mode: " strong { "Signed in (private encrypted replica)" }
-                }
-                p {
-                    style: "margin: 0 0 8px 0; font-size: 0.85em; color: #555;",
-                    "Replica: {replica_label}"
-                }
-                {match wipe_state.read().clone() {
-                    WipeState::Idle => rsx! {
-                        button {
-                            onclick: move |_| {
-                                let (auth, path, ks, kn) = auth_data.clone();
-                                let cl = wipe_client.clone();
-                                spawn(async move {
-                                    let unsynced = cl.with_conn(|c| c.unsynced()).await;
-                                    match forget_device(
-                                        &auth, &path, ks.as_ref(), &kn, &unsynced, false,
-                                    )
-                                    .await
-                                    {
-                                        Ok(()) => restart.request(),
-                                        Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) => {
-                                            wipe_state.set(WipeState::ConfirmForce {
-                                                unsynced_count: seqs.len(),
-                                            });
-                                        }
-                                        Err(err) => {
-                                            wipe_state.set(WipeState::Error(format!(
-                                                "logout error: {err}"
-                                            )));
-                                        }
-                                    }
-                                });
-                            },
-                            "Sign out (wipe local replica)"
-                        }
-                    },
-                    WipeState::ConfirmForce { unsynced_count } => rsx! {
-                        div {
-                            style: "background: #fff8e1; border: 1px solid #f0c040; \
-                                    border-radius: 6px; padding: 8px 12px; margin-top: 6px;",
-                            p {
-                                style: "margin: 0 0 6px 0;",
-                                "{unsynced_count} write(s) are not yet synced and will be permanently lost."
-                            }
-                            div {
-                                style: "display: flex; gap: 6px;",
-                                button {
-                                    onclick: move |_| {
-                                        let (auth, path, ks, kn) = auth_data_force.clone();
-                                        let cl = force_client.clone();
-                                        spawn(async move {
-                                            let unsynced = cl.with_conn(|c| c.unsynced()).await;
-                                            match forget_device(
-                                                &auth, &path, ks.as_ref(), &kn, &unsynced, true,
-                                            )
-                                            .await
-                                            {
-                                                Ok(()) => restart.request(),
-                                                Err(err) => {
-                                                    wipe_state.set(WipeState::Error(format!(
-                                                        "logout error: {err}"
-                                                    )));
-                                                }
-                                            }
-                                        });
-                                    },
-                                    "Confirm: discard and wipe"
-                                }
-                                button {
-                                    onclick: move |_| wipe_state.set(WipeState::Idle),
-                                    "Cancel"
-                                }
-                            }
-                        }
-                    },
-                    WipeState::Error(msg) => rsx! {
-                        p {
-                            style: "color: #b00; margin: 6px 0 0 0; font-size: 0.85em;",
-                            {msg}
-                        }
-                        button {
-                            onclick: move |_| wipe_state.set(WipeState::Idle),
-                            "Dismiss"
-                        }
-                    },
-                }}
-            }
-
-            div {
-                style: "border: 1px solid #ccc; border-radius: 6px; \
-                        padding: 10px 14px; margin-bottom: 16px;",
-                h3 {
-                    style: "margin: 0 0 8px 0; font-size: 1em;",
-                    "Accounts"
-                }
-                for (acc_key, display, is_current) in account_items {
-                    div {
-                        key: "{acc_key}",
-                        style: "display: flex; align-items: center; gap: 8px; margin-bottom: 4px;",
-                        span { style: "flex: 1;", {display} }
-                        if is_current {
-                            span {
-                                style: "font-size: 0.8em; color: #555; font-style: italic;",
-                                "(current)"
-                            }
-                        } else {
-                            {
-                                let ts = Arc::clone(&token_store);
-                                let cl = switch_client.clone();
-                                let key = acc_key.clone();
-                                rsx! {
-                                    button {
-                                        onclick: move |_| {
-                                            let ts = Arc::clone(&ts);
-                                            let cl = cl.clone();
-                                            let key = key.clone();
-                                            spawn(async move {
-                                                let unsynced =
-                                                    cl.with_conn(|c| c.unsynced()).await;
-                                                if !unsynced.is_empty() {
-                                                    wipe_state.set(WipeState::Error(format!(
-                                                        "Cannot switch: {} write(s) not yet synced.",
-                                                        unsynced.len()
-                                                    )));
-                                                    return;
-                                                }
-                                                if let Err(err) =
-                                                    ts.store(IDENTITY_RECORD, &key)
-                                                {
-                                                    wipe_state.set(WipeState::Error(format!(
-                                                        "Cannot switch account: {err}"
-                                                    )));
-                                                    return;
-                                                }
-                                                restart.request();
-                                            });
-                                        },
-                                        "Switch"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                if *add_picking.read() {
-                    div {
-                        style: "margin-top: 8px; background: #f5f5ff; \
-                                border: 1px solid #c8c8e8; border-radius: 6px; \
-                                padding: 10px 14px;",
-                        p {
-                            style: "margin: 0 0 8px 0; font-size: 0.9em;",
-                            "The app will sign in again and open a browser login page. \
-                             Come back after signing in to finish adding the account."
-                        }
-                        div {
-                            style: "display: flex; gap: 6px; flex-wrap: wrap;",
-                            button {
-                                onclick: move |_| {
-                                    let cl = add_client.clone();
-                                    let ts = Arc::clone(&token_store_add);
-                                    spawn(async move {
-                                        let unsynced = cl.with_conn(|c| c.unsynced()).await;
-                                        if !unsynced.is_empty() {
-                                            wipe_state.set(WipeState::Error(format!(
-                                                "Cannot add account: {} write(s) not yet synced.",
-                                                unsynced.len()
-                                            )));
-                                            return;
-                                        }
-                                        if let Err(err) = ts.clear(IDENTITY_RECORD) {
-                                            wipe_state.set(WipeState::Error(format!(
-                                                "Cannot clear identity pointer: {err}"
-                                            )));
-                                            return;
-                                        }
-                                        restart.request();
-                                    });
-                                },
-                                "Sign in"
-                            }
-                            button {
-                                onclick: move |_| add_picking.set(false),
-                                "Cancel"
-                            }
-                        }
-                    }
-                } else {
-                    button {
-                        style: "margin-top: 6px;",
-                        onclick: move |_| add_picking.set(true),
-                        "Add another account"
-                    }
-                }
-            }
+            SessionPanel { wipe_state }
+            AccountsPanel { wipe_state }
 
             h1 { "connetto live demo" }
             p {
@@ -1171,444 +757,842 @@ fn App() -> Element {
                 }
             }
 
-            // Photos panel: pick, stage, list, display.
-            div {
-                style: "border: 1px solid #ccc; border-radius: 6px; \
-                        padding: 10px 14px; margin-bottom: 16px;",
-                h2 {
-                    style: "margin-top: 0; font-size: 1em;",
-                    "Photos"
-                }
-                if !content_status.read().is_empty() {
-                    p {
-                        style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
-                        "content: " {content_status}
-                    }
-                }
+            PhotosPanel {}
+            RetentionPanel { footprint }
+            ExportPanel {}
+            ImportPanel {}
+        }
+    }
+}
 
-                // Pick and stage a photo: inserts an order row and a photo row together.
-                label {
-                    "Pick and stage photo: "
-                    input {
-                        r#type: "file",
-                        accept: ".jpg,.jpeg,.png",
-                        onchange: move |evt: FormEvent| {
-                            let cc = pick_content.clone();
-                            let files = evt.files();
-                            spawn(async move {
-                                let Some(file) = files.into_iter().next() else {
-                                    return;
-                                };
-                                let name = file.name();
-                                let Some(mime) = mime_from_extension(Path::new(&name)) else {
-                                    photo_pick_msg.set(Some(
-                                        "not an image: only .jpg .jpeg .png are accepted".to_owned(),
-                                    ));
-                                    return;
-                                };
-                                let bytes = match file.read_bytes().await {
-                                    Ok(b) => b,
-                                    Err(err) => {
-                                        photo_pick_msg
-                                            .set(Some(format!("could not read the file: {err}")));
-                                        return;
-                                    }
-                                };
-                                match cc.stage(bytes.as_ref(), mime, stage_photo_row).await {
-                                    Ok(_) => {
-                                        photo_pick_msg.set(Some(format!("staged: {name}")));
-                                    }
-                                    Err(err) => {
-                                        photo_pick_msg.set(Some(format!("stage failed: {err}")));
-                                    }
-                                }
-                            });
+/// The warning shown while the session nears expiry with local writes unsent.
+async fn expiry_text(
+    client: &ConnettoClient<Ws>,
+    session_expires_at: std::time::SystemTime,
+) -> Option<String> {
+    let unsynced = client.with_conn(|c| c.unsynced()).await;
+    let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
+    let warning = expiry_warning(
+        std::time::SystemTime::now(),
+        session_expires_at,
+        lead,
+        unsynced,
+        0,
+    )?;
+    let remaining = warning
+        .session_expires_at
+        .duration_since(std::time::SystemTime::now())
+        .unwrap_or_default();
+    let days = remaining.as_secs() / 86400;
+    Some(format!(
+        "Session expires in {days} day(s): {} pending local item(s) at risk. \
+         Stay connected to extend the deadline automatically.",
+        warning.pending_count()
+    ))
+}
+
+/// `quantity: count` pairs in quantity order, or `pending` before the first answer.
+fn grouped_label(counts: &HashMap<i64, i64>) -> String {
+    let mut sorted: Vec<(i64, i64)> = counts.iter().map(|(q, c)| (*q, *c)).collect();
+    sorted.sort_unstable();
+    if sorted.is_empty() {
+        return "pending".to_owned();
+    }
+    sorted
+        .iter()
+        .map(|(quantity, count)| format!("{quantity}: {count}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Sign out of this account, wiping the replica, and start over.
+async fn sign_out(
+    auth: &AuthCtx,
+    client: &ConnettoClient<Ws>,
+    discard_unsynced: bool,
+    restart: Restart,
+    mut wipe_state: Signal<WipeState>,
+) {
+    let unsynced = client.with_conn(|c| c.unsynced()).await;
+    match forget_device(
+        &auth.authenticator,
+        &auth.db_path,
+        auth.key_store.as_ref(),
+        &auth.key_name,
+        &unsynced,
+        discard_unsynced,
+    )
+    .await
+    {
+        Ok(()) => restart.request(),
+        Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) if !discard_unsynced => {
+            wipe_state.set(WipeState::ConfirmForce {
+                unsynced_count: seqs.len(),
+            });
+        }
+        Err(err) => wipe_state.set(WipeState::Error(format!("logout error: {err}"))),
+    }
+}
+
+#[component]
+fn SessionPanel(wipe_state: Signal<WipeState>) -> Element {
+    let restart = use_context::<Restart>();
+    let client = use_context::<ConnettoClient<Ws>>();
+    let auth_ctx = use_context::<AuthCtx>();
+    let replica_label = auth_ctx.key_name.clone();
+    let (wipe_auth, wipe_client) = (auth_ctx.clone(), client.clone());
+    let (force_auth, force_client) = (auth_ctx, client);
+
+    rsx! {
+        div {
+            style: "background: #f0f4ff; border: 1px solid #c0c8e8; \
+                    border-radius: 6px; padding: 10px 14px; margin-bottom: 16px;",
+            p {
+                style: "margin: 0 0 6px 0; font-size: 0.9em; color: #444;",
+                "Mode: " strong { "Signed in (private encrypted replica)" }
+            }
+            p {
+                style: "margin: 0 0 8px 0; font-size: 0.85em; color: #555;",
+                "Replica: {replica_label}"
+            }
+            {match wipe_state.read().clone() {
+                WipeState::Idle => rsx! {
+                    button {
+                        onclick: move |_| {
+                            let (auth, cl) = (wipe_auth.clone(), wipe_client.clone());
+                            spawn(async move { sign_out(&auth, &cl, false, restart, wipe_state).await });
                         },
+                        "Sign out (wipe local replica)"
                     }
-                }
-                if let Some(msg) = photo_pick_msg.read().clone() {
-                    p {
-                        style: "font-family: monospace; font-size: 0.85em; \
-                                color: #555; margin: 6px 0 0 0;",
-                        {msg}
-                    }
-                }
-
-                if let Some(err) = photos_error {
-                    p { style: "color: #b00; margin-top: 8px;", "photos subscription error: {err}" }
-                }
-
-                // Live list of photos with content_state and display.
-                if display_photos.is_empty() {
-                    p {
-                        style: "color: #888; font-size: 0.9em; margin-top: 8px;",
-                        "No photos yet."
-                    }
-                } else {
+                },
+                WipeState::ConfirmForce { unsynced_count } => rsx! {
                     div {
-                        style: "margin-top: 10px;",
-                        for photo in display_photos {
-                            {
-                                let state_label = match photo.content_state.as_deref() {
-                                    Some("available") => "available",
-                                    Some(s) => s,
-                                    None => "pending upload",
-                                };
-                                let src = srcs_snap.get(&photo.id).cloned();
-                                let pid = photo.id;
-                                rsx! {
-                                    div {
-                                        key: "{pid}",
-                                        style: "border: 1px solid #e0e0e0; border-radius: 4px; \
-                                                padding: 8px; margin-bottom: 8px;",
-                                        p {
-                                            style: "margin: 0 0 4px 0; font-size: 0.85em; color: #555;",
-                                            "id: {pid}  state: {state_label}"
-                                        }
-                                        if let Some(src) = src {
-                                            img {
-                                                src: {src},
-                                                style: "max-width: 200px; max-height: 200px; \
-                                                        display: block; margin-top: 4px;",
-                                                alt: "photo"
-                                            }
-                                        }
-                                    }
-                                }
+                        style: "background: #fff8e1; border: 1px solid #f0c040; \
+                                border-radius: 6px; padding: 8px 12px; margin-top: 6px;",
+                        p {
+                            style: "margin: 0 0 6px 0;",
+                            "{unsynced_count} write(s) are not yet synced and will be permanently lost."
+                        }
+                        div {
+                            style: "display: flex; gap: 6px;",
+                            button {
+                                onclick: move |_| {
+                                    let (auth, cl) = (force_auth.clone(), force_client.clone());
+                                    spawn(async move { sign_out(&auth, &cl, true, restart, wipe_state).await });
+                                },
+                                "Confirm: discard and wipe"
+                            }
+                            button {
+                                onclick: move |_| wipe_state.set(WipeState::Idle),
+                                "Cancel"
                             }
                         }
                     }
-                }
+                },
+                WipeState::Error(msg) => rsx! {
+                    p {
+                        style: "color: #b00; margin: 6px 0 0 0; font-size: 0.85em;",
+                        {msg}
+                    }
+                    button {
+                        onclick: move |_| wipe_state.set(WipeState::Idle),
+                        "Dismiss"
+                    }
+                },
+            }}
+        }
+    }
+}
 
-                // Content pins: pin all photos, fetch pinned bytes, unpin.
+/// Point the device at another account, or at none so the next start signs in
+/// afresh, and start over. Refused while local writes are unsent.
+async fn change_account(
+    client: &ConnettoClient<Ws>,
+    token_store: &KeyringStore,
+    account: Option<&str>,
+    restart: Restart,
+    mut wipe_state: Signal<WipeState>,
+) {
+    let unsynced = client.with_conn(|c| c.unsynced()).await;
+    if !unsynced.is_empty() {
+        wipe_state.set(WipeState::Error(format!(
+            "Cannot change account: {} write(s) not yet synced.",
+            unsynced.len()
+        )));
+        return;
+    }
+    let pointed = match account {
+        Some(key) => token_store.store(IDENTITY_RECORD, key),
+        None => token_store.clear(IDENTITY_RECORD),
+    };
+    match pointed {
+        Ok(()) => restart.request(),
+        Err(err) => wipe_state.set(WipeState::Error(format!("Cannot change account: {err}"))),
+    }
+}
+
+#[component]
+fn AccountsPanel(wipe_state: Signal<WipeState>) -> Element {
+    let restart = use_context::<Restart>();
+    let client = use_context::<ConnettoClient<Ws>>();
+    let auth_ctx = use_context::<AuthCtx>();
+    let mut add_picking: Signal<bool> = use_signal(|| false);
+    let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
+    let current_account = auth_ctx.current_account.clone();
+    let token_store = Arc::clone(&auth_ctx.token_store);
+    let add_client = client.clone();
+    let add_store = Arc::clone(&token_store);
+
+    let account_items: Vec<(String, String, bool)> = accounts_list
+        .read()
+        .iter()
+        .map(|key| {
+            let display = decode_identity::<String>(key).unwrap_or_else(|_| key.clone());
+            (key.clone(), display, *key == current_account)
+        })
+        .collect();
+
+    rsx! {
+        div {
+            style: "border: 1px solid #ccc; border-radius: 6px; \
+                    padding: 10px 14px; margin-bottom: 16px;",
+            h3 {
+                style: "margin: 0 0 8px 0; font-size: 1em;",
+                "Accounts"
+            }
+            for (acc_key, display, is_current) in account_items {
                 div {
-                    style: "margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap;",
-                    button {
-                        onclick: move |_| {
-                            let cc = pin_content.clone();
-                            spawn(async move {
-                                match cc
-                                    .pin_content(
-                                        "photos",
-                                        "SELECT content_id FROM photos",
-                                        "content_id",
-                                    )
-                                    .await
-                                {
-                                    Ok(()) => photo_pin_msg.set(Some("pinned photos".to_owned())),
-                                    Err(err) => photo_pin_msg
-                                        .set(Some(format!("pin failed: {err}"))),
+                    key: "{acc_key}",
+                    style: "display: flex; align-items: center; gap: 8px; margin-bottom: 4px;",
+                    span { style: "flex: 1;", {display} }
+                    if is_current {
+                        span {
+                            style: "font-size: 0.8em; color: #555; font-style: italic;",
+                            "(current)"
+                        }
+                    } else {
+                        {
+                            let ts = Arc::clone(&token_store);
+                            let cl = client.clone();
+                            rsx! {
+                                button {
+                                    onclick: move |_| {
+                                        let (ts, cl, key) = (Arc::clone(&ts), cl.clone(), acc_key.clone());
+                                        spawn(async move {
+                                            change_account(&cl, &ts, Some(&key), restart, wipe_state).await;
+                                        });
+                                    },
+                                    "Switch"
                                 }
-                            });
-                        },
-                        "Pin all photos"
-                    }
-                    button {
-                        onclick: move |_| {
-                            let cc = unpin_content.clone();
-                            spawn(async move {
-                                match cc.unpin_content("photos").await {
-                                    Ok(()) => {
-                                        photo_pin_msg.set(Some("unpinned photos".to_owned()));
-                                    }
-                                    Err(err) => photo_pin_msg
-                                        .set(Some(format!("unpin failed: {err}"))),
-                                }
-                            });
-                        },
-                        "Unpin photos"
-                    }
-                    button {
-                        onclick: move |_| {
-                            let cc = fetch_content.clone();
-                            spawn(async move {
-                                match cc.fetch_pinned().await {
-                                    Ok(ids) => photo_pin_msg.set(Some(format!(
-                                        "fetched {} pinned file(s)",
-                                        ids.len()
-                                    ))),
-                                    Err(err) => photo_pin_msg
-                                        .set(Some(format!("fetch failed: {err}"))),
-                                }
-                            });
-                        },
-                        "Fetch pinned"
-                    }
-                    button {
-                        onclick: move |_| {
-                            let cc = tidy_content_handle.clone();
-                            spawn(async move {
-                                match cc.tidy_content().await {
-                                    Ok(n) => photo_pin_msg.set(Some(format!(
-                                        "content tidy: {n} file(s) evicted"
-                                    ))),
-                                    Err(err) => photo_pin_msg
-                                        .set(Some(format!("tidy failed: {err}"))),
-                                }
-                            });
-                        },
-                        "Free up content storage"
+                            }
+                        }
                     }
                 }
-                if let Some(msg) = photo_pin_msg.read().clone() {
+            }
+            if *add_picking.read() {
+                div {
+                    style: "margin-top: 8px; background: #f5f5ff; \
+                            border: 1px solid #c8c8e8; border-radius: 6px; \
+                            padding: 10px 14px;",
                     p {
-                        style: "font-family: monospace; font-size: 0.85em; \
-                                color: #555; margin: 6px 0 0 0;",
-                        {msg}
+                        style: "margin: 0 0 8px 0; font-size: 0.9em;",
+                        "The app will sign in again and open a browser login page. \
+                         Come back after signing in to finish adding the account."
                     }
-                }
-
-                // Refused uploads: show detail and offer retry.
-                if !refused_snap.is_empty() {
                     div {
-                        style: "margin-top: 10px; background: #fff3cd; \
-                                border: 1px solid #f0ad4e; border-radius: 4px; padding: 8px;",
-                        p {
-                            style: "margin: 0 0 4px 0; font-weight: bold; font-size: 0.9em;",
-                            "Refused uploads"
-                        }
-                        for (fid, detail) in refused_snap {
-                            {
-                                let fid_clone = fid;
-                                let cc = retry_content.clone();
-                                rsx! {
-                                    div {
-                                        key: "{short_hex(fid.as_bytes())}",
-                                        style: "display: flex; align-items: center; gap: 8px; \
-                                                margin-bottom: 4px; font-size: 0.85em;",
-                                        span {
-                                            style: "flex: 1; font-family: monospace;",
-                                            "{short_hex(fid.as_bytes())}: {detail}"
-                                        }
-                                        button {
-                                            onclick: move |_| {
-                                                let cc = cc.clone();
-                                                spawn(async move {
-                                                    if let Err(err) =
-                                                        cc.retry_refused(fid_clone).await
-                                                    {
-                                                        tracing::error!(
-                                                            error = %err,
-                                                            "retry refused failed"
-                                                        );
-                                                    } else {
-                                                        refused_uploads
-                                                            .write()
-                                                            .retain(|(id, _)| *id != fid_clone);
-                                                    }
-                                                });
-                                            },
-                                            "Retry"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // BytesLost: show lost file IDs and offer acknowledgement.
-                if !retired_snap.is_empty() {
-                    div {
-                        style: "margin-top: 10px; background: #fdecea; \
-                                border: 1px solid #f5c6cb; border-radius: 4px; padding: 8px;",
-                        p {
-                            style: "margin: 0 0 4px 0; font-weight: bold; font-size: 0.9em;",
-                            "Bytes lost"
-                        }
-                        p {
-                            style: "font-size: 0.85em; margin: 0 0 6px 0; color: #666;",
-                            "These files' chunks are unreadable. Their row still exists. \
-                             Acknowledge to clear the record."
-                        }
-                        for fid in &retired_snap {
-                            p {
-                                style: "font-family: monospace; font-size: 0.85em; margin: 2px 0;",
-                                "{short_hex(fid.as_bytes())}"
-                            }
-                        }
+                        style: "display: flex; gap: 6px; flex-wrap: wrap;",
                         button {
                             onclick: move |_| {
-                                let ids = retired_snap.clone();
-                                let cc = forget_content.clone();
+                                let (cl, ts) = (add_client.clone(), Arc::clone(&add_store));
                                 spawn(async move {
-                                    if let Err(err) = cc.forget_retired_content(&ids).await {
-                                        tracing::error!(
-                                            error = %err,
-                                            "forget retired failed"
-                                        );
-                                    } else {
-                                        retired_files.write().retain(|id| !ids.contains(id));
-                                    }
+                                    change_account(&cl, &ts, None, restart, wipe_state).await;
                                 });
                             },
-                            "Acknowledge all"
+                            "Sign in"
+                        }
+                        button {
+                            onclick: move |_| add_picking.set(false),
+                            "Cancel"
+                        }
+                    }
+                }
+            } else {
+                button {
+                    style: "margin-top: 6px;",
+                    onclick: move |_| add_picking.set(true),
+                    "Add another account"
+                }
+            }
+        }
+    }
+}
+
+/// The status line for one content event.
+fn content_label(event: &ContentEvent) -> String {
+    match event {
+        ContentEvent::Uploaded { file_id } => format!("uploaded {}", short_hex(file_id.as_bytes())),
+        ContentEvent::UploadDeferred { file_id, detail } => {
+            format!("deferred {}: {detail}", short_hex(file_id.as_bytes()))
+        }
+        ContentEvent::UploadRefused { file_id, detail } => {
+            format!("refused {}: {detail}", short_hex(file_id.as_bytes()))
+        }
+        ContentEvent::BytesLost {
+            file_id,
+            unreadable,
+        } => format!(
+            "bytes lost {} ({unreadable} unreadable chunks)",
+            short_hex(file_id.as_bytes())
+        ),
+        ContentEvent::Fetched { file_id } => format!("fetched {}", short_hex(file_id.as_bytes())),
+        ContentEvent::IntegrityPassFailed { detail } => format!("integrity check failed: {detail}"),
+    }
+}
+
+/// What the content client reports, as a status line plus the refused uploads
+/// and lost files it names. Both lists start from what the client persisted,
+/// so a restart does not hide last run's.
+struct ContentFeed {
+    status: Signal<String>,
+    refused: Signal<Vec<(FileId, String)>>,
+    retired: Signal<Vec<FileId>>,
+}
+
+fn use_content_feed(content: &Content) -> ContentFeed {
+    let mut status: Signal<String> = use_signal(String::new);
+    let mut refused: Signal<Vec<(FileId, String)>> = use_signal(Vec::new);
+    let mut retired: Signal<Vec<FileId>> = use_signal(Vec::new);
+    let event_rx = content.events();
+    use_hook(move || {
+        spawn(async move {
+            let mut rx = event_rx;
+            while let Ok(event) = rx.recv().await {
+                status.set(content_label(&event));
+                match event {
+                    ContentEvent::UploadRefused { file_id, detail } => {
+                        refused.write().push((file_id, detail));
+                    }
+                    ContentEvent::BytesLost { file_id, .. } => retired.write().push(file_id),
+                    _ => {}
+                }
+            }
+        })
+    });
+    let cc = content.clone();
+    use_hook(move || {
+        spawn(async move {
+            // The event stream is already live, so a fresh entry may arrive
+            // before these queries return.
+            for entry in cc.refused_content().await.unwrap_or_default() {
+                let seen = refused.read().iter().any(|(id, _)| *id == entry.0);
+                if !seen {
+                    refused.write().push(entry);
+                }
+            }
+            for id in cc.retired_content().await.unwrap_or_default() {
+                let seen = retired.read().contains(&id);
+                if !seen {
+                    retired.write().push(id);
+                }
+            }
+        });
+    });
+    ContentFeed {
+        status,
+        refused,
+        retired,
+    }
+}
+
+/// Display srcs for the listed photos. Local bytes become data URIs at every
+/// state, since content this device staged answers as Local while unsent. A
+/// signed URL is used only once the server says the row's content is available.
+async fn photo_sources(content: &Content, photos: &[Photo]) -> HashMap<Uuid, String> {
+    let mut srcs = HashMap::new();
+    for photo in photos {
+        let Some(fid) = photo_file_id(&photo.content_id) else {
+            continue;
+        };
+        let available = photo.content_state.as_deref() == Some("available");
+        match content.resolve(fid).await {
+            Ok(Resolved::Local { bytes, .. }) => {
+                let enc = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                srcs.insert(photo.id, format!("data:image/jpeg;base64,{enc}"));
+            }
+            Ok(Resolved::Remote { url }) if available => {
+                srcs.insert(photo.id, url);
+            }
+            _ => {}
+        }
+    }
+    srcs
+}
+
+/// Stage one picked file as a photo, answering with the line to show.
+async fn stage_picked(content: &Content, name: &str, bytes: Result<Vec<u8>, String>) -> String {
+    let Some(mime) = mime_from_extension(Path::new(name)) else {
+        return "not an image: only .jpg .jpeg .png are accepted".to_owned();
+    };
+    let bytes = match bytes {
+        Ok(bytes) => bytes,
+        Err(err) => return format!("could not read the file: {err}"),
+    };
+    match content.stage(bytes.as_slice(), mime, stage_photo_row).await {
+        Ok(_) => format!("staged: {name}"),
+        Err(err) => format!("stage failed: {err}"),
+    }
+}
+
+#[component]
+fn PhotosPanel() -> Element {
+    let client = use_context::<ConnettoClient<Ws>>();
+    let content = use_context::<Content>();
+    let photos_query = use_live::<_, _, Photo>(&client, photos::table.order(photos::id.asc()));
+    let feed = use_content_feed(&content);
+    let content_status = feed.status;
+
+    let mut photo_srcs: Signal<HashMap<Uuid, String>> = use_signal(HashMap::new);
+    {
+        let cc = content.clone();
+        use_effect(move || {
+            let photos = photos_query.value().read().clone();
+            let cc = cc.clone();
+            spawn(async move { photo_srcs.set(photo_sources(&cc, &photos).await) });
+        });
+    }
+
+    let mut photo_pick_msg: Signal<Option<String>> = use_signal(|| None);
+    let display_photos: Vec<Photo> = photos_query.value().read().iter().cloned().collect();
+    let photos_error = photos_query.error().read().clone();
+    let srcs_snap = photo_srcs.read().clone();
+    let pick_content = content;
+
+    rsx! {
+        div {
+            style: "border: 1px solid #ccc; border-radius: 6px; \
+                    padding: 10px 14px; margin-bottom: 16px;",
+            h2 {
+                style: "margin-top: 0; font-size: 1em;",
+                "Photos"
+            }
+            if !content_status.read().is_empty() {
+                p {
+                    style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
+                    "content: " {content_status}
+                }
+            }
+
+            // Pick and stage a photo: inserts an order row and a photo row together.
+            label {
+                "Pick and stage photo: "
+                input {
+                    r#type: "file",
+                    accept: ".jpg,.jpeg,.png",
+                    onchange: move |evt: FormEvent| {
+                        let cc = pick_content.clone();
+                        let files = evt.files();
+                        spawn(async move {
+                            let Some(file) = files.into_iter().next() else {
+                                return;
+                            };
+                            let name = file.name();
+                            let bytes = file
+                                .read_bytes()
+                                .await
+                                .map(|b| b.to_vec())
+                                .map_err(|err| err.to_string());
+                            photo_pick_msg.set(Some(stage_picked(&cc, &name, bytes).await));
+                        });
+                    },
+                }
+            }
+            if let Some(msg) = photo_pick_msg.read().clone() {
+                p {
+                    style: "font-family: monospace; font-size: 0.85em; \
+                            color: #555; margin: 6px 0 0 0;",
+                    {msg}
+                }
+            }
+
+            if let Some(err) = photos_error {
+                p { style: "color: #b00; margin-top: 8px;", "photos subscription error: {err}" }
+            }
+
+            if display_photos.is_empty() {
+                p {
+                    style: "color: #888; font-size: 0.9em; margin-top: 8px;",
+                    "No photos yet."
+                }
+            } else {
+                div {
+                    style: "margin-top: 10px;",
+                    for photo in display_photos {
+                        PhotoCard { key: "{photo.id}", photo: photo.clone(), src: srcs_snap.get(&photo.id).cloned() }
+                    }
+                }
+            }
+
+            PinControls {}
+            RefusedUploads { refused: feed.refused }
+            LostBytes { retired: feed.retired }
+        }
+    }
+}
+
+#[component]
+fn PhotoCard(photo: Photo, src: Option<String>) -> Element {
+    let state_label = photo.content_state.as_deref().unwrap_or("pending upload");
+    let pid = photo.id;
+    rsx! {
+        div {
+            style: "border: 1px solid #e0e0e0; border-radius: 4px; \
+                    padding: 8px; margin-bottom: 8px;",
+            p {
+                style: "margin: 0 0 4px 0; font-size: 0.85em; color: #555;",
+                "id: {pid}  state: {state_label}"
+            }
+            if let Some(src) = src {
+                img {
+                    src,
+                    style: "max-width: 200px; max-height: 200px; \
+                            display: block; margin-top: 4px;",
+                    alt: "photo"
+                }
+            }
+        }
+    }
+}
+
+/// Which content action a pin button runs.
+#[derive(Clone, Copy)]
+enum PinAction {
+    Pin,
+    Unpin,
+    Fetch,
+    Tidy,
+}
+
+impl PinAction {
+    async fn run(self, content: &Content) -> String {
+        match self {
+            Self::Pin => content
+                .pin_content("photos", "SELECT content_id FROM photos", "content_id")
+                .await
+                .map_or_else(
+                    |err| format!("pin failed: {err}"),
+                    |()| "pinned photos".to_owned(),
+                ),
+            Self::Unpin => content.unpin_content("photos").await.map_or_else(
+                |err| format!("unpin failed: {err}"),
+                |()| "unpinned photos".to_owned(),
+            ),
+            Self::Fetch => content.fetch_pinned().await.map_or_else(
+                |err| format!("fetch failed: {err}"),
+                |ids| format!("fetched {} pinned file(s)", ids.len()),
+            ),
+            Self::Tidy => content.tidy_content().await.map_or_else(
+                |err| format!("tidy failed: {err}"),
+                |n| format!("content tidy: {n} file(s) evicted"),
+            ),
+        }
+    }
+}
+
+#[component]
+fn PinControls() -> Element {
+    let content = use_context::<Content>();
+    let mut message: Signal<Option<String>> = use_signal(|| None);
+    let buttons = [
+        (PinAction::Pin, "Pin all photos"),
+        (PinAction::Unpin, "Unpin photos"),
+        (PinAction::Fetch, "Fetch pinned"),
+        (PinAction::Tidy, "Free up content storage"),
+    ];
+    rsx! {
+        div {
+            style: "margin-top: 12px; display: flex; gap: 6px; flex-wrap: wrap;",
+            for (action, label) in buttons {
+                {
+                    let cc = content.clone();
+                    rsx! {
+                        button {
+                            key: "{label}",
+                            onclick: move |_| {
+                                let cc = cc.clone();
+                                spawn(async move { message.set(Some(action.run(&cc).await)) });
+                            },
+                            {label}
                         }
                     }
                 }
             }
+        }
+        if let Some(msg) = message.read().clone() {
+            p {
+                style: "font-family: monospace; font-size: 0.85em; \
+                        color: #555; margin: 6px 0 0 0;",
+                {msg}
+            }
+        }
+    }
+}
 
-            div {
-                style: "border: 1px solid #ccc; border-radius: 6px; padding: 10px 14px;",
-                h2 {
-                    style: "margin-top: 0; font-size: 1em;",
-                    "Retention"
-                }
-                p { "Replica: {pages} pages (~{kb} KB total, {free} free to reclaim)." }
-                p {
-                    style: "color: #666; font-size: 0.9em;",
-                    "Ending a subscription evicts rows no live query still covers, \
-                     and the trim pass returns those pages to the filesystem."
-                }
-                button {
-                    onclick: move |_| {
-                        let client = tidy_client.clone();
-                        spawn(async move {
-                            if let Err(err) = client.tidy().await {
-                                tracing::error!(error = %err, "tidy failed");
+#[component]
+fn RefusedUploads(refused: Signal<Vec<(FileId, String)>>) -> Element {
+    let content = use_context::<Content>();
+    let entries = refused.read().clone();
+    if entries.is_empty() {
+        return rsx! {};
+    }
+    rsx! {
+        div {
+            style: "margin-top: 10px; background: #fff3cd; \
+                    border: 1px solid #f0ad4e; border-radius: 4px; padding: 8px;",
+            p {
+                style: "margin: 0 0 4px 0; font-weight: bold; font-size: 0.9em;",
+                "Refused uploads"
+            }
+            for (fid, detail) in entries {
+                {
+                    let cc = content.clone();
+                    rsx! {
+                        div {
+                            key: "{short_hex(fid.as_bytes())}",
+                            style: "display: flex; align-items: center; gap: 8px; \
+                                    margin-bottom: 4px; font-size: 0.85em;",
+                            span {
+                                style: "flex: 1; font-family: monospace;",
+                                "{short_hex(fid.as_bytes())}: {detail}"
                             }
-                            footprint.set(replica_footprint(&client).await);
-                        });
-                    },
-                    "Free up space"
-                }
-            }
-
-            div {
-                style: "border: 1px solid #ccc; border-radius: 6px; \
-                        padding: 10px 14px; margin-top: 16px;",
-                h2 {
-                    style: "margin-top: 0; font-size: 1em;",
-                    "Your data"
-                }
-                p {
-                    style: "color: #666; font-size: 0.9em;",
-                    "Save a zip archive of this device's local data, including any unsent \
-                     photo bytes. The archive is not encrypted."
-                }
-                button {
-                    onclick: move |_| {
-                        let cc = export_content.clone();
-                        spawn(async move {
-                            let message = match create_export_file() {
-                                Err(err) => format!("could not open the export file: {err}"),
-                                Ok((part, file)) => match cc.export_local_data(
-                                    connetto_client::ExportScope::Everything,
-                                    file,
-                                )
-                                .await
-                                {
-                                    Ok(file) => {
-                                        let written = file.metadata().map(|meta| meta.len());
-                                        drop(file);
-                                        match (publish_export(&part), written) {
-                                            (Ok(path), Ok(bytes)) => {
-                                                format!(
-                                                    "Wrote {bytes} bytes to {}",
-                                                    path.display()
-                                                )
-                                            }
-                                            (Ok(path), Err(err)) => format!(
-                                                "wrote {} but could not measure it: {err}",
-                                                path.display()
-                                            ),
-                                            (Err(err), _) => {
-                                                format!(
-                                                    "could not replace the last export: {err}"
-                                                )
+                            button {
+                                onclick: move |_| {
+                                    let cc = cc.clone();
+                                    spawn(async move {
+                                        match cc.retry_refused(fid).await {
+                                            Ok(_) => refused.write().retain(|(id, _)| *id != fid),
+                                            Err(err) => {
+                                                tracing::error!(error = %err, "retry refused failed");
                                             }
                                         }
-                                    }
-                                    Err(err) => format!("export failed: {err}"),
+                                    });
                                 },
-                            };
-                            export_status.set(Some(message));
-                        });
-                    },
-                    "Export local data"
-                }
-                if let Some(message) = export_status.read().clone() {
-                    p {
-                        style: "font-family: monospace; font-size: 0.85em; \
-                                color: #555; margin: 8px 0 0 0;",
-                        {message}
+                                "Retry"
+                            }
+                        }
                     }
                 }
             }
+        }
+    }
+}
 
-            div {
-                style: "border: 1px solid #ccc; border-radius: 6px; \
-                        padding: 10px 14px; margin-top: 16px;",
-                h2 {
-                    style: "margin-top: 0; font-size: 1em;",
-                    "Restore from file"
-                }
+#[component]
+fn LostBytes(retired: Signal<Vec<FileId>>) -> Element {
+    let content = use_context::<Content>();
+    let ids = retired.read().clone();
+    if ids.is_empty() {
+        return rsx! {};
+    }
+    let shown = ids.clone();
+    rsx! {
+        div {
+            style: "margin-top: 10px; background: #fdecea; \
+                    border: 1px solid #f5c6cb; border-radius: 4px; padding: 8px;",
+            p {
+                style: "margin: 0 0 4px 0; font-weight: bold; font-size: 0.9em;",
+                "Bytes lost"
+            }
+            p {
+                style: "font-size: 0.85em; margin: 0 0 6px 0; color: #666;",
+                "These files' chunks are unreadable. Their row still exists. \
+                 Acknowledge to clear the record."
+            }
+            for fid in shown {
                 p {
-                    style: "color: #666; font-size: 0.9em;",
-                    "Pick an archive from this account. The file's version wins every clash."
+                    style: "font-family: monospace; font-size: 0.85em; margin: 2px 0;",
+                    "{short_hex(fid.as_bytes())}"
                 }
-                label {
-                    "Import from file: "
-                    input {
-                        r#type: "file",
-                        accept: ".zip",
-                        onchange: move |evt: FormEvent| {
-                            let cc = import_content.clone();
-                            let files = evt.files();
-                            spawn(async move {
-                                let Some(file) = files.into_iter().next() else {
-                                    return;
-                                };
-                                let source = match file.read_bytes().await {
-                                    Ok(bytes) => std::io::Cursor::new(bytes.to_vec()),
-                                    Err(err) => {
-                                        import_status
-                                            .set(Some(format!("could not read it: {err}")));
-                                        return;
-                                    }
-                                };
-                                let message = match cc.prepare_local_data_import(source).await {
-                                    Err(err) => format!("refused: {err}"),
-                                    Ok(mut plan) => {
-                                        let clash_count =
-                                            plan.replica_plan().collisions().len();
-                                        let choices = ImportChoices::keeping_the_file();
-                                        match cc
-                                            .apply_local_data_import(&mut plan, &choices)
-                                            .await
-                                        {
-                                            Ok(outcome) => {
-                                                let mut msg = format!(
-                                                    "{} row(s) restored, {} kept, \
-                                                     {} write(s) restored, {} content file(s)",
-                                                    outcome.rows_restored,
-                                                    outcome.rows_kept,
-                                                    outcome.writes_restored,
-                                                    plan.content_files(),
-                                                );
-                                                if clash_count > 0 {
-                                                    msg.push_str(&format!(
-                                                        " ({clash_count} clash(es) \
-                                                         resolved to the file)"
-                                                    ));
-                                                }
-                                                msg
-                                            }
-                                            Err(err) => format!("apply failed: {err}"),
-                                        }
-                                    }
-                                };
-                                import_status.set(Some(message));
-                            });
-                        },
-                    }
+            }
+            button {
+                onclick: move |_| {
+                    let (ids, cc) = (ids.clone(), content.clone());
+                    spawn(async move {
+                        match cc.forget_retired_content(&ids).await {
+                            Ok(_) => retired.write().retain(|id| !ids.contains(id)),
+                            Err(err) => tracing::error!(error = %err, "forget retired failed"),
+                        }
+                    });
+                },
+                "Acknowledge all"
+            }
+        }
+    }
+}
+
+#[component]
+fn RetentionPanel(footprint: Signal<(i64, i64)>) -> Element {
+    let client = use_context::<ConnettoClient<Ws>>();
+    let (pages, free) = *footprint.read();
+    let kb = pages * 4;
+    rsx! {
+        div {
+            style: "border: 1px solid #ccc; border-radius: 6px; padding: 10px 14px;",
+            h2 {
+                style: "margin-top: 0; font-size: 1em;",
+                "Retention"
+            }
+            p { "Replica: {pages} pages (~{kb} KB total, {free} free to reclaim)." }
+            p {
+                style: "color: #666; font-size: 0.9em;",
+                "Ending a subscription evicts rows no live query still covers, \
+                 and the trim pass returns those pages to the filesystem."
+            }
+            button {
+                onclick: move |_| {
+                    let client = client.clone();
+                    spawn(async move {
+                        if let Err(err) = client.tidy().await {
+                            tracing::error!(error = %err, "tidy failed");
+                        }
+                        footprint.set(replica_footprint(&client).await);
+                    });
+                },
+                "Free up space"
+            }
+        }
+    }
+}
+
+/// Write this device's local data to the export file, answering with the line to show.
+async fn export_everything(content: &Content) -> String {
+    let (part, file) = match create_export_file() {
+        Ok(opened) => opened,
+        Err(err) => return format!("could not open the export file: {err}"),
+    };
+    let file = match content
+        .export_local_data(connetto_client::ExportScope::Everything, file)
+        .await
+    {
+        Ok(file) => file,
+        Err(err) => return format!("export failed: {err}"),
+    };
+    let written = file.metadata().map(|meta| meta.len());
+    drop(file);
+    match (publish_export(&part), written) {
+        (Ok(path), Ok(bytes)) => format!("Wrote {bytes} bytes to {}", path.display()),
+        (Ok(path), Err(err)) => format!("wrote {} but could not measure it: {err}", path.display()),
+        (Err(err), _) => format!("could not replace the last export: {err}"),
+    }
+}
+
+#[component]
+fn ExportPanel() -> Element {
+    let content = use_context::<Content>();
+    let mut status: Signal<Option<String>> = use_signal(|| None);
+    rsx! {
+        div {
+            style: "border: 1px solid #ccc; border-radius: 6px; \
+                    padding: 10px 14px; margin-top: 16px;",
+            h2 {
+                style: "margin-top: 0; font-size: 1em;",
+                "Your data"
+            }
+            p {
+                style: "color: #666; font-size: 0.9em;",
+                "Save a zip archive of this device's local data, including any unsent \
+                 photo bytes. The archive is not encrypted."
+            }
+            button {
+                onclick: move |_| {
+                    let cc = content.clone();
+                    spawn(async move { status.set(Some(export_everything(&cc).await)) });
+                },
+                "Export local data"
+            }
+            if let Some(message) = status.read().clone() {
+                p {
+                    style: "font-family: monospace; font-size: 0.85em; \
+                            color: #555; margin: 8px 0 0 0;",
+                    {message}
                 }
-                if let Some(message) = import_status.read().clone() {
-                    p {
-                        style: "font-family: monospace; font-size: 0.85em; \
-                                color: #555; margin: 8px 0 0 0;",
-                        {message}
-                    }
+            }
+        }
+    }
+}
+
+/// Restore one archive, keeping the file's version of every clash, and answer
+/// with the line to show.
+async fn import_archive(content: &Content, bytes: Result<Vec<u8>, String>) -> String {
+    let source = match bytes {
+        Ok(bytes) => std::io::Cursor::new(bytes),
+        Err(err) => return format!("could not read it: {err}"),
+    };
+    let mut plan = match content.prepare_local_data_import(source).await {
+        Ok(plan) => plan,
+        Err(err) => return format!("refused: {err}"),
+    };
+    let clash_count = plan.replica_plan().collisions().len();
+    let choices = ImportChoices::keeping_the_file();
+    let outcome = match content.apply_local_data_import(&mut plan, &choices).await {
+        Ok(outcome) => outcome,
+        Err(err) => return format!("apply failed: {err}"),
+    };
+    let mut msg = format!(
+        "{} row(s) restored, {} kept, {} write(s) restored, {} content file(s)",
+        outcome.rows_restored,
+        outcome.rows_kept,
+        outcome.writes_restored,
+        plan.content_files(),
+    );
+    if clash_count > 0 {
+        msg.push_str(&format!(" ({clash_count} clash(es) resolved to the file)"));
+    }
+    msg
+}
+
+#[component]
+fn ImportPanel() -> Element {
+    let content = use_context::<Content>();
+    let mut status: Signal<Option<String>> = use_signal(|| None);
+    rsx! {
+        div {
+            style: "border: 1px solid #ccc; border-radius: 6px; \
+                    padding: 10px 14px; margin-top: 16px;",
+            h2 {
+                style: "margin-top: 0; font-size: 1em;",
+                "Restore from file"
+            }
+            p {
+                style: "color: #666; font-size: 0.9em;",
+                "Pick an archive from this account. The file's version wins every clash."
+            }
+            label {
+                "Import from file: "
+                input {
+                    r#type: "file",
+                    accept: ".zip",
+                    onchange: move |evt: FormEvent| {
+                        let cc = content.clone();
+                        let files = evt.files();
+                        spawn(async move {
+                            let Some(file) = files.into_iter().next() else {
+                                return;
+                            };
+                            let bytes = file
+                                .read_bytes()
+                                .await
+                                .map(|b| b.to_vec())
+                                .map_err(|err| err.to_string());
+                            status.set(Some(import_archive(&cc, bytes).await));
+                        });
+                    },
+                }
+            }
+            if let Some(message) = status.read().clone() {
+                p {
+                    style: "font-family: monospace; font-size: 0.85em; \
+                            color: #555; margin: 8px 0 0 0;",
+                    {message}
                 }
             }
         }

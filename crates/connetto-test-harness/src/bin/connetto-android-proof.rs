@@ -234,8 +234,24 @@ async fn prove(
     .await?;
     wait_for_count(&stack.pg_url, offline + 1).await?;
     device.screenshot(evidence, "uploaded").await?;
+    sign_out(device, &mut app, evidence).await?;
     step("proof complete");
     Ok(())
+}
+
+/// Sign out, which revokes the session and destroys the replica key, and see
+/// the demo start over. Only a successful sign-out starts over, since any
+/// failure is shown in the session panel instead.
+async fn sign_out(device: &Device, app: &mut Cdp, evidence: &Path) -> Result<()> {
+    step("sign out");
+    app.click("Sign out (wipe local replica)").await?;
+    app.wait_for_outcome(
+        "Signing in",
+        &["logout error", "not yet synced"],
+        Duration::from_secs(60),
+    )
+    .await?;
+    device.screenshot(evidence, "signed-out").await
 }
 
 fn step(name: &str) {
