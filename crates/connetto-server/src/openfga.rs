@@ -1605,7 +1605,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                         // store being down, and an operator acts on that
                         // difference.
                         .map_err(|err| match err {
-                            subql::visibility::openfga::MaterialiseError::Replay(inner) => inner,
+                            subql::visibility::openfga::ReconcileError::Replay(inner) => inner,
                             other => UpkeepError::Write(other.to_string()),
                         })?;
                     outcome.note_keys(&self.naming, &reports);

@@ -51,6 +51,12 @@ fn install_keyring_store() -> keyring_core::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "android")]
+fn install_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(android_native_keyring_store::Store::new()?);
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 fn install_keyring_store() -> keyring_core::Result<()> {
     keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
@@ -58,6 +64,7 @@ fn install_keyring_store() -> keyring_core::Result<()> {
 }
 
 #[cfg(not(any(
+    target_os = "android",
     target_os = "ios",
     target_os = "linux",
     target_os = "macos",
@@ -451,8 +458,17 @@ impl ReplicaKeyStore for MemoryKeyStore {
 pub type BrowserOpener = Arc<dyn Fn(&str) -> Result<(), ClientError> + Send + Sync>;
 
 /// The real opener, launching a detached system browser.
+///
+/// On Android `webbrowser` hands the URL to the browser app, since the `open`
+/// crate's Android arm runs `xdg-open`, which phones lack. The login page
+/// stays outside the app either way, as RFC 8252 requires.
 #[must_use]
 pub fn system_browser_opener() -> BrowserOpener {
+    #[cfg(target_os = "android")]
+    return Arc::new(|url: &str| {
+        webbrowser::open(url).map_err(|err| ClientError::Auth(format!("open browser: {err}")))
+    });
+    #[cfg(not(target_os = "android"))]
     Arc::new(|url: &str| {
         open::that_detached(url).map_err(|err| ClientError::Auth(format!("open browser: {err}")))
     })
@@ -504,12 +520,13 @@ impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
 ///
 /// It holds the account whose stored credential it should try, rather than
 /// passing one at each call, so no two call sites can disagree about which
-/// credential this is.
+/// credential this is. A login or refresh that reveals the account replaces
+/// it, so the token source and logout address the account signed in now.
 pub struct NativeAuthenticator {
     server_base: String,
     provider: String,
     store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
-    account: Option<String>,
+    account: std::sync::Mutex<Option<String>>,
     opener: BrowserOpener,
     http: reqwest::Client,
 }
@@ -536,7 +553,7 @@ impl NativeAuthenticator {
             server_base: server_base.into(),
             provider: provider.into(),
             store,
-            account,
+            account: std::sync::Mutex::new(account),
             opener: system_browser_opener(),
             http: reqwest::Client::new(),
         }
@@ -561,8 +578,8 @@ impl NativeAuthenticator {
     pub async fn acquire<Id: DeserializeOwned + serde::Serialize>(
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
-        if let Some(account) = self.account.as_deref()
-            && self.store.load(account)?.is_some()
+        if let Some(account) = self.account()
+            && self.store.load(&account)?.is_some()
             && let Ok(session) = self.refresh_access().await
         {
             return Ok(session);
@@ -594,12 +611,11 @@ impl NativeAuthenticator {
     /// could then write to the identity record.
     async fn refresh_tokens<Id: DeserializeOwned>(&self) -> Result<TokenResponse<Id>, ClientError> {
         let account = self
-            .account
-            .as_deref()
+            .account()
             .ok_or_else(|| ClientError::Auth("no account to refresh".to_owned()))?;
         let refresh = self
             .store
-            .load(account)?
+            .load(&account)?
             .ok_or_else(|| ClientError::Auth("no stored refresh token".to_owned()))?;
         let response: TokenResponse<Id> = self
             .post_json(
@@ -607,7 +623,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await?;
-        self.store.store(account, &response.refresh_token)?;
+        self.store.store(&account, &response.refresh_token)?;
         Ok(response)
     }
 
@@ -669,8 +685,21 @@ impl NativeAuthenticator {
     /// who this device is: a silent refresh on a start, or an interactive login
     /// on a first run or after the credential lapsed.
     fn remember<Id: serde::Serialize>(&self, user_id: &Id) -> Result<(), ClientError> {
-        self.store
-            .store(IDENTITY_RECORD, &encode_identity(user_id)?)
+        let account = encode_identity(user_id)?;
+        self.store.store(IDENTITY_RECORD, &account)?;
+        *self
+            .account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(account);
+        Ok(())
+    }
+
+    /// The account whose stored credential this authenticator addresses.
+    fn account(&self) -> Option<String> {
+        self.account
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// A silent-refresh [`AccessTokenSource`] for
@@ -729,10 +758,10 @@ impl NativeAuthenticator {
         // Signing out is per account: any other stored credential survives, and
         // the marker is left naming an account with none, which the next start
         // answers with an interactive login rather than by picking somebody else.
-        let Some(account) = self.account.as_deref() else {
+        let Some(account) = self.account() else {
             return Ok(());
         };
-        let Some(refresh) = self.store.load(account)? else {
+        let Some(refresh) = self.store.load(&account)? else {
             return Ok(());
         };
         let revoked = self
@@ -741,7 +770,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await;
-        self.store.clear(account)?;
+        self.store.clear(&account)?;
         revoked.map(drop)
     }
 
