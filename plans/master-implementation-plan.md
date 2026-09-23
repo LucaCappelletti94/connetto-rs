@@ -5653,7 +5653,7 @@ Done as a design, and derived. The subql side is phased in `docs/upstream-subql-
 
 ## R73: the PostgreSQL mesh question, reframed as failover verification
 
-**Status.** **DONE** (2026-09-22) on `feat/r73-failover-verification`, built ahead of the `last` place the Sequence table gave it at the maintainer's word. X7 given an owner 2026-08-21 by the full review, then **reframed with the maintainer 2026-08-22**. The hard parts are existing Postgres features, and verifying them found one that is not, a divergence connetto detects itself (decisions 4 to 10 below). The Done-when is demonstrated by `crates/connetto-server/tests/it/failover.rs` on Postgres 18.6, red before the timeline check twice over (the connection live through the promotion was never closed, and with that close alone the lost cursor was caught up instead of resynced) and green after, beside 703 passing tests across `connetto-core`, `connetto-server`, `connetto-test-harness` and `connetto-client`.
+**Status.** **DONE** (2026-09-22) on `feat/r73-failover-verification`, built ahead of the `last` place the Sequence table gave it at the maintainer's word. X7 given an owner 2026-08-21 by the full review, then **reframed with the maintainer 2026-08-22**. The hard parts are existing Postgres features, and verifying them found one that is not, a divergence connetto detects itself (decisions 4 to 10 below). The Done-when is demonstrated by `crates/connetto-server/tests/it/failover.rs` on Postgres 18.6, red before the timeline check twice over (the connection live through the promotion was never closed, and with that close alone the lost cursor was caught up instead of resynced) and green after, beside 705 passing tests across `connetto-core`, `connetto-server`, `connetto-test-harness` and `connetto-client`.
 
 **Blocked on nothing.**
 
@@ -5670,7 +5670,7 @@ Done as a design, and derived. The subql side is phased in `docs/upstream-subql-
 3. **The test runs on Postgres 18**, in a primary and standby pair the R73 test starts itself with the harness's container labels, leaving `Fixture::acquire` and its `postgres:16` untouched. Measured the same day on 18.6. A `pgoutput` slot created with `failover = true` becomes sync-ready on a standby running `sync_replication_slots = on` once the consumer advances past the standby's catalog xmin, and after promotion it serves the changes nobody had consumed, then new ones, with no recreation. The synced slot can lag what the old primary confirmed, so the server can receive a change twice, which the reconnect log absorbs (`ON CONFLICT (lsn) DO NOTHING`).
 4. **The divergence is fixed in this phase**, not deferred to R70 or a new phase.
 5. **Only cursors past the switch point resync.** A cursor carries the timeline it was issued on. One from an earlier timeline resyncs only when its position lies beyond where that timeline ended in the current history, so a lossless switchover resyncs nobody. It still closes every live connection under decision 8, and each resumes by catching up.
-6. **A cursor in the old eight-byte layout is fresh.** It already takes the LSN 0 path once the server reads the longer layout, so every existing client resyncs once. No deployment exists to pay for it.
+6. **A cursor in the old eight-byte layout resyncs with `CursorBeyondHistory`.** Decided as fresh on the claim that the LSN 0 path resyncs every existing client once, and corrected the same day after Codex review of PR #55: that path sends a plain snapshot with no notice, and the client clears nothing without one, so rows deleted while it was away would stay for ever. Any nonempty cursor the server cannot read now takes the clearing resync, and only an empty or absent one starts fresh. No deployment exists to pay for the one resync.
 7. **The resync carries a new `FullResyncReason` variant** naming the cause. A wire change, so clients upgrade with the server.
 8. **Live sessions are closed with a new `FatalErrorReason` variant** when the server sees the timeline change, so a client live through the failover reconnects and meets the handshake check. A wire change shipping with decision 7's.
 9. **The history is read with the replication command `TIMELINE_HISTORY`**, over a short replication connection connetto opens itself, needing only the `REPLICATION` attribute the change feed's role already holds. `pg_control_checkpoint()` was measured unusable, still reporting timeline 1 on 18.6 right after the promotion.
@@ -5692,13 +5692,16 @@ What the server does at each change-feed connect, the loop in the server binary 
 
 R32's slot check runs after this, unchanged, and still fires when a synced slot confirmed a change whose reconnect-log row the standby never received.
 
-The client's first `CursorBeyondHistory` notice on a connection empties every table any declared subscription covers, whatever a sibling claims, because every row subscription of the session resyncs and a lost row matching two filters would otherwise be spared by each ordinary clear in turn. Later notices on the same connection clear as an ordinary resync, so they spare the replacements already delivered, and the next connection starts over. Found while testing on 2026-09-22 and pinned in `crates/connetto-client/tests/it/truncate_resync.rs` by three tests, each shown to fail when its half of the rule is removed.
+The client's first `CursorBeyondHistory` notice on a connection empties every table any declared subscription covers, whatever a sibling claims, because every row subscription of the session resyncs and a lost row matching two filters would otherwise be spared by each ordinary clear in turn. Later notices on the same connection clear as an ordinary resync, so they spare the replacements already delivered, and the next connection starts over. A hidden membership subscription has no declared record, so a `CursorBeyondHistory` notice on a `connetto-membership:` label clears that membership table, inside the first notice's wipe or on its own after it. Found while testing on 2026-09-22 and in Codex review of PR #55, and pinned in `crates/connetto-client/tests/it/truncate_resync.rs` by four tests, each red before its change.
+
+**Recorded, not this phase's, found in the same review.** A resync of a hidden membership subscription under any other reason clears nothing on the client, because `clear_subscription_rows` finds no declared record for it, so a membership row deleted while the client was away survives a retention or authorization resync. This predates R73 and is on `main`. It has no phase yet.
 
 What the handshake does with the presented cursor, against the stored history.
 
 | Cursor | Outcome |
 |---|---|
-| Empty, or any length but twelve (the old eight-byte layout included) | fresh client, LSN 0, full resync as today |
+| Empty or absent | fresh client, a plain snapshot as today |
+| Nonempty but not twelve bytes (the old eight-byte layout included) | full resync with the new reason |
 | Current timeline | today's `catchup_decision`, unchanged |
 | An earlier timeline in the history, position at or before where it ended | resumes at that position, as today |
 | An earlier timeline in the history, position beyond where it ended | full resync with the new reason |

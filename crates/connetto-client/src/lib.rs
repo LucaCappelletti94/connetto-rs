@@ -2220,6 +2220,9 @@ enum AttachReplay {
     Pending { watermark: Option<u64> },
 }
 
+/// The label prefix the server gives a hidden membership subscription (R27).
+const MEMBERSHIP_LABEL_PREFIX: &str = "connetto-membership:";
+
 /// Which scoped tables a clear empties whatever a sibling subscription still claims.
 enum Stale {
     /// None, so each sibling keeps what its filter claims.
@@ -4054,16 +4057,27 @@ where
         reason: &FullResyncReason,
     ) -> Result<(), ClientError> {
         let declared = subscriptions::declared(&mut self.db)?;
+        let beyond_history = *reason == FullResyncReason::CursorBeyondHistory;
+        // A hidden membership subscription has no declared record to take its tables from.
+        let membership = sub_id
+            .strip_prefix(MEMBERSHIP_LABEL_PREFIX)
+            .filter(|_| beyond_history)
+            .map(str::to_lowercase);
         // Every row subscription resyncs, so the first notice empties all their tables and later ones spare fresh replacements.
-        if *reason == FullResyncReason::CursorBeyondHistory && !self.history_cleared {
+        if beyond_history && !self.history_cleared {
             self.history_cleared = true;
-            let mut scope = HashSet::new();
+            let mut scope: HashSet<String> = membership.into_iter().collect();
             for record in &declared {
                 if let Some(coverage) = crate::live::coverage_of(&record.spec)? {
                     scope.extend(coverage.tables);
                 }
             }
             self.delete_uncovered(&scope, None, &Stale::Everything, &HashMap::new())?;
+            return Ok(());
+        }
+        if let Some(table) = membership {
+            let scope = HashSet::from([table]);
+            self.delete_uncovered(&scope, None, &Stale::Nothing, &HashMap::new())?;
             return Ok(());
         }
         let Some(resyncing) = declared

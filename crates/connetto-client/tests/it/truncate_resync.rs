@@ -14,15 +14,16 @@
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck,
+    MembershipOpened, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
-const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
+const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER); \
+    CREATE TABLE members (id INTEGER PRIMARY KEY, quantity INTEGER);";
 /// Two filters over one table that overlap: a row at quantity 5 satisfies both.
 const QUERY_LOW: &str = "SELECT * FROM orders WHERE quantity > 0";
 const QUERY_HIGH: &str = "SELECT * FROM orders WHERE quantity < 100";
@@ -39,11 +40,11 @@ diesel::table! {
     }
 }
 
-/// One snapshot's rows as the compressed patchset a `SnapshotPatch` carries.
-fn snapshot_payload(rows: &[(i64, i64)]) -> Vec<u8> {
+/// One snapshot's rows of `table` as the compressed patchset a `SnapshotPatch` carries.
+fn snapshot_payload(table: &str, rows: &[(i64, i64)]) -> Vec<u8> {
     let mut patchset = PatchSet::<SimpleTable, String, Vec<u8>>::new();
     for &(id, quantity) in rows {
-        let table = SimpleTable::new("orders", &["id", "quantity"], &[0]);
+        let table = SimpleTable::new(table, &["id", "quantity"], &[0]);
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Integer(id))
             .expect("set id")
@@ -55,10 +56,21 @@ fn snapshot_payload(rows: &[(i64, i64)]) -> Vec<u8> {
     zstd::encode_all(bytes.as_slice(), 3).expect("compress snapshot")
 }
 
-/// Send one begin, patch, end triple for `sub_id`.
+/// Send one begin, patch, end triple of `orders` rows for `sub_id`.
 async fn send_snapshot(
     server: &mut LoopbackTransport,
     sub_id: &str,
+    rows: &[(i64, i64)],
+    cursor: u8,
+) {
+    send_snapshot_of(server, sub_id, "orders", rows, cursor).await;
+}
+
+/// Send one begin, patch, end triple of `table` rows for `sub_id`.
+async fn send_snapshot_of(
+    server: &mut LoopbackTransport,
+    sub_id: &str,
+    table: &str,
     rows: &[(i64, i64)],
     cursor: u8,
 ) {
@@ -72,7 +84,7 @@ async fn send_snapshot(
     server
         .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch::new(
             sub_id.to_owned(),
-            snapshot_payload(rows),
+            snapshot_payload(table, rows),
         )))
         .await
         .expect("patch");
@@ -318,5 +330,92 @@ async fn an_unacknowledged_local_write_survives_the_clear() {
         vec![99],
         "the truncate takes the server's rows and leaves the caller's own \
          unacknowledged insert, which nothing else would put back",
+    );
+}
+
+diesel::table! {
+    /// A membership table the server serves through a hidden subscription.
+    members (id) {
+        /// Member identifier, the primary key.
+        id -> diesel::sql_types::BigInt,
+        /// Unread here.
+        quantity -> diesel::sql_types::BigInt,
+    }
+}
+
+const MEMBERSHIP_SUB: &str = "connetto-membership:members";
+
+/// A membership row the promoted database lost goes too, even when this process
+/// learned of the hidden subscription only after the first notice, as a
+/// restarted process does (R73).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_beyond_history_clears_a_hidden_membership_table() {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "membership".to_owned(),
+                session_token: "membership".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                resume_token: "membership".to_owned(),
+                schema_version: None,
+                initial_credits: 64,
+                last_applied_seq: None,
+            }))
+            .await
+            .expect("ack");
+        while !matches!(
+            server.recv().await,
+            Ok(Some(IncomingFrame::Control(ControlMessage::Subscribe(_))) | None) | Err(_)
+        ) {}
+        send_snapshot_of(&mut server, MEMBERSHIP_SUB, "members", &[(7, 1)], 1).await;
+        send_snapshot(&mut server, SUB_LOW, &[(1, 5)], 2).await;
+        for (sub, table, cursor) in [(SUB_LOW, "orders", 3), (MEMBERSHIP_SUB, "members", 4)] {
+            if sub == MEMBERSHIP_SUB {
+                server
+                    .send_control(ControlMessage::MembershipOpened(MembershipOpened {
+                        sub_id: MEMBERSHIP_SUB.to_owned(),
+                        member_table: "members".to_owned(),
+                    }))
+                    .await
+                    .expect("announce");
+            }
+            server
+                .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+                    sub_id: sub.to_owned(),
+                    reason: FullResyncReason::CursorBeyondHistory,
+                }))
+                .await
+                .expect("resync");
+            send_snapshot_of(&mut server, sub, table, &[], cursor).await;
+        }
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+    let config = ClientConfig::new("membership").with_login(Some(Grant::new("user:token")));
+    let mut conn =
+        ConnettoConnection::connect(client_end, &Replica::in_memory(), SQLITE_DDL, &config, None)
+            .await
+            .expect("connect");
+    conn.subscribe(SUB_LOW, QUERY_LOW).await.expect("subscribe");
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    let member_ids = |conn: &mut ConnettoConnection<LoopbackTransport>| -> Vec<i64> {
+        members::table
+            .select(members::id)
+            .load(conn.conn())
+            .expect("read members")
+    };
+    assert_eq!(member_ids(&mut conn), vec![7]);
+
+    pump_to_snapshot_end(&mut conn).await;
+    pump_to_snapshot_end(&mut conn).await;
+    assert_eq!(
+        member_ids(&mut conn),
+        Vec::<i64>::new(),
+        "the promoted database lost the membership row, and nothing declared covers its table"
     );
 }

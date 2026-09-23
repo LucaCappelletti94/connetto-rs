@@ -808,21 +808,27 @@ fn retry_ms(wait: Duration) -> u64 {
 /// Where a handshake's cursor lets its subscriptions resume.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Resume {
-    /// No position, or one in a layout this server does not read.
+    /// No position, which a client holding no rows presents.
     Fresh,
     /// A position the database's history still holds.
     At(u64),
-    /// A position past where its timeline ended, naming changes the database lost (R73).
+    /// A position past where its timeline ended, naming changes the database lost, or one this server cannot read (R73).
     BeyondHistory,
 }
 
 impl Resume {
     /// Judge `cursor` against the database's `history`.
     fn of(cursor: Option<&Cursor>, history: &TimelineHistory) -> Self {
-        match cursor.and_then(|cursor| Position::from_cursor_bytes(cursor.as_bytes())) {
-            None | Some(Position { lsn: 0, .. }) => Self::Fresh,
+        let Some(bytes) = cursor
+            .map(Cursor::as_bytes)
+            .filter(|bytes| !bytes.is_empty())
+        else {
+            return Self::Fresh;
+        };
+        match Position::from_cursor_bytes(bytes) {
+            Some(Position { lsn: 0, .. }) => Self::Fresh,
             Some(position) if history.contains(position) => Self::At(position.lsn),
-            Some(_) => Self::BeyondHistory,
+            Some(_) | None => Self::BeyondHistory,
         }
     }
 }
@@ -5377,12 +5383,20 @@ mod tests {
         let history = twice_promoted();
         assert_eq!(Resume::of(None, &history), Resume::Fresh);
         assert_eq!(judged(&[], &history), Resume::Fresh);
+        assert_eq!(judged(&at(1, 0), &history), Resume::Fresh);
+    }
+
+    /// A client holding rows presents a cursor, so one the server cannot read
+    /// must resync with the notice that clears them, not a plain snapshot.
+    #[test]
+    fn a_cursor_the_server_cannot_read_resyncs_with_a_clear() {
+        let history = twice_promoted();
         assert_eq!(
             judged(&0x150_u64.to_be_bytes(), &history),
-            Resume::Fresh,
-            "the layout without a timeline cannot be judged, so it resyncs"
+            Resume::BeyondHistory,
+            "the layout without a timeline"
         );
-        assert_eq!(judged(&at(1, 0), &history), Resume::Fresh);
+        assert_eq!(judged(&[1, 2, 3], &history), Resume::BeyondHistory);
     }
 
     /// A membership table watched under the given caller kinds.
