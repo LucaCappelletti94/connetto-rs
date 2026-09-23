@@ -344,12 +344,22 @@ diesel::table! {
 }
 
 const MEMBERSHIP_SUB: &str = "connetto-membership:members";
+/// An application subscription over the membership table, which a deployment may declare too.
+const SUB_MEMBERS: &str = "members-app";
+const QUERY_MEMBERS: &str = "SELECT * FROM members WHERE quantity > 0";
 
-/// A membership row the promoted database lost goes too, even when this process
-/// learned of the hidden subscription only after the first notice, as a
-/// restarted process does (R73).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_cursor_beyond_history_clears_a_hidden_membership_table() {
+/// One step of a scripted reconnect: which subscription, which table, which
+/// rows it seeds and which its replacement carries.
+type Step = (
+    &'static str,
+    &'static str,
+    &'static [(i64, i64)],
+    &'static [(i64, i64)],
+);
+
+/// Seed every step, then replace each for `CursorBeyondHistory` in order, announcing the
+/// hidden membership subscription just before its notice the way the server does.
+fn membership_server(declared: usize, steps: &'static [Step]) -> LoopbackTransport {
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
@@ -368,13 +378,20 @@ async fn a_cursor_beyond_history_clears_a_hidden_membership_table() {
             }))
             .await
             .expect("ack");
-        while !matches!(
-            server.recv().await,
-            Ok(Some(IncomingFrame::Control(ControlMessage::Subscribe(_))) | None) | Err(_)
-        ) {}
-        send_snapshot_of(&mut server, MEMBERSHIP_SUB, "members", &[(7, 1)], 1).await;
-        send_snapshot(&mut server, SUB_LOW, &[(1, 5)], 2).await;
-        for (sub, table, cursor) in [(SUB_LOW, "orders", 3), (MEMBERSHIP_SUB, "members", 4)] {
+        let mut subscribed = 0;
+        while subscribed < declared {
+            match server.recv().await {
+                Ok(Some(IncomingFrame::Control(ControlMessage::Subscribe(_)))) => subscribed += 1,
+                Ok(Some(_)) => {}
+                _ => return,
+            }
+        }
+        let mut cursor = 0;
+        for &(sub, table, seed, _) in steps {
+            cursor += 1;
+            send_snapshot_of(&mut server, sub, table, seed, cursor).await;
+        }
+        for &(sub, table, _, replacement) in steps {
             if sub == MEMBERSHIP_SUB {
                 server
                     .send_control(ControlMessage::MembershipOpened(MembershipOpened {
@@ -391,24 +408,52 @@ async fn a_cursor_beyond_history_clears_a_hidden_membership_table() {
                 }))
                 .await
                 .expect("resync");
-            send_snapshot_of(&mut server, sub, table, &[], cursor).await;
+            cursor += 1;
+            send_snapshot_of(&mut server, sub, table, replacement, cursor).await;
         }
         while let Ok(Some(_)) = server.recv().await {}
     });
+    client_end
+}
+
+fn member_ids(conn: &mut ConnettoConnection<LoopbackTransport>) -> Vec<i64> {
+    members::table
+        .select(members::id)
+        .order(members::id.asc())
+        .load(conn.conn())
+        .expect("read members")
+}
+
+/// Connect over `server`, declare `subscriptions`, and drain `seeds` snapshots.
+async fn over(
+    server: LoopbackTransport,
+    subscriptions: &[(&str, &str)],
+    seeds: usize,
+) -> ConnettoConnection<LoopbackTransport> {
     let config = ClientConfig::new("membership").with_login(Some(Grant::new("user:token")));
     let mut conn =
-        ConnettoConnection::connect(client_end, &Replica::in_memory(), SQLITE_DDL, &config, None)
+        ConnettoConnection::connect(server, &Replica::in_memory(), SQLITE_DDL, &config, None)
             .await
             .expect("connect");
-    conn.subscribe(SUB_LOW, QUERY_LOW).await.expect("subscribe");
-    pump_to_snapshot_end(&mut conn).await;
-    pump_to_snapshot_end(&mut conn).await;
-    let member_ids = |conn: &mut ConnettoConnection<LoopbackTransport>| -> Vec<i64> {
-        members::table
-            .select(members::id)
-            .load(conn.conn())
-            .expect("read members")
-    };
+    for (sub, query) in subscriptions {
+        conn.subscribe(sub, query).await.expect("subscribe");
+    }
+    for _ in 0..seeds {
+        pump_to_snapshot_end(&mut conn).await;
+    }
+    conn
+}
+
+/// A membership row the promoted database lost goes too, even when this process
+/// learned of the hidden subscription only after the first notice, as a
+/// restarted process does (R73).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_beyond_history_clears_a_hidden_membership_table() {
+    const STEPS: &[Step] = &[
+        (SUB_LOW, "orders", &[(1, 5)], &[]),
+        (MEMBERSHIP_SUB, "members", &[(7, 1)], &[]),
+    ];
+    let mut conn = over(membership_server(1, STEPS), &[(SUB_LOW, QUERY_LOW)], 2).await;
     assert_eq!(member_ids(&mut conn), vec![7]);
 
     pump_to_snapshot_end(&mut conn).await;
@@ -417,5 +462,33 @@ async fn a_cursor_beyond_history_clears_a_hidden_membership_table() {
         member_ids(&mut conn),
         Vec::<i64>::new(),
         "the promoted database lost the membership row, and nothing declared covers its table"
+    );
+}
+
+/// With the application also subscribed to the membership table, the first
+/// notice already empties it, so the later membership notice must keep what
+/// the application's fresh replacement delivered while the lost row stays gone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hidden_membership_clear_keeps_a_fresh_application_replacement() {
+    const STEPS: &[Step] = &[
+        (SUB_LOW, "orders", &[(1, 5)], &[]),
+        (SUB_MEMBERS, "members", &[(7, 1)], &[(8, 1)]),
+        (MEMBERSHIP_SUB, "members", &[(7, 1)], &[]),
+    ];
+    let mut conn = over(
+        membership_server(2, STEPS),
+        &[(SUB_LOW, QUERY_LOW), (SUB_MEMBERS, QUERY_MEMBERS)],
+        3,
+    )
+    .await;
+    assert_eq!(member_ids(&mut conn), vec![7]);
+
+    for _ in 0..3 {
+        pump_to_snapshot_end(&mut conn).await;
+    }
+    assert_eq!(
+        member_ids(&mut conn),
+        vec![8],
+        "order 7 was lost, and order 8 came from the promoted database after the first clear"
     );
 }

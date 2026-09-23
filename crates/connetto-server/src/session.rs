@@ -2831,12 +2831,7 @@ where
             return Ok(None);
         }
 
-        // Judge the resume cursor and read the server watermark for the ack.
-        let resume = self.resume_from(handshake.last_cursor.as_ref());
-        let current_cursor = match self.oplog.current_lsn().await.map_err(oplog_err)? {
-            Some(lsn) => Cursor::new(self.stamp(&lsn.to_be_bytes())),
-            None => Cursor::new(Vec::new()),
-        };
+        let current_lsn = self.oplog.current_lsn().await.map_err(oplog_err)?;
         // The durable mutation watermark: the client retires pending records
         // at or below it and replays the rest. Its read is the handshake's one
         // reader-pool checkout, so an unidentified caller takes a share permit
@@ -2871,6 +2866,11 @@ where
             &outbound_tx,
         )
         .await;
+        // Judged only once registered, so a history read that lands meanwhile
+        // either shows here or closes this connection (R73).
+        let resume = self.resume_from(handshake.last_cursor.as_ref());
+        let current_cursor =
+            Cursor::new(current_lsn.map_or_else(Vec::new, |lsn| self.stamp(&lsn.to_be_bytes())));
 
         if let Err(err) = transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {

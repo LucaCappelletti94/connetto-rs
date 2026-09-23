@@ -32,6 +32,7 @@ use connetto_test_harness::{
     provision_watermark,
 };
 use diesel_async::AsyncPgConnection;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -175,6 +176,15 @@ async fn provision(pool: &Pool<AsyncPgConnection>) -> PgOplog {
 }
 
 fn manager_on(pool: &Pool<AsyncPgConnection>, oplog: PgOplog) -> Arc<Manager> {
+    manager_writing_to(pool, pool.clone(), oplog)
+}
+
+/// A manager whose watermark reads go through `writes`, so a test can hold that pool.
+fn manager_writing_to(
+    pool: &Pool<AsyncPgConnection>,
+    writes: Pool<AsyncPgConnection>,
+    oplog: PgOplog,
+) -> Arc<Manager> {
     SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
         PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
@@ -182,12 +192,77 @@ fn manager_on(pool: &Pool<AsyncPgConnection>, oplog: PgOplog) -> Arc<Manager> {
         Arc::new(TestGrantChecker),
         NoConnector,
         oplog,
-        pg_write_target::<ConnettoWatermark>(pool.clone(), PG_DDL).expect("write target"),
+        pg_write_target::<ConnettoWatermark>(writes, PG_DDL).expect("write target"),
         Arc::new(RequestGuard::default()),
         SessionConfig::default(),
         None,
         NoSigner,
     )
+}
+
+/// Timeline 2, which ended timeline 1 at `0/10`.
+fn promoted_early() -> TimelineHistory {
+    TimelineHistory::parse(2, "1\t0/10\tno recovery target specified").expect("parse")
+}
+
+/// A cursor from before timelines were stamped is judged on the wire as one
+/// the server cannot read, so the client is told to clear before the snapshot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cursor_without_a_timeline_resyncs_with_a_clear() {
+    let fixture = Fixture::acquire().await;
+    let oplog = provision(fixture.admin()).await;
+    let manager = manager_on(fixture.admin(), oplog);
+    let mut client = connect(&manager, Some(Cursor::new(0x20_u64.to_be_bytes().to_vec()))).await;
+    assert_eq!(
+        snapshot(&mut client).await,
+        (Some(FullResyncReason::CursorBeyondHistory), BTreeSet::new())
+    );
+}
+
+/// A handshake already under way when the server reads a new history must be
+/// judged against that history, since the close that follows the read can
+/// run before the handshake registers and so miss it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handshake_under_way_meets_a_history_read_during_it() {
+    let fixture = Fixture::acquire().await;
+    let oplog = provision(fixture.admin()).await;
+    let writes = Pool::builder()
+        .max_size(1)
+        .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            fixture.admin_url(),
+        ))
+        .await
+        .expect("a one-connection write pool");
+    let manager = manager_writing_to(fixture.admin(), writes.clone(), oplog);
+    let held = writes.get().await.expect("hold the only write connection");
+    let started = writes.state().statistics.get_started;
+
+    let past_the_old_end = Position {
+        timeline: 1,
+        lsn: 0x20,
+    };
+    let handshake = {
+        let manager = Arc::clone(&manager);
+        tokio::spawn(async move {
+            connect(
+                &manager,
+                Some(Cursor::new(past_the_old_end.to_cursor_bytes())),
+            )
+            .await
+        })
+    };
+    while writes.state().statistics.get_started == started {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    manager.reconcile_history(promoted_early()).await;
+    drop(held);
+
+    let mut client = handshake.await.expect("the handshake finishes");
+    assert_eq!(
+        snapshot(&mut client).await.0,
+        Some(FullResyncReason::CursorBeyondHistory),
+        "a verdict taken before the history read would catch up from a position the database lost"
+    );
 }
 
 /// The first history a process reads is stored without a close, the same history again changes nothing, and a new timeline closes every live connection.
