@@ -6,15 +6,16 @@
 
 ## What is encrypted
 
-**Built.** Every durable replica on a device is ciphertext. The local tier that attaches to a replica shares its key and is ciphertext too. The refresh credential is stored separately and is also protected, though by a different key and by a different mechanism depending on the target.
+**Built.** Every durable replica on a device is ciphertext. The local tier that attaches to a replica shares its key and is ciphertext too. Natively the refresh credential is stored separately in the OS keyring. In the browser it is an `HttpOnly` cookie the browser keeps, outside every store this chapter protects (`11-authentication.md`, **Decided (R90, 2026-09-22)**).
 
 | Store | Native | Browser |
 |---|---|---|
 | Replica | SQLCipher file, per-replica key | sqlite3mc file in OPFS, per-replica key |
 | Local (never-syncing) tier | ATTACHed, inherits replica key | Separate connection, same per-replica key passed explicitly |
-| Refresh token | OS keyring (`keyring` crate, no SQLite involved) | OPFS SQLite database encrypted under the device key |
+| Refresh token | OS keyring (`keyring` crate, no SQLite involved) | none, an `HttpOnly` cookie the browser keeps (R90) |
+| Account index and last-used marker | OS keyring index record | plain OPFS SQLite database, never secret (R90) |
 
-The refresh store's device key is distinct from per-replica keys and is covered in the Key custody section below.
+The browser's account index is plain by design, since an account key is an identifier and not a secret. A file an earlier build left under its name reads as not a database, and the boot discards it and asks for a login, while any other failure to open it propagates rather than costing the remembered accounts (**Decided (R90, 2026-09-23)**).
 
 ---
 

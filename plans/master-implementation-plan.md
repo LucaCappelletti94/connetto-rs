@@ -208,7 +208,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R52 native Android gate | NOT STARTED | R88's Android leg (added 2026-09-13). Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
 | R88 the mobile build of a demo | NOT STARTED, minted 2026-09-13 | nothing. Android first on this workstation, iOS through the maintainer's Mac | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
-| R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section, the 2026-08-06 parked BFF entry absorbed | no |
+| R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
 | R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R71 and R91. Two decisions in the section | no |
@@ -5140,7 +5140,7 @@ No read failure of any class can make the change stream reconnect or stop, a poi
 
 ## R90: the browser's refresh token moves into an `HttpOnly` cookie
 
-**Status.** **DONE** (2026-09-22), built on `feat/r90-cookie-refresh` cut from main `db2a449`. Minted 2026-09-13 from the Parked entry of 2026-08-06 that found chapter 11 claiming backend-for-frontend while the browser holds a durable credential. Decided with the maintainer the same day, mechanics settled with the maintainer 2026-09-22.
+**Status.** **DONE** (2026-09-22), built on `feat/r90-cookie-refresh` cut from main `db2a449`. Minted 2026-09-13 from the Parked entry of 2026-08-06 that found chapter 11 claiming backend-for-frontend while the browser holds a durable credential. Decided with the maintainer the same day, mechanics settled with the maintainer 2026-09-22, the credential scope reversed with the maintainer 2026-09-23.
 
 **Blocked on nothing.** Native clients are untouched.
 
