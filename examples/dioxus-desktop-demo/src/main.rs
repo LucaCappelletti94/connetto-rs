@@ -31,8 +31,9 @@
 //! `127.0.0.1:7777`), and `CONNETTO_DEMO_PG`, the conninfo the backend writer
 //! buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
 //! Its server runs `schema.sql` and `policies.sql`, with `schema.sql`,
-//! `connetto_file_server::DEPLOYMENT_DDL`, `roles.sql` and `content.sql`
-//! applied in that order, and `orders,photos` writable.
+//! `connetto_file_server::DEPLOYMENT_DDL`, `connetto_server::epoch::EPOCH_DDL`,
+//! `roles.sql` and `content.sql` applied in that order, and `orders,photos`
+//! writable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -400,7 +401,13 @@ async fn setup() -> anyhow::Result<Parts> {
             ReqwestHttp::new(),
         )
         .await
-        .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?,
+        .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?
+        .heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("registering the lost-photo query: {err}"))?,
     );
     let cc_drive = Arc::clone(&content);
     let outbox = tokio::spawn(async move { cc_drive.drive_outbox(TokioSleeper).await });
@@ -1045,6 +1052,9 @@ fn content_label(event: &ContentEvent) -> String {
             short_hex(file_id.as_bytes())
         ),
         ContentEvent::Fetched { file_id } => format!("fetched {}", short_hex(file_id.as_bytes())),
+        ContentEvent::LostRequeued { file_id } => {
+            format!("re-uploading lost {}", short_hex(file_id.as_bytes()))
+        }
         ContentEvent::IntegrityPassFailed { detail } => format!("integrity check failed: {detail}"),
     }
 }

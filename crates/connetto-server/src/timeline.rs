@@ -1,16 +1,20 @@
-//! Which timeline of the database a resume cursor belongs to (R73).
+//! Which cluster and which timeline of the database a resume cursor belongs to (R73, R70).
 //!
 //! A promoted standby's history ends the old timeline where the standby stopped
 //! receiving, so a cursor past that point names changes the database lost.
+//! A dump restored into another cluster starts again at timeline 1 under another
+//! system identifier, so a cursor naming the old identifier names changes it never had.
 
 use pg_walstream::PgReplicationConnection;
 
 /// The timeline of a database that was never promoted.
 const FIRST_TIMELINE: u32 = 1;
 
-/// A write-ahead log position on the timeline it was issued from.
+/// A write-ahead log position on the cluster and timeline it was issued from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
+    /// The system identifier of the cluster the position was issued on.
+    pub system: u64,
     /// The timeline the position was issued on.
     pub timeline: u32,
     /// The byte offset into the write-ahead log.
@@ -19,23 +23,26 @@ pub struct Position {
 
 impl Position {
     /// A cursor's length on the wire.
-    const ENCODED_LEN: usize = 12;
+    const ENCODED_LEN: usize = 20;
 
-    /// The wire cursor, timeline first so byte order stays issue order across a promotion.
+    /// The wire cursor, the cluster then the timeline, so byte order stays issue order across a promotion.
     #[must_use]
     pub fn to_cursor_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::ENCODED_LEN);
+        bytes.extend_from_slice(&self.system.to_be_bytes());
         bytes.extend_from_slice(&self.timeline.to_be_bytes());
         bytes.extend_from_slice(&self.lsn.to_be_bytes());
         bytes
     }
 
-    /// Read a wire cursor, `None` for any other length, the timeline-less layout included.
+    /// Read a wire cursor, `None` for any other length, the layouts without a cluster included.
     #[must_use]
     pub fn from_cursor_bytes(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; Self::ENCODED_LEN] = bytes.try_into().ok()?;
-        let (timeline, lsn) = bytes.split_at(4);
+        let (system, rest) = bytes.split_at(8);
+        let (timeline, lsn) = rest.split_at(4);
         Some(Self {
+            system: u64::from_be_bytes(system.try_into().ok()?),
             timeline: u32::from_be_bytes(timeline.try_into().ok()?),
             lsn: u64::from_be_bytes(lsn.try_into().ok()?),
         })
@@ -59,9 +66,10 @@ pub enum TimelineError {
     Join(String),
 }
 
-/// The database's current timeline, and where each timeline before it ended.
+/// The database's cluster, its current timeline, and where each timeline before it ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineHistory {
+    system: u64,
     current: u32,
     /// Each ancestor timeline and the last position it shares with the current one.
     ended: Vec<(u32, u64)>,
@@ -70,6 +78,7 @@ pub struct TimelineHistory {
 impl Default for TimelineHistory {
     fn default() -> Self {
         Self {
+            system: 0,
             current: FIRST_TIMELINE,
             ended: Vec::new(),
         }
@@ -77,18 +86,33 @@ impl Default for TimelineHistory {
 }
 
 impl TimelineHistory {
+    /// A never promoted database of the cluster `system`.
+    #[must_use]
+    pub fn first(system: u64) -> Self {
+        Self {
+            system,
+            ..Self::default()
+        }
+    }
+
+    /// The system identifier of the database's cluster.
+    #[must_use]
+    pub const fn system(&self) -> u64 {
+        self.system
+    }
+
     /// The timeline the database writes on now.
     #[must_use]
     pub const fn current(&self) -> u32 {
         self.current
     }
 
-    /// Parse the history file Postgres keeps for `current`.
+    /// Parse the history file Postgres keeps for `current` on the cluster `system`.
     ///
     /// # Errors
     ///
     /// [`TimelineError::Malformed`] when a line names no timeline or no position.
-    pub fn parse(current: u32, content: &str) -> Result<Self, TimelineError> {
+    pub fn parse(system: u64, current: u32, content: &str) -> Result<Self, TimelineError> {
         let ended = content
             .lines()
             .map(str::trim)
@@ -104,26 +128,32 @@ impl TimelineHistory {
                 Ok((timeline, end))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self { current, ended })
+        Ok(Self {
+            system,
+            current,
+            ended,
+        })
     }
 
-    /// Whether `position` is on the current timeline or on an ancestor at or before its end.
+    /// Whether `position` is on this cluster, on the current timeline or on an ancestor at or before its end.
     #[must_use]
     pub fn contains(&self, position: Position) -> bool {
-        position.timeline == self.current
-            || self
-                .ended
-                .iter()
-                .any(|&(timeline, end)| timeline == position.timeline && position.lsn <= end)
+        position.system == self.system
+            && (position.timeline == self.current
+                || self
+                    .ended
+                    .iter()
+                    .any(|&(timeline, end)| timeline == position.timeline && position.lsn <= end))
     }
 
-    /// An eight-byte offset cursor stamped with the current timeline, empty staying empty.
+    /// An eight-byte offset cursor stamped with the cluster and the current timeline, empty staying empty.
     #[must_use]
     pub fn stamp(&self, lsn_cursor: &[u8]) -> Vec<u8> {
         let Ok(lsn) = <[u8; 8]>::try_from(lsn_cursor) else {
             return lsn_cursor.to_vec();
         };
         Position {
+            system: self.system,
             timeline: self.current,
             lsn: u64::from_be_bytes(lsn),
         }
@@ -165,17 +195,24 @@ pub async fn read_history(database_url: &str) -> Result<TimelineHistory, Timelin
 fn read_history_blocking(conninfo: &str) -> Result<TimelineHistory, TimelineError> {
     let mut conn = PgReplicationConnection::connect(conninfo)
         .map_err(|err| TimelineError::Connect(err.to_string()))?;
-    let system = conn
+    let identified = conn
         .identify_system()
         .map_err(|err| TimelineError::Query(err.to_string()))?;
-    let reported = system
-        .get_value(0, 1)
-        .ok_or_else(|| TimelineError::Malformed("IDENTIFY_SYSTEM named no timeline".to_owned()))?;
+    let named = |column: i32, what: &str| {
+        identified
+            .get_value(0, column)
+            .ok_or_else(|| TimelineError::Malformed(format!("IDENTIFY_SYSTEM named no {what}")))
+    };
+    let reported = named(0, "system identifier")?;
+    let Ok(system) = reported.parse::<u64>() else {
+        return Err(TimelineError::Malformed(reported));
+    };
+    let reported = named(1, "timeline")?;
     let Ok(current) = reported.parse::<u32>() else {
         return Err(TimelineError::Malformed(reported));
     };
     if current == FIRST_TIMELINE {
-        return Ok(TimelineHistory::default());
+        return Ok(TimelineHistory::first(system));
     }
     let history = conn
         .exec(&format!("TIMELINE_HISTORY {current}"))
@@ -183,7 +220,7 @@ fn read_history_blocking(conninfo: &str) -> Result<TimelineHistory, TimelineErro
     let content = history.get_bytes(0, 1).ok_or_else(|| {
         TimelineError::Malformed(format!("TIMELINE_HISTORY {current} returned no content"))
     })?;
-    TimelineHistory::parse(current, &String::from_utf8_lossy(content))
+    TimelineHistory::parse(system, current, &String::from_utf8_lossy(content))
 }
 
 #[cfg(test)]
@@ -195,13 +232,20 @@ mod tests {
     const TWICE_PROMOTED: &str = "1\t0/3034A08\tno recovery target specified\n\n\
                                   2\t0/5000000\tno recovery target specified\n";
 
+    /// The cluster every history here belongs to.
+    const CLUSTER: u64 = 7_688_797_528_129_531_953;
+
     fn at(timeline: u32, lsn: u64) -> Position {
-        Position { timeline, lsn }
+        Position {
+            system: CLUSTER,
+            timeline,
+            lsn,
+        }
     }
 
     #[test]
     fn an_ancestor_holds_positions_up_to_where_it_ended_and_no_further() {
-        let history = TimelineHistory::parse(3, TWICE_PROMOTED).expect("parse");
+        let history = TimelineHistory::parse(CLUSTER, 3, TWICE_PROMOTED).expect("parse");
         let first_end = 0x0303_4A08;
         assert!(history.contains(at(1, first_end)));
         assert!(!history.contains(at(1, first_end + 1)));
@@ -216,20 +260,33 @@ mod tests {
 
     #[test]
     fn a_never_promoted_database_holds_every_first_timeline_position_and_nothing_else() {
-        let history = TimelineHistory::default();
+        let history = TimelineHistory::first(CLUSTER);
         assert!(history.contains(at(1, u64::MAX)));
         assert!(!history.contains(at(2, 1)));
     }
 
     #[test]
+    fn a_position_from_another_cluster_is_outside_every_history() {
+        let other = |timeline, lsn| Position {
+            system: CLUSTER + 1,
+            timeline,
+            lsn,
+        };
+        assert!(!TimelineHistory::first(CLUSTER).contains(other(1, 0x10)));
+        let history = TimelineHistory::parse(CLUSTER, 3, TWICE_PROMOTED).expect("parse");
+        assert!(!history.contains(other(3, 0x10)));
+        assert!(!history.contains(other(1, 0x10)));
+    }
+
+    #[test]
     fn a_line_without_a_position_is_refused() {
-        assert!(TimelineHistory::parse(2, "1\tnot-a-position\treason").is_err());
-        assert!(TimelineHistory::parse(2, "one\t0/1\treason").is_err());
+        assert!(TimelineHistory::parse(CLUSTER, 2, "1\tnot-a-position\treason").is_err());
+        assert!(TimelineHistory::parse(CLUSTER, 2, "one\t0/1\treason").is_err());
     }
 
     #[test]
     fn a_stamped_cursor_reads_back_and_sorts_by_timeline_first() {
-        let history = TimelineHistory::parse(2, "1\t0/10\treason").expect("parse");
+        let history = TimelineHistory::parse(CLUSTER, 2, "1\t0/10\treason").expect("parse");
         let stamped = history.stamp(&0x20_u64.to_be_bytes());
         assert_eq!(Position::from_cursor_bytes(&stamped), Some(at(2, 0x20)));
         assert!(at(1, u64::MAX).to_cursor_bytes() < at(2, 0).to_cursor_bytes());
@@ -240,8 +297,10 @@ mod tests {
     }
 
     #[test]
-    fn the_layout_without_a_timeline_reads_as_no_position() {
+    fn the_layouts_without_a_cluster_read_as_no_position() {
         assert_eq!(Position::from_cursor_bytes(&7_u64.to_be_bytes()), None);
+        let timeline_only = [&2_u32.to_be_bytes()[..], &7_u64.to_be_bytes()].concat();
+        assert_eq!(Position::from_cursor_bytes(&timeline_only), None);
         assert_eq!(Position::from_cursor_bytes(&[]), None);
     }
 

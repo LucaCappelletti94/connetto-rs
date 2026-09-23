@@ -106,6 +106,10 @@ async fn boot_with(
             .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_hub_meta_name(hub_meta)
             .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(demo_policy_tables())
             .with_caller_function(CALLER_FUNCTION)

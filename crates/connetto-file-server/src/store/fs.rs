@@ -1,6 +1,6 @@
 //! Filesystem chunk store.
 
-use super::StoreError;
+use super::{StoreError, StoredChunk};
 use connetto_file_core::{ChunkHash, ChunkStore};
 use core::future::{self, Future};
 use std::path::{Path, PathBuf};
@@ -33,6 +33,49 @@ impl FsStore {
         let h = crate::hex_32(hash.as_bytes());
         self.root.join(&h[..2]).join(&h[2..4]).join(&h)
     }
+
+    /// Every chunk under the root, skipping names that are not a hash, such as temp files.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Io` when a directory or a file's metadata cannot be read.
+    pub async fn list(&self) -> Result<Vec<StoredChunk>, StoreError> {
+        let root = self.root.clone();
+        tokio::task::spawn_blocking(move || list_blocking(&root))
+            .await
+            .map_err(|err| StoreError::Io(std::io::Error::other(err)))?
+    }
+}
+
+fn list_blocking(root: &Path) -> Result<Vec<StoredChunk>, StoreError> {
+    let mut found = Vec::new();
+    for first in std::fs::read_dir(root)? {
+        let first = first?;
+        if !first.file_type()?.is_dir() {
+            continue;
+        }
+        for second in std::fs::read_dir(first.path())? {
+            let second = second?;
+            if !second.file_type()?.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(second.path())? {
+                let entry = entry?;
+                let Some(bytes) = entry
+                    .file_name()
+                    .to_str()
+                    .and_then(crate::upload::parse_hex_32)
+                else {
+                    continue;
+                };
+                found.push(StoredChunk {
+                    hash: ChunkHash::from_bytes(bytes),
+                    modified: entry.metadata()?.modified()?,
+                });
+            }
+        }
+    }
+    Ok(found)
 }
 
 impl ChunkStore for FsStore {

@@ -3,7 +3,7 @@
 -- schema.sql feeds CONNETTO_PG_DDL and is what clients sync, this file feeds
 -- CONNETTO_PG_POLICIES and is what the authorization model is derived from.
 -- Apply both to Postgres, this one last, after schema.sql, the file server
--- DDL, roles.sql and content.sql.
+-- DDL, the epoch DDL, roles.sql and content.sql.
 -- build.rs translates the pair together, which is what splits the replica's
 -- orders into a backing table, a view of the logical name, and INSTEAD OF
 -- triggers. The caller is read from app.user_id, which the server binds per

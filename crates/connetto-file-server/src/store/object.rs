@@ -1,7 +1,7 @@
 //! Object-store chunk backend (S3, `MinIO`, local filesystem, and any other
 //! `object_store`-compatible target).
 
-use super::StoreError;
+use super::{StoreError, StoredChunk};
 use connetto_file_core::{ChunkHash, ChunkStore};
 use object_store::{ObjectStore, PutPayload, path::Path};
 use std::sync::Arc;
@@ -23,6 +23,32 @@ impl ObjectStoreBackend {
     fn chunk_path(hash: &ChunkHash) -> Path {
         let h = crate::hex_32(hash.as_bytes());
         Path::from(format!("chunks/{}/{}/{}", &h[..2], &h[2..4], h))
+    }
+
+    /// Every chunk under `chunks/`, skipping objects whose name is not a hash.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Object` when the backend's listing fails.
+    pub async fn list(&self) -> Result<Vec<StoredChunk>, StoreError> {
+        use futures_util::TryStreamExt;
+        let prefix = Path::from("chunks");
+        let mut found = Vec::new();
+        let mut objects = self.store.list(Some(&prefix));
+        while let Some(meta) = objects.try_next().await? {
+            let Some(bytes) = meta
+                .location
+                .filename()
+                .and_then(crate::upload::parse_hex_32)
+            else {
+                continue;
+            };
+            found.push(StoredChunk {
+                hash: ChunkHash::from_bytes(bytes),
+                modified: meta.last_modified.into(),
+            });
+        }
+        Ok(found)
     }
 }
 

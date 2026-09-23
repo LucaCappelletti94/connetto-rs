@@ -92,6 +92,8 @@ Mapping runs once, at the login callback, when connetto mints the session, not o
 
 connetto emits no server DDL on any path a deployment runs, and the one exception is worth naming so the rule is not read as absolute: `PgOplog::ensure_schema` in `crates/connetto-server/src/oplog.rs` does emit `CREATE TABLE IF NOT EXISTS` for the oplog table. It is opt-in, nothing in the server calls it, and only a test does. So it is a convenience for bringing up a scratch database, not a migration mechanism, and it is not a precedent for connetto owning a deployment's schema. The tables below are the deployment's to create and migrate, and `ConnettoStoreSchema` is the real contract, implementable by hand against whatever tables (and column names, extra columns, foreign keys, or indexes) the deployment wants. The `connetto_auth_tables!(Id, IdSqlType)` macro is a convenience default only: it expands to these `diesel::table!` blocks and a `ConnettoStoreSchema` impl for the default shape, parameterized by the developer's `Id` type and its diesel SQL type. A deployment that wants a different shape skips the macro and implements the trait.
 
+`20-deployment.md` lists these tables beside everything else a deployment holds, with what each backup method carries and what the server does when one is missing.
+
 The `user_id` type is a placeholder the deployment fills for its `Id` (for example `BYTEA` for a `uuid`, or `TEXT` for a string id as the reference binary uses). The reference SQL:
 
 ```sql

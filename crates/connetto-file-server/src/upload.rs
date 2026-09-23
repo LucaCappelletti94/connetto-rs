@@ -216,6 +216,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
         .map(ToOwned::to_owned)
         .collect();
     let store = &state.store;
+    let settings = state.caller_settings.clone();
     let ceilings = state.ceilings.clone();
     let quota_settings = state.quotas.clone();
     // Ordering: acquire reader before admin so a saturated reader pool never
@@ -271,6 +272,10 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
         .transaction::<StatusCode, ServerError, _>(async move |conn| {
             let (manifest, declared) =
                 match db::load_manifest_locked::<S>(conn, &file_id, &key).await? {
+                    // A heal for others deletes the healer's manifest, so its retry finds only the committed file.
+                    None if db::file_committed::<S>(conn, &file_id).await? => {
+                        return Ok(StatusCode::OK);
+                    }
                     None => return Err(ServerError::NotFound),
                     Some(db::ManifestState::Committed) => {
                         // Already committed from a previous call or session: re-run the
@@ -300,6 +305,7 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                             .chunks()
                             .iter()
                             .fold(0u64, |acc, c| acc.saturating_add(c.len));
+                        // A heal is checked too, because the store no longer holds a lost file's bytes.
                         {
                             let totals = ceilings.read().await;
                             check_deployment_ceilings(&totals, &quota_settings, storage_new_bytes)?;
@@ -315,7 +321,10 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
             // committer takes this lock before flipping its manifest, the
             // verification mutates nothing in the database, so the SUM under
             // the lock still sees every flip that happened before it.
-            if quota_settings.identity_quota > 0 {
+            // A healer that is not an original uploader is charged nothing and owns nothing.
+            let lost = db::lost_manifest_callers::<S>(conn, &file_id).await?;
+            let heals_for_others = !lost.is_empty() && !lost.contains(&key);
+            if quota_settings.identity_quota > 0 && !heals_for_others {
                 quotas::serialize_uploader(conn, &key).await?;
                 let used = quotas::uploader_committed_bytes::<S>(conn, &key).await?;
                 if used.saturating_add(declared) > quota_settings.identity_quota {
@@ -323,7 +332,16 @@ pub(crate) async fn post_commit<S: ConnettoFileSchema>(
                 }
             }
             let attributions: Vec<&str> = attributions.iter().map(String::as_str).collect();
-            db::commit_manifest_atomic::<S>(conn, &file_id, &key, &attributions).await?;
+            db::commit_manifest_atomic::<S>(
+                conn,
+                &settings,
+                &file_id,
+                &key,
+                &attributions,
+                lost,
+                manifest.chunks(),
+            )
+            .await?;
             Ok(StatusCode::OK)
         })
         .await
@@ -444,7 +462,7 @@ pub(crate) fn parse_chunk_hash(s: &str) -> Result<ChunkHash, ServerError> {
     Ok(ChunkHash::from_bytes(bytes))
 }
 
-fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
+pub(crate) fn parse_hex_32(s: &str) -> Option<[u8; 32]> {
     if s.len() != 64 {
         return None;
     }

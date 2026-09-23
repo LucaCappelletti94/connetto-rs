@@ -110,6 +110,14 @@ pub enum ContentError {
         /// The column the pin named.
         column: String,
     },
+    /// A heal-lost query did not answer with the column it named.
+    #[error("heal-lost query {query} names column {column}, which it does not return")]
+    HealColumnMissing {
+        /// The query as the application registered it.
+        query: String,
+        /// The column the query named.
+        column: String,
+    },
 }
 
 /// Why a staged commit did not land, keeping the row's refusal distinguishable
@@ -160,7 +168,8 @@ impl ContentError {
             | Self::MalformedGrant(_)
             | Self::IdentityMismatch { .. }
             | Self::Archive(_)
-            | Self::PinColumnMissing { .. } => AttemptOutcome::Refused,
+            | Self::PinColumnMissing { .. }
+            | Self::HealColumnMissing { .. } => AttemptOutcome::Refused,
             Self::Http { .. }
             | Self::Replica(_)
             | Self::Client(_)

@@ -53,7 +53,7 @@ use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::wait::HttpWaitStrategy;
-use testcontainers::core::{IntoContainerPort, WaitFor};
+use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
 use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard};
@@ -101,6 +101,9 @@ const MOCK_OAUTH_TAG: &str = "6.0.2";
 /// image publishes none of its own, so both of its ports are named here or the
 /// container is unreachable.
 const POSTGRES_PORT: u16 = 5432;
+/// Where a second cluster inside a restorable fixture's container listens, so a
+/// test can restore a backup beside the cluster it was taken from.
+const SPARE_PORT: u16 = 5433;
 const FGA_GRPC_PORT: u16 = 8081;
 const FGA_HTTP_PORT: u16 = 8080;
 const MOCK_OAUTH_PORT: u16 = 8080;
@@ -656,8 +659,10 @@ static COUNTER_SCOPE: RwLock<()> = RwLock::const_new(());
 pub struct Fixture {
     admin_url: String,
     admin: Pool<AsyncPgConnection>,
-    /// Never read: holding the handle is what keeps the database alive.
-    _postgres: ContainerAsync<GenericImage>,
+    /// Held to keep the database alive, and the target of [`Self::shell`].
+    postgres: ContainerAsync<GenericImage>,
+    /// The admin conninfo on the mapped spare port, present on a restorable fixture only.
+    spare_url: Option<String>,
     /// Started on the first ask, because most tests never ask and an unused
     /// service is a container start for nothing.
     fga: OnceCell<Authorization>,
@@ -680,18 +685,26 @@ impl Fixture {
     /// Panics when the Docker daemon is unreachable, when the container host address or mapped port cannot be resolved, or when watermark provisioning fails, all of which are test setup failures.
     pub async fn acquire() -> Self {
         let scope = COUNTER_SCOPE.read().await;
-        Self::acquire_with(Some(scope), None).await
+        Self::acquire_with(Some(scope), None, false).await
     }
 
     /// Start a fixture isolated from shared fixtures for process-global counter measurements.
     pub async fn acquire_exclusive() -> Self {
         let scope = COUNTER_SCOPE.write().await;
-        Self::acquire_with(None, Some(scope)).await
+        Self::acquire_with(None, Some(scope), false).await
+    }
+
+    /// Start a fixture whose container also publishes port 5433, where a test restores a backup
+    /// as a second cluster ([`Self::spare_url`]) using the tools [`Self::shell`] reaches.
+    pub async fn acquire_restorable() -> Self {
+        let scope = COUNTER_SCOPE.read().await;
+        Self::acquire_with(Some(scope), None, true).await
     }
 
     async fn acquire_with(
         shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
         exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
+        restorable: bool,
     ) -> Self {
         if let Some(directives) = std::env::var("CONNETTO_TEST_LOG")
             .ok()
@@ -703,9 +716,13 @@ impl Fixture {
                 .try_init();
         }
         sweep_abandoned_containers();
-        let request = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
+        let mut image = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
             .with_exposed_port(POSTGRES_PORT.tcp())
-            .with_wait_for(WaitFor::message_on_stderr(POSTGRES_READY))
+            .with_wait_for(WaitFor::message_on_stderr(POSTGRES_READY));
+        if restorable {
+            image = image.with_exposed_port(SPARE_PORT.tcp());
+        }
+        let request = image
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_cmd(["-c", "wal_level=logical", "-c", "fsync=off"])
             .with_labels(container_labels("postgres"))
@@ -716,17 +733,70 @@ impl Fixture {
             .get_host_port_ipv4(POSTGRES_PORT.tcp())
             .await
             .expect("the mapped postgres port");
+        let spare_url = if restorable {
+            let spare = postgres
+                .get_host_port_ipv4(SPARE_PORT.tcp())
+                .await
+                .expect("the mapped spare port");
+            Some(format!(
+                "postgres://postgres:postgres@{host}:{spare}/postgres"
+            ))
+        } else {
+            None
+        };
         let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
         let admin = pool_when_ready(&admin_url).await;
         provision_watermark(&admin).await;
+        exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
         Self {
             admin_url,
             admin,
-            _postgres: postgres,
+            postgres,
+            spare_url,
             fga: OnceCell::new(),
             _shared_counter_scope: shared_counter_scope,
             _exclusive_counter_scope: exclusive_counter_scope,
         }
+    }
+
+    /// Run a `bash` script inside the container as the `postgres` user and
+    /// return its standard output.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the exec cannot start or the script exits nonzero, printing
+    /// the script's standard error.
+    pub async fn shell(&self, script: &str) -> String {
+        let mut run = self
+            .postgres
+            .exec(
+                ExecCommand::new(["gosu", "postgres", "bash", "-euo", "pipefail", "-c", script])
+                    .with_cmd_ready_condition(CmdWaitFor::exit()),
+            )
+            .await
+            .unwrap_or_else(|err| panic!("starting `{script}` in the container: {err}"));
+        let stdout = run.stdout_to_vec().await.expect("read the script's stdout");
+        let stderr = run.stderr_to_vec().await.expect("read the script's stderr");
+        let code = run.exit_code().await.expect("read the script's exit code");
+        assert_eq!(
+            code,
+            Some(0),
+            "`{script}` failed in the container: {}",
+            String::from_utf8_lossy(&stderr)
+        );
+        String::from_utf8(stdout).expect("the script printed UTF-8")
+    }
+
+    /// The admin conninfo of the second cluster a restorable fixture's test starts on port 5433.
+    ///
+    /// # Panics
+    ///
+    /// Panics on a fixture not acquired through [`Self::acquire_restorable`].
+    #[must_use]
+    pub fn spare_url(&self) -> &str {
+        self.spare_url
+            .as_deref()
+            .expect("only a restorable fixture publishes the spare port")
     }
 
     /// The admin pool. It bypasses RLS, so read-backs through it see every row.
@@ -775,6 +845,22 @@ impl Fixture {
         for statement in statements {
             exec(&self.admin, statement).await;
         }
+    }
+
+    /// Create the database auth store's tables in the reference shape
+    /// (`11-authentication.md`), for a server run with `CONNETTO_AUTH=database`.
+    pub async fn provision_auth_tables(&self) {
+        self.setup(&[
+            "CREATE TABLE connetto_sessions (\
+             session_id UUID PRIMARY KEY, user_id TEXT NOT NULL, \
+             current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
+             absolute_deadline TIMESTAMPTZ NOT NULL, revoked BOOLEAN NOT NULL DEFAULT FALSE)",
+            "CREATE TABLE connetto_provider_tokens (\
+             session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
+             issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
+             expires_at TIMESTAMPTZ)",
+        ])
+        .await;
     }
 
     /// Put each published table in full previous-image mode, then create the publication, slot and oplog table.

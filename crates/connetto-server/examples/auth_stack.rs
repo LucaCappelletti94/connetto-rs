@@ -96,6 +96,13 @@ impl AuthStore for ServerStore {
         }
     }
 
+    async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.revoke_every_session().await,
+            Self::Db(store) => store.revoke_every_session().await,
+        }
+    }
+
     async fn session_is_live(
         &self,
         session_id: SessionId,

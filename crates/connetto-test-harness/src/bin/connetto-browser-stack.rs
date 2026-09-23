@@ -39,6 +39,8 @@ const LANDING_PATH: &str = "/dev/landing";
 /// Where a suite fetches the share key this run minted, standing in for
 /// whatever a deployment's own sharing hands a user.
 const SHARE_PATH: &str = "/dev/share";
+/// Where a suite posts hex file ids whose stored chunks the stack deletes before restarting the server, so the boot reconcile marks those files lost.
+const LOSE_CONTENT_PATH: &str = "/dev/lose-content";
 const CALLER_FUNCTION: &str = "current_app_user";
 const BROWSER_PROVIDER: &str = "dev-idp";
 
@@ -52,12 +54,115 @@ const DEPLOYMENT: Deployment = Deployment {
 };
 connetto_auth_tables!(String, diesel::sql_types::Text);
 
+diesel::table! {
+    /// The file server's chunk rows, as the lose-content route reads them.
+    _cfs_manifest_chunks (file_id, uploaded_by, position) {
+        /// The file the chunk belongs to.
+        file_id -> Bytea,
+        /// The caller whose manifest names the chunk.
+        uploaded_by -> Text,
+        /// The chunk's place in the file.
+        position -> Integer,
+        /// The chunk's content hash, which names its stored bytes.
+        chunk_hash -> Bytea,
+    }
+}
+
 struct Services {
     provisioned: Provisioned,
     idp: MockOauth,
     server_bin: PathBuf,
     envs: Vec<(String, String)>,
     share: Arc<Share>,
+}
+
+/// The sync server child, which the lose-content route stops and starts again.
+#[derive(Clone)]
+struct SyncServer {
+    child: Arc<tokio::sync::Mutex<Option<Child>>>,
+    server_bin: PathBuf,
+    envs: Arc<Vec<(String, String)>>,
+    content_dir: PathBuf,
+    admin_url: String,
+}
+
+impl SyncServer {
+    fn new(services: &Services) -> Self {
+        Self {
+            child: Arc::new(tokio::sync::Mutex::new(None)),
+            server_bin: services.server_bin.clone(),
+            envs: Arc::new(services.envs.clone()),
+            content_dir: services.provisioned.content_store.path.clone(),
+            admin_url: services.provisioned.fixture.admin_url().to_owned(),
+        }
+    }
+
+    async fn start(&self) -> Result<()> {
+        let mut slot = self.child.lock().await;
+        *slot = Some(self.spawn().await?);
+        Ok(())
+    }
+
+    async fn spawn(&self) -> Result<Child> {
+        // The child's auth listener carries the file routes the suites fetch.
+        spawn_server(&self.server_bin, &self.envs, SYNC_BIND, CONTENT_BIND).await
+    }
+
+    /// Stops the server, deletes the stored chunks of `file_ids`, and starts it again.
+    async fn lose_content_and_restart(&self, file_ids: Vec<Vec<u8>>) -> Result<()> {
+        use _cfs_manifest_chunks as chunks;
+        use connetto_file_core::ChunkStore as _;
+        use diesel::{ExpressionMethods as _, QueryDsl as _};
+        use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
+
+        let mut conn = AsyncPgConnection::establish(&self.admin_url)
+            .await
+            .context("connecting to name the lost chunks")?;
+        let hashes: Vec<Vec<u8>> = chunks::table
+            .filter(chunks::file_id.eq_any(&file_ids))
+            .select(chunks::chunk_hash)
+            .distinct()
+            .load(&mut conn)
+            .await
+            .context("reading the files' chunks")?;
+        if hashes.is_empty() {
+            return Err(anyhow!("no stored file matches the ids the request names"));
+        }
+        let store = connetto_file_server::FsStore::new(&self.content_dir)
+            .with_context(|| format!("opening {}", self.content_dir.display()))?;
+        let mut slot = self.child.lock().await;
+        if let Some(mut child) = slot.take() {
+            child.kill().await.context("stopping connetto-server")?;
+        }
+        wait_until_closed(SYNC_BIND, Duration::from_secs(10)).await;
+        wait_until_closed(CONTENT_BIND, Duration::from_secs(10)).await;
+        for hash in hashes {
+            let hash: [u8; 32] = hash
+                .try_into()
+                .map_err(|_| anyhow!("a stored chunk hash is not 32 bytes"))?;
+            store
+                .delete_chunk(&connetto_file_core::ChunkHash::from_bytes(hash))
+                .await
+                .map_err(|err| anyhow!("deleting a lost chunk: {err}"))?;
+        }
+        *slot = Some(self.spawn().await?);
+        Ok(())
+    }
+}
+
+/// Parses whitespace-separated 64-character hex file ids.
+fn parse_file_ids(body: &str) -> Option<Vec<Vec<u8>>> {
+    body.split_whitespace()
+        .map(|hex| {
+            (hex.len() == 64)
+                .then(|| {
+                    (0..32)
+                        .map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
+                        .collect::<Option<Vec<u8>>>()
+                })
+                .flatten()
+        })
+        .collect()
 }
 
 /// One slice of the suite list, `--shard I/N`: this process runs every suite
@@ -94,8 +199,9 @@ async fn main() -> Result<()> {
     let services = prepare_services(server_bin).await?;
 
     if let Some((program, args)) = command {
-        let _auth = start_auth_stack(&services).await?;
-        let _server = start_sync_server(&services).await?;
+        let server = SyncServer::new(&services);
+        let _auth = start_auth_stack(&services, server.clone()).await?;
+        server.start().await?;
         run_process(&program, &args, &services.envs).await?;
     } else {
         // The verified-topology pass is one native run, so only the first
@@ -105,8 +211,9 @@ async fn main() -> Result<()> {
             wait_until_closed(SYNC_BIND, Duration::from_secs(5)).await;
             wait_until_closed(AUTH_BIND, Duration::from_secs(5)).await;
         }
-        let _auth = start_auth_stack(&services).await?;
-        let _server = start_sync_server(&services).await?;
+        let server = SyncServer::new(&services);
+        let _auth = start_auth_stack(&services, server.clone()).await?;
+        server.start().await?;
         run_default_browser_suites(&services, shard).await?;
     }
 
@@ -234,7 +341,7 @@ async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
     })
 }
 
-async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
+async fn start_auth_stack(services: &Services, server: SyncServer) -> Result<TaskGuard> {
     let listener = tokio::net::TcpListener::bind(AUTH_BIND)
         .await
         .with_context(|| format!("binding {AUTH_BIND}"))?;
@@ -311,6 +418,24 @@ async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
             )
         }),
     )
+    .route(
+        LOSE_CONTENT_PATH,
+        axum::routing::post(|body: String| async move {
+            let Some(file_ids) = parse_file_ids(&body).filter(|ids| !ids.is_empty()) else {
+                return (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    "the body names hex file ids".to_owned(),
+                );
+            };
+            match server.lose_content_and_restart(file_ids).await {
+                Ok(()) => (axum::http::StatusCode::OK, String::new()),
+                Err(err) => (
+                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("{err:#}"),
+                ),
+            }
+        }),
+    )
     .layer(cors);
     let handle = tokio::spawn(async move {
         if let Err(err) = axum::serve(listener, app).await {
@@ -321,17 +446,6 @@ async fn start_auth_stack(services: &Services) -> Result<TaskGuard> {
         return Err(anyhow!("browser auth stack did not open {AUTH_BIND}"));
     }
     Ok(TaskGuard { handle })
-}
-
-async fn start_sync_server(services: &Services) -> Result<Child> {
-    // The child's auth listener carries the file routes the suites fetch.
-    spawn_server(
-        &services.server_bin,
-        &services.envs,
-        SYNC_BIND,
-        CONTENT_BIND,
-    )
-    .await
 }
 
 /// The verified-topology run, or with `run` false the build of the binary it runs.

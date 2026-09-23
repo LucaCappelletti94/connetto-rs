@@ -174,6 +174,9 @@ pub trait AuthStore: Send + Sync {
         session_id: SessionId,
     ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
 
+    /// Revoke every session still live, returning how many were, the answer to a restore that revived rotated refresh tokens.
+    fn revoke_every_session(&self) -> impl Future<Output = Result<u64, AuthStoreError>> + Send;
+
     /// The session a presented refresh token names, once its secret is
     /// verified, or `None` when no live session matches.
     ///
@@ -406,6 +409,25 @@ impl<
             record.revoked = true;
         }
         Ok(())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+        let mut revoked = 0;
+        for record in self
+            .sessions
+            .lock()
+            .expect("auth store lock")
+            .values_mut()
+            .filter(|record| !record.revoked)
+        {
+            record.revoked = true;
+            revoked += 1;
+        }
+        Ok(revoked)
     }
 
     #[expect(
@@ -663,6 +685,15 @@ mod db {
                 .await
                 .map_err(backend)?;
             Ok(())
+        }
+
+        async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            let revoked = S::revoke_every_update()
+                .execute(&mut conn)
+                .await
+                .map_err(backend)?;
+            Ok(u64::try_from(revoked).unwrap_or(u64::MAX))
         }
 
         async fn session_for_refresh(

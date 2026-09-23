@@ -384,3 +384,60 @@ async fn the_driver_retries_a_deferred_upload_with_no_reconnect() {
         "the file the driver sent is the one that was waiting"
     );
 }
+
+/// R70 decision 16: after an upload the driver releases what no pin covers, as the
+/// browser worker does, and keeps what a pin names.
+#[tokio::test]
+async fn the_driver_releases_an_uploaded_file_no_pin_covers() {
+    let dir = tempdir().expect("temp dir");
+    let http = RecordingHttp::new(vec![
+        (200, br#"{"needed":[]}"#.to_vec()),
+        (200, Vec::new()),
+        (200, br#"{"needed":[]}"#.to_vec()),
+        (200, Vec::new()),
+    ]);
+    let client = connected_client(
+        &dir.path().join("replica.sqlite"),
+        Scripted::granting("https://files.test/files/ab/intent?t=TOKEN"),
+    )
+    .await;
+    let chunks = dir.path().join("chunks");
+    let content = attach_content(client, &chunks, http).await;
+    content
+        .pin_content(
+            "kept",
+            "SELECT content_id FROM photos WHERE id = 1",
+            "content_id",
+        )
+        .await
+        .expect("pin the first photo");
+    let mut events = content.events();
+    stage_photo(&content, 1, PHOTO, MimeClass::Jpeg).await;
+    stage_photo(
+        &content,
+        2,
+        b"a second photograph, nobody pinned",
+        MimeClass::Jpeg,
+    )
+    .await;
+    assert_eq!(walk_files(&chunks).len(), 2);
+
+    let released = async {
+        let mut uploaded = 0;
+        while uploaded < 2 {
+            if let Ok(ContentEvent::Uploaded { .. }) = events.recv().await {
+                uploaded += 1;
+            }
+        }
+        while walk_files(&chunks).len() != 1 {
+            tokio::time::sleep(core::time::Duration::from_millis(50)).await;
+        }
+    };
+    tokio::select! {
+        () = content.drive_outbox(|_| core::future::ready(())) => panic!("the driver ended"),
+        () = released => {}
+        () = tokio::time::sleep(core::time::Duration::from_secs(10)) => {
+            panic!("the unpinned upload was never released, {} chunk files remain", walk_files(&chunks).len())
+        }
+    }
+}

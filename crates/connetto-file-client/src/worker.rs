@@ -107,12 +107,17 @@ fn next_after(waiting: &[FileId], last: Option<FileId>) -> Option<FileId> {
 ///
 /// Split apart, an entry could leave the outbox with nothing recording that
 /// this device ever declared the file while an application row still names it.
+/// A heal entry leaves quietly, since a cache copy lost is no authored data lost.
 pub(crate) fn retire(
     conn: &mut diesel::SqliteConnection,
     file_id: FileId,
 ) -> Result<(), ContentError> {
     conn.transaction(|conn| {
+        let heal = db::is_heal(conn, file_id)?;
         db::dequeue(conn, file_id)?;
+        if heal {
+            return Ok(());
+        }
         db::record_retired(conn, file_id)
     })
     .map_err(ContentError::from)
@@ -202,6 +207,7 @@ pub enum ResolveRoute {
 pub struct ContentArchive<B> {
     store: B,
     root_key: [u8; 32],
+    heal_queries: Vec<(String, String)>,
 }
 
 impl<B> ContentArchive<B>
@@ -211,21 +217,121 @@ where
     /// Creates archive policy over one encrypted chunk store.
     #[must_use]
     pub const fn new(store: B, root_key: [u8; 32]) -> Self {
-        Self { store, root_key }
+        Self {
+            store,
+            root_key,
+            heal_queries: Vec::new(),
+        }
     }
 
-    /// Installs content bookkeeping.
+    /// Adds a query naming, in `file_id_column`, files the server marked lost, as
+    /// [`ContentClient::heal_lost`](crate::ContentClient::heal_lost) does natively.
+    #[must_use]
+    pub fn with_heal_lost(mut self, query: &str, file_id_column: &str) -> Self {
+        self.heal_queries
+            .push((query.to_owned(), file_id_column.to_owned()));
+        self
+    }
+
+    /// Whether any heal query is registered, so a row change is worth a [`queue_lost`](Self::queue_lost).
+    #[must_use]
+    pub fn heals_lost(&self) -> bool {
+        !self.heal_queries.is_empty()
+    }
+
+    /// Installs content bookkeeping and checks every heal query answers its column.
     ///
     /// # Errors
     ///
-    /// [`ContentError::Replica`] when the bookkeeping schema cannot be applied.
+    /// [`ContentError::Replica`] when the bookkeeping schema cannot be applied, and
+    /// [`ContentError::HealColumnMissing`] when a heal query does not return its column.
     pub fn install<T: Transport>(
         &self,
         connection: &mut ConnettoConnection<T>,
     ) -> Result<(), ContentError> {
         let conn = connection.conn();
         conn.batch_execute(db::CONTENT_DDL)?;
-        db::add_refused_column(conn).map_err(ContentError::from)
+        db::add_outbox_columns(conn)?;
+        for (query, column) in &self.heal_queries {
+            if !crate::retain::answers_column(conn, query, column) {
+                return Err(ContentError::HealColumnMissing {
+                    query: query.clone(),
+                    column: column.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Puts back in the outbox every file a heal query names that this device holds.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when a query or the bookkeeping cannot be read or written.
+    pub fn queue_lost<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<Vec<FileId>, ContentError> {
+        crate::retain::queue_lost(connection.conn(), &self.heal_queries)
+    }
+
+    /// Keeps the files `query` names in `file_id_column` on this device under `name`, as
+    /// [`ContentClient::pin_content`](crate::ContentClient::pin_content) does natively.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::PinColumnMissing`] when the query does not return the named column,
+    /// and [`ContentError::Replica`] when the record cannot be written.
+    pub fn pin_content<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        name: &str,
+        query: &str,
+        file_id_column: &str,
+    ) -> Result<(), ContentError> {
+        if !crate::retain::answers_column(connection.conn(), query, file_id_column) {
+            return Err(ContentError::PinColumnMissing {
+                name: name.to_owned(),
+                column: file_id_column.to_owned(),
+            });
+        }
+        connection
+            .transact_with_bookkeeping(
+                |c| db::put_pin(c, name, query, file_id_column).map_err(ContentError::Replica),
+                |_| Ok::<(), ContentError>(()),
+            )
+            .map(|_| ())
+    }
+
+    /// Ends the pin under `name`. Unknown names are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the record cannot be removed.
+    pub fn unpin_content<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        name: &str,
+    ) -> Result<(), ContentError> {
+        connection
+            .transact_with_bookkeeping(
+                |c| db::drop_pin(c, name),
+                |_| Ok::<(), diesel::result::Error>(()),
+            )
+            .map(|_| ())
+            .map_err(ContentError::Replica)
+    }
+
+    /// Every content pin, as name, query and file-id column, in name order.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when the records cannot be read.
+    pub fn content_pins<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+    ) -> Result<Vec<(String, String, String)>, ContentError> {
+        db::pins(connection.conn()).map_err(ContentError::Replica)
     }
 
     /// Chunks one file into the encrypted store without touching the replica.
@@ -442,7 +548,7 @@ where
         })
     }
 
-    /// Counts content files that have not reached the server.
+    /// Counts files authored here that have not reached the server.
     ///
     /// # Errors
     ///
@@ -457,8 +563,8 @@ where
     /// Counts content files that are sendable: in the outbox and not permanently refused.
     ///
     /// The outbox driver schedules walks from this count rather than from
-    /// [`pending_files`](Self::pending_files), so a refused entry never triggers a walk.
-    /// Pending work keeps counting every row.
+    /// [`pending_files`](Self::pending_files), so a refused entry never triggers a walk,
+    /// and a queued heal entry does.
     ///
     /// # Errors
     ///
@@ -470,7 +576,7 @@ where
         db::sendable_count(connection.conn())
     }
 
-    /// Lists the files waiting in the outbox, in queue order.
+    /// Lists the files authored here that wait in the outbox, in queue order.
     ///
     /// # Errors
     ///
@@ -1178,6 +1284,139 @@ mod tests {
         assert!(
             encrypted.read_chunk(&hash).await.is_ok(),
             "a chunk a manifest names must survive a stale orphan listing"
+        );
+    }
+
+    /// A heal query queues a held file once, and never a file queued already, lost here
+    /// too, or held nowhere on this device.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_heal_query_queues_only_files_this_device_can_send() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+        use connetto_file_core::{EncryptingStore, MimeClass, process_file};
+        use diesel::connection::SimpleConnection;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB, content_state TEXT)",
+            &ClientConfig::new("heal"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive = super::ContentArchive::new(store.clone(), [1; 32]).with_heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        );
+        archive.install(&mut connection).expect("content tables");
+
+        let encrypted = EncryptingStore::new(store, &[1; 32]);
+        let mut files = Vec::new();
+        for byte in 1..=4u8 {
+            let manifest = process_file(&vec![byte; 1024], MimeClass::Jpeg, &encrypted)
+                .await
+                .expect("the bytes chunk");
+            files.push(manifest);
+        }
+        let [held, queued, retired, absent] = [&files[0], &files[1], &files[2], &files[3]];
+        for manifest in [held, queued, retired] {
+            db::put_manifest(connection.conn(), manifest).expect("record the manifest");
+        }
+        db::enqueue(connection.conn(), queued.file_id()).expect("queue one");
+        db::record_retired(connection.conn(), retired.file_id()).expect("retire one");
+        for (id, manifest) in files.iter().enumerate() {
+            connection
+                .conn()
+                .batch_execute(&format!(
+                    "INSERT INTO photos VALUES ({id}, x'{}', 'lost')",
+                    manifest.file_id()
+                ))
+                .expect("a lost row");
+        }
+
+        assert_eq!(
+            archive.queue_lost(&mut connection).expect("the pass runs"),
+            vec![held.file_id()]
+        );
+        assert!(db::is_unsent(connection.conn(), held.file_id()).expect("read"));
+        assert!(!db::is_unsent(connection.conn(), absent.file_id()).expect("read"));
+        assert_eq!(
+            archive
+                .queue_lost(&mut connection)
+                .expect("the pass runs again"),
+            Vec::new(),
+            "a queued file is not queued twice"
+        );
+
+        // A heal entry is sent like any entry and is not this device's authorship.
+        assert_eq!(archive.sendable_files(&mut connection).expect("count"), 2);
+        assert_eq!(archive.pending_files(&mut connection).expect("count"), 1);
+        assert_eq!(
+            archive.unsent_files(&mut connection).expect("list"),
+            vec![queued.file_id()]
+        );
+        assert_eq!(
+            super::outbox_manifests(&mut connection)
+                .expect("the export set")
+                .iter()
+                .map(connetto_file_core::Manifest::file_id)
+                .collect::<Vec<_>>(),
+            vec![queued.file_id()],
+            "a heal entry is never exported as authored content"
+        );
+
+        // Another device healed the file, so this one must not upload it too.
+        connection
+            .conn()
+            .batch_execute("UPDATE photos SET content_state = 'available'")
+            .expect("the heal arrives");
+        assert_eq!(
+            archive.queue_lost(&mut connection).expect("the pass runs"),
+            Vec::new()
+        );
+        assert!(!db::is_unsent(connection.conn(), held.file_id()).expect("read"));
+        assert!(
+            db::is_unsent(connection.conn(), queued.file_id()).expect("read"),
+            "an authored entry stays whatever the query says"
+        );
+    }
+
+    /// A heal entry whose local bytes are gone leaves the outbox quietly, since a cache
+    /// copy lost is no authored data lost.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[test]
+    fn an_unreadable_heal_entry_is_dropped_without_a_loss_record() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("heal-lost"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let archive =
+            super::ContentArchive::new(crate::store::FsStore::new(dir.path().join("c")), [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+        let healing = file(0x4E);
+        db::enqueue_heal(connection.conn(), healing).expect("queue a heal");
+
+        super::ContentArchive::<crate::store::FsStore>::finish_attempt(
+            &mut connection,
+            healing,
+            Err(crate::error::ContentError::NoManifest { file_id: healing }),
+        )
+        .expect("the attempt settles");
+        assert!(!db::is_unsent(connection.conn(), healing).expect("read"));
+        assert_eq!(
+            db::retired(connection.conn()).expect("read retired"),
+            Vec::<FileId>::new()
         );
     }
 
@@ -2241,6 +2480,41 @@ mod tests {
         );
     }
 
+    /// A file queued to heal and then staged or imported here is authored, so it counts as pending and is never retired quietly.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[tokio::test]
+    async fn a_heal_entry_whose_file_is_then_authored_here_becomes_authored() {
+        use crate::db;
+        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+        use connetto_core::test_support::FakeTransport;
+
+        let mut connection = ConnettoConnection::<FakeTransport>::open(
+            &Replica::in_memory(),
+            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
+            &ClientConfig::new("heal-then-author"),
+            None,
+        )
+        .expect("the replica opens offline");
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let store = crate::store::FsStore::new(dir.path().join("chunks"));
+        let archive = super::ContentArchive::new(store, [1; 32]);
+        archive.install(&mut connection).expect("content tables");
+
+        let file_id = file(0xDD);
+        db::enqueue_heal(connection.conn(), file_id).expect("queue a heal");
+        db::refuse(connection.conn(), file_id, "over the quota").expect("refuse the heal");
+        db::enqueue(connection.conn(), file_id).expect("author the same file");
+
+        assert!(!db::is_heal(connection.conn(), file_id).expect("read the kind"));
+        assert_eq!(db::outbox_count(connection.conn()).expect("count"), 1);
+        assert!(
+            db::sendable(connection.conn())
+                .expect("sendable")
+                .is_empty(),
+            "the refusal stays until an explicit retry, as for any authored entry"
+        );
+    }
+
     /// The integrity walk retires a refused entry whose bytes are conclusively gone, so a
     /// refusal does not make a loss invisible.
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
@@ -2329,7 +2603,7 @@ mod tests {
                 .pending_files(&mut connection)
                 .expect("pending count"),
             2,
-            "pending_files counts every outbox row including refused ones"
+            "pending_files counts every authored outbox row including refused ones"
         );
         assert_eq!(
             archive

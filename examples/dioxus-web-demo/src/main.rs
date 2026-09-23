@@ -432,6 +432,10 @@ async fn run_db_worker() -> Result<(), JsValue> {
             .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(PolicyTables::from_translation(
                 POLICY_TABLES.iter().copied(),

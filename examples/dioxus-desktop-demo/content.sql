@@ -1,7 +1,8 @@
 -- The two contracts the file server asks of this deployment, with the grants
 -- its reader role needs. Apply in this order:
 --
---   schema.sql, connetto_file_server::DEPLOYMENT_DDL, roles.sql,
+--   schema.sql, connetto_file_server::DEPLOYMENT_DDL,
+--   connetto_server::epoch::EPOCH_DDL, roles.sql,
 --   content.sql.
 --
 -- connetto_visible_files is SECURITY INVOKER with a pinned search_path so row

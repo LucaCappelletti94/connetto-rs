@@ -223,11 +223,11 @@ async fn setup_content_store(
     };
     let persistent = store.is_persistent();
     let wipe_namespace = identified.then_some(namespace);
-    Ok((
-        Some(ContentArchive::new(store, root_key)),
-        Some(persistent),
-        wipe_namespace,
-    ))
+    let archive = config.content_heal_lost.iter().fold(
+        ContentArchive::new(store, root_key),
+        |archive, (query, column)| archive.with_heal_lost(query, column),
+    );
+    Ok((Some(archive), Some(persistent), wipe_namespace))
 }
 
 fn start_relay_hub<F, S>(

@@ -10,7 +10,7 @@ use bytes::Bytes;
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId};
 use connetto_file_server::{
     AnyStore, AppPools, Config, ContentCaller, CustomStore, DEPLOYMENT_DDL, DefaultFileSchema,
-    FsStore, ObjectStoreBackend, StoreError, TicketSigner, TicketVerifier, serve,
+    FsStore, ObjectStoreBackend, StoreError, StoredChunk, TicketSigner, TicketVerifier, serve,
 };
 use diesel_async::{
     AsyncConnection, AsyncPgConnection, RunQueryDsl,
@@ -442,6 +442,12 @@ impl CustomStore for FaultStore {
             self.inner.delete(hash).await
         })
     }
+
+    fn list(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredChunk>, StoreError>> + Send + '_>> {
+        Box::pin(async move { self.inner.list().await })
+    }
 }
 
 struct GatedWriteStore {
@@ -482,6 +488,12 @@ impl CustomStore for GatedWriteStore {
         hash: &'a ChunkHash,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
         Box::pin(async move { self.inner.delete(hash).await })
+    }
+
+    fn list(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredChunk>, StoreError>> + Send + '_>> {
+        Box::pin(async move { self.inner.list().await })
     }
 }
 
@@ -529,6 +541,12 @@ impl CustomStore for GatedReadStore {
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
         Box::pin(async move { self.inner.delete(hash).await })
     }
+
+    fn list(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredChunk>, StoreError>> + Send + '_>> {
+        Box::pin(async move { self.inner.list().await })
+    }
 }
 
 struct ShortReadStore {
@@ -568,6 +586,12 @@ impl CustomStore for ShortReadStore {
         hash: &'a ChunkHash,
     ) -> Pin<Box<dyn Future<Output = Result<(), StoreError>> + Send + 'a>> {
         Box::pin(async move { self.inner.delete(hash).await })
+    }
+
+    fn list(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredChunk>, StoreError>> + Send + '_>> {
+        Box::pin(async move { self.inner.list().await })
     }
 }
 

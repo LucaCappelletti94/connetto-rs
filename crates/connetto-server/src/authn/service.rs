@@ -382,6 +382,18 @@ impl<S: AuthStore> AuthService<S> {
             .await
     }
 
+    /// Revoke every live session, returning how many were live.
+    ///
+    /// A restore rewinds the session store to the backup, which brings back refresh tokens rotated away since, so the server calls this whenever it finds itself on a restored or another cluster (R70).
+    /// No audit row is written, since the row names one session, and the server logs the count and the cause.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError`] if the store fails.
+    pub async fn revoke_every_session(&self) -> Result<u64, AuthError> {
+        Ok(self.store.revoke_every_session().await?)
+    }
+
     /// Revoke, and record the cause. Three causes reach here and they are not
     /// interchangeable: an audit row saying only that a login ended cannot tell
     /// an ordinary logout from a stolen credential, which is the most valuable
