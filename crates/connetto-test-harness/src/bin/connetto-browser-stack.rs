@@ -177,7 +177,9 @@ fn build_only() -> Result<Option<PathBuf>> {
 /// Build every native binary a run needs and copy them, with this one, into
 /// `dir`, so one CI job builds what every shard then runs.
 async fn prebuild(dir: &Path) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
     let binaries = [
         (ensure_server_bin().await?, "connetto-server"),
         (build_topology().await?, "verified-topology"),
@@ -188,7 +190,8 @@ async fn prebuild(dir: &Path) -> Result<()> {
     ];
     for (from, name) in binaries {
         let to = dir.join(exe_name(name));
-        fs::copy(&from, &to)
+        tokio::fs::copy(&from, &to)
+            .await
             .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
     }
     Ok(())
