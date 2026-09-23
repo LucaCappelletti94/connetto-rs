@@ -193,17 +193,6 @@ pub(crate) fn init_worker(key_store: Rc<IdbKeyStore>, initial: Custody) {
     WORKER_KEY_STORE.with(|ks| ks.borrow_mut().replace(key_store));
 }
 
-/// The worker's own key store, the one whose derived key-encryption key an
-/// unlock put in memory.
-///
-/// Anything in the worker that needs the device key after the gate must use this
-/// rather than opening a second store: the derived key lives on the instance, so
-/// a freshly opened one is locked on an enrolled profile even though the worker
-/// is unlocked.
-pub(crate) fn worker_key_store() -> Option<Rc<IdbKeyStore>> {
-    WORKER_KEY_STORE.with(|slot| slot.borrow().clone())
-}
-
 /// Update the worker-side custody after an unlock or enrol outcome.
 ///
 /// Called from `boot_db_worker` once the tab's answer is processed.

@@ -35,10 +35,9 @@ pub mod unlock;
 pub mod workers;
 
 pub use auth::{
-    AT_REST_KEK_LABEL, AT_REST_PRF_INPUT, Acquired, AuthError, BrowserAuthenticator,
-    BrowserSession, LOCKED_MESSAGE, LOGIN_CHANNEL, LoginMessage, PendingLogin, RefreshStore,
-    WorkerAuthConfig, await_login_code, deliver_login_code, remembered_account,
-    remembered_identity,
+    AT_REST_KEK_LABEL, AT_REST_PRF_INPUT, AccountStore, Acquired, AuthError, BrowserAuthenticator,
+    BrowserSession, LOCKED_MESSAGE, LOGIN_CHANNEL, LoginMessage, PendingLogin, WorkerAuthConfig,
+    await_login_code, deliver_login_code, remembered_account, remembered_identity,
 };
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
@@ -62,8 +61,7 @@ pub use relay::{
     ExportRefused, ForgetRefused, HubGone, HubNotice, ImportRefused, RelayError, RelayHub, TabId,
 };
 pub use storage::{
-    PendingWipe, ReplicaStorage, WipeError, clear_device_key, device_key, mark_wipe_pending,
-    take_pending_wipes, wipe_replica,
+    PendingWipe, ReplicaStorage, WipeError, mark_wipe_pending, take_pending_wipes, wipe_replica,
 };
 pub use unlock::UnlockError;
 use wasm_bindgen::JsCast;

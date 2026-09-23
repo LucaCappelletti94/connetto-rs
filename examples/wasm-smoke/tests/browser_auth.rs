@@ -3,15 +3,14 @@
 //! Everything here is what the native leg structurally cannot reach. E4.a proved
 //! the shared OAuth spine, meaning connetto's login and callback endpoints, the
 //! provider round trip, and the token mint, all of which is one implementation for
-//! both clients. What forks after that is browser-specific and had never run at
-//! all: `BrowserAuthenticator` had never talked to a server, `web-sys` `fetch` had
-//! never carried a token request, the refresh store had never held a credential
-//! from a real login, and `BrowserAuthenticator::logout` had never been executed.
+//! both clients. What forks after that is browser-specific: `BrowserAuthenticator`
+//! talking to a server over `web-sys` `fetch`, the refresh credential living in
+//! the `HttpOnly` cookie the browser carries, and `BrowserAuthenticator::logout`
+//! revoking through that cookie.
 //!
-//! Runs in a dedicated worker, which is where the real DB worker runs and the only
-//! context with OPFS sync access handles, so the token custody path is the product
-//! one: the refresh token lands in an OPFS database encrypted under this device's
-//! own key.
+//! Runs in a dedicated worker, which is where the real DB worker runs and the
+//! only context with OPFS sync access handles, so the account index beside the
+//! cookie is the product one.
 //!
 //! One thing this still stands in for: the tab. A worker cannot navigate, and a
 //! test page that navigated away would end the test, so the login URL is walked
@@ -24,12 +23,12 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::{encode_identity, replica_db_name};
-use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::traits::ReplicaKeyStore;
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, RefreshStore, WorkerAuthConfig,
+    AccountStore, Acquired, BrowserAuthenticator, IdbKeyStore, WorkerAuthConfig,
     provision_replica_key,
 };
-use connetto_web::storage::{ReplicaStorage, clear_device_key, device_key};
+use connetto_web::storage::ReplicaStorage;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -48,14 +47,12 @@ const PROVIDER: &str = "dev-idp";
 /// be confused with another test's.
 const TWO_ACCOUNT_DB: &str = "r54-two-accounts.sqlite";
 
-/// The OPFS database holding the refresh token for this suite, distinct from the
-/// other suites' so one origin's pool holds them all.
-const REFRESH_DB: &str = "e4b-refresh.sqlite";
+/// The OPFS account index for this suite, distinct from the other suites' so one
+/// origin's pool holds them all.
+const ACCOUNT_DB: &str = "e4b-accounts.sqlite";
 
-/// A second refresh store, used to present a credential the server has revoked.
-const REVOKED_DB: &str = "e4b-revoked.sqlite";
-/// A third store, for the stale-marker case, so its bogus marker cannot be
-/// mistaken for either store above.
+/// A second index, for the stale-marker case, so its bogus marker cannot be
+/// mistaken for the one above.
 const STALE_DB: &str = "r42-stale-marker.sqlite";
 
 /// The replica prefix this suite names its per-identity replica under.
@@ -133,57 +130,49 @@ fn config_for(provider: &str) -> WorkerAuthConfig {
 async fn login_as(
     subject: &str,
     account: Option<String>,
-    store: &RefreshStore,
+    store: &AccountStore,
 ) -> connetto_web::auth::BrowserSession<String> {
     let authenticator = BrowserAuthenticator::new(config_for(PROVIDER), account);
     let pending = match authenticator
-        .acquire::<String, _>(store)
+        .acquire::<String>(store)
         .await
         .expect("acquire")
     {
         Acquired::NeedLogin(pending) => pending,
-        Acquired::Access(_) => panic!("addressing no stored credential cannot refresh silently"),
+        Acquired::Access(_) => panic!("addressing no stored account cannot refresh silently"),
     };
     let (code, state) = walk_the_login(&pending.login_url, subject).await;
     authenticator
-        .complete::<String, _>(&pending, &code, &state, store)
+        .complete::<String>(&pending, &code, &state, store)
         .await
         .expect("complete the login")
 }
 
 /// The whole browser branch in one pass: acquire needs a login, the login
 /// completes against a real provider, the token exchange goes out through
-/// `web-sys` `fetch` from the worker, the refresh token lands encrypted in OPFS, a
-/// second acquire refreshes silently rather than asking to log in again, the
-/// identity names an encrypted replica that opens, and a logout clears local state
-/// and revokes the session so the credential it held is dead.
+/// `web-sys` `fetch` from the worker, the browser takes the refresh cookie the
+/// exchange set, a second acquire refreshes silently through that cookie rather
+/// than asking to log in again, the identity names an encrypted replica that
+/// opens, and a logout revokes the session and clears the cookie and the index
+/// row.
 #[wasm_bindgen_test]
 async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     let storage = ReplicaStorage::install().await;
     let keys = IdbKeyStore::open().await.expect("open the key store");
 
-    // Start from nothing, so a rerun in the same origin is not resuming an earlier
-    // session's credential.
-    clear_device_key(&keys).await.expect("clear the device key");
-    for db in [REFRESH_DB, REVOKED_DB] {
-        storage.delete_db(db).expect("clear an earlier store");
-    }
-    let device = device_key(&keys).await.expect("mint the device key");
+    // Start from nothing, so a rerun in the same origin is not resuming an
+    // earlier session.
+    storage
+        .delete_db(ACCOUNT_DB)
+        .expect("clear an earlier index");
 
-    let store =
-        RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("open the refresh store");
+    let store = AccountStore::open(&storage.db_url(ACCOUNT_DB)).expect("open the account index");
     // Nothing is stored, so pass None: this is a first run.
     let first_auth = BrowserAuthenticator::new(config(), None);
 
-    // Nothing is stored, so there is nothing to refresh from and the worker asks
-    // for an interactive login.
-    let pending = match first_auth
-        .acquire::<String, _>(&store)
-        .await
-        .expect("acquire")
-    {
+    let pending = match first_auth.acquire::<String>(&store).await.expect("acquire") {
         Acquired::NeedLogin(pending) => pending,
-        Acquired::Access(_) => panic!("an empty refresh store cannot silently refresh"),
+        Acquired::Access(_) => panic!("an empty account index cannot silently refresh"),
     };
     assert!(
         pending.login_url.starts_with(AUTH_BASE),
@@ -196,11 +185,11 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // and its own one-time code reaches the client redirect.
     let (code, state) = walk_the_login(&pending.login_url, "browser-user").await;
 
-    // The worker redeems that code over `web-sys` fetch, which is the first time
-    // this path has ever carried a request, and persists the rotated refresh token
-    // into the encrypted OPFS store.
+    // The worker redeems that code over `web-sys` fetch. The refresh token never
+    // appears in the body: the same response set the `HttpOnly` cookie, which
+    // this crate cannot read.
     let session = first_auth
-        .complete::<String, _>(&pending, &code, &state, &store)
+        .complete::<String>(&pending, &code, &state, &store)
         .await
         .expect("complete the login");
     assert!(
@@ -212,35 +201,36 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
         "and the identity the provider asserted"
     );
 
-    // Derive the account key from the identity the login returned: this is the
-    // key under which the credential and all subsequent loads must be addressed.
+    // The account lands in the index and owns the last-used marker.
     let account = encode_identity(&session.user_id).expect("encode the account key");
-    let first_refresh = store
-        .load(&account)
-        .expect("load")
-        .expect("the refresh token is persisted");
+    assert!(
+        store.accounts().expect("list").contains(&account),
+        "the account is indexed"
+    );
+    assert_eq!(
+        connetto_web::auth::remembered_account(&store)
+            .expect("read the marker")
+            .as_deref(),
+        Some(account.as_str()),
+        "and the marker names it"
+    );
 
-    // A cold start or a leader failover refreshes silently: no interactive login,
-    // the same identity, and a rotated token. The authenticator for this knows
+    // A cold start or a leader failover refreshes silently through the cookie:
+    // no interactive login, the same identity. The authenticator for this knows
     // which account to try.
     let authenticator = BrowserAuthenticator::new(config(), Some(account.clone()));
     let refreshed = match authenticator
-        .acquire::<String, _>(&store)
+        .acquire::<String>(&store)
         .await
         .expect("acquire again")
     {
         Acquired::Access(session) => session,
-        Acquired::NeedLogin(_) => panic!("a stored refresh token must refresh silently"),
+        Acquired::NeedLogin(_) => panic!("the cookie the login set must refresh silently"),
     };
     assert_eq!(
         refreshed.user_id, session.user_id,
         "the identity is continuous across a refresh"
     );
-    let rotated = store
-        .load(&account)
-        .expect("load")
-        .expect("a refresh token");
-    assert_ne!(rotated, first_refresh, "the refresh token rotated");
 
     // The identity names its own replica, and the key for it is minted on this
     // device. This is the join between the auth path and the encryption work: the
@@ -268,51 +258,28 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
         "the identity's replica is in the pool"
     );
 
-    // Keep a copy of the live credential, so the revoke can be observed rather
-    // than inferred from the local clear.
-    let live_refresh = store
-        .load(&account)
-        .expect("load")
-        .expect("a refresh token");
-    let revoked_store =
-        RefreshStore::open(&storage.db_url(REVOKED_DB), &device).expect("open the second store");
-    revoked_store
-        .store(&account, &live_refresh)
-        .expect("seed the copy before the logout");
-    // Without this the revoke assertion below could pass for the wrong reason: an
-    // empty store also yields `NeedLogin`, which would look like a refusal.
-    assert_eq!(
-        revoked_store.load(&account).expect("load").as_deref(),
-        Some(live_refresh.as_str()),
-        "the copy really holds the credential that is about to be revoked"
-    );
-
-    // Credential teardown, for real, over `fetch` from the worker.
+    // Credential teardown, for real, over `fetch` from the worker: the marked
+    // logout revokes the session and removes this account's cookie.
     authenticator
         .logout(&store)
         .await
         .expect("logout, including the server revoke");
-    assert_eq!(
-        store.load(&account).expect("load"),
-        None,
-        "the local credential is cleared"
+    assert!(
+        !store.accounts().expect("list").contains(&account),
+        "the account leaves the index"
     );
 
-    // And the copy is dead, which is what the revoke bought: without it this would
-    // refresh happily and the logout would be local theatre.
-    // The revoked-store test uses its own authenticator pointing at the same
-    // account: an empty-store NeedLogin is indistinguishable from a server
-    // refusal without this.
-    let revoked_auth = BrowserAuthenticator::new(config(), Some(account.clone()));
-    match revoked_auth
-        .acquire::<String, _>(&revoked_store)
+    // The cookie is gone with the session: an acquire for the account can only
+    // ask for an interactive login again. That the server-side session is dead
+    // too, rather than merely un-carried, is pinned natively in
+    // `authn_flow::marked_logout_revokes_and_clears_only_that_cookie`.
+    match BrowserAuthenticator::new(config(), Some(account.clone()))
+        .acquire::<String>(&store)
         .await
-        .expect("acquire with the revoked credential")
+        .expect("acquire after logout")
     {
         Acquired::NeedLogin(_) => {}
-        Acquired::Access(_) => {
-            panic!("a revoked session must not refresh, even with the token in hand")
-        }
+        Acquired::Access(_) => panic!("a logged-out account must not refresh"),
     }
 
     // Data teardown is not part of a logout: the replica and its key survive, which
@@ -335,9 +302,8 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
 /// `crates/connetto-web/tests/account_boot.rs` proves the same outcome offline,
 /// but offline a fallback that walked the remaining accounts would fail its
 /// refresh too and reach the same answer, so nothing there tells the two designs
-/// apart. Here the fallback's refresh would succeed, so the other account's token
-/// rotating is the observable difference, and it is what the last assertion
-/// forbids.
+/// apart. Here the fallback's refresh would succeed, and the refusal to attempt
+/// it is the observable difference.
 ///
 /// Why the alternative is refused rather than merely unimplemented: it would open
 /// one identity's data when the user expected another's, and there is no
@@ -345,53 +311,44 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
 #[wasm_bindgen_test]
 async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
     let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
-    storage.delete_db(STALE_DB).expect("clear an earlier store");
-    let device = device_key(&keys).await.expect("mint the device key");
-    let store =
-        RefreshStore::open(&storage.db_url(STALE_DB), &device).expect("open the refresh store");
+    storage.delete_db(STALE_DB).expect("clear an earlier index");
+    let store = AccountStore::open(&storage.db_url(STALE_DB)).expect("open the account index");
 
-    // One real account, signed in for real, so its credential genuinely refreshes.
+    // One real account, signed in for real, so its cookie genuinely refreshes.
     let pending = match BrowserAuthenticator::new(config(), None)
-        .acquire::<String, _>(&store)
+        .acquire::<String>(&store)
         .await
         .expect("acquire")
     {
         Acquired::NeedLogin(pending) => pending,
-        Acquired::Access(_) => panic!("an empty store cannot refresh"),
+        Acquired::Access(_) => panic!("an empty index cannot refresh"),
     };
     let (code, state) = walk_the_login(&pending.login_url, "present-user").await;
     let session = BrowserAuthenticator::new(config(), None)
-        .complete::<String, _>(&pending, &code, &state, &store)
+        .complete::<String>(&pending, &code, &state, &store)
         .await
         .expect("complete the login");
     let present = encode_identity(&session.user_id).expect("encode the account key");
-    let untouched = store
-        .load(&present)
-        .expect("load")
-        .expect("the credential landed");
 
     // A second account this device once held and has since signed out of. The
     // marker still names it, which is what a sign-out of the last-used account
     // leaves behind.
     let departed = encode_identity(&"departed-account").expect("encode the departed account");
     store
-        .store(connetto_client::IDENTITY_RECORD, &departed)
+        .remember(&departed)
         .expect("point the marker at the departed account");
-    assert_eq!(
-        store.load(&departed).expect("load the departed account"),
-        None,
-        "it holds no credential, which is the case under test"
-    );
+    store
+        .forget(&departed)
+        .expect("sign the departed account out, keeping the marker");
 
     let boot = connetto_web::auth::remembered_account(&store)
         .expect("read the marker")
         .expect("a marker is set");
     assert_eq!(boot, departed, "the boot reads the departed account");
     match BrowserAuthenticator::new(config(), Some(boot))
-        .acquire::<String, _>(&store)
+        .acquire::<String>(&store)
         .await
-        .expect("an absent credential is not an error")
+        .expect("an absent account is not an error")
     {
         Acquired::NeedLogin(_) => {}
         Acquired::Access(session) => panic!(
@@ -399,12 +356,18 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
             session.user_id
         ),
     }
-    assert_eq!(
-        store.load(&present).expect("load").as_deref(),
-        Some(untouched.as_str()),
-        "and the account that is still signed in was never presented, so its token \
-         did not rotate"
-    );
+
+    // The live account was never presented, and its cookie is exactly as alive as
+    // it was: presenting it would have refreshed it, so this succeeding on a
+    // second pass is what a fallback implementation would have done first.
+    match BrowserAuthenticator::new(config(), Some(present.clone()))
+        .acquire::<String>(&store)
+        .await
+        .expect("address the present account directly")
+    {
+        Acquired::Access(_) => {}
+        Acquired::NeedLogin(_) => panic!("the present account's cookie should still refresh"),
+    }
 }
 
 /// R54: two real logins leave two accounts signed in at once, and addressing
@@ -414,34 +377,28 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
 /// any application path. Its store-level half is covered by
 /// `every_stored_account_is_listed`, and `account_boot.rs` covers the boot
 /// decision. What only this can carry is that two genuine logins resolve two
-/// genuine identities, that neither login disturbs the other's credential, and
-/// that the two name different replicas, which is what keeps one account's rows
-/// out of the other's file.
+/// genuine identities, that each account keeps its own working cookie, and that
+/// the two name different replicas, which is what keeps one account's rows out
+/// of the other's file.
 ///
 /// The second identity comes from submitting a different subject to the same
 /// provider.
 #[wasm_bindgen_test]
 async fn two_real_logins_leave_two_accounts_signed_in_at_once() {
     let storage = ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
     storage
         .delete_db(TWO_ACCOUNT_DB)
-        .expect("clear an earlier store");
-    let device = device_key(&keys).await.expect("mint the device key");
-    let store = RefreshStore::open(&storage.db_url(TWO_ACCOUNT_DB), &device)
-        .expect("open the refresh store");
+        .expect("clear an earlier index");
+    let store =
+        AccountStore::open(&storage.db_url(TWO_ACCOUNT_DB)).expect("open the account index");
 
     // First person. Nothing is stored, so nothing is addressed.
     let first = login_as("alice", None, &store).await;
     let first_account = encode_identity(&first.user_id).expect("encode the first account");
-    let first_token = store
-        .load(&first_account)
-        .expect("load")
-        .expect("the first credential landed");
 
     // Second person, added rather than switched to: no stored account is
     // addressed, so this reaches an interactive login instead of refreshing the
-    // first person's credential.
+    // first person's cookie.
     let second = login_as("bob", None, &store).await;
     let second_account = encode_identity(&second.user_id).expect("encode the second account");
 
@@ -451,15 +408,10 @@ async fn two_real_logins_leave_two_accounts_signed_in_at_once() {
     );
 
     // Both signed in at once, which is the phase in one assertion.
-    let listed = RefreshTokenStore::accounts(&store).expect("list the accounts");
+    let listed = store.accounts().expect("list the accounts");
     assert!(
         listed.contains(&first_account) && listed.contains(&second_account),
-        "both accounts are offered to a picker, got {listed:?}"
-    );
-    assert_eq!(
-        store.load(&first_account).expect("load").as_deref(),
-        Some(first_token.as_str()),
-        "and adding the second left the first person's credential untouched"
+        "both accounts are offered to a picker"
     );
 
     // The later login owns the cold-boot default.
@@ -482,9 +434,10 @@ async fn two_real_logins_leave_two_accounts_signed_in_at_once() {
 
     // Switching back: addressing the first account refreshes it silently, with no
     // login and without becoming the other person. This is what a switch does once
-    // the worker has been replaced.
+    // the worker has been replaced, and it is the per-account cookie doing it:
+    // adding the second person left the first one's cookie usable.
     let switched = match BrowserAuthenticator::new(config(), Some(first_account.clone()))
-        .acquire::<String, _>(&store)
+        .acquire::<String>(&store)
         .await
         .expect("acquire against the first account")
     {

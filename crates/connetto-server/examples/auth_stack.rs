@@ -38,7 +38,7 @@ use connetto_test_harness::MockOauth;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use tower_http::cors::{Any, CorsLayer};
+use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 /// The provider name a client names in its login request.
 const PROVIDER: &str = "dev-idp";
@@ -232,16 +232,25 @@ async fn main() -> Result<()> {
     registry.register(Arc::new(provider));
 
     // Permissive on purpose, and scoped to connetto's routes plus the landing.
+    // Credentialed, because the browser cookie contract fetches with
+    // `credentials: "include"`, and a credentialed answer must echo the
+    // request rather than name a wildcard.
     let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
-    let connetto = auth_router(service, Arc::new(registry), RedirectPolicy::default())
-        .route(
-            LANDING_PATH,
-            get(|| async { "connetto dev landing: the code is in this URL" }),
-        )
-        .layer(cors);
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request())
+        .allow_credentials(true);
+    let connetto = auth_router(
+        service,
+        Arc::new(registry),
+        RedirectPolicy::default(),
+        connetto_server::CookieSameSite::Strict,
+    )
+    .route(
+        LANDING_PATH,
+        get(|| async { "connetto dev landing: the code is in this URL" }),
+    )
+    .layer(cors);
 
     let app = connetto;
 

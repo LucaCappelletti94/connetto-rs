@@ -170,7 +170,7 @@ pub struct DbWorkerConfig {
     pub(crate) share_keys: Vec<(String, String)>,
     /// Browser OAuth acquisition config; `None` uses a placeholder token.
     pub(crate) auth: Option<crate::auth::WorkerAuthConfig>,
-    /// OPFS database holding the worker-only refresh token.
+    /// OPFS database holding the account index and last-used marker.
     pub(crate) auth_db_name: &'static str,
     /// Whether to serve the passkey unlock protocol.
     ///
@@ -361,7 +361,7 @@ impl DbWorkerConfig {
         self
     }
 
-    /// OPFS database holding the worker-only refresh token.
+    /// OPFS database holding the account index and last-used marker.
     #[must_use]
     pub fn with_auth_db_name(mut self, auth_db_name: &'static str) -> Self {
         self.auth_db_name = auth_db_name;

@@ -23,17 +23,16 @@
 
 mod common;
 
-use common::{REFRESH_DB, auth_config, play_the_tab, walk_the_login, worker_config};
+use common::{ACCOUNT_DB, auth_config, play_the_tab, walk_the_login, worker_config};
 use connetto_client::{encode_identity, replica_db_name};
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, PendingWork, RefreshStore, provision_replica_key,
+    AccountStore, Acquired, BrowserAuthenticator, IdbKeyStore, PendingWork, provision_replica_key,
     remembered_account, remembered_identity,
 };
 use connetto_web::storage::{
-    PendingWipe, ReplicaStorage, clear_device_key, device_key, mark_wipe_pending,
-    take_pending_wipes, tier_db_name,
+    PendingWipe, ReplicaStorage, mark_wipe_pending, take_pending_wipes, tier_db_name,
 };
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -47,39 +46,37 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
 
     // Start from nothing, so a rerun is not resuming an earlier session.
     take_pending_wipes().await.expect("drain any earlier wipes");
-    clear_device_key(&keys).await.expect("clear the device key");
     storage
-        .delete_db(REFRESH_DB)
-        .expect("clear an earlier refresh store");
+        .delete_db(ACCOUNT_DB)
+        .expect("clear an earlier account index");
 
     // A first login outside the startup, only to learn which replica this account
     // owns, which the test needs in order to plant a delete request for it. The
-    // refresh token it leaves is thrown away below, so the startup cannot refresh
-    // silently and has to log in through the tab.
-    let device = device_key(&keys).await.expect("mint the device key");
+    // index is deleted below, so the startup has no account to address and has
+    // to log in through the tab.
     let user_id = {
-        let store = RefreshStore::open(&storage.db_url(REFRESH_DB), &device)
-            .expect("open the refresh store");
+        let store =
+            AccountStore::open(&storage.db_url(ACCOUNT_DB)).expect("open the account index");
         let authenticator = BrowserAuthenticator::new(auth_config(), None);
         let pending = match authenticator
-            .acquire::<String, _>(&store)
+            .acquire::<String>(&store)
             .await
             .expect("acquire")
         {
             Acquired::NeedLogin(pending) => pending,
-            Acquired::Access(_) => panic!("an empty store cannot refresh"),
+            Acquired::Access(_) => panic!("an empty index cannot refresh"),
         };
         let (code, state) = walk_the_login(&pending.login_url).await;
         authenticator
-            .complete::<String, _>(&pending, &code, &state, &store)
+            .complete::<String>(&pending, &code, &state, &store)
             .await
             .expect("complete the first login")
             .user_id
     };
     let replica_name = replica_db_name(DB_NAME, &user_id).expect("a replica name");
     storage
-        .delete_db(REFRESH_DB)
-        .expect("discard the first login's refresh token");
+        .delete_db(ACCOUNT_DB)
+        .expect("discard the first login's account record");
 
     // Plant a replica for that account with a key of its own, then ask for it to be
     // deleted. This is the state a user leaves behind by pressing the delete button.
@@ -166,14 +163,12 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
         "and the startup opened the device-private database the derivation names"
     );
 
-    // R20 step 0: the startup wrote down which account it signed in as, beside
-    // the credential it stored. This is what a later start with no network has
-    // to read, because the account otherwise only ever arrives inside a token
-    // response and fetching one needs the network. The test deleted this
-    // database before the startup ran, so the record here was written by the
-    // login the startup itself performed.
-    let device = device_key(&keys).await.expect("the device key");
-    let store = RefreshStore::open(&storage.db_url(REFRESH_DB), &device).expect("reopen the store");
+    // R20 step 0: the startup wrote down which account it signed in as. This is
+    // what a later start with no network has to read, because the account
+    // otherwise only ever arrives inside a token response and fetching one
+    // needs the network. The test deleted this database before the startup ran,
+    // so the record here was written by the login the startup itself performed.
+    let store = AccountStore::open(&storage.db_url(ACCOUNT_DB)).expect("reopen the account index");
     let remembered: Option<String> = remembered_identity(&store).expect("read the record");
     assert_eq!(
         remembered.as_deref(),
@@ -186,7 +181,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     let expected_account = encode_identity(&user_id).expect("encode the account key");
     assert_eq!(
         account, expected_account,
-        "the account marker holds the encoded id and is the store key for the credential"
+        "the account marker holds the encoded id"
     );
     assert_eq!(
         replica_db_name(DB_NAME, &remembered.expect("remembered")).expect("derive"),

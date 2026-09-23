@@ -6,15 +6,16 @@
 
 ## What is encrypted
 
-**Built.** Every durable replica on a device is ciphertext. The local tier that attaches to a replica shares its key and is ciphertext too. The refresh credential is stored separately and is also protected, though by a different key and by a different mechanism depending on the target.
+**Built.** Every durable replica on a device is ciphertext. The local tier that attaches to a replica shares its key and is ciphertext too. Natively the refresh credential is stored separately in the OS keyring. In the browser it is an `HttpOnly` cookie the browser keeps, outside every store this chapter protects (`11-authentication.md`, **Decided (R90, 2026-09-22)**).
 
 | Store | Native | Browser |
 |---|---|---|
 | Replica | SQLCipher file, per-replica key | sqlite3mc file in OPFS, per-replica key |
 | Local (never-syncing) tier | ATTACHed, inherits replica key | Separate connection, same per-replica key passed explicitly |
-| Refresh token | OS keyring (`keyring` crate, no SQLite involved) | OPFS SQLite database encrypted under the device key |
+| Refresh token | OS keyring (`keyring` crate, no SQLite involved) | none, an `HttpOnly` cookie the browser keeps (R90) |
+| Account index and last-used marker | OS keyring index record | plain OPFS SQLite database, never secret (R90) |
 
-The refresh store's device key is distinct from per-replica keys and is covered in the Key custody section below.
+The browser's account index is plain by design, since an account key is an identifier and not a secret. A file an earlier build left under its name reads as not a database, and the boot discards it and asks for a login, while any other failure to open it propagates rather than costing the remembered accounts (**Decided (R90, 2026-09-23)**).
 
 ---
 
@@ -36,20 +37,20 @@ The key survives logout deliberately. It is scoped per device rather than per se
 
 ### One trait per secret
 
-**Built (R41), 2026-08-07.** Each of the two secrets has one trait in `connetto-core`, implemented by every native and browser store, and every method names the account it addresses. Nothing is called `ReplicaKeyStore` in two crates any more, so a citation of that symbol is unambiguous.
+**Built (R41), 2026-08-07.** Each of the two secrets has one trait in `connetto-core`, implemented by every native and browser store, and every method names the account it addresses. Nothing is called `ReplicaKeyStore` in two crates any more, so a citation of that symbol is unambiguous. R90 deletes the browser's `RefreshTokenStore` implementation, the browser holding no refresh credential at rest once the token moves to an `HttpOnly` cookie (`11-authentication.md`, **Decided (R90, 2026-09-22)**), so that trait stands for the native targets.
 
 | Secret | Trait | Native | Browser |
 |---|---|---|---|
-| refresh token | `connetto_core::traits::RefreshTokenStore`, synchronous | `KeyringStore`, `MemoryRefreshStore` | `RefreshStore` |
+| refresh token | `connetto_core::traits::RefreshTokenStore`, synchronous | `KeyringStore`, `MemoryRefreshStore` | none after R90, the credential is an `HttpOnly` cookie (`11-authentication.md`) |
 | replica keys | `connetto_core::traits::ReplicaKeyStore`, awaiting | `KeyringKeyStore`, `MemoryKeyStore` | `IdbKeyStore` |
 
 Each trait carries an associated `Error`, following `connetto_core::traits::Transport::Error`, so neither target's error type had to move and no shared error was invented.
 
-**Why the account is an argument rather than a field on the store.** The browser reads a secret before any account is known, because the refresh token is what reveals the account, and that secret sits in the same store as the derived per-account records under the literal `connetto-device-key`. A store scoped to one account would have nobody to construct it for. `KeyringStore` in `crates/connetto-client/src/auth.rs` used to carry `(service, user)` and now carries the service alone, composing its entry the way `KeyringKeyStore` beside it always did. The browser refresh store keeps one row per account, `connetto_refresh (account, token)`, rather than the single row it held before. Which account a caller attempts on boot is read from the last-used marker (`connetto_web::auth::remembered_account` in the browser, `connetto_client::auth::remembered_account` on native), from an explicit switch target when the user picks an account, or is `None` on a first run, which goes straight to an interactive login.
+**Why the account is an argument rather than a field on the store.** One store instance serves every account on both targets, so the account is data the caller supplies rather than identity the constructor bakes. `KeyringStore` in `crates/connetto-client/src/auth.rs` used to carry `(service, user)` and now carries the service alone, composing its entry the way `KeyringKeyStore` beside it always did. The R41 form also served the browser's per-account refresh rows and the `connetto-device-key` record, and R90 deletes both (**Decided (R90, 2026-09-22)**), leaving the parameter standing on the native shape alone. Which account a caller attempts on boot is read from the last-used marker (`connetto_web::auth::remembered_account` in the browser, `connetto_client::auth::remembered_account` on native), from an explicit switch target when the user picks an account, or is `None` on a first run, which goes straight to an interactive login.
 
-**Why only the key store awaits.** The browser reaches `IndexedDB` and `SubtleCrypto` through promises that have no synchronous form in a worker. The native implementations therefore wear an awaiting signature over a keychain call that returns immediately, and that call blocks whoever polls it. Bounded rather than hidden: key custody runs when a database is opened or an account is logged out, never per change. The futures carry `MaybeSend` exactly as `Transport`'s do. The refresh-token trait stays synchronous, because neither target needs to await there and forcing symmetry would be a false await on both sides. Only its browser construction is asynchronous, since the device key it opens under comes from the key store.
+**Why only the key store awaits.** The browser reaches `IndexedDB` and `SubtleCrypto` through promises that have no synchronous form in a worker. The native implementations therefore wear an awaiting signature over a keychain call that returns immediately, and that call blocks whoever polls it. Bounded rather than hidden: key custody runs when a database is opened or an account is logged out, never per change. The futures carry `MaybeSend` exactly as `Transport`'s do. The refresh-token trait stays synchronous, because the native target needs no await there and forcing symmetry would be a false await, and its browser implementation goes with the browser refresh store (R90).
 
-What the seam buys over the rename is one caller. `crates/connetto-client/tests/secret_stores.rs` and `crates/connetto-web/tests/secret_stores.rs` run the same two exercises from `connetto_core::test_support`, written against the traits alone, against the native and the browser stores.
+What the seam buys over the rename is one caller. `crates/connetto-client/tests/secret_stores.rs` and `crates/connetto-web/tests/secret_stores.rs` run the same two exercises from `connetto_core::test_support`, written against the traits alone, against the native and the browser stores. R90 retargets the browser half to the key store, its refresh exercise retiring with the store.
 
 ### The key store
 
@@ -61,7 +62,7 @@ What the seam buys over the rename is one caller. `crates/connetto-client/tests/
 | `store(&self, name: &str, key: &ReplicaKey)` | Persist `key` under `name` |
 | `clear(&self, name: &str)` | Remove the record, which crypto-shreds the replica |
 
-`name` is the same value `replica_db_name` produced for the replica file, so two identities on one device hold separate records and a wipe of one cannot reach the other. A literal name is equally valid and is how the browser addresses the device key it needs before any identity exists.
+`name` is the same value `replica_db_name` produced for the replica file, so two identities on one device hold separate records and a wipe of one cannot reach the other. A literal name is equally valid.
 
 The concrete implementation shipped for production on native is `connetto_client::auth::KeyringKeyStore` in `crates/connetto-client/src/auth.rs`, which uses OS secure storage: Keychain on macOS, Credential Manager on Windows, and the kernel keyutils keyring on Linux. On Linux the key lives in the session keyring. That keyring survives logout but not a reboot, so a rebooted Linux device reports `ClientError::ReplicaKeyMissing` and recovers by wiping and re-syncing.
 
@@ -82,11 +83,11 @@ The test implementation is `connetto_client::auth::MemoryKeyStore`, an in-memory
 
 The account key is `connetto_client::encode_identity(&user_id)`, the serde JSON encoding of the deployment's user id type. For a `String` id `"alice"`, the key is the seven-character string `"alice"` including the quotes. `connetto_client::decode_identity` reverses it.
 
-**The browser** answers `accounts()` from the rows of the `connetto_refresh` SQLite table directly, the same table the tokens live in. Its answer cannot disagree with what is stored.
+**Deleted by R90 (decided 2026-09-22).** The browser answered `accounts()` from the rows of the `connetto_refresh` SQLite table directly, the same table the tokens lived in. Its account index and last-used marker survive as plain records in an unencrypted store, since neither was ever a secret.
 
 **The native store** cannot ask the OS keyring: `keyring` 3.6.3 exposes no enumeration surface on any of its three backends, verified in its source. The native implementation therefore maintains its own index record in the keyring alongside the token entries. An out-of-band keychain edit can leave that index stale. A stale entry that names an account whose token has since been removed falls through to an interactive login rather than selecting a wrong identity.
 
-**The last-used marker. Built (R42).** After a successful login, both authenticators write the credential under the account key and write `connetto_client::IDENTITY_RECORD` (the literal `"connetto-device-identity"`) with that same account key as its value. The marker therefore points at a row: reading it with `remembered_account` yields the same string that addresses the token. A boot with no marker stored returns `None` and the authenticator goes straight to an interactive login.
+**The last-used marker. Built (R42).** After a successful login, both authenticators write `connetto_client::IDENTITY_RECORD` (the literal `"connetto-device-identity"`) with that same account key as its value, natively beside the credential and, after R90, in the browser as a plain record with no credential write beside it. The marker therefore points at a row: reading it with `remembered_account` yields the same string that addresses the account's row, and natively the token. A boot with no marker stored returns `None` and the authenticator goes straight to an interactive login.
 
 ### Browser key store
 
@@ -103,15 +104,15 @@ The scope of protection is documented on the type: this defends against script-l
 
 ### The gate on locally stored secrets
 
-**Built (R23) for the browser.** Native gating is R51 (Apple), R52 (Android), and R53 (Windows). Every locally stored secret sits behind a user-verification gate. Opening the app presents a fingerprint, a face check or a device passcode once, and both the replica and the stored refresh token become readable. This is the pattern a banking application uses, and it is worth being precise about what it is not: the server verifies nothing, sees nothing, and is not involved. The gate protects secrets at rest on the device. Session lifetime, revocation and the identity provider's authority are governed entirely by `11-authentication.md` and are untouched by it.
+**Built (R23) for the browser.** Native gating is R51 (Apple), R52 (Android), and R53 (Windows). Every locally stored secret sits behind a user-verification gate. Opening the app presents a fingerprint, a face check or a device passcode once, and on native both the replica and the stored refresh token become readable, while in the browser the replica becomes readable and nothing else can: R90 moved the browser's refresh credential into an `HttpOnly` cookie that needs no gate because it is not browser storage at all (**Decided (R90, 2026-09-22)**). This is the pattern a banking application uses, and it is worth being precise about what it is not: the server verifies nothing, sees nothing, and is not involved. The gate protects secrets at rest on the device. Session lifetime, revocation and the identity provider's authority are governed entirely by `11-authentication.md` and are untouched by it.
 
-**Both secrets are covered, not one.** Gating either alone leaves a route to the same data, because whoever can use the refresh token can open a session and pull the data down again, and whoever can open the replica already has it. In the browser this costs nothing extra: the two are already wrapped by a single key-encryption key, since the refresh store's device key is itself a record in `IdbKeyStore`. On native they are independent keychain items and are gated separately.
+**Native covers both secrets, the browser one. Amended (R90, 2026-09-22).** Gating either native secret alone leaves a route to the same data, because whoever can use the refresh token can open a session and pull the data down again, and whoever can open the replica already has it. The two are independent keychain items and are gated separately. In the browser the second secret no longer exists client-side, its former wrapper having been a record in `IdbKeyStore`, so the gate covers the replica key alone.
 
 **One unlock lasts as long as the process. Decided.** The derived key is held in memory while the application runs and a fresh start prompts again. No inactivity timeout and no per-operation prompt: the operating system's own screen lock is the right control for an unattended machine, and connetto has no notion of a sensitive operation to hang a second prompt on.
 
 **Browser mechanism: a key derived from a passkey, replacing the stored one.** WebAuthn's `prf` extension derives 32 bytes from a credential given an input, the same bytes every time, and the specification forces user verification for it, overriding the request's own preference if necessary. So the gate arrives as a property of the mechanism rather than as separate work. The derived value goes through HKDF with a per-purpose label rather than being used as a key directly.
 
-The input is **one fixed value, not per identity**, producing one key-encryption key that unwraps per-identity records. R23 originally proposed a per-identity input, which cannot work: the refresh store must open before any identity is known, so no identity-derived key could unwrap it. Nothing is lost, because per-identity keys exist for erasing one account without touching another, which the existing per-identity wrapped records already provide.
+The input is **one fixed value, not per identity**, producing one key-encryption key that unwraps per-identity records. R23's original argument for a fixed input was that the refresh store must open before any identity is known, and R90 deletes the store that needed it (**Decided (R90, 2026-09-22)**). The decision stands on the reason that outlives the store: erasing one account without touching another is the job per-identity keys actually have, the per-identity wrapped records already provide it, and one gesture on a shared profile must open every account's replica rather than the remembered one.
 
 Storage becomes:
 
@@ -121,7 +122,7 @@ Storage becomes:
 | `wrapped` | keyed by (replica name, credential id), each holding an IV and the encrypted replica key |
 | `credentials` | enrolled credential identifiers, in the clear, since they are not secret and are needed to scope the assertion |
 
-The `kek` store holds the key-encryption key exactly while nobody has enrolled. Enrolling re-wraps every `wrapped` record under the derived key and destroys the stored `kek` record. A profile snapshot taken before enrolment holds the stored key and therefore the replica key, which enrolment re-wraps but does not re-key, and deleting an `IndexedDB` record does not erase the bytes underneath. A first run keeps its refresh token in memory until enrolment resolves, so a profile that enrols never wrote a stored key at all. Keying `wrapped` by credential as well as replica costs nothing and avoids a stored-record migration if more than one holder is ever wanted. **Only one row is written**: multiple holders are rejected, because every copy lives in the same store and is lost together, so they protect only against losing an authenticator that sits on a different device from the replica, and only for a user who enrolled a backup in advance.
+The `kek` store holds the key-encryption key exactly while nobody has enrolled. Enrolling re-wraps every `wrapped` record under the derived key and destroys the stored `kek` record. A profile snapshot taken before enrolment holds the stored key and therefore the replica key, which enrolment re-wraps but does not re-key, and deleting an `IndexedDB` record does not erase the bytes underneath. After R90 a first run holds no token in memory at all, the credential arriving in the `HttpOnly` cookie, and the deferred first-run dance is deleted with the refresh store (decided 2026-09-22). Keying `wrapped` by credential as well as replica costs nothing and avoids a stored-record migration if more than one holder is ever wanted. **Only one row is written**: multiple holders are rejected, because every copy lives in the same store and is lost together, so they protect only against losing an authenticator that sits on a different device from the replica, and only for a user who enrolled a backup in advance.
 
 **A topology constraint, settled by the specification rather than by choice.** `PublicKeyCredential` is `[SecureContext, Exposed = Window]`, so it cannot be called from a worker, while connetto's database and its keys live in a dedicated worker per `09-wasm.md`. The assertion therefore happens in a tab and the key crosses into the worker.
 
@@ -164,7 +165,7 @@ Call `provision_replica_key` only for a replica that does not yet exist. For one
 
 ### The device key (browser only)
 
-**Built.** The browser `RefreshStore` must be readable before any identity is known, because the identity is what the refresh token resolves to. A per-replica key cannot be used here because the replica name is derived from the identity. `connetto_web::storage::device_key` in `crates/connetto-web/src/storage.rs` provisions a separate record in the browser key store under the literal constant `"connetto-device-key"`, which a derived name can never collide with. The device key wraps the `RefreshStore`'s SQLite pages with the same AES-256-CBC codec the replica uses.
+**Deleted by R90 (decided 2026-09-22).** The device key existed to wrap the browser `RefreshStore`'s SQLite pages under a name no identity-derived replica name could address, because the identity is what the refresh token resolves to. With the refresh credential in an `HttpOnly` cookie the store is gone, and `connetto_web::storage::device_key` and `clear_device_key` go with it, leaving `IdbKeyStore` holding per-identity wrapped replica keys and nothing else.
 
 ---
 
@@ -228,7 +229,7 @@ The unauthenticated name (for a deployment with no authentication) is the bare p
 
 **Built.** Teardown is two orthogonal axes. connetto ships mechanisms and the application decides policy.
 
-**Credential teardown**: `NativeAuthenticator::logout` in `crates/connetto-client/src/auth.rs` revokes the session server-side and clears the stored refresh token. In the browser, `BrowserAuthenticator::logout` in `crates/connetto-web/src/auth.rs` does the same, then `connetto_web::storage::clear_device_key` crypto-shreds the `RefreshStore` by destroying the device key. **Decided (2026-09-14, before R69), built 2026-09-14:** the native keyring store's account index is a record only while it lists an account, so clearing the last account removes the record rather than writing an empty list, and a store whose accounts are all gone leaves nothing in the OS keyring. An absent index already read as empty, so nothing else changes.
+**Credential teardown**: `NativeAuthenticator::logout` in `crates/connetto-client/src/auth.rs` revokes the session server-side and clears the stored refresh token. In the browser, `BrowserAuthenticator::logout` in `crates/connetto-web/src/auth.rs` revokes the session through the account's cookie, and the server deletes that cookie in the same response. After R90 nothing durable is left to shred, so the local half clears the account's rows from the plain (unencrypted, never-secret) account record store (decided 2026-09-22). **Decided (2026-09-14, before R69), built 2026-09-14:** the native keyring store's account index is a record only while it lists an account, so clearing the last account removes the record rather than writing an empty list, and a store whose accounts are all gone leaves nothing in the OS keyring. An absent index already read as empty, so nothing else changes.
 
 **Data teardown**: `connetto_client::teardown::wipe_replica` in `crates/connetto-client/src/teardown.rs` destroys the replica's key-store record and then deletes everything that key opens, the replica file with its WAL and SHM sidecars, the device-private tier with its own, and the content directory, in the order the table below gives. The key goes first: if a delete then fails, what remains is inert ciphertext, and the wipe's promise still holds. The reverse order would leave a readable file whenever the delete failed. The browser mirror is `connetto_web::storage::wipe_replica` in `crates/connetto-web/src/storage.rs`.
 
@@ -278,7 +279,7 @@ The replica filename is `prefix-sha256(canonical(user_id))` truncated to 128 bit
 
 ## No open decisions
 
-Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07. R42, the multi-account credential store with enumeration, landed on 2026-08-19. The browser gate is built (R23). Two items remain decided rather than built: R21, which moves the native side onto the browser's page codec, and R71, which makes Linux custody survive a reboot. R51, R52, and R53 carry the native gating surfaces for Apple, Android, and Windows respectively. An unidentified run introduces no encryption decision at all: its local copy is SQLite's own `:memory:` and carries no key (chapter 12, **Built (R3)**), so nothing of it is at rest. (Corrected 2026-09-12: this paragraph used to say the unauthenticated replica is encrypted under a device-scoped key built in phase E5, a discarded series and a shape R3 replaced with in-memory.)
+Everything this chapter covers is decided. R41, the single seam for the two secret stores, landed on 2026-08-07. R42, the multi-account credential store with enumeration, landed on 2026-08-19. The browser gate is built (R23) and after R90 it covers the replica key alone, the browser's refresh token having moved to an `HttpOnly` cookie with the device key deleted (decided 2026-09-22). Two items remain decided rather than built: R21, which moves the native side onto the browser's page codec, and R71, which makes Linux custody survive a reboot. R51, R52, and R53 carry the native gating surfaces for Apple, Android, and Windows respectively. An unidentified run introduces no encryption decision at all: its local copy is SQLite's own `:memory:` and carries no key (chapter 12, **Built (R3)**), so nothing of it is at rest. (Corrected 2026-09-12: this paragraph used to say the unauthenticated replica is encrypted under a device-scoped key built in phase E5, a discarded series and a shape R3 replaced with in-memory.)
 
 ---
 

@@ -12,7 +12,7 @@ use connetto_wasm_smoke::workers::{
     DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL,
 };
 use connetto_web::auth::{
-    Acquired, BrowserAuthenticator, IdbKeyStore, LoginMessage, RefreshStore, WorkerAuthConfig,
+    AccountStore, Acquired, BrowserAuthenticator, LoginMessage, WorkerAuthConfig,
 };
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -24,8 +24,8 @@ use web_sys::{BroadcastChannel, MessageEvent, Request, RequestInit, Response};
 pub const AUTH_BASE: &str = "http://127.0.0.1:18099";
 /// The provider the login server registers.
 pub const PROVIDER: &str = "dev-idp";
-/// These suites' refresh store, kept apart from every other suite's.
-pub const REFRESH_DB: &str = "e42-refresh.sqlite";
+/// These suites' account index, kept apart from every other suite's.
+pub const ACCOUNT_DB: &str = "e42-accounts.sqlite";
 
 pub fn auth_config() -> WorkerAuthConfig {
     // The stack serves the navigation and the fetch calls on one origin.
@@ -46,7 +46,7 @@ pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::D
         .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
         .with_caller_function(connetto_wasm_smoke::CALLER_FUNCTION)
         .with_auth(auth)
-        .with_auth_db_name(REFRESH_DB)
+        .with_auth_db_name(ACCOUNT_DB)
 }
 
 async fn fetch_str(url: &str) -> Response {
@@ -199,26 +199,22 @@ pub async fn mint_session() -> (String, String) {
 
 pub async fn mint_session_as(username: &str) -> (String, String) {
     let storage = connetto_web::storage::ReplicaStorage::install().await;
-    let keys = IdbKeyStore::open().await.expect("open the key store");
-    let device = connetto_web::storage::device_key(&keys)
-        .await
-        .expect("device key");
     static NEXT_MINT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db_name = format!("common-mint-{unique}.sqlite");
-    let store = RefreshStore::open(&storage.db_url(&db_name), &device).expect("open refresh store");
+    let store = AccountStore::open(&storage.db_url(&db_name)).expect("open account index");
     let authenticator = BrowserAuthenticator::new(auth_config(), None);
     let pending = match authenticator
-        .acquire::<String, _>(&store)
+        .acquire::<String>(&store)
         .await
         .expect("acquire")
     {
         Acquired::NeedLogin(pending) => pending,
-        Acquired::Access(_) => panic!("a fresh store cannot refresh silently"),
+        Acquired::Access(_) => panic!("a fresh index cannot refresh silently"),
     };
     let (code, state) = walk_the_login_as(&pending.login_url, username).await;
     let session = authenticator
-        .complete::<String, _>(&pending, &code, &state, &store)
+        .complete::<String>(&pending, &code, &state, &store)
         .await
         .expect("complete login");
     drop(store);

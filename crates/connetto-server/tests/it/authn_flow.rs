@@ -5,18 +5,20 @@
 //! handshake liveness check that makes revocation authoritative, and the login
 //! and refresh HTTP endpoints backed by a containerised OIDC provider.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode};
+use base64::Engine as _;
 use connetto_core::auth::AuthContext;
 use connetto_core::messages::{ControlMessage, FatalErrorReason, Grant, Handshake};
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
-    AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore, Materializer, PageSpec,
-    ProviderRegistry, RedirectPolicy, RequestGuard, ResolvedIdentity, SessionConfig,
+    AuthConfig, AuthService, CookieSameSite, GenericOidcProvider, InMemoryAuthStore, Materializer,
+    PageSpec, ProviderRegistry, RedirectPolicy, RequestGuard, ResolvedIdentity, SessionConfig,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TokenAuthority, auth_router,
     loopback, pg_write_target,
 };
@@ -542,7 +544,12 @@ async fn authorize_hop(authorize_url: &str, subject: &str) -> (String, String) {
 async fn http_oauth_flow_then_refresh_roundtrip() {
     let (_authority, svc) = service();
     let (_idp, registry) = oidc_registry().await;
-    let router = auth_router(svc, registry, RedirectPolicy::default());
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
 
     // Start: a redirect whose Location is the IDP authorize URL.
     let start = get_request(
@@ -690,7 +697,12 @@ async fn loopback_code(router: &axum::Router, subject: &str) -> String {
 async fn loopback_code_exchange_with_pkce() {
     let (_authority, svc) = service();
     let (_idp, registry) = oidc_registry().await;
-    let router = auth_router(svc, registry, RedirectPolicy::default());
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
 
     let code = loopback_code(&router, "frank").await;
     let (status, body) = post_json(
@@ -741,7 +753,12 @@ async fn loopback_code_exchange_with_pkce() {
 async fn redirect_policy_gates_the_client_redirect() {
     let (_authority, svc) = service();
     let (_idp, registry) = oidc_registry().await;
-    let router = auth_router(svc, registry, RedirectPolicy::default());
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
 
     // A non-loopback redirect with no allowlist entry is refused before any mint.
     let resp = get_request(
@@ -785,7 +802,7 @@ async fn redirect_policy_admits_an_allowlisted_https_callback() {
     let (_authority, svc) = service();
     let (_idp, registry) = oidc_registry().await;
     let policy = RedirectPolicy::new(vec!["https://app.example/cb".to_owned()]);
-    let router = auth_router(svc, registry, policy);
+    let router = auth_router(svc, registry, policy, CookieSameSite::default());
 
     let resp = get_request(
         &router,
@@ -797,4 +814,645 @@ async fn redirect_policy_admits_an_allowlisted_https_callback() {
         StatusCode::TEMPORARY_REDIRECT,
         "allowlisted callback accepted"
     );
+}
+
+// R90: the browser cookie contract on the three auth endpoints.
+
+/// POST a JSON body with arbitrary extra headers and return the raw response,
+/// because the cookie contract lives in headers a parsed body cannot show.
+async fn post_marked(
+    router: axum::Router,
+    path: &str,
+    body: serde_json::Value,
+    headers: &[(&str, &str)],
+) -> axum::http::Response<Body> {
+    let mut builder = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(Body::from(serde_json::to_vec(&body).expect("serialize")))
+        .expect("build request");
+    router.oneshot(request).await.expect("route")
+}
+
+fn set_cookies(response: &axum::http::Response<Body>) -> Vec<String> {
+    response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|value| value.to_str().expect("utf-8").to_owned())
+        .collect()
+}
+
+const MARKED: [(&str, &str); 1] = [("x-connetto-client", "browser")];
+
+/// Drive a marked loopback login and return the `name=value` pair the
+/// `Set-Cookie` header carried together with the `user_id` the body returned,
+/// because the cookie name derives from that id and a test cannot guess it.
+async fn marked_login(router: &axum::Router, subject: &str) -> (String, String) {
+    let code = loopback_code(router, subject).await;
+    let response = post_marked(
+        router.clone(),
+        "/auth/token",
+        json!({ "code": code, "code_verifier": PKCE_VERIFIER }),
+        &MARKED,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "marked login succeeds");
+    let cookies = set_cookies(&response);
+    assert_eq!(cookies.len(), 1, "one cookie on a marked login");
+    let cookie = cookies[0].split(';').next().expect("name=value").to_owned();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(body["access_token"].as_str().is_some(), "access token");
+    assert!(
+        body.get("refresh_token").is_none(),
+        "the marked body carries no refresh token",
+    );
+    let user_id = body["user_id"].as_str().expect("user_id").to_owned();
+    (cookie, user_id)
+}
+
+#[tokio::test]
+async fn marked_login_sets_the_prefixed_cookie_and_hides_the_body_token() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    let code = loopback_code(&router, "erin").await;
+    let response = post_marked(
+        router.clone(),
+        "/auth/token",
+        json!({ "code": code, "code_verifier": PKCE_VERIFIER }),
+        &MARKED,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(body["access_token"].as_str().is_some(), "access token");
+    assert!(
+        body.get("refresh_token").is_none(),
+        "the marked body carries no refresh token",
+    );
+
+    let code2 = loopback_code(&router, "erin").await;
+    let response = post_marked(
+        router,
+        "/auth/token",
+        json!({ "code": code2, "code_verifier": PKCE_VERIFIER }),
+        &MARKED,
+    )
+    .await;
+    let cookie = set_cookies(&response).pop().expect("a set-cookie").clone();
+    let (pair, rest) = cookie.split_once(';').expect("attributes");
+    let (name, value) = pair.split_once('=').expect("name=value");
+    assert!(
+        name.starts_with("__Host-Http-connetto-refresh-"),
+        "cookie carries the host prefix, got {name}",
+    );
+    assert!(!value.is_empty(), "the cookie carries a value");
+    for attribute in ["HttpOnly", "Secure", "Path=/", "SameSite=Strict"] {
+        assert!(rest.contains(attribute), "{attribute} present, got {rest}");
+    }
+    assert!(!rest.contains("Domain"), "no Domain attribute, got {rest}");
+}
+
+#[tokio::test]
+async fn native_paths_never_see_a_set_cookie() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    let code = loopback_code(&router, "erin").await;
+    let response = post_marked(
+        router.clone(),
+        "/auth/token",
+        json!({ "code": code, "code_verifier": PKCE_VERIFIER }),
+        &[],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        set_cookies(&response).is_empty(),
+        "native login sets no cookie"
+    );
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    assert!(
+        body["refresh_token"].as_str().is_some(),
+        "native login still carries the body token",
+    );
+}
+
+#[tokio::test]
+async fn marked_refresh_rotates_through_the_cookie() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    let (cookie, user_id) = marked_login(&router, "gina").await;
+    let (name, first) = cookie.split_once('=').expect("name=value");
+
+    let response = post_marked(
+        router.clone(),
+        "/auth/refresh",
+        json!({ "user_id": user_id }),
+        &[("x-connetto-client", "browser"), ("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "marked refresh");
+    let rotated = set_cookies(&response).pop().expect("rotated cookie");
+    let (rotated_name, rotated_value) = rotated.split_once('=').expect("pair");
+    assert_eq!(rotated_name, name, "rotation keeps the account's cookie");
+    assert_ne!(rotated_value, first, "rotation changes the value");
+
+    // The spent cookie value no longer refreshes: the jar updated server-side
+    // and the old value is a replay.
+    let replay = post_marked(
+        router,
+        "/auth/refresh",
+        json!({ "user_id": user_id }),
+        &[("x-connetto-client", "browser"), ("cookie", &cookie)],
+    )
+    .await;
+    assert_eq!(replay.status(), StatusCode::UNAUTHORIZED, "replay refused");
+}
+
+#[tokio::test]
+async fn marked_requests_without_the_cookie_are_401() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    let response = post_marked(
+        router,
+        "/auth/refresh",
+        json!({ "user_id": "gina" }),
+        &MARKED,
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::UNAUTHORIZED,
+        "a marked refresh with no cookie falls to interactive login",
+    );
+}
+
+#[tokio::test]
+async fn mixed_contracts_are_400() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    let (cookie, hugo) = marked_login(&router, "hugo").await;
+    let cookie_headers = [
+        ("x-connetto-client", "browser"),
+        ("cookie", cookie.as_str()),
+    ];
+
+    // A marked refresh that also carries a body token mixes the two contracts.
+    let response = post_marked(
+        router.clone(),
+        "/auth/refresh",
+        json!({ "user_id": hugo, "refresh_token": "whatever.value" }),
+        &cookie_headers,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "mixed refresh");
+
+    // A marked refresh that names no account cannot select a cookie.
+    let response = post_marked(router.clone(), "/auth/refresh", json!({}), &cookie_headers).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "no user_id");
+
+    // The native path with no body token is the same refusal.
+    let response = post_marked(router.clone(), "/auth/refresh", json!({}), &[]).await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "native no token"
+    );
+
+    // An unknown header value is not the browser contract either.
+    let response = post_marked(
+        router.clone(),
+        "/auth/refresh",
+        json!({ "user_id": hugo }),
+        &[("x-connetto-client", "gecko"), ("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "unknown marker");
+
+    // A cross-site form cannot set the marker, so its cookie rides a native
+    // request that carries no body token and is refused before any rotation.
+    let response = post_marked(
+        router,
+        "/auth/refresh",
+        json!({ "user_id": hugo }),
+        &[("cookie", cookie.as_str())],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::BAD_REQUEST,
+        "a cookie alone never authenticates the native path",
+    );
+}
+
+#[tokio::test]
+async fn marked_logout_revokes_and_clears_only_that_cookie() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    let (hugo, hugo_id) = marked_login(&router, "hugo").await;
+    let (anna, anna_id) = marked_login(&router, "anna").await;
+
+    let response = post_marked(
+        router.clone(),
+        "/auth/logout",
+        json!({ "user_id": hugo_id }),
+        &[("x-connetto-client", "browser"), ("cookie", hugo.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT, "marked logout");
+    let removal = set_cookies(&response).pop().expect("removal header");
+    let (pair, rest) = removal.split_once(';').expect("attributes");
+    let (_name, value) = pair.split_once('=').expect("name=value");
+    assert_eq!(value, "", "the removal carries an empty value");
+    for attribute in ["HttpOnly", "Secure", "Path=/", "SameSite=Strict"] {
+        assert!(rest.contains(attribute), "removal {attribute}, got {rest}");
+    }
+
+    // The revoked session cannot refresh again even with the (stale) cookie.
+    let response = post_marked(
+        router.clone(),
+        "/auth/refresh",
+        json!({ "user_id": hugo_id }),
+        &[("x-connetto-client", "browser"), ("cookie", hugo.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "revoked");
+
+    // The other account's cookie is untouched.
+    let response = post_marked(
+        router,
+        "/auth/refresh",
+        json!({ "user_id": anna_id }),
+        &[("x-connetto-client", "browser"), ("cookie", anna.as_str())],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "the other account lives");
+}
+
+#[tokio::test]
+async fn cookie_name_mismatch_revokes_the_borrowed_session() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+
+    // erin logs in marked. frank logs in natively, so the test holds frank's
+    // token as a string and can hand it under erin's cookie name.
+    let (erin, erin_id) = marked_login(&router, "erin").await;
+    let (erin_name, _) = erin.split_once('=').expect("erin cookie");
+    let frank_code = loopback_code(&router, "frank").await;
+    let (status, frank_body) = post_json(
+        router.clone(),
+        "/auth/token",
+        json!({ "code": frank_code, "code_verifier": PKCE_VERIFIER }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let frank_token = frank_body["refresh_token"].as_str().expect("token");
+
+    let borrowed = format!("{erin_name}={frank_token}");
+    let response = post_marked(
+        router.clone(),
+        "/auth/refresh",
+        json!({ "user_id": erin_id }),
+        &[("x-connetto-client", "browser"), ("cookie", &borrowed)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "mismatch 401");
+
+    // The borrowed session is gone: frank's own native refresh now fails.
+    let (status, _) = post_json(
+        router.clone(),
+        "/auth/refresh",
+        json!({ "refresh_token": frank_token }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "borrowed session revoked");
+
+    // erin's own session was never touched.
+    let response = post_marked(
+        router,
+        "/auth/refresh",
+        json!({ "user_id": erin_id }),
+        &[("x-connetto-client", "browser"), ("cookie", &erin)],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK, "erin unaffected");
+}
+
+#[tokio::test]
+async fn samesite_none_setting_renders_none() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::None,
+    );
+
+    let code = loopback_code(&router, "gina").await;
+    let response = post_marked(
+        router,
+        "/auth/token",
+        json!({ "code": code, "code_verifier": PKCE_VERIFIER }),
+        &MARKED,
+    )
+    .await;
+    let cookie = set_cookies(&response).pop().expect("cookie");
+    assert!(cookie.contains("SameSite=None"), "got {cookie}");
+    assert!(
+        cookie.contains("Secure"),
+        "None still carries Secure, got {cookie}"
+    );
+}
+
+/// A store whose refresh lookup breaks mid-test, the way a database outage
+/// breaks it after a login already landed.
+struct LookupOutageStore {
+    inner: InMemoryAuthStore,
+    down: std::sync::atomic::AtomicBool,
+}
+
+impl connetto_server::AuthStore for LookupOutageStore {
+    type Id = String;
+
+    fn create_session(
+        &self,
+        identity: &ResolvedIdentity,
+        now: SystemTime,
+    ) -> impl Future<
+        Output = Result<connetto_server::IssuedSession<Self::Id>, connetto_server::AuthStoreError>,
+    > + Send {
+        self.inner.create_session(identity, now)
+    }
+
+    fn session_is_live(
+        &self,
+        session_id: connetto_server::SessionId,
+        now: SystemTime,
+    ) -> impl Future<Output = Result<bool, connetto_server::AuthStoreError>> + Send {
+        self.inner.session_is_live(session_id, now)
+    }
+
+    fn rotate_refresh(
+        &self,
+        refresh_token: &str,
+        now: SystemTime,
+    ) -> impl Future<
+        Output = Result<connetto_server::RefreshOutcome<Self::Id>, connetto_server::AuthStoreError>,
+    > + Send {
+        self.inner.rotate_refresh(refresh_token, now)
+    }
+
+    fn revoke_session(
+        &self,
+        session_id: connetto_server::SessionId,
+    ) -> impl Future<Output = Result<(), connetto_server::AuthStoreError>> + Send {
+        self.inner.revoke_session(session_id)
+    }
+
+    fn session_for_refresh(
+        &self,
+        refresh_token: &str,
+    ) -> impl Future<
+        Output = Result<Option<connetto_server::SessionId>, connetto_server::AuthStoreError>,
+    > + Send {
+        let down = self.down.load(std::sync::atomic::Ordering::SeqCst);
+        let lookup = self.inner.session_for_refresh(refresh_token);
+        async move {
+            if down {
+                Err(connetto_server::AuthStoreError::Backend(
+                    "connection refused".to_owned(),
+                ))
+            } else {
+                lookup.await
+            }
+        }
+    }
+
+    fn set_retained_provider_token(
+        &self,
+        session_id: connetto_server::SessionId,
+        token: &connetto_server::RetainedProviderToken,
+        now: SystemTime,
+    ) -> impl Future<Output = Result<(), connetto_server::AuthStoreError>> + Send {
+        self.inner
+            .set_retained_provider_token(session_id, token, now)
+    }
+
+    fn retained_provider_token(
+        &self,
+        session_id: connetto_server::SessionId,
+    ) -> impl Future<
+        Output = Result<
+            Option<connetto_server::RetainedProviderToken>,
+            connetto_server::AuthStoreError,
+        >,
+    > + Send {
+        self.inner.retained_provider_token(session_id)
+    }
+}
+
+/// A logout whose revoke fails still clears the cookie. The worker drops its
+/// index row whatever the answer, so a cookie left behind would be a live
+/// credential for an account the device believes it signed out of.
+#[tokio::test]
+async fn a_failed_marked_revoke_still_clears_the_cookie() {
+    let config = AuthConfig::default();
+    let authority = Arc::new(TokenAuthority::generate(&config).expect("generate keypair"));
+    let store = Arc::new(LookupOutageStore {
+        inner: InMemoryAuthStore::new(config.refresh_lifetimes()),
+        down: std::sync::atomic::AtomicBool::new(false),
+    });
+    let svc = Arc::new(AuthService::new(
+        authority,
+        Arc::clone(&store),
+        Arc::new(RequestGuard::default()),
+    ));
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+    let (cookie, user_id) = marked_login(&router, "ines").await;
+
+    store.down.store(true, std::sync::atomic::Ordering::SeqCst);
+    let response = post_marked(
+        router,
+        "/auth/logout",
+        json!({ "user_id": user_id }),
+        &[
+            ("x-connetto-client", "browser"),
+            ("cookie", cookie.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "the revoke failure is reported"
+    );
+    let removal = set_cookies(&response)
+        .pop()
+        .expect("the removal rides the error response");
+    let (pair, rest) = removal.split_once(';').expect("attributes");
+    let (name, value) = pair.split_once('=').expect("name=value");
+    assert_eq!(
+        name,
+        cookie.split_once('=').expect("name=value").0,
+        "the removal names the account's cookie"
+    );
+    assert_eq!(value, "", "the removal carries an empty value");
+    for attribute in ["HttpOnly", "Secure", "Path=/", "SameSite=Strict"] {
+        assert!(rest.contains(attribute), "removal {attribute}, got {rest}");
+    }
+}
+
+/// The cookie pair, its `Max-Age`, and the body's lapse instant of one marked
+/// response.
+async fn cookie_lifetime(response: axum::http::Response<Body>) -> (String, u64, u64) {
+    let cookie = set_cookies(&response).pop().expect("a refresh cookie");
+    let max_age = cookie
+        .split(';')
+        .find_map(|attribute| attribute.trim().strip_prefix("Max-Age="))
+        .unwrap_or_else(|| panic!("no Max-Age in {cookie}"))
+        .parse::<u64>()
+        .expect("numeric Max-Age");
+    let pair = cookie.split(';').next().expect("name=value").to_owned();
+    let bytes = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let body: serde_json::Value = serde_json::from_slice(&bytes).expect("json");
+    let lapses_at = body["session_expires_at"]
+        .as_u64()
+        .expect("session_expires_at");
+    (pair, max_age, lapses_at)
+}
+
+fn assert_lives_until(max_age: u64, lapses_at: u64, what: &str) {
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let remaining = lapses_at.saturating_sub(now);
+    assert!(remaining > 0, "{what}: the session is live");
+    assert!(
+        max_age.abs_diff(remaining) <= 5,
+        "{what}: Max-Age {max_age} tracks the {remaining}s the session has left"
+    );
+}
+
+/// The refresh cookie outlives a browser restart and never outlives the
+/// session: its `Max-Age` is the time left until the session lapses, set at
+/// login and set again by every rotation as the idle window slides.
+#[tokio::test]
+async fn the_refresh_cookie_lives_until_the_session_lapses() {
+    let (_authority, svc) = service();
+    let (_idp, registry) = oidc_registry().await;
+    let router = auth_router(
+        svc,
+        registry,
+        RedirectPolicy::default(),
+        CookieSameSite::default(),
+    );
+    let code = loopback_code(&router, "jana").await;
+    let login = post_marked(
+        router.clone(),
+        "/auth/token",
+        json!({ "code": code, "code_verifier": PKCE_VERIFIER }),
+        &MARKED,
+    )
+    .await;
+    assert_eq!(login.status(), StatusCode::OK, "marked login");
+    let (cookie, max_age, lapses_at) = cookie_lifetime(login).await;
+    assert_lives_until(max_age, lapses_at, "login");
+
+    let user_id = {
+        let (_, value) = cookie.split_once('=').expect("name=value");
+        assert!(!value.is_empty(), "the login cookie carries a credential");
+        let (_, encoded) = cookie
+            .split_once("__Host-Http-connetto-refresh-")
+            .expect("the prefixed name");
+        let encoded = encoded.split_once('=').expect("name=value").0;
+        let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(encoded)
+            .expect("base64url name");
+        serde_json::from_slice::<serde_json::Value>(&raw).expect("serde id")
+    };
+    let rotated = post_marked(
+        router,
+        "/auth/refresh",
+        json!({ "user_id": user_id }),
+        &[
+            ("x-connetto-client", "browser"),
+            ("cookie", cookie.as_str()),
+        ],
+    )
+    .await;
+    assert_eq!(rotated.status(), StatusCode::OK, "marked refresh");
+    let (_, max_age, lapses_at) = cookie_lifetime(rotated).await;
+    assert_lives_until(max_age, lapses_at, "rotation");
 }

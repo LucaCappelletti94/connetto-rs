@@ -6,8 +6,9 @@
 //! The worker holds connetto's tokens and the tab never does: the worker mints
 //! the PKCE verifier, hands the tab only a login URL, and the tab hands back
 //! only the authorization code. The worker exchanges the code for tokens, keeps
-//! the access token in memory, and persists the refresh token worker-only in
-//! OPFS so a cold start or a leader failover silently refreshes and resumes.
+//! the access token in memory, and leaves the refresh token in the `HttpOnly`
+//! cookie the server set, so a cold start or a leader failover silently
+//! refreshes and resumes without any local credential.
 //! See `docs/architecture/11-authentication.md`.
 //!
 //! The enforced invariant: [`LoginMessage`] has no variant that carries a token,
@@ -20,7 +21,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::ReplicaKey;
 use connetto_core::percent::percent_encode;
-use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::traits::ReplicaKeyStore;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::{Connection, SqliteConnection};
@@ -35,7 +36,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    BroadcastChannel, Headers, MessageEvent, Request, RequestInit, Response, WorkerGlobalScope,
+    BroadcastChannel, Headers, MessageEvent, Request, RequestCredentials, RequestInit, Response,
+    WorkerGlobalScope,
 };
 use zeroize::Zeroize;
 
@@ -47,7 +49,7 @@ pub const LOGIN_CHANNEL: &str = "connetto-login";
 /// how much local work is still unsynced before offering to destroy it. It
 /// carries only [`LogoutMessage`], which cannot hold a token either.
 ///
-/// The worker owns the refresh token, the replica, and its key, so a tab cannot
+/// The worker owns the session and the replica with its key, so a tab cannot
 /// log out by itself. What a tab owns is the button and the wording, which is
 /// why the destructive choice travels as a request rather than as an action.
 pub const LOGOUT_CHANNEL: &str = "connetto-logout";
@@ -55,8 +57,8 @@ pub const LOGOUT_CHANNEL: &str = "connetto-logout";
 /// Failure of a browser acquisition step.
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
-    /// The refresh-token store could not be opened, read, or written.
-    #[error("refresh store: {0}")]
+    /// A local store could not be opened, read, or written.
+    #[error("local store: {0}")]
     Store(String),
     /// A `fetch` to connetto-server failed or returned a non-success status.
     #[error("auth request failed: {0}")]
@@ -77,9 +79,10 @@ pub enum AuthError {
     /// A browser API was unavailable in this context.
     #[error("browser context error: {0}")]
     Context(String),
-    /// An existing database did not decrypt under the key supplied. A wrong key
-    /// and a corrupt file are indistinguishable to the page codec.
-    #[error("the database does not decrypt under the key supplied: {0}")]
+    /// An existing database file is not a database this build can read, as a
+    /// file written under a key reads without it. A wrong key and a corrupt
+    /// file are indistinguishable to the page codec.
+    #[error("the database file cannot be read: {0}")]
     Undecryptable(String),
     /// A key operation was refused because a credential is enrolled but no
     /// derived key-encryption key is held, or because this build cannot reach
@@ -106,8 +109,8 @@ impl From<AuthError> for JsValue {
 /// prefix and the detail after it stays free to change.
 pub const LOCKED_MESSAGE: &str = "connetto-locked";
 
-/// Fixed PRF extension input for the at-rest key. Never per-identity, because
-/// the refresh store opens before any identity is known.
+/// Fixed PRF extension input for the at-rest key. Never per-identity: one
+/// enrolled credential unlocks every replica this device holds.
 pub const AT_REST_PRF_INPUT: &[u8] = b"connetto/at-rest/v1";
 
 /// HKDF label for the key-encryption key derived from the PRF output.
@@ -173,118 +176,90 @@ impl WorkerAuthConfig {
     }
 }
 
-/// The rotating refresh token, persisted worker-only in an OPFS-backed SQLite
-/// database so a cold start or leader failover can silently refresh. When OPFS
-/// is unavailable the same code runs against the in-memory VFS, so the session
-/// works but does not survive a worker restart.
+/// The accounts this browser profile has signed into and which of them it last
+/// used, the two facts a start needs before the network answers.
 ///
-/// Encrypted at rest under [`device_key`](crate::storage::device_key) rather than
-/// under a per-replica key, and the distinction is structural. This store is read
-/// to learn the identity, while a per-replica key is addressed by
-/// `replica_db_name`, which is derived from that identity, so the store must be
-/// readable strictly before any per-replica key exists. A device-scoped key has
-/// no such ordering problem: it is named by a literal, minted locally on first
-/// use, and wrapped in the same non-extractable [`IdbKeyStore`] the replica
-/// keys live in.
+/// No credential lives here. The rotating refresh token is an `HttpOnly` cookie
+/// the server sets and rotates, invisible to this crate, and the browser itself
+/// carries it on every marked request. What remains is the index: which
+/// accounts exist, and whose replica file to open. The account otherwise only
+/// ever arrives inside a token response, which the network gates, so this small
+/// plain record is what makes a start possible at all.
 ///
-/// What that protects is bounded by what the token is: a rotating credential,
-/// revocable server-side, and useless once a logout revokes the session. The
-/// user's data is the replica's business, not this store's.
-pub struct RefreshStore {
+/// Plain rather than encrypted, which its contents allow, since an account key
+/// is a serialized id and not a secret. It lives in an OPFS-backed SQLite
+/// database like the replicas. Where OPFS is unavailable the same code runs
+/// against the in-memory VFS, and the account list does not survive a worker
+/// restart there.
+pub struct AccountStore {
     conn: RefCell<SqliteConnection>,
 }
 
 diesel::table! {
-    /// Encrypted refresh token storage, one row per account
-    connetto_refresh (account) {
-        /// The account this record belongs to, which every call addresses
-        account -> diesel::sql_types::Text,
-        /// Encrypted refresh token value
-        token -> diesel::sql_types::Text,
+    /// Plain account index, one row per account plus the last-used marker
+    connetto_accounts (record) {
+        /// The serialized account id, or the last-used marker keyed by
+        /// `connetto_client::IDENTITY_RECORD`
+        record -> diesel::sql_types::Text,
+        /// The marker's account for the marker row, empty for account rows
+        value -> diesel::sql_types::Text,
     }
 }
 
-impl RefreshStore {
-    /// Open (creating if needed) the refresh store at `db_url`, encrypted under
-    /// `key`.
-    ///
-    /// `db_url` is the codec URL
-    /// [`ReplicaStorage::db_url`](crate::storage::ReplicaStorage::db_url)
-    /// composes over the installed VFS, because the codec intercepts as a VFS
-    /// shim and a bare name would leave it out of the stack. `key` is
-    /// [`device_key`](crate::storage::device_key), not a per-replica key: this
-    /// store is read before any identity is known, so nothing addressed by an
-    /// identity can protect it.
-    ///
-    /// Opening is the only asymmetry with the native store, and it is why the
-    /// trait covers the three accessors and not construction: the key this needs
-    /// comes from the key store, so a browser refresh store is reached through an
-    /// await while a keyring entry is not.
+/// `SQLITE_NOTADB` as `Undecryptable`, every other failure as `Store`. The
+/// match is on SQLite's own message, the one form both diesel error types
+/// carry for it.
+fn unreadable_or_store(context: &str, err: &dyn std::fmt::Display) -> AuthError {
+    let detail = format!("{context}: {err}");
+    if detail.contains("file is not a database") {
+        AuthError::Undecryptable(detail)
+    } else {
+        AuthError::Store(detail)
+    }
+}
+
+impl AccountStore {
+    /// Open (creating if needed) the account index at `db_url`, a codec URL
+    /// from [`ReplicaStorage::db_url`](crate::storage::ReplicaStorage::db_url)
+    /// like every other database here. No unlock call: the codec encrypts only
+    /// what a keyed connection writes, so this one reads and writes plain
+    /// pages.
     ///
     /// # Errors
     ///
-    /// [`AuthError::Undecryptable`] if a store already exists and `key` does not
-    /// open it, or [`AuthError::Store`] if the database cannot be opened or
-    /// initialized.
-    pub fn open(db_url: &str, key: &ReplicaKey) -> Result<Self, AuthError> {
+    /// [`AuthError::Undecryptable`] if a file under this name is not a
+    /// database, which is what a pre-cookie build's encrypted refresh store
+    /// reads as. The caller discards it, since its credential is unusable
+    /// under the cookie contract and a fresh login rewrites everything here.
+    /// [`AuthError::Store`] for any other failure to open or initialize, which
+    /// the caller propagates rather than discarding the index.
+    pub fn open(db_url: &str) -> Result<Self, AuthError> {
         let mut conn = SqliteConnection::establish(db_url)
-            .map_err(|err| AuthError::Store(format!("open {db_url}: {err}")))?;
-        // Before any statement that reads a page: the CREATE TABLE below would
-        // otherwise read the header and fail on ciphertext.
-        connetto_client::cipher::unlock(&mut conn, key).map_err(|err| match err {
-            connetto_client::UnlockError::WrongKey(detail) => {
-                AuthError::Undecryptable(detail.to_string())
-            }
-            other => AuthError::Store(format!("unlock the refresh store: {other}")),
-        })?;
+            .map_err(|err| unreadable_or_store(&format!("open {db_url}"), &err))?;
         conn.batch_execute(
-            "CREATE TABLE IF NOT EXISTS connetto_refresh (account TEXT PRIMARY KEY NOT NULL, token TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS connetto_accounts (record TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)",
         )
-        .map_err(|err| AuthError::Store(format!("init: {err}")))?;
+        .map_err(|err| unreadable_or_store("init", &err))?;
+        // One probe read, because SQLite surfaces an unreadable file on the first
+        // real page read rather than on establish, and the caller's discard-and-
+        // reopen recovery is keyed on this call failing here, not a later read.
+        conn.batch_execute("SELECT count(*) FROM connetto_accounts")
+            .map_err(|err| unreadable_or_store("probe", &err))?;
         Ok(Self {
             conn: RefCell::new(conn),
         })
     }
-}
 
-impl RefreshTokenStore for RefreshStore {
-    type Error = AuthError;
-
-    fn load(&self, account: &str) -> Result<Option<String>, AuthError> {
-        connetto_refresh::table
-            .filter(connetto_refresh::account.eq(account))
-            .select(connetto_refresh::token)
-            .first::<String>(&mut *self.conn.borrow_mut())
-            .optional()
-            .map_err(|err| AuthError::Store(format!("load: {err}")))
-    }
-
-    fn store(&self, account: &str, token: &str) -> Result<(), AuthError> {
-        diesel::insert_into(connetto_refresh::table)
-            .values((
-                connetto_refresh::account.eq(account),
-                connetto_refresh::token.eq(token),
-            ))
-            .on_conflict(connetto_refresh::account)
-            .do_update()
-            .set(connetto_refresh::token.eq(token))
-            .execute(&mut *self.conn.borrow_mut())
-            .map_err(|err| AuthError::Store(format!("save: {err}")))?;
-        Ok(())
-    }
-
-    fn clear(&self, account: &str) -> Result<(), AuthError> {
-        diesel::delete(connetto_refresh::table.filter(connetto_refresh::account.eq(account)))
-            .execute(&mut *self.conn.borrow_mut())
-            .map_err(|err| AuthError::Store(format!("clear: {err}")))?;
-        Ok(())
-    }
-
-    /// Enumerated from the rows the tokens live in, so it cannot disagree with
-    /// what is stored. No index is kept here, and none is needed.
-    fn accounts(&self) -> Result<Vec<String>, AuthError> {
-        let names = connetto_refresh::table
-            .select(connetto_refresh::account)
+    /// The accounts this profile has signed into, without the reserved marker.
+    /// Enumerated from the rows themselves, so it cannot disagree with what is
+    /// stored.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the database cannot be read.
+    pub fn accounts(&self) -> Result<Vec<String>, AuthError> {
+        let names = connetto_accounts::table
+            .select(connetto_accounts::record)
             .load::<String>(&mut *self.conn.borrow_mut())
             .map_err(|err| AuthError::Store(format!("accounts: {err}")))?;
         Ok(names
@@ -292,71 +267,65 @@ impl RefreshTokenStore for RefreshStore {
             .filter(|name| !connetto_client::is_reserved_record(name))
             .collect())
     }
-}
 
-/// A refresh store that writes nowhere, for the one boot where there is nothing
-/// yet to write under.
-///
-/// A first run cannot persist its credential before the gate resolves. The
-/// device key that encrypts [`RefreshStore`] is a record in [`IdbKeyStore`], so
-/// writing it before enrolment would mint a stored key-encryption key, and
-/// enrolment could then only delete that record, which does not erase the bytes
-/// underneath. A snapshot of the profile taken in between would hold the stored
-/// key and therefore the replica key. So acquisition runs against this, and
-/// [`take`](Self::take) hands the rows to the real store once the gate is
-/// settled and the device key resolves under whichever key-encryption key won.
-///
-/// Only a run that finds no existing store uses it. With a store already on
-/// disk a stored key already exists, so deferring buys nothing and reading the
-/// credential that is there saves the user an interactive login.
-#[derive(Default)]
-pub(crate) struct DeferredRefreshStore {
-    rows: RefCell<Vec<(String, String)>>,
-}
-
-impl DeferredRefreshStore {
-    /// Every row written, in write order, leaving this store empty.
-    pub(crate) fn take(&self) -> Vec<(String, String)> {
-        self.rows.take()
-    }
-}
-
-impl RefreshTokenStore for DeferredRefreshStore {
-    type Error = AuthError;
-
-    fn load(&self, account: &str) -> Result<Option<String>, AuthError> {
-        Ok(self
-            .rows
-            .borrow()
-            .iter()
-            .rev()
-            .find(|(name, _)| name == account)
-            .map(|(_, value)| value.clone()))
+    /// List this profile in under `account` and mark it last-used.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if either row cannot be written.
+    pub fn remember(&self, account: &str) -> Result<(), AuthError> {
+        self.put(account, "")?;
+        self.put(connetto_client::IDENTITY_RECORD, account)
     }
 
-    fn store(&self, account: &str, token: &str) -> Result<(), AuthError> {
-        let mut rows = self.rows.borrow_mut();
-        match rows.iter_mut().find(|(name, _)| name == account) {
-            Some(row) => token.clone_into(&mut row.1),
-            None => rows.push((account.to_owned(), token.to_owned())),
-        }
+    /// Drop one account from the index, leaving the marker where it is: a
+    /// marker pointing at a signed-out account is what makes the next boot
+    /// answer with an interactive login rather than by picking somebody else.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the row cannot be deleted.
+    pub fn forget(&self, account: &str) -> Result<(), AuthError> {
+        self.remove(account)
+    }
+
+    /// The account key this device last signed in under, if it ever did.
+    ///
+    /// # Errors
+    ///
+    /// [`AuthError::Store`] if the record cannot be read.
+    pub(crate) fn last_account(&self) -> Result<Option<String>, AuthError> {
+        self.get(connetto_client::IDENTITY_RECORD)
+    }
+
+    fn get(&self, record: &str) -> Result<Option<String>, AuthError> {
+        connetto_accounts::table
+            .filter(connetto_accounts::record.eq(record))
+            .select(connetto_accounts::value)
+            .first::<String>(&mut *self.conn.borrow_mut())
+            .optional()
+            .map_err(|err| AuthError::Store(format!("load: {err}")))
+    }
+
+    fn put(&self, record: &str, value: &str) -> Result<(), AuthError> {
+        diesel::insert_into(connetto_accounts::table)
+            .values((
+                connetto_accounts::record.eq(record),
+                connetto_accounts::value.eq(value),
+            ))
+            .on_conflict(connetto_accounts::record)
+            .do_update()
+            .set(connetto_accounts::value.eq(value))
+            .execute(&mut *self.conn.borrow_mut())
+            .map_err(|err| AuthError::Store(format!("save: {err}")))?;
         Ok(())
     }
 
-    fn clear(&self, account: &str) -> Result<(), AuthError> {
-        self.rows.borrow_mut().retain(|(name, _)| name != account);
+    fn remove(&self, record: &str) -> Result<(), AuthError> {
+        diesel::delete(connetto_accounts::table.filter(connetto_accounts::record.eq(record)))
+            .execute(&mut *self.conn.borrow_mut())
+            .map_err(|err| AuthError::Store(format!("clear: {err}")))?;
         Ok(())
-    }
-
-    /// The pending rows, which is every account this boot has written so far.
-    fn accounts(&self) -> Result<Vec<String>, AuthError> {
-        Ok(self
-            .rows
-            .borrow()
-            .iter()
-            .map(|(name, _)| name.clone())
-            .filter(|name| !connetto_client::is_reserved_record(name))
-            .collect())
     }
 }
 
@@ -500,12 +469,12 @@ pub enum LogoutMessage {
     },
 }
 
-/// The tokens plus session metadata connetto-server returns from its token and
-/// refresh endpoints.
+/// The tokens plus session metadata connetto-server returns from its marked
+/// token and refresh endpoints. The refresh token is absent by contract: it
+/// travels as the `HttpOnly` cookie the same response set, never in the body.
 #[derive(Debug, Deserialize)]
 struct TokenResponse<Id> {
     access_token: String,
-    refresh_token: String,
     user_id: Id,
     session_expires_at: u64,
 }
@@ -1180,31 +1149,32 @@ pub async fn provision_replica_key<S: ReplicaKeyStore<Error = AuthError>>(
     Ok(minted)
 }
 
-/// Persist what a token response established: the credential under the account
-/// it belongs to, and that same account as the last-used marker.
+/// Record what a token response established: the account in the index, and
+/// that same account as the last-used marker.
 ///
 /// Keyed off the response rather than off whatever the caller was told to try,
 /// because a first login has no account to key on and learns it here. One
 /// encoding serves both records, so the marker's value is literally the key of
 /// the row it points at.
 ///
-/// The browser mirror of the same write on `NativeAuthenticator`. Both token
-/// paths do it, because either can be the one that establishes who this device
-/// is: a silent refresh on a start, or an interactive login on a first run.
+/// The credential itself is written nowhere: the marked token response carries
+/// no refresh token, and the browser holds it in the `HttpOnly` cookie the same
+/// response set. This is the browser mirror of `NativeAuthenticator`'s write
+/// minus the credential half. Both token paths record, because either can be
+/// the one that establishes who this device is: a silent refresh on a start,
+/// or an interactive login on a first run.
 ///
 /// # Errors
 ///
 /// [`AuthError::Store`] if the account cannot be encoded or either record
 /// written.
-fn persist_session<Id: serde::Serialize, S: RefreshTokenStore<Error = AuthError>>(
-    store: &S,
+fn persist_session<Id: serde::Serialize>(
+    store: &AccountStore,
     user_id: &Id,
-    refresh_token: &str,
 ) -> Result<(), AuthError> {
     let account = connetto_client::encode_identity(user_id)
         .map_err(|err| AuthError::Store(err.to_string()))?;
-    store.store(&account, refresh_token)?;
-    store.store(connetto_client::IDENTITY_RECORD, &account)
+    store.remember(&account)
 }
 
 /// The account this device last signed in as, if it ever did.
@@ -1218,13 +1188,10 @@ fn persist_session<Id: serde::Serialize, S: RefreshTokenStore<Error = AuthError>
 /// [`AuthError::Store`] if the record cannot be read, or if it does not decode
 /// as this build's id type, which means a build whose id type differed wrote
 /// it. The recovery is a fresh login, which rewrites it.
-pub fn remembered_identity<
-    Id: serde::de::DeserializeOwned,
-    S: RefreshTokenStore<Error = AuthError>,
->(
-    store: &S,
+pub fn remembered_identity<Id: serde::de::DeserializeOwned>(
+    store: &AccountStore,
 ) -> Result<Option<Id>, AuthError> {
-    let Some(record) = store.load(connetto_client::IDENTITY_RECORD)? else {
+    let Some(record) = store.last_account()? else {
         return Ok(None);
     };
     connetto_client::decode_identity(&record)
@@ -1242,10 +1209,8 @@ pub fn remembered_identity<
 /// # Errors
 ///
 /// [`AuthError::Store`] if the record cannot be read.
-pub fn remembered_account<S: RefreshTokenStore<Error = AuthError>>(
-    store: &S,
-) -> Result<Option<String>, AuthError> {
-    store.load(connetto_client::IDENTITY_RECORD)
+pub fn remembered_account(store: &AccountStore) -> Result<Option<String>, AuthError> {
+    store.last_account()
 }
 
 /// A fresh key from the platform RNG.
@@ -1313,34 +1278,43 @@ impl BrowserAuthenticator {
         Self { config, account }
     }
 
-    /// Try a silent refresh from the stored token, on failure or absence
-    /// produce a [`PendingLogin`] for interactive login.
+    /// Try a silent refresh from the cookie the browser holds for the account,
+    /// on failure or absence produce a [`PendingLogin`] for interactive login.
+    ///
+    /// The index row is the assertion that this device has a session worth
+    /// resuming for the account, so an account the index does not list is not
+    /// asked of the server at all. Whether the cookie then rides is the
+    /// browser's decision, not this crate's: no cookie means the server
+    /// refuses, and a refusal is indistinguishable from a spent cookie, which
+    /// is exactly the fall-through to interactive login this needs.
     ///
     /// The replica key is not part of this exchange: see
     /// [`complete`](Self::complete).
     ///
     /// # Errors
     ///
-    /// [`AuthError::Store`] if the refresh store cannot be read.
-    pub async fn acquire<
-        Id: serde::de::DeserializeOwned + serde::Serialize,
-        S: RefreshTokenStore<Error = AuthError>,
-    >(
+    /// [`AuthError::Store`] if the account index cannot be read.
+    pub async fn acquire<Id: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
-        store: &S,
+        store: &AccountStore,
     ) -> Result<Acquired<Id>, AuthError> {
+        // An account another build's id type wrote cannot resume here, so it
+        // takes the login that rewrites the marker, as `remembered_identity`
+        // promises, rather than failing every boot the index row outlives.
         if let Some(account) = self.account.as_deref()
-            && let Some(refresh) = store.load(account)?
+            && store.accounts()?.iter().any(|name| name == account)
+            && let Ok(user_id) = connetto_client::decode_identity::<Id>(account)
         {
-            match self.refresh_tokens(&refresh).await {
+            match self.refresh_tokens(&user_id).await {
                 Ok(tokens) => {
-                    persist_session(store, &tokens.user_id, &tokens.refresh_token)?;
+                    persist_session(store, &tokens.user_id)?;
                     return Ok(Acquired::Access(tokens.into()));
                 }
                 // A transient refresh fault must not force an interactive login:
                 // propagate it so the worker boot can retry silently.
                 Err(err @ AuthError::Transient(_)) => return Err(err),
-                // A rejected or expired refresh token falls through to login.
+                // A refused refresh, spent or absent cookie falls through to
+                // login.
                 Err(_) => {}
             }
         }
@@ -1366,7 +1340,8 @@ impl BrowserAuthenticator {
     }
 
     /// Complete an interactive login: verify the returned state, exchange the
-    /// code for tokens, and persist the refresh token.
+    /// code for tokens, and record the account. The refresh token arrives in
+    /// the `Set-Cookie` the exchange set, held by the browser, not here.
     ///
     /// The replica key is not part of this exchange. Resolve it afterwards from
     /// the identity this returns, with [`provision_replica_key`] for a fresh
@@ -1375,26 +1350,24 @@ impl BrowserAuthenticator {
     /// # Errors
     ///
     /// [`AuthError`] on a state mismatch, a failed exchange, or a store write.
-    pub async fn complete<
-        Id: serde::de::DeserializeOwned + serde::Serialize,
-        S: RefreshTokenStore<Error = AuthError>,
-    >(
+    pub async fn complete<Id: serde::de::DeserializeOwned + serde::Serialize>(
         &self,
         pending: &PendingLogin,
         code: &str,
         state: &str,
-        store: &S,
+        store: &AccountStore,
     ) -> Result<BrowserSession<Id>, AuthError> {
         if state != pending.state {
             return Err(AuthError::StateMismatch);
         }
         let tokens = self.exchange_code(code, &pending.verifier).await?;
-        persist_session(store, &tokens.user_id, &tokens.refresh_token)?;
+        persist_session(store, &tokens.user_id)?;
         Ok(tokens.into())
     }
 
-    /// Credential teardown: revoke the session server-side and clear the stored
-    /// refresh token, so re-authentication is required.
+    /// Credential teardown: revoke the session server-side, which clears this
+    /// account's cookie, and drop the account from the index, so
+    /// re-authentication is required.
     ///
     /// One half of the logout grid. It touches no data: the replica and its key
     /// survive, which is what lets a returning user resume from their persisted
@@ -1403,44 +1376,50 @@ impl BrowserAuthenticator {
     ///
     /// The revoke is awaited, and **the local clear happens either way**. A tab
     /// with no connectivity must still be able to log out, so a failed revoke is
-    /// reported rather than allowed to keep the credential in OPFS. `Ok` means the
-    /// session is refused at the next handshake, and an error means local state is
-    /// gone but the session stays live server-side until it expires on its own.
-    /// Queueing the revoke is not an option, since after the clear there is no
-    /// credential left to authenticate it with.
+    /// reported rather than allowed to keep the account in the index. `Ok` means
+    /// the session is refused at the next handshake, and an error means the
+    /// index row is gone and the cookie was cleared as far as the request got,
+    /// while the session stays live server-side until it expires on its own.
+    /// Queueing the revoke is not an option, since after the row goes the
+    /// account is unresumable anyway.
     ///
     /// Revocation is liveness, not expiry: the access token the worker still holds
     /// in memory stays signature-valid until its own short TTL runs out, so drop
     /// the connection rather than trusting the server to refuse it.
     ///
-    /// Idempotent: with no refresh token stored there is nothing to revoke.
+    /// Idempotent: with no index row there is nothing this account could
+    /// resume, and the marked logout for an account without a cookie is a
+    /// server-side no-op.
     ///
     /// # Errors
     ///
     /// [`AuthError::Transient`] or [`AuthError::Request`] if the revoke fails,
-    /// after the local clear, or [`AuthError::Store`] if the store cannot be read
-    /// or cleared.
-    pub async fn logout(&self, store: &RefreshStore) -> Result<(), AuthError> {
+    /// after the local clear, or [`AuthError::Store`] if the account cannot be
+    /// decoded or its row deleted.
+    pub async fn logout(&self, store: &AccountStore) -> Result<(), AuthError> {
         // Signing out is per account: the others keep their credentials, and the
         // marker is left pointing at an account with none, which the next boot
         // answers with an interactive login rather than by picking somebody else.
         let Some(account) = self.account.as_deref() else {
             return Ok(());
         };
-        let Some(refresh) = store.load(account)? else {
-            return Ok(());
-        };
-        let body = serde_json::json!({ "refresh_token": refresh }).to_string();
+        // No membership gate: the cookie is the credential, and the index can be
+        // empty while a live cookie remains, by recovery or eviction. The server
+        // answers a marked logout with `204` whether or not a cookie rode, so
+        // posting whenever the account is known is what actually revokes.
+        let user_id: serde_json::Value = serde_json::from_str(account)
+            .map_err(|err| AuthError::Store(format!("account key: {err}")))?;
+        let body = serde_json::json!({ "user_id": user_id }).to_string();
         let revoked = post_json(&format!("{}/auth/logout", self.config.auth_base_url), &body).await;
-        store.clear(account)?;
+        store.forget(account)?;
         revoked.map(drop)
     }
 
-    async fn refresh_tokens<Id: serde::de::DeserializeOwned>(
+    async fn refresh_tokens<Id: serde::Serialize + serde::de::DeserializeOwned>(
         &self,
-        refresh_token: &str,
+        user_id: &Id,
     ) -> Result<TokenResponse<Id>, AuthError> {
-        let body = serde_json::json!({ "refresh_token": refresh_token }).to_string();
+        let body = serde_json::json!({ "user_id": user_id }).to_string();
         let text = post_json(
             &format!("{}/auth/refresh", self.config.auth_base_url),
             &body,
@@ -1682,13 +1661,22 @@ fn random_token() -> String {
 }
 
 /// POST `body` as JSON to `url` from the worker and return the response body.
+///
+/// Every request here comes from the browser, so it carries the header that
+/// selects the cookie contract on the server, and `include` so the browser
+/// attaches the `HttpOnly` refresh cookie and accepts the `Set-Cookie` a login
+/// response returns.
 async fn post_json(url: &str, body: &str) -> Result<String, AuthError> {
     let options = RequestInit::new();
     options.set_method("POST");
     options.set_body(&JsValue::from_str(body));
+    options.set_credentials(RequestCredentials::Include);
     let headers = Headers::new().map_err(|err| AuthError::Context(format!("headers: {err:?}")))?;
     headers
         .set("Content-Type", "application/json")
+        .map_err(|err| AuthError::Context(format!("header set: {err:?}")))?;
+    headers
+        .set("x-connetto-client", "browser")
         .map_err(|err| AuthError::Context(format!("header set: {err:?}")))?;
     options.set_headers(headers.as_ref());
     let request = Request::new_with_str_and_init(url, &options)
