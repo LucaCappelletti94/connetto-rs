@@ -51,6 +51,7 @@ use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
+use testcontainers::core::logs::LogFrame;
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{IntoContainerPort, WaitFor};
 use testcontainers::runners::AsyncRunner;
@@ -163,6 +164,85 @@ fn container_labels(role: &str) -> [(String, String); 2] {
         (CONTAINER_LABEL.to_owned(), role.to_owned()),
         (STARTED_LABEL.to_owned(), now_secs().to_string()),
     ]
+}
+
+/// How long one readiness probe may take before the next is sent.
+///
+/// testcontainers probes with a client that has no timeout, so one probe that
+/// connects and never gets an answer would hold the whole startup budget.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Ready once `path` on `port` answers `200`, each probe bounded by [`PROBE_TIMEOUT`].
+///
+/// # Panics
+///
+/// When the probe client cannot be built, which is a test setup failure.
+fn http_ready(path: &str, port: u16) -> WaitFor {
+    let client = reqwest::Client::builder()
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .expect("a readiness probe client");
+    WaitFor::http(
+        HttpWaitStrategy::new(path)
+            .with_port(port.tcp())
+            .with_client(client)
+            .with_expected_status_code(200_u16),
+    )
+}
+
+/// What a container printed until it was ready, so a startup failure can show it.
+#[derive(Clone, Default)]
+struct StartupLog {
+    text: Arc<parking_lot::Mutex<Vec<u8>>>,
+    done: Arc<AtomicBool>,
+}
+
+impl StartupLog {
+    /// The consumer to hand the container, which stops keeping output once [`Self::ready`] is called.
+    fn consumer(&self) -> impl Fn(&LogFrame) + Send + Sync + 'static {
+        let log = self.clone();
+        move |frame| {
+            if AtomicBool::load(&log.done, std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
+            let (LogFrame::StdOut(bytes) | LogFrame::StdErr(bytes)) = frame;
+            log.text.lock().extend_from_slice(bytes);
+        }
+    }
+
+    /// Stop keeping output and drop what was kept.
+    fn ready(&self) {
+        self.done.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.text.lock().clear();
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.text.lock()).into_owned()
+    }
+}
+
+/// Start `request`, panicking with `service`'s own output when it never became ready.
+///
+/// # Panics
+///
+/// When the container does not start, which is a test setup failure.
+async fn start_logged(
+    request: testcontainers::ContainerRequest<GenericImage>,
+    service: &str,
+) -> ContainerAsync<GenericImage> {
+    let log = StartupLog::default();
+    let started = request.with_log_consumer(log.consumer()).start().await;
+    match started {
+        Ok(container) => {
+            log.ready();
+            container
+        }
+        Err(err) => panic!(
+            "this test starts its own {service}, which did not become ready: {err}\n\
+             --- {service} output ---\n{}",
+            log.text()
+        ),
+    }
 }
 
 /// Join a fresh anonymous session keyring for this thread and its descendants,
@@ -363,21 +443,13 @@ impl MockOauth {
     /// Panics when the Docker daemon is unreachable, when the container host address cannot be resolved, or when the mapped port is unavailable, all of which are test setup failures.
     pub async fn start() -> Self {
         sweep_abandoned_containers();
-        let container = GenericImage::new(MOCK_OAUTH_IMAGE, MOCK_OAUTH_TAG)
+        let request = GenericImage::new(MOCK_OAUTH_IMAGE, MOCK_OAUTH_TAG)
             .with_exposed_port(MOCK_OAUTH_PORT.tcp())
-            .with_wait_for(WaitFor::http(
-                HttpWaitStrategy::new("/isalive")
-                    .with_port(MOCK_OAUTH_PORT.tcp())
-                    .with_expected_status_code(200_u16),
-            ))
+            .with_wait_for(http_ready("/isalive", MOCK_OAUTH_PORT))
             .with_env_var("JSON_CONFIG", MOCK_OAUTH_CONFIG)
             .with_labels(container_labels("oauth"))
-            .with_startup_timeout(STARTUP_TIMEOUT)
-            .start()
-            .await
-            .expect(
-                "this test starts its own identity provider, so it needs a reachable Docker daemon",
-            );
+            .with_startup_timeout(STARTUP_TIMEOUT);
+        let container = start_logged(request, "identity provider").await;
         let host = container.get_host().await.expect("the docker host");
         let port = container
             .get_host_port_ipv4(MOCK_OAUTH_PORT.tcp())
@@ -630,16 +702,14 @@ impl Fixture {
                 .try_init();
         }
         sweep_abandoned_containers();
-        let postgres = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
+        let request = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
             .with_exposed_port(POSTGRES_PORT.tcp())
             .with_wait_for(WaitFor::message_on_stderr(POSTGRES_READY))
             .with_env_var("POSTGRES_PASSWORD", "postgres")
             .with_cmd(["-c", "wal_level=logical", "-c", "fsync=off"])
             .with_labels(container_labels("postgres"))
-            .with_startup_timeout(STARTUP_TIMEOUT)
-            .start()
-            .await
-            .expect("this test starts its own postgres, so it needs a reachable Docker daemon");
+            .with_startup_timeout(STARTUP_TIMEOUT);
+        let postgres = start_logged(request, "postgres").await;
         let host = postgres.get_host().await.expect("the docker host");
         let port = postgres
             .get_host_port_ipv4(POSTGRES_PORT.tcp())
@@ -754,23 +824,14 @@ impl Fixture {
     async fn authorization(&self) -> &Authorization {
         self.fga
             .get_or_init(|| async {
-                let container = GenericImage::new(FGA_IMAGE, FGA_TAG)
+                let request = GenericImage::new(FGA_IMAGE, FGA_TAG)
                     .with_exposed_port(FGA_GRPC_PORT.tcp())
                     .with_exposed_port(FGA_HTTP_PORT.tcp())
-                    .with_wait_for(WaitFor::http(
-                        HttpWaitStrategy::new("/healthz")
-                            .with_port(FGA_HTTP_PORT.tcp())
-                            .with_expected_status_code(200_u16),
-                    ))
+                    .with_wait_for(http_ready("/healthz", FGA_HTTP_PORT))
                     .with_cmd(["run"])
                     .with_labels(container_labels("openfga"))
-                    .with_startup_timeout(STARTUP_TIMEOUT)
-                    .start()
-                    .await
-                    .expect(
-                        "this test starts its own authorization service, so it needs a reachable \
-                         Docker daemon",
-                    );
+                    .with_startup_timeout(STARTUP_TIMEOUT);
+                let container = start_logged(request, "authorization service").await;
                 let host = container.get_host().await.expect("the docker host");
                 let port = container
                     .get_host_port_ipv4(FGA_GRPC_PORT.tcp())
@@ -1852,5 +1913,66 @@ mod sweep_tests {
                     .output();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use std::time::Duration;
+
+    use testcontainers::core::IntoContainerPort;
+    use testcontainers::{GenericImage, ImageExt};
+
+    use super::{container_labels, http_ready, start_logged};
+
+    const PYTHON_IMAGE: &str = "python";
+    const PYTHON_TAG: &str = "3.12-slim-bookworm";
+    const PORT: u16 = 8080;
+
+    /// Accepts the first connection and never answers it, then answers `200` to every later one.
+    const STALLS_FIRST: &str = "\
+import socket
+s = socket.socket()
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(('', 8080))
+s.listen(8)
+held = s.accept()[0]
+print('holding the first probe', flush=True)
+while True:
+    c = s.accept()[0]
+    c.recv(4096)
+    c.sendall(b'HTTP/1.1 200 OK\\r\\nContent-Length: 0\\r\\nConnection: close\\r\\n\\r\\n')
+    c.close()
+";
+
+    /// One probe the service never answers must not spend the whole startup budget,
+    /// which is how an idle runner timed out an identity provider that was up.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_unanswered_probe_does_not_hold_the_startup_budget() {
+        let request = GenericImage::new(PYTHON_IMAGE, PYTHON_TAG)
+            .with_exposed_port(PORT.tcp())
+            .with_wait_for(http_ready("/", PORT))
+            .with_cmd(["python", "-c", STALLS_FIRST])
+            .with_labels(container_labels("probe-test"))
+            .with_startup_timeout(Duration::from_secs(30));
+        start_logged(request, "stalling server").await;
+    }
+
+    /// A service that never becomes ready is named with what it printed, since
+    /// the timeout alone cannot tell a slow start from a crash.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[should_panic(expected = "configuration rejected at line 7")]
+    async fn a_service_that_never_becomes_ready_panics_with_its_own_output() {
+        let request = GenericImage::new(PYTHON_IMAGE, PYTHON_TAG)
+            .with_exposed_port(PORT.tcp())
+            .with_wait_for(http_ready("/", PORT))
+            .with_cmd([
+                "python",
+                "-c",
+                "import time; print('configuration rejected at line 7', flush=True); time.sleep(60)",
+            ])
+            .with_labels(container_labels("probe-test"))
+            .with_startup_timeout(Duration::from_secs(5));
+        start_logged(request, "failing server").await;
     }
 }
