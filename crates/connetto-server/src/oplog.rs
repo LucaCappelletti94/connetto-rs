@@ -9,8 +9,8 @@
 //! [`Oplog`] is the seam, shaped like
 //! [`SnapshotSource`](crate::session::SnapshotSource): an async, `Send + Sync`
 //! trait. [`InMemoryOplog`] is the ring-buffer test double. [`PgOplog`] is the
-//! production target, a Postgres table so every
-//! node in the mesh sees the same log (`06-reconnect.md` line 163).
+//! production target, a Postgres table, so the log survives a restart and a
+//! promoted standby carries it with every other table (`06-reconnect.md`).
 //!
 //! # Pruning policy
 //!
@@ -121,8 +121,8 @@ impl ChangeRecord {
         }
     }
 
-    /// The source LSN, the oplog key. The opaque wire cursor is this value
-    /// big-endian.
+    /// The source LSN, the oplog key. The wire cursor is this value stamped
+    /// with the timeline it was read on ([`crate::timeline`]).
     #[must_use]
     pub const fn lsn(&self) -> u64 {
         self.lsn
@@ -512,8 +512,8 @@ mod pg {
 
     /// A Postgres-table [`Oplog`], the production target.
     ///
-    /// The log is a single table so every node in the mesh reads the same
-    /// history (`06-reconnect.md` line 163). The row image plus routing metadata
+    /// The log is a single table, which a promoted standby carries with every
+    /// other table. The row image plus routing metadata
     /// (`table_name`, `op`, `pk`, `is_tombstone`) are stored as typed columns for
     /// indexing and observability, and the full [`ChangeEvent`] is stored as a
     /// serialized blob so catchup replays it losslessly.

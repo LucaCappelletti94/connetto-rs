@@ -39,6 +39,8 @@ mod grants;
 
 mod grouped_wire;
 
+mod failover;
+
 mod inprocess_loop;
 mod logging;
 

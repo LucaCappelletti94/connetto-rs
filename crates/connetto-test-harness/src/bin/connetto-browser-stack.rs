@@ -2,7 +2,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -18,8 +18,8 @@ use connetto_server::{
 };
 use connetto_test_harness::stack::{
     ChildGuard, Deployment, KeyDir, Provisioned, TaskGuard, display_command, ensure_server_bin,
-    provision, repo_path, require_free, require_success, run_process, spawn_server, strings,
-    wait_for_tcp, wait_until_closed,
+    exe_name, provision, repo_path, require_free, require_success, run_process, spawn_server,
+    strings, wait_for_tcp, wait_until_closed,
 };
 use connetto_test_harness::{Fixture, MockOauth};
 use diesel_async::AsyncPgConnection;
@@ -82,6 +82,9 @@ impl Shard {
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
+    if let Some(dir) = build_only()? {
+        return prebuild(&dir).await;
+    }
     require_free(SYNC_BIND)?;
     require_free(AUTH_BIND)?;
     require_free(CONTENT_BIND)?;
@@ -113,6 +116,44 @@ async fn main() -> Result<()> {
 /// A program with its arguments to run against the stack instead of the
 /// default suites.
 type StackCommand = (OsString, Vec<OsString>);
+
+/// The directory of `--build-only DIR`, which must be the only argument.
+fn build_only() -> Result<Option<PathBuf>> {
+    let args: Vec<OsString> = std::env::args_os()
+        .skip(1)
+        .filter(|arg| arg != "--")
+        .collect();
+    match args.as_slice() {
+        [flag, dir] if flag == "--build-only" => Ok(Some(PathBuf::from(dir))),
+        _ if args.iter().any(|arg| arg == "--build-only") => {
+            Err(anyhow!("--build-only takes one directory and nothing else"))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Build every native binary a run needs and copy them, with this one, into
+/// `dir`, so one CI job builds what every shard then runs.
+async fn prebuild(dir: &Path) -> Result<()> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let binaries = [
+        (ensure_server_bin().await?, "connetto-server"),
+        (build_topology().await?, "verified-topology"),
+        (
+            std::env::current_exe().context("locating this binary")?,
+            "connetto-browser-stack",
+        ),
+    ];
+    for (from, name) in binaries {
+        let to = dir.join(exe_name(name));
+        tokio::fs::copy(&from, &to)
+            .await
+            .with_context(|| format!("copying {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
 
 /// The optional `--shard I/N` selector, then optionally a [`StackCommand`].
 fn cli_arguments() -> Result<(Option<Shard>, Option<StackCommand>)> {
@@ -293,8 +334,9 @@ async fn start_sync_server(services: &Services) -> Result<ChildGuard> {
     .await
 }
 
-async fn run_verified_topology(services: &Services) -> Result<()> {
-    let args = strings(&[
+/// The verified-topology run, or with `run` false the build of the binary it runs.
+fn topology_args(run: bool) -> Vec<OsString> {
+    let mut args = strings(&[
         "+stable",
         "test",
         "--release",
@@ -303,11 +345,48 @@ async fn run_verified_topology(services: &Services) -> Result<()> {
         "--all-features",
         "--test",
         "it",
-        "--",
-        "verified_topology",
-        "--ignored",
     ]);
-    run_process(OsStr::new("cargo"), &args, &services.envs).await
+    if run {
+        args.extend(strings(&["--", "verified_topology", "--ignored"]));
+    } else {
+        args.extend(strings(&[
+            "--no-run",
+            "--message-format=json-render-diagnostics",
+        ]));
+    }
+    args
+}
+
+/// Build the verified-topology test binary and return its path.
+async fn build_topology() -> Result<PathBuf> {
+    let args = topology_args(false);
+    let display = display_command(OsStr::new("cargo"), &args);
+    eprintln!("running {display}");
+    let output = Command::new("cargo")
+        .args(&args)
+        .stderr(Stdio::inherit())
+        .output()
+        .await
+        .with_context(|| format!("starting {display}"))?;
+    require_success(&display, output.status)?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|message| message["target"]["name"] == "it")
+        .and_then(|message| message["executable"].as_str().map(PathBuf::from))
+        .ok_or_else(|| anyhow!("{display} reported no test executable"))
+}
+
+/// Run the verified topology, from the binary `CONNETTO_TOPOLOGY_BIN` names
+/// when a build job made it, otherwise through cargo.
+async fn run_verified_topology(services: &Services) -> Result<()> {
+    match std::env::var_os("CONNETTO_TOPOLOGY_BIN") {
+        Some(bin) => {
+            let args = strings(&["verified_topology", "--ignored"]);
+            run_process(&bin, &args, &services.envs).await
+        }
+        None => run_process(OsStr::new("cargo"), &topology_args(true), &services.envs).await,
+    }
 }
 
 async fn run_default_browser_suites(services: &Services, shard: Option<Shard>) -> Result<()> {

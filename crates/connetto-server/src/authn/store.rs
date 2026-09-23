@@ -5,8 +5,7 @@
 //! resolves identity deterministically from `(issuer, subject)`, and is
 //! single-server and ephemeral. The database store holds
 //! it in Postgres through typed diesel queries, resolves identity through a
-//! linking table so one human may hold several logins, and is durable and
-//! mesh-capable. See `docs/architecture/11-authentication.md`.
+//! linking table so one human may hold several logins, and is durable. See `docs/architecture/11-authentication.md`.
 //!
 //! The refresh token is `"<session_id>.<secret>"`. Only the SHA-256 of the
 //! secret is stored, and every rotation replaces it. A presented secret whose
@@ -502,7 +501,7 @@ mod db {
     );
 
     /// The Postgres auth store, generic over the deployment's schema. Durable
-    /// across restart and the only variant that backs a mesh. Identity resolves
+    /// across restart and the only variant a promoted standby carries. Identity resolves
     /// through the deployment's [`IdentityResolver`], which owns the users table
     /// the `sessions.user_id` column foreign-keys, so connetto owns no schema.
     pub struct DbAuthStore<S: ConnettoStoreSchema> {

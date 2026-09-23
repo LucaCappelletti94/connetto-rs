@@ -323,8 +323,8 @@ impl TokenAuthority {
     /// Build over an Ed25519 keypair supplied as PKCS#8 PEM (private) and the
     /// matching public-key PEM.
     ///
-    /// A stable key is what lets a mesh verify tokens on any node with the
-    /// shared public key, which is not a secret, so no secret crosses nodes.
+    /// A stable key is what lets every server, a restarted one included, verify
+    /// tokens with the shared public key, which is not a secret.
     ///
     /// # Errors
     ///

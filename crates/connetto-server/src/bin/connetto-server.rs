@@ -181,7 +181,7 @@ connetto_ban_table!(String, diesel::sql_types::Text);
 enum ServerStore {
     /// Single-server, ephemeral, deterministic identity mapping.
     InMemory(InMemoryAuthStore),
-    /// Durable and mesh-capable, identity resolved by the deployment.
+    /// Durable, identity resolved by the deployment.
     Db(DbAuthStore<ConnettoAuthSchema>),
 }
 
@@ -485,8 +485,8 @@ fn oidc_config_from_env(
 
 /// Load the Ed25519 signing keypair from `CONNETTO_JWT_PRIVATE_KEY_FILE` and
 /// `CONNETTO_JWT_PUBLIC_KEY_FILE` (PKCS#8 PEM), or generate an ephemeral one.
-/// An ephemeral key does not survive a restart, so a durable or mesh deployment
-/// supplies a stable key.
+/// An ephemeral key does not survive a restart, so a durable deployment supplies a
+/// stable key.
 fn build_token_authority(config: &AuthConfig) -> Result<TokenAuthority> {
     if let (Ok(private_path), Ok(public_path)) = (
         std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE"),
@@ -1478,6 +1478,11 @@ async fn run(
     // per connect and must not spin on a deterministic parse error.
     ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
+    // Read before serving so the first cursor issued already carries the timeline.
+    let history = connetto_server::timeline::read_history(database_url)
+        .await
+        .map_err(|err| anyhow!("reading the timeline history: {err}"))?;
+    manager.reconcile_history(history).await;
 
     let ingest_manager = manager.clone();
     let gap_manager = manager.clone();
@@ -1497,19 +1502,10 @@ async fn run(
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
                     .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
-                // Where the stream is about to resume, read before opening it
-                // so streaming cannot have moved it. Past what was delivered
-                // means a stretch of changes was never seen, and nothing may
-                // be served against the old log after that (R32).
-                if let Some(resume) = connetto_server::slot::resume_position(&pool, &slot)
+                manager
+                    .reconcile_before_stream(&url, &pool, &slot)
                     .await
-                    .map_err(|err| anyhow!("reading the replication slot: {err}"))?
-                {
-                    manager
-                        .reconcile_stream(resume)
-                        .await
-                        .map_err(|err| anyhow!("reconciling the change feed: {err}"))?;
-                }
+                    .map_err(|err| anyhow!("{err}"))?;
                 let config = PgStreamingConfig::new(url, slot, publication);
                 PgStreamingCdcSource::connect(config, catalog)
                     .await

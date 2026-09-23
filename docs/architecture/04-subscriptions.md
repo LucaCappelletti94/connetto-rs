@@ -20,7 +20,7 @@ A subscription has:
 
 - A **subscription ID** (`sub_id`): a client-chosen string, unique within the session, used to correlate snapshot and update messages.
 - A **spec** (`SubscriptionSpec`): describes what data the client wants.
-- A **resume cursor**: the server LSN at which the client last received an update for this subscription.
+- A **resume cursor**: the server position at which the client last received an update for this subscription, stamped with the database's timeline (R73).
 
 ---
 

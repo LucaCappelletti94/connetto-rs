@@ -20,6 +20,7 @@ use connetto_core::Cursor;
 use connetto_core::messages::{BulkMessage, ControlMessage, LivePatch};
 use connetto_core::traits::Transport;
 use connetto_core::transport::{LoopbackTransport, loopback};
+use connetto_server::Position;
 use connetto_test_harness::Client;
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{
@@ -274,13 +275,16 @@ impl Accounted {
     }
 }
 
-/// A live cursor is the causing event's position, eight bytes big-endian.
+/// A live cursor is the causing event's position.
 fn position_of(cursor: &Cursor) -> u64 {
-    let bytes: [u8; 8] = cursor
-        .as_bytes()
-        .try_into()
-        .expect("a live cursor carries a position");
-    u64::from_be_bytes(bytes)
+    Position::from_cursor_bytes(cursor.as_bytes())
+        .expect("a live cursor carries a position")
+        .lsn
+}
+
+/// The wire cursor of `lsn` on a database never promoted.
+fn cursor_at(lsn: u64) -> Cursor {
+    Cursor::new(Position { timeline: 1, lsn }.to_cursor_bytes())
 }
 
 /// A patchset's operations, one verb and a key each, for a refusal to name.
@@ -415,7 +419,7 @@ async fn frames(frames: Vec<(u64, Vec<u8>)>) -> (Client, LoopbackTransport) {
         server_end
             .send_bulk(BulkMessage::LivePatch(LivePatch::new(
                 "docs",
-                Cursor::new(position.to_be_bytes().to_vec()),
+                cursor_at(position),
                 patchset_zstd,
             )))
             .await
@@ -430,7 +434,7 @@ fn accounted_at_nine() -> (Replica, Accounted) {
     let mut replica = Replica::new();
     replica.apply(&items_patch(7, "delivered"));
     let mut accounted = Accounted::default();
-    accounted.note(&Cursor::new(9_u64.to_be_bytes().to_vec()));
+    accounted.note(&cursor_at(9));
     (replica, accounted)
 }
 

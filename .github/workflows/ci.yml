@@ -498,12 +498,70 @@ jobs:
           rm -rf target/wasm32-unknown-unknown/release/incremental
           rm -rf target/tmp
 
+  browser-build:
+    name: Browser stack build
+    runs-on: ubuntu-latest
+    # The release server and the release topology test binary, built once
+    # here instead of in every shard, where they were most of the budget.
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Cache native build output
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: t-browser-native-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            t-browser-native-${{ runner.os }}-
+
+      - name: Install stable browser toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build the browser stack
+        run: |
+          cargo +stable run \
+            -p connetto-test-harness \
+            --bin connetto-browser-stack \
+            -- \
+            --build-only browser-bins
+
+      # The debug stack is mostly DWARF. Panic locations do not need it.
+      - name: Strip debug sections from the prebuilt binaries
+        run: strip --strip-debug browser-bins/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: browser-bins
+          path: browser-bins
+          retention-days: 1
+          if-no-files-found: error
+
+      - name: Prune target cache
+        if: always()
+        run: |
+          rm -rf target/debug/incremental
+          rm -rf target/release/incremental
+          rm -rf target/tmp
+
   browser-tests:
     name: Browser tests ${{ matrix.shard }}/4
+    needs: browser-build
     runs-on: ubuntu-latest
-    # A shard compiles the stack (cached below) and runs a quarter of the
-    # suites, each against its own machine-local stack, so the serial rule
-    # inside one process holds while the wall clock divides by four.
+    # A shard runs a quarter of the suites against its own machine-local
+    # stack from the prebuilt binaries, so the serial rule inside one process
+    # holds while the wall clock divides by four.
     timeout-minutes: 40
     strategy:
       fail-fast: false
@@ -523,18 +581,23 @@ jobs:
           restore-keys: |
             dl-${{ runner.os }}-
 
-      # The stack builds three graphs (the debug harness, the release server
-      # and client test binaries, and the shared wasm tree in target-wasm),
-      # which dominated the old 40-minute job. Warm shards skip all three.
-      - name: Cache browser build output
+      # The wasm tree in target-wasm is the one graph a shard still builds.
+      - name: Cache wasm build output
         uses: actions/cache@v6
         with:
-          path: |
-            target
-            target-wasm
-          key: t-browser-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          path: target-wasm
+          key: t-browser-wasm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            t-browser-${{ runner.os }}-
+            t-browser-wasm-${{ runner.os }}-
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: browser-bins
+          path: browser-bins
+
+      # Artifacts drop the executable bit.
+      - name: Mark the prebuilt binaries executable
+        run: chmod +x browser-bins/*
 
       - name: Install stable browser toolchain
         run: rustup toolchain install stable --profile minimal
@@ -557,21 +620,16 @@ jobs:
         run: docker pull ghcr.io/navikt/mock-oauth2-server:6.0.2
 
       - name: Run browser suites
-        run: |
-          cargo +stable run \
-            -p connetto-test-harness \
-            --bin connetto-browser-stack \
-            -- \
-            --shard ${{ matrix.shard }}/4
+        env:
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+          CONNETTO_TOPOLOGY_BIN: ${{ github.workspace }}/browser-bins/verified-topology
+        run: browser-bins/connetto-browser-stack --shard ${{ matrix.shard }}/4
 
       - name: Prune target cache
         if: always()
         run: |
-          rm -rf target/debug/incremental
-          rm -rf target/release/incremental
           rm -rf target-wasm/wasm32-unknown-unknown/debug/incremental
           rm -rf target-wasm/debug/incremental
-          rm -rf target/tmp
 
   file-core-wasm:
     name: File core wasm

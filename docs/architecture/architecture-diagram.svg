@@ -24,7 +24,7 @@
     <!-- ===== PostgreSQL panel ===== -->
     <rect x="35" y="60" width="460" height="330" rx="8" fill="#ECEFF1" stroke="#90A4AE" stroke-width="1" />
     <text x="265" y="82" text-anchor="middle" font-size="13" font-weight="600" fill="#455A64">PostgreSQL</text>
-    <text x="265" y="96" text-anchor="middle" font-size="10" fill="#78909C">source of truth, one instance today</text>
+    <text x="265" y="96" text-anchor="middle" font-size="10" fill="#78909C">source of truth, one primary with standbys for failover</text>
 
     <!-- PG instance (built) -->
     <g transform="translate(55, 110)">
@@ -39,24 +39,21 @@
       <text x="14" y="114" font-size="9.5" fill="#78909C">WAL / CDC out (pgoutput)</text>
     </g>
 
-    <!-- Mesh part: open question X7, R73 -->
+    <!-- Standby for failover, R73 -->
     <g transform="translate(300, 110)">
-      <rect width="175" height="56" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="56" rx="1" fill="#EF5350" />
-      <text x="87" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#333">PG instance 2</text>
-      <text x="87" y="40" text-anchor="middle" font-size="9" fill="#C62828">multi-server shape, R73</text>
+      <rect width="175" height="130" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="130" rx="1" fill="#4CAF50" />
+      <text x="87" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">PostgreSQL standby</text>
+      <line x1="10" y1="30" x2="165" y2="30" stroke="#E0E0E0" />
+      <text x="14" y="48" font-size="9.5" fill="#555">every table, byte for byte</text>
+      <text x="14" y="64" font-size="9.5" fill="#555">synced failover slot</text>
+      <text x="14" y="80" font-size="9.5" fill="#555">promoted on failure,</text>
+      <text x="14" y="96" font-size="9.5" fill="#555">the address moves to it</text>
     </g>
-    <g transform="translate(300, 186)">
-      <rect width="175" height="56" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="56" rx="1" fill="#EF5350" />
-      <text x="87" y="22" text-anchor="middle" font-size="11" font-weight="600" fill="#333">PG instance N</text>
-      <text x="87" y="40" text-anchor="middle" font-size="9" fill="#C62828">multi-server shape, R73</text>
-    </g>
-    <line x1="275" y1="138" x2="300" y2="138" stroke="#EF5350" stroke-width="1.5" marker-start="url(#arrow-red)" marker-end="url(#arrow-red)" />
-    <line x1="275" y1="214" x2="300" y2="214" stroke="#EF5350" stroke-width="1.5" marker-start="url(#arrow-red)" marker-end="url(#arrow-red)" />
-    <text x="287" y="130" text-anchor="middle" font-size="8" fill="#C62828">(8)</text>
-    <text x="265" y="272" text-anchor="middle" font-size="10" font-weight="600" fill="#C62828">mesh: open question X7, reframed as R73 failover verification</text>
-    <text x="265" y="286" text-anchor="middle" font-size="9" fill="#C62828">the hard parts are existing Postgres features, the phase is verification and a deployment recipe</text>
+    <line x1="275" y1="175" x2="300" y2="175" stroke="#4CAF50" stroke-width="1.5" marker-end="url(#arrow-green)" />
+    <text x="287" y="167" text-anchor="middle" font-size="8" fill="#2E7D32">(8)</text>
+    <text x="265" y="272" text-anchor="middle" font-size="10" font-weight="600" fill="#2E7D32">(8) streaming replication, failover by promotion (R73, chapter 06)</text>
+    <text x="265" y="286" text-anchor="middle" font-size="9" fill="#2E7D32">cursors carry their timeline, multi-master is out of scope</text>
 
     <!-- ===== External services ===== -->
     <rect x="35" y="410" width="460" height="120" rx="8" fill="#ECEFF1" stroke="#90A4AE" stroke-width="1" />
@@ -653,5 +650,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-09-21 to the plan's current state.</text>
+  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-09-23 to the plan's current state.</text>
 </svg>

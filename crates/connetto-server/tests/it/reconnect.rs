@@ -25,8 +25,8 @@ use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, OplogConfig, PageSpec,
-    RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    loopback, pg_write_target,
+    Position, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -198,13 +198,14 @@ where
     events
 }
 
-/// The resume cursor a client would persist after applying `event`.
+/// The resume cursor a client would persist after applying `event`, on the
+/// first timeline of a database never promoted.
 fn cursor_of(event: &ChangeEvent) -> Cursor {
     let lsn = event
         .checkpoint()
         .expect("row event carries a checkpoint")
         .0;
-    Cursor::new(lsn.to_be_bytes().to_vec())
+    Cursor::new(Position { timeline: 1, lsn }.to_cursor_bytes())
 }
 
 /// Open a session on `manager`, send the handshake carrying `resume`, and read
