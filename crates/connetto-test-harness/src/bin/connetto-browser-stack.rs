@@ -2,11 +2,10 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow};
 use axum::routing::get;
@@ -17,14 +16,16 @@ use connetto_server::{
     ProviderRegistry, RedirectPolicy, RequestGuard, TokenAuthority, auth_router,
     connetto_auth_tables,
 };
-use connetto_test_harness::{Fixture, MockOauth, PUBLICATION, SLOT};
+use connetto_test_harness::stack::{
+    Deployment, KeyDir, Provisioned, TaskGuard, display_command, ensure_server_bin, exe_name,
+    provision, repo_path, require_free, require_success, run_process, spawn_server, strings,
+    wait_for_tcp, wait_until_closed,
+};
+use connetto_test_harness::{Fixture, MockOauth};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use tokio::net::TcpStream;
 use tokio::process::{Child, Command};
-use tokio::task::JoinHandle;
-use tokio::time::{Instant, sleep};
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 const SYNC_BIND: &str = "127.0.0.1:7777";
@@ -43,11 +44,14 @@ const LOSE_CONTENT_PATH: &str = "/dev/lose-content";
 const CALLER_FUNCTION: &str = "current_app_user";
 const BROWSER_PROVIDER: &str = "dev-idp";
 
-const SCHEMA_SQL: &str = include_str!("../../../../examples/deployment/schema.sql");
-const POLICIES_SQL: &str = include_str!("../../../../examples/deployment/policies.sql");
-const ROLES_SQL: &str = include_str!("../../../../examples/deployment/roles.sql");
-const DEPLOYMENT_SQL: &str = include_str!("../../../../crates/connetto-file-server/sql/schema.sql");
-const CONTENT_SQL: &str = include_str!("../../../../examples/wasm-smoke/content.sql");
+const DEPLOYMENT: Deployment = Deployment {
+    schema: include_str!("../../../../examples/deployment/schema.sql"),
+    roles: include_str!("../../../../examples/deployment/roles.sql"),
+    content: include_str!("../../../../examples/wasm-smoke/content.sql"),
+    policies: include_str!("../../../../examples/deployment/policies.sql"),
+    published: &["orders", "order_lines", "photos"],
+    writable: "orders,photos",
+};
 connetto_auth_tables!(String, diesel::sql_types::Text);
 
 diesel::table! {
@@ -64,37 +68,12 @@ diesel::table! {
     }
 }
 
-struct KeyDir {
-    dir: PathBuf,
-    private: PathBuf,
-    public: PathBuf,
-    content_der: PathBuf,
-}
-
-impl Drop for KeyDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
-struct StoreDir {
-    dir: PathBuf,
-}
-
-impl Drop for StoreDir {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.dir);
-    }
-}
-
 struct Services {
-    fixture: Fixture,
+    provisioned: Provisioned,
     idp: MockOauth,
-    keys: KeyDir,
     server_bin: PathBuf,
     envs: Vec<(String, String)>,
     share: Arc<Share>,
-    content_store: StoreDir,
 }
 
 /// The sync server child, which the lose-content route stops and starts again.
@@ -113,8 +92,8 @@ impl SyncServer {
             child: Arc::new(tokio::sync::Mutex::new(None)),
             server_bin: services.server_bin.clone(),
             envs: Arc::new(services.envs.clone()),
-            content_dir: services.content_store.dir.clone(),
-            admin_url: services.fixture.admin_url().to_owned(),
+            content_dir: services.provisioned.content_store.path.clone(),
+            admin_url: services.provisioned.fixture.admin_url().to_owned(),
         }
     }
 
@@ -125,21 +104,8 @@ impl SyncServer {
     }
 
     async fn spawn(&self) -> Result<Child> {
-        let mut command = Command::new(&self.server_bin);
-        command
-            .envs(self.envs.iter().cloned())
-            .env("CONNETTO_AUTH_BIND", CONTENT_BIND)
-            // The child's auth listener carries the file routes the suites fetch.
-            // The server logs to stdout. Nulling it hid every server line from CI.
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .kill_on_drop(true);
-        let mut child = command.spawn().context("spawning connetto-server")?;
-        wait_for_child_port(&mut child, SYNC_BIND, "connetto-server").await?;
-        if !wait_for_tcp(CONTENT_BIND, Duration::from_secs(20)).await {
-            return Err(anyhow!("connetto-server did not open {CONTENT_BIND}"));
-        }
-        Ok(child)
+        // The child's auth listener carries the file routes the suites fetch.
+        spawn_server(&self.server_bin, &self.envs, SYNC_BIND, CONTENT_BIND).await
     }
 
     /// Stops the server, deletes the stored chunks of `file_ids`, and starts it again.
@@ -197,16 +163,6 @@ fn parse_file_ids(body: &str) -> Option<Vec<Vec<u8>>> {
                 .flatten()
         })
         .collect()
-}
-
-struct TaskGuard {
-    handle: JoinHandle<()>,
-}
-
-impl Drop for TaskGuard {
-    fn drop(&mut self) {
-        self.handle.abort();
-    }
 }
 
 /// One slice of the suite list, `--shard I/N`: this process runs every suite
@@ -345,117 +301,44 @@ fn parse_shard(value: &str) -> Result<Shard> {
     Ok(Shard { index, count })
 }
 
-fn require_free(bind: &str) -> Result<()> {
-    let listener = StdTcpListener::bind(bind)
-        .with_context(|| format!("{bind} is already in use, stop that process first"))?;
-    drop(listener);
-    Ok(())
-}
-
 async fn prepare_services(server_bin: PathBuf) -> Result<Services> {
-    let fixture = Fixture::acquire().await;
-    fixture.setup(&[SCHEMA_SQL]).await;
-    fixture.setup(&[DEPLOYMENT_SQL]).await;
-    fixture.provision_auth_tables().await;
-    fixture.setup(&[ROLES_SQL]).await;
-    fixture.setup(&[CONTENT_SQL]).await;
-    fixture.setup(&[POLICIES_SQL]).await;
-    fixture
-        .start_replication(&["orders", "order_lines", "photos"])
-        .await;
-    let (fga_url, fga_store) = fixture_fga(&fixture).await;
-    let keys = generate_keys().await?;
-    let share = seed_share(&fixture, &keys).await?;
-    let content_dir = std::env::temp_dir().join(format!(
-        "connetto-browser-content-{}-{}",
-        std::process::id(),
-        now_millis()
-    ));
-    tokio::fs::create_dir_all(&content_dir)
-        .await
-        .with_context(|| format!("creating {}", content_dir.display()))?;
-    let content_store = StoreDir { dir: content_dir };
+    let provisioned = provision(&DEPLOYMENT, "connetto-browser-stack").await?;
+    let share = seed_share(&provisioned.fixture, &provisioned.keys).await?;
     let idp = MockOauth::start().await;
-    let reader_url = with_user_url(fixture.admin_url(), "connetto_reader", "connetto_reader");
     let schema_file = repo_path(&["examples", "deployment", "schema.sql"])?;
     let policies_file = repo_path(&["examples", "deployment", "policies.sql"])?;
 
-    let mut envs = vec![
-        ("DATABASE_URL".to_owned(), fixture.admin_url().to_owned()),
-        ("CONNETTO_READER_URL".to_owned(), reader_url),
-        ("CONNETTO_BIND".to_owned(), SYNC_BIND.to_owned()),
-        ("CONNETTO_AUTH_BIND".to_owned(), AUTH_BIND.to_owned()),
-        ("CONNETTO_AUTH".to_owned(), "database".to_owned()),
-        ("CONNETTO_WRITABLE".to_owned(), "orders,photos".to_owned()),
-        ("CONNETTO_CONTENT_URL".to_owned(), CONTENT_BASE.to_owned()),
-        (
-            "CONNETTO_CONTENT_STORE".to_owned(),
-            format!("fs:{}", content_store.dir.display()),
-        ),
-        (
-            "CONNETTO_CONTENT_KEY".to_owned(),
-            keys.content_der.display().to_string(),
-        ),
-        ("CONNETTO_CONTENT_SWEEP_SECS".to_owned(), "1".to_owned()),
-        (
-            "CONNETTO_TEST_CONTENT_BASE".to_owned(),
-            CONTENT_BASE.to_owned(),
-        ),
-        ("CONNETTO_PG_DDL".to_owned(), SCHEMA_SQL.to_owned()),
-        ("CONNETTO_PG_POLICIES".to_owned(), POLICIES_SQL.to_owned()),
-        ("CONNETTO_SLOT".to_owned(), SLOT.to_owned()),
-        ("CONNETTO_PUBLICATION".to_owned(), PUBLICATION.to_owned()),
-        ("CONNETTO_FGA_URL".to_owned(), fga_url),
-        ("CONNETTO_FGA_STORE".to_owned(), fga_store),
-        (
-            "CONNETTO_JWT_PRIVATE_KEY_FILE".to_owned(),
-            keys.private.display().to_string(),
-        ),
-        (
-            "CONNETTO_JWT_PUBLIC_KEY_FILE".to_owned(),
-            keys.public.display().to_string(),
-        ),
-        (
-            "CONNETTO_CALLER_FUNCTION".to_owned(),
-            CALLER_FUNCTION.to_owned(),
-        ),
-        ("CONNETTO_SLOT_LAG_SECS".to_owned(), "0".to_owned()),
-        ("CONNETTO_TEST_AUTH_BASE".to_owned(), AUTH_BASE.to_owned()),
-        ("CONNETTO_TEST_WS".to_owned(), SYNC_WS.to_owned()),
-        (
-            "CONNETTO_TEST_PROVIDER".to_owned(),
-            BROWSER_PROVIDER.to_owned(),
-        ),
-        (
-            "CONNETTO_TEST_PG_DDL_FILE".to_owned(),
-            schema_file.display().to_string(),
-        ),
-        (
-            "CONNETTO_TEST_PG_POLICIES_FILE".to_owned(),
-            policies_file.display().to_string(),
-        ),
-        (
-            "CONNETTO_SERVER_BIN".to_owned(),
-            server_bin.display().to_string(),
-        ),
-    ];
+    let mut envs = provisioned.server_env(&DEPLOYMENT, SYNC_BIND, AUTH_BIND, CONTENT_BASE);
+    envs.extend(
+        [
+            ("CONNETTO_CONTENT_SWEEP_SECS", "1".to_owned()),
+            ("CONNETTO_TEST_CONTENT_BASE", CONTENT_BASE.to_owned()),
+            ("CONNETTO_CALLER_FUNCTION", CALLER_FUNCTION.to_owned()),
+            ("CONNETTO_SLOT_LAG_SECS", "0".to_owned()),
+            ("CONNETTO_TEST_AUTH_BASE", AUTH_BASE.to_owned()),
+            ("CONNETTO_TEST_WS", SYNC_WS.to_owned()),
+            ("CONNETTO_TEST_PROVIDER", BROWSER_PROVIDER.to_owned()),
+            (
+                "CONNETTO_TEST_PG_DDL_FILE",
+                schema_file.display().to_string(),
+            ),
+            (
+                "CONNETTO_TEST_PG_POLICIES_FILE",
+                policies_file.display().to_string(),
+            ),
+            ("CONNETTO_SERVER_BIN", server_bin.display().to_string()),
+        ]
+        .map(|(key, value)| (key.to_owned(), value)),
+    );
     envs.extend(idp.env_pairs(BROWSER_PROVIDER, CALLBACK));
 
     Ok(Services {
-        fixture,
+        provisioned,
         idp,
-        keys,
         server_bin,
         envs,
         share: Arc::new(share),
-        content_store,
     })
-}
-
-async fn fixture_fga(fixture: &Fixture) -> (String, String) {
-    let endpoint = fixture.fga_url().await.to_owned();
-    let (_, store) = fixture.fga_store().await;
-    (endpoint, store)
 }
 
 async fn start_auth_stack(services: &Services, server: SyncServer) -> Result<TaskGuard> {
@@ -473,16 +356,17 @@ async fn start_auth_stack(services: &Services, server: SyncServer) -> Result<Tas
     let registry = Arc::new(registry);
 
     let config = AuthConfig::default();
-    let private = tokio::fs::read(&services.keys.private)
+    let private = tokio::fs::read(&services.provisioned.keys.private)
         .await
-        .with_context(|| format!("reading {}", services.keys.private.display()))?;
-    let public = tokio::fs::read(&services.keys.public)
+        .with_context(|| format!("reading {}", services.provisioned.keys.private.display()))?;
+    let public = tokio::fs::read(&services.provisioned.keys.public)
         .await
-        .with_context(|| format!("reading {}", services.keys.public.display()))?;
+        .with_context(|| format!("reading {}", services.provisioned.keys.public.display()))?;
     let authority = TokenAuthority::from_ed_pem(&private, &public, &config)
         .map_err(|err| anyhow!("loading the browser signing keypair: {err}"))?;
-    let manager =
-        AsyncDieselConnectionManager::<AsyncPgConnection>::new(services.fixture.admin_url());
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+        services.provisioned.fixture.admin_url(),
+    );
     let pool = Pool::builder()
         .build(manager)
         .await
@@ -723,18 +607,6 @@ fn test_files(dir: &[&str]) -> Result<Vec<OsString>> {
     Ok(tests)
 }
 
-async fn run_process(program: &OsStr, args: &[OsString], envs: &[(String, String)]) -> Result<()> {
-    let display = display_command(program, args);
-    eprintln!("running {display}");
-    let status = Command::new(program)
-        .args(args)
-        .envs(envs.iter().cloned())
-        .status()
-        .await
-        .with_context(|| format!("starting {display}"))?;
-    require_success(&display, status)
-}
-
 /// What the headless runner prints when the environment lost the session
 /// through no fault of the suite. The first is R46's report loss, documented
 /// as an upstream defect (`docs/upstream-wasm-bindgen-headless-hang.md`). The
@@ -823,85 +695,6 @@ where
     Ok(hung)
 }
 
-fn require_success(display: &str, status: std::process::ExitStatus) -> Result<()> {
-    if status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!("{display} exited with {status}"))
-    }
-}
-
-async fn wait_for_child_port(child: &mut Child, bind: &str, name: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        if TcpStream::connect(bind).await.is_ok() {
-            return Ok(());
-        }
-        if let Some(status) = child.try_wait().context("checking child status")? {
-            return Err(anyhow!("{name} exited before opening {bind}: {status}"));
-        }
-        if Instant::now() >= deadline {
-            return Err(anyhow!("{name} did not open {bind}"));
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn wait_for_tcp(bind: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if TcpStream::connect(bind).await.is_ok() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn wait_until_closed(bind: &str, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if TcpStream::connect(bind).await.is_err() {
-            return;
-        }
-        sleep(Duration::from_millis(100)).await;
-    }
-}
-
-async fn ensure_server_bin() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("CONNETTO_SERVER_BIN") {
-        let path = PathBuf::from(path);
-        if path.exists() {
-            return Ok(path);
-        }
-        return Err(anyhow!("CONNETTO_SERVER_BIN names a missing file"));
-    }
-    let candidate = target_dir()?
-        .join("release")
-        .join(exe_name("connetto-server"));
-    // The build runs even when the binary exists. A cached tree can hold a
-    // server from another commit, and cargo's fingerprinting makes the warm
-    // case a no-op while a stale exists() shortcut cannot.
-    let args = strings(&[
-        "+stable",
-        "build",
-        "--release",
-        "--all-features",
-        "-p",
-        "connetto-server",
-        "--bin",
-        "connetto-server",
-    ]);
-    run_process(OsStr::new("cargo"), &args, &[]).await?;
-    if candidate.exists() {
-        Ok(candidate)
-    } else {
-        Err(anyhow!("connetto-server was not found after the build"))
-    }
-}
-
 /// A minted share key, the row only its holder can see, and the token a tab
 /// presents to claim it.
 #[derive(Clone)]
@@ -959,106 +752,6 @@ async fn seed_share(fixture: &Fixture, keys: &KeyDir) -> Result<Share> {
         token,
         photo,
     })
-}
-
-async fn generate_keys() -> Result<KeyDir> {
-    let dir = std::env::temp_dir().join(format!(
-        "connetto-browser-stack-{}-{}",
-        std::process::id(),
-        now_millis()
-    ));
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .with_context(|| format!("creating {}", dir.display()))?;
-    let private = dir.join("priv.pem");
-    let public = dir.join("pub.pem");
-    let content_der = dir.join("content.der");
-    let gen_args = vec![
-        OsString::from("genpkey"),
-        OsString::from("-algorithm"),
-        OsString::from("ed25519"),
-        OsString::from("-out"),
-        private.as_os_str().to_owned(),
-    ];
-    run_process(OsStr::new("openssl"), &gen_args, &[]).await?;
-    let pub_args = vec![
-        OsString::from("pkey"),
-        OsString::from("-in"),
-        private.as_os_str().to_owned(),
-        OsString::from("-pubout"),
-        OsString::from("-out"),
-        public.as_os_str().to_owned(),
-    ];
-    run_process(OsStr::new("openssl"), &pub_args, &[]).await?;
-    let content_key =
-        ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
-            .map_err(|err| anyhow!("generating the content ticket keypair: {err:?}"))?;
-    tokio::fs::write(&content_der, content_key.as_ref())
-        .await
-        .with_context(|| format!("writing {}", content_der.display()))?;
-    Ok(KeyDir {
-        dir,
-        private,
-        public,
-        content_der,
-    })
-}
-
-fn with_user_url(url: &str, user: &str, password: &str) -> String {
-    let (scheme, rest) = url.split_once("://").expect("url has a scheme");
-    let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
-    format!("{scheme}://{user}:{password}@{host}")
-}
-
-fn target_dir() -> Result<PathBuf> {
-    if let Ok(value) = std::env::var("CARGO_TARGET_DIR") {
-        let path = PathBuf::from(value);
-        if path.is_absolute() {
-            Ok(path)
-        } else {
-            Ok(repo_root()?.join(path))
-        }
-    } else {
-        Ok(repo_root()?.join("target"))
-    }
-}
-
-fn repo_path(parts: &[&str]) -> Result<PathBuf> {
-    let mut path = repo_root()?;
-    for part in parts {
-        path.push(part);
-    }
-    Ok(path)
-}
-
-fn repo_root() -> Result<PathBuf> {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .context("finding the repository root")
-}
-
-fn exe_name(base: &str) -> String {
-    format!("{base}{}", std::env::consts::EXE_SUFFIX)
-}
-
-fn strings(args: &[&str]) -> Vec<OsString> {
-    args.iter().map(OsString::from).collect()
-}
-
-fn display_command(program: &OsStr, args: &[OsString]) -> String {
-    let mut text = program.to_string_lossy().into_owned();
-    for arg in args {
-        text.push(' ');
-        text.push_str(&arg.to_string_lossy());
-    }
-    text
-}
-
-fn now_millis() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis())
 }
 
 #[cfg(test)]

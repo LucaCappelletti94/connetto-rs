@@ -376,6 +376,46 @@ jobs:
             --all-features \
             ${{ matrix.target }}
 
+  android:
+    # R88: the phone build of the desktop demo, checked without a device. Its
+    # own job because the matrix legs pass --all-features, which would switch
+    # the desktop renderer on for the phone.
+    name: Compile dioxus-desktop-demo android
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable toolchain with the Android target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-linux-android --toolchain stable
+
+      - name: Check the demo for Android
+        working-directory: examples/dioxus-desktop-demo
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          tc="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          export CC_aarch64_linux_android="$tc/aarch64-linux-android29-clang"
+          export AR_aarch64_linux_android="$tc/llvm-ar"
+          export RANLIB_aarch64_linux_android="$tc/llvm-ranlib"
+          export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android29-clang"
+          cargo +stable check \
+            --target aarch64-linux-android \
+            --no-default-features \
+            --features mobile
+
   rust-tests:
     name: Rust tests ${{ matrix.name }}
     runs-on: ubuntu-latest

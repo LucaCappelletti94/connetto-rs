@@ -61,6 +61,7 @@ use tokio::task::JoinHandle;
 
 pub mod fanout;
 pub mod roster;
+pub mod stack;
 pub mod standby;
 
 pub use roster::{RosterAuth, WITHHELD_ID};

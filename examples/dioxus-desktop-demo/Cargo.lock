@@ -58,6 +58,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
+name = "android-native-keyring-store"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "48c6349ddff23194f8fdce2ea8849380f5a4868c1648965b70e801e104cba9b3"
+dependencies = [
+ "base64 0.22.1",
+ "jni 0.21.1",
+ "keyring-core",
+ "log",
+ "ndk-context",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -907,6 +925,7 @@ dependencies = [
 name = "connetto-client"
 version = "0.0.0"
 dependencies = [
+ "android-native-keyring-store",
  "anyhow",
  "apple-native-keyring-store",
  "base64 0.22.1",
@@ -929,6 +948,7 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "webbrowser",
  "windows-native-keyring-store",
  "zeroize",
  "zip",
@@ -994,7 +1014,7 @@ dependencies = [
  "diesel-async",
  "dioxus",
  "pg2sqlite",
- "rfd",
+ "robius-directories",
  "rosetta-uuid",
  "tempfile",
  "tokio",
@@ -1112,6 +1132,7 @@ dependencies = [
  "connetto-server",
  "diesel",
  "diesel-async",
+ "futures-util",
  "keyutils",
  "openfga-client",
  "openidconnect",
@@ -1127,6 +1148,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-tungstenite",
  "tower-http",
  "tracing-subscriber",
  "uuid",
@@ -1634,7 +1656,7 @@ dependencies = [
  "byteorder",
  "chrono",
  "diesel_derives",
- "downcast-rs 2.0.2",
+ "downcast-rs",
  "itoa",
  "libsqlite3-sys",
  "num-bigint",
@@ -2154,7 +2176,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2178,15 +2200,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 3.0.5",
-]
-
-[[package]]
-name = "dlib"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
-dependencies = [
- "libloading 0.8.9",
 ]
 
 [[package]]
@@ -2222,12 +2235,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "downcast-rs"
-version = "1.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
 
 [[package]]
 name = "downcast-rs"
@@ -2438,7 +2445,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -4164,6 +4171,7 @@ checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "bindgen",
  "cc",
+ "openssl-sys",
  "pkg-config",
  "vcpkg",
 ]
@@ -5079,7 +5087,7 @@ dependencies = [
  "md-5 0.10.6",
  "parking_lot",
  "percent-encoding",
- "quick-xml 0.37.5",
+ "quick-xml",
  "rand 0.8.8",
  "reqwest 0.12.28",
  "ring",
@@ -5199,6 +5207,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "openssl-src"
+version = "300.6.1+3.6.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46eb8fb9fb3b61ce1c0f8a026c4c1a0714d3a9e138e7fbde78753ce2babc3846"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "openssl-sys"
 version = "0.9.117"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5206,6 +5223,7 @@ checksum = "b47e7e6bb2c38cd930d25a23b40fa52e068c10e85f3e03a7f5ba5aaca5713695"
 dependencies = [
  "cc",
  "libc",
+ "openssl-src",
  "pkg-config",
  "vcpkg",
 ]
@@ -5373,7 +5391,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#a803a6b5b968819d74c97e12676d21faa32c532e"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#787815b7cb578e1407b524e7f43c73be91bd6b5b"
 dependencies = [
  "git2",
  "sql-traits",
@@ -6068,15 +6086,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "quick-xml"
-version = "0.41.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
-dependencies = [
- "memchr",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6129,7 +6138,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6589,9 +6598,6 @@ dependencies = [
  "raw-window-handle 0.6.2",
  "wasm-bindgen",
  "wasm-bindgen-futures",
- "wayland-backend",
- "wayland-client",
- "wayland-protocols",
  "web-sys",
  "windows-sys 0.61.2",
 ]
@@ -6669,12 +6675,32 @@ dependencies = [
 ]
 
 [[package]]
-name = "rosetta-uuid"
-version = "0.1.3"
+name = "robius-android-env"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fe5fcb5c7da28c0c6d3831ae92216f1dc4281ff6ab916732577aef95154ec8a"
+checksum = "087fcb3061ccc432658a605cb868edd44e0efb08e7a159b486f02804a7616bef"
 dependencies = [
- "chrono",
+ "jni 0.21.1",
+ "ndk-context",
+]
+
+[[package]]
+name = "robius-directories"
+version = "6.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6226ef6667258c14b4d84d1380c37649ad517d1bcdf6401b7db06552058e9679"
+dependencies = [
+ "dirs-sys",
+ "jni 0.21.1",
+ "robius-android-env",
+]
+
+[[package]]
+name = "rosetta-uuid"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "051ccd27e3f7d4f8cffc9e6ad073e08920c0b88a4f061bb0620899034a95453a"
+dependencies = [
  "diesel",
  "getrandom 0.4.3",
  "uuid",
@@ -6757,7 +6783,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6863,12 +6889,6 @@ dependencies = [
  "serde",
  "serde_json",
 ]
-
-[[package]]
-name = "scoped-tls"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopeguard"
@@ -7446,9 +7466,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9492ba2237745ec8d2c2475b23097ceb916d1175d264d7aeb1e44399face303f"
+checksum = "26dd4527d7fe7a00a76907a4512c2fdefaa3b5dc20a5c7801d8ff614eae9dc4a"
 dependencies = [
  "diesel",
  "diesel-async",
@@ -7476,7 +7496,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#d3983044c09f340965e4b904015914bd09fbbefe"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f354ee25fc7ac9919adbbf6e5a3b6da2f6eadc80"
 dependencies = [
  "log",
  "recursive",
@@ -7506,7 +7526,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#d3983044c09f340965e4b904015914bd09fbbefe"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f354ee25fc7ac9919adbbf6e5a3b6da2f6eadc80"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7606,7 +7626,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#884b80e657a251f55157715ff726d9a6867f3540"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#daa081889b8fd6fa9734de25da1fe4438126ecb8"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -7816,10 +7836,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8765,66 +8785,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "wayland-backend"
-version = "0.3.17"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "38a91b4eaddff87b1cd1074985e3713da4af2c49742d1b356b2c01670a67a078"
-dependencies = [
- "cc",
- "downcast-rs 1.2.1",
- "rustix",
- "scoped-tls",
- "smallvec",
- "wayland-sys",
-]
-
-[[package]]
-name = "wayland-client"
-version = "0.31.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
-dependencies = [
- "bitflags 2.13.2",
- "rustix",
- "wayland-backend",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-protocols"
-version = "0.32.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6"
-dependencies = [
- "bitflags 2.13.2",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
-]
-
-[[package]]
-name = "wayland-scanner"
-version = "0.31.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "338e30461b3a2b67d70eb30a6d89f8e0c93a833e07d2ae89085cd070c4a00ac0"
-dependencies = [
- "proc-macro2",
- "quick-xml 0.41.0",
- "quote",
-]
-
-[[package]]
-name = "wayland-sys"
-version = "0.31.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
-dependencies = [
- "dlib",
- "log",
- "pkg-config",
-]
-
-[[package]]
 name = "web-sys"
 version = "0.3.105"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8990,7 +8950,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

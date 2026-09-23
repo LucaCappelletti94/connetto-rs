@@ -283,6 +283,32 @@ async fn native_login_refreshes_and_silently_reacquires() {
     assert_eq!(session.user_id, login.user_id, "same identity on reacquire");
 }
 
+/// A first run has no remembered account, and the login is what reveals it.
+/// The same authenticator's token source then has to refresh for that account,
+/// because it is what the session's first reconnect asks for a fresh grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_login_refreshes_for_its_own_reconnect() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _idp) = spawn_auth_server().await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let authenticator = Arc::new(
+        NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
+            .with_browser_opener(fake_browser("first-run-user")),
+    );
+    let login = authenticator.login::<String>().await.expect("login");
+    let account = encode_identity(&login.user_id).expect("encode account");
+    let issued = store.load(&account).expect("load").expect("refresh stored");
+
+    let token = authenticator
+        .token_source()
+        .token()
+        .await
+        .expect("the token source refreshes for the account the login revealed");
+    assert!(!token.is_empty(), "a fresh access token");
+    let rotated = store.load(&account).expect("load").expect("refresh stored");
+    assert_ne!(issued, rotated, "the refresh rotated that account's token");
+}
+
 /// A project whose `Id` is a typed uuid, not a string. The token endpoint
 /// serializes that id and the client deserializes it straight back into the
 /// same type, so nothing on the `user_id` path is text.
@@ -470,6 +496,35 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
         .logout()
         .await
         .expect("a second logout is a no-op");
+}
+
+/// Signing out of the session a first run just created revokes it, because the
+/// login told the authenticator which account it now holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_first_login_logout_revokes_its_own_session() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, service, _idp) = spawn_auth_server_with_service().await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let authenticator =
+        NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
+            .with_browser_opener(fake_browser("first-run-user"));
+    let login = authenticator.login::<String>().await.expect("login");
+    let account = encode_identity(&login.user_id).expect("encode account");
+
+    authenticator.logout().await.expect("logout");
+
+    assert_eq!(
+        store.load(&account).expect("load"),
+        None,
+        "the refresh token is cleared"
+    );
+    let concrete = service.handshake_authority();
+    let authority: &dyn HandshakeAuthority = &concrete;
+    match authority.check_grant(&Grant::new(login.access_token)).await {
+        Err(GrantRefused::Revoked) => {}
+        Err(other) => panic!("expected Revoked, got {other:?}"),
+        Ok(_) => panic!("the first run's session must be refused after its logout"),
+    }
 }
 
 /// Offline logout, which decision three of phase E3 settles: the local clear

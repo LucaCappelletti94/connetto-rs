@@ -32,7 +32,7 @@ sqlite-wasm-rs = { version = "0.5", default-features = false }
 # Client-authored uuid v4 keys for the synced orders table: one strongly typed
 # `rosetta_uuid::Uuid` that maps to SQLite BLOB and Postgres uuid from a single
 # schema, generated with the browser CSPRNG through getrandom's wasm_js backend.
-rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
 web-sys = { version = "0.3", features = [
   "BroadcastChannel",
   "MessageEvent",
@@ -63,7 +63,7 @@ wasm-bindgen-test = "0.3"
 serde_json = "1"
 # The full-resync parity test hand-builds snapshot patchsets to feed a fake
 # upstream through the relay hub, the same native encoding the wire carries.
-sqlite-diff-rs = { version = "0.11", default-features = false }
+sqlite-diff-rs = { version = "0.14", default-features = false }
 connetto-file-client = { path = "../../crates/connetto-file-client" }
 zstd = "0.13"
 

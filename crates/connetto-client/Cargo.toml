@@ -45,6 +45,8 @@ native-auth = [
   "dep:apple-native-keyring-store",
   "dep:linux-keyutils-keyring-store",
   "dep:windows-native-keyring-store",
+  "dep:android-native-keyring-store",
+  "dep:webbrowser",
   "dep:open",
   "dep:getrandom",
 ]
@@ -66,7 +68,7 @@ diesel = { workspace = true, features = [
 ] }
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Counting ops in a captured changeset for the advisory MutationHeader op_count.
-sqlite-diff-rs = { version = "0.13", default-features = false }
+sqlite-diff-rs = { version = "0.14", default-features = false }
 # Bulk payloads ride the wire Zstd-compressed (connetto-core Q2.5).
 zstd = "0.13"
 # Extracting the table set of a live query from its rendered SQL, so the pump
@@ -117,7 +119,6 @@ reqwest = { version = "0.12", default-features = false, features = [
   "json",
 ], optional = true }
 keyring-core = { version = "1.0.0", optional = true }
-open = { version = "5.4", optional = true }
 # Reading the base64url payload of a grant the client already holds, so a share
 # key whose expiry has passed is not presented again. Unconditional and tiny:
 # the check has to hold on wasm too, where `native-auth` is never on.
@@ -152,6 +153,21 @@ linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", optional = true }
+
+# Every other native target launches the browser through `open`.
+[target.'cfg(not(any(target_os = "android", all(target_family = "wasm", target_os = "unknown"))))'.dependencies]
+open = { version = "5.4", optional = true }
+
+# Android: the Keystore-backed store of the same family, and `webbrowser`,
+# whose Android arm hands the sign-in URL to the browser app through the same
+# activity context. The NDK ships no OpenSSL headers, so SQLCipher builds its
+# own from source here.
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = { version = "1.0.0", optional = true }
+webbrowser = { version = "1.2", optional = true }
+libsqlite3-sys = { version = ">=0.38, <0.39", features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
 
 # Browser: the SQLite3 Multiple Ciphers amalgamation instead of vanilla SQLite,
 # in the same crate diesel already links on wasm, so one C library is built.
@@ -197,7 +213,7 @@ pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "
 # a `bool` column, the same key strategy the demos use, rather than raw bytes.
 # The native-auth test additionally serves it as the project's typed user id
 # across the token endpoint, which needs serde both ways.
-rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite", "serde"] }
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "serde"] }
 # The native-auth test serves connetto-server's auth router on a real port and
 # drives the browser round-trip with a redirect-following-disabled HTTP client.
 axum = "0.8"

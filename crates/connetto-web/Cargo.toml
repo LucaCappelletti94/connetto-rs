@@ -104,7 +104,7 @@ web-sys = { version = "0.3", features = [
 diesel-sqlite-session = { git = "https://github.com/LucaCappelletti94/diesel-sqlite-session" }
 # Routing live patches by table needs the patchset parser, and snapshot
 # payloads ride the wire zstd compressed like the server's snapshot leg.
-sqlite-diff-rs = { version = "0.13", default-features = false }
+sqlite-diff-rs = { version = "0.14", default-features = false }
 connetto-file-core = { path = "../connetto-file-core" }
 zstd = "0.13"
 # tokio::select! races the hub's channels against the upstream pump, and the
@@ -150,7 +150,7 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # UUID blob column, mirroring the server's session_id UUID primary key.
 # getrandom with the js feature (already present above) is what makes v4 mint
 # in a browser context.
-rosetta-uuid = { version = "0.1.3", features = ["serde", "sqlite"] }
+rosetta-uuid = { version = "0.2.0", features = ["serde", "sqlite"] }
 
 # The replica key store is exercised in a dedicated worker against real
 # IndexedDB and real WebCrypto, and the at-rest assertion reads the stored
