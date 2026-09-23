@@ -75,7 +75,8 @@ async fn main() -> Result<()> {
         device.serial,
         now_millis()
     ));
-    std::fs::create_dir_all(&evidence)
+    tokio::fs::create_dir_all(&evidence)
+        .await
         .with_context(|| format!("creating {}", evidence.display()))?;
     eprintln!("evidence in {}", evidence.display());
 
@@ -85,7 +86,9 @@ async fn main() -> Result<()> {
     device.set_browser_role_holder(BROWSER).await?;
     let outcome = prove(&device, apk, &stack, &evidence).await;
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
-    std::fs::write(evidence.join("logcat.txt"), log).context("writing the device log")?;
+    tokio::fs::write(evidence.join("logcat.txt"), log)
+        .await
+        .context("writing the device log")?;
     if let Err(err) = &outcome {
         let _ = device.screenshot(&evidence, "failure").await;
         eprintln!("proof failed: {err:#}");
@@ -497,7 +500,8 @@ impl Device {
             .output()
             .await
             .context("starting adb")?;
-        std::fs::write(dir.join(format!("{name}.png")), output.stdout)
+        tokio::fs::write(dir.join(format!("{name}.png")), output.stdout)
+            .await
             .context("writing a screenshot")
     }
 
