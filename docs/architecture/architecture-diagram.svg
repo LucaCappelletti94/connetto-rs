@@ -588,7 +588,7 @@
       <text x="315" y="34" text-anchor="middle" font-size="9" fill="#555">it logs in with a key it holds, as the app's bot user, and keeps that session across restarts</text>
       <text x="315" y="50" text-anchor="middle" font-size="9" fill="#555">it sees only the rows its installers shared with it, either one user at a time or all together</text>
       <text x="315" y="66" text-anchor="middle" font-size="9" fill="#555">its traffic is charged to the user it acts for, or to the developer's app allowance, never to the bot</text>
-      <text x="315" y="80" text-anchor="middle" font-size="9" fill="#555">its replica lives in memory, a durable one waits on Linux key custody, R71</text>
+      <text x="315" y="80" text-anchor="middle" font-size="9" fill="#555">its replica lives in memory, a durable one is R93, after R71's Linux key custody</text>
     </g>
   </g>
 
