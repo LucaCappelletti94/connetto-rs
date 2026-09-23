@@ -23,7 +23,8 @@
 //! - `CONNETTO_CONTENT_URL`, `CONNETTO_CONTENT_STORE`, `CONNETTO_CONTENT_KEY`:
 //!   file server settings; required for photo upload and signed-URL resolve.
 //!   The server must also list `photos` in `CONNETTO_WRITABLE`. Apply schema.sql,
-//!   `connetto_file_server::DEPLOYMENT_DDL`, roles.sql, content.sql in that order.
+//!   `connetto_file_server::DEPLOYMENT_DDL`, `connetto_server::epoch::EPOCH_DDL`,
+//!   roles.sql, content.sql in that order.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -291,7 +292,13 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx, Conten
             ReqwestHttp::new(),
         )
         .await
-        .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?,
+        .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?
+        .heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!("registering the lost-photo query: {err}"))?,
     );
     let cc_drive = Arc::clone(&content);
     tokio::spawn(async move { cc_drive.drive_outbox(TokioSleeper).await });
@@ -536,6 +543,12 @@ fn app() -> Element {
                     }
                     ContentEvent::Fetched { file_id } => {
                         content_status.set(format!("fetched {}", short_hex(file_id.as_bytes())));
+                    }
+                    ContentEvent::LostRequeued { file_id } => {
+                        content_status.set(format!(
+                            "re-uploading lost {}",
+                            short_hex(file_id.as_bytes())
+                        ));
                     }
                     ContentEvent::IntegrityPassFailed { detail } => {
                         content_status.set(format!("integrity check failed: {detail}"));

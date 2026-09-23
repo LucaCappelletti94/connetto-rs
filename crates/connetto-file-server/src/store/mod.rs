@@ -35,6 +35,15 @@ impl From<object_store::Error> for StoreError {
     }
 }
 
+/// One chunk a store holds, as the boot reconcile lists it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredChunk {
+    /// The chunk's hash, read back from its object name.
+    pub hash: ChunkHash,
+    /// When the store last wrote it, which the grace window is measured from.
+    pub modified: std::time::SystemTime,
+}
+
 /// Dynamic store backend for custom implementations.
 ///
 /// Implement this trait in test code to inject any behaviour (faults, latency,
@@ -64,6 +73,11 @@ pub trait CustomStore: Send + Sync + 'static {
         &'a self,
         hash: &'a ChunkHash,
     ) -> Pin<Box<dyn std::future::Future<Output = Result<(), StoreError>> + Send + 'a>>;
+
+    /// Every chunk the store holds.
+    fn list(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<StoredChunk>, StoreError>> + Send + '_>>;
 }
 
 /// Either storage backend, chosen at construction time.
@@ -159,6 +173,21 @@ impl AnyStore {
                 s.delete_chunk(hash).await
             }
             Self::Custom(s) => s.delete(hash).await,
+        }
+    }
+
+    /// Every chunk the store holds, a listing only the server's boot reconcile needs.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Io` when the `Fs` backend cannot read a directory or a file's metadata.
+    /// Returns `StoreError::Object` when the `Object` backend's listing fails.
+    /// Propagates whatever `StoreError` the `Custom` backend returns.
+    pub async fn list(&self) -> Result<Vec<StoredChunk>, StoreError> {
+        match self {
+            Self::Fs(s) => s.list().await,
+            Self::Object(s) => s.list().await,
+            Self::Custom(s) => s.list().await,
         }
     }
 

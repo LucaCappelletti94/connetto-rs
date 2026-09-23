@@ -150,6 +150,8 @@ pub struct DbWorkerConfig {
     pub(crate) hub_meta_name: &'static str,
     /// Seed for account-isolated browser content storage.
     pub(crate) content_namespace: Option<&'static str>,
+    /// `(query, file_id_column)` pairs naming files the server marked lost.
+    pub(crate) content_heal_lost: Vec<(&'static str, &'static str)>,
     /// The transport every content transfer runs under, carrying the idle bound.
     pub(crate) content_http: connetto_file_client::BrowserHttp,
     /// Broadcast channel opening the first upstream connect attempt.
@@ -207,6 +209,7 @@ impl DbWorkerConfig {
             extra_upstream: Vec::new(),
             hub_meta_name: "",
             content_namespace: None,
+            content_heal_lost: Vec::new(),
             content_http: connetto_file_client::BrowserHttp::new(),
             connect_gate: None,
             schema_version,
@@ -281,6 +284,20 @@ impl DbWorkerConfig {
     #[must_use]
     pub fn with_content_namespace(mut self, namespace: &'static str) -> Self {
         self.content_namespace = Some(namespace);
+        self
+    }
+
+    /// Upload again every file `query` names in `file_id_column` that this device holds.
+    ///
+    /// The browser half of [`connetto_file_client::ContentClient::heal_lost`], for
+    /// example `SELECT content_id FROM photos WHERE content_state = 'lost'`.
+    #[must_use]
+    pub fn with_content_heal_lost(
+        mut self,
+        query: &'static str,
+        file_id_column: &'static str,
+    ) -> Self {
+        self.content_heal_lost.push((query, file_id_column));
         self
     }
 

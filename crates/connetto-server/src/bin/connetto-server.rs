@@ -117,6 +117,7 @@ use connetto_file_server::{
 };
 use connetto_server::CallerMappings;
 use connetto_server::audit::pg_audit_hook;
+use connetto_server::epoch::{self, Epoch, Found};
 use connetto_server::openfga::{Counted, FgaAuth, ModelState, ModelSubject, Translated};
 use connetto_server::reach::GrantReach;
 use connetto_server::{
@@ -125,7 +126,7 @@ use connetto_server::{
     Materializer, OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource,
     ProviderRegistry, ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
     RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog,
-    SessionConfig, SessionError, SessionManager, ThrottleConfig, TokenAuthority,
+    SessionConfig, SessionError, SessionManager, StreamCheck, ThrottleConfig, TokenAuthority,
     WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
     connetto_ban_table, connetto_watermark_table, is_loopback_host, pg_ban_store, pg_write_target,
     preflight,
@@ -225,6 +226,13 @@ impl AuthStore for ServerStore {
         match self {
             Self::InMemory(store) => store.revoke_session(session_id).await,
             Self::Db(store) => store.revoke_session(session_id).await,
+        }
+    }
+
+    async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.revoke_every_session().await,
+            Self::Db(store) => store.revoke_every_session().await,
         }
     }
 
@@ -726,6 +734,21 @@ async fn build_content(
     })
     .await
     .map_err(|err| anyhow!("content preflight: {err}"))?;
+    let reconciled = files::reconcile_store::<DefaultFileSchema>(
+        &admin,
+        &open_store(&spec)?,
+        &files::CallerSettings::default(),
+        settings.grace,
+    )
+    .await
+    .map_err(|err| anyhow!("reconciling the chunk store with the database: {err}"))?;
+    if reconciled.orphans_removed > 0 || !reconciled.lost.is_empty() {
+        tracing::warn!(
+            orphans_removed = reconciled.orphans_removed,
+            lost = reconciled.lost.len(),
+            "the chunk store and the database disagreed, reconciled before serving",
+        );
+    }
     spawn_sweep(admin, spec, settings.grace, settings.cadence);
     tracing::info!(
         base = %settings.base_url,
@@ -1168,6 +1191,14 @@ async fn main() -> Result<()> {
             });
         }));
     }
+    // A restore rewinds the session store with the rows, so the cluster and the
+    // slot are settled before either listener opens (R70 decisions 5 and 10).
+    preflight::require(&pool, &[Artifact::Table(epoch::EPOCH_TABLE)]).await?;
+    let check = manager
+        .check_before_stream(&database_url, &pool, &slot)
+        .await
+        .map_err(|err| anyhow!("settling the change feed before serving: {err}"))?;
+    settle_epoch(&manager, &service, &pool, check, Found::AtBoot).await?;
     let cookie_same_site =
         CookieSameSite::parse(&var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")).ok_or_else(
             || {
@@ -1188,11 +1219,14 @@ async fn main() -> Result<()> {
     );
     run(
         &manager,
+        &service,
         &pool,
-        &database_url,
-        &slot,
-        &publication,
-        &pg_ddl,
+        FeedSource {
+            database_url: &database_url,
+            slot: &slot,
+            publication: &publication,
+            pg_ddl: &pg_ddl,
+        },
         &bind,
     )
     .await
@@ -1463,29 +1497,74 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
     }
 }
 
+/// Revoke every login session when the feed reads from another cluster, or at boot when the slot resumed past the reconnect log, then record the cluster and trim the log (R70 decisions 5, 10 and 18).
+async fn settle_epoch(
+    manager: &ServerManager,
+    service: &AuthService<ServerStore>,
+    pool: &Pool<AsyncPgConnection>,
+    check: StreamCheck,
+    found: Found,
+) -> Result<()> {
+    let settled = epoch::compare(pool, check.system)
+        .await
+        .map_err(|err| anyhow!("reading the recorded cluster: {err}"))?;
+    if let Some(cause) = epoch::revocation(settled, check, found) {
+        let revoked = service
+            .revoke_every_session()
+            .await
+            .map_err(|err| anyhow!("revoking every session after a restore: {err}"))?;
+        tracing::error!(
+        revoked,
+        cause = %cause,
+        "the database was restored or replaced, so every login session was revoked \
+         and each device logs in again"
+        );
+    }
+    // Recorded and trimmed only once the revocation held, so a failure meets the same restore on the next try.
+    if settled != Epoch::Same {
+        epoch::record(pool, check.system)
+            .await
+            .map_err(|err| anyhow!("recording the database's cluster: {err}"))?;
+    }
+    if let Some(resume) = check.gap {
+        manager
+            .reconcile_stream(resume)
+            .await
+            .map_err(|err| anyhow!("trimming the reconnect log past a gap: {err}"))?;
+    }
+    Ok(())
+}
+
+/// Where the change feed reads from.
+struct FeedSource<'a> {
+    database_url: &'a str,
+    slot: &'a str,
+    publication: &'a str,
+    pg_ddl: &'a str,
+}
+
 /// Start CDC ingestion and serve connections until the listener fails or a
 /// shutdown signal arrives.
 async fn run(
     manager: &Arc<ServerManager>,
+    service: &Arc<AuthService<ServerStore>>,
     pool: &Pool<AsyncPgConnection>,
-    database_url: &str,
-    slot: &str,
-    publication: &str,
-    pg_ddl: &str,
+    feed: FeedSource<'_>,
     bind: &str,
 ) -> Result<()> {
+    let FeedSource {
+        database_url,
+        slot,
+        publication,
+        pg_ddl,
+    } = feed;
     // Fail fast on a bad catalog DDL; the reconnect loop rebuilds the catalog
     // per connect and must not spin on a deterministic parse error.
     ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
-    // Read before serving so the first cursor issued already carries the timeline.
-    let history = connetto_server::timeline::read_history(database_url)
-        .await
-        .map_err(|err| anyhow!("reading the timeline history: {err}"))?;
-    manager.reconcile_history(history).await;
-
     let ingest_manager = manager.clone();
     let gap_manager = manager.clone();
+    let gap_service = service.clone();
     let gap_pool = pool.clone();
     let url = database_url.to_owned();
     let slot = slot.to_owned();
@@ -1498,14 +1577,16 @@ async fn run(
         let connect = || {
             let (url, slot, publication, ddl) =
                 (url.clone(), slot.clone(), publication.clone(), ddl.clone());
-            let (pool, manager) = (gap_pool.clone(), gap_manager.clone());
+            let (pool, manager, service) =
+                (gap_pool.clone(), gap_manager.clone(), gap_service.clone());
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
                     .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
-                manager
-                    .reconcile_before_stream(&url, &pool, &slot)
+                let check = manager
+                    .check_before_stream(&url, &pool, &slot)
                     .await
                     .map_err(|err| anyhow!("{err}"))?;
+                settle_epoch(&manager, &service, &pool, check, Found::WhileRunning).await?;
                 let config = PgStreamingConfig::new(url, slot, publication);
                 PgStreamingCdcSource::connect(config, catalog)
                     .await

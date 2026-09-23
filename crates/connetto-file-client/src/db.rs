@@ -39,19 +39,14 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// One row per file this device authored and has not yet uploaded.
-    ///
-    /// Presence here is what makes content unsent rather than cached, which
-    /// is the distinction chapter 18 draws: unsent content is data and cannot
-    /// be refetched, fetched content is cache. A non-null `refused` column
-    /// means a permanent error was recorded and the entry waits for an
-    /// explicit retry; it is still counted as unsent by `outbox` and
-    /// `outbox_count` and excluded from `sendable`.
+    /// One row per file this device must upload, authored here or healing a file the server lost, and `outbox` and `outbox_count` read only the authored rows.
     _connetto_content_outbox (file_id) {
         /// BLAKE3 identity of the file awaiting upload.
         file_id -> Binary,
         /// Permanent refusal detail, set when no later attempt can succeed.
         refused -> Nullable<Text>,
+        /// Whether the entry heals a file the server lost rather than sending one this device authored.
+        heal -> Bool,
     }
 }
 
@@ -86,23 +81,34 @@ pub(crate) const CONTENT_DDL: &str = "\
     (file_id BLOB NOT NULL, ordinal INTEGER NOT NULL, hash BLOB NOT NULL, \
      len BIGINT NOT NULL, PRIMARY KEY (file_id, ordinal)); \
     CREATE TABLE IF NOT EXISTS _connetto_content_outbox \
-    (file_id BLOB NOT NULL PRIMARY KEY, refused TEXT); \
+    (file_id BLOB NOT NULL PRIMARY KEY, refused TEXT, heal BOOLEAN NOT NULL DEFAULT FALSE); \
     CREATE TABLE IF NOT EXISTS _connetto_content_retired \
     (file_id BLOB NOT NULL PRIMARY KEY); \
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
     (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL)";
 
-/// Adds the `refused` column to an existing outbox table that predates it.
+/// Adds the `refused` and `heal` columns to an existing outbox table that predates them.
 ///
-/// Run as a separate statement after `CONTENT_DDL` because `batch_execute`
-/// aborts the whole batch on the first error, and this statement is expected
+/// Run as separate statements after `CONTENT_DDL` because `batch_execute`
+/// aborts the whole batch on the first error, and each statement is expected
 /// to fail with a duplicate-column error on replicas that already have it.
 ///
 /// # Errors
 ///
 /// [`diesel::result::Error`] for any error other than a duplicate-column name.
-pub(crate) fn add_refused_column(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
-    match conn.batch_execute("ALTER TABLE _connetto_content_outbox ADD COLUMN refused TEXT") {
+pub(crate) fn add_outbox_columns(conn: &mut SqliteConnection) -> Result<(), diesel::result::Error> {
+    add_column(
+        conn,
+        "ALTER TABLE _connetto_content_outbox ADD COLUMN refused TEXT",
+    )?;
+    add_column(
+        conn,
+        "ALTER TABLE _connetto_content_outbox ADD COLUMN heal BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+}
+
+fn add_column(conn: &mut SqliteConnection, statement: &str) -> Result<(), diesel::result::Error> {
+    match conn.batch_execute(statement) {
         Ok(()) => Ok(()),
         Err(diesel::result::Error::DatabaseError(_, ref info))
             if info.message().contains("duplicate column name") =>
@@ -215,6 +221,44 @@ pub(crate) fn referenced_hashes(
         .collect()
 }
 
+/// Records that this device holds a file the server lost and should upload it again.
+pub(crate) fn enqueue_heal(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    diesel::insert_or_ignore_into(_connetto_content_outbox::table)
+        .values((
+            _connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()),
+            _connetto_content_outbox::heal.eq(true),
+        ))
+        .execute(conn)
+        .map(|_| ())
+}
+
+/// Every heal entry in the outbox.
+pub(crate) fn heal_entries(conn: &mut SqliteConnection) -> Result<Vec<FileId>, ContentError> {
+    let rows: Vec<Vec<u8>> = _connetto_content_outbox::table
+        .filter(_connetto_content_outbox::heal.eq(true))
+        .select(_connetto_content_outbox::file_id)
+        .load(conn)?;
+    rows.into_iter()
+        .map(|id| Ok(FileId::from_bytes(exactly_32(&id)?)))
+        .collect()
+}
+
+/// Whether this file's outbox entry is a heal.
+pub(crate) fn is_heal(
+    conn: &mut SqliteConnection,
+    file_id: FileId,
+) -> Result<bool, diesel::result::Error> {
+    _connetto_content_outbox::table
+        .filter(_connetto_content_outbox::file_id.eq(file_id.as_bytes().to_vec()))
+        .filter(_connetto_content_outbox::heal.eq(true))
+        .count()
+        .get_result::<i64>(conn)
+        .map(|n| n > 0)
+}
+
 /// Records that a file is authored here and not yet uploaded.
 pub(crate) fn enqueue(
     conn: &mut SqliteConnection,
@@ -270,9 +314,10 @@ pub(crate) fn forget_retired(
         .map(|_| ())
 }
 
-/// Every file awaiting upload, oldest identity first for a stable walk order.
+/// Every authored file awaiting upload, oldest identity first for a stable walk order.
 pub(crate) fn outbox(conn: &mut SqliteConnection) -> Result<Vec<FileId>, ContentError> {
     let rows: Vec<Vec<u8>> = _connetto_content_outbox::table
+        .filter(_connetto_content_outbox::heal.eq(false))
         .order(_connetto_content_outbox::file_id.asc())
         .select(_connetto_content_outbox::file_id)
         .load(conn)?;
@@ -281,9 +326,10 @@ pub(crate) fn outbox(conn: &mut SqliteConnection) -> Result<Vec<FileId>, Content
         .collect()
 }
 
-/// Number of files waiting for upload.
+/// Number of authored files waiting for upload.
 pub(crate) fn outbox_count(conn: &mut SqliteConnection) -> Result<u64, ContentError> {
     let count = _connetto_content_outbox::table
+        .filter(_connetto_content_outbox::heal.eq(false))
         .count()
         .get_result::<i64>(conn)?;
     Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))

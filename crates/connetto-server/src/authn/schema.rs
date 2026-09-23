@@ -155,6 +155,8 @@ where
     /// The whole opaque `UPDATE sessions SET revoked = true WHERE session_id = ?`
     /// statement.
     type RevokeUpdate: QueryFragment<Pg> + QueryId + Send;
+    /// The whole opaque `UPDATE sessions SET revoked = true WHERE NOT revoked` statement.
+    type RevokeEveryUpdate: QueryFragment<Pg> + QueryId + Send;
 
     /// Build the `sessions.session_id = ?` predicate.
     fn session_pk(session_id: SessionId) -> Self::SessionPk;
@@ -168,6 +170,8 @@ where
     ) -> Self::RotationUpdate;
     /// Build the revoke UPDATE statement (`revoked = true`).
     fn revoke_update(session_id: SessionId) -> Self::RevokeUpdate;
+    /// Build the UPDATE revoking every session still live.
+    fn revoke_every_update() -> Self::RevokeEveryUpdate;
 
     /// Build the insertable new-sessions row. The store cannot name a developer
     /// struct's fields, so it hands the column values here.
@@ -348,6 +352,13 @@ macro_rules! connetto_auth_tables {
                 >,
                 diesel::dsl::Eq<connetto_sessions::revoked, bool>,
             >;
+            type RevokeEveryUpdate = diesel::helper_types::Update<
+                diesel::helper_types::Filter<
+                    connetto_sessions::table,
+                    diesel::dsl::Eq<connetto_sessions::revoked, bool>,
+                >,
+                diesel::dsl::Eq<connetto_sessions::revoked, bool>,
+            >;
 
             fn session_pk(session_id: $crate::SessionId) -> Self::SessionPk {
                 use diesel::ExpressionMethods as _;
@@ -389,6 +400,14 @@ macro_rules! connetto_auth_tables {
                 diesel::update(diesel::QueryDsl::filter(
                     connetto_sessions::table,
                     connetto_sessions::session_id.eq(session_id),
+                ))
+                .set(connetto_sessions::revoked.eq(true))
+            }
+            fn revoke_every_update() -> Self::RevokeEveryUpdate {
+                use diesel::ExpressionMethods as _;
+                diesel::update(diesel::QueryDsl::filter(
+                    connetto_sessions::table,
+                    connetto_sessions::revoked.eq(false),
                 ))
                 .set(connetto_sessions::revoked.eq(true))
             }

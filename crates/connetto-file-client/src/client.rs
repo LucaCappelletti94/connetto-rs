@@ -74,6 +74,11 @@ pub enum ContentEvent {
         /// How many of its chunks could not be read.
         unreadable: usize,
     },
+    /// A file the server marked lost went back in the outbox, since this device holds its bytes.
+    LostRequeued {
+        /// The file queued again.
+        file_id: FileId,
+    },
     /// A pinned file's bytes arrived and are now local.
     Fetched {
         /// The file now held locally.
@@ -115,6 +120,8 @@ pub struct ContentClient<T: Transport, B: ChunkStore + Clone, H: ContentHttp> {
     /// Signalled when an import commits or when a refusal is cleared, waking
     /// `drive_outbox` without a replica mutation or a reconnect.
     outbox_wake: tokio::sync::Notify,
+    /// The application's `(query, file_id_column)` pairs naming files the server marked lost.
+    heal_queries: Vec<(String, String)>,
 }
 
 impl<T, B, H> ContentClient<T, B, H>
@@ -145,7 +152,7 @@ where
         client
             .with_conn(|conn| {
                 conn.batch_execute(db::CONTENT_DDL)?;
-                db::add_refused_column(conn.conn())
+                db::add_outbox_columns(conn.conn())
             })
             .await?;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
@@ -159,6 +166,7 @@ where
             events,
             content_writes: tokio::sync::Mutex::new(()),
             outbox_wake: tokio::sync::Notify::new(),
+            heal_queries: Vec::new(),
         })
     }
 
@@ -229,6 +237,60 @@ where
     pub fn with_source(mut self, source: BoxedSource) -> Self {
         self.sources.push(source);
         self
+    }
+
+    /// Uploads again from this device every file `query` names in `file_id_column` that it holds.
+    ///
+    /// The query reads the application's own tables, where the server's setter
+    /// writes `lost`, for example
+    /// `SELECT content_id FROM photos WHERE content_state = 'lost'`. Each time
+    /// [`drive_outbox`](Self::drive_outbox) wakes, a named file this device
+    /// holds is put back in the outbox and uploads like any unsent file.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::HealColumnMissing`] when the query does not return the named column.
+    pub async fn heal_lost(
+        mut self,
+        query: &str,
+        file_id_column: &str,
+    ) -> Result<Self, ContentError> {
+        let (probe, column) = (query.to_owned(), file_id_column.to_owned());
+        if !self
+            .client
+            .with_conn(move |conn| crate::retain::answers_column(conn.conn(), &probe, &column))
+            .await
+        {
+            return Err(ContentError::HealColumnMissing {
+                query: query.to_owned(),
+                column: file_id_column.to_owned(),
+            });
+        }
+        self.heal_queries
+            .push((query.to_owned(), file_id_column.to_owned()));
+        Ok(self)
+    }
+
+    /// Puts back in the outbox every file a [`heal_lost`](Self::heal_lost) query names and this device holds.
+    ///
+    /// # Errors
+    ///
+    /// [`ContentError::Replica`] when a query or the bookkeeping cannot be read or written.
+    pub async fn queue_lost_files(&self) -> Result<Vec<FileId>, ContentError> {
+        if self.heal_queries.is_empty() {
+            return Ok(Vec::new());
+        }
+        let queries = self.heal_queries.clone();
+        let queued = self
+            .client
+            .with_conn(move |conn| crate::retain::queue_lost(conn.conn(), &queries))
+            .await?;
+        for file_id in &queued {
+            let _ = self
+                .events
+                .send(ContentEvent::LostRequeued { file_id: *file_id });
+        }
+        Ok(queued)
     }
 
     /// Observe what the content client does. Lagging receivers drop the oldest
@@ -448,13 +510,19 @@ where
                     // identical whichever pass reached the fact first.
                     AttemptOutcome::Lost => match self.unreadable_chunks(file_id).await? {
                         Some(unreadable) => {
+                            let heal = self
+                                .client
+                                .with_conn(move |conn| db::is_heal(conn.conn(), file_id))
+                                .await?;
                             self.client
                                 .with_conn(move |conn| retire(conn.conn(), file_id))
                                 .await?;
-                            let _ = self.events.send(ContentEvent::BytesLost {
-                                file_id,
-                                unreadable,
-                            });
+                            if !heal {
+                                let _ = self.events.send(ContentEvent::BytesLost {
+                                    file_id,
+                                    unreadable,
+                                });
+                            }
                         }
                         None => {
                             let _ = self.events.send(ContentEvent::UploadDeferred {
@@ -481,61 +549,6 @@ where
             ticket::request(&self.client, file_id, ContentVerb::Write { declared_len }).await?;
         let store = self.store_for(FETCHED_CLASS);
         upload::upload(&self.http, &url, &manifest, &store).await
-    }
-
-    /// The outbox driver: the boot integrity pass, then a walk whenever one
-    /// could get further than the last.
-    ///
-    /// Returned as a future rather than spawned, the same shape
-    /// [`ConnettoClient::with_pump`] uses, so the caller decides which
-    /// executor drives it. It ends when the client's event stream ends, which
-    /// is when the last client clone drops.
-    ///
-    /// A reconnect is not the only thing that unblocks a walk, and treating it
-    /// as the only one leaves offline content pending forever. The ordinary
-    /// case says so: a write ticket is refused for a file the deployment
-    /// cannot see yet, and what makes it visible is the entry row landing, on
-    /// a connection that never dropped. A saturated upload window clears the
-    /// same way. So while anything is still queued this backs off and walks
-    /// again under `sleeper`, and while the outbox is empty it costs nothing,
-    /// waiting on the event stream instead.
-    pub async fn drive_outbox<S: Sleeper>(&self, mut sleeper: S) {
-        let policy = ReconnectPolicy::default();
-        let mut events = self.client.events();
-        if let Err(err) = self.verify_unsent().await {
-            let _ = self.events.send(ContentEvent::IntegrityPassFailed {
-                detail: err.to_string(),
-            });
-        }
-        let mut attempt: u32 = 0;
-        loop {
-            let _ = self.flush_outbox().await;
-            let queued = self
-                .client
-                .with_conn(|conn| db::sendable(conn.conn()))
-                .await
-                .is_ok_and(|waiting| !waiting.is_empty());
-            if queued {
-                attempt = attempt.saturating_add(1);
-                sleeper.sleep(policy.backoff(attempt)).await;
-                continue;
-            }
-            attempt = 0;
-            loop {
-                tokio::select! {
-                    () = self.outbox_wake.notified() => break,
-                    result = events.recv() => match result {
-                        Ok(
-                            ClientEvent::Reconnected
-                            | ClientEvent::SyncStatus(SyncStatus::Connected)
-                            | ClientEvent::MutationApplied { .. },
-                        ) => break,
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => return,
-                    }
-                }
-            }
-        }
     }
 
     /// Where this file's bytes are to be had, for display.
@@ -647,22 +660,12 @@ where
         query: &str,
         file_id_column: &str,
     ) -> Result<(), ContentError> {
-        if file_id_column.contains(['[', ']']) {
-            return Err(ContentError::PinColumnMissing {
-                name: name.to_owned(),
-                column: file_id_column.to_owned(),
-            });
-        }
-        let probe = crate::retain::pin_sql(query, file_id_column);
         let name = name.to_owned();
         let query = query.to_owned();
         let column = file_id_column.to_owned();
         self.client
             .with_conn(move |conn| {
-                if diesel::sql_query(format!("{probe} LIMIT 0"))
-                    .execute(conn.conn())
-                    .is_err()
-                {
+                if !crate::retain::answers_column(conn.conn(), &query, &column) {
                     return Err(ContentError::PinColumnMissing { name, column });
                 }
                 conn.transact_with_bookkeeping(
@@ -794,6 +797,72 @@ where
     B: ChunkInventory + Clone + Sync + MaybeSend + 'static,
     H: ContentHttp,
 {
+    /// The outbox driver: the boot integrity pass, then a walk whenever one
+    /// could get further than the last, then [`tidy_content`](Self::tidy_content)
+    /// after each walk that sent a file.
+    ///
+    /// Returned as a future rather than spawned, the same shape
+    /// [`ConnettoClient::with_pump`] uses, so the caller decides which
+    /// executor drives it. It ends when the client's event stream ends, which
+    /// is when the last client clone drops.
+    ///
+    /// A reconnect is not the only thing that unblocks a walk, and treating it
+    /// as the only one leaves offline content pending forever. The ordinary
+    /// case says so: a write ticket is refused for a file the deployment
+    /// cannot see yet, and what makes it visible is the entry row landing, on
+    /// a connection that never dropped. A saturated upload window clears the
+    /// same way. So while anything is still queued this backs off and walks
+    /// again under `sleeper`, and while the outbox is empty it costs nothing,
+    /// waiting on the event stream instead.
+    pub async fn drive_outbox<S: Sleeper>(&self, mut sleeper: S) {
+        let policy = ReconnectPolicy::default();
+        let mut events = self.client.events();
+        if let Err(err) = self.verify_unsent().await {
+            let _ = self.events.send(ContentEvent::IntegrityPassFailed {
+                detail: err.to_string(),
+            });
+        }
+        let mut attempt: u32 = 0;
+        loop {
+            let _ = self.queue_lost_files().await;
+            // The same release the browser worker runs after an upload, so both keep one rule.
+            if self.flush_outbox().await.is_ok_and(|sent| sent > 0) {
+                let _ = self.tidy_content().await;
+            }
+            let queued = self
+                .client
+                .with_conn(|conn| db::sendable(conn.conn()))
+                .await
+                .is_ok_and(|waiting| !waiting.is_empty());
+            if queued {
+                attempt = attempt.saturating_add(1);
+                sleeper.sleep(policy.backoff(attempt)).await;
+                continue;
+            }
+            attempt = 0;
+            loop {
+                tokio::select! {
+                    () = self.outbox_wake.notified() => break,
+                    result = events.recv() => match result {
+                        Ok(
+                            ClientEvent::Reconnected
+                            | ClientEvent::SyncStatus(SyncStatus::Connected)
+                            | ClientEvent::MutationApplied { .. },
+                        ) => break,
+                        // A `lost` flip arrives as an ordinary row change.
+                        Ok(
+                            ClientEvent::LivePatch { .. }
+                            | ClientEvent::SnapshotEnd { .. }
+                            | ClientEvent::FullResync { .. },
+                        ) if !self.heal_queries.is_empty() => break,
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(broadcast::error::RecvError::Closed) => return,
+                    }
+                }
+            }
+        }
+    }
+
     /// Reclaims the disk every byte nothing wants is holding.
     ///
     /// The byte-level mirror of R15's `tidy`, and application-callable for the

@@ -20,7 +20,7 @@ use connetto_core::Cursor;
 use connetto_core::messages::{BulkMessage, ControlMessage, LivePatch};
 use connetto_core::traits::Transport;
 use connetto_core::transport::{LoopbackTransport, loopback};
-use connetto_server::Position;
+use connetto_server::{Position, TimelineHistory};
 use connetto_test_harness::Client;
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{
@@ -284,7 +284,14 @@ fn position_of(cursor: &Cursor) -> u64 {
 
 /// The wire cursor of `lsn` on a database never promoted.
 fn cursor_at(lsn: u64) -> Cursor {
-    Cursor::new(Position { timeline: 1, lsn }.to_cursor_bytes())
+    Cursor::new(
+        Position {
+            system: TimelineHistory::default().system(),
+            timeline: 1,
+            lsn,
+        }
+        .to_cursor_bytes(),
+    )
 }
 
 /// A patchset's operations, one verb and a key each, for a refusal to name.

@@ -912,6 +912,8 @@ dependencies = [
  "anyhow",
  "axum",
  "connetto-core",
+ "connetto-file-core",
+ "connetto-file-server",
  "connetto-server",
  "diesel",
  "diesel-async",

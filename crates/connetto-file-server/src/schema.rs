@@ -308,7 +308,7 @@ where
     fn delete_registry_row_stmt(hash: Vec<u8>)
     -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 
-    /// Build `DELETE FROM manifests WHERE NOT committed AND created_at < cutoff RETURNING file_id`.
+    /// Build `DELETE FROM manifests WHERE NOT committed AND NOT lost AND created_at < cutoff RETURNING file_id`.
     ///
     /// The `RETURNING` clause is the reason this returns a loadable type: the
     /// DELETE and the file-id collection must be atomic, which rules out a
@@ -337,6 +337,75 @@ where
     fn any_committed_manifest_caller_stmt(
         file_id: Vec<u8>,
     ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+
+    /// Build `SELECT chunk_hash, state FROM chunk_registry`, every row.
+    fn registry_rows_stmt()
+    -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String)> + Send + 'static;
+
+    /// Build `SELECT file_id, uploaded_by, chunk_len FROM manifest_chunks
+    /// WHERE chunk_hash = ANY(hashes) AND stored` over the rows whose manifest
+    /// is committed or already lost.
+    fn stored_rows_naming_stmt(
+        hashes: Vec<Vec<u8>>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, (Vec<u8>, String, i64)> + Send + 'static;
+
+    /// Build `UPDATE manifests SET committed = FALSE, lost = TRUE,
+    /// accepted_bytes = accepted_bytes - missing WHERE file_id = ? AND uploaded_by = ?`.
+    fn mark_manifest_lost_stmt(
+        file_id: Vec<u8>,
+        caller: String,
+        missing: i64,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
+    /// Build `UPDATE manifest_chunks SET stored = FALSE WHERE file_id = ? AND
+    /// uploaded_by = ? AND chunk_hash = ANY(hashes)`.
+    fn unstore_manifest_chunks_stmt(
+        file_id: Vec<u8>,
+        caller: String,
+        hashes: Vec<Vec<u8>>,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
+    /// Build `UPDATE manifest_chunks SET stored = FALSE WHERE chunk_hash = ANY(hashes)`,
+    /// for the rows of uploads still in flight.
+    fn unstore_chunks_stmt(
+        hashes: Vec<Vec<u8>>,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
+    /// Build `UPDATE chunk_registry SET state = 'pending' WHERE chunk_hash = ANY(hashes)
+    /// AND state = 'stored'`.
+    fn mark_registry_pending_stmt(
+        hashes: Vec<Vec<u8>>,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
+    /// Build `SELECT uploaded_by FROM manifests WHERE file_id = ? AND lost FOR UPDATE`.
+    fn lost_manifest_callers_stmt(
+        file_id: Vec<u8>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+
+    /// Build `UPDATE manifest_chunks SET stored = TRUE WHERE file_id = ?` over
+    /// the rows of the file's lost manifests.
+    fn restore_lost_chunks_stmt(
+        file_id: Vec<u8>,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
+    /// Build `UPDATE manifests SET committed = TRUE, lost = FALSE WHERE
+    /// file_id = ? AND lost RETURNING uploaded_by`.
+    fn restore_lost_manifests_stmt(
+        file_id: Vec<u8>,
+    ) -> impl for<'q> AsyncLoadQuery<'q, AsyncPgConnection, String> + Send + 'static;
+
+    /// Build `DELETE FROM manifest_chunks WHERE file_id = ? AND uploaded_by = ?`.
+    fn delete_manifest_chunks_stmt(
+        file_id: Vec<u8>,
+        caller: String,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
+
+    /// Build `DELETE FROM manifests WHERE file_id = ? AND uploaded_by = ?`,
+    /// its chunk rows following through the cascade.
+    fn delete_manifest_stmt(
+        file_id: Vec<u8>,
+        caller: String,
+    ) -> impl QueryFragment<Pg> + QueryId + Send + 'static;
 }
 
 /// Generate the file-server tables and their [`ConnettoFileSchema`] impl
@@ -370,6 +439,8 @@ macro_rules! connetto_file_tables {
                 uploaded_by -> diesel::sql_types::Text,
                 /// When the intent was declared, read by the sweep grace window.
                 created_at -> diesel::sql_types::Timestamptz,
+                /// Set at boot when the store lost chunks this manifest names, until a re-upload.
+                lost -> diesel::sql_types::Bool,
             }
         }
 
@@ -795,8 +866,11 @@ macro_rules! connetto_file_tables {
             + 'static {
                 diesel::delete(diesel::QueryDsl::filter(
                     diesel::QueryDsl::filter(
-                        $manifests::table,
-                        diesel::ExpressionMethods::eq($manifests::committed, false),
+                        diesel::QueryDsl::filter(
+                            $manifests::table,
+                            diesel::ExpressionMethods::eq($manifests::committed, false),
+                        ),
+                        diesel::ExpressionMethods::eq($manifests::lost, false),
                     ),
                     diesel::ExpressionMethods::lt($manifests::created_at, cutoff),
                 ))
@@ -849,6 +923,241 @@ macro_rules! connetto_file_tables {
                     ),
                     $manifests::uploaded_by,
                 )
+            }
+            fn registry_rows_stmt() -> impl for<'q> diesel_async::methods::LoadQuery<
+                'q,
+                diesel_async::AsyncPgConnection,
+                (Vec<u8>, String),
+            > + Send
+            + 'static {
+                diesel::QueryDsl::select(
+                    $chunk_registry::table,
+                    ($chunk_registry::chunk_hash, $chunk_registry::state),
+                )
+            }
+            fn stored_rows_naming_stmt(
+                hashes: Vec<Vec<u8>>,
+            ) -> impl for<'q> diesel_async::methods::LoadQuery<
+                'q,
+                diesel_async::AsyncPgConnection,
+                (Vec<u8>, String, i64),
+            > + Send
+            + 'static {
+                diesel::QueryDsl::select(
+                    diesel::QueryDsl::filter(
+                        diesel::QueryDsl::filter(
+                            diesel::QueryDsl::filter(
+                                $manifest_chunks::table,
+                                diesel::ExpressionMethods::eq_any(
+                                    $manifest_chunks::chunk_hash,
+                                    hashes,
+                                ),
+                            ),
+                            diesel::ExpressionMethods::eq($manifest_chunks::stored, true),
+                        ),
+                        diesel::dsl::exists(diesel::QueryDsl::select(
+                            diesel::QueryDsl::filter(
+                                diesel::QueryDsl::filter(
+                                    diesel::QueryDsl::filter(
+                                        $manifests::table,
+                                        diesel::ExpressionMethods::eq(
+                                            $manifests::file_id,
+                                            $manifest_chunks::file_id,
+                                        ),
+                                    ),
+                                    diesel::ExpressionMethods::eq(
+                                        $manifests::uploaded_by,
+                                        $manifest_chunks::uploaded_by,
+                                    ),
+                                ),
+                                diesel::BoolExpressionMethods::or(
+                                    diesel::ExpressionMethods::eq($manifests::committed, true),
+                                    diesel::ExpressionMethods::eq($manifests::lost, true),
+                                ),
+                            ),
+                            $manifests::file_id,
+                        )),
+                    ),
+                    (
+                        $manifest_chunks::file_id,
+                        $manifest_chunks::uploaded_by,
+                        $manifest_chunks::chunk_len,
+                    ),
+                )
+            }
+            fn mark_manifest_lost_stmt(
+                file_id: Vec<u8>,
+                caller: String,
+                missing: i64,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::update(diesel::QueryDsl::filter(
+                    $manifests::table,
+                    Self::manifest_pk_eq(file_id, caller),
+                ))
+                .set((
+                    diesel::ExpressionMethods::eq($manifests::committed, false),
+                    diesel::ExpressionMethods::eq($manifests::lost, true),
+                    diesel::ExpressionMethods::eq(
+                        $manifests::accepted_bytes,
+                        $manifests::accepted_bytes - missing,
+                    ),
+                ))
+            }
+            fn unstore_manifest_chunks_stmt(
+                file_id: Vec<u8>,
+                caller: String,
+                hashes: Vec<Vec<u8>>,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $manifest_chunks::table,
+                        Self::mc_pk_eq(file_id, caller),
+                    ),
+                    diesel::ExpressionMethods::eq_any($manifest_chunks::chunk_hash, hashes),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $manifest_chunks::stored,
+                    false,
+                ))
+            }
+            fn unstore_chunks_stmt(
+                hashes: Vec<Vec<u8>>,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::update(diesel::QueryDsl::filter(
+                    $manifest_chunks::table,
+                    diesel::ExpressionMethods::eq_any($manifest_chunks::chunk_hash, hashes),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $manifest_chunks::stored,
+                    false,
+                ))
+            }
+            fn mark_registry_pending_stmt(
+                hashes: Vec<Vec<u8>>,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $chunk_registry::table,
+                        diesel::ExpressionMethods::eq_any($chunk_registry::chunk_hash, hashes),
+                    ),
+                    diesel::ExpressionMethods::eq($chunk_registry::state, "stored"),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $chunk_registry::state,
+                    "pending",
+                ))
+            }
+            fn lost_manifest_callers_stmt(
+                file_id: Vec<u8>,
+            ) -> impl for<'q> diesel_async::methods::LoadQuery<
+                'q,
+                diesel_async::AsyncPgConnection,
+                String,
+            > + Send
+            + 'static {
+                diesel::QueryDsl::for_update(diesel::QueryDsl::select(
+                    diesel::QueryDsl::filter(
+                        diesel::QueryDsl::filter(
+                            $manifests::table,
+                            diesel::ExpressionMethods::eq($manifests::file_id, file_id),
+                        ),
+                        diesel::ExpressionMethods::eq($manifests::lost, true),
+                    ),
+                    $manifests::uploaded_by,
+                ))
+            }
+            fn restore_lost_chunks_stmt(
+                file_id: Vec<u8>,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $manifest_chunks::table,
+                        diesel::ExpressionMethods::eq($manifest_chunks::file_id, file_id),
+                    ),
+                    diesel::dsl::exists(diesel::QueryDsl::select(
+                        diesel::QueryDsl::filter(
+                            diesel::QueryDsl::filter(
+                                diesel::QueryDsl::filter(
+                                    $manifests::table,
+                                    diesel::ExpressionMethods::eq(
+                                        $manifests::file_id,
+                                        $manifest_chunks::file_id,
+                                    ),
+                                ),
+                                diesel::ExpressionMethods::eq(
+                                    $manifests::uploaded_by,
+                                    $manifest_chunks::uploaded_by,
+                                ),
+                            ),
+                            diesel::ExpressionMethods::eq($manifests::lost, true),
+                        ),
+                        $manifests::file_id,
+                    )),
+                ))
+                .set(diesel::ExpressionMethods::eq(
+                    $manifest_chunks::stored,
+                    true,
+                ))
+            }
+            fn restore_lost_manifests_stmt(
+                file_id: Vec<u8>,
+            ) -> impl for<'q> diesel_async::methods::LoadQuery<
+                'q,
+                diesel_async::AsyncPgConnection,
+                String,
+            > + Send
+            + 'static {
+                diesel::update(diesel::QueryDsl::filter(
+                    diesel::QueryDsl::filter(
+                        $manifests::table,
+                        diesel::ExpressionMethods::eq($manifests::file_id, file_id),
+                    ),
+                    diesel::ExpressionMethods::eq($manifests::lost, true),
+                ))
+                .set((
+                    diesel::ExpressionMethods::eq($manifests::committed, true),
+                    diesel::ExpressionMethods::eq($manifests::lost, false),
+                ))
+                .returning($manifests::uploaded_by)
+            }
+            fn delete_manifest_chunks_stmt(
+                file_id: Vec<u8>,
+                caller: String,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::delete(diesel::QueryDsl::filter(
+                    $manifest_chunks::table,
+                    Self::mc_pk_eq(file_id, caller),
+                ))
+            }
+            fn delete_manifest_stmt(
+                file_id: Vec<u8>,
+                caller: String,
+            ) -> impl diesel::query_builder::QueryFragment<diesel::pg::Pg>
+            + diesel::query_builder::QueryId
+            + Send
+            + 'static {
+                diesel::delete(diesel::QueryDsl::filter(
+                    $manifests::table,
+                    Self::manifest_pk_eq(file_id, caller),
+                ))
             }
         }
     };

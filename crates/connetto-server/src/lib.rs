@@ -26,6 +26,7 @@ pub mod authn;
 pub mod ban;
 pub mod capability;
 pub mod counters;
+pub mod epoch;
 pub mod guard;
 mod key_filter;
 pub mod materializer;
@@ -97,7 +98,7 @@ pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
     NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, StreamCheckError,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, StreamCheck, StreamCheckError,
     subject_set_reach,
 };
 pub use slot::{SlotError, SlotLag};

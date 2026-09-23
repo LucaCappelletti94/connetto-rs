@@ -42,11 +42,11 @@ use keyring_core::Entry;
 use openidconnect::reqwest;
 use serde_json::json;
 
-const PG_DDL: &str =
+pub(super) const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
-const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
+pub(super) const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 const OWNED_PG_DDL: &str = "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_SQLITE_DDL: &str =
     "CREATE TABLE owned (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);";
@@ -63,7 +63,7 @@ const OWNED_POLICIES: &str = "ALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
 ///
 /// The database filters none of its rows and the model has to agree, which the
 /// translator reports and the change path answers with no round trip.
-const NO_POLICIES: &str = "";
+pub(super) const NO_POLICIES: &str = "";
 
 // The client replica's `orders` table, typed for the poller's count query.
 diesel::table! {
@@ -82,7 +82,8 @@ diesel::table! {
 
 /// Serializes the Docker-gated tests. They reset the same Postgres and share one
 /// replication slot and publication name, so they must not run concurrently.
-static PG_SERIAL: LazyLock<tokio::sync::Mutex<()>> = LazyLock::new(|| tokio::sync::Mutex::new(()));
+pub(super) static PG_SERIAL: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 fn server_bin() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_connetto-server"))
@@ -90,7 +91,7 @@ fn server_bin() -> PathBuf {
 
 /// The client binary is a sibling of the server binary in the same target
 /// profile directory. It is built by a separate crate, so it must already exist.
-fn client_bin() -> PathBuf {
+pub(super) fn client_bin() -> PathBuf {
     server_bin()
         .parent()
         .expect("target profile directory")
@@ -98,7 +99,7 @@ fn client_bin() -> PathBuf {
 }
 
 /// Kills its child on drop so a panicking assertion never leaks a process.
-struct ChildGuard(Child);
+pub(super) struct ChildGuard(Child);
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
@@ -118,13 +119,13 @@ const CLIENT_KEYRING_SERVICE: &str = "connetto-client";
 /// stops opening. A test throws its replica away with the directory, so the
 /// entry is left naming a path that no longer exists, and enough of them exhaust
 /// the per-user keyring quota until every later mint fails.
-struct ReplicaDir {
+pub(super) struct ReplicaDir {
     dir: TempDir,
     replicas: Vec<String>,
 }
 
 impl ReplicaDir {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             dir: tempfile::tempdir().expect("tempdir"),
             replicas: Vec::new(),
@@ -132,7 +133,7 @@ impl ReplicaDir {
     }
 
     /// A replica path inside the directory, registered for keyring cleanup.
-    fn replica(&mut self, name: &str) -> PathBuf {
+    pub(super) fn replica(&mut self, name: &str) -> PathBuf {
         let path = self.dir.path().join(name);
         self.replicas.push(path.to_string_lossy().into_owned());
         path
@@ -149,7 +150,7 @@ impl Drop for ReplicaDir {
     }
 }
 
-fn keyring_entry(name: &str) -> keyring_core::Result<Entry> {
+pub(super) fn keyring_entry(name: &str) -> keyring_core::Result<Entry> {
     keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
     Entry::new(CLIENT_KEYRING_SERVICE, name)
 }
@@ -191,7 +192,7 @@ fn count_orders(db_path: &Path) -> i64 {
 
 /// Poll a client's local store until it holds at least `want` rows or the
 /// timeout elapses. Returns the last count seen.
-async fn wait_for_rows(db_path: &Path, want: i64, timeout: Duration) -> i64 {
+pub(super) async fn wait_for_rows(db_path: &Path, want: i64, timeout: Duration) -> i64 {
     let deadline = Instant::now() + timeout;
     loop {
         let seen = count_orders(db_path);
@@ -203,7 +204,7 @@ async fn wait_for_rows(db_path: &Path, want: i64, timeout: Duration) -> i64 {
 }
 
 /// Poll until a TCP connect to `addr` succeeds or the timeout elapses.
-async fn wait_for_port(addr: &str, timeout: Duration) -> bool {
+pub(super) async fn wait_for_port(addr: &str, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
         if tokio::net::TcpStream::connect(addr).await.is_ok() {
@@ -215,7 +216,7 @@ async fn wait_for_port(addr: &str, timeout: Duration) -> bool {
 }
 
 /// A free localhost port, released before the caller binds it.
-fn free_port() -> u16 {
+pub(super) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
         .local_addr()
@@ -229,14 +230,14 @@ fn free_port() -> u16 {
 ///
 /// A store per server rather than one shared, so two tests in one run cannot
 /// read each other's rules or facts.
-struct Authorization {
+pub(super) struct Authorization {
     policies: String,
-    endpoint: String,
-    store: String,
+    pub(super) endpoint: String,
+    pub(super) store: String,
 }
 
 impl Authorization {
-    async fn provision(fixture: &Fixture, policies: &str) -> Self {
+    pub(super) async fn provision(fixture: &Fixture, policies: &str) -> Self {
         let endpoint = fixture.fga_url().await.to_owned();
         let (_channel, store) = fixture.fga_store().await;
         Self {
@@ -255,7 +256,7 @@ impl Authorization {
     }
 }
 
-fn spawn_server_cfg(
+pub(super) fn spawn_server_cfg(
     database_url: &str,
     bind: &str,
     pg_ddl: &str,
@@ -289,7 +290,7 @@ fn spawn_server_cfg(
     ChildGuard(child)
 }
 
-fn spawn_client(
+pub(super) fn spawn_client(
     ws: &str,
     db_path: &Path,
     client_id: &str,
@@ -314,7 +315,7 @@ fn spawn_client(
     clippy::too_many_arguments,
     reason = "the argument list mirrors the client binary's environment surface"
 )]
-fn spawn_client_env(
+pub(super) fn spawn_client_env(
     ws: &str,
     db_path: &Path,
     client_id: &str,
@@ -353,7 +354,7 @@ fn spawn_client_env(
 }
 
 /// Run a single DDL/DML statement in its own transaction (autocommit).
-async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
+pub(super) async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
     let mut conn = pool.get().await.expect("admin connection");
     sql_query(sql)
         .execute(&mut *conn)
@@ -362,7 +363,7 @@ async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
 }
 
 /// Reset the orders fixture, auth tables and reader role for one server run.
-async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
+pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
     // Stale per-session watermarks from a previous run would suppress replayed
     // mutations, so drop and recreate fresh. connetto emits no DDL and the
@@ -417,7 +418,7 @@ async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
 
 /// Rewrite a Postgres URL's user info, keeping host, port, and database. Used to
 /// point the server's write target at a non-superuser role subject to RLS.
-fn with_user_url(url: &str, user: &str, password: &str) -> String {
+pub(super) fn with_user_url(url: &str, user: &str, password: &str) -> String {
     let (scheme, rest) = url.split_once("://").expect("url has a scheme");
     let host = rest.rsplit_once('@').map_or(rest, |(_, host)| host);
     format!("{scheme}://{user}:{password}@{host}")
@@ -476,17 +477,17 @@ async fn wait_for_pg_count(
 
 /// A loopback identity provider plus the env pairs the server binary needs to
 /// discover and use it. Holds the provider guard alive for the test.
-struct AuthStack {
+pub(super) struct AuthStack {
     _idp: MockOauth,
     /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_PROVIDERS` settings.
-    env_pairs: Vec<(String, String)>,
+    pub(super) env_pairs: Vec<(String, String)>,
     /// Base URL of the server binary's auth endpoints.
-    auth_base: String,
+    pub(super) auth_base: String,
 }
 
 /// Start the mock OAuth provider and configure connetto's auth callback at
 /// `auth_port`.
-async fn build_auth_stack(auth_port: u16) -> AuthStack {
+pub(super) async fn build_auth_stack(auth_port: u16) -> AuthStack {
     let callback = format!("http://127.0.0.1:{auth_port}/auth/callback");
     let idp = MockOauth::start().await;
     let auth_base = format!("http://127.0.0.1:{auth_port}");
@@ -562,7 +563,7 @@ async fn token_body(auth_base: &str, subject: &str) -> serde_json::Value {
 
 /// Drive the login dance through the server binary's auth endpoints and return
 /// the minted `(access_token, user_id)` pair.
-async fn mint_token(auth_base: &str) -> (String, String) {
+pub(super) async fn mint_token(auth_base: &str) -> (String, String) {
     let body = token_body(auth_base, "e2e-user").await;
     let access_token = body["access_token"]
         .as_str()
@@ -579,7 +580,7 @@ async fn mint_token(auth_base: &str) -> (String, String) {
 ///
 /// Only the audit test needs it, because logging out is the one producer
 /// reachable from outside the process.
-async fn mint_refresh_token(auth_base: &str) -> String {
+pub(super) async fn mint_refresh_token(auth_base: &str) -> String {
     let body = token_body(auth_base, "e2e-user").await;
     body["refresh_token"]
         .as_str()

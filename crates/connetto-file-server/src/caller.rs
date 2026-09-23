@@ -102,3 +102,55 @@ pub(crate) fn attributions(caller: &ContentCaller) -> Result<Vec<&str>, ServerEr
     }
     Ok(attributions)
 }
+
+/// The attributions a stored manifest key was written for, the inverse of [`manifest_key`] then [`attributions`].
+pub(crate) fn attributions_of_key<'k>(settings: &CallerSettings, key: &'k str) -> Vec<&'k str> {
+    if let Some(identity) = key.strip_prefix("user:") {
+        return vec![identity];
+    }
+    key.strip_prefix("keys:")
+        .map(|keys| keys.split(settings.separator).collect())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn round_trip(caller: &ContentCaller) -> Vec<String> {
+        let settings = CallerSettings::default();
+        let key = manifest_key(&settings, caller).expect("a caller with a half owns a key");
+        attributions_of_key(&settings, &key)
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn owned(caller: &ContentCaller) -> Vec<String> {
+        attributions(caller)
+            .expect("a caller with a half is attributed")
+            .into_iter()
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    #[test]
+    fn every_caller_shape_round_trips_to_its_attributions() {
+        for caller in [
+            ContentCaller::new(Some("alice".to_owned()), None),
+            ContentCaller::new(Some("keys:user:a,b".to_owned()), None),
+            ContentCaller::new(None, ["key:k1".to_owned()]),
+            ContentCaller::new(None, ["key:k1".to_owned(), "key:k2".to_owned()]),
+        ] {
+            assert_eq!(round_trip(&caller), owned(&caller), "{caller:?}");
+        }
+    }
+
+    #[test]
+    fn a_key_of_neither_shape_names_nobody() {
+        assert_eq!(
+            attributions_of_key(&CallerSettings::default(), "alice"),
+            Vec::<&str>::new()
+        );
+    }
+}

@@ -23,7 +23,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, Materializer, NoConnector, NoSigner, OplogConfig, PageKey, PageSpec, Position,
     RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    loopback, pg_write_target,
+    TimelineHistory, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
@@ -398,6 +398,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
     }
     let resume = Cursor::new(
         Position {
+            system: TimelineHistory::default().system(),
             timeline: 1,
             lsn: first_lsn.expect("at least one event"),
         }

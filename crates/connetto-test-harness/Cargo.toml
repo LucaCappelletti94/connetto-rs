@@ -22,6 +22,9 @@ connetto-core = { workspace = true, features = [
 # The harness exercises the real Postgres write and read paths, which
 # connetto-server now compiles unconditionally.
 connetto-server = { path = "../connetto-server" }
+# The browser stack's lose-content route finds a file's chunks and deletes them from the store.
+connetto-file-core = { path = "../connetto-file-core" }
+connetto-file-server = { path = "../connetto-file-server" }
 # The CDC replication source, the async re-execution connector, and the catalog
 # parser used to build both. pg-streaming brings PgStreamingCdcSource and
 # PgStreamingConfig, executor-diesel-async-postgres brings PgAsyncDieselConnector.

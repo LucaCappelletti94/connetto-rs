@@ -14,6 +14,8 @@ CREATE TABLE IF NOT EXISTS _cfs_manifests (
     committed      BOOLEAN      NOT NULL DEFAULT FALSE,
     uploaded_by    TEXT         NOT NULL,
     created_at     TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+    -- Set at boot when the store lost chunks this manifest names, until a re-upload.
+    lost           BOOLEAN      NOT NULL DEFAULT FALSE,
     PRIMARY KEY (file_id, uploaded_by)
 );
 
@@ -115,6 +117,8 @@ CREATE INDEX IF NOT EXISTS _cfs_chunk_registry_deleting_idx
 -- which is the identity when the caller has one and each share key it holds
 -- otherwise, one call per key, so the setter must be idempotent.  SET
 -- search_path prevents privilege escalation through a crafted search path.
+-- The state is `available` at commit and `lost` when the boot reconcile finds
+-- the file's bytes gone, and a setter that refuses `lost` stops the server's boot.
 --
 -- Example template:
 --

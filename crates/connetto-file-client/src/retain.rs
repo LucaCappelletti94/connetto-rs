@@ -19,14 +19,29 @@ use crate::error::ContentError;
 pub(crate) fn pinned_ids(conn: &mut SqliteConnection) -> Result<HashSet<FileId>, ContentError> {
     let mut wanted = HashSet::new();
     for (_, query, column) in db::pins(conn)? {
-        let rows: Vec<PinnedId> = diesel::sql_query(pin_sql(&query, &column)).load(conn)?;
-        for row in rows {
-            if let Ok(bytes) = <[u8; 32]>::try_from(row.file_id.as_slice()) {
-                wanted.insert(FileId::from_bytes(bytes));
-            }
-        }
+        query_ids(conn, &query, &column, &mut wanted)?;
     }
     Ok(wanted)
+}
+
+/// Adds every file identity `query` answers in `column` to `into`.
+///
+/// # Errors
+///
+/// [`ContentError::Replica`] when the query cannot be run.
+pub(crate) fn query_ids(
+    conn: &mut SqliteConnection,
+    query: &str,
+    column: &str,
+    into: &mut HashSet<FileId>,
+) -> Result<(), ContentError> {
+    let rows: Vec<PinnedId> = diesel::sql_query(pin_sql(query, column)).load(conn)?;
+    for row in rows {
+        if let Ok(bytes) = <[u8; 32]>::try_from(row.file_id.as_slice()) {
+            into.insert(FileId::from_bytes(bytes));
+        }
+    }
+    Ok(())
 }
 
 /// One file identity out of a pin query.
@@ -82,4 +97,50 @@ fn evictable(
 /// quoting has no such fallback and reports `no such column`.
 pub(crate) fn pin_sql(query: &str, column: &str) -> String {
     format!("SELECT [{column}] AS file_id FROM ({query}) AS _connetto_pin")
+}
+
+/// Queues as heals the files a heal query names that this device holds and has not queued or lost,
+/// and drops heal entries the queries no longer name.
+///
+/// A heal entry no query names any more was healed by another device, and uploading it too would
+/// make this caller an extra uploader. A file whose local copy is gone is left to the retired
+/// record, so a query that keeps naming it does not queue it on every change.
+///
+/// # Errors
+///
+/// [`ContentError::Replica`] when a query or the bookkeeping cannot be read or written.
+pub(crate) fn queue_lost(
+    conn: &mut SqliteConnection,
+    queries: &[(String, String)],
+) -> Result<Vec<FileId>, ContentError> {
+    let mut named = HashSet::new();
+    for (query, column) in queries {
+        query_ids(conn, query, column, &mut named)?;
+    }
+    for healing in db::heal_entries(conn)? {
+        if !named.contains(&healing) {
+            db::dequeue(conn, healing)?;
+        }
+    }
+    let retired: HashSet<FileId> = db::retired(conn)?.into_iter().collect();
+    let mut queued = Vec::new();
+    for file_id in named {
+        if retired.contains(&file_id)
+            || db::is_unsent(conn, file_id)?
+            || db::load_manifest(conn, file_id)?.is_none()
+        {
+            continue;
+        }
+        db::enqueue_heal(conn, file_id)?;
+        queued.push(file_id);
+    }
+    Ok(queued)
+}
+
+/// Whether `query` answers the column `column` names, checked without reading a row.
+pub(crate) fn answers_column(conn: &mut SqliteConnection, query: &str, column: &str) -> bool {
+    !column.contains(['[', ']'])
+        && diesel::sql_query(format!("{} LIMIT 0", pin_sql(query, column)))
+            .execute(conn)
+            .is_ok()
 }

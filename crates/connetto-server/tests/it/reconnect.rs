@@ -26,7 +26,7 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, OplogConfig, PageSpec,
     Position, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, loopback, pg_write_target,
+    SnapshotSource, TimelineHistory, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -205,7 +205,14 @@ fn cursor_of(event: &ChangeEvent) -> Cursor {
         .checkpoint()
         .expect("row event carries a checkpoint")
         .0;
-    Cursor::new(Position { timeline: 1, lsn }.to_cursor_bytes())
+    Cursor::new(
+        Position {
+            system: TimelineHistory::default().system(),
+            timeline: 1,
+            lsn,
+        }
+        .to_cursor_bytes(),
+    )
 }
 
 /// Open a session on `manager`, send the handshake carrying `resume`, and read

@@ -761,6 +761,15 @@ pub enum StreamCheckError {
     Session(#[from] SessionError),
 }
 
+/// What settling the change feed found before it opened.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamCheck {
+    /// The system identifier of the database's cluster.
+    pub system: u64,
+    /// Where the slot resumes, when that is past the reconnect log.
+    pub gap: Option<u64>,
+}
+
 fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Transport(err.to_string())
 }
@@ -1780,23 +1789,50 @@ where
         Ok(Some(resume_lsn))
     }
 
-    /// Settle the timeline, then the slot's resume position, before each connect of the change feed (R73, R32).
+    /// Settle the cluster and timeline, then read whether the slot resumes past the reconnect log, leaving the log untouched (R73, R32, R70).
+    ///
+    /// A caller that revokes sessions on a gap trims the log with [`reconcile_stream`](Self::reconcile_stream) only once the revocation held, so a failed revocation meets the same gap again on the next try.
     ///
     /// # Errors
     ///
-    /// [`StreamCheckError`] when either read fails, and the feed must then stay closed.
+    /// [`StreamCheckError`] when a read fails, and the feed must then stay closed.
+    pub async fn check_before_stream(
+        &self,
+        database_url: &str,
+        pool: &Pool<AsyncPgConnection>,
+        slot: &str,
+    ) -> Result<StreamCheck, StreamCheckError> {
+        let history = crate::timeline::read_history(database_url).await?;
+        let system = history.system();
+        self.reconcile_history(history).await;
+        let gap = match crate::slot::resume_position(pool, slot).await? {
+            Some(resume) => {
+                let ingested = self.oplog.current_lsn().await.map_err(oplog_err)?;
+                ingested
+                    .is_some_and(|ingested| resume > ingested)
+                    .then_some(resume)
+            }
+            None => None,
+        };
+        Ok(StreamCheck { system, gap })
+    }
+
+    /// Settle the cluster and timeline, then the slot's resume position, before each connect of the change feed (R73, R32).
+    ///
+    /// # Errors
+    ///
+    /// [`StreamCheckError`] when a read or the trim fails, and the feed must then stay closed.
     pub async fn reconcile_before_stream(
         &self,
         database_url: &str,
         pool: &Pool<AsyncPgConnection>,
         slot: &str,
-    ) -> Result<(), StreamCheckError> {
-        let history = crate::timeline::read_history(database_url).await?;
-        self.reconcile_history(history).await;
-        if let Some(resume) = crate::slot::resume_position(pool, slot).await? {
+    ) -> Result<StreamCheck, StreamCheckError> {
+        let check = self.check_before_stream(database_url, pool, slot).await?;
+        if let Some(resume) = check.gap {
             self.reconcile_stream(resume).await?;
         }
-        Ok(())
+        Ok(check)
     }
 
     /// Close every live connection with `reason`, returning how many were told.
@@ -5355,13 +5391,21 @@ mod tests {
         Resume::of(Some(&Cursor::new(cursor.to_vec())), history)
     }
 
+    /// The cluster the histories here belong to.
+    const CLUSTER: u64 = 42;
+
     fn at(timeline: u32, lsn: u64) -> Vec<u8> {
-        Position { timeline, lsn }.to_cursor_bytes()
+        Position {
+            system: CLUSTER,
+            timeline,
+            lsn,
+        }
+        .to_cursor_bytes()
     }
 
     /// Timeline 3, whose history ended timeline 1 at 0x100 and timeline 2 at 0x200.
     fn twice_promoted() -> TimelineHistory {
-        TimelineHistory::parse(3, "1\t0/100\tr\n2\t0/200\tr\n").expect("parse")
+        TimelineHistory::parse(CLUSTER, 3, "1\t0/100\tr\n2\t0/200\tr\n").expect("parse")
     }
 
     #[test]
@@ -5374,7 +5418,18 @@ mod tests {
         assert_eq!(
             judged(&at(4, 0x10), &history),
             Resume::BeyondHistory,
-            "a timeline this history never had, an old primary brought back or another cluster"
+            "a timeline this history never had, an old primary brought back"
+        );
+    }
+
+    /// A dump restored into another cluster starts again at timeline 1, so only the identifier tells its cursors apart.
+    #[test]
+    fn a_cursor_from_another_cluster_resyncs() {
+        let restored = TimelineHistory::first(CLUSTER + 1);
+        assert_eq!(judged(&at(1, 0x10), &restored), Resume::BeyondHistory);
+        assert_eq!(
+            judged(&at(1, 0x10), &TimelineHistory::first(CLUSTER)),
+            Resume::At(0x10)
         );
     }
 
@@ -5395,6 +5450,12 @@ mod tests {
             judged(&0x150_u64.to_be_bytes(), &history),
             Resume::BeyondHistory,
             "the layout without a timeline"
+        );
+        let timeline_only = [&3_u32.to_be_bytes()[..], &0x150_u64.to_be_bytes()].concat();
+        assert_eq!(
+            judged(&timeline_only, &history),
+            Resume::BeyondHistory,
+            "the layout without a cluster"
         );
         assert_eq!(judged(&[1, 2, 3], &history), Resume::BeyondHistory);
     }
