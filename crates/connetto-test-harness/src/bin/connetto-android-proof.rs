@@ -171,28 +171,9 @@ async fn prove(
 
     step("sign in");
     device.launch().await?;
-    // The demo opens the login in a Custom Tab. Typing into it with trusted
-    // input is a user gesture, so the browser follows the final redirect into
-    // the app, which is the path a real tap takes.
     let mut tab = device.login_tab(&stack.issuer).await?;
     device.screenshot(evidence, "login-page").await?;
-    tab.evaluate("document.querySelector('input[name=username]').focus()")
-        .await?;
-    tab.call("Input.insertText", serde_json::json!({ "text": USER }))
-        .await?;
-    for kind in ["keyDown", "keyUp"] {
-        tab.call(
-            "Input.dispatchKeyEvent",
-            serde_json::json!({
-                "type": kind,
-                "key": "Enter",
-                "code": "Enter",
-                "windowsVirtualKeyCode": 13,
-                "text": "\r",
-            }),
-        )
-        .await?;
-    }
+    submit_login(&mut tab).await?;
     drop(tab);
     let mut app = device.app().await?;
     app.wait_for_text("status: connected", Duration::from_secs(90))
@@ -241,6 +222,7 @@ async fn prove(
     wait_for_count(&stack.pg_url, offline + 1).await?;
     device.screenshot(evidence, "uploaded").await?;
     sign_out(device, &mut app, evidence).await?;
+    sign_in_across_a_killed_process(device, &stack.issuer, evidence).await?;
     step("proof complete");
     Ok(())
 }
@@ -258,6 +240,72 @@ async fn sign_out(device: &Device, app: &mut Cdp, evidence: &Path) -> Result<()>
     )
     .await?;
     device.screenshot(evidence, "signed-out").await
+}
+
+/// The system may kill the app while its login is open in the browser tab.
+/// Sign-out leaves the demo opening a fresh login, so the driver kills the
+/// backgrounded app the way low memory does, then finishes the login in the
+/// tab. The redirect starts a new process, and only one that finishes the
+/// persisted login reaches `connected`, since a restarted login would open a
+/// tab nobody types into.
+async fn sign_in_across_a_killed_process(
+    device: &Device,
+    issuer: &str,
+    evidence: &Path,
+) -> Result<()> {
+    step("sign in across a killed process");
+    let mut tab = device.login_tab(issuer).await?;
+    let killed = device.adb(&["shell", "pidof", PACKAGE]).await?;
+    device.adb(&["shell", "am", "kill", PACKAGE]).await?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while device.adb(&["shell", "pidof", PACKAGE]).await.is_ok() {
+        if Instant::now() >= deadline {
+            bail!(
+                "the backgrounded app (pid {}) was not killed",
+                killed.trim()
+            );
+        }
+        sleep(Duration::from_millis(250)).await;
+    }
+    submit_login(&mut tab).await?;
+    drop(tab);
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let mut app = loop {
+        match device.app().await {
+            Ok(app) => break app,
+            Err(err) if Instant::now() >= deadline => {
+                return Err(err.context("the redirect never started the app again"));
+            }
+            Err(_) => sleep(Duration::from_millis(500)).await,
+        }
+    };
+    app.wait_for_text("status: connected", Duration::from_secs(90))
+        .await?;
+    device.screenshot(evidence, "resumed").await
+}
+
+/// Type the dev user into the identity provider's form and submit it. Trusted
+/// input is a user gesture, so the browser follows the final redirect into the
+/// app, which is the path a real tap takes.
+async fn submit_login(tab: &mut Cdp) -> Result<()> {
+    tab.evaluate("document.querySelector('input[name=username]').focus()")
+        .await?;
+    tab.call("Input.insertText", serde_json::json!({ "text": USER }))
+        .await?;
+    for kind in ["keyDown", "keyUp"] {
+        tab.call(
+            "Input.dispatchKeyEvent",
+            serde_json::json!({
+                "type": kind,
+                "key": "Enter",
+                "code": "Enter",
+                "windowsVirtualKeyCode": 13,
+                "text": "\r",
+            }),
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 fn step(name: &str) {

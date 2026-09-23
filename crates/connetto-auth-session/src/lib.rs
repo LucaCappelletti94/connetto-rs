@@ -57,3 +57,17 @@ pub async fn authorize(url: &str, timeout: Duration) -> Result<String, AuthSessi
         Err(AuthSessionError::Unsupported)
     }
 }
+
+/// The redirect this process received before any [`authorize`] ran in it,
+/// taken so it is returned once. A process the system started to deliver a
+/// login's redirect holds it here.
+///
+/// # Errors
+///
+/// [`AuthSessionError::Bridge`] when the platform bridge cannot be reached.
+pub fn delivered() -> Result<Option<String>, AuthSessionError> {
+    #[cfg(target_os = "android")]
+    return android::delivered();
+    #[cfg(not(target_os = "android"))]
+    Ok(None)
+}

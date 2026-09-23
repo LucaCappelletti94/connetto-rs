@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use connetto_client::{
     AcquiredSession, AuthorizationSession, BrowserOpener, ClientError, Grant, MemoryKeyStore,
-    MemoryRefreshStore, NativeAuthenticator, encode_identity, provision_replica_key,
+    MemoryRefreshStore, NativeAuthenticator, SessionFuture, encode_identity, provision_replica_key,
     replica_db_name,
 };
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, RefreshTokenStore, ReplicaKeyStore};
@@ -617,6 +617,78 @@ async fn walk_to_app_redirect(login_url: String, subject: &str, redirect: &str) 
     panic!("the login never reached {redirect}");
 }
 
+/// A scripted browser session. `authorize` walks the login as `subject` and,
+/// with `die` set, records the redirect in `delivered` and never returns, as a
+/// process the system killed would. `delivered` hands back what an earlier
+/// process received.
+struct ScriptedSession {
+    subject: &'static str,
+    die: bool,
+    forge_state: bool,
+    delivered: Arc<std::sync::Mutex<Option<String>>>,
+    opened: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ScriptedSession {
+    fn new(subject: &'static str) -> Self {
+        Self {
+            subject,
+            die: false,
+            forge_state: false,
+            delivered: Arc::default(),
+            opened: Arc::default(),
+        }
+    }
+}
+
+impl AuthorizationSession for ScriptedSession {
+    fn authorize(&self, url: String) -> SessionFuture {
+        self.opened
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let (subject, die, forge) = (self.subject, self.die, self.forge_state);
+        let delivered = Arc::clone(&self.delivered);
+        Box::pin(async move {
+            let mut redirect = walk_to_app_redirect(url, subject, APP_REDIRECT).await;
+            if forge {
+                redirect = forged_state(&redirect);
+            }
+            if die {
+                *delivered.lock().expect("slot") = Some(redirect);
+                return std::future::pending().await;
+            }
+            Ok(redirect)
+        })
+    }
+
+    fn delivered(&self) -> Option<String> {
+        self.delivered.lock().expect("slot").take()
+    }
+}
+
+/// `redirect` with its `state` replaced by one no login sent.
+fn forged_state(redirect: &str) -> String {
+    let (before, after) = redirect.split_once("state=").expect("a state");
+    let rest = after.split_once('&').map_or("", |(_, rest)| rest);
+    format!("{before}state=forged&{rest}")
+}
+
+fn claimed(
+    base: &str,
+    store: &SharedRefresh,
+    session: Arc<dyn AuthorizationSession>,
+) -> NativeAuthenticator {
+    let panicking: BrowserOpener =
+        Arc::new(|_url: &str| panic!("a claimed redirect never opens the loopback browser"));
+    NativeAuthenticator::new(
+        base.to_owned(),
+        MOCK_OAUTH_PROVIDER,
+        Arc::clone(store),
+        None,
+    )
+    .with_browser_opener(panicking)
+    .with_claimed_redirect(APP_REDIRECT, session)
+}
+
 /// A mobile build signs in through its own redirect, which the server allows
 /// by exact match, and the app's session hands back the URL carrying the code.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -625,16 +697,11 @@ async fn a_claimed_redirect_login_completes_through_the_apps_session() {
     let (base, _service, _idp) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
-    let session: AuthorizationSession = Arc::new(|url: String| {
-        Box::pin(async move { Ok(walk_to_app_redirect(url, "mobile-user", APP_REDIRECT).await) })
-    });
-    let panicking: BrowserOpener =
-        Arc::new(|_url: &str| panic!("a claimed redirect never opens the loopback browser"));
-    let authenticator = Arc::new(
-        NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, Arc::clone(&store), None)
-            .with_browser_opener(panicking)
-            .with_claimed_redirect(APP_REDIRECT, session),
-    );
+    let authenticator = Arc::new(claimed(
+        &base,
+        &store,
+        Arc::new(ScriptedSession::new("mobile-user")),
+    ));
 
     let login = authenticator.login::<String>().await.expect("login");
 
@@ -642,6 +709,11 @@ async fn a_claimed_redirect_login_completes_through_the_apps_session() {
     assert!(
         store.load(&account).expect("load").is_some(),
         "the refresh token is stored for the account the login revealed"
+    );
+    assert_eq!(
+        store.accounts().expect("accounts"),
+        vec![account],
+        "a finished login leaves no pending record and lists only the account"
     );
     let token = authenticator.token_source().token().await.expect("refresh");
     assert!(!token.is_empty(), "the session refreshes like any other");
@@ -655,16 +727,9 @@ async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
     let (base, _service, _idp) =
         spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
-    let session: AuthorizationSession = Arc::new(|url: String| {
-        Box::pin(async move {
-            let callback = walk_to_app_redirect(url, "mobile-user", APP_REDIRECT).await;
-            let (before, after) = callback.split_once("state=").expect("a state");
-            let rest = after.split_once('&').map_or("", |(_, rest)| rest);
-            Ok(format!("{before}state=forged&{rest}"))
-        })
-    });
-    let authenticator = NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, store, None)
-        .with_claimed_redirect(APP_REDIRECT, session);
+    let mut session = ScriptedSession::new("mobile-user");
+    session.forge_state = true;
+    let authenticator = claimed(&base, &store, Arc::new(session));
 
     match authenticator.login::<String>().await {
         Err(ClientError::Auth(message)) => assert!(message.contains("state"), "{message}"),
@@ -673,4 +738,104 @@ async fn a_claimed_redirect_with_a_foreign_state_is_refused() {
             other.map(|s| s.user_id)
         ),
     }
+}
+
+/// The system may kill the app while the login is open in the browser tab.
+/// The redirect then starts a fresh process, which finishes that same login
+/// from the persisted verifier without opening another tab.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_login_finishes_in_the_process_its_redirect_restarts() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let mut dying = ScriptedSession::new("mobile-user");
+    dying.die = true;
+    let delivered = Arc::clone(&dying.delivered);
+    let first = claimed(&base, &store, Arc::new(dying));
+    let killed =
+        tokio::time::timeout(std::time::Duration::from_secs(10), first.login::<String>()).await;
+    assert!(
+        killed.is_err(),
+        "the first process never finishes its login"
+    );
+    drop(first);
+
+    let restarted = ScriptedSession {
+        delivered,
+        ..ScriptedSession::new("mobile-user")
+    };
+    let opened = Arc::clone(&restarted.opened);
+    let second = claimed(&base, &store, Arc::new(restarted));
+    let login = second.login::<String>().await.expect("the resumed login");
+
+    assert_eq!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the restarted process opens no second tab"
+    );
+    let account = encode_identity(&login.user_id).expect("encode account");
+    assert_eq!(
+        store.accounts().expect("accounts"),
+        vec![account],
+        "the pending record is gone once the login finishes"
+    );
+}
+
+/// A redirect the new process finds carrying another login's `state` is
+/// discarded, and a new login runs instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_process_starts_over_on_a_foreign_redirect() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let mut dying = ScriptedSession::new("mobile-user");
+    dying.die = true;
+    dying.forge_state = true;
+    let delivered = Arc::clone(&dying.delivered);
+    let first = claimed(&base, &store, Arc::new(dying));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), first.login::<String>()).await;
+    drop(first);
+
+    let restarted = ScriptedSession {
+        delivered,
+        ..ScriptedSession::new("mobile-user")
+    };
+    let opened = Arc::clone(&restarted.opened);
+    let second = claimed(&base, &store, Arc::new(restarted));
+    second.login::<String>().await.expect("a fresh login");
+    assert_eq!(
+        opened.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the foreign redirect is discarded and one new tab opens"
+    );
+}
+
+/// A new process with a pending login but no delivered redirect (the user came
+/// back through the launcher) starts a new login rather than waiting.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_process_without_a_redirect_starts_over() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let mut dying = ScriptedSession::new("mobile-user");
+    dying.die = true;
+    let first = claimed(&base, &store, Arc::new(dying));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), first.login::<String>()).await;
+    drop(first);
+    assert!(
+        store.accounts().expect("accounts").is_empty(),
+        "a pending login is never listed as an account"
+    );
+
+    let restarted = ScriptedSession::new("mobile-user");
+    let second = claimed(&base, &store, Arc::new(restarted));
+    let login = second.login::<String>().await.expect("a fresh login");
+    assert_eq!(
+        store.accounts().expect("accounts"),
+        vec![encode_identity(&login.user_id).expect("encode account")],
+        "the new login's account is the only record listed"
+    );
 }

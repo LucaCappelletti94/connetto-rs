@@ -95,16 +95,29 @@ const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 /// own redirect (RFC 8252 section 7.1).
 #[cfg(target_os = "android")]
 fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
-    authenticator.with_claimed_redirect(
-        APP_REDIRECT,
-        Arc::new(|url: String| {
-            Box::pin(async move {
-                connetto_auth_session::authorize(&url, LOGIN_WINDOW)
-                    .await
-                    .map_err(|err| connetto_client::ClientError::Auth(err.to_string()))
-            })
-        }),
-    )
+    authenticator.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
+}
+
+/// The Custom Tab and the app's redirect, through `connetto-auth-session`.
+#[cfg(target_os = "android")]
+struct TabSession;
+
+#[cfg(target_os = "android")]
+impl connetto_client::AuthorizationSession for TabSession {
+    fn authorize(&self, url: String) -> connetto_client::SessionFuture {
+        Box::pin(async move {
+            connetto_auth_session::authorize(&url, LOGIN_WINDOW)
+                .await
+                .map_err(|err| connetto_client::ClientError::Auth(err.to_string()))
+        })
+    }
+
+    fn delivered(&self) -> Option<String> {
+        connetto_auth_session::delivered().unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "reading a delivered login redirect");
+            None
+        })
+    }
 }
 
 /// On a desktop, sign in through the system browser and a loopback listener

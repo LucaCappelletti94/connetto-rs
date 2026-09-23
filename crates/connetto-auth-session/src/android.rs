@@ -44,6 +44,11 @@ pub(crate) async fn authorize(url: &str, timeout: Duration) -> Result<String, Au
     }
 }
 
+pub(crate) fn delivered() -> Result<Option<String>, AuthSessionError> {
+    let plugin = construct()?;
+    jni_call(|env, _| take_redirect(env, plugin.as_obj()))
+}
+
 fn construct() -> Result<AuthSessionPlugin, AuthSessionError> {
     jni_call(|env, activity| {
         let loader = env

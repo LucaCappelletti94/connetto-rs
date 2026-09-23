@@ -346,6 +346,10 @@ pub const IDENTITY_RECORD: &str = "connetto-device-identity";
 /// cannot disagree with what is stored.
 pub(crate) const ACCOUNTS_RECORD: &str = "connetto-account-index";
 
+/// A login through an app-claimed redirect while its browser tab is open, kept
+/// so a process the system restarts to deliver the redirect can finish it.
+pub(crate) const PENDING_LOGIN_RECORD: &str = "connetto-pending-login";
+
 /// Whether `name` is one of connetto's own credential-store records rather than
 /// an account.
 ///
@@ -355,7 +359,7 @@ pub(crate) const ACCOUNTS_RECORD: &str = "connetto-account-index";
 /// id and neither literal is valid JSON.
 #[must_use]
 pub fn is_reserved_record(name: &str) -> bool {
-    name == IDENTITY_RECORD || name == ACCOUNTS_RECORD
+    name == IDENTITY_RECORD || name == ACCOUNTS_RECORD || name == PENDING_LOGIN_RECORD
 }
 
 /// Encode `user_id` for [`IDENTITY_RECORD`], and for the credential row itself.

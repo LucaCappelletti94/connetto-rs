@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::replica::PENDING_LOGIN_RECORD;
 use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
 
 fn ensure_keyring_store() -> Result<(), ClientError> {
@@ -515,25 +516,39 @@ impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
     }
 }
 
-/// Runs a login in the platform's browser session and resolves to the URL the
-/// redirect delivered back to the app, carrying `code` and `state`.
+/// What [`AuthorizationSession::authorize`] resolves to.
+pub type SessionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ClientError>> + Send>>;
+
+/// The platform's browser session a login runs in, returning through a
+/// redirect the operating system routes to the app.
 ///
 /// This is the mobile half of RFC 8252: an in-app browser tab that returns
-/// through a redirect the operating system routes to the app, where a
-/// desktop listens on loopback instead.
-pub type AuthorizationSession = Arc<
-    dyn Fn(
-            String,
-        ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<String, ClientError>> + Send>,
-        > + Send
-        + Sync,
->;
+/// through an app-claimed redirect, where a desktop listens on loopback
+/// instead.
+pub trait AuthorizationSession: Send + Sync {
+    /// Open `url` and resolve to the redirect URL delivered back to the app,
+    /// which carries `code` and `state`.
+    fn authorize(&self, url: String) -> SessionFuture;
+
+    /// A redirect this process received before it started any login, which is
+    /// what a process the system started to deliver it holds.
+    fn delivered(&self) -> Option<String>;
+}
 
 /// An app-claimed redirect and the session that receives it.
 struct ClaimedRedirect {
     uri: String,
-    session: AuthorizationSession,
+    session: Arc<dyn AuthorizationSession>,
+}
+
+/// A login through an app-claimed redirect, persisted before the browser tab
+/// opens so that a process the redirect starts can finish it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingLogin {
+    verifier: String,
+    state: String,
+    redirect_uri: String,
 }
 
 /// Acquires and refreshes connetto's own tokens for a native client, driving the
@@ -594,11 +609,15 @@ impl NativeAuthenticator {
     /// operating system, with `session` running the browser and returning what
     /// the redirect delivered, instead of a loopback listener. The server must
     /// list `redirect_uri` in its redirect allowlist.
+    ///
+    /// Such a login is persisted in the refresh-token store while the browser
+    /// is open, so a process the system restarts to deliver the redirect can
+    /// finish it.
     #[must_use]
     pub fn with_claimed_redirect(
         mut self,
         redirect_uri: impl Into<String>,
-        session: AuthorizationSession,
+        session: Arc<dyn AuthorizationSession>,
     ) -> Self {
         self.claimed = Some(ClaimedRedirect {
             uri: redirect_uri.into(),
@@ -673,6 +692,10 @@ impl NativeAuthenticator {
     /// refresh token. The code comes back through the app-claimed redirect when
     /// one is set, and through a `127.0.0.1` listener otherwise.
     ///
+    /// With a claimed redirect, a login an earlier process started and the
+    /// system killed is finished first when its redirect was delivered to this
+    /// one, and replaced by a new login otherwise.
+    ///
     /// # Errors
     ///
     /// [`ClientError::Auth`] on any redirect, browser, or exchange failure, and
@@ -680,6 +703,11 @@ impl NativeAuthenticator {
     pub async fn login<Id: DeserializeOwned + serde::Serialize>(
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
+        if let Some(claimed) = &self.claimed
+            && let Some(session) = self.resume(claimed).await?
+        {
+            return Ok(session);
+        }
         let verifier = random_token();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_token();
@@ -694,9 +722,19 @@ impl NativeAuthenticator {
             )
         };
         let (code, returned_state) = if let Some(claimed) = &self.claimed {
-            let delivered = (claimed.session)(login_url(&claimed.uri)).await?;
-            let query = delivered.split_once('?').map_or("", |(_, query)| query);
-            code_and_state(query, "redirect")?
+            let pending = PendingLogin {
+                verifier: verifier.clone(),
+                state: state.clone(),
+                redirect_uri: claimed.uri.clone(),
+            };
+            let pending = serde_json::to_string(&pending)
+                .map_err(|err| ClientError::Auth(format!("recording the login: {err}")))?;
+            self.store.store(PENDING_LOGIN_RECORD, &pending)?;
+            let delivered = claimed.session.authorize(login_url(&claimed.uri)).await;
+            // This process saw the login end, so nothing is left to resume.
+            self.store.clear(PENDING_LOGIN_RECORD)?;
+            let delivered = delivered?;
+            code_and_state(query_of(&delivered), "redirect")?
         } else {
             let listener = TcpListener::bind("127.0.0.1:0")
                 .await
@@ -711,6 +749,47 @@ impl NativeAuthenticator {
         if returned_state != state {
             return Err(ClientError::Auth("login state mismatch".to_owned()));
         }
+        self.redeem(&code, &verifier).await
+    }
+
+    /// Finish the login an earlier process persisted, when the redirect that
+    /// carries its `state` was delivered to this one. `None` means a new login
+    /// has to start, and the persisted record is gone either way.
+    async fn resume<Id: DeserializeOwned + serde::Serialize>(
+        &self,
+        claimed: &ClaimedRedirect,
+    ) -> Result<Option<AcquiredSession<Id>>, ClientError> {
+        let Some(pending) = self.store.load(PENDING_LOGIN_RECORD)? else {
+            return Ok(None);
+        };
+        self.store.clear(PENDING_LOGIN_RECORD)?;
+        let Some(delivered) = claimed.session.delivered() else {
+            return Ok(None);
+        };
+        let Ok(pending) = serde_json::from_str::<PendingLogin>(&pending) else {
+            return Ok(None);
+        };
+        let Ok((code, state)) = code_and_state(query_of(&delivered), "redirect") else {
+            return Ok(None);
+        };
+        if state != pending.state || pending.redirect_uri != claimed.uri {
+            return Ok(None);
+        }
+        match self.redeem(&code, &pending.verifier).await {
+            Ok(session) => Ok(Some(session)),
+            // An expired or spent code, so a new login is the way forward.
+            Err(ClientError::Auth(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Exchange `code` with its PKCE `verifier` and store the credential it
+    /// yields under the account it reveals.
+    async fn redeem<Id: DeserializeOwned + serde::Serialize>(
+        &self,
+        code: &str,
+        verifier: &str,
+    ) -> Result<AcquiredSession<Id>, ClientError> {
         let response: TokenResponse<Id> = self
             .post_json(
                 &format!("{}/auth/token", self.server_base),
@@ -904,6 +983,11 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
     delivered
+}
+
+/// The query of a URL, or nothing when it has none.
+fn query_of(url: &str) -> &str {
+    url.split_once('?').map_or("", |(_, query)| query)
 }
 
 /// The `code` and `state` a redirect's query carries, where `what` names the

@@ -87,7 +87,7 @@ pub use archive::{
 #[cfg(feature = "native-auth")]
 pub use auth::{
     AcquiredSession, AuthorizationSession, BrowserOpener, KeyringKeyStore, KeyringStore,
-    MemoryKeyStore, MemoryRefreshStore, NativeAuthenticator, provision_replica_key,
+    MemoryKeyStore, MemoryRefreshStore, NativeAuthenticator, SessionFuture, provision_replica_key,
     system_browser_opener,
 };
 pub use cipher::{ReplicaKey, UnlockError};
