@@ -377,7 +377,11 @@ async fn the_uploader_heals_by_sending_only_the_missing_bytes() {
 
     let (status, body) = download(&app, &signer, &setup.file_id).await;
     assert_eq!(status, StatusCode::OK);
-    assert!(body == setup.data, "the whole file serves again");
+    assert_eq!(
+        FileId::from_chunks([&body[..]]),
+        setup.file_id,
+        "the whole file serves again"
+    );
     let mut conn = connect_admin(&setup.pg.url_admin).await;
     assert_eq!(
         manifest_rows(&mut conn, &setup.file_id).await,
