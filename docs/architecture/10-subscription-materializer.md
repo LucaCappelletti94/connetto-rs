@@ -151,6 +151,8 @@ Three responses, all connetto's. Startup refuses when the slot or the publicatio
 
 **`idle_replication_slot_timeout` is worth considering and is not a substitute.** It invalidates a slot nothing has read for a configured period, which bounds the damage from a server that is gone for good. It does nothing about a server that is present and merely stuck, which is the case the size cap covers.
 
+**For a standby that can take over, create the slot as a failover slot.** `pg_create_logical_replication_slot(name, 'pgoutput', false, false, true)` on Postgres 17 or later, with slot synchronization on the standby, keeps the slot through a promotion so the feed continues rather than meeting the recreated-slot hole below. `06-reconnect.md` holds the whole recipe, and the timeline check that runs before this slot check on every connect of the feed (R73).
+
 **Dropping a slot is the deployment's to do, and doing it under a running server is safe but not free.** Startup refuses a missing slot, so a slot that disappears later draws a `replication slot is gone` warning rather than silence, and recreating it opens a hole the server detects on its next connect: every client is closed and re-downloads. Stopping the server first avoids that.
 
 ### Shared retry primitive

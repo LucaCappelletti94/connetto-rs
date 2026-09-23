@@ -29,7 +29,7 @@ The client persists the following in local SQLite across process restarts:
 
 | Item | Description |
 |---|---|
-| `last_applied_lsn` | Highest server LSN the client has applied to local SQLite. |
+| `last_applied_lsn` | The cursor of the last frame the client applied to local SQLite, opaque to the client. The server writes twelve bytes, the timeline and then the position (R73, see Failover). |
 | `pending_mutations` | The local mutation queue (see `03-sync-pipeline.md`). |
 | `subscriptions` | The set of subscriptions to re-declare on reconnect (spec + sub_id). |
 | `session_token` | Durable session handle. **Built (R2, R3)**: for an identified run the auth store's session id is the handle, an unidentified run gets one minted at handshake, and the `resume_token` credential returned beside it is what proves the handle on the next connect. The client persists the pair outside the local replica (natively where the refresh token lives, worker-only in the browser). Cursors, the watermark and the connection registry key on it (chapter 12). |
@@ -93,7 +93,7 @@ On reconnect, the client sends:
 ```
 Handshake {
   client_id:     String,
-  last_lsn:      u64,        // client's resume cursor (0 if never connected)
+  last_cursor:   Option<Cursor>, // client's resume cursor, absent if never synced
   session_token: String,     // Built, defective: see note below
   grants:        Vec<Grant>, // Decided (R3): zero or more opaque grants
 }
@@ -135,10 +135,12 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 ### Case 2: Client's LSN is outside the oplog window (or LSN = 0)
 
 1. The client's resume cursor predates the oldest available oplog entry. It cannot catch up incrementally.
-2. Server sends `FullResyncRequired { reason: "lsn_outside_retention_window" }`: the client shows a "re-syncing..." state and clears local data for affected subscriptions.
+2. Server sends `FullResyncRequired { reason: CursorOutsideRetention }`: the client shows a "re-syncing..." state and clears local data for affected subscriptions.
 3. For each re-declared subscription:
    - Server sends `SnapshotBegin` (control), one or more `SnapshotPatch` bulk frames carrying the matching rows, then `SnapshotEnd(current_lsn)` (control).
 4. The client applies the snapshot as a full replacement (not a merge).
+
+A cursor past where its timeline ended, or one the server cannot read, takes this path with `CursorBeyondHistory` instead, whatever the window holds (R73, see Failover).
 
 The notice waits for the read (R38). `FullResyncRequired` is sent only once the fresh snapshot has been read, immediately ahead of its frames, because it is also the instruction to discard local rows. A read that fails instead draws the same single bare refusal as any other cause, so the caller learns nothing about the name it guessed and keeps its rows for a snapshot that never arrived.
 
