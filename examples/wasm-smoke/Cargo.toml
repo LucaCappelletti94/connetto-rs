@@ -32,7 +32,7 @@ sqlite-wasm-rs = { version = "0.5", default-features = false }
 # Client-authored uuid v4 keys for the synced orders table: one strongly typed
 # `rosetta_uuid::Uuid` that maps to SQLite BLOB and Postgres uuid from a single
 # schema, generated with the browser CSPRNG through getrandom's wasm_js backend.
-rosetta-uuid = { version = "0.1.3", features = ["diesel", "sqlite"] }
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
 web-sys = { version = "0.3", features = [
   "BroadcastChannel",
   "MessageEvent",

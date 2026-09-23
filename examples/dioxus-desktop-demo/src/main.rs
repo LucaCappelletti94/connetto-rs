@@ -1,39 +1,49 @@
-//! Windowed desktop demo of connetto live queries with native auth.
+//! Native demo of connetto live queries with native auth, on the desktop and,
+//! built with `dx` for the `mobile` feature, on Android.
 //!
-//! On launch the app acquires a connetto session via the RFC 8252 loopback
-//! PKCE flow against `connetto-server`'s auth endpoints (or silently refreshes
-//! if a refresh token is already stored), names the replica from the resolved
-//! identity, opens it with an OS-keyring-held encryption key, and installs a
-//! silent-refresh token source for reconnects. Signing out calls `forget_device`
-//! (credential revoke plus key destroy), then restarts the process so a fresh
-//! login begins immediately.
+//! The window opens first and setup runs as a task behind it. Setup acquires
+//! a connetto session via the RFC 8252 loopback PKCE flow against
+//! `connetto-server`'s auth endpoints in the system browser (or silently
+//! refreshes if a refresh token is already stored), names the replica from the
+//! resolved identity, opens it with an OS-keyring-held encryption key, and
+//! starts a pump that redials and resumes whenever the link drops. Signing out
+//! calls `forget_device` (credential revoke plus key destroy) and runs setup
+//! again in the same process, so a fresh login begins immediately.
 //!
-//! Configuration environment variables:
+//! The dev stack is one command from the repository root, which prints the
+//! environment a desktop run needs and the `adb reverse` lines a phone needs.
 //!
-//! - `CONNETTO_DEMO_SERVER`: WebSocket host:port of connetto-server
-//!   (default `127.0.0.1:7777`).
-//! - `CONNETTO_DEMO_PG`: Postgres conninfo for the backend writer buttons
-//!   (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
-//! - `CONNETTO_READER_URL`: conninfo for the non-owner Postgres role provisioned
-//!   by `roles.sql` (required).
-//! - `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the OIDC provider vars from
-//!   `target/dev-idp.env`: server auth env from the dev IdP. Start the dev
-//!   IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set and source
-//!   `target/dev-idp.env` before starting the server.
-//! - `CONNETTO_CONTENT_URL`, `CONNETTO_CONTENT_STORE`, `CONNETTO_CONTENT_KEY`:
-//!   file server settings; required for photo upload and signed-URL resolve.
-//!   The server must also list `photos` in `CONNETTO_WRITABLE`. Apply schema.sql,
-//!   `connetto_file_server::DEPLOYMENT_DDL`, roles.sql, content.sql in that order.
+//! ```text
+//! cargo run -p connetto-test-harness --bin connetto-demo-stack
+//! ```
+//!
+//! Run as that command's program, `connetto-android-proof` builds this demo
+//! for an attached phone or emulator, installs it, and walks sign-in, sync,
+//! an offline write and its upload on reconnect.
+//!
+//! ```text
+//! cargo build -p connetto-test-harness --bin connetto-android-proof
+//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
+//!   target/debug/connetto-android-proof --serial SERIAL
+//! ```
+//!
+//! The demo reads `CONNETTO_DEMO_SERVER`, the sync host:port (default
+//! `127.0.0.1:7777`), and `CONNETTO_DEMO_PG`, the conninfo the backend writer
+//! buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
+//! Its server runs `schema.sql` and `policies.sql`, with `schema.sql`,
+//! `connetto_file_server::DEPLOYMENT_DDL`, `roles.sql` and `content.sql`
+//! applied in that order, and `orders,photos` writable.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use base64::Engine as _;
 use connetto_client::auth::{
     KeyringKeyStore, KeyringStore, NativeAuthenticator, provision_replica_key, remembered_account,
 };
-use connetto_client::reconnect::TokioSleeper;
+use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
 use connetto_client::replica::{Replica, replica_db_name};
 use connetto_client::teardown::{
     ForgetError, PurgeError, content_dir, expiry_warning, forget_device,
@@ -61,9 +71,12 @@ include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 /// The translated SQLite DDL, used to seed a replica on first boot.
 const REPLICA_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 /// The Postgres schema source the connetto-server must be started with
-/// (`CONNETTO_PG_DDL`). Its SHA-256 is the schema version presented at the
-/// handshake.
+/// (`CONNETTO_PG_DDL`).
 const SCHEMA_SQL: &str = include_str!("../schema.sql");
+/// The row policies the server must be started with (`CONNETTO_PG_POLICIES`).
+/// The server hashes them beside the schema into the version presented at the
+/// handshake.
+const POLICIES_SQL: &str = include_str!("../policies.sql");
 
 const AUTH_SERVER: &str = "http://127.0.0.1:18081";
 const AUTH_PROVIDER: &str = "dev-idp";
@@ -119,6 +132,11 @@ struct AuthCtx {
 }
 
 fn data_dir() -> PathBuf {
+    app_data_root().join("connetto-dioxus-demo")
+}
+
+#[cfg(not(target_os = "android"))]
+fn app_data_root() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(xdg)
     } else if let Ok(home) = std::env::var("HOME") {
@@ -126,7 +144,20 @@ fn data_dir() -> PathBuf {
     } else {
         std::env::temp_dir()
     }
-    .join("connetto-dioxus-demo")
+}
+
+/// The app's private files directory, since Android sets neither `HOME` nor
+/// `XDG_DATA_HOME`. A failed lookup is logged and leaves the temp directory,
+/// where the first write then fails with an error setup reports.
+#[cfg(target_os = "android")]
+fn app_data_root() -> PathBuf {
+    robius_directories::ProjectDirs::from("", "", "connetto-dioxus-demo").map_or_else(
+        || {
+            tracing::error!("the app's files directory is unavailable");
+            std::env::temp_dir()
+        },
+        |dirs| dirs.data_dir().to_path_buf(),
+    )
 }
 
 fn export_path() -> PathBuf {
@@ -146,81 +177,141 @@ fn publish_export(part: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-fn restart() {
-    if let Ok(exe) = std::env::current_exe() {
-        let _ = std::process::Command::new(exe).spawn();
-    }
-    std::process::exit(0)
-}
-
 fn main() {
     connetto_core::logging::init_stdout();
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("build tokio runtime");
-    let started = rt.block_on(setup());
-    let (client, backend, auth_ctx, content) = match started {
-        Ok(parts) => parts,
-        Err(err) => {
-            let _guard = rt.enter();
-            launch_startup_failure(&err);
-            return;
+    // Leaked so it outlives `launch`: every session's tasks run on it for the
+    // life of the process.
+    let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("build tokio runtime"),
+    ));
+    let _guard = runtime.enter();
+    let builder = dioxus::LaunchBuilder::new();
+    #[cfg(feature = "desktop")]
+    let builder = builder.with_cfg(
+        dioxus::desktop::Config::new().with_window(
+            dioxus::desktop::WindowBuilder::new()
+                .with_title(format!("connetto live demo (pid {})", std::process::id()))
+                .with_inner_size(dioxus::desktop::LogicalSize::new(760.0, 1100.0)),
+        ),
+    );
+    builder.launch(Shell);
+}
+
+/// Everything one signed-in session runs on, and dropping it ends the
+/// session. The pump owns the connection and the outbox task holds a client
+/// clone, so both are aborted here.
+struct Parts {
+    client: ConnettoClient<Ws>,
+    backend: Backend,
+    auth: AuthCtx,
+    content: Content,
+    pump: tokio::task::JoinHandle<()>,
+    outbox: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for Parts {
+    fn drop(&mut self) {
+        self.pump.abort();
+        self.outbox.abort();
+    }
+}
+
+/// One session's parts, equal only to itself, so a new session remounts the UI.
+#[derive(Clone)]
+struct SessionParts(Rc<Parts>);
+
+impl PartialEq for SessionParts {
+    fn eq(&self, other: &Self) -> bool {
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Ends the current session and runs setup again, which signs in afresh as
+/// whichever account the marker names.
+#[derive(Clone, Copy)]
+struct Restart(Signal<u64>);
+
+impl Restart {
+    fn request(mut self) {
+        *self.0.write() += 1;
+    }
+}
+
+enum Stage {
+    Starting,
+    Ready(SessionParts),
+    Failed(String),
+}
+
+/// Opens at once and runs setup as a task behind it. Android calls `main`
+/// from the activity's start, so nothing there may wait on the network or on
+/// a login in the browser.
+#[component]
+fn Shell() -> Element {
+    let generation = use_signal(|| 0_u64);
+    let mut stage = use_signal(|| Stage::Starting);
+    use_context_provider(|| Restart(generation));
+    let runtime = use_hook(tokio::runtime::Handle::current);
+    use_effect(move || {
+        let _ = generation();
+        stage.set(Stage::Starting);
+        let runtime = runtime.clone();
+        spawn(async move {
+            let outcome = runtime.spawn(setup()).await;
+            stage.set(match outcome {
+                Ok(Ok(parts)) => Stage::Ready(SessionParts(Rc::new(parts))),
+                Ok(Err(err)) => Stage::Failed(
+                    err.chain()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join(": "),
+                ),
+                Err(err) => Stage::Failed(format!("the setup task stopped: {err}")),
+            });
+        });
+    });
+    let session = *generation.read();
+    match &*stage.read() {
+        Stage::Starting => rsx! {
+            div {
+                style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
+                h2 { "Signing in" }
+                p { "A browser page opens for the login. Come back here once you have signed in." }
+            }
+        },
+        Stage::Failed(detail) => {
+            let detail = detail.clone();
+            rsx! {
+                div {
+                    style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
+                    h2 { "connetto demo cannot start" }
+                    p { style: "color: #a33;", {detail} }
+                    p { "Check that the dev stack is up with CONNETTO_AUTH, CONNETTO_AUTH_BIND, CONNETTO_OIDC_PROVIDERS and the per-provider vars set, and on a phone that adb reverse forwards its ports." }
+                    button { onclick: move |_| Restart(generation).request(), "Try again" }
+                }
+            }
         }
-    };
-    let _guard = rt.enter();
-    let title = format!("connetto live demo (pid {})", std::process::id());
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new().with_window(
-                dioxus::desktop::WindowBuilder::new()
-                    .with_title(title)
-                    .with_inner_size(dioxus::desktop::LogicalSize::new(760.0, 1100.0)),
-            ),
-        )
-        .with_context(client)
-        .with_context(backend)
-        .with_context(auth_ctx)
-        .with_context(content)
-        .launch(app);
-}
-
-fn launch_startup_failure(err: &anyhow::Error) {
-    let detail = err
-        .chain()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(": ");
-    STARTUP_ERROR.set(detail).ok();
-    dioxus::LaunchBuilder::desktop()
-        .with_cfg(
-            dioxus::desktop::Config::new().with_window(
-                dioxus::desktop::WindowBuilder::new()
-                    .with_title("connetto demo: cannot start")
-                    .with_inner_size(dioxus::desktop::LogicalSize::new(620.0, 320.0)),
-            ),
-        )
-        .launch(startup_failure_app);
-}
-
-static STARTUP_ERROR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-
-fn startup_failure_app() -> Element {
-    let detail = STARTUP_ERROR
-        .get()
-        .cloned()
-        .unwrap_or_else(|| "unknown startup failure".to_owned());
-    rsx! {
-        div {
-            style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
-            h2 { "connetto demo cannot start" }
-            p { style: "color: #a33;", {detail} }
-            p { "Check that CONNETTO_AUTH, CONNETTO_AUTH_BIND, CONNETTO_OIDC_PROVIDERS, and per-provider vars are set, then relaunch." }
+        Stage::Ready(parts) => {
+            let parts = parts.clone();
+            rsx! { Session { key: "{session}", parts } }
         }
     }
 }
 
-async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx, Content)> {
+/// Provides one session's parts to the app for as long as it is mounted.
+#[component]
+fn Session(parts: SessionParts) -> Element {
+    use_context_provider(|| parts.0.client.clone());
+    use_context_provider(|| parts.0.backend.clone());
+    use_context_provider(|| parts.0.auth.clone());
+    use_context_provider(|| parts.0.content.clone());
+    rsx! { App {} }
+}
+
+async fn setup() -> anyhow::Result<Parts> {
     use anyhow::Context as _;
 
     let server =
@@ -237,7 +328,25 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx, Conten
 
     let (conn, auth_ctx, root_key) = setup_authenticated(transport).await?;
 
-    let client = ConnettoClient::start(conn);
+    // A dropped link redials the same address and resumes, so writes made
+    // while offline upload once the server is reachable again.
+    let (client, pump) = ConnettoClient::with_reconnect(
+        conn,
+        move || {
+            let server = server.clone();
+            async move {
+                let stream = TcpStream::connect(&server)
+                    .await
+                    .map_err(|err| err.to_string())?;
+                WebSocketTransport::connect("ws://127.0.0.1/", stream)
+                    .await
+                    .map_err(|err| err.to_string())
+            }
+        },
+        TokioSleeper,
+        ReconnectPolicy::default(),
+    );
+    let pump = tokio::spawn(pump);
 
     let (tx, mut rx) = mpsc::unbounded_channel::<DemoCmd>();
     tokio::spawn(async move {
@@ -294,9 +403,16 @@ async fn setup() -> anyhow::Result<(ConnettoClient<Ws>, Backend, AuthCtx, Conten
         .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?,
     );
     let cc_drive = Arc::clone(&content);
-    tokio::spawn(async move { cc_drive.drive_outbox(TokioSleeper).await });
+    let outbox = tokio::spawn(async move { cc_drive.drive_outbox(TokioSleeper).await });
 
-    Ok((client, Backend(tx), auth_ctx, content))
+    Ok(Parts {
+        client,
+        backend: Backend(tx),
+        auth: auth_ctx,
+        content,
+        pump,
+        outbox,
+    })
 }
 
 async fn setup_authenticated(
@@ -362,7 +478,10 @@ async fn setup_authenticated(
 
     let config = ClientConfig::new(key_name.clone())
         .with_login(Some(Grant::new(session.access_token)))
-        .with_schema_version(Some(connetto_core::SchemaVersion::from_source(SCHEMA_SQL)))
+        .with_schema_version(Some(connetto_core::SchemaVersion::from_sources([
+            SCHEMA_SQL,
+            POLICIES_SQL,
+        ])))
         .with_sql_functions(uuidv4_functions())
         .with_policy_tables(PolicyTables::from_translation(
             POLICY_TABLES.iter().copied(),
@@ -453,6 +572,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
             Some(format!("server closed the connection: {reason:?}"))
         }
         ClientEvent::Closed => Some("connection closed".to_owned()),
+        ClientEvent::AuthenticationRequired => {
+            Some("session expired, sign out and sign in again".to_owned())
+        }
         _ => None,
     }
 }
@@ -464,7 +586,9 @@ enum WipeState {
     Error(String),
 }
 
-fn app() -> Element {
+#[component]
+fn App() -> Element {
+    let restart = use_context::<Restart>();
     let client = use_context::<ConnettoClient<Ws>>();
     let backend = use_context::<Backend>();
     let auth_ctx = use_context::<AuthCtx>();
@@ -791,7 +915,7 @@ fn app() -> Element {
                                     )
                                     .await
                                     {
-                                        Ok(()) => restart(),
+                                        Ok(()) => restart.request(),
                                         Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) => {
                                             wipe_state.set(WipeState::ConfirmForce {
                                                 unsynced_count: seqs.len(),
@@ -829,7 +953,7 @@ fn app() -> Element {
                                             )
                                             .await
                                             {
-                                                Ok(()) => restart(),
+                                                Ok(()) => restart.request(),
                                                 Err(err) => {
                                                     wipe_state.set(WipeState::Error(format!(
                                                         "logout error: {err}"
@@ -906,7 +1030,7 @@ fn app() -> Element {
                                                     )));
                                                     return;
                                                 }
-                                                restart();
+                                                restart.request();
                                             });
                                         },
                                         "Switch"
@@ -923,7 +1047,7 @@ fn app() -> Element {
                                 padding: 10px 14px;",
                         p {
                             style: "margin: 0 0 8px 0; font-size: 0.9em;",
-                            "The app will restart and open a browser login page. \
+                            "The app will sign in again and open a browser login page. \
                              Come back after signing in to finish adding the account."
                         }
                         div {
@@ -947,7 +1071,7 @@ fn app() -> Element {
                                             )));
                                             return;
                                         }
-                                        restart();
+                                        restart.request();
                                     });
                                 },
                                 "Sign in"
@@ -1062,53 +1186,45 @@ fn app() -> Element {
                     }
                 }
 
-                // Pick and stage a photo; inserts an order row and a photo row together.
-                button {
-                    onclick: move |_| {
-                        let cc = pick_content.clone();
-                        spawn(async move {
-                            let Some(file) = rfd::AsyncFileDialog::new()
-                                .add_filter("images", &["jpg", "jpeg", "png"])
-                                .pick_file()
-                                .await
-                            else {
-                                return;
-                            };
-                            let path = file.path().to_owned();
-                            let Some(mime) = mime_from_extension(&path) else {
-                                photo_pick_msg.set(Some(
-                                    "not an image: only .jpg .jpeg .png are accepted".to_owned(),
-                                ));
-                                return;
-                            };
-                            let bytes = match tokio::fs::read(&path).await {
-                                Ok(b) => b,
-                                Err(err) => {
-                                    photo_pick_msg
-                                        .set(Some(format!("could not read the file: {err}")));
+                // Pick and stage a photo: inserts an order row and a photo row together.
+                label {
+                    "Pick and stage photo: "
+                    input {
+                        r#type: "file",
+                        accept: ".jpg,.jpeg,.png",
+                        onchange: move |evt: FormEvent| {
+                            let cc = pick_content.clone();
+                            let files = evt.files();
+                            spawn(async move {
+                                let Some(file) = files.into_iter().next() else {
                                     return;
+                                };
+                                let name = file.name();
+                                let Some(mime) = mime_from_extension(Path::new(&name)) else {
+                                    photo_pick_msg.set(Some(
+                                        "not an image: only .jpg .jpeg .png are accepted".to_owned(),
+                                    ));
+                                    return;
+                                };
+                                let bytes = match file.read_bytes().await {
+                                    Ok(b) => b,
+                                    Err(err) => {
+                                        photo_pick_msg
+                                            .set(Some(format!("could not read the file: {err}")));
+                                        return;
+                                    }
+                                };
+                                match cc.stage(bytes.as_ref(), mime, stage_photo_row).await {
+                                    Ok(_) => {
+                                        photo_pick_msg.set(Some(format!("staged: {name}")));
+                                    }
+                                    Err(err) => {
+                                        photo_pick_msg.set(Some(format!("stage failed: {err}")));
+                                    }
                                 }
-                            };
-                            let name = path
-                                .file_name()
-                                .and_then(|n| n.to_str())
-                                .unwrap_or("photo")
-                                .to_owned();
-                            match cc
-                                .stage(bytes.as_slice(), mime, stage_photo_row)
-                                .await
-                            {
-                                Ok(_) => {
-                                    photo_pick_msg.set(Some(format!("staged: {name}")));
-                                }
-                                Err(err) => {
-                                    photo_pick_msg
-                                        .set(Some(format!("stage failed: {err}")));
-                                }
-                            }
-                        });
-                    },
-                    "Pick and stage photo"
+                            });
+                        },
+                    }
                 }
                 if let Some(msg) = photo_pick_msg.read().clone() {
                     p {
@@ -1431,60 +1547,61 @@ fn app() -> Element {
                     style: "color: #666; font-size: 0.9em;",
                     "Pick an archive from this account. The file's version wins every clash."
                 }
-                button {
-                    onclick: move |_| {
-                        let cc = import_content.clone();
-                        spawn(async move {
-                            let Some(file) = rfd::AsyncFileDialog::new()
-                                .add_filter("archive", &["zip"])
-                                .pick_file()
-                                .await
-                            else {
-                                return;
-                            };
-                            let source = match std::fs::File::open(file.path()) {
-                                Ok(source) => source,
-                                Err(err) => {
-                                    import_status
-                                        .set(Some(format!("could not open it: {err}")));
+                label {
+                    "Import from file: "
+                    input {
+                        r#type: "file",
+                        accept: ".zip",
+                        onchange: move |evt: FormEvent| {
+                            let cc = import_content.clone();
+                            let files = evt.files();
+                            spawn(async move {
+                                let Some(file) = files.into_iter().next() else {
                                     return;
-                                }
-                            };
-                            let message = match cc.prepare_local_data_import(source).await {
-                                Err(err) => format!("refused: {err}"),
-                                Ok(mut plan) => {
-                                    let clash_count =
-                                        plan.replica_plan().collisions().len();
-                                    let choices = ImportChoices::keeping_the_file();
-                                    match cc
-                                        .apply_local_data_import(&mut plan, &choices)
-                                        .await
-                                    {
-                                        Ok(outcome) => {
-                                            let mut msg = format!(
-                                                "{} row(s) restored, {} kept, \
-                                                 {} write(s) restored, {} content file(s)",
-                                                outcome.rows_restored,
-                                                outcome.rows_kept,
-                                                outcome.writes_restored,
-                                                plan.content_files(),
-                                            );
-                                            if clash_count > 0 {
-                                                msg.push_str(&format!(
-                                                    " ({clash_count} clash(es) \
-                                                     resolved to the file)"
-                                                ));
-                                            }
-                                            msg
-                                        }
-                                        Err(err) => format!("apply failed: {err}"),
+                                };
+                                let source = match file.read_bytes().await {
+                                    Ok(bytes) => std::io::Cursor::new(bytes.to_vec()),
+                                    Err(err) => {
+                                        import_status
+                                            .set(Some(format!("could not read it: {err}")));
+                                        return;
                                     }
-                                }
-                            };
-                            import_status.set(Some(message));
-                        });
-                    },
-                    "Import from file"
+                                };
+                                let message = match cc.prepare_local_data_import(source).await {
+                                    Err(err) => format!("refused: {err}"),
+                                    Ok(mut plan) => {
+                                        let clash_count =
+                                            plan.replica_plan().collisions().len();
+                                        let choices = ImportChoices::keeping_the_file();
+                                        match cc
+                                            .apply_local_data_import(&mut plan, &choices)
+                                            .await
+                                        {
+                                            Ok(outcome) => {
+                                                let mut msg = format!(
+                                                    "{} row(s) restored, {} kept, \
+                                                     {} write(s) restored, {} content file(s)",
+                                                    outcome.rows_restored,
+                                                    outcome.rows_kept,
+                                                    outcome.writes_restored,
+                                                    plan.content_files(),
+                                                );
+                                                if clash_count > 0 {
+                                                    msg.push_str(&format!(
+                                                        " ({clash_count} clash(es) \
+                                                         resolved to the file)"
+                                                    ));
+                                                }
+                                                msg
+                                            }
+                                            Err(err) => format!("apply failed: {err}"),
+                                        }
+                                    }
+                                };
+                                import_status.set(Some(message));
+                            });
+                        },
+                    }
                 }
                 if let Some(message) = import_status.read().clone() {
                     p {
