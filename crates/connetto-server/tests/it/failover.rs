@@ -21,9 +21,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    LoopbackTransport, Materializer, NoConnector, NoSigner, OplogConfig, PgOplog, PgSnapshotSource,
-    Position, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager, TimelineHistory,
-    loopback, pg_write_target, timeline,
+    LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog, OplogConfig, PgOplog,
+    PgSnapshotSource, Position, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager,
+    TimelineHistory, loopback, pg_write_target, timeline,
 };
 use connetto_test_harness::Fixture;
 use connetto_test_harness::standby::{Pair, Switchboard};
@@ -63,7 +63,7 @@ async fn next_frame(client: &mut LoopbackTransport, what: &str) -> IncomingFrame
         .await
         .unwrap_or_else(|_| panic!("no frame within {WAIT:?} while waiting for {what}"))
         .expect("recv")
-        .expect("the connection stays open")
+        .unwrap_or_else(|| panic!("the connection closed while waiting for {what}"))
 }
 
 /// The order ids a patch inserts or updates.
@@ -149,6 +149,10 @@ async fn live(client: &mut LoopbackTransport, id: i64) -> Cursor {
                 | ControlMessage::SnapshotBegin(_)
                 | ControlMessage::SnapshotEnd(_),
             ) => panic!("a resuming cursor inside the window must not resync"),
+            IncomingFrame::Control(ControlMessage::FatalError(fatal)) => panic!(
+                "the connection closed with {:?} while waiting for order {id}",
+                fatal.reason
+            ),
             IncomingFrame::Control(_) | IncomingFrame::Bulk(_) => {}
         }
     }
@@ -370,6 +374,16 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
             }
         }
     }
+    // The partition must not cut off a log row for a change the synced slot already covers,
+    // or the promoted server rightly declares a gap and closes every connection.
+    let last_beat = *kept.last().expect("at least the first order");
+    let delivered = Position::from_cursor_bytes(live(&mut watcher, last_beat).await.as_bytes())
+        .expect("a stamped cursor")
+        .lsn;
+    let log = PgOplog::new(pool.clone(), OPLOG_TABLE, OplogConfig::default());
+    while log.current_lsn().await.expect("read the log") < Some(delivered) {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     pair.wait_replayed(&pair.primary_position().await).await;
 
     pair.partition_standby().await;
@@ -390,6 +404,8 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
         FatalErrorReason::DatabaseTimelineChanged,
         "a connection live through the promotion is closed so its cursor gets judged"
     );
+    // Handshakes wait for the feed, so none races the promoted server's gap check.
+    pair.wait_slot_active(SLOT).await;
 
     let mut returning = connect(&manager, Some(lost)).await;
     assert_eq!(

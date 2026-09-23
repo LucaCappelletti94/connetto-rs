@@ -251,6 +251,24 @@ impl Pair {
         wait_until(&self.standby, &question, "synchronize the failover slot").await;
     }
 
+    /// Wait until a consumer is streaming from `slot` on the standby, which after
+    /// a promotion means the change feed reconnected.
+    ///
+    /// # Panics
+    ///
+    /// When none is within the harness's startup timeout.
+    pub async fn wait_slot_active(&self, slot: &str) {
+        let question = format!(
+            "SELECT count(*) = 1 FROM pg_replication_slots WHERE slot_name = '{slot}' AND active"
+        );
+        wait_until(
+            &self.standby,
+            &question,
+            "serve the change feed from the slot",
+        )
+        .await;
+    }
+
     /// Whether the standby's copy of `slot` came from synchronization, which a
     /// slot recreated by hand after a promotion never does.
     pub async fn slot_was_synced(&self, slot: &str) -> bool {
