@@ -2469,7 +2469,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#50f3b0ce22a8a4ff22095d2baf943b2c9ae7e08a"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7e068a8c14ed9ec7eed0112427121d4e89799be8"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -2533,7 +2533,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#d3983044c09f340965e4b904015914bd09fbbefe"
 dependencies = [
  "log",
  "recursive",
@@ -2554,7 +2554,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#d3983044c09f340965e4b904015914bd09fbbefe"
 dependencies = [
  "proc-macro2",
  "quote",
