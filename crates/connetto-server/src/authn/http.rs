@@ -220,7 +220,7 @@ impl<Id> From<TokenPair<Id>> for TokenResponse<Id> {
 /// `Arc`), so it is implemented by hand to avoid an `S: Clone` bound.
 pub struct AuthState<S: AuthStore> {
     /// The `SameSite` attribute the refresh cookie renders with.
-    pub cookie_same_site: CookieSameSite,
+    cookie_same_site: CookieSameSite,
     service: Arc<AuthService<S>>,
     registry: Arc<ProviderRegistry>,
     pending: Arc<PendingLogins>,

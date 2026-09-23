@@ -1204,11 +1204,11 @@ async fn main() -> Result<()> {
 /// one origin means a deployment names its origins once.
 ///
 /// Credentials, which the R90 browser contract's `credentials: "include"`
-/// fetches need, ride only the listed origins, plus loopback pages when
-/// `loopback_listener` says the listener itself binds loopback. A deployed
-/// listener answers a loopback page without them, so under `SameSite=None`
-/// no local process can spend a user's refresh cookie and read the token.
-fn cors_layer(cors_origins: &[String], loopback_listener: bool) -> CorsLayer {
+/// fetches need, ride only the listed origins. A loopback page is answered
+/// without them unless it is listed, whatever address the listener binds, so
+/// under `SameSite=None` no local page can spend a user's refresh cookie and
+/// read the token. A development page lists its own origin to carry one.
+fn cors_layer(cors_origins: &[String]) -> CorsLayer {
     let answered = cors_origins.to_vec();
     let credentialed = cors_origins.to_vec();
     CorsLayer::new()
@@ -1218,28 +1218,14 @@ fn cors_layer(cors_origins: &[String], loopback_listener: bool) -> CorsLayer {
             })
         }))
         .allow_credentials(AllowCredentials::predicate(move |origin, _parts| {
-            origin.to_str().is_ok_and(|origin| {
-                (loopback_listener && is_loopback_origin(origin))
-                    || credentialed.iter().any(|allowed| allowed == origin)
-            })
+            origin
+                .to_str()
+                .is_ok_and(|origin| credentialed.iter().any(|allowed| allowed == origin))
         }))
         // Wildcards are illegal with credentials, so the answer mirrors what
         // the preflight asked for.
         .allow_methods(AllowMethods::mirror_request())
         .allow_headers(AllowHeaders::mirror_request())
-}
-
-/// Whether `auth_bind` (`host:port`) listens on loopback only, which is what
-/// marks a development listener. An unparsable host counts as not loopback.
-fn binds_loopback(auth_bind: &str) -> bool {
-    let Some((host, _port)) = auth_bind.rsplit_once(':') else {
-        return false;
-    };
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    host == "localhost"
-        || host
-            .parse::<std::net::IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Mount the file router on the auth listener's router before the CORS layer
@@ -1292,7 +1278,7 @@ fn spawn_auth_endpoints(
         ),
         file_router,
     )
-    .layer(cors_layer(cors_origins, binds_loopback(auth_bind)));
+    .layer(cors_layer(cors_origins));
     let auth_bind = auth_bind.to_owned();
     tokio::spawn(async move {
         match TcpListener::bind(&auth_bind).await {
@@ -1634,18 +1620,16 @@ mod tests {
         assert_eq!(comma_list(" , "), Vec::<String>::new());
     }
 
-    /// Credentials ride only the configured origins, and a loopback page only
-    /// when the listener itself binds loopback. A loopback page on a deployed
-    /// listener is still answered, without credentials, so under `SameSite=None`
-    /// a local process cannot spend the refresh cookie and read the token.
+    /// Credentials ride only the origins `CONNETTO_AUTH_CORS_ORIGINS` lists. A
+    /// loopback page is still answered without being listed, and without
+    /// credentials, whatever address the listener binds, so under
+    /// `SameSite=None` no local page can spend a refresh cookie it was not
+    /// listed for. A development page lists its own origin to carry one.
     #[tokio::test]
     async fn the_cors_layer_carries_credentials_only_for_trusted_origins() {
-        async fn answer(
-            app: &str,
-            origin: &str,
-            loopback_listener: bool,
-        ) -> axum::response::Response {
-            let layer = cors_layer(&[app.to_owned()], loopback_listener);
+        async fn answer(listed: &[&str], origin: &str) -> axum::response::Response {
+            let listed: Vec<String> = listed.iter().map(|&origin| origin.to_owned()).collect();
+            let layer = cors_layer(&listed);
             let router = layer.layer(axum::Router::new().route(
                 "/auth/refresh",
                 axum::routing::post(|| async { StatusCode::NO_CONTENT }),
@@ -1668,11 +1652,13 @@ mod tests {
                 .get("access-control-allow-credentials")
                 .is_some_and(|value| value == "true")
         }
+        const APP: &str = "https://app.example";
+        const DEV: &str = "http://127.0.0.1:5173";
 
-        let trusted = answer("https://app.example", "https://app.example", false).await;
+        let trusted = answer(&[APP], APP).await;
         assert_eq!(
             trusted.headers()["access-control-allow-origin"],
-            "https://app.example",
+            APP,
             "the configured origin is answered"
         );
         assert!(
@@ -1680,25 +1666,25 @@ mod tests {
             "and the answer permits the cookie to ride"
         );
 
-        let deployed = answer("https://app.example", "http://127.0.0.1:5173", false).await;
+        let unlisted = answer(&[APP], DEV).await;
         assert_eq!(
-            deployed.headers()["access-control-allow-origin"],
-            "http://127.0.0.1:5173",
+            unlisted.headers()["access-control-allow-origin"],
+            DEV,
             "a loopback page is answered without being configured"
         );
         assert!(
-            !credentialed(&deployed),
-            "but a deployed listener never lets its cookie ride from one"
+            !credentialed(&unlisted),
+            "but its cookie never rides until its origin is listed"
         );
 
-        let dev = answer("https://app.example", "http://127.0.0.1:5173", true).await;
+        let listed = answer(&[APP, DEV], DEV).await;
         assert!(
-            credentialed(&dev),
-            "a loopback listener lets a loopback dev page carry the cookie"
+            credentialed(&listed),
+            "a development page that lists its origin carries the cookie"
         );
 
         for hostile in ["https://evil.example", "http://evil.localhost:5173"] {
-            let answered = answer("https://app.example", hostile, true).await;
+            let answered = answer(&[APP], hostile).await;
             assert!(
                 !answered
                     .headers()
@@ -1706,21 +1692,6 @@ mod tests {
                 "{hostile} gets no answer, so the browser refuses it the response"
             );
             assert!(!credentialed(&answered), "and no credentials for {hostile}");
-        }
-    }
-
-    #[test]
-    fn only_a_loopback_bind_is_a_loopback_listener() {
-        for bind in ["127.0.0.1:8081", "[::1]:8081", "localhost:8081"] {
-            assert!(binds_loopback(bind), "{bind}");
-        }
-        for bind in [
-            "0.0.0.0:8081",
-            "[::]:8081",
-            "10.0.0.5:8081",
-            "auth.example:443",
-        ] {
-            assert!(!binds_loopback(bind), "{bind}");
         }
     }
 
@@ -1768,7 +1739,7 @@ mod tests {
         let file_routes =
             axum::Router::new().route("/files/{id}", axum::routing::get(|| async { "served" }));
         let app = mount_on_auth_listener(axum::Router::new(), Some(file_routes))
-            .layer(cors_layer(&["https://app.example".to_owned()], false));
+            .layer(cors_layer(&["https://app.example".to_owned()]));
 
         let preflight = app
             .clone()

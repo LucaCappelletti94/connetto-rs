@@ -82,7 +82,7 @@ pub enum AuthError {
     /// An existing database file is not a database this build can read, as a
     /// file written under a key reads without it. A wrong key and a corrupt
     /// file are indistinguishable to the page codec.
-    #[error("the database does not decrypt under the key supplied: {0}")]
+    #[error("the database file cannot be read: {0}")]
     Undecryptable(String),
     /// A key operation was refused because a credential is enrolled but no
     /// derived key-encryption key is held, or because this build cannot reach
