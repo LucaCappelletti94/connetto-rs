@@ -1099,6 +1099,7 @@ dependencies = [
  "openidconnect",
  "parking_lot",
  "pg2sqlite",
+ "pg_walstream",
  "ring",
  "rls2fga",
  "rmp-serde",
@@ -1133,7 +1134,9 @@ dependencies = [
  "keyutils",
  "openfga-client",
  "openidconnect",
+ "parking_lot",
  "pg2sqlite",
+ "reqwest 0.13.5",
  "ring",
  "rls2fga",
  "serde_json",
@@ -2171,7 +2174,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2440,7 +2443,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5386,7 +5389,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#844ae23de209c25ac089d830983ff6233ace3ed9"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#787815b7cb578e1407b524e7f43c73be91bd6b5b"
 dependencies = [
  "git2",
  "sql-traits",
@@ -6133,7 +6136,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -6778,7 +6781,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -7440,7 +7443,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#50f3b0ce22a8a4ff22095d2baf943b2c9ae7e08a"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7e068a8c14ed9ec7eed0112427121d4e89799be8"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -7461,9 +7464,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9492ba2237745ec8d2c2475b23097ceb916d1175d264d7aeb1e44399face303f"
+checksum = "26dd4527d7fe7a00a76907a4512c2fdefaa3b5dc20a5c7801d8ff614eae9dc4a"
 dependencies = [
  "diesel",
  "diesel-async",
@@ -7491,7 +7494,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f354ee25fc7ac9919adbbf6e5a3b6da2f6eadc80"
 dependencies = [
  "log",
  "recursive",
@@ -7521,7 +7524,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#1195239663b48a51bf6b153f5d5150ec71042335"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f354ee25fc7ac9919adbbf6e5a3b6da2f6eadc80"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7621,7 +7624,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#884b80e657a251f55157715ff726d9a6867f3540"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#daa081889b8fd6fa9734de25da1fe4438126ecb8"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -7831,10 +7834,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8945,7 +8948,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
