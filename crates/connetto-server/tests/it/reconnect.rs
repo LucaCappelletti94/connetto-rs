@@ -533,6 +533,8 @@ struct Script {
     /// Every read asked for since the script was armed.
     reads: Vec<&'static str>,
     armed: bool,
+    /// Holds the next entries read until the test releases it, telling the test it arrived.
+    hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 /// An in-memory reconnect log that refuses scripted reads, as a database does while it is cut off.
@@ -603,6 +605,11 @@ impl Oplog for ScriptedOplog {
     }
 
     async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, Refused> {
+        let hold = self.script.lock().expect("script").hold.take();
+        if let Some((arrived, release)) = hold {
+            arrived.notify_one();
+            release.notified().await;
+        }
         self.gate("entries_since").await?;
         self.inner
             .entries_since(lsn)
@@ -658,7 +665,7 @@ async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> Loopba
     client
 }
 
-/// A manager on a scripted log holding three matching orders, and their events.
+/// A manager on a scripted log holding three matching orders, their events, and the source that wrote them.
 async fn scripted(
     fixture: &Fixture,
     config: SessionConfig,
@@ -666,6 +673,7 @@ async fn scripted(
     Arc<ScriptedManager>,
     Arc<std::sync::Mutex<Script>>,
     Vec<ChangeEvent>,
+    PgSqliteEmuSource,
 ) {
     let script = Arc::new(std::sync::Mutex::new(Script::default()));
     let manager = SessionManager::with_oplog(
@@ -693,7 +701,7 @@ async fn scripted(
         );
         events.extend(drive(&mut source, &manager, &sql).await);
     }
-    (manager, script, events)
+    (manager, script, events, source)
 }
 
 /// Arm `script` to refuse `reads` in order.
@@ -715,7 +723,7 @@ fn arm(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
     let fixture = Fixture::acquire().await;
-    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
+    let (manager, script, events, _source) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     arm(
         &script,
@@ -754,7 +762,7 @@ async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_catchup_whose_entries_were_pruned_while_it_waited_resyncs() {
     let fixture = Fixture::acquire().await;
-    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
+    let (manager, script, events, _source) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     let second = events[1].checkpoint().expect("a checkpoint").0;
     arm(&script, &["entries_since"], true, Some(second));
@@ -770,7 +778,7 @@ async fn a_catchup_whose_entries_were_pruned_while_it_waited_resyncs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_ended_by_an_error_leaves_no_connection_registered() {
     let fixture = Fixture::acquire().await;
-    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
+    let (manager, script, events, _source) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     assert_eq!(manager.live_connections().await, 1);
     arm(&script, &["min_lsn"], false, None);
@@ -792,7 +800,7 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
     const BUDGET: Duration = Duration::from_secs(2);
     let fixture = Fixture::acquire().await;
     let config = SessionConfig::default().with_resume_read_budget(BUDGET);
-    let (manager, script, events) = scripted(&fixture, config).await;
+    let (manager, script, events, _source) = scripted(&fixture, config).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     let started = tokio::time::Instant::now();
 
@@ -827,4 +835,36 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
         waited < BUDGET + Duration::from_millis(500),
         "the connection waited {waited:?} on the log, past its budget of {BUDGET:?}"
     );
+}
+
+/// A change that goes live while a resume is still replaying older entries is delivered after them, and the replay does not end the connection for trailing the cursor the live change already moved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_change_that_goes_live_during_a_replay_follows_it() {
+    let fixture = Fixture::acquire().await;
+    let (manager, script, events, mut source) = scripted(&fixture, SessionConfig::default()).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+    subscribe(&mut client).await;
+
+    // The route stands and the ceiling is read by the time the replay asks for its entries.
+    arrived.notified().await;
+    let live = drive(
+        &mut source,
+        &manager,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (4, 1.0, 4, 'row')",
+    )
+    .await;
+    release.notify_one();
+
+    for event in events[1..].iter().chain(&live) {
+        let BulkMessage::LivePatch(patch) = next_bulk(&mut client).await else {
+            panic!("expected the replay and then the live change");
+        };
+        assert_eq!(patch.cursor, cursor_of(event));
+    }
+    expect_idle(&mut client).await;
 }

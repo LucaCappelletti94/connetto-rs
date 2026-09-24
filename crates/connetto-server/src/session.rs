@@ -44,7 +44,10 @@ use subql::backend::{CdcEvent, Postgres, ScalarFamily, Value as PgValue};
 use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
-use subql::{CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId, TableLike};
+use subql::{
+    AdvanceCursorError, CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId,
+    TableLike,
+};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -5221,12 +5224,18 @@ where
                 continue;
             };
             let cursor = self.stamp(&record.lsn().to_be_bytes());
-            {
+            let advanced = {
                 self.materializer.lock().await.advance_cursor(
                     state.session_id.as_u64_key(),
                     reg.sub_id,
                     &cursor,
-                )?;
+                )
+            };
+            match advanced {
+                // A live change dispatched since the route went up already moved the cursor past this entry, and its patch queues behind the replay.
+                Ok(())
+                | Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {}
+                Err(err) => return Err(err.into()),
             }
             let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
             enqueue_and_flush(

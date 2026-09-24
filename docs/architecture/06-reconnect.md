@@ -134,6 +134,8 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 
 **Built (2026-09-24).** Every reconnect-log read a resume makes, the handshake's position and the catchup's window, ceiling and entries, retries a failure to reach the database under one backoff whose waits add up to at most 30 seconds per connection however many subscriptions it resumes (`SessionConfig::with_resume_read_budget`), so a resume that straddles a failover waits rather than ending. After reading its entries the catchup reads the oldest retained entry once more, and a window that no longer reaches `last_lsn` takes Case 2 with `CursorOutsideRetention` instead of a replay with a gap. A read that still fails ends the session without a fatal frame, since no reason names it, and the session releases its registration and its subscriptions on that exit as on every other.
 
+**Built (2026-09-24).** A change that goes live while a catchup is still replaying moves the subscription's resume position in subql past the entries still being replayed, because the route stands before the replay starts. A replayed entry that trails it leaves the position where the live change put it and is still delivered, and the live patch reaches the client after the replay because only this connection's task sends on its transport.
+
 ### Case 2: Client's LSN is outside the oplog window (or LSN = 0)
 
 1. The client's resume cursor predates the oldest available oplog entry. It cannot catch up incrementally.
