@@ -162,6 +162,30 @@ async fn a_connection_opens_and_serves_reads_with_no_server() {
     assert!(matches!(conn.ping(1).await, Err(ClientError::NotConnected)));
 }
 
+/// However many writes wait for a server, none is given up, the oldest included, since during an outage the oldest is the write the server deferred.
+#[tokio::test]
+async fn no_waiting_write_is_evicted_however_many_queue() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("queue.sqlite");
+    let replica = Replica::encrypted_file(
+        path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+
+    let mut queued = Vec::new();
+    for id in 0..300 {
+        diesel::insert_into(items::table)
+            .values((items::id.eq(id), items::label.eq("waiting")))
+            .execute(conn.conn())
+            .expect("write with no server");
+        queued.push(conn.push().await.expect("queue the write").expect("a seq"));
+    }
+    assert_eq!(conn.unsynced(), queued, "every write still waits, in order");
+}
+
 /// Part two: the same connection, handed a transport, sends what it queued.
 #[tokio::test]
 async fn attaching_a_transport_later_replays_what_was_queued() {

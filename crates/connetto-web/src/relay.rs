@@ -109,11 +109,6 @@ const MAX_STAGED_CONTENT: usize = 8;
 /// hub answers `Unavailable`.
 const RESOLVE_WAIT_MS: i32 = 15_000;
 
-/// Upstream sequence numbers retained for mapping rejections back to a tab.
-/// A rejection arrives well within this window, mirroring the client's own
-/// pending cap.
-const SEQ_MAP_CAP: usize = 256;
-
 /// The delivery-credit window the hub advertises and enforces per tab,
 /// matching the server's `initial_credits`. Only bulk frames (`LivePatch`,
 /// `SnapshotPatch`) consume credits, so keepalive and acknowledgements cannot
@@ -477,10 +472,9 @@ const HUB_SCHEMA: &str = "connetto_hub";
 #[derive(Default)]
 struct HubState {
     tabs: HashMap<TabId, TabState>,
-    /// Upstream push sequence to the owning tab and its sequence, for
-    /// mapping rejections back. Entries of accepted mutations linger
-    /// (acceptance has no reply), so the map is pruned oldest-first past
-    /// [`SEQ_MAP_CAP`].
+    /// Upstream push sequence to the owning tab and its sequence, for mapping
+    /// the server's answer back. An entry leaves when the server settles its
+    /// write, like the worker's own pending record, so none is dropped early.
     seq_map: BTreeMap<u64, (TabId, u64)>,
     blank: BlankState,
     /// Lowercased names of the device-private tables the worker connection has
@@ -3286,9 +3280,6 @@ where
     }
     if let Some(worker_seq) = worker.push().await.map_err(RelayError::from)? {
         state.seq_map.insert(worker_seq, (id, tab_seq));
-        if state.seq_map.len() > SEQ_MAP_CAP {
-            state.seq_map.pop_first();
-        }
     }
     Ok(())
 }

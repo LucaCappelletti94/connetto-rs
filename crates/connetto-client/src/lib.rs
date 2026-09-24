@@ -1159,10 +1159,6 @@ fn server_wins(conflict: ConflictType) -> ConflictAction {
     }
 }
 
-/// Maximum number of pushed mutations retained for rollback. A server rejection
-/// arrives well within this window, so the changeset to invert is still held.
-const PENDING_CAP: usize = 256;
-
 /// The schedule a deferred write is sent again on. Uncapped, because a write
 /// the server could not settle is kept like an offline one.
 static RESEND_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
@@ -1767,16 +1763,6 @@ fn validate_archive_compat(
     Ok(())
 }
 
-fn check_pending_capacity(held: usize, incoming: usize) -> Result<(), ClientError> {
-    let queued = held.saturating_add(incoming);
-    if queued > PENDING_CAP {
-        return Err(ClientError::Import(format!(
-            "the archive carries {incoming} queued writes and this replica already holds {held}, which is past the {PENDING_CAP} it can hold"
-        )));
-    }
-    Ok(())
-}
-
 fn resolve_import_columns(
     db: &mut SqliteConnection,
     local_tables: &HashSet<String>,
@@ -2339,8 +2325,8 @@ pub struct ConnettoConnection<T: Transport> {
     /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `db`.
     transaction_state: AnsiTransactionManager,
     /// Changesets of pushed mutations awaiting resolution, keyed by `client_seq`,
-    /// so a server rejection can be inverted and rolled back locally. Bounded by
-    /// `PENDING_CAP`.
+    /// so a server rejection can be inverted and rolled back locally. Nothing
+    /// is ever evicted from it, and a record leaves only when the server settles it.
     pending: BTreeMap<u64, Vec<u8>>,
     /// Where sending the writes the server deferred again stands.
     resend: Resend,
@@ -3175,7 +3161,6 @@ where
             &self.schema_fingerprint()?,
             self.account().as_deref(),
         )?;
-        check_pending_capacity(self.pending.len(), archive.pending.len())?;
         let (local_columns, main_columns) =
             resolve_import_columns(&mut self.db, &self.local_tables, &self.hidden_tables)?;
         for changeset in &archive.pending {
@@ -3850,14 +3835,6 @@ where
         {
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             persist_pending(&mut self.db, seq, &changeset)?;
-            // The cap is a safety valve against a server that never
-            // acknowledges: evicting a record gives up its replay.
-            if self.pending.len() >= PENDING_CAP
-                && let Some((&oldest, _)) = self.pending.first_key_value()
-            {
-                self.pending.pop_first();
-                delete_pending(&mut self.db, oldest)?;
-            }
         }
         // Reset capture: a fresh session records only writes after this push.
         let mut fresh = self
@@ -4996,71 +4973,6 @@ mod tests {
                 assert!(
                     message.contains("ghosts"),
                     "the refusal names it: {message}"
-                );
-            }
-            other => panic!("expected a refusal, got {}", other.is_ok()),
-        }
-    }
-
-    /// The cap bounds the queue after the import, not the archive alone: a
-    /// replica already holding writes of its own has that much less room, and
-    /// the eviction that would otherwise take the difference is silent.
-    #[test]
-    fn a_queue_that_does_not_fit_beside_the_replicas_own_is_refused() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut conn = tiered_connection(&dir);
-        let fingerprint = conn.schema_fingerprint().expect("fingerprint");
-        // The replica is already at its cap, so one more write does not fit.
-        for seq in 0..PENDING_CAP as u64 {
-            conn.pending.insert(seq, Vec::new());
-        }
-        let bytes = archive_bytes(&archive::Archive {
-            scope: ExportScope::Unsynced,
-            fingerprint,
-            account: None,
-            synced_rows: None,
-            local_rows: None,
-            pending: vec![Vec::new()],
-            attachments: &[],
-        });
-        match conn.import_local_data(std::io::Cursor::new(&bytes)) {
-            Err(ClientError::Import(message)) => {
-                assert!(
-                    message.contains("already holds 256"),
-                    "the refusal names what is already queued: {message}"
-                );
-            }
-            other => panic!("expected a refusal, got {}", other.is_ok()),
-        }
-    }
-
-    /// A queue longer than the replica holds is refused whole rather than
-    /// trimmed, because the queue evicts its oldest record when full and an
-    /// import may never give up a write.
-    ///
-    /// Also unreachable from an honest export, for the same reason from the
-    /// other side: the source's own queue is capped at `PENDING_CAP`.
-    #[test]
-    fn an_oversized_queue_is_refused_whole() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let mut conn = tiered_connection(&dir);
-        let fingerprint = conn.schema_fingerprint().expect("fingerprint");
-        // The records themselves are never reached: the count is checked
-        // first, which is the point.
-        let bytes = archive_bytes(&archive::Archive {
-            scope: ExportScope::Unsynced,
-            fingerprint,
-            account: None,
-            synced_rows: None,
-            local_rows: None,
-            pending: vec![Vec::new(); PENDING_CAP + 1],
-            attachments: &[],
-        });
-        match conn.import_local_data(std::io::Cursor::new(&bytes)) {
-            Err(ClientError::Import(message)) => {
-                assert!(
-                    message.contains("queued writes") && message.contains("256"),
-                    "the refusal names the cap: {message}"
                 );
             }
             other => panic!("expected a refusal, got {}", other.is_ok()),
