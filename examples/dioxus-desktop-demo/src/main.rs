@@ -2,9 +2,10 @@
 //! built with `dx` for the `mobile` feature, on Android.
 //!
 //! The window opens first and setup runs as a task behind it. Setup acquires
-//! a connetto session via the RFC 8252 loopback PKCE flow against
-//! `connetto-server`'s auth endpoints in the system browser (or silently
-//! refreshes if a refresh token is already stored), names the replica from the
+//! a connetto session through RFC 8252's PKCE flow against `connetto-server`'s
+//! auth endpoints, on a desktop in the system browser with a loopback
+//! redirect and on a phone in a Custom Tab with the app's own redirect (or
+//! silently refreshes if a refresh token is already stored), names the replica from the
 //! resolved identity, opens it with an OS-keyring-held encryption key, and
 //! starts a pump that redials and resumes whenever the link drops. Signing out
 //! calls `forget_device` (credential revoke plus key destroy) and runs setup
@@ -84,6 +85,49 @@ const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 const AUTH_PROVIDER: &str = "dev-idp";
 const REPLICA_PREFIX: &str = "connetto-desktop-demo";
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
+/// The login redirect on a phone, whose scheme is the app's bundle identifier
+/// (`Dioxus.toml`), the scheme the bundled redirect activity claims.
+#[cfg(target_os = "android")]
+const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
+/// How long a login in the browser tab may take.
+#[cfg(target_os = "android")]
+const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// On a phone, sign in through the platform's in-app browser tab and the app's
+/// own redirect (RFC 8252 section 7.1).
+#[cfg(target_os = "android")]
+fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
+    authenticator.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
+}
+
+/// The Custom Tab and the app's redirect, through `connetto-auth-session`.
+#[cfg(target_os = "android")]
+struct TabSession;
+
+#[cfg(target_os = "android")]
+impl connetto_client::AuthorizationSession for TabSession {
+    fn authorize(&self, url: String) -> connetto_client::SessionFuture {
+        Box::pin(async move {
+            connetto_auth_session::authorize(&url, LOGIN_WINDOW)
+                .await
+                .map_err(|err| connetto_client::ClientError::Auth(err.to_string()))
+        })
+    }
+
+    fn delivered(&self) -> Option<String> {
+        connetto_auth_session::delivered().unwrap_or_else(|err| {
+            tracing::warn!(error = %err, "reading a delivered login redirect");
+            None
+        })
+    }
+}
+
+/// On a desktop, sign in through the system browser and a loopback listener
+/// (RFC 8252 section 7.3).
+#[cfg(not(target_os = "android"))]
+fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
+    authenticator
+}
 
 // The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
 // local write omits the id and this registered function mints it.
@@ -437,14 +481,14 @@ async fn setup_authenticated(
 
     let account =
         remembered_account(token_store.as_ref()).context("reading the remembered account")?;
-    let authenticator = Arc::new(NativeAuthenticator::new(
+    let authenticator = Arc::new(platform_sign_in(NativeAuthenticator::new(
         std::env::var("CONNETTO_DEMO_AUTH_ORIGIN")
             .unwrap_or_else(|_| DEFAULT_AUTH_ORIGIN.to_owned()),
         AUTH_PROVIDER,
         Arc::clone(&token_store)
             as Arc<dyn RefreshTokenStore<Error = connetto_client::ClientError> + Send + Sync>,
         account,
-    ));
+    )));
 
     let session = authenticator
         .acquire::<String>()

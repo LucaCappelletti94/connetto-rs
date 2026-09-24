@@ -28,6 +28,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::replica::PENDING_LOGIN_RECORD;
 use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
 
 fn ensure_keyring_store() -> Result<(), ClientError> {
@@ -515,8 +516,44 @@ impl<Id> From<TokenResponse<Id>> for AcquiredSession<Id> {
     }
 }
 
+/// What [`AuthorizationSession::authorize`] resolves to.
+pub type SessionFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<String, ClientError>> + Send>>;
+
+/// The platform's browser session a login runs in, returning through a
+/// redirect the operating system routes to the app.
+///
+/// On a phone, RFC 8252 has the login open in an in-app browser tab that
+/// returns through an app-claimed redirect, where a desktop listens on
+/// loopback instead.
+pub trait AuthorizationSession: Send + Sync {
+    /// Open `url` and resolve to the redirect URL delivered back to the app,
+    /// which carries `code` and `state`.
+    fn authorize(&self, url: String) -> SessionFuture;
+
+    /// A redirect this process received before it started any login, which is
+    /// what a process the system started to deliver it holds.
+    fn delivered(&self) -> Option<String>;
+}
+
+/// An app-claimed redirect and the session that receives it.
+struct ClaimedRedirect {
+    uri: String,
+    session: Arc<dyn AuthorizationSession>,
+}
+
+/// A login through an app-claimed redirect, persisted before the browser tab
+/// opens so that a process the redirect starts can finish it.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct PendingLogin {
+    verifier: String,
+    state: String,
+    redirect_uri: String,
+}
+
 /// Acquires and refreshes connetto's own tokens for a native client, driving the
-/// loopback Authorization Code plus PKCE flow against connetto-server.
+/// Authorization Code plus PKCE flow against connetto-server, over loopback or
+/// an app-claimed redirect.
 ///
 /// It holds the account whose stored credential it should try, rather than
 /// passing one at each call, so no two call sites can disagree about which
@@ -528,6 +565,7 @@ pub struct NativeAuthenticator {
     store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
     account: std::sync::Mutex<Option<String>>,
     opener: BrowserOpener,
+    claimed: Option<ClaimedRedirect>,
     http: reqwest::Client,
 }
 
@@ -555,6 +593,7 @@ impl NativeAuthenticator {
             store,
             account: std::sync::Mutex::new(account),
             opener: system_browser_opener(),
+            claimed: None,
             http: reqwest::Client::new(),
         }
     }
@@ -563,6 +602,27 @@ impl NativeAuthenticator {
     #[must_use]
     pub fn with_browser_opener(mut self, opener: BrowserOpener) -> Self {
         self.opener = opener;
+        self
+    }
+
+    /// Log in through `redirect_uri`, a redirect the app registered with its
+    /// operating system, with `session` running the browser and returning what
+    /// the redirect delivered, instead of a loopback listener. The server must
+    /// list `redirect_uri` in its redirect allowlist.
+    ///
+    /// Such a login is persisted in the refresh-token store while the browser
+    /// is open, so a process the system restarts to deliver the redirect can
+    /// finish it.
+    #[must_use]
+    pub fn with_claimed_redirect(
+        mut self,
+        redirect_uri: impl Into<String>,
+        session: Arc<dyn AuthorizationSession>,
+    ) -> Self {
+        self.claimed = Some(ClaimedRedirect {
+            uri: redirect_uri.into(),
+            session,
+        });
         self
     }
 
@@ -627,41 +687,109 @@ impl NativeAuthenticator {
         Ok(response)
     }
 
-    /// Run the interactive loopback login: bind a `127.0.0.1` listener, open the
-    /// system browser at connetto-server's login endpoint, catch the redirected
-    /// code, exchange it with the PKCE verifier, and store the refresh token.
+    /// Run the interactive login: open connetto-server's login endpoint, catch
+    /// the redirected code, exchange it with the PKCE verifier, and store the
+    /// refresh token. The code comes back through the app-claimed redirect when
+    /// one is set, and through a `127.0.0.1` listener otherwise.
+    ///
+    /// With a claimed redirect, a login an earlier process started and the
+    /// system killed is finished first when its redirect was delivered to this
+    /// one, and replaced by a new login otherwise.
     ///
     /// # Errors
     ///
-    /// [`ClientError::Auth`] on any loopback, browser, or exchange failure.
+    /// [`ClientError::Auth`] on any redirect, browser, or exchange failure, and
+    /// when the returned `state` is not the one this login sent.
     pub async fn login<Id: DeserializeOwned + serde::Serialize>(
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
+        if let Some(claimed) = &self.claimed
+            && let Some(session) = self.resume(claimed).await?
+        {
+            return Ok(session);
+        }
         let verifier = random_token();
         let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
         let state = random_token();
-        let listener = TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|err| ClientError::Auth(format!("loopback bind: {err}")))?;
-        let port = listener
-            .local_addr()
-            .map_err(|err| ClientError::Auth(format!("loopback addr: {err}")))?
-            .port();
-        let redirect_uri = format!("http://127.0.0.1:{port}/callback");
-        let url = format!(
-            "{}/auth/login?provider={}&redirect_uri={}&code_challenge={}&state={}",
-            self.server_base,
-            percent_encode(&self.provider),
-            percent_encode(&redirect_uri),
-            percent_encode(&challenge),
-            percent_encode(&state),
-        );
-        (self.opener)(&url)?;
-
-        let (code, returned_state) = accept_loopback_code(&listener).await?;
+        let login_url = |redirect_uri: &str| {
+            format!(
+                "{}/auth/login?provider={}&redirect_uri={}&code_challenge={}&state={}",
+                self.server_base,
+                percent_encode(&self.provider),
+                percent_encode(redirect_uri),
+                percent_encode(&challenge),
+                percent_encode(&state),
+            )
+        };
+        let (code, returned_state) = if let Some(claimed) = &self.claimed {
+            let pending = PendingLogin {
+                verifier: verifier.clone(),
+                state: state.clone(),
+                redirect_uri: claimed.uri.clone(),
+            };
+            let pending = serde_json::to_string(&pending)
+                .map_err(|err| ClientError::Auth(format!("recording the login: {err}")))?;
+            self.store.store(PENDING_LOGIN_RECORD, &pending)?;
+            let delivered = claimed.session.authorize(login_url(&claimed.uri)).await;
+            // This process saw the login end, so nothing is left to resume.
+            self.store.clear(PENDING_LOGIN_RECORD)?;
+            let delivered = delivered?;
+            code_and_state(query_of(&delivered), "redirect")?
+        } else {
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|err| ClientError::Auth(format!("loopback bind: {err}")))?;
+            let port = listener
+                .local_addr()
+                .map_err(|err| ClientError::Auth(format!("loopback addr: {err}")))?
+                .port();
+            (self.opener)(&login_url(&format!("http://127.0.0.1:{port}/callback")))?;
+            accept_loopback_code(&listener).await?
+        };
         if returned_state != state {
-            return Err(ClientError::Auth("loopback state mismatch".to_owned()));
+            return Err(ClientError::Auth("login state mismatch".to_owned()));
         }
+        self.redeem(&code, &verifier).await
+    }
+
+    /// Finish the login an earlier process persisted, when the redirect that
+    /// carries its `state` was delivered to this one. `None` means a new login
+    /// has to start, and the persisted record is gone either way.
+    async fn resume<Id: DeserializeOwned + serde::Serialize>(
+        &self,
+        claimed: &ClaimedRedirect,
+    ) -> Result<Option<AcquiredSession<Id>>, ClientError> {
+        let Some(pending) = self.store.load(PENDING_LOGIN_RECORD)? else {
+            return Ok(None);
+        };
+        self.store.clear(PENDING_LOGIN_RECORD)?;
+        let Some(delivered) = claimed.session.delivered() else {
+            return Ok(None);
+        };
+        let Ok(pending) = serde_json::from_str::<PendingLogin>(&pending) else {
+            return Ok(None);
+        };
+        let Ok((code, state)) = code_and_state(query_of(&delivered), "redirect") else {
+            return Ok(None);
+        };
+        if state != pending.state || pending.redirect_uri != claimed.uri {
+            return Ok(None);
+        }
+        match self.redeem(&code, &pending.verifier).await {
+            Ok(session) => Ok(Some(session)),
+            // An expired or spent code, so a new login is the way forward.
+            Err(ClientError::Auth(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
+    /// Exchange `code` with its PKCE `verifier` and store the credential it
+    /// yields under the account it reveals.
+    async fn redeem<Id: DeserializeOwned + serde::Serialize>(
+        &self,
+        code: &str,
+        verifier: &str,
+    ) -> Result<AcquiredSession<Id>, ClientError> {
         let response: TokenResponse<Id> = self
             .post_json(
                 &format!("{}/auth/token", self.server_base),
@@ -844,16 +972,7 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
         .and_then(|line| line.split_whitespace().nth(1))
         .unwrap_or("");
     let query = target.split_once('?').map_or("", |(_, query)| query);
-
-    let mut code = None;
-    let mut state = None;
-    for pair in query.split('&') {
-        if let Some(value) = pair.strip_prefix("code=") {
-            code = Some(percent_decode(value));
-        } else if let Some(value) = pair.strip_prefix("state=") {
-            state = Some(percent_decode(value));
-        }
-    }
+    let delivered = code_and_state(query, "loopback callback");
 
     let page =
         "<!doctype html><html><body>Login complete. You may close this window.</body></html>";
@@ -863,10 +982,28 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
     );
     let _ = stream.write_all(response.as_bytes()).await;
     let _ = stream.flush().await;
+    delivered
+}
 
-    let code = code.ok_or_else(|| ClientError::Auth("loopback callback had no code".to_owned()))?;
-    let state =
-        state.ok_or_else(|| ClientError::Auth("loopback callback had no state".to_owned()))?;
+/// The query of a URL, or nothing when it has none.
+fn query_of(url: &str) -> &str {
+    url.split_once('?').map_or("", |(_, query)| query)
+}
+
+/// The `code` and `state` a redirect's query carries, where `what` names the
+/// redirect in the error.
+fn code_and_state(query: &str, what: &str) -> Result<(String, String), ClientError> {
+    let mut code = None;
+    let mut state = None;
+    for pair in query.split('&') {
+        if let Some(value) = pair.strip_prefix("code=") {
+            code = Some(percent_decode(value));
+        } else if let Some(value) = pair.strip_prefix("state=") {
+            state = Some(percent_decode(value));
+        }
+    }
+    let code = code.ok_or_else(|| ClientError::Auth(format!("the {what} had no code")))?;
+    let state = state.ok_or_else(|| ClientError::Auth(format!("the {what} had no state")))?;
     Ok((code, state))
 }
 

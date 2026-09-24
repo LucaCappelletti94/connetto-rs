@@ -32,10 +32,12 @@ chrono = { version = "0.4.45", default-features = false, features = ["clock", "s
 connetto-file-client = { path = "../../crates/connetto-file-client" }
 base64 = "0.22"
 
-# The app's private files directory on Android (`Context.getFilesDir`), read
-# through the activity context Dioxus Mobile publishes.
 [target.'cfg(target_os = "android")'.dependencies]
+# The app's private files directory (`Context.getFilesDir`), read through the
+# activity context Dioxus Mobile publishes.
 robius-directories = "6"
+# Sign-in through a Custom Tab and the app's own redirect.
+connetto-auth-session = { path = "../../crates/connetto-auth-session" }
 
 [features]
 default = ["desktop"]

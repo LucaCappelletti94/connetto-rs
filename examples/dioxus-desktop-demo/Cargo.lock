@@ -922,6 +922,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-auth-session"
+version = "0.0.0"
+dependencies = [
+ "manganis",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "connetto-client"
 version = "0.0.0"
 dependencies = [
@@ -1002,6 +1011,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "connetto-auth-session",
  "connetto-client",
  "connetto-core",
  "connetto-demo-deployment",

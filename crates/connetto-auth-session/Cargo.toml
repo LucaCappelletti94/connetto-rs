@@ -1,0 +1,24 @@
+[package]
+name = "connetto-auth-session"
+description = "The platform browser session a native connetto app signs in through on mobile, returning through a redirect the operating system routes to the app."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+# `ffi` bundles the Kotlin module into the app, and `android::with_activity`
+# reaches the Activity without code of our own touching raw JNI pointers.
+manganis = "0.7.10"
+# Polling for the redirect within the caller's bound.
+tokio = { workspace = true, features = ["time"] }

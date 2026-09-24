@@ -35,6 +35,10 @@ const DEMO_AUTH_PORT: u16 = 18081;
 const PROVIDER: &str = "dev-idp";
 /// The port in the demo's default `CONNETTO_DEMO_PG`.
 const DEMO_PG_PORT: u16 = 55456;
+/// The demo's redirect on a phone, its bundle identifier as the scheme. The
+/// server lists it by exact match, as RFC 8252 section 7.1 has an operator
+/// register an app's scheme.
+const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
 
 const DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../../examples/dioxus-desktop-demo/schema.sql"),
@@ -71,6 +75,10 @@ async fn main() -> Result<()> {
     let idp = MockOauth::start().await;
     let mut envs = provisioned.server_env(&DEPLOYMENT, &sync_bind, &auth_bind, &auth_base);
     envs.extend(idp.env_pairs(PROVIDER, &format!("{auth_base}/auth/callback")));
+    envs.push((
+        "CONNETTO_AUTH_REDIRECT_ALLOWLIST".to_owned(),
+        APP_REDIRECT.to_owned(),
+    ));
     let _server = spawn_server(&server_bin, &envs, &sync_bind, &auth_bind).await?;
 
     let pg_url = provisioned.fixture.admin_url();
