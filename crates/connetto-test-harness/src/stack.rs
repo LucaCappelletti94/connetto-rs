@@ -98,6 +98,7 @@ pub async fn provision(deployment: &Deployment, label: &str) -> Result<Provision
     let fixture = Fixture::acquire().await;
     fixture.setup(&[deployment.schema]).await;
     fixture.setup(&[DEPLOYMENT_SQL]).await;
+    fixture.setup(&[connetto_server::epoch::EPOCH_DDL]).await;
     provision_auth_tables(&fixture).await;
     fixture.setup(&[deployment.roles]).await;
     fixture.setup(&[deployment.content]).await;
