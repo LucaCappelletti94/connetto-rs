@@ -778,6 +778,34 @@ fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
 
+/// The retry one resume's reconnect-log reads share, 200 ms doubling to 5 s and 30 s in all.
+fn resume_read_policy() -> RetryPolicy {
+    RetryPolicy::new().with_max_total_backoff(Some(Duration::from_secs(30)))
+}
+
+/// Read the reconnect log through `read`, waiting under `backoff` and reading again while the failure is transient.
+async fn read_log<O: Oplog, R, Fut>(
+    backoff: &mut Backoff<'_>,
+    mut read: impl FnMut() -> Fut,
+) -> Result<R, SessionError>
+where
+    Fut: core::future::Future<Output = Result<R, O::Error>>,
+{
+    loop {
+        match read().await {
+            Ok(value) => return Ok(value),
+            Err(err) if O::is_transient(&err) => {
+                let Some(wait) = backoff.next_wait() else {
+                    return Err(oplog_err(err));
+                };
+                tracing::warn!(error = %err, wait_ms = retry_ms(wait), "the reconnect log did not answer a resume, reading it again");
+                tokio::time::sleep(wait).await;
+            }
+            Err(err) => return Err(oplog_err(err)),
+        }
+    }
+}
+
 /// A [`ContentTicketSigner`] for deployments without file handling.
 ///
 /// `mint` always fails rather than panicking, since any client can send a
@@ -2867,7 +2895,9 @@ where
             return Ok(None);
         }
 
-        let current_lsn = self.oplog.current_lsn().await.map_err(oplog_err)?;
+        let policy = resume_read_policy();
+        let current_lsn =
+            read_log::<O, _, _>(&mut policy.start(), || self.oplog.current_lsn()).await?;
         // The durable mutation watermark: the client retires pending records
         // at or below it and replays the rest. Its read is the handshake's one
         // reader-pool checkout, so an unidentified caller takes a share permit
@@ -3397,7 +3427,11 @@ where
             closing: refused == Reaction::Close,
         };
 
-        while !state.closing {
+        // Every exit breaks with its result rather than returning, so the teardown below always runs.
+        let ended: Result<(), SessionError> = loop {
+            if state.closing {
+                break Ok(());
+            }
             // One task, two arms. The transport arm awaits a whole subscribe,
             // including its first page of rows, so the outbound arm cannot
             // interleave a live patch into that. A read still arriving in
@@ -3409,30 +3443,35 @@ where
             // Moving either arm onto its own task breaks that silently.
             tokio::select! {
                 incoming = transport.recv() => {
-                    match incoming.map_err(transport_err)? {
-                        None => break,
-                        Some(IncomingFrame::Control(msg)) => {
-                            self.handle_control(&mut transport, msg, &mut state).await?;
+                    let handled = match incoming.map_err(transport_err) {
+                        Err(err) => Err(err),
+                        Ok(None) => break Ok(()),
+                        Ok(Some(IncomingFrame::Control(msg))) => {
+                            self.handle_control(&mut transport, msg, &mut state).await
                         }
-                        Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch))) => {
-                            self.handle_mutation(&mut transport, patch, &mut state).await?;
+                        Ok(Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(patch)))) => {
+                            self.handle_mutation(&mut transport, patch, &mut state).await
                         }
-                        Some(IncomingFrame::Bulk(_)) => {
-                            return Err(SessionError::Protocol(
-                                "unexpected bulk frame from client".into(),
-                            ));
-                        }
+                        Ok(Some(IncomingFrame::Bulk(_))) => Err(SessionError::Protocol(
+                            "unexpected bulk frame from client".into(),
+                        )),
+                    };
+                    if let Err(err) = handled {
+                        break Err(err);
                     }
                 }
                 outbound = outbound_rx.recv() => {
-                    let Some(outbound) = outbound else { break };
-                    if !self.handle_outbound(&mut transport, outbound, &mut state).await? {
-                        break;
+                    let Some(outbound) = outbound else { break Ok(()) };
+                    match self.handle_outbound(&mut transport, outbound, &mut state).await {
+                        Ok(true) => {}
+                        Ok(false) => break Ok(()),
+                        Err(err) => break Err(err),
                     }
                 }
             }
-        }
+        };
 
+        // Runs on every exit, an error included, so no ended session stays registered.
         self.unregister_connection(session_id, connection_num).await;
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
@@ -3440,7 +3479,7 @@ where
 
         self.unsubscribe_all(state).await;
         tracing::info!("connection closed");
-        Ok(())
+        ended
     }
 
     /// Deliver one item the dispatch side produced for this session, answering
@@ -4344,11 +4383,16 @@ where
             Resume::Fresh => None,
             Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
             Resume::At(lsn) => {
-                let min = self.oplog.min_lsn().await.map_err(oplog_err)?;
-                let current = self.oplog.current_lsn().await.map_err(oplog_err)?;
+                let policy = resume_read_policy();
+                let mut backoff = policy.start();
+                let min = read_log::<O, _, _>(&mut backoff, || self.oplog.min_lsn()).await?;
+                let current =
+                    read_log::<O, _, _>(&mut backoff, || self.oplog.current_lsn()).await?;
                 match catchup_decision(lsn, min, current) {
                     CatchupDecision::Catchup => {
-                        return self.catch_up_row(transport, sub, state, &reg, lsn).await;
+                        return self
+                            .catch_up_row(transport, sub, state, &reg, lsn, &mut backoff)
+                            .await;
                     }
                     CatchupDecision::FullResync => Some(FullResyncReason::CursorOutsideRetention),
                 }
@@ -4988,19 +5032,32 @@ where
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
         from: u64,
+        backoff: &mut Backoff<'_>,
     ) -> Result<(), SessionError> {
         self.attach_row_route(&sub, state, reg).await;
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so
         // replaying it cannot duplicate a live patch.
-        let ceiling = self
-            .oplog
-            .current_lsn()
-            .await
-            .map_err(oplog_err)?
+        let ceiling = read_log::<O, _, _>(backoff, || self.oplog.current_lsn())
+            .await?
             .unwrap_or(0);
-        let entries = self.oplog.entries_since(from).await.map_err(oplog_err)?;
+        let entries = read_log::<O, _, _>(backoff, || self.oplog.entries_since(from)).await?;
+        // Retention only moves forward, so a log that still reaches the cursor now reached it when the entries were read.
+        let min = read_log::<O, _, _>(backoff, || self.oplog.min_lsn()).await?;
+        if matches!(
+            catchup_decision(from, min, Some(ceiling)),
+            CatchupDecision::FullResync
+        ) {
+            return self
+                .resnapshot_row(
+                    transport,
+                    state,
+                    &sub.sub_id,
+                    &FullResyncReason::CursorOutsideRetention,
+                )
+                .await;
+        }
         // One watcher, this session's caller, so the buffers hold one verdict
         // each and are reused across the whole replay.
         let watchers = [Arc::clone(&state.principal)];

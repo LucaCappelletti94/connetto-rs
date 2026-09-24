@@ -251,6 +251,12 @@ pub trait Oplog: Send + Sync {
     /// Oplog-source error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
 
+    /// Whether a read that failed with `err` may succeed if made again, as when the database cut the connection.
+    fn is_transient(err: &Self::Error) -> bool {
+        let _ = err;
+        false
+    }
+
     /// Append one record, then drop whatever the retention window no longer
     /// covers. Pruning is not a separate seam: an external caller would race
     /// the append it belongs to.
@@ -655,6 +661,17 @@ mod pg {
     impl Oplog for PgOplog {
         type Error = PgOplogError;
 
+        fn is_transient(err: &PgOplogError) -> bool {
+            match err {
+                PgOplogError::Pool(_) => true,
+                PgOplogError::Query(err) => matches!(
+                    crate::reexec::diesel_failure(err),
+                    crate::reexec::ReadFailure::Transient
+                ),
+                PgOplogError::Codec(_) | PgOplogError::LsnRange(_) => false,
+            }
+        }
+
         async fn append(&self, record: ChangeRecord) -> Result<(), PgOplogError> {
             let event_bytes = serde_json::to_vec(record.event())?;
             let lsn = lsn_to_i64(record.lsn())?;
@@ -727,6 +744,29 @@ mod pg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a failure to reach the database may pass on a second read, so the default of no never hides a missing override.
+    #[test]
+    fn only_an_unreachable_database_is_a_transient_log_failure() {
+        use diesel::result::{DatabaseErrorKind, Error};
+        let cut =
+            |kind| Error::DatabaseError(kind, Box::new(String::from("the connection went away")));
+        assert!(PgOplog::is_transient(&PgOplogError::Pool(
+            "timed out".to_owned()
+        )));
+        assert!(PgOplog::is_transient(&PgOplogError::Query(cut(
+            DatabaseErrorKind::ClosedConnection
+        ))));
+        assert!(PgOplog::is_transient(&PgOplogError::Query(cut(
+            DatabaseErrorKind::UnableToSendCommand
+        ))));
+        assert!(!PgOplog::is_transient(&PgOplogError::Query(
+            Error::NotFound
+        )));
+        assert!(!PgOplog::is_transient(&PgOplogError::LsnRange(u64::MAX)));
+        let codec = serde_json::from_str::<u8>("not a number").expect_err("malformed");
+        assert!(!PgOplog::is_transient(&PgOplogError::Codec(codec)));
+    }
 
     #[test]
     fn decision_zero_resume_always_resyncs() {
