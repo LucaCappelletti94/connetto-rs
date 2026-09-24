@@ -90,7 +90,9 @@ async fn connect(manager: &Arc<Manager>, cursor: Option<Cursor>) -> LoopbackTran
     let (server_end, mut client) = loopback();
     let serving = Arc::clone(manager);
     tokio::spawn(async move {
-        let _ = serving.serve(server_end).await;
+        if let Err(err) = serving.serve(server_end).await {
+            eprintln!("session ended with an error: {err}");
+        }
     });
     let mut handshake =
         Handshake::new(PROTOCOL_VERSION, CALLER).with_grant(Grant::new(format!("user:{CALLER}")));

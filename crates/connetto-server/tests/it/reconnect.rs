@@ -24,9 +24,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, OplogConfig, PageSpec,
-    Position, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, TimelineHistory, loopback, pg_write_target,
+    ChangeRecord, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog,
+    OplogConfig, PageSpec, Position, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, TimelineHistory, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -177,14 +177,15 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 /// Execute `sql` against the emulated backend, route every resulting event
 /// through the manager (which appends to the oplog), and return the events.
 /// The emulator stamps monotonic LSNs, which the LSN-keyed oplog relies on.
-async fn drive<A>(
+async fn drive<A, O>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<SeedSnapshot, A, ConnettoWatermark>,
+    manager: &SessionManager<SeedSnapshot, A, ConnettoWatermark, NoConnector, O>,
     sql: &str,
 ) -> Vec<ChangeEvent>
 where
     A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
     A::Error: core::fmt::Display,
+    O: Oplog,
 {
     source.execute_sql(sql).expect("execute dml");
     let mut events = Vec::new();
@@ -518,4 +519,312 @@ async fn tombstone_replays_the_delete() {
 
     client.close().await.expect("close client");
     server.await.expect("join server");
+}
+
+/// What the scripted log refuses and records.
+#[derive(Default)]
+struct Script {
+    /// The reads to refuse, each once, in the order they are expected.
+    refuse: std::collections::VecDeque<&'static str>,
+    /// Whether a refusal is one a later read may get past.
+    transient: bool,
+    /// Where to prune the log, once, when the first refusal happens.
+    prune_through: Option<u64>,
+    /// Every read asked for since the script was armed.
+    reads: Vec<&'static str>,
+    armed: bool,
+}
+
+/// An in-memory reconnect log that refuses scripted reads, as a database does while it is cut off.
+struct ScriptedOplog {
+    inner: InMemoryOplog,
+    script: Arc<std::sync::Mutex<Script>>,
+}
+
+/// A read the scripted log refused.
+#[derive(Debug)]
+struct Refused {
+    transient: bool,
+}
+
+impl core::fmt::Display for Refused {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(
+            f,
+            "the reconnect log refused a read (transient: {})",
+            self.transient
+        )
+    }
+}
+
+impl ScriptedOplog {
+    /// Record `read`, refusing it when it is the next scripted refusal.
+    async fn gate(&self, read: &'static str) -> Result<(), Refused> {
+        let (refused, prune) = {
+            let mut script = self.script.lock().expect("script");
+            if !script.armed {
+                return Ok(());
+            }
+            script.reads.push(read);
+            if script.refuse.front() == Some(&read) {
+                script.refuse.pop_front();
+                (
+                    Some(Refused {
+                        transient: script.transient,
+                    }),
+                    script.prune_through.take(),
+                )
+            } else {
+                (None, None)
+            }
+        };
+        if let Some(lsn) = prune {
+            self.inner
+                .forget_through(lsn)
+                .await
+                .unwrap_or_else(|never| match never {});
+        }
+        refused.map_or(Ok(()), Err)
+    }
+}
+
+impl Oplog for ScriptedOplog {
+    type Error = Refused;
+
+    fn is_transient(err: &Refused) -> bool {
+        err.transient
+    }
+
+    async fn append(&self, record: ChangeRecord) -> Result<(), Refused> {
+        self.inner
+            .append(record)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, Refused> {
+        self.gate("entries_since").await?;
+        self.inner
+            .entries_since(lsn)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn min_lsn(&self) -> Result<Option<u64>, Refused> {
+        self.gate("min_lsn").await?;
+        self.inner.min_lsn().await.map_err(|never| match never {})
+    }
+
+    async fn current_lsn(&self) -> Result<Option<u64>, Refused> {
+        self.gate("current_lsn").await?;
+        self.inner
+            .current_lsn()
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn forget_through(&self, lsn: u64) -> Result<(), Refused> {
+        self.inner
+            .forget_through(lsn)
+            .await
+            .map_err(|never| match never {})
+    }
+}
+
+type ScriptedManager =
+    SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark, NoConnector, ScriptedOplog>;
+
+/// Open a session on the scripted manager, printing the error it ends with, and read the ack.
+async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> LoopbackTransport {
+    let (server_transport, mut client) = loopback();
+    let server = Arc::clone(manager);
+    tokio::spawn(async move {
+        if let Err(err) = server.serve(server_transport).await {
+            eprintln!("session ended with an error: {err}");
+        }
+    });
+    let handshake = Handshake::new(PROTOCOL_VERSION, "client-a")
+        .with_grant(connetto_core::messages::Grant::new(
+            "user:client-a".to_owned(),
+        ))
+        .with_cursor(resume);
+    client
+        .send_control(ControlMessage::Handshake(handshake))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+}
+
+/// A manager on a scripted log holding three matching orders, and their events.
+async fn scripted(
+    fixture: &Fixture,
+    config: SessionConfig,
+) -> (
+    Arc<ScriptedManager>,
+    Arc<std::sync::Mutex<Script>>,
+    Vec<ChangeEvent>,
+) {
+    let script = Arc::new(std::sync::Mutex::new(Script::default()));
+    let manager = SessionManager::with_oplog(
+        Materializer::new(PG_DDL).expect("build materializer"),
+        SeedSnapshot,
+        RosterAuth::granting("client-a"),
+        test_verifier(),
+        NoConnector,
+        ScriptedOplog {
+            inner: InMemoryOplog::new(OplogConfig::default()),
+            script: Arc::clone(&script),
+        },
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        config,
+        None,
+        NoSigner,
+    );
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    for id in 1..=3 {
+        let sql = format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, {id}, 'row')"
+        );
+        events.extend(drive(&mut source, &manager, &sql).await);
+    }
+    (manager, script, events)
+}
+
+/// Arm `script` to refuse `reads` in order.
+fn arm(
+    script: &std::sync::Mutex<Script>,
+    reads: &[&'static str],
+    transient: bool,
+    prune_through: Option<u64>,
+) {
+    let mut script = script.lock().expect("script");
+    script.refuse = reads.iter().copied().collect();
+    script.transient = transient;
+    script.prune_through = prune_through;
+    script.reads.clear();
+    script.armed = true;
+}
+
+/// A database cut off for a moment during a resume, as a promotion does, delays the catchup rather than ending the connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
+    let fixture = Fixture::acquire().await;
+    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    arm(
+        &script,
+        &["min_lsn", "current_lsn", "current_lsn", "entries_since"],
+        true,
+        None,
+    );
+    subscribe(&mut client).await;
+
+    for event in &events[1..] {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(live.cursor, cursor_of(event));
+    }
+    let script = script.lock().expect("script");
+    assert!(script.refuse.is_empty(), "every scripted refusal was met");
+    assert_eq!(
+        script.reads,
+        [
+            "min_lsn",
+            "min_lsn",
+            "current_lsn",
+            "current_lsn",
+            "current_lsn",
+            "current_lsn",
+            "entries_since",
+            "entries_since",
+            "min_lsn",
+        ],
+        "the decision's two reads, the replay's ceiling and entries, each read again once, then the retention check"
+    );
+}
+
+/// Retention moving past the cursor while a read waits turns the catchup into a resync, never a replay with a hole.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_catchup_whose_entries_were_pruned_while_it_waited_resyncs() {
+    let fixture = Fixture::acquire().await;
+    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    let second = events[1].checkpoint().expect("a checkpoint").0;
+    arm(&script, &["entries_since"], true, Some(second));
+    subscribe(&mut client).await;
+
+    let ControlMessage::FullResyncRequired(resync) = next_control(&mut client).await else {
+        panic!("expected a resync rather than a replay with a hole");
+    };
+    assert_eq!(resync.reason, FullResyncReason::CursorOutsideRetention);
+}
+
+/// A session that ends on an error releases its connection like any other.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_ended_by_an_error_leaves_no_connection_registered() {
+    let fixture = Fixture::acquire().await;
+    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    assert_eq!(manager.live_connections().await, 1);
+    arm(&script, &["min_lsn"], false, None);
+    subscribe(&mut client).await;
+
+    let ended = tokio::time::timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("the session ends");
+    assert!(
+        matches!(ended, Ok(None)),
+        "the transport ends, got {ended:?}"
+    );
+    assert_eq!(manager.live_connections().await, 0);
+}
+
+/// One connection's wait on the reconnect log is bounded however many subscriptions it resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
+    const BUDGET: Duration = Duration::from_secs(2);
+    let fixture = Fixture::acquire().await;
+    let config = SessionConfig::default().with_resume_read_budget(BUDGET);
+    let (manager, script, events) = scripted(&fixture, config).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    let started = tokio::time::Instant::now();
+
+    // Three jittered waits spend between 0.7 s and 1.4 s of the budget, and the catchup still arrives.
+    arm(&script, &["min_lsn", "min_lsn", "min_lsn"], true, None);
+    subscribe(&mut client).await;
+    for event in &events[1..] {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(live.cursor, cursor_of(event));
+    }
+
+    // The second subscription's reads keep failing, so only what is left of the budget stands before the end.
+    arm(&script, &["min_lsn"; 64], true, None);
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "orders-again".to_owned(),
+            spec: SubscriptionSpec::new(QUERY),
+        }))
+        .await
+        .expect("send the second subscribe");
+    let ended = tokio::time::timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("the session ends");
+    assert!(
+        matches!(ended, Ok(None)),
+        "the transport ends, got {ended:?}"
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited < BUDGET + Duration::from_millis(500),
+        "the connection waited {waited:?} on the log, past its budget of {BUDGET:?}"
+    );
 }
