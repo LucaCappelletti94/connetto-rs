@@ -50,6 +50,8 @@ struct Recorder {
     greeted: Arc<AtomicBool>,
     uploads: Arc<Mutex<Vec<u64>>>,
     subscribes: Arc<Mutex<Vec<(String, String)>>>,
+    /// The durable watermark the handshake reports.
+    watermark: Option<u64>,
 }
 
 impl Transport for Recorder {
@@ -97,7 +99,7 @@ impl Transport for Recorder {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                last_applied_seq: self.watermark,
             }),
         ))))
     }
@@ -184,6 +186,56 @@ async fn no_waiting_write_is_evicted_however_many_queue() {
         queued.push(conn.push().await.expect("queue the write").expect("a seq"));
     }
     assert_eq!(conn.unsynced(), queued, "every write still waits, in order");
+}
+
+/// A write the server applied while its answer was lost is reported applied when the next handshake's watermark retires it, as the browser hub needs to answer the tab that made it.
+#[tokio::test]
+async fn a_write_the_handshake_watermark_retires_is_reported_applied() {
+    let dir = tempdir().expect("temp dir");
+    let path = dir.path().join("retired.sqlite");
+    let replica = Replica::encrypted_file(
+        path.to_str().expect("utf-8 path"),
+        Some(connetto_core::test_support::replica_key()),
+    )
+    .expect("a resolved key");
+    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
+        .expect("open with no server");
+    let mut queued = Vec::new();
+    for id in 0..2 {
+        diesel::insert_into(items::table)
+            .values((items::id.eq(id), items::label.eq("waiting")))
+            .execute(conn.conn())
+            .expect("write with no server");
+        queued.push(conn.push().await.expect("queue the write").expect("a seq"));
+    }
+
+    conn.attach(Recorder {
+        watermark: Some(queued[0]),
+        ..Recorder::default()
+    })
+    .await
+    .expect("attach");
+    assert_eq!(conn.unsynced(), vec![queued[1]]);
+    let mut applied = Vec::new();
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::MutationApplied { client_seq } => applied.push(client_seq),
+            ClientEvent::SyncStatus(_) => {}
+            other => {
+                assert_eq!(
+                    other,
+                    ClientEvent::Closed,
+                    "only the recorder's close follows"
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        applied,
+        vec![queued[0]],
+        "the retired write is reported applied"
+    );
 }
 
 /// Part two: the same connection, handed a transport, sends what it queued.

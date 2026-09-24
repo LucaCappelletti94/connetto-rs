@@ -2742,9 +2742,11 @@ where
 
     /// Bring the pending mutations in line with the server's durable
     /// watermark after a handshake: retire everything at or below it (those
-    /// applied, so the optimistic local rows are correct), replay the rest
-    /// in order, and keep the sequence counter above every number the server
-    /// has seen. The server's watermark makes a duplicated replay idempotent.
+    /// applied, so the optimistic local rows are correct) and report each as
+    /// [`ClientEvent::MutationApplied`], since its own acknowledgement was
+    /// lost with the old socket, then replay the rest in order, and keep the
+    /// sequence counter above every number the server has seen. The server's
+    /// watermark makes a duplicated replay idempotent.
     async fn reconcile_pending(&mut self, watermark: Option<u64>) -> Result<(), ClientError> {
         if let Some(watermark) = watermark {
             let retired: Vec<u64> = self
@@ -2757,6 +2759,8 @@ where
                 for seq in retired {
                     self.pending.remove(&seq);
                     delete_pending(&mut self.db, seq)?;
+                    self.notices
+                        .push_back(ClientEvent::MutationApplied { client_seq: seq });
                 }
             }
             self.next_seq = self.next_seq.max(watermark.saturating_add(1));

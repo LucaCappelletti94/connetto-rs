@@ -131,7 +131,7 @@ On receiving `LivePatch`:
 
 When a client's own mutation is successfully applied server-side, it triggers a CDC event. That event flows through the fanout engine and arrives back at the originating client as an ordinary `LivePatch`.
 
-**The echo is not suppressed and needs no recognition.** Applying it is idempotent: the patch carries the values the client already holds, and re-application converges under the same rule as the snapshot overlap (R28 part A). Pending bookkeeping never rides the echo: the dedicated `MutationApplied { client_seq }` reply is what retires the pending record, and the handshake's durable watermark (`last_applied_seq`) retires anything acknowledged while the client was away.
+**The echo is not suppressed and needs no recognition.** Applying it is idempotent: the patch carries the values the client already holds, and re-application converges under the same rule as the snapshot overlap (R28 part A). Pending bookkeeping never rides the echo: the dedicated `MutationApplied { client_seq }` reply is what retires the pending record, and the handshake's durable watermark (`last_applied_seq`) retires anything acknowledged while the client was away, reporting each as `MutationApplied` so a consumer such as the browser hub learns the outcome whose reply the old socket lost.
 
 ---
 
