@@ -151,6 +151,8 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
 # getrandom with the js feature (already present above) is what makes v4 mint
 # in a browser context.
 rosetta-uuid = { version = "0.2.0", features = ["serde", "sqlite"] }
+# A tab's client id is a free-form label, so the watermark key is its v5 hash.
+uuid = { version = "1", default-features = false, features = ["v5"] }
 
 # The replica key store is exercised in a dedicated worker against real
 # IndexedDB and real WebCrypto, and the at-rest assertion reads the stored

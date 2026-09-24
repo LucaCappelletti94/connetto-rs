@@ -115,6 +115,14 @@ pub enum ClientError {
     /// The server violated the expected wire sequence.
     #[error("protocol violation: {0}")]
     Protocol(String),
+    /// The peer refused the handshake and said why: a server on another
+    /// protocol version, a newer connection on the same handle, a shutdown, or
+    /// a browser relay hub rejecting a malformed tab.
+    #[error("handshake refused: {reason:?}")]
+    Refused {
+        /// The refusal the peer sent.
+        reason: FatalErrorReason,
+    },
     /// The SQLite capture session failed.
     #[error("session error: {0}")]
     Session(String),
@@ -2138,6 +2146,11 @@ where
                 resume_token: ack.resume_token,
                 watermark: ack.last_applied_seq,
                 schema_version: ack.schema_version,
+            })
+        }
+        Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
+            Err(ClientError::Refused {
+                reason: fatal.reason,
             })
         }
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),

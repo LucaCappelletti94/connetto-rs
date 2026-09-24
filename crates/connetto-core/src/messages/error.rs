@@ -90,7 +90,8 @@ pub enum FatalErrorReason {
     /// because the handle keys the per-subscription cursors and the pending
     /// buffer, and two readers would each consume the other's changes.
     ConnectionSuperseded,
-    /// Client sent a control frame the server could not parse.
+    /// The client sent a frame its peer, the server or a browser relay hub,
+    /// could not accept.
     ProtocolViolation {
         /// Human-readable detail.
         detail: String,
