@@ -4935,7 +4935,7 @@ mod tests {
         let wait = conn.resend_timer().expect("a resend is armed").wait();
         assert!(
             wait <= RESEND_POLICY.initial_backoff(),
-            "the new deferral starts from the first wait, got {wait:?}"
+            "the new deferral starts from the first wait"
         );
     }
 
