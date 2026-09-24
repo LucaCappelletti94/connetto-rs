@@ -70,7 +70,7 @@ use crate::workers::helpers::sleep_ms;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices,
-    ImportOutcome, PolicyTables, subscription_is_aggregate, subscription_tables,
+    ImportOutcome, PolicyTables, ResendTimer, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
@@ -511,6 +511,10 @@ struct HubState {
     /// Resolves waiting on a server ticket answer, each with the tab and
     /// request to answer and the `Date::now` instant its wait ends.
     pending_resolve: Vec<PendingHubResolve>,
+
+    /// The worker's armed resend of writes the server deferred, with the
+    /// `Date::now` instant it falls due, so arriving frames never restart it.
+    resend: Option<(ResendTimer, f64)>,
 }
 
 /// One resolve whose ticket request is in flight, kept in the hub state so
@@ -567,7 +571,10 @@ where
 struct NoSleep;
 
 impl Sleeper for NoSleep {
-    fn sleep(&mut self, _duration: core::time::Duration) -> impl Future<Output = ()> + MaybeSend {
+    fn sleep(
+        &mut self,
+        _duration: core::time::Duration,
+    ) -> impl Future<Output = ()> + MaybeSend + use<> {
         core::future::ready(())
     }
 }
@@ -1179,6 +1186,8 @@ enum Wake {
     Verify,
     /// A resolve's ticket wait ran out while the hub served everything else.
     Resolve,
+    /// The worker's resend of the writes the server deferred fell due.
+    Resend,
 }
 
 impl<U> HubRuntime<U>
@@ -1240,6 +1249,14 @@ where
             }
         };
         tokio::pin!(resolve_wait);
+        let resend_ms = resend_deadline_ms(&mut self.state, &self.worker);
+        let resend_wait = async {
+            match resend_ms {
+                Some(ms) => sleep_ms(ms).await,
+                None => core::future::pending().await,
+            }
+        };
+        tokio::pin!(resend_wait);
         // Each arm only names its wake reason, so a losing branch leaves
         // nothing half applied: every mpsc receive loses nothing when dropped.
         let wake = {
@@ -1257,6 +1274,7 @@ where
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
                 () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
+                () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
             }
         };
         match wake {
@@ -1267,6 +1285,16 @@ where
             Wake::Resolve => {
                 expire_resolves(&mut self.state);
                 Ok(true)
+            }
+            Wake::Resend => {
+                let Some((timer, _)) = self.state.resend.take() else {
+                    return Ok(true);
+                };
+                match self.worker.resend_deferred(timer).await {
+                    Ok(()) => Ok(true),
+                    // A failed send is the upstream failing, answered like any other.
+                    Err(err) => self.serve_upstream(reconnect, Err(err)).await,
+                }
             }
         }
     }
@@ -3650,6 +3678,36 @@ fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
         })
         .min();
     ms
+}
+
+/// Milliseconds until the worker's armed resend falls due, `None` when none is
+/// armed. A newly armed resend takes its deadline from now, and one already
+/// armed keeps the deadline it had.
+fn resend_deadline_ms<U>(state: &mut HubState, worker: &ConnettoConnection<U>) -> Option<i32>
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let armed = worker.resend_timer();
+    if armed != state.resend.map(|(timer, _)| timer) {
+        state.resend = armed.map(|timer| {
+            (
+                timer,
+                js_sys::Date::now() + timer.wait().as_secs_f64() * 1000.0,
+            )
+        });
+    }
+    let (_, deadline) = state.resend?;
+    let ms = (deadline - js_sys::Date::now())
+        .clamp(1.0, f64::from(i32::MAX))
+        .ceil();
+    debug_assert!(ms.is_finite(), "a resend deadline is a finite instant");
+    // Clamped into [1, i32::MAX] above, so the cast drops only the fraction the ceil already removed.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "clamped into i32 range and rounded up before the cast"
+    )]
+    Some(ms as i32)
 }
 
 /// Answers `Unavailable` to every resolve whose wait ran out.

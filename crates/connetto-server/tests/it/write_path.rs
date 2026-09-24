@@ -6,7 +6,9 @@
 //! `MutationConflict`, an unauthorized write yields `MutationReject`, and a
 //! replayed `client_seq` applies exactly once. The write lands in Postgres and
 //! is read back through the admin pool; the `notes` table carries its own
-//! version column (`edited_at`).
+//! version column (`edited_at`). A database the write cannot reach is retried
+//! within the write budget, then answered `Indeterminate` with every later
+//! write of the connection held behind it.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
@@ -26,10 +28,12 @@ use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, WITH
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 use subql::backend::Postgres;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 
@@ -533,4 +537,182 @@ async fn watermark_survives_reconnect_reusing_session() {
     );
     client.close().await;
     server.await.expect("join server 3").expect("session 3 ok");
+}
+
+/// A one-connection write pool whose checkout gives up quickly, so a test holding its connection is an unreachable database.
+async fn single_connection_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+    Pool::builder()
+        .max_size(1)
+        .connection_timeout(Duration::from_millis(100))
+        .build(AsyncDieselConnectionManager::new(fixture.admin_url()))
+        .await
+        .expect("build the write pool")
+}
+
+fn writing_manager(
+    pool: &Pool<AsyncPgConnection>,
+    config: SessionConfig,
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoWatermark>> {
+    SessionManager::new(
+        Materializer::with_write_catalog(PG_DDL, writable_catalog()).expect("build materializer"),
+        NoSnapshot,
+        RosterAuth::granting("writer").withholding(WITHHELD_ID),
+        test_verifier(),
+        pg_write_target::<ConnettoWatermark>(pool.clone(), PG_DDL).expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        config,
+    )
+}
+
+async fn expect_indeterminate(client: &mut Client, client_seq: u64) {
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected write {client_seq} to be refused");
+    };
+    assert_eq!(
+        (reject.client_seq, reject.reason),
+        (client_seq, MutationRejectReason::Indeterminate)
+    );
+}
+
+async fn expect_applied(client: &mut Client, client_seq: u64) {
+    let ControlMessage::MutationApplied(applied) = client.next_control().await else {
+        panic!("expected write {client_seq} to apply");
+    };
+    assert_eq!(applied.client_seq, client_seq);
+}
+
+/// A database unreachable past the retry budget answers `Indeterminate`, and no later write of the connection applies ahead of it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_database_defers_the_write_and_every_later_one() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let pool = single_connection_pool(&fixture).await;
+    let manager = writing_manager(
+        &pool,
+        SessionConfig::default().with_write_retry_budget(Duration::from_millis(500)),
+    );
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake("writer").await;
+
+    let outage = pool.get_owned().await.expect("hold the only connection");
+    client.upload(1, insert_changeset(2, "first", "t1")).await;
+    expect_indeterminate(&mut client, 1).await;
+    client.upload(2, insert_changeset(3, "second", "t2")).await;
+    expect_indeterminate(&mut client, 2).await;
+    drop(outage);
+
+    // Applying 2 first would raise the watermark past 1, and a resent 1 would then be acknowledged unapplied.
+    client.upload(2, insert_changeset(3, "second", "t2")).await;
+    expect_indeterminate(&mut client, 2).await;
+    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+
+    client.upload(1, insert_changeset(2, "first", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.upload(2, insert_changeset(3, "second", "t2")).await;
+    expect_applied(&mut client, 2).await;
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "first", "t1"),
+            note(3, "second", "t2"),
+        ]
+    );
+
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// An outage shorter than the retry budget costs the client nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_brief_outage_is_retried_through() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let pool = single_connection_pool(&fixture).await;
+    let manager = writing_manager(&pool, SessionConfig::default());
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake("writer").await;
+
+    let outage = pool.get_owned().await.expect("hold the only connection");
+    let recovery = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        drop(outage);
+    });
+    client.upload(1, insert_changeset(2, "patient", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    recovery.await.expect("join recovery");
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "patient", "t1")]
+    );
+
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A deferred write that comes back refused is settled, so the writes behind it apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_write_settled_by_a_refusal_releases_the_writes_behind_it() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let pool = single_connection_pool(&fixture).await;
+    let manager = writing_manager(
+        &pool,
+        SessionConfig::default().with_write_retry_budget(Duration::ZERO),
+    );
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake("writer").await;
+
+    let outage = pool.get_owned().await.expect("hold the only connection");
+    client.upload(1, insert_changeset(2, "first", "t1")).await;
+    expect_indeterminate(&mut client, 1).await;
+    drop(outage);
+
+    // The same sequence comes back naming a row the caller may not write, as after a grant was withdrawn.
+    client
+        .upload(1, insert_changeset(WITHHELD_ID, "withheld", "tw"))
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the resent write to be refused");
+    };
+    assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+    client.upload(2, insert_changeset(3, "second", "t2")).await;
+    expect_applied(&mut client, 2).await;
+
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// The apply asks the durable watermark itself, so a commit that landed while its answer was lost is acknowledged again rather than applied twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_the_durable_watermark_covers_is_acknowledged_unapplied() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let manager = writing_manager(fixture.admin(), SessionConfig::default());
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake("writer").await;
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+
+    // Stands in for a commit of 2 whose reply never reached this connection.
+    fixture
+        .setup(&["UPDATE _connetto_mutations SET last_seq = 2"])
+        .await;
+    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    expect_applied(&mut client, 2).await;
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")]
+    );
+
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
 }

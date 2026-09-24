@@ -33,11 +33,11 @@ pub use connetto_core::{Custody, NoGate};
 
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, FatalErrorReason, Handshake, MutationHeader, MutationPatch, Ping, Subscribe,
-    SubscriptionSpec, Unsubscribe,
+    ControlMessage, FatalErrorReason, Handshake, MutationHeader, MutationPatch, MutationReject,
+    MutationRejectReason, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Cursor, PROTOCOL_VERSION, SchemaVersion, quote_ident};
+use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use diesel::connection::SimpleConnection;
@@ -1013,6 +1013,16 @@ pub enum ClientEvent {
         /// Rows the rejected write touched, rolled back locally.
         rows: Vec<AffectedRow>,
     },
+    /// The server could not settle a prior mutation yet, so it stays pending
+    /// on the replica, rows and all, and is sent again. A later
+    /// [`MutationApplied`](Self::MutationApplied),
+    /// [`MutationRejected`](Self::MutationRejected) or
+    /// [`MutationConflict`](Self::MutationConflict) for the same sequence
+    /// settles it.
+    MutationDeferred {
+        /// The deferred mutation's sequence number.
+        client_seq: u64,
+    },
     /// The server reported a conflict on a prior mutation.
     MutationConflict {
         /// The conflicting mutation's sequence number.
@@ -1152,6 +1162,39 @@ fn server_wins(conflict: ConflictType) -> ConflictAction {
 /// Maximum number of pushed mutations retained for rollback. A server rejection
 /// arrives well within this window, so the changeset to invert is still held.
 const PENDING_CAP: usize = 256;
+
+/// The schedule a deferred write is sent again on. Uncapped, because a write
+/// the server could not settle is kept like an offline one.
+static RESEND_POLICY: std::sync::LazyLock<RetryPolicy> = std::sync::LazyLock::new(RetryPolicy::new);
+
+/// Where sending the deferred writes again stands.
+enum Resend {
+    /// Nothing is deferred.
+    Idle,
+    /// Every pending write goes out again once `timer` elapses.
+    Waiting {
+        episode: Backoff<'static>,
+        timer: ResendTimer,
+    },
+    /// Every pending write went out again, and no answer has settled the deferral yet.
+    Resent { episode: Backoff<'static> },
+}
+
+/// One armed resend of the writes the server deferred, for whoever drives the
+/// pump to sleep on before calling [`ConnettoConnection::resend_deferred`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResendTimer {
+    armed: u64,
+    wait: Duration,
+}
+
+impl ResendTimer {
+    /// How long to wait before sending the deferred writes again.
+    #[must_use]
+    pub const fn wait(&self) -> Duration {
+        self.wait
+    }
+}
 
 /// Conflict resolution for a rollback: a row a concurrent server patch already
 /// changed is left as the server left it, so only a cleanly-matching optimistic
@@ -2299,6 +2342,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// so a server rejection can be inverted and rolled back locally. Bounded by
     /// `PENDING_CAP`.
     pending: BTreeMap<u64, Vec<u8>>,
+    /// Where sending the writes the server deferred again stands.
+    resend: Resend,
+    /// How many resends were ever armed, so a pump tells a fresh timer from the one it sleeps on.
+    resends_armed: u64,
     /// Identity presented at handshake, kept for re-handshakes on resume.
     config: ClientConfig,
     /// Optional source of fresh access tokens, consulted on every resume so a
@@ -2556,6 +2603,8 @@ where
             residual_warned: false,
             transaction_state: AnsiTransactionManager::default(),
             pending,
+            resend: Resend::Idle,
+            resends_armed: 0,
             config: config.clone(),
             token_source: None,
             local_tables: HashSet::new(),
@@ -2751,6 +2800,65 @@ where
         Ok(())
     }
 
+    /// The armed resend of writes the server deferred, when there is one.
+    ///
+    /// A pump that owns a timer sleeps for [`ResendTimer::wait`] and then calls
+    /// [`resend_deferred`](Self::resend_deferred). One that does not leaves the
+    /// writes pending until the next reconnect or [`replay_pending`](Self::replay_pending).
+    #[must_use]
+    pub const fn resend_timer(&self) -> Option<ResendTimer> {
+        match &self.resend {
+            Resend::Waiting { timer, .. } => Some(*timer),
+            Resend::Idle | Resend::Resent { .. } => None,
+        }
+    }
+
+    /// Send every pending write again, in order, when `timer` is still the armed resend.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when encoding or sending a queued mutation fails.
+    pub async fn resend_deferred(&mut self, timer: ResendTimer) -> Result<(), ClientError> {
+        match core::mem::replace(&mut self.resend, Resend::Idle) {
+            Resend::Waiting {
+                episode,
+                timer: armed,
+            } if armed == timer && self.is_connected() => {
+                self.resend = Resend::Resent { episode };
+                self.replay_pending().await
+            }
+            unchanged => {
+                self.resend = unchanged;
+                Ok(())
+            }
+        }
+    }
+
+    /// Arm a resend after the server deferred a pending write, `asked` being the wait it named.
+    ///
+    /// An armed resend stands, because it already sends every pending write.
+    fn defer_pending(&mut self, asked: Option<Duration>) {
+        let mut episode = match core::mem::replace(&mut self.resend, Resend::Idle) {
+            waiting @ Resend::Waiting { .. } => {
+                self.resend = waiting;
+                return;
+            }
+            Resend::Resent { episode } => episode,
+            Resend::Idle => RESEND_POLICY.start(),
+        };
+        let backoff = episode
+            .next_wait()
+            .unwrap_or_else(|| RESEND_POLICY.max_backoff());
+        self.resends_armed += 1;
+        self.resend = Resend::Waiting {
+            episode,
+            timer: ResendTimer {
+                armed: self.resends_armed,
+                wait: asked.unwrap_or(backoff),
+            },
+        };
+    }
+
     /// The live socket, or the not-connected refusal.
     ///
     /// Every method that speaks to the server goes through this, so the offline
@@ -2774,6 +2882,8 @@ where
     /// Drop the live socket and announce it, once.
     fn disconnected(&mut self) {
         self.attach_replay = AttachReplay::Idle;
+        // A fresh transport replays every pending write, so no resend stays owed.
+        self.resend = Resend::Idle;
         if self.wire.take().is_some() {
             self.notices
                 .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
@@ -3972,23 +4082,10 @@ where
                     reason: resync.reason,
                 })
             }
-            ControlMessage::MutationApplied(ack) => {
-                if self.pending.remove(&ack.client_seq).is_some() {
-                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                    delete_pending(&mut self.db, ack.client_seq)?;
-                }
-                Ok(ClientEvent::MutationApplied {
-                    client_seq: ack.client_seq,
-                })
-            }
-            ControlMessage::MutationReject(reject) => {
-                let rows = self.rollback(reject.client_seq)?;
-                Ok(ClientEvent::MutationRejected {
-                    client_seq: reject.client_seq,
-                    rows,
-                })
-            }
+            ControlMessage::MutationApplied(ack) => self.mutation_applied(ack.client_seq),
+            ControlMessage::MutationReject(reject) => self.mutation_rejected(&reject),
             ControlMessage::MutationConflict(conflict) => {
+                self.settle_resend();
                 let rows = self.rollback(conflict.client_seq)?;
                 Ok(ClientEvent::MutationConflict {
                     client_seq: conflict.client_seq,
@@ -4005,10 +4102,21 @@ where
                 related_to: err.related_to,
                 detail: err.detail,
             }),
-            ControlMessage::RateLimited(limited) => Ok(ClientEvent::RateLimited {
-                related_to: limited.related_to,
-                retry_after_ms: limited.retry_after_ms,
-            }),
+            ControlMessage::RateLimited(limited) => {
+                // A mutation is correlated by its sequence, and one still pending waits for its resend.
+                let throttled_write = limited
+                    .related_to
+                    .as_deref()
+                    .and_then(|related| related.parse::<u64>().ok())
+                    .is_some_and(|seq| self.pending.contains_key(&seq));
+                if throttled_write {
+                    self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
+                }
+                Ok(ClientEvent::RateLimited {
+                    related_to: limited.related_to,
+                    retry_after_ms: limited.retry_after_ms,
+                })
+            }
             // A relay saying whether IT can reach the server. For a tab that is
             // the answer that matters, because a tab whose own link is fine
             // still cannot sync while the relay cannot, so it rides the same
@@ -4038,6 +4146,38 @@ where
             other => Err(ClientError::Protocol(format!(
                 "unexpected control frame from server: {other:?}"
             ))),
+        }
+    }
+
+    /// Retire a mutation the server applied durably.
+    fn mutation_applied(&mut self, client_seq: u64) -> Result<ClientEvent, ClientError> {
+        if self.pending.remove(&client_seq).is_some() {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            delete_pending(&mut self.db, client_seq)?;
+        }
+        self.settle_resend();
+        Ok(ClientEvent::MutationApplied { client_seq })
+    }
+
+    /// Roll back a mutation the server refused, or keep it for a resend when the server could not settle it.
+    fn mutation_rejected(&mut self, reject: &MutationReject) -> Result<ClientEvent, ClientError> {
+        let client_seq = reject.client_seq;
+        // Rolling back a write the server could not settle would lose it for good.
+        if reject.reason == MutationRejectReason::Indeterminate {
+            if self.pending.contains_key(&client_seq) {
+                self.defer_pending(None);
+            }
+            return Ok(ClientEvent::MutationDeferred { client_seq });
+        }
+        self.settle_resend();
+        let rows = self.rollback(client_seq)?;
+        Ok(ClientEvent::MutationRejected { client_seq, rows })
+    }
+
+    /// The server gave a resent write a final answer, so whatever deferred it has passed and the next deferral starts its schedule afresh.
+    fn settle_resend(&mut self) {
+        if matches!(self.resend, Resend::Resent { .. }) {
+            self.resend = Resend::Idle;
         }
     }
 
@@ -4761,6 +4901,43 @@ mod tests {
         assert_eq!(conn.custody(), Custody::Unverified(NoGate::Offerable));
         conn.set_custody(Custody::Verified);
         assert_eq!(conn.custody(), Custody::Verified);
+    }
+
+    /// A resent write the server refuses settles the deferral, so the next outage starts its resend from the first wait.
+    #[test]
+    fn a_settled_resend_restarts_the_next_deferral_from_the_first_wait() {
+        let config = ClientConfig::new("resend-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        conn.db
+            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .expect("local write");
+        let changeset = conn.session.changeset().expect("capture the write");
+        conn.pending.insert(0, changeset.clone());
+        conn.pending.insert(1, changeset);
+        // A deferral whose writes went out again after its schedule had grown.
+        let mut episode = RESEND_POLICY.start();
+        for _ in 0..6 {
+            let _ = episode.next_wait();
+        }
+        conn.resend = Resend::Resent { episode };
+
+        conn.handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: 0,
+            reason: MutationRejectReason::Unauthorized,
+        }))
+        .expect("the refusal settles");
+        conn.handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: 1,
+            reason: MutationRejectReason::Indeterminate,
+        }))
+        .expect("the next outage defers");
+        let wait = conn.resend_timer().expect("a resend is armed").wait();
+        assert!(
+            wait <= RESEND_POLICY.initial_backoff(),
+            "the new deferral starts from the first wait"
+        );
     }
 
     /// A device with a device-private tier, for the two refusals an honest

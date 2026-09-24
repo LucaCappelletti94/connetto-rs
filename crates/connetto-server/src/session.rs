@@ -501,6 +501,8 @@ pub struct SessionConfig {
     schema_version: Option<SchemaVersion>,
     /// The total time one connection may wait on reconnect-log reads that failed transiently while resuming.
     resume_read_budget: Duration,
+    /// How long one mutation may keep retrying an apply the database failed transiently before it is answered `Indeterminate`.
+    write_retry_budget: Duration,
 }
 
 impl Default for SessionConfig {
@@ -509,6 +511,7 @@ impl Default for SessionConfig {
             initial_credits: 64,
             schema_version: None,
             resume_read_budget: Duration::from_secs(30),
+            write_retry_budget: Duration::from_secs(5),
         }
     }
 }
@@ -538,6 +541,13 @@ impl SessionConfig {
     #[must_use]
     pub const fn with_resume_read_budget(mut self, budget: Duration) -> Self {
         self.resume_read_budget = budget;
+        self
+    }
+
+    /// Sets how long one mutation may keep retrying an apply the database failed transiently before it is answered `Indeterminate`.
+    #[must_use]
+    pub const fn with_write_retry_budget(mut self, budget: Duration) -> Self {
+        self.write_retry_budget = budget;
         self
     }
 
@@ -786,6 +796,22 @@ fn transport_err<E: core::fmt::Display>(err: E) -> SessionError {
 
 fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
+}
+
+/// Record that `client_seq` was deferred. The earliest deferred sequence stays
+/// the one every later write waits behind, so the server holds the order
+/// whatever order the client resends in.
+fn record_deferral<Id, Key>(
+    state: &mut SessionState<Id, Key>,
+    client_seq: u64,
+    deferral: Deferral,
+) {
+    if state
+        .deferred
+        .is_none_or(|(earliest, _)| client_seq <= earliest)
+    {
+        state.deferred = Some((client_seq, deferral));
+    }
 }
 
 /// Read the reconnect log through `read`, reading again after a transient failure while the connection's `budget` of waiting lasts.
@@ -1236,6 +1262,15 @@ struct PagedRead {
 /// few numeric cells), so hitting it means the fold would demote anyway.
 const GROUPED_SEED_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
+/// Why a mutation was deferred, which is also how every later sequence behind it is answered.
+#[derive(Debug, Clone, Copy)]
+enum Deferral {
+    /// The caller's reader share or byte window is spent until the instant, answered `RateLimited`.
+    Throttled(Instant),
+    /// The database or the authorization service could not answer, answered `Indeterminate`.
+    Unreachable,
+}
+
 /// Mutable per-session state carried through the run loop.
 struct SessionState<Id, Key> {
     credits: u32,
@@ -1256,11 +1291,11 @@ struct SessionState<Id, Key> {
     principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
-    /// A deferred mutation and when its deferral ends. Every later sequence on
-    /// this connection is deferred behind it, because the watermark is one
-    /// number: a later write applied first would advance it past the deferred
-    /// one, whose resend the watermark check would then acknowledge unapplied.
-    deferred: Option<(u64, Instant)>,
+    /// A deferred mutation and what deferred it. Every later sequence on this
+    /// connection is deferred behind it, because the watermark is one number:
+    /// a later write applied first would advance it past the deferred one,
+    /// whose resend the watermark check would then acknowledge unapplied.
+    deferred: Option<(u64, Deferral)>,
     /// The connetto-minted session id from the verified token. The durable
     /// watermark keys on it, so a reconnect reusing the same session dedupes.
     session_id: SessionId,
@@ -3099,12 +3134,7 @@ where
         let key = crate::capability::meter_key(&state.principal, state.session_id);
         let patch_len = u64::try_from(patch.patchset_zstd.len()).unwrap_or(u64::MAX);
         match self.guard.bytes().allow_mutation_bytes(&key, patch_len) {
-            Ok(()) => {
-                if state.deferred.is_some_and(|(seq, _)| seq == client_seq) {
-                    state.deferred = None;
-                }
-                Ok(Some(permit))
-            }
+            Ok(()) => Ok(Some(permit)),
             Err(wait) => {
                 tracing::warn!(
                     client_seq,
@@ -3120,8 +3150,7 @@ where
     }
 
     /// Answer `RateLimited` for `client_seq` and record the deferral so later
-    /// sequences on this connection wait behind it. An already deferred
-    /// sequence keeps its earlier deadline.
+    /// sequences on this connection wait behind it.
     async fn defer_mutation<T: Transport>(
         &self,
         transport: &mut T,
@@ -3129,10 +3158,11 @@ where
         wait: Duration,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        match state.deferred {
-            Some((seq, _)) if seq == client_seq => {}
-            _ => state.deferred = Some((client_seq, Instant::now() + wait)),
-        }
+        record_deferral(
+            state,
+            client_seq,
+            Deferral::Throttled(Instant::now() + wait),
+        );
         transport
             .send_control(ControlMessage::RateLimited(RateLimited {
                 related_to: Some(client_seq.to_string()),
@@ -3147,8 +3177,9 @@ where
     /// at all, each refused with a reject the client rolls back, since neither
     /// can ever be resent as it is. The per-write measurement an operator sizes
     /// the meter from is logged. A sequence past a deferred one is deferred
-    /// behind it with the same deadline, so writes apply in the order the
-    /// client numbered them. `false` means the mutation was answered here.
+    /// behind it the same way, so writes apply in the order the client
+    /// numbered them, and the deferred sequence itself arriving again is
+    /// settled afresh. `false` means the mutation was answered here.
     async fn admit_mutation<T: Transport>(
         &self,
         transport: &mut T,
@@ -3184,18 +3215,28 @@ where
             .await?;
             return Ok(false);
         }
-        if let Some((deferred_seq, until)) = state.deferred
-            && client_seq > deferred_seq
-        {
-            let wait = until.saturating_duration_since(Instant::now());
-            tracing::debug!(
-                client_seq,
-                deferred_seq,
-                "mutation deferred behind an earlier one"
-            );
-            self.defer_mutation(transport, client_seq, wait, state)
-                .await?;
-            return Ok(false);
+        match state.deferred {
+            Some((deferred_seq, deferral)) if client_seq > deferred_seq => {
+                tracing::debug!(
+                    client_seq,
+                    deferred_seq,
+                    "mutation deferred behind an earlier one"
+                );
+                match deferral {
+                    Deferral::Throttled(until) => {
+                        let wait = until.saturating_duration_since(Instant::now());
+                        self.defer_mutation(transport, client_seq, wait, state)
+                            .await?;
+                    }
+                    Deferral::Unreachable => {
+                        self.reject_indeterminate(transport, client_seq, state)
+                            .await?;
+                    }
+                }
+                return Ok(false);
+            }
+            Some((deferred_seq, _)) if client_seq == deferred_seq => state.deferred = None,
+            _ => {}
         }
         Ok(true)
     }
@@ -3857,7 +3898,9 @@ where
             // The service could not be reached, so whether the caller may
             // write is unknown. The client must retry rather than discard.
             WriteVerdict::Undetermined => {
-                return self.reject_indeterminate(transport, client_seq).await;
+                return self
+                    .reject_indeterminate(transport, client_seq, state)
+                    .await;
             }
         }
 
@@ -3869,14 +3912,7 @@ where
             let Some(_reader_permit) = self.mutation_permit(transport, &patch, state).await? else {
                 return Ok(());
             };
-            self.target
-                .commit(
-                    &state.principal,
-                    &plan,
-                    &patch.patchset_zstd,
-                    state.session_id,
-                    client_seq,
-                )
+            self.commit_retrying(&plan, &patch.patchset_zstd, state, client_seq)
                 .await
         };
         match outcome {
@@ -3910,6 +3946,44 @@ where
                 )
                 .await
             }
+            Err(WriteError::Transient(detail)) => {
+                tracing::warn!(client_seq, error = %detail, "mutation deferred, the database did not answer within the retry budget");
+                self.reject_indeterminate(transport, client_seq, state)
+                    .await
+            }
+        }
+    }
+
+    /// Commit one mutation, applying it again while the database fails transiently and the write retry budget lasts.
+    async fn commit_retrying(
+        &self,
+        plan: &crate::materializer::WritePlan,
+        payload_zstd: &[u8],
+        state: &SessionState<Id, Key>,
+        client_seq: u64,
+    ) -> Result<WriteOutcome, WriteError> {
+        let policy =
+            RetryPolicy::new().with_max_total_backoff(Some(self.config.write_retry_budget));
+        let mut episode = policy.start();
+        loop {
+            let outcome = self
+                .target
+                .commit(
+                    &state.principal,
+                    plan,
+                    payload_zstd,
+                    state.session_id,
+                    client_seq,
+                )
+                .await;
+            let Err(WriteError::Transient(detail)) = &outcome else {
+                return outcome;
+            };
+            let Some(wait) = episode.next_wait() else {
+                return outcome;
+            };
+            tracing::warn!(client_seq, error = %detail, wait_ms = retry_ms(wait), "a write could not reach the database, applying it again");
+            tokio::time::sleep(wait).await;
         }
     }
 
@@ -3932,16 +4006,19 @@ where
             .await
     }
 
-    /// Refuse one write the authorization service could not answer.
+    /// Refuse one write the database or the authorization service could not
+    /// answer, and defer every later sequence on this connection behind it.
     ///
     /// The client MUST retry rather than discard its pending record: the
-    /// server could not determine whether the write is permitted, so discarding
-    /// it would turn a transient outage into permanent loss.
+    /// server could not determine whether the write is permitted or apply it,
+    /// so discarding it would turn a transient outage into permanent loss.
     async fn reject_indeterminate<T: Transport>(
         &self,
         transport: &mut T,
         client_seq: u64,
+        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
+        record_deferral(state, client_seq, Deferral::Unreachable);
         self.reject(transport, client_seq, MutationRejectReason::Indeterminate)
             .await
     }

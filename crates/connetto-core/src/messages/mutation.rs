@@ -77,13 +77,17 @@ pub enum MutationRejectReason {
         /// Human-readable detail.
         detail: String,
     },
-    /// The authorization service was unreachable when the server checked
-    /// whether this caller may write.
+    /// The server could not settle this write, because the authorization
+    /// service was unreachable when it checked whether this caller may write
+    /// or the database could not take the write within the server's retry
+    /// budget.
     ///
     /// Reusing `Unauthorized` here would be a data-loss bug: a client that
     /// receives `Unauthorized` stops retrying and may discard the mutation,
     /// turning a transient outage into permanent loss. A client that receives
-    /// `Indeterminate` MUST retry rather than retire its pending record.
+    /// `Indeterminate` MUST retry rather than retire its pending record. Every
+    /// later write on the same connection is answered `Indeterminate` too until
+    /// this one is settled, so none applies ahead of it.
     Indeterminate,
 }
 
