@@ -18,7 +18,10 @@ const HELLO_TIMEOUT_MS: f64 = 15_000.0;
 pub type TabWire = MessageTransport<BroadcastChannel>;
 
 enum HelloReady {
-    Waiting,
+    /// The deadline runs.
+    Counting,
+    /// The boot waits on the user, so the deadline does not run.
+    AtUser,
     Up,
     Failed(String),
 }
@@ -57,10 +60,10 @@ impl From<IntakeError> for JsValue {
 async fn poll_hello_channel(
     channel: &BroadcastChannel,
     state: &Rc<RefCell<HelloReady>>,
+    started: &Rc<Cell<f64>>,
     deadline_ms: f64,
 ) -> Result<(), IntakeError> {
     const POLL_MS: i32 = 50;
-    let started = js_sys::Date::now();
     loop {
         match &*state.borrow() {
             HelloReady::Up => return Ok(()),
@@ -68,10 +71,12 @@ async fn poll_hello_channel(
                 let detail = detail.clone();
                 return Err(IntakeError::BootFailed { detail });
             }
-            HelloReady::Waiting => {}
-        }
-        if js_sys::Date::now() - started >= deadline_ms {
-            return Err(IntakeError::Timeout { deadline_ms });
+            HelloReady::Counting => {
+                if js_sys::Date::now() - started.get() >= deadline_ms {
+                    return Err(IntakeError::Timeout { deadline_ms });
+                }
+            }
+            HelloReady::AtUser => {}
         }
         let _ = channel.post_message(&JsValue::from_str("ask"));
         sleep_ms(POLL_MS).await;
@@ -107,6 +112,8 @@ fn current_boot_in_flight() -> Option<super::boot::BootIdentity> {
 enum BootOutcome {
     /// A failure for this boot can still arrive.
     Pending,
+    /// As [`Pending`](Self::Pending), with the boot waiting on the user.
+    AtUser,
     /// The boot failed, and the reason is still worth telling a waiter that joins now.
     Failed(String),
     /// The worker is up, or a newer boot has been announced, so this one has nothing to say.
@@ -118,9 +125,9 @@ enum BootOutcome {
 /// Both the announcement and the failure are single broadcasts and a broadcast is not replayed,
 /// so a waiter that joins later would have nothing to attribute a failure to, and one that
 /// joins after the failure would have no failure either. This answers `ask` with the
-/// announcement while the boot is pending and with the announcement followed by the failure
-/// once it has failed, until a newer boot is announced or the worker reports ready. Dropping it
-/// stops answering.
+/// announcement while the boot is pending, followed by the boot's wait on the user while it has
+/// one and by the failure once it has failed, until a newer boot is announced or the worker
+/// reports ready. Dropping it stops answering.
 pub struct BootAnnouncer {
     channel: BroadcastChannel,
     identity: super::boot::BootIdentity,
@@ -139,7 +146,10 @@ impl BootAnnouncer {
     /// reported ready or the boot reported its failure.
     #[must_use]
     pub fn in_flight(&self) -> bool {
-        *self.outcome.borrow() == BootOutcome::Pending
+        matches!(
+            *self.outcome.borrow(),
+            BootOutcome::Pending | BootOutcome::AtUser
+        )
     }
 }
 
@@ -174,35 +184,46 @@ pub(super) fn announce_boot_on(
         // Readiness carries no identity for the waiters, so only the tagged form retires this
         // announcer: an outgoing worker's queued readiness must not spend the boot replacing it.
         let readiness = format!("ready:{identity}");
+        let waiting = format!("waiting:{identity}");
+        let resumed = format!("resumed:{identity}");
         let announcement = announcement.clone();
         let outcome = Rc::clone(&outcome);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(heard) = event.data().as_string() else {
                 return;
             };
+            let mut outcome = outcome.borrow_mut();
             if heard == readiness {
-                *outcome.borrow_mut() = BootOutcome::Spent;
+                *outcome = BootOutcome::Spent;
             } else if let Some(detail) = heard.strip_prefix(failure.as_str()) {
                 // Only a pending boot can fail: a worker that has reported ready booted, and an
                 // error it throws later is not this boot's outcome.
-                let mut outcome = outcome.borrow_mut();
-                if *outcome == BootOutcome::Pending {
+                if matches!(*outcome, BootOutcome::Pending | BootOutcome::AtUser) {
                     *outcome = BootOutcome::Failed(detail.to_owned());
                 }
             } else if heard.starts_with("booting:") && heard != announcement {
                 // A newer boot is the one a waiter should hear about now.
-                *outcome.borrow_mut() = BootOutcome::Spent;
+                *outcome = BootOutcome::Spent;
+            } else if heard == waiting {
+                if *outcome == BootOutcome::Pending {
+                    *outcome = BootOutcome::AtUser;
+                }
+            } else if heard == resumed {
+                if *outcome == BootOutcome::AtUser {
+                    *outcome = BootOutcome::Pending;
+                }
             } else if heard == "ask" {
-                let reason = match &*outcome.borrow() {
+                let follow_up = match &*outcome {
                     BootOutcome::Pending => None,
+                    BootOutcome::AtUser => Some(waiting.clone()),
                     BootOutcome::Failed(detail) => Some(format!("{failure}{detail}")),
                     BootOutcome::Spent => return,
                 };
-                // The identity goes first, because a waiter acts on a failure only for an
-                // identity it knows.
+                // The identity goes first, because a waiter acts on a failure or a wait on the
+                // user only for an identity it knows.
                 let _ = channel.post_message(&JsValue::from_str(&announcement));
-                if let Some(reason) = reason {
-                    let _ = channel.post_message(&JsValue::from_str(&reason));
+                if let Some(follow_up) = follow_up {
+                    let _ = channel.post_message(&JsValue::from_str(&follow_up));
                 }
             }
         })
@@ -246,7 +267,8 @@ pub(super) async fn await_db_worker_ready_bounded(
         operation: "hello channel",
         detail: format!("{err:?}"),
     })?;
-    let state = Rc::new(RefCell::new(HelloReady::Waiting));
+    let state = Rc::new(RefCell::new(HelloReady::Counting));
+    let started = Rc::new(Cell::new(js_sys::Date::now()));
     let mut initial = known.to_vec();
     if initial.is_empty() && channel_name == super::HELLO_CHANNEL {
         // Only a caller that named nothing falls back to this context's boot, because a caller
@@ -260,35 +282,53 @@ pub(super) async fn await_db_worker_ready_bounded(
     let trusts_announcements = known_ids.borrow().is_empty();
     let on_message = {
         let state = Rc::clone(&state);
+        let started = Rc::clone(&started);
         let known_ids = Rc::clone(&known_ids);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
             };
+            let is_known = |id: &str| known_ids.borrow().iter().any(|known| known.matches_str(id));
+            let mut state = state.borrow_mut();
+            // Readiness and failure are terminal: a worker that answered this wait booted, and
+            // what it throws afterwards is not this wait's outcome.
+            if matches!(*state, HelloReady::Up | HelloReady::Failed(_)) {
+                return;
+            }
             if message == "ready" || message.starts_with("ready:") {
-                *state.borrow_mut() = HelloReady::Up;
+                *state = HelloReady::Up;
             } else if let Some(id) = message.strip_prefix("booting:") {
                 // Only a spawn announces, so the newest announcement names the boot that will
                 // serve this waiter, and the one before it has been replaced: its failure no
-                // longer says anything about whether a worker is coming.
-                if trusts_announcements {
+                // longer says anything about whether a worker is coming, and neither does its
+                // wait on the user.
+                if trusts_announcements && !is_known(id) {
                     *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
+                    if matches!(*state, HelloReady::AtUser) {
+                        *state = HelloReady::Counting;
+                        started.set(js_sys::Date::now());
+                    }
                 }
             } else if let Some(rest) = message.strip_prefix("failed:")
                 && let Some((id, detail)) = rest.split_once(':')
-                && known_ids.borrow().iter().any(|known| known.matches_str(id))
+                && is_known(id)
             {
-                // Readiness is terminal: a worker that answered this wait booted, and what it
-                // throws afterwards is not this wait's outcome.
-                let mut state = state.borrow_mut();
-                if matches!(*state, HelloReady::Waiting) {
-                    *state = HelloReady::Failed(detail.to_owned());
-                }
+                *state = HelloReady::Failed(detail.to_owned());
+            } else if let Some(id) = message.strip_prefix("waiting:")
+                && is_known(id)
+            {
+                *state = HelloReady::AtUser;
+            } else if let Some(id) = message.strip_prefix("resumed:")
+                && is_known(id)
+                && matches!(*state, HelloReady::AtUser)
+            {
+                *state = HelloReady::Counting;
+                started.set(js_sys::Date::now());
             }
         })
     };
     channel.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
-    let result = poll_hello_channel(&channel, &state, deadline_ms).await;
+    let result = poll_hello_channel(&channel, &state, &started, deadline_ms).await;
     channel.set_onmessage(None);
     channel.close();
     result
@@ -419,6 +459,37 @@ pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody,
     channel.close();
     drop(on_message);
     Ok(answered.unwrap_or(Custody::Ephemeral))
+}
+
+/// Worker side: run `step`, a boot step that waits on the user, announced on the hello channel
+/// so a page waiting for this boot pauses its deadline for as long as the user takes.
+pub(crate) async fn awaiting_user<F: Future>(step: F) -> F::Output {
+    awaiting_user_on(
+        super::HELLO_CHANNEL,
+        super::boot::boot_identity_from_location(),
+        step,
+    )
+    .await
+}
+
+/// [`awaiting_user`] on `channel_name` for the boot `identity`, so a test speaks on a channel of
+/// its own. A boot with no identity announces nothing, since no waiter could attribute it.
+pub(super) async fn awaiting_user_on<F: Future>(
+    channel_name: &str,
+    identity: Option<String>,
+    step: F,
+) -> F::Output {
+    let announcing = identity.and_then(|identity| {
+        let channel = BroadcastChannel::new(channel_name).ok()?;
+        let _ = channel.post_message(&JsValue::from_str(&format!("waiting:{identity}")));
+        Some((channel, identity))
+    });
+    let output = step.await;
+    if let Some((channel, identity)) = announcing {
+        let _ = channel.post_message(&JsValue::from_str(&format!("resumed:{identity}")));
+        channel.close();
+    }
+    output
 }
 
 /// Open the hello channel and broadcast the initial `ready`.

@@ -765,6 +765,146 @@ async fn a_waiter_with_its_own_boot_ignores_another_announced_boot() {
     );
 }
 
+/// Posts `messages` on `hello` in order, `gap_ms` apart, after an initial `gap_ms`.
+fn post_later(hello: &'static str, gap_ms: u64, messages: Vec<String>) {
+    spawn_local(async move {
+        let Ok(sender) = BroadcastChannel::new(hello) else {
+            return;
+        };
+        for message in messages {
+            crate::workers::sleep(core::time::Duration::from_millis(gap_ms)).await;
+            let _ = sender.post_message(&JsValue::from_str(&message));
+        }
+    });
+}
+
+/// A boot waiting on the user is not late, so the wait outlasts its deadline for as long as the
+/// user takes and then ends with the readiness that follows.
+#[wasm_bindgen_test]
+async fn a_boot_waiting_on_the_user_is_not_timed_out() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-waits-on-user";
+    post_later(
+        hello,
+        400,
+        vec![
+            format!("waiting:{identity}"),
+            format!("resumed:{identity}"),
+            format!("ready:{identity}"),
+        ],
+    );
+    // The user step runs from about 400 ms to 800 ms and the ready lands at about 1200 ms, well
+    // past a deadline counted from the start.
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 500.0)
+        .await
+        .expect("the user step must pause the deadline");
+}
+
+/// Once the user has answered, the boot is on the clock again, from the moment it resumed.
+#[wasm_bindgen_test]
+async fn a_resumed_boot_gets_a_fresh_deadline_and_no_more() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-resumed-deadline";
+    post_later(
+        hello,
+        100,
+        vec![format!("waiting:{identity}"), format!("resumed:{identity}")],
+    );
+    let started = Date::now();
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0)
+        .await
+        .expect_err("nothing reports readiness after the resume");
+    let elapsed = Date::now() - started;
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, got {error:?}"
+    );
+    assert!(
+        elapsed >= 550.0,
+        "the deadline must count from the resume at about 200 ms, expired after {elapsed} ms"
+    );
+}
+
+/// Another boot waiting on its user says nothing about this one, so it pauses nothing.
+#[wasm_bindgen_test]
+async fn another_boot_waiting_on_its_user_pauses_nothing() {
+    let mine = super::boot::BootIdentity::mint();
+    let other = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-foreign-waiting";
+    post_later(hello, 50, vec![format!("waiting:{other}")]);
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 300.0)
+        .await
+        .expect_err("a foreign pause must not hold this wait");
+    assert!(
+        matches!(&error, IntakeError::Timeout { .. }),
+        "expected Timeout, got {error:?}"
+    );
+}
+
+/// A boot that fails while the user is being asked reports that failure, pause or not.
+#[wasm_bindgen_test]
+async fn a_boot_failing_during_the_user_step_is_reported() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-fails-at-user";
+    post_later(
+        hello,
+        50,
+        vec![
+            format!("waiting:{identity}"),
+            format!("failed:{identity}:login-cancelled"),
+        ],
+    );
+    let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 2_000.0)
+        .await
+        .expect_err("the failure must be reported");
+    assert!(
+        matches!(&error, IntakeError::BootFailed { detail } if detail.contains("login-cancelled")),
+        "expected the failure, got {error:?}"
+    );
+}
+
+/// A waiter that joins while the boot waits on the user learns both the boot and the pause from
+/// the announcer, since neither broadcast is replayed.
+#[wasm_bindgen_test]
+async fn a_late_waiter_learns_the_boot_is_waiting_on_the_user() {
+    let identity = super::boot::BootIdentity::mint();
+    let hello = "connetto-hello-late-waiting";
+    let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
+        .expect("the hello channel must open");
+    if let Ok(sender) = BroadcastChannel::new(hello) {
+        let _ = sender.post_message(&JsValue::from_str(&format!("waiting:{identity}")));
+    }
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+    post_later(hello, 900, vec![format!("ready:{identity}")]);
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[], 300.0)
+        .await
+        .expect("the announcer must tell a late waiter the boot is paused");
+    drop(announcer);
+}
+
+/// The worker's own announcement of a user step is what pauses a page waiting on its boot.
+#[wasm_bindgen_test]
+async fn a_user_step_the_worker_runs_pauses_the_wait() {
+    let identity = super::boot::BootIdentity::mint();
+    let id = identity.to_string();
+    let hello = "connetto-hello-worker-user-step";
+    spawn_local(async move {
+        crate::workers::sleep(core::time::Duration::from_millis(50)).await;
+        crate::workers::intake::awaiting_user_on(
+            hello,
+            Some(id.clone()),
+            crate::workers::sleep(core::time::Duration::from_millis(700)),
+        )
+        .await;
+        if let Ok(sender) = BroadcastChannel::new(hello) {
+            let _ = sender.post_message(&JsValue::from_str(&format!("ready:{id}")));
+        }
+    });
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 300.0)
+        .await
+        .expect("a user step the worker announces must pause the deadline");
+}
+
 /// A module that cannot be fetched fails before any Rust runs, and the spawning context
 /// reports it, so a reconnect attempt handed no identity still learns why.
 #[wasm_bindgen_test]
