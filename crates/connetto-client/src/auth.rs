@@ -523,9 +523,9 @@ pub type SessionFuture =
 /// The platform's browser session a login runs in, returning through a
 /// redirect the operating system routes to the app.
 ///
-/// This is the mobile half of RFC 8252: an in-app browser tab that returns
-/// through an app-claimed redirect, where a desktop listens on loopback
-/// instead.
+/// On a phone, RFC 8252 has the login open in an in-app browser tab that
+/// returns through an app-claimed redirect, where a desktop listens on
+/// loopback instead.
 pub trait AuthorizationSession: Send + Sync {
     /// Open `url` and resolve to the redirect URL delivered back to the app,
     /// which carries `code` and `state`.

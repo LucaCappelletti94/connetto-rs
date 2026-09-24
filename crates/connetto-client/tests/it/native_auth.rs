@@ -713,7 +713,12 @@ async fn a_claimed_redirect_login_completes_through_the_apps_session() {
     assert_eq!(
         store.accounts().expect("accounts"),
         vec![account],
-        "a finished login leaves no pending record and lists only the account"
+        "a finished login lists only the account"
+    );
+    assert_eq!(
+        store.load("connetto-pending-login").expect("load"),
+        None,
+        "a finished login leaves no pending record"
     );
     let token = authenticator.token_source().token().await.expect("refresh");
     assert!(!token.is_empty(), "the session refreshes like any other");
@@ -778,6 +783,11 @@ async fn a_login_finishes_in_the_process_its_redirect_restarts() {
     assert_eq!(
         store.accounts().expect("accounts"),
         vec![account],
+        "the resumed login lists only the account"
+    );
+    assert_eq!(
+        store.load("connetto-pending-login").expect("load"),
+        None,
         "the pending record is gone once the login finishes"
     );
 }
