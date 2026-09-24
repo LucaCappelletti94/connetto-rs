@@ -499,6 +499,8 @@ pub struct SessionConfig {
     /// Schema version advertised in the handshake ack, or `None` to declare no
     /// version (staleness detection off for every client).
     schema_version: Option<SchemaVersion>,
+    /// The total time one connection may wait on reconnect-log reads that failed transiently while resuming.
+    resume_read_budget: Duration,
 }
 
 impl Default for SessionConfig {
@@ -506,6 +508,7 @@ impl Default for SessionConfig {
         Self {
             initial_credits: 64,
             schema_version: None,
+            resume_read_budget: Duration::from_secs(30),
         }
     }
 }
@@ -528,6 +531,13 @@ impl SessionConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
+        self
+    }
+
+    /// Sets the total time one connection may wait on reconnect-log reads that failed transiently while resuming.
+    #[must_use]
+    pub const fn with_resume_read_budget(mut self, budget: Duration) -> Self {
+        self.resume_read_budget = budget;
         self
     }
 
@@ -778,26 +788,28 @@ fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
 
-/// The retry one resume's reconnect-log reads share, 200 ms doubling to 5 s and 30 s in all.
-fn resume_read_policy() -> RetryPolicy {
-    RetryPolicy::new().with_max_total_backoff(Some(Duration::from_secs(30)))
-}
-
-/// Read the reconnect log through `read`, waiting under `backoff` and reading again while the failure is transient.
+/// Read the reconnect log through `read`, reading again after a transient failure while the connection's `budget` of waiting lasts.
+///
+/// Each wait is the default policy's exact backoff for its attempt, 200 ms doubling to 5 s, cut to what is left and taken from it.
 async fn read_log<O: Oplog, R, Fut>(
-    backoff: &mut Backoff<'_>,
+    budget: &mut Duration,
     mut read: impl FnMut() -> Fut,
 ) -> Result<R, SessionError>
 where
     Fut: core::future::Future<Output = Result<R, O::Error>>,
 {
+    let policy = RetryPolicy::new();
+    let mut attempt: u32 = 0;
     loop {
         match read().await {
             Ok(value) => return Ok(value),
             Err(err) if O::is_transient(&err) => {
-                let Some(wait) = backoff.next_wait() else {
+                if budget.is_zero() {
                     return Err(oplog_err(err));
-                };
+                }
+                attempt = attempt.saturating_add(1);
+                let wait = policy.backoff(attempt).min(*budget);
+                *budget -= wait;
                 tracing::warn!(error = %err, wait_ms = retry_ms(wait), "the reconnect log did not answer a resume, reading it again");
                 tokio::time::sleep(wait).await;
             }
@@ -981,6 +993,8 @@ struct HandshakeOutcome<Id, Key> {
     connection_num: u64,
     principal: Arc<Principal<Id, Key>>,
     resume: Resume,
+    /// What is left of the connection's wait on reconnect-log reads after the handshake's.
+    resume_read_budget: Duration,
     applied_watermark: Option<u64>,
     /// How many grants were refused, tallied for abuse once the run is
     /// registered so a crossing can close the connection it happened on.
@@ -1254,6 +1268,8 @@ struct SessionState<Id, Key> {
     applied_watermark: Option<u64>,
     /// Where the handshake cursor lets every re-declared subscription resume.
     resume: Resume,
+    /// What is left of the connection's wait on reconnect-log reads, which every catchup draws from.
+    resume_read_budget: Duration,
     /// Set when a per-connection abuse threshold crossed, so the run loop ends
     /// after the frame that crossed it. A caller with no identity has no name
     /// to ban, so closing the socket is the whole outcome.
@@ -2895,9 +2911,9 @@ where
             return Ok(None);
         }
 
-        let policy = resume_read_policy();
+        let mut resume_read_budget = self.config.resume_read_budget;
         let current_lsn =
-            read_log::<O, _, _>(&mut policy.start(), || self.oplog.current_lsn()).await?;
+            read_log::<O, _, _>(&mut resume_read_budget, || self.oplog.current_lsn()).await?;
         // The durable mutation watermark: the client retires pending records
         // at or below it and replays the rest. Its read is the handshake's one
         // reader-pool checkout, so an unidentified caller takes a share permit
@@ -2959,6 +2975,7 @@ where
             connection_num,
             principal: Arc::new(principal),
             resume,
+            resume_read_budget,
             applied_watermark,
             refused_grants,
             span,
@@ -3395,6 +3412,7 @@ where
             connection_num,
             principal,
             resume,
+            resume_read_budget,
             applied_watermark,
             refused_grants,
             span: _,
@@ -3424,6 +3442,7 @@ where
             session_id,
             applied_watermark,
             resume,
+            resume_read_budget,
             closing: refused == Reaction::Close,
         };
 
@@ -4383,16 +4402,15 @@ where
             Resume::Fresh => None,
             Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
             Resume::At(lsn) => {
-                let policy = resume_read_policy();
-                let mut backoff = policy.start();
-                let min = read_log::<O, _, _>(&mut backoff, || self.oplog.min_lsn()).await?;
+                let min =
+                    read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_lsn())
+                        .await?;
                 let current =
-                    read_log::<O, _, _>(&mut backoff, || self.oplog.current_lsn()).await?;
+                    read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.current_lsn())
+                        .await?;
                 match catchup_decision(lsn, min, current) {
                     CatchupDecision::Catchup => {
-                        return self
-                            .catch_up_row(transport, sub, state, &reg, lsn, &mut backoff)
-                            .await;
+                        return self.catch_up_row(transport, sub, state, &reg, lsn).await;
                     }
                     CatchupDecision::FullResync => Some(FullResyncReason::CursorOutsideRetention),
                 }
@@ -5032,19 +5050,23 @@ where
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
         from: u64,
-        backoff: &mut Backoff<'_>,
     ) -> Result<(), SessionError> {
         self.attach_row_route(&sub, state, reg).await;
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so
         // replaying it cannot duplicate a live patch.
-        let ceiling = read_log::<O, _, _>(backoff, || self.oplog.current_lsn())
-            .await?
-            .unwrap_or(0);
-        let entries = read_log::<O, _, _>(backoff, || self.oplog.entries_since(from)).await?;
+        let ceiling =
+            read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.current_lsn())
+                .await?
+                .unwrap_or(0);
+        let entries = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+            self.oplog.entries_since(from)
+        })
+        .await?;
         // Retention only moves forward, so a log that still reaches the cursor now reached it when the entries were read.
-        let min = read_log::<O, _, _>(backoff, || self.oplog.min_lsn()).await?;
+        let min =
+            read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_lsn()).await?;
         if matches!(
             catchup_decision(from, min, Some(ceiling)),
             CatchupDecision::FullResync

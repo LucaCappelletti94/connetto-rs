@@ -661,6 +661,7 @@ async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> Loopba
 /// A manager on a scripted log holding three matching orders, and their events.
 async fn scripted(
     fixture: &Fixture,
+    config: SessionConfig,
 ) -> (
     Arc<ScriptedManager>,
     Arc<std::sync::Mutex<Script>>,
@@ -680,7 +681,7 @@ async fn scripted(
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
         Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
+        config,
         None,
         NoSigner,
     );
@@ -706,6 +707,7 @@ fn arm(
     script.refuse = reads.iter().copied().collect();
     script.transient = transient;
     script.prune_through = prune_through;
+    script.reads.clear();
     script.armed = true;
 }
 
@@ -713,7 +715,7 @@ fn arm(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
     let fixture = Fixture::acquire().await;
-    let (manager, script, events) = scripted(&fixture).await;
+    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     arm(
         &script,
@@ -752,7 +754,7 @@ async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_catchup_whose_entries_were_pruned_while_it_waited_resyncs() {
     let fixture = Fixture::acquire().await;
-    let (manager, script, events) = scripted(&fixture).await;
+    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     let second = events[1].checkpoint().expect("a checkpoint").0;
     arm(&script, &["entries_since"], true, Some(second));
@@ -768,7 +770,7 @@ async fn a_catchup_whose_entries_were_pruned_while_it_waited_resyncs() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_session_ended_by_an_error_leaves_no_connection_registered() {
     let fixture = Fixture::acquire().await;
-    let (manager, script, events) = scripted(&fixture).await;
+    let (manager, script, events) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     assert_eq!(manager.live_connections().await, 1);
     arm(&script, &["min_lsn"], false, None);
@@ -782,4 +784,44 @@ async fn a_session_ended_by_an_error_leaves_no_connection_registered() {
         "the transport ends, got {ended:?}"
     );
     assert_eq!(manager.live_connections().await, 0);
+}
+
+/// One connection's wait on the reconnect log is bounded however many subscriptions it resumes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
+    let fixture = Fixture::acquire().await;
+    let config = SessionConfig::default().with_resume_read_budget(Duration::from_secs(1));
+    let (manager, script, events) = scripted(&fixture, config).await;
+    let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+
+    // Waits of 200 ms, 400 ms and what is left of the second, spending the whole budget.
+    arm(&script, &["min_lsn", "min_lsn", "min_lsn"], true, None);
+    subscribe(&mut client).await;
+    for event in &events[1..] {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(live.cursor, cursor_of(event));
+    }
+
+    arm(&script, &["min_lsn"], true, None);
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "orders-again".to_owned(),
+            spec: SubscriptionSpec::new(QUERY),
+        }))
+        .await
+        .expect("send the second subscribe");
+    let ended = tokio::time::timeout(Duration::from_secs(10), client.recv())
+        .await
+        .expect("the session ends");
+    assert!(
+        matches!(ended, Ok(None)),
+        "the transport ends, got {ended:?}"
+    );
+    assert_eq!(
+        script.lock().expect("script").reads,
+        ["min_lsn"],
+        "the second subscription's failure is not read again, the budget being spent"
+    );
 }
