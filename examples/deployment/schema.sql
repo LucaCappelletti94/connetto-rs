@@ -3,8 +3,9 @@
 -- a first boot applies. The connetto-server for this demo must be started with
 -- this same schema in CONNETTO_PG_DDL and must list every synced table in
 -- CONNETTO_WRITABLE. Apply in this order: this file,
--- connetto_file_server::DEPLOYMENT_DDL, roles.sql (the non-owner role
--- required by CONNETTO_READER_URL), content.sql, then policies.sql.
+-- connetto_file_server::DEPLOYMENT_DDL, connetto_server::epoch::EPOCH_DDL,
+-- roles.sql (the non-owner role required by CONNETTO_READER_URL),
+-- content.sql, then policies.sql.
 -- The key default is load-bearing on the client rather than here: build.rs
 -- translates it through pg2sqlite into the replica's own DEFAULT (uuidv4()),
 -- which mints the key when a local write omits it. Both ends mint version 4.

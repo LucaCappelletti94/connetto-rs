@@ -3,8 +3,9 @@
 -- replica template database the app ships. The connetto-server for this demo
 -- must be started with this same schema in CONNETTO_PG_DDL and must list
 -- every synced table in CONNETTO_WRITABLE. Apply in this order: this file,
--- connetto_file_server::DEPLOYMENT_DDL, roles.sql (the non-owner role
--- required by CONNETTO_READER_URL), then content.sql.
+-- connetto_file_server::DEPLOYMENT_DDL, connetto_server::epoch::EPOCH_DDL,
+-- roles.sql (the non-owner role required by CONNETTO_READER_URL), then
+-- content.sql.
 -- The server also requires CONNETTO_AUTH, CONNETTO_AUTH_BIND, and the
 -- CONNETTO_OIDC_* variables written by the dev IdP (see dev_idp.rs).
 -- The key default is load-bearing on the client rather than here: build.rs

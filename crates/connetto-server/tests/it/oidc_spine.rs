@@ -593,6 +593,10 @@ impl AuthStore for OutageStore {
         self.0.revoke_session(session_id)
     }
 
+    fn revoke_every_session(&self) -> impl Future<Output = Result<u64, AuthStoreError>> + Send {
+        self.0.revoke_every_session()
+    }
+
     fn session_for_refresh(
         &self,
         refresh_token: &str,

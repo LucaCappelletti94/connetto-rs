@@ -44,7 +44,8 @@ use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 const PROVIDER: &str = "dev-idp";
 
 /// Where the stack listens unless `CONNETTO_AUTH_STACK_BIND` says otherwise. It is
-/// fixed rather than ephemeral because a browser test cannot be told a random port.
+/// fixed rather than ephemeral because a wasm test reads its address at compile
+/// time through `option_env!("CONNETTO_TEST_AUTH_BASE")` and never at run time.
 const DEFAULT_BIND: &str = "127.0.0.1:18099";
 /// The path the client redirect points at. Serving it here lets a browser test
 /// read the delivered code out of the final URL.
@@ -93,6 +94,13 @@ impl AuthStore for ServerStore {
         match self {
             Self::InMemory(store) => store.revoke_session(session_id).await,
             Self::Db(store) => store.revoke_session(session_id).await,
+        }
+    }
+
+    async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
+        match self {
+            Self::InMemory(store) => store.revoke_every_session().await,
+            Self::Db(store) => store.revoke_every_session().await,
         }
     }
 

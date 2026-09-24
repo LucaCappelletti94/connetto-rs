@@ -61,7 +61,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auth::PendingWork;
-use crate::content_wire::{ContentFrame, WireResolve, mime_from_code};
+use crate::content_wire::{ContentFrame, WirePins, WireResolve, mime_from_code};
 use crate::frames::{
     InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
 };
@@ -1321,7 +1321,26 @@ where
                         | ClientEvent::SyncStatus(SyncStatus::Connected)
                         | ClientEvent::MutationApplied { .. }
                 );
+                // A `lost` flip arrives as an ordinary row change.
+                let rows_changed = matches!(
+                    &event,
+                    ClientEvent::LivePatch { .. }
+                        | ClientEvent::SnapshotEnd { .. }
+                        | ClientEvent::FullResync { .. }
+                );
                 handle_worker_event(&mut self.worker, &mut self.state, event)?;
+                if rows_changed && let Some(content) = &self.content {
+                    let archive = content.archive();
+                    if archive.heals_lost() {
+                        match archive.queue_lost(&mut self.worker) {
+                            Ok(queued) if !queued.is_empty() => self.wake_content()?,
+                            Ok(_) => {}
+                            Err(err) => {
+                                tracing::warn!(error = %err, "queueing lost content failed");
+                            }
+                        }
+                    }
+                }
                 if wake_content {
                     self.wake_content()?;
                 }
@@ -2382,7 +2401,14 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::ForgetRetired(_, _)
             | HubEvent::RefusedContent(_)
             | HubEvent::RetryRefused(_, _)
-            | HubEvent::Internal(_, ContentFrame::Resolve { .. }, _)
+            | HubEvent::Internal(
+                _,
+                ContentFrame::Resolve { .. }
+                    | ContentFrame::Pin { .. }
+                    | ContentFrame::Unpin { .. }
+                    | ContentFrame::ListPins { .. },
+                _
+            )
     )
 }
 
@@ -3469,7 +3495,76 @@ where
             }
             Ok(())
         }
-        ContentFrame::ResolveReply { .. } => Ok(()),
+        pin @ (ContentFrame::Pin { .. }
+        | ContentFrame::Unpin { .. }
+        | ContentFrame::ListPins { .. }) => {
+            serve_pin_frame(worker, state, content, id, pin);
+            Ok(())
+        }
+        ContentFrame::ResolveReply { .. } | ContentFrame::PinReply { .. } => Ok(()),
+    }
+}
+
+/// Answers a tab's pin, unpin or pin listing from the replica.
+fn serve_pin_frame<U: Transport>(
+    worker: &mut ConnettoConnection<U>,
+    state: &HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    tab: TabId,
+    frame: ContentFrame,
+) {
+    let (request_id, answer) = match frame {
+        ContentFrame::Pin {
+            request_id,
+            name,
+            query,
+            file_id_column,
+        } => (
+            request_id,
+            with_archive(content, |archive| {
+                archive
+                    .pin_content(worker, &name, &query, &file_id_column)
+                    .map(|()| WirePins::Done)
+            }),
+        ),
+        ContentFrame::Unpin { request_id, name } => (
+            request_id,
+            with_archive(content, |archive| {
+                archive
+                    .unpin_content(worker, &name)
+                    .map(|()| WirePins::Done)
+            }),
+        ),
+        ContentFrame::ListPins { request_id } => (
+            request_id,
+            with_archive(content, |archive| {
+                archive.content_pins(worker).map(WirePins::Pins)
+            }),
+        ),
+        ContentFrame::Stage { .. }
+        | ContentFrame::Resolve { .. }
+        | ContentFrame::ResolveReply { .. }
+        | ContentFrame::PinReply { .. } => return,
+    };
+    answer_pins(state, tab, request_id, answer);
+}
+
+/// Runs `pin` against the archive, refusing when content is disabled.
+fn with_archive(
+    content: Option<&ContentArchive<BrowserStore>>,
+    pin: impl FnOnce(&ContentArchive<BrowserStore>) -> Result<WirePins, ContentError>,
+) -> WirePins {
+    match content {
+        Some(archive) => pin(archive).unwrap_or_else(|err| WirePins::Refused(err.to_string())),
+        None => WirePins::Refused("content is not enabled on this worker".to_owned()),
+    }
+}
+
+/// Answers a tab's pin frame on its content lane.
+fn answer_pins(state: &HubState, tab: TabId, request_id: u64, answer: WirePins) {
+    if let Some(entry) = state.tabs.get(&tab) {
+        let reply = ContentFrame::PinReply { request_id, answer };
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
     }
 }
 

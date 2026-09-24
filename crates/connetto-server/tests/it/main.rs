@@ -35,6 +35,8 @@ mod delta_aggregate;
 
 mod e2e;
 
+mod epoch;
+
 mod grants;
 
 mod grouped_wire;
@@ -80,6 +82,8 @@ mod rls_write_filter;
 mod rls_write_question;
 
 mod session_loop;
+
+mod restore;
 
 mod slot_watch;
 

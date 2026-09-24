@@ -146,6 +146,91 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
     files.abort();
 }
 
+/// R70 decision 13: a file the server's boot reconcile marked lost comes back
+/// from the device that still holds it, with no call from the application
+/// beyond registering where `lost` shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Docker: the fixture starts its own Postgres"]
+async fn a_device_holding_a_lost_photo_uploads_it_again() {
+    let fixture = Fixture::acquire().await;
+    provision(&fixture).await;
+    let chunk_dir = tempdir().expect("temp dir");
+    let (_, signer, files) = start_file_server(&fixture, chunk_dir.path()).await;
+    let server = Arc::new(spawn_sync_server(&fixture, signer).await);
+    let replica_dir = tempdir().expect("temp dir");
+    let (a, gate) = offline_device_a(replica_dir.path(), &server);
+    let a_content = attach_device_a_content(a.clone(), chunk_dir.path())
+        .await
+        .heal_lost(
+            "SELECT content_id FROM photos WHERE content_state = 'lost'",
+            "content_id",
+        )
+        .await
+        .expect("the query returns the column it names");
+    let file_id = stage_offline_photo(&a_content).await;
+    gate.store(true, Ordering::Relaxed);
+    a.pin("photos", "SELECT * FROM photos")
+        .await
+        .expect("device A follows its own photos, which is how it hears of the loss");
+    wait_for_upload(&a_content).await;
+    assert_eq!(
+        wait_for_state(&fixture, file_id.as_bytes())
+            .await
+            .as_deref(),
+        Some("available")
+    );
+
+    // What a restore leaves after the sweep removed the bytes past the backup.
+    let server_chunks = chunk_dir.path().join("server");
+    std::fs::remove_dir_all(&server_chunks).expect("lose the server's bytes");
+    let reconciled = connetto_file_server::reconcile_store::<DefaultFileSchema>(
+        fixture.admin(),
+        &connetto_file_server::AnyStore::Fs(ServerStore::new(&server_chunks).expect("store")),
+        &connetto_file_server::CallerSettings::default(),
+        Duration::from_secs(600),
+    )
+    .await
+    .expect("the boot reconcile runs");
+    assert_eq!(reconciled.lost, vec![file_id]);
+
+    let driver = {
+        let a_content = Arc::new(a_content);
+        let driving = Arc::clone(&a_content);
+        tokio::spawn(async move { driving.drive_outbox(TokioSleeper).await });
+        a_content
+    };
+    wait_for_pg_state(&fixture, file_id.as_bytes(), "available").await;
+    assert_eq!(
+        driver.bytes(file_id).await.expect("read").as_deref(),
+        Some(PHOTO),
+        "the photo is whole again"
+    );
+    files.abort();
+}
+
+/// Reads `content_state` out of Postgres until it equals `wanted`.
+async fn wait_for_pg_state(fixture: &Fixture, file_id: &[u8; 32], wanted: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut conn = fixture.admin().get().await.expect("admin connection");
+        let rows: Vec<StateRow> = diesel_async::RunQueryDsl::load(
+            diesel::sql_query("SELECT content_state FROM photos WHERE content_id = $1")
+                .bind::<diesel::sql_types::Bytea, _>(file_id.to_vec()),
+            &mut *conn,
+        )
+        .await
+        .expect("read the state");
+        if rows.first().and_then(|row| row.content_state.as_deref()) == Some(wanted) {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "content_state never became {wanted}"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// Attaches a content client to device A's dedicated chunk directory.
 async fn attach_device_a_content(
     a: ConnettoClient<LoopbackTransport>,

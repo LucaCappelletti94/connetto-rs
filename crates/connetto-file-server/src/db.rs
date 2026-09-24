@@ -12,7 +12,7 @@ use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQ
 
 use connetto_core::auth::ContentCaller;
 
-use crate::caller::{CallerSettings, bind_caller};
+use crate::caller::{CallerSettings, attributions_of_key, bind_caller};
 use crate::functions;
 use crate::needed;
 use crate::schema::ConnettoFileSchema;
@@ -148,23 +148,7 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
 
         // Batch-insert chunk rows (one SQL statement, not one per chunk).
         if !chunks_owned.is_empty() {
-            let rows: Vec<(i32, Vec<u8>, i64)> = chunks_owned
-                .iter()
-                .enumerate()
-                .map(|(i, ch)| {
-                    let pos = i32::try_from(i).map_err(|_| {
-                        IntentTxErr::Db(diesel::result::Error::DeserializationError(
-                            "chunk count overflows i32".into(),
-                        ))
-                    })?;
-                    let len = i64::try_from(ch.len).map_err(|_| {
-                        IntentTxErr::Db(diesel::result::Error::DeserializationError(
-                            "chunk len overflows i64".into(),
-                        ))
-                    })?;
-                    Ok((pos, ch.hash.as_bytes().to_vec(), len))
-                })
-                .collect::<Result<Vec<_>, IntentTxErr>>()?;
+            let rows = chunk_rows(&chunks_owned)?;
             c.execute_returning_count(S::insert_chunk_rows_batch_stmt(
                 file_id_bytes,
                 caller_owned,
@@ -230,6 +214,17 @@ pub(crate) async fn load_any_committed_manifest<S: ConnettoFileSchema>(
             .map(Some),
         None => Ok(None),
     }
+}
+
+/// Whether any caller holds a committed manifest for `file_id`.
+pub(crate) async fn file_committed<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+) -> Result<bool, diesel::result::Error> {
+    let callers: Vec<String> = S::any_committed_manifest_caller_stmt(file_id.as_bytes().to_vec())
+        .load(conn)
+        .await?;
+    Ok(!callers.is_empty())
 }
 
 /// Locks and returns the manifest for `(file_id, caller)` in any state.
@@ -395,6 +390,16 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
     Ok(rows.pop().map(|(_, state)| state))
 }
 
+/// The uploaders whose manifests of `file_id` the boot reconcile marked lost, locked.
+pub(crate) async fn lost_manifest_callers<S: ConnettoFileSchema>(
+    conn: &mut AsyncPgConnection,
+    file_id: &FileId,
+) -> Result<Vec<String>, diesel::result::Error> {
+    S::lost_manifest_callers_stmt(file_id.as_bytes().to_vec())
+        .load(conn)
+        .await
+}
+
 /// Atomically marks the manifest committed and calls the deployment setter,
 /// all inside one Postgres transaction.
 ///
@@ -403,34 +408,65 @@ pub(crate) async fn lock_registry_state<S: ConnettoFileSchema>(
 /// can see the file afterwards under any one. A deployment setter is
 /// therefore called more than once for one commit and must be idempotent.
 ///
+/// A non-empty `lost` heals the file, restoring those manifests under the committer's verified chunks for their own uploaders.
+///
 /// When the manifest is already committed (zero rows from the guarded UPDATE),
 /// returns [`CommitOutcome::AlreadyCommitted`] without re-calling the setter.
-///
-/// Commit no longer touches the chunk registry: liveness is derived from
-/// `manifest_chunks` references and no counter needs incrementing.
 pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
+    settings: &CallerSettings,
     file_id: &FileId,
     key: &str,
     attributions: &[&str],
+    lost: Vec<String>,
+    chunks: &[ChunkMeta],
 ) -> Result<CommitOutcome, diesel::result::Error> {
     let file_id_bytes = file_id.as_bytes().to_vec();
+    let rows = chunk_rows(chunks)?;
     let commit_stmt = S::mark_manifest_committed_stmt(file_id_bytes.clone(), key.to_owned());
     let attributions: Vec<String> = attributions.iter().map(|to| (*to).to_owned()).collect();
-    let setter_arg = file_id_bytes;
+    let key = key.to_owned();
 
     conn.transaction::<CommitOutcome, CommitTxError, _>(async move |c| {
-        let rows = c.execute_returning_count(commit_stmt).await?;
-
-        if rows == 0 {
-            return Ok(CommitOutcome::AlreadyCommitted);
-        }
-
-        // Call the deployment setter inside the transaction.  A raise rolls
-        // back the committed flag so the client can retry.
-        for attribution in &attributions {
+        let told: Vec<String> = if lost.is_empty() {
+            if c.execute_returning_count(commit_stmt).await? == 0 {
+                return Ok(CommitOutcome::AlreadyCommitted);
+            }
+            attributions
+        } else {
+            // Another device may have chunked the same bytes differently, and only the committer's chunks are known stored.
+            for owner in lost.iter().filter(|owner| **owner != key) {
+                c.execute_returning_count(S::delete_manifest_chunks_stmt(
+                    file_id_bytes.clone(),
+                    owner.clone(),
+                ))
+                .await?;
+                c.execute_returning_count(S::insert_chunk_rows_batch_stmt(
+                    file_id_bytes.clone(),
+                    owner.clone(),
+                    rows.clone(),
+                ))
+                .await?;
+            }
+            c.execute_returning_count(S::restore_lost_chunks_stmt(file_id_bytes.clone()))
+                .await?;
+            let restored: Vec<String> = S::restore_lost_manifests_stmt(file_id_bytes.clone())
+                .load(c)
+                .await?;
+            if !restored.contains(&key) {
+                c.execute_returning_count(S::delete_manifest_stmt(file_id_bytes.clone(), key))
+                    .await?;
+            }
+            restored
+                .iter()
+                .flat_map(|owner| attributions_of_key(settings, owner))
+                .map(ToOwned::to_owned)
+                .collect()
+        };
+        // A raise rolls back the commit so the client can retry.
+        for attribution in &told {
             diesel::select(crate::functions::connetto_set_content_state(
-                setter_arg.as_slice(),
+                file_id_bytes.as_slice(),
                 "available",
                 attribution.as_str(),
             ))
@@ -438,13 +474,28 @@ pub(crate) async fn commit_manifest_atomic<S: ConnettoFileSchema>(
             .await
             .map_err(CommitTxError::Setter)?;
         }
-
         Ok(CommitOutcome::Committed)
     })
     .await
     .map_err(|e| match e {
         CommitTxError::Db(e) | CommitTxError::Setter(e) => e,
     })
+}
+
+/// `(position, hash, len)` rows for [`ConnettoFileSchema::insert_chunk_rows_batch_stmt`].
+fn chunk_rows(chunks: &[ChunkMeta]) -> Result<Vec<(i32, Vec<u8>, i64)>, diesel::result::Error> {
+    chunks
+        .iter()
+        .enumerate()
+        .map(|(i, ch)| {
+            let overflow = |what: &str| diesel::result::Error::DeserializationError(what.into());
+            Ok((
+                i32::try_from(i).map_err(|_| overflow("chunk count overflows i32"))?,
+                ch.hash.as_bytes().to_vec(),
+                i64::try_from(ch.len).map_err(|_| overflow("chunk len overflows i64"))?,
+            ))
+        })
+        .collect()
 }
 
 /// Locks the sweep set, deletes stale manifests, then marks still-unreferenced hashes.

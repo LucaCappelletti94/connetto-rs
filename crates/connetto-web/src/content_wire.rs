@@ -35,6 +35,47 @@ pub enum ContentFrame {
         /// The answer.
         answer: WireResolve,
     },
+    /// The tab keeps the files `query` names in `file_id_column` on this device under `name`.
+    Pin {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+        /// The pin's name, its identity for replace and end.
+        name: String,
+        /// The SQLite query naming the pinned files.
+        query: String,
+        /// The result column carrying the file identity.
+        file_id_column: String,
+    },
+    /// The tab ends the pin under `name`.
+    Unpin {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+        /// The pin to end.
+        name: String,
+    },
+    /// The tab asks for every pin.
+    ListPins {
+        /// Identifies the reply, unique per tab transport.
+        request_id: u64,
+    },
+    /// The hub's answer to a pin frame.
+    PinReply {
+        /// The `request_id` being answered.
+        request_id: u64,
+        /// The answer.
+        answer: WirePins,
+    },
+}
+
+/// A pin answer in its wire shape.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WirePins {
+    /// The pin or unpin was recorded.
+    Done,
+    /// Every pin, as name, query and file-id column, in name order.
+    Pins(Vec<(String, String, String)>),
+    /// The hub refused, with the reason.
+    Refused(String),
 }
 
 /// A resolution answer in its wire shape.

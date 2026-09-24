@@ -8,25 +8,30 @@
 //! ```
 //!
 //! Bare, it serves until interrupted and prints the environment a desktop run
-//! needs and the `adb reverse` lines that put every service on a phone's
-//! loopback at the address the demo dials. Given a program, it runs that
-//! program against the stack with `CONNETTO_DEMO_SERVER`, `CONNETTO_DEMO_PG`,
+//! or a web build needs and the `adb reverse` lines that put every service on
+//! a phone's loopback at the address the demo dials. Given a program, it runs
+//! that program against the stack with `CONNETTO_DEMO_SERVER`,
+//! `CONNETTO_DEMO_AUTH_ORIGIN`, `CONNETTO_DEMO_WS`, `CONNETTO_DEMO_PG`,
 //! `CONNETTO_DEMO_ADB_REVERSE` (comma-separated `device:host` port pairs) and
 //! `CONNETTO_DEMO_ISSUER` set, then stops.
+//!
+//! `CONNETTO_STACK_SYNC_PORT` and `CONNETTO_STACK_AUTH_PORT` move its
+//! listeners off 7777 and 18081.
 
 use std::ffi::OsString;
 
 use anyhow::{Context as _, Result, anyhow};
 use connetto_test_harness::MockOauth;
 use connetto_test_harness::stack::{
-    Deployment, ensure_server_bin, provision, require_free, run_process, spawn_server,
+    AUTH_PORT_VAR, Deployment, SYNC_PORT_VAR, ensure_server_bin, ports, provision, require_free,
+    run_process, spawn_server,
 };
 
-const SYNC_BIND: &str = "127.0.0.1:7777";
-/// The demo's `AUTH_SERVER`. The server's auth listener serves content too.
-const AUTH_BIND: &str = "127.0.0.1:18081";
-const AUTH_BASE: &str = "http://127.0.0.1:18081";
-const CALLBACK: &str = "http://127.0.0.1:18081/auth/callback";
+/// The sync port the demo dials unless told otherwise, which a phone keeps.
+const DEMO_SYNC_PORT: u16 = 7777;
+/// The auth port of the demo's default `AUTH_SERVER`, which a phone keeps. The
+/// server's auth listener serves content too.
+const DEMO_AUTH_PORT: u16 = 18081;
 const PROVIDER: &str = "dev-idp";
 /// The port in the demo's default `CONNETTO_DEMO_PG`.
 const DEMO_PG_PORT: u16 = 55456;
@@ -47,8 +52,18 @@ const DEPLOYMENT: Deployment = Deployment {
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
-    require_free(SYNC_BIND)?;
-    require_free(AUTH_BIND)?;
+    let [sync_port, auth_port] = ports(
+        |name| std::env::var(name).ok(),
+        [
+            (SYNC_PORT_VAR, DEMO_SYNC_PORT),
+            (AUTH_PORT_VAR, DEMO_AUTH_PORT),
+        ],
+    )?;
+    let sync_bind = format!("127.0.0.1:{sync_port}");
+    let auth_bind = format!("127.0.0.1:{auth_port}");
+    let auth_base = format!("http://{auth_bind}");
+    require_free(&sync_bind, SYNC_PORT_VAR)?;
+    require_free(&auth_bind, AUTH_PORT_VAR)?;
 
     let mut args = std::env::args_os().skip(1).collect::<Vec<OsString>>();
     if args.first().is_some_and(|arg| arg == "--") {
@@ -58,19 +73,19 @@ async fn main() -> Result<()> {
     let server_bin = ensure_server_bin().await?;
     let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack").await?;
     let idp = MockOauth::start().await;
-    let mut envs = provisioned.server_env(&DEPLOYMENT, SYNC_BIND, AUTH_BIND, AUTH_BASE);
-    envs.extend(idp.env_pairs(PROVIDER, CALLBACK));
+    let mut envs = provisioned.server_env(&DEPLOYMENT, &sync_bind, &auth_bind, &auth_base);
+    envs.extend(idp.env_pairs(PROVIDER, &format!("{auth_base}/auth/callback")));
     envs.push((
         "CONNETTO_AUTH_REDIRECT_ALLOWLIST".to_owned(),
         APP_REDIRECT.to_owned(),
     ));
-    let _server = spawn_server(&server_bin, &envs, SYNC_BIND, AUTH_BIND).await?;
+    let _server = spawn_server(&server_bin, &envs, &sync_bind, &auth_bind).await?;
 
     let pg_url = provisioned.fixture.admin_url();
     // Each pair is the device port, where the demo dials, then the host port.
     let reverse = [
-        (url_port(SYNC_BIND)?, url_port(SYNC_BIND)?),
-        (url_port(AUTH_BIND)?, url_port(AUTH_BIND)?),
+        (DEMO_SYNC_PORT, sync_port),
+        (DEMO_AUTH_PORT, auth_port),
         (url_port(idp.issuer())?, url_port(idp.issuer())?),
         (DEMO_PG_PORT, url_port(pg_url)?),
     ];
@@ -80,7 +95,9 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     let demo_env = vec![
-        ("CONNETTO_DEMO_SERVER".to_owned(), SYNC_BIND.to_owned()),
+        ("CONNETTO_DEMO_SERVER".to_owned(), sync_bind.clone()),
+        ("CONNETTO_DEMO_AUTH_ORIGIN".to_owned(), auth_base),
+        ("CONNETTO_DEMO_WS".to_owned(), format!("ws://{sync_bind}/")),
         ("CONNETTO_DEMO_PG".to_owned(), pg_url.to_owned()),
         ("CONNETTO_DEMO_ADB_REVERSE".to_owned(), reverse_spec),
         ("CONNETTO_DEMO_ISSUER".to_owned(), idp.issuer().to_owned()),
@@ -89,8 +106,8 @@ async fn main() -> Result<()> {
     if args.is_empty() {
         println!("connetto demo stack is up, Ctrl-C stops it");
         println!();
-        println!("desktop:");
-        for (key, value) in &demo_env[..2] {
+        println!("desktop and web builds:");
+        for (key, value) in &demo_env[..4] {
             println!("  export {key}={value}");
         }
         println!();

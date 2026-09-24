@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::content_wire::{ContentFrame, WireResolve, mime_code};
+use crate::content_wire::{ContentFrame, WirePins, WireResolve, mime_code};
 use crate::frames::{InternalLane, MessageSink, MessageTransport};
 use crate::workers::helpers::sleep_ms;
 use connetto_client::live::ConnettoClient;
@@ -239,6 +239,23 @@ pub enum TabStageError<E: Display> {
 /// One answer to a `Resolve`, with the bytes a `Local` answer carries.
 type ResolveAnswer = (WireResolve, Option<Blob>);
 
+/// One reply the hub sends on a tab's content lane, keyed by its request.
+enum LaneAnswer {
+    Resolve(ResolveAnswer),
+    Pins(WirePins),
+}
+
+/// Why a tab's pin request did not take effect.
+#[derive(Debug, thiserror::Error)]
+pub enum TabPinError {
+    /// The worker refused, with its reason.
+    #[error("the worker refused the pin request: {0}")]
+    Refused(String),
+    /// No answer arrived in time, or the lane is closed.
+    #[error("the worker did not answer the pin request")]
+    Unanswered,
+}
+
 /// A tab's content lane: stage files through the worker and ask where bytes
 /// live, while the tab's client owns the transport itself.
 ///
@@ -250,7 +267,7 @@ type ResolveAnswer = (WireResolve, Option<Blob>);
 /// checking that the bytes hash to the identity the row names.
 pub struct TabContent<S: MessageSink + Clone + 'static> {
     lane: InternalLane<S>,
-    replies: Rc<RefCell<HashMap<u64, oneshot::Sender<ResolveAnswer>>>>,
+    replies: Rc<RefCell<HashMap<u64, oneshot::Sender<LaneAnswer>>>>,
     next_request: Rc<Cell<u64>>,
 }
 
@@ -260,17 +277,23 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
     #[must_use]
     pub fn new(transport: &mut MessageTransport<S>) -> Self {
         let lane = transport.internal_lane();
-        let replies: Rc<RefCell<HashMap<u64, oneshot::Sender<ResolveAnswer>>>> =
+        let replies: Rc<RefCell<HashMap<u64, oneshot::Sender<LaneAnswer>>>> =
             Rc::new(RefCell::new(HashMap::new()));
         if let Some(mut inbox) = transport.take_internal_inbox() {
             let waiting = Rc::clone(&replies);
             wasm_bindgen_futures::spawn_local(async move {
                 while let Some(inbound) = inbox.next().await {
-                    if let Some(ContentFrame::ResolveReply { request_id, answer }) =
-                        ContentFrame::from_json(&inbound.json)
-                        && let Some(sender) = waiting.borrow_mut().remove(&request_id)
-                    {
-                        let _ = sender.send((answer, inbound.blob));
+                    let (request_id, answer) = match ContentFrame::from_json(&inbound.json) {
+                        Some(ContentFrame::ResolveReply { request_id, answer }) => {
+                            (request_id, LaneAnswer::Resolve((answer, inbound.blob)))
+                        }
+                        Some(ContentFrame::PinReply { request_id, answer }) => {
+                            (request_id, LaneAnswer::Pins(answer))
+                        }
+                        _ => continue,
+                    };
+                    if let Some(sender) = waiting.borrow_mut().remove(&request_id) {
+                        let _ = sender.send(answer);
                     }
                 }
             });
@@ -341,6 +364,88 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
 
     /// Where this file's bytes are to be had, answered by the worker.
     pub async fn resolve(&self, file_id: FileId) -> TabResolved {
+        let answer = self
+            .ask(|request_id| ContentFrame::Resolve {
+                request_id,
+                file_id: *file_id.as_bytes(),
+            })
+            .await;
+        match answer {
+            Some(LaneAnswer::Resolve((WireResolve::Remote { url }, _))) => {
+                TabResolved::Remote { url }
+            }
+            Some(LaneAnswer::Resolve((WireResolve::Local, Some(blob)))) => {
+                TabResolved::Local { blob }
+            }
+            _ => TabResolved::Unavailable,
+        }
+    }
+
+    /// Keeps the files `query` names in `file_id_column` on this device under `name`,
+    /// as the native content client's `pin_content` does.
+    ///
+    /// # Errors
+    ///
+    /// [`TabPinError::Refused`] when the worker refuses, for a query not returning the
+    /// named column among other reasons, and [`TabPinError::Unanswered`] when no answer comes.
+    pub async fn pin_content(
+        &self,
+        name: &str,
+        query: &str,
+        file_id_column: &str,
+    ) -> Result<(), TabPinError> {
+        self.pin_request(|request_id| ContentFrame::Pin {
+            request_id,
+            name: name.to_owned(),
+            query: query.to_owned(),
+            file_id_column: file_id_column.to_owned(),
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Ends the pin under `name`. Unknown names are a no-op.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn unpin_content(&self, name: &str) -> Result<(), TabPinError> {
+        self.pin_request(|request_id| ContentFrame::Unpin {
+            request_id,
+            name: name.to_owned(),
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Every content pin, as name, query and file-id column, in name order.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn content_pins(&self) -> Result<Vec<(String, String, String)>, TabPinError> {
+        match self
+            .pin_request(|request_id| ContentFrame::ListPins { request_id })
+            .await?
+        {
+            WirePins::Pins(pins) => Ok(pins),
+            WirePins::Done | WirePins::Refused(_) => Err(TabPinError::Unanswered),
+        }
+    }
+
+    async fn pin_request(
+        &self,
+        frame: impl FnOnce(u64) -> ContentFrame,
+    ) -> Result<WirePins, TabPinError> {
+        match self.ask(frame).await {
+            Some(LaneAnswer::Pins(WirePins::Refused(reason))) => Err(TabPinError::Refused(reason)),
+            Some(LaneAnswer::Pins(answer)) => Ok(answer),
+            Some(LaneAnswer::Resolve(_)) | None => Err(TabPinError::Unanswered),
+        }
+    }
+
+    /// Posts the frame `frame` builds under a fresh request id and waits, bounded, for its reply.
+    async fn ask(&self, frame: impl FnOnce(u64) -> ContentFrame) -> Option<LaneAnswer> {
         let request_id = {
             let next = self.next_request.get() + 1;
             self.next_request.set(next);
@@ -348,24 +453,20 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
         };
         let (sender, answer) = oneshot::channel();
         self.replies.borrow_mut().insert(request_id, sender);
-        let frame = ContentFrame::Resolve {
-            request_id,
-            file_id: *file_id.as_bytes(),
-        };
-        if self.lane.post_internal(&frame.to_json(), None).is_err() {
+        if self
+            .lane
+            .post_internal(&frame(request_id).to_json(), None)
+            .is_err()
+        {
             self.replies.borrow_mut().remove(&request_id);
-            return TabResolved::Unavailable;
+            return None;
         }
-        tokio::select! {
-            answer = answer => match answer.unwrap_or((WireResolve::Unavailable, None)) {
-                (WireResolve::Remote { url }, _) => TabResolved::Remote { url },
-                (WireResolve::Local, Some(blob)) => TabResolved::Local { blob },
-                (WireResolve::Local, None) | (WireResolve::Unavailable, _) => {
-                    TabResolved::Unavailable
-                }
-            },
-            () = sleep_ms(TAB_RESOLVE_WAIT_MS) => TabResolved::Unavailable,
-        }
+        let answered = tokio::select! {
+            answer = answer => answer.ok(),
+            () = sleep_ms(TAB_RESOLVE_WAIT_MS) => None,
+        };
+        self.replies.borrow_mut().remove(&request_id);
+        answered
     }
 }
 

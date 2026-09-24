@@ -1,5 +1,5 @@
 //! The browser smoke: the full connetto sync loop on wasm32 inside a
-//! dedicated worker, against a real `connetto-server` on `127.0.0.1:7777`
+//! dedicated worker, against a real `connetto-server` at `DEMO_WS_URL`
 //! backed by real Postgres logical replication.
 //!
 //! Covers, in one test: the browser WebSocket transport, the client core
@@ -16,6 +16,7 @@ mod common;
 
 use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
 use connetto_wasm_smoke::BrowserSocket;
+use connetto_wasm_smoke::workers::DEMO_WS_URL;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -76,7 +77,7 @@ async fn pump_until(
 
 #[wasm_bindgen_test]
 async fn full_sync_loop_in_a_dedicated_worker() {
-    let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
+    let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let (token, identity) = common::mint_session().await;

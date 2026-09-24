@@ -226,6 +226,7 @@ const MANIFESTS_COLS: &[(&str, &str)] = &[
     ("committed", "boolean"),
     ("uploaded_by", "text"),
     ("created_at", "timestamp with time zone"),
+    ("lost", "boolean"),
 ];
 
 const CHUNKS_COLS: &[(&str, &str)] = &[

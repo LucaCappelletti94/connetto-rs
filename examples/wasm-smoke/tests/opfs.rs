@@ -18,6 +18,7 @@ use connetto_client::{
     cipher::cipher_url, dsl::Watchable,
 };
 use connetto_wasm_smoke::BrowserSocket;
+use connetto_wasm_smoke::workers::DEMO_WS_URL;
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -69,7 +70,7 @@ fn replica_url() -> String {
 
 /// Open the replica, applying `ddl` on a first boot and nothing on a reopen.
 async fn connect(config: &ClientConfig, ddl: Option<&str>) -> ConnettoConnection<BrowserSocket> {
-    let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
+    let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let url = replica_url();

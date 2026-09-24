@@ -206,7 +206,12 @@ fn manager_writing_to(
 
 /// Timeline 2, which ended timeline 1 at `0/10`.
 fn promoted_early() -> TimelineHistory {
-    TimelineHistory::parse(2, "1\t0/10\tno recovery target specified").expect("parse")
+    TimelineHistory::parse(
+        TimelineHistory::default().system(),
+        2,
+        "1\t0/10\tno recovery target specified",
+    )
+    .expect("parse")
 }
 
 /// A cursor from before timelines were stamped is judged on the wire as one
@@ -242,6 +247,7 @@ async fn a_handshake_under_way_meets_a_history_read_during_it() {
     let started = writes.state().statistics.get_started;
 
     let past_the_old_end = Position {
+        system: TimelineHistory::default().system(),
         timeline: 1,
         lsn: 0x20,
     };
@@ -286,8 +292,12 @@ async fn only_a_changed_timeline_closes_live_connections() {
         "reading the timeline the server already serves closes nothing"
     );
 
-    let promoted =
-        TimelineHistory::parse(2, "1\t0/3000000\tno recovery target specified").expect("parse");
+    let promoted = TimelineHistory::parse(
+        TimelineHistory::default().system(),
+        2,
+        "1\t0/3000000\tno recovery target specified",
+    )
+    .expect("parse");
     manager.reconcile_history(promoted).await;
     assert_eq!(
         closed(&mut client).await,

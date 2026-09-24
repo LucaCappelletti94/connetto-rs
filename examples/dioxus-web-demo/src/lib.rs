@@ -17,7 +17,8 @@ pub const DEMO_TAB_DDL: &str = concat!(
     include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql")),
 );
 
-pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
+pub use connetto_demo_deployment::{AUTH_BASE, DEMO_WS_URL, auth_landing};
+
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
 pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
@@ -106,14 +107,18 @@ async fn boot_with(
             .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_hub_meta_name(hub_meta)
             .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(demo_policy_tables())
             .with_caller_function(CALLER_FUNCTION)
             .with_subjects_function(SUBJECTS_FUNCTION)
             .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                "http://127.0.0.1:18099",
+                AUTH_BASE,
                 "dev-idp",
-                "http://127.0.0.1:18099/dev/landing",
+                auth_landing(),
             )))
             .with_auth_db_name(auth_db),
     )

@@ -24,6 +24,7 @@
 
 use connetto_client::{encode_identity, replica_db_name};
 use connetto_core::traits::ReplicaKeyStore;
+use connetto_wasm_smoke::AUTH_BASE;
 use connetto_web::auth::{
     AccountStore, Acquired, BrowserAuthenticator, IdbKeyStore, WorkerAuthConfig,
     provision_replica_key,
@@ -35,9 +36,6 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{Request, RequestInit, Response, WorkerGlobalScope};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
-
-/// Where the auth stack listens by default.
-const AUTH_BASE: &str = "http://127.0.0.1:18099";
 
 /// The provider the stack registers, and the landing route it serves so the
 /// worker can read the delivered code from the final URL.
@@ -118,7 +116,7 @@ fn config() -> WorkerAuthConfig {
 
 fn config_for(provider: &str) -> WorkerAuthConfig {
     // The stack serves connetto's navigation and fetch endpoints on one origin.
-    WorkerAuthConfig::new(AUTH_BASE, provider, format!("{AUTH_BASE}/dev/landing"))
+    WorkerAuthConfig::new(AUTH_BASE, provider, connetto_wasm_smoke::auth_landing())
 }
 
 /// Log in for real against `provider` and return the session it resolved.

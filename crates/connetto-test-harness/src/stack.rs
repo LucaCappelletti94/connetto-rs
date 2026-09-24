@@ -98,6 +98,7 @@ pub async fn provision(deployment: &Deployment, label: &str) -> Result<Provision
     let fixture = Fixture::acquire().await;
     fixture.setup(&[deployment.schema]).await;
     fixture.setup(&[DEPLOYMENT_SQL]).await;
+    fixture.setup(&[connetto_server::epoch::EPOCH_DDL]).await;
     provision_auth_tables(&fixture).await;
     fixture.setup(&[deployment.roles]).await;
     fixture.setup(&[deployment.content]).await;
@@ -310,14 +311,55 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
     }
 }
 
-/// Fail when `bind` is taken, naming it.
+/// The variable that moves a stack's sync listener.
+pub const SYNC_PORT_VAR: &str = "CONNETTO_STACK_SYNC_PORT";
+/// The variable that moves a stack's auth listener.
+pub const AUTH_PORT_VAR: &str = "CONNETTO_STACK_AUTH_PORT";
+/// The variable that moves a stack's content listener.
+pub const CONTENT_PORT_VAR: &str = "CONNETTO_STACK_CONTENT_PORT";
+
+/// Each `(variable, default)` port as `var` reads it.
+///
+/// # Errors
+///
+/// When a value is not a port from 1 to 65535, or two ports coincide, since
+/// every entry names its own listener.
+pub fn ports<const N: usize>(
+    var: impl Fn(&str) -> Option<String>,
+    wanted: [(&str, u16); N],
+) -> Result<[u16; N]> {
+    let mut ports = [0; N];
+    for (slot, (name, default)) in ports.iter_mut().zip(wanted) {
+        *slot = match var(name) {
+            None => default,
+            Some(value) => value
+                .parse()
+                .ok()
+                .filter(|port| *port != 0)
+                .ok_or_else(|| anyhow!("{name} wants a port from 1 to 65535, got {value:?}"))?,
+        };
+    }
+    for (index, port) in ports.iter().enumerate() {
+        if let Some(earlier) = ports[..index].iter().position(|other| other == port) {
+            return Err(anyhow!(
+                "{} and {} both name port {port}",
+                wanted[earlier].0,
+                wanted[index].0
+            ));
+        }
+    }
+    Ok(ports)
+}
+
+/// Fail when `bind` is taken, naming it and the variable `var` that moves it.
 ///
 /// # Errors
 ///
 /// When the address cannot be bound.
-pub fn require_free(bind: &str) -> Result<()> {
-    let listener = StdTcpListener::bind(bind)
-        .with_context(|| format!("{bind} is already in use, stop that process first"))?;
+pub fn require_free(bind: &str, var: &str) -> Result<()> {
+    let listener = StdTcpListener::bind(bind).with_context(|| {
+        format!("{bind} is already in use, stop that process or move the stack with {var}")
+    })?;
     drop(listener);
     Ok(())
 }

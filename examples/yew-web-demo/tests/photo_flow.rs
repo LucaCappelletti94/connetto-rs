@@ -28,7 +28,8 @@ use connetto_web::auth::{
 use connetto_web::storage::ReplicaStorage;
 use connetto_web::{MessageTransport, TabContent, TabResolved, locks, workers};
 use connetto_yew_web_demo::{
-    CALLER_FUNCTION, DEMO_TAB_DDL, demo_policy_tables, demo_schema_version, uuidv4_functions,
+    AUTH_BASE, CALLER_FUNCTION, DEMO_TAB_DDL, auth_landing, demo_policy_tables,
+    demo_schema_version, uuidv4_functions,
 };
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -43,8 +44,6 @@ use web_sys::{
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-const AUTH_BASE: &str = "http://127.0.0.1:18099";
-const AUTH_LANDING: &str = "http://127.0.0.1:18099/dev/landing";
 const AUTH_PROVIDER: &str = "dev-idp";
 const AUTH_USERNAME: &str = "startup";
 
@@ -197,7 +196,7 @@ async fn mint_session() -> (String, String) {
     let db = format!("yew-photo-mint-{n}.sqlite");
     let store = AccountStore::open(&storage.db_url(&db)).expect("account index");
     let auth = BrowserAuthenticator::new(
-        WorkerAuthConfig::new(AUTH_BASE, AUTH_PROVIDER, AUTH_LANDING),
+        WorkerAuthConfig::new(AUTH_BASE, AUTH_PROVIDER, auth_landing()),
         None,
     );
     let pending = match auth.acquire::<String>(&store).await.expect("acquire") {

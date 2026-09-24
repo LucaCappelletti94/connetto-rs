@@ -60,8 +60,12 @@ include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
 /// The tab-to-worker transport this window's client rides.
 type Tab = MessageTransport<BroadcastChannel>;
 
-/// The demo server the DB worker connects upstream to.
-const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
+/// The demo server the DB worker connects upstream to, `CONNETTO_DEMO_WS` at
+/// build time when set.
+const DEMO_WS_URL: &str = match option_env!("CONNETTO_DEMO_WS") {
+    Some(url) => url,
+    None => "ws://127.0.0.1:7777/",
+};
 /// The synced replica schema (worker first boot, policy-split by build.rs from schema.sql +
 /// policies.sql). The tab mirror uses a simpler non-split DDL below.
 const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
@@ -96,8 +100,12 @@ const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.
 const DEMO_UID_CHANNEL: &str = "connetto-demo-uid";
 /// The origin serving `connetto-server`'s auth router, which the login navigation
 /// goes to directly. The worker's `fetch` calls go through this app's own origin
-/// instead, where the dev server proxies them.
-const AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
+/// instead, where the dev server proxies them. `CONNETTO_DEMO_AUTH_ORIGIN` at
+/// build time moves it, and the proxy in `Dioxus.toml` has to follow by hand.
+const AUTH_ORIGIN: &str = match option_env!("CONNETTO_DEMO_AUTH_ORIGIN") {
+    Some(origin) => origin,
+    None => "http://127.0.0.1:18081",
+};
 /// OIDC provider registered in the dev IdP.
 const AUTH_PROVIDER: &str = "dev-idp";
 /// Path the dev IdP redirects back to after login.
@@ -432,6 +440,10 @@ async fn run_db_worker() -> Result<(), JsValue> {
             .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
             .with_hub_meta_name("connetto-hub-meta.sqlite")
             .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
             .with_sql_functions(uuidv4_functions())
             .with_policy_tables(PolicyTables::from_translation(
                 POLICY_TABLES.iter().copied(),
