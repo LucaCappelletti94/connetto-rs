@@ -381,9 +381,11 @@ async fn the_ledger_counts_both_directions_and_the_window_refuses_reads() {
     assert_eq!(body.len(), 4096);
     await_traffic(&fx.pg, 4096, 4096).await;
 
-    // The window now holds accepted + served = 8192; one more accepted
-    // upload fills it past the ceiling and the next read is refused.
-    upload(&fx.app, &fx.signer, &chunked(9, 1)).await;
+    // The window now holds accepted + served = 8192. One more file's chunk
+    // PUTs bill their bytes as they land, which fills the window past the
+    // ceiling, and the next read is refused. Its commit is left out, since
+    // the server rightly refuses that too once the cached window refreshes.
+    stage(&fx.app, &fx.signer, &chunked(9, 1)).await;
     for _ in 0..100 {
         tokio::time::sleep(Duration::from_millis(100)).await;
         let req = axum::http::Request::builder()
