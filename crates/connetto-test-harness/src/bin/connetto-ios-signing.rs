@@ -37,7 +37,7 @@ async fn main() -> Result<()> {
     tokio::fs::create_dir_all(&dir).await?;
 
     let keychain = Keychain::open(&dir).await?;
-    let (certificate, identity) = ensure_certificate(&api, &keychain, &dir).await?;
+    let certificate = ensure_certificate(&api, &keychain, &dir).await?;
     let bundle = ensure_bundle(&api).await?;
     let devices = ensure_devices(&api).await?;
     let profile = ensure_profile(&api, &bundle, &certificate, &devices).await?;
@@ -46,6 +46,9 @@ async fn main() -> Result<()> {
         profile.display(),
         devices.len()
     );
+    let identity = ios_signing::identity()
+        .await?
+        .context("the keychain holds no valid signing identity")?;
     println!("{identity}");
     Ok(())
 }
@@ -224,26 +227,6 @@ impl Keychain {
         Ok(keychain)
     }
 
-    /// The SHA-1 of the one valid code-signing identity in this keychain.
-    async fn identity(&self) -> Result<Option<String>> {
-        let listing = run(
-            "security",
-            &[
-                "find-identity",
-                "-v",
-                "-p",
-                "codesigning",
-                &self.path.display().to_string(),
-            ],
-        )
-        .await?;
-        Ok(listing.lines().find_map(|line| {
-            let hash = line.split_whitespace().nth(1)?;
-            (hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()))
-                .then(|| hash.to_owned())
-        }))
-    }
-
     async fn import(&self, key: &Path, certificate: &Path, dir: &Path) -> Result<()> {
         let pem = dir.join("certificate.pem");
         run(
@@ -312,15 +295,11 @@ impl Keychain {
     }
 }
 
-/// A development certificate whose key this Mac holds, imported into the
-/// keychain, and its identity. The certificate is recorded before it is
+/// The id of a development certificate whose key this Mac holds, imported
+/// into the keychain. The certificate is recorded before it is
 /// imported, and one already on the account for the local key is reused, so
 /// a failed run never leaves a second certificate behind.
-async fn ensure_certificate(
-    api: &Api,
-    keychain: &Keychain,
-    dir: &Path,
-) -> Result<(String, String)> {
+async fn ensure_certificate(api: &Api, keychain: &Keychain, dir: &Path) -> Result<String> {
     let key = dir.join("signing-key.pem");
     if !key.exists() {
         let pem = run("openssl", &["genrsa", "2048"]).await?;
@@ -365,14 +344,10 @@ async fn ensure_certificate(
             .context("a certificate without an id")?
             .to_owned()
     };
-    if keychain.identity().await?.is_none() {
+    if ios_signing::identity().await?.is_none() {
         keychain.import(&key, &certificate, dir).await?;
     }
-    let identity = keychain
-        .identity()
-        .await?
-        .context("the imported certificate is not a valid signing identity")?;
-    Ok((id, identity))
+    Ok(id)
 }
 
 /// The development certificate on the account whose public key is the local

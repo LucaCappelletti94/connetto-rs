@@ -53,6 +53,35 @@ pub async fn unlock() -> Result<()> {
     Ok(())
 }
 
+/// The SHA-1 of the valid code-signing identity in the keychain, which
+/// `dx build --apple-team-id` takes. It is public, the certificate's
+/// fingerprint.
+///
+/// # Errors
+///
+/// When `security` cannot list the keychain.
+pub async fn identity() -> Result<Option<String>> {
+    let output = tokio::process::Command::new("security")
+        .args(["find-identity", "-v", "-p", "codesigning"])
+        .arg(keychain()?)
+        .output()
+        .await
+        .context("starting security")?;
+    if !output.status.success() {
+        bail!(
+            "listing the signing keychain failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let hash = line.split_whitespace().nth(1)?;
+            (hash.len() == 40 && hash.chars().all(|c| c.is_ascii_hexdigit()))
+                .then(|| hash.to_owned())
+        }))
+}
+
 fn home() -> Result<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
