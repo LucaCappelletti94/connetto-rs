@@ -405,13 +405,24 @@ async fn wait_for_count(pg_url: &str, expected: i64) -> Result<()> {
 
 struct Device {
     serial: String,
+    /// The browser targets [`Device::login_tab`] returned. A finished login's
+    /// tab can stay listed on the authorize URL while it closes, so a later
+    /// login must never pick it again.
+    spent_tabs: std::sync::Mutex<Vec<String>>,
 }
 
 impl Device {
+    fn new(serial: String) -> Self {
+        Self {
+            serial,
+            spent_tabs: std::sync::Mutex::default(),
+        }
+    }
+
     /// The named device, or the only one attached.
     async fn pick(serial: Option<String>) -> Result<Self> {
         if let Some(serial) = serial {
-            return Ok(Self { serial });
+            return Ok(Self::new(serial));
         }
         let output = Command::new("adb")
             .arg("devices")
@@ -425,9 +436,7 @@ impl Device {
             .filter_map(|line| line.strip_suffix("\tdevice"))
             .collect::<Vec<_>>();
         match attached.as_slice() {
-            [serial] => Ok(Self {
-                serial: (*serial).to_owned(),
-            }),
+            [serial] => Ok(Self::new((*serial).to_owned())),
             [] => bail!("no authorised device is attached"),
             _ => bail!("several devices are attached, name one with --serial"),
         }
@@ -559,25 +568,29 @@ impl Device {
             .with_context(|| format!("adb forwarded to {port:?}"))
     }
 
-    /// A `DevTools` session on the login tab the demo opened on `issuer`,
-    /// tapping past the browser's first-run screens while it appears. The
-    /// forward lives until [`main`] removes every forward.
+    /// A `DevTools` session on the login tab the demo opened on `issuer`, never
+    /// one an earlier call returned, tapping past the browser's first-run
+    /// screens while it appears. The forward lives until [`main`] removes every
+    /// forward.
     async fn login_tab(&self, issuer: &str) -> Result<Cdp> {
         let prefix = format!("{issuer}/authorize?");
         let port = self.forward("chrome_devtools_remote").await?;
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
             let tabs = list_targets(port).await.unwrap_or_default();
-            if let Some(ws) = tabs
-                .iter()
-                .filter(|tab| {
-                    tab["url"]
-                        .as_str()
-                        .is_some_and(|url| url.starts_with(&prefix))
+            let fresh = {
+                let spent = self.spent_tabs.lock().expect("spent tabs");
+                tabs.iter().find_map(|tab| {
+                    let id = tab["id"].as_str()?;
+                    let url = tab["url"].as_str()?;
+                    let ws = tab["webSocketDebuggerUrl"].as_str()?;
+                    (url.starts_with(&prefix) && !spent.iter().any(|seen| seen == id))
+                        .then(|| (id.to_owned(), ws.to_owned()))
                 })
-                .find_map(|tab| tab["webSocketDebuggerUrl"].as_str())
-            {
-                return Cdp::connect(ws).await;
+            };
+            if let Some((id, ws)) = fresh {
+                self.spent_tabs.lock().expect("spent tabs").push(id);
+                return Cdp::connect(&ws).await;
             }
             self.tap_interstitial().await?;
             if Instant::now() >= deadline {
