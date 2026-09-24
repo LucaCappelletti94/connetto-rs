@@ -259,15 +259,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
                 Ok(WriteOutcome::Applied)
             })
             .await;
-        match outcome {
-            Ok(outcome) => Ok(outcome),
-            Err(CommitError::Denied) => Err(WriteError::Unauthorized),
-            Err(CommitError::Db(err)) if is_rls_violation(&err.to_string()) => {
-                Err(WriteError::Unauthorized)
-            }
-            Err(CommitError::Db(err)) => Err(err.into()),
-            Err(CommitError::Probe(err)) => Err(WriteError::Materializer(err)),
-        }
+        outcome.map_err(commit_failure)
     }
 
     /// The highest `client_seq` durably applied for this session handle, read
@@ -324,4 +316,54 @@ async fn watermark_of<W: ConnettoWatermarkSchema>(
         .first(conn)
         .await
         .optional()
+}
+
+/// The write error a failed commit transaction reports.
+fn commit_failure(err: CommitError) -> WriteError {
+    match err {
+        CommitError::Denied => WriteError::Unauthorized,
+        CommitError::Db(err) if is_rls_violation(&err.to_string()) => WriteError::Unauthorized,
+        CommitError::Db(err) => err.into(),
+        // The conflict probe reads inside the same transaction, so its connection failing is the same outage.
+        CommitError::Probe(MaterializerError::Apply(err))
+            if crate::reexec::diesel_failure(&err) == crate::reexec::ReadFailure::Transient =>
+        {
+            WriteError::Transient(err.to_string())
+        }
+        CommitError::Probe(err) => WriteError::Materializer(err),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CommitError, MaterializerError, WriteError, commit_failure};
+    use diesel::result::{DatabaseErrorKind, Error};
+
+    fn db_error(kind: DatabaseErrorKind, message: &str) -> Error {
+        Error::DatabaseError(kind, Box::new(message.to_owned()))
+    }
+
+    /// The conflict probe reads inside the commit transaction, so a connection cut there is the outage the apply retries.
+    #[test]
+    fn a_probe_cut_off_mid_read_is_retried_like_the_apply() {
+        let closed = || {
+            db_error(
+                DatabaseErrorKind::ClosedConnection,
+                "server closed the connection",
+            )
+        };
+        assert!(matches!(
+            commit_failure(CommitError::Probe(MaterializerError::Apply(closed()))),
+            WriteError::Transient(_)
+        ));
+        assert!(matches!(
+            commit_failure(CommitError::Db(closed())),
+            WriteError::Transient(_)
+        ));
+        let duplicate = db_error(DatabaseErrorKind::UniqueViolation, "duplicate key");
+        assert!(matches!(
+            commit_failure(CommitError::Probe(MaterializerError::Apply(duplicate))),
+            WriteError::Materializer(_)
+        ));
+    }
 }

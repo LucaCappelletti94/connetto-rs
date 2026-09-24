@@ -4084,6 +4084,7 @@ where
             ControlMessage::MutationApplied(ack) => self.mutation_applied(ack.client_seq),
             ControlMessage::MutationReject(reject) => self.mutation_rejected(&reject),
             ControlMessage::MutationConflict(conflict) => {
+                self.settle_resend();
                 let rows = self.rollback(conflict.client_seq)?;
                 Ok(ClientEvent::MutationConflict {
                     client_seq: conflict.client_seq,
@@ -4153,10 +4154,7 @@ where
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             delete_pending(&mut self.db, client_seq)?;
         }
-        // The server answered a resent write, so whatever deferred it has passed.
-        if matches!(self.resend, Resend::Resent { .. }) {
-            self.resend = Resend::Idle;
-        }
+        self.settle_resend();
         Ok(ClientEvent::MutationApplied { client_seq })
     }
 
@@ -4170,8 +4168,16 @@ where
             }
             return Ok(ClientEvent::MutationDeferred { client_seq });
         }
+        self.settle_resend();
         let rows = self.rollback(client_seq)?;
         Ok(ClientEvent::MutationRejected { client_seq, rows })
+    }
+
+    /// The server gave a resent write a final answer, so whatever deferred it has passed and the next deferral starts its schedule afresh.
+    fn settle_resend(&mut self) {
+        if matches!(self.resend, Resend::Resent { .. }) {
+            self.resend = Resend::Idle;
+        }
     }
 
     /// Drop a row subscription's tables ahead of a full-resync snapshot,
@@ -4894,6 +4900,43 @@ mod tests {
         assert_eq!(conn.custody(), Custody::Unverified(NoGate::Offerable));
         conn.set_custody(Custody::Verified);
         assert_eq!(conn.custody(), Custody::Verified);
+    }
+
+    /// A resent write the server refuses settles the deferral, so the next outage starts its resend from the first wait.
+    #[test]
+    fn a_settled_resend_restarts_the_next_deferral_from_the_first_wait() {
+        let config = ClientConfig::new("resend-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        conn.db
+            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .expect("local write");
+        let changeset = conn.session.changeset().expect("capture the write");
+        conn.pending.insert(0, changeset.clone());
+        conn.pending.insert(1, changeset);
+        // A deferral whose writes went out again after its schedule had grown.
+        let mut episode = RESEND_POLICY.start();
+        for _ in 0..6 {
+            let _ = episode.next_wait();
+        }
+        conn.resend = Resend::Resent { episode };
+
+        conn.handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: 0,
+            reason: MutationRejectReason::Unauthorized,
+        }))
+        .expect("the refusal settles");
+        conn.handle_control(ControlMessage::MutationReject(MutationReject {
+            client_seq: 1,
+            reason: MutationRejectReason::Indeterminate,
+        }))
+        .expect("the next outage defers");
+        let wait = conn.resend_timer().expect("a resend is armed").wait();
+        assert!(
+            wait <= RESEND_POLICY.initial_backoff(),
+            "the new deferral starts from the first wait, got {wait:?}"
+        );
     }
 
     /// A device with a device-private tier, for the two refusals an honest
