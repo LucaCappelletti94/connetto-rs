@@ -317,6 +317,15 @@ pub const SYNC_PORT_VAR: &str = "CONNETTO_STACK_SYNC_PORT";
 pub const AUTH_PORT_VAR: &str = "CONNETTO_STACK_AUTH_PORT";
 /// The variable that moves a stack's content listener.
 pub const CONTENT_PORT_VAR: &str = "CONNETTO_STACK_CONTENT_PORT";
+/// The variable that puts a stack on the LAN. Its listeners bind every
+/// interface, and every address a client or its browser follows names this
+/// host.
+pub const PUBLIC_HOST_VAR: &str = "CONNETTO_STACK_PUBLIC_HOST";
+/// The variables naming the PEM certificate chain and key a stack on a public
+/// host serves its auth listener with over TLS.
+pub const TLS_CERT_VAR: &str = "CONNETTO_STACK_TLS_CERT";
+/// See [`TLS_CERT_VAR`].
+pub const TLS_KEY_VAR: &str = "CONNETTO_STACK_TLS_KEY";
 
 /// Each `(variable, default)` port as `var` reads it.
 ///

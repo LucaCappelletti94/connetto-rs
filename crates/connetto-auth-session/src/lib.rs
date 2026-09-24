@@ -9,12 +9,16 @@
 //!
 //! On Android the tab is a Custom Tab, and the redirect is any URI whose
 //! scheme is the app's `applicationId`, which the bundled `RedirectActivity`
-//! receives. Other platforms answer [`AuthSessionError::Unsupported`].
+//! receives. On iOS it is an ephemeral `ASWebAuthenticationSession`, which
+//! catches any URI whose scheme is the lowercased bundle identifier. Other
+//! platforms answer [`AuthSessionError::Unsupported`].
 
 use std::time::Duration;
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_os = "ios")]
+mod ios;
 
 /// Why a browser session produced no redirect.
 #[derive(Debug, thiserror::Error)]
@@ -38,11 +42,11 @@ pub enum AuthSessionError {
 ///
 /// # Errors
 ///
-/// [`AuthSessionError::Unsupported`] off Android,
+/// [`AuthSessionError::Unsupported`] off Android and iOS,
 /// [`AuthSessionError::Bridge`] when the tab cannot be opened or read, and
 /// [`AuthSessionError::TimedOut`] when the user never finishes the login.
 #[cfg_attr(
-    not(target_os = "android"),
+    not(any(target_os = "android", target_os = "ios")),
     expect(
         clippy::unused_async,
         reason = "one async signature on every target, awaiting only where a session exists"
@@ -51,7 +55,9 @@ pub enum AuthSessionError {
 pub async fn authorize(url: &str, timeout: Duration) -> Result<String, AuthSessionError> {
     #[cfg(target_os = "android")]
     return android::authorize(url, timeout).await;
-    #[cfg(not(target_os = "android"))]
+    #[cfg(target_os = "ios")]
+    return ios::authorize(url, timeout).await;
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         let _ = (url, timeout);
         Err(AuthSessionError::Unsupported)
@@ -60,7 +66,8 @@ pub async fn authorize(url: &str, timeout: Duration) -> Result<String, AuthSessi
 
 /// The redirect this process received before any [`authorize`] ran in it,
 /// taken so it is returned once. A process the system started to deliver a
-/// login's redirect holds it here.
+/// login's redirect holds it here. iOS never starts a process for one, since
+/// the session that caught the redirect dies with the process that opened it.
 ///
 /// # Errors
 ///

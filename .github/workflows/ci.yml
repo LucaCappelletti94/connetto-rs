@@ -416,6 +416,41 @@ jobs:
             --no-default-features \
             --features mobile
 
+  ios:
+    # R88: the phone build of the desktop demo for iOS, checked without a
+    # device, for the same reason the Android leg is its own job.
+    name: Compile dioxus-desktop-demo ios
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Install stable toolchain with the iOS targets
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios aarch64-apple-ios-sim --toolchain stable
+
+      - name: Check the demo for iOS devices and the simulator
+        working-directory: examples/dioxus-desktop-demo
+        run: |
+          for target in aarch64-apple-ios aarch64-apple-ios-sim; do
+            cargo +stable check \
+              --target "$target" \
+              --no-default-features \
+              --features mobile
+          done
+
   rust-tests:
     name: Rust tests ${{ matrix.name }}
     runs-on: ubuntu-latest

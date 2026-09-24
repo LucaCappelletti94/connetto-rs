@@ -16,16 +16,22 @@
 //! `CONNETTO_DEMO_ISSUER` set, then stops.
 //!
 //! `CONNETTO_STACK_SYNC_PORT` and `CONNETTO_STACK_AUTH_PORT` move its
-//! listeners off 7777 and 18081.
+//! listeners off 7777 and 18081. `CONNETTO_STACK_PUBLIC_HOST` puts it on the
+//! LAN for a phone that has no `adb reverse`, binding every interface and
+//! naming that host in every address it hands out. With it,
+//! `CONNETTO_STACK_TLS_CERT` and `CONNETTO_STACK_TLS_KEY` name a certificate
+//! for that host, and the auth listener, which carries the login callback and
+//! content, is served over TLS in front of the server's plain one.
 
 use std::ffi::OsString;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use connetto_test_harness::MockOauth;
+use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
-    AUTH_PORT_VAR, Deployment, SYNC_PORT_VAR, ensure_server_bin, ports, provision, require_free,
-    run_process, spawn_server,
+    AUTH_PORT_VAR, Deployment, PUBLIC_HOST_VAR, SYNC_PORT_VAR, TLS_CERT_VAR, TLS_KEY_VAR,
+    ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
 };
+use connetto_test_harness::{MockOauth, with_host};
 
 /// The sync port the demo dials unless told otherwise, which a phone keeps.
 const DEMO_SYNC_PORT: u16 = 7777;
@@ -52,18 +58,18 @@ const DEPLOYMENT: Deployment = Deployment {
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
-    let [sync_port, auth_port] = ports(
-        |name| std::env::var(name).ok(),
-        [
-            (SYNC_PORT_VAR, DEMO_SYNC_PORT),
-            (AUTH_PORT_VAR, DEMO_AUTH_PORT),
-        ],
-    )?;
-    let sync_bind = format!("127.0.0.1:{sync_port}");
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-    let auth_base = format!("http://{auth_bind}");
-    require_free(&sync_bind, SYNC_PORT_VAR)?;
-    require_free(&auth_bind, AUTH_PORT_VAR)?;
+    let plan = Addresses::from_env()?;
+    let Addresses {
+        sync_port,
+        auth_port,
+        public_host,
+        tls,
+        sync_bind,
+        public_auth_bind,
+        auth_bind,
+        sync_address,
+        auth_base,
+    } = plan;
 
     let mut args = std::env::args_os().skip(1).collect::<Vec<OsString>>();
     if args.first().is_some_and(|arg| arg == "--") {
@@ -73,6 +79,10 @@ async fn main() -> Result<()> {
     let server_bin = ensure_server_bin().await?;
     let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack").await?;
     let idp = MockOauth::start().await;
+    let idp = match public_host.as_deref() {
+        Some(host) => idp.advertised_on(host),
+        None => idp,
+    };
     let mut envs = provisioned.server_env(&DEPLOYMENT, &sync_bind, &auth_bind, &auth_base);
     envs.extend(idp.env_pairs(PROVIDER, &format!("{auth_base}/auth/callback")));
     envs.push((
@@ -80,13 +90,28 @@ async fn main() -> Result<()> {
         APP_REDIRECT.to_owned(),
     ));
     let _server = spawn_server(&server_bin, &envs, &sync_bind, &auth_bind).await?;
+    let _tls = match &tls {
+        Some((cert, key)) => Some(
+            Relay::start_tls(
+                &public_auth_bind,
+                &auth_bind,
+                std::path::Path::new(cert),
+                std::path::Path::new(key),
+            )
+            .await?,
+        ),
+        None => None,
+    };
 
-    let pg_url = provisioned.fixture.admin_url();
+    let pg_url = public_host.as_deref().map_or_else(
+        || provisioned.fixture.admin_url().to_owned(),
+        |host| with_host(provisioned.fixture.admin_url(), host),
+    );
     let reverse = device_reverse(
         sync_port,
         auth_port,
         url_port(idp.issuer())?,
-        url_port(pg_url)?,
+        url_port(&pg_url)?,
     )?;
     let reverse_spec = reverse
         .iter()
@@ -94,10 +119,13 @@ async fn main() -> Result<()> {
         .collect::<Vec<_>>()
         .join(",");
     let demo_env = vec![
-        ("CONNETTO_DEMO_SERVER".to_owned(), sync_bind.clone()),
+        ("CONNETTO_DEMO_SERVER".to_owned(), sync_address.clone()),
         ("CONNETTO_DEMO_AUTH_ORIGIN".to_owned(), auth_base),
-        ("CONNETTO_DEMO_WS".to_owned(), format!("ws://{sync_bind}/")),
-        ("CONNETTO_DEMO_PG".to_owned(), pg_url.to_owned()),
+        (
+            "CONNETTO_DEMO_WS".to_owned(),
+            format!("ws://{sync_address}/"),
+        ),
+        ("CONNETTO_DEMO_PG".to_owned(), pg_url),
         ("CONNETTO_DEMO_ADB_REVERSE".to_owned(), reverse_spec),
         ("CONNETTO_DEMO_ISSUER".to_owned(), idp.issuer().to_owned()),
     ];
@@ -122,6 +150,67 @@ async fn main() -> Result<()> {
         run_process(&program, &args, &demo_env).await?;
     }
     Ok(())
+}
+
+/// Where the stack listens and what it tells clients, from the environment.
+struct Addresses {
+    sync_port: u16,
+    auth_port: u16,
+    public_host: Option<String>,
+    tls: Option<(String, String)>,
+    sync_bind: String,
+    /// The auth address clients reach, which a TLS relay owns when there is
+    /// one.
+    public_auth_bind: String,
+    /// The server's own auth listener, on loopback behind a TLS relay.
+    auth_bind: String,
+    sync_address: String,
+    auth_base: String,
+}
+
+impl Addresses {
+    fn from_env() -> Result<Self> {
+        let [sync_port, auth_port] = ports(
+            |name| std::env::var(name).ok(),
+            [
+                (SYNC_PORT_VAR, DEMO_SYNC_PORT),
+                (AUTH_PORT_VAR, DEMO_AUTH_PORT),
+            ],
+        )?;
+        let public_host = std::env::var(PUBLIC_HOST_VAR).ok();
+        let (bind_host, host) = public_host
+            .as_deref()
+            .map_or(("127.0.0.1", "127.0.0.1"), |host| ("0.0.0.0", host));
+        let tls = match (
+            std::env::var(TLS_CERT_VAR).ok(),
+            std::env::var(TLS_KEY_VAR).ok(),
+        ) {
+            (Some(cert), Some(key)) if public_host.is_some() => Some((cert, key)),
+            (None, None) => None,
+            _ => bail!("{TLS_CERT_VAR} and {TLS_KEY_VAR} go together, with {PUBLIC_HOST_VAR}"),
+        };
+        let sync_bind = format!("{bind_host}:{sync_port}");
+        let public_auth_bind = format!("{bind_host}:{auth_port}");
+        let scheme = if tls.is_some() { "https" } else { "http" };
+        require_free(&sync_bind, SYNC_PORT_VAR)?;
+        require_free(&public_auth_bind, AUTH_PORT_VAR)?;
+        let auth_bind = if tls.is_some() {
+            format!("127.0.0.1:{}", free_port()?)
+        } else {
+            public_auth_bind.clone()
+        };
+        Ok(Self {
+            sync_port,
+            auth_port,
+            sync_address: format!("{host}:{sync_port}"),
+            auth_base: format!("{scheme}://{host}:{auth_port}"),
+            public_host,
+            tls,
+            sync_bind,
+            public_auth_bind,
+            auth_bind,
+        })
+    }
 }
 
 /// The `adb reverse` pairs, each the device port then the host port. The
@@ -154,6 +243,11 @@ fn device_reverse(
         pairs.push((auth_port, auth_port));
     }
     Ok(pairs)
+}
+
+fn free_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").context("finding a free port")?;
+    Ok(listener.local_addr()?.port())
 }
 
 /// The port in a `host:port` or a URL with an explicit port.

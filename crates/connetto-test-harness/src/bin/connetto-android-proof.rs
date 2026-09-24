@@ -27,15 +27,11 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
-use connetto_test_harness::pool_for;
+use connetto_test_harness::demo::{order_count, wait_for_count};
+use connetto_test_harness::inspector::{PageSession, list_pages};
 use connetto_test_harness::stack::{now_millis, repo_path};
-use diesel::QueryDsl as _;
-use diesel_async::RunQueryDsl as _;
-use futures_util::{SinkExt as _, StreamExt as _};
-use openidconnect::reqwest;
 use tokio::process::Command;
-use tokio::time::{Instant, sleep, timeout};
-use tokio_tungstenite::tungstenite::Message;
+use tokio::time::{Instant, sleep};
 
 const PACKAGE: &str = "dev.connetto.dioxusdemo";
 const ACTIVITY: &str = "dev.dioxus.main.MainActivity";
@@ -52,18 +48,6 @@ const INTERSTITIALS: [&str; 3] = [
     "com.android.chrome:id/terms_accept",
 ];
 const BROWSER_ROLE: &str = "android.app.role.BROWSER";
-/// How long one `DevTools` request may take to answer.
-const CDP_REPLY: Duration = Duration::from_secs(10);
-
-diesel::table! {
-    /// The demo's orders, as far as the proof counts them.
-    orders (id) {
-        /// Key.
-        id -> diesel::sql_types::Uuid,
-        /// Ordered amount.
-        quantity -> diesel::sql_types::BigInt,
-    }
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -230,7 +214,7 @@ async fn prove(
 /// Sign out, which revokes the session and destroys the replica key, and see
 /// the demo start over. Only a successful sign-out starts over, since any
 /// failure is shown in the session panel instead.
-async fn sign_out(device: &Device, app: &mut Cdp, evidence: &Path) -> Result<()> {
+async fn sign_out(device: &Device, app: &mut PageSession, evidence: &Path) -> Result<()> {
     step("sign out");
     app.click("Sign out (wipe local replica)").await?;
     app.wait_for_outcome(
@@ -287,7 +271,7 @@ async fn sign_in_across_a_killed_process(
 /// Type the dev user into the identity provider's form and submit it. Trusted
 /// input is a user gesture, so the browser follows the final redirect into the
 /// app, which is the path a real tap takes.
-async fn submit_login(tab: &mut Cdp) -> Result<()> {
+async fn submit_login(tab: &mut PageSession) -> Result<()> {
     tab.evaluate("document.querySelector('input[name=username]').focus()")
         .await?;
     tab.call("Input.insertText", serde_json::json!({ "text": USER }))
@@ -377,30 +361,6 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
     Ok(demo.join(
         "target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk",
     ))
-}
-
-async fn order_count(pg_url: &str) -> Result<i64> {
-    let pool = pool_for(pg_url).await;
-    let mut conn = pool.get().await.context("a Postgres connection")?;
-    orders::table
-        .count()
-        .get_result(&mut conn)
-        .await
-        .context("counting orders")
-}
-
-async fn wait_for_count(pg_url: &str, expected: i64) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        let count = order_count(pg_url).await?;
-        if count == expected {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("Postgres holds {count} orders, expected {expected}");
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
 }
 
 struct Device {
@@ -572,12 +532,12 @@ impl Device {
     /// one an earlier call returned, tapping past the browser's first-run
     /// screens while it appears. The forward lives until [`main`] removes every
     /// forward.
-    async fn login_tab(&self, issuer: &str) -> Result<Cdp> {
+    async fn login_tab(&self, issuer: &str) -> Result<PageSession> {
         let prefix = format!("{issuer}/authorize?");
         let port = self.forward("chrome_devtools_remote").await?;
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            let tabs = list_targets(port).await.unwrap_or_default();
+            let tabs = list_pages(port).await.unwrap_or_default();
             let fresh = {
                 let spent = self.spent_tabs.lock().expect("spent tabs");
                 tabs.iter().find_map(|tab| {
@@ -590,7 +550,7 @@ impl Device {
             };
             if let Some((id, ws)) = fresh {
                 self.spent_tabs.lock().expect("spent tabs").push(id);
-                return Cdp::connect(&ws).await;
+                return PageSession::devtools(&ws).await;
             }
             self.tap_interstitial().await?;
             if Instant::now() >= deadline {
@@ -627,137 +587,18 @@ impl Device {
 
     /// A `DevTools` session on the demo's `WebView`, over a forward that lives
     /// until [`main`] removes every forward.
-    async fn app(&self) -> Result<Cdp> {
+    async fn app(&self) -> Result<PageSession> {
         let pid = self.adb(&["shell", "pidof", PACKAGE]).await?;
         let port = self
             .forward(&format!("webview_devtools_remote_{}", pid.trim()))
             .await?;
-        let targets = list_targets(port).await?;
+        let targets = list_pages(port).await?;
         let ws = targets
             .iter()
             .find(|target| target["type"] == "page")
             .and_then(|target| target["webSocketDebuggerUrl"].as_str())
             .ok_or_else(|| anyhow!("the demo's WebView has no DevTools page"))?;
-        Cdp::connect(ws).await
-    }
-}
-
-async fn list_targets(port: u16) -> Result<Vec<serde_json::Value>> {
-    reqwest::get(format!("http://127.0.0.1:{port}/json"))
-        .await
-        .context("listing DevTools targets")?
-        .json()
-        .await
-        .context("reading DevTools targets")
-}
-
-/// One `DevTools` protocol session. Each request carries an id its reply
-/// quotes, and each wait for a reply is bounded by [`CDP_REPLY`].
-struct Cdp {
-    socket: tokio_tungstenite::WebSocketStream<
-        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
-    >,
-    next_id: u64,
-}
-
-impl Cdp {
-    async fn connect(url: &str) -> Result<Self> {
-        let (socket, _) = tokio_tungstenite::connect_async(url)
-            .await
-            .context("opening the DevTools session")?;
-        Ok(Self { socket, next_id: 0 })
-    }
-
-    /// Evaluate `expression` in the page and return its value.
-    async fn evaluate(&mut self, expression: &str) -> Result<serde_json::Value> {
-        let result = self
-            .call(
-                "Runtime.evaluate",
-                serde_json::json!({ "expression": expression, "returnByValue": true }),
-            )
-            .await?;
-        Ok(result["result"]["value"].clone())
-    }
-
-    /// Send one `DevTools` request and return its result.
-    async fn call(&mut self, method: &str, params: serde_json::Value) -> Result<serde_json::Value> {
-        self.next_id += 1;
-        let id = self.next_id;
-        let request = serde_json::json!({ "id": id, "method": method, "params": params });
-        self.socket
-            .send(Message::Text(request.to_string()))
-            .await
-            .context("sending a DevTools request")?;
-        let deadline = tokio::time::Instant::now() + CDP_REPLY;
-        loop {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let frame = timeout(remaining, self.socket.next())
-                .await
-                .map_err(|_| anyhow!("DevTools request {id} got no reply within {CDP_REPLY:?}"))?
-                .ok_or_else(|| anyhow!("the DevTools session closed"))?
-                .context("reading the DevTools session")?;
-            let Message::Text(text) = frame else {
-                continue;
-            };
-            let reply: serde_json::Value =
-                serde_json::from_str(&text).context("parsing a DevTools reply")?;
-            if reply["id"] == id {
-                if let Some(error) = reply.get("error") {
-                    bail!("DevTools request {id} failed: {error}");
-                }
-                return Ok(reply["result"].clone());
-            }
-        }
-    }
-
-    async fn page_text(&mut self) -> Result<String> {
-        Ok(self
-            .evaluate("document.body.innerText")
-            .await?
-            .as_str()
-            .unwrap_or_default()
-            .to_owned())
-    }
-
-    async fn wait_for_text(&mut self, text: &str, limit: Duration) -> Result<()> {
-        self.wait_for_outcome(text, &[], limit).await
-    }
-
-    /// Wait until the page shows `text`, failing at once when it shows one of
-    /// `refusals` instead.
-    async fn wait_for_outcome(
-        &mut self,
-        text: &str,
-        refusals: &[&str],
-        limit: Duration,
-    ) -> Result<()> {
-        let deadline = Instant::now() + limit;
-        loop {
-            let page = self.page_text().await?;
-            if page.contains(text) {
-                return Ok(());
-            }
-            if let Some(refusal) = refusals.iter().find(|refusal| page.contains(**refusal)) {
-                bail!("the demo showed {refusal:?} rather than {text:?}, it shows:\n{page}");
-            }
-            if Instant::now() >= deadline {
-                bail!("the demo never showed {text:?}, it shows:\n{page}");
-            }
-            sleep(Duration::from_millis(500)).await;
-        }
-    }
-
-    /// Click the button labelled `label`.
-    async fn click(&mut self, label: &str) -> Result<()> {
-        let script = format!(
-            "(() => {{ const b = [...document.querySelectorAll('button')].find(b => b.textContent.trim() === {}); if (!b) return false; b.click(); return true; }})()",
-            serde_json::Value::String(label.to_owned())
-        );
-        if self.evaluate(&script).await? == true {
-            Ok(())
-        } else {
-            bail!("the demo has no button {label:?}")
-        }
+        PageSession::devtools(ws).await
     }
 }
 
