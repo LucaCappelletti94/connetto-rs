@@ -30,11 +30,11 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 95 phases, 73 done and 22 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 95 phases, 74 done and 21 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
-| Native unlock gates and the mobile demo build | R51 to R53, R88 |
+| Native unlock gates | R51 to R53 |
 | One page codec, synced tables without local references, Linux key custody across a reboot | R21, R92, R71 |
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline | R70, R72 |

@@ -91,6 +91,9 @@ tracing-subscriber = { version = "0.3", default-features = false, features = [
   "std",
 ] }
 ring = "0.17"
+# Encoding the App Store Connect token and decoding what the API returns,
+# already in the graph through testcontainers.
+base64 = "0.22"
 # Ids for the fixture rows the browser stack seeds.
 uuid = { version = "1", features = ["v4"] }
 # The Android proof drives the demo's WebView over the DevTools protocol.

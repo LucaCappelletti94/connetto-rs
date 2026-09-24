@@ -62,6 +62,7 @@ use tokio::task::JoinHandle;
 pub mod demo;
 pub mod fanout;
 pub mod inspector;
+pub mod ios_signing;
 pub mod relay;
 pub mod roster;
 pub mod stack;
