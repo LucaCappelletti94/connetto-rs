@@ -17,7 +17,24 @@ pub const DEMO_TAB_DDL: &str = concat!(
     include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql")),
 );
 
-pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
+/// The browser stack's sync endpoint, as `CONNETTO_TEST_WS` named it when this
+/// crate was built.
+pub const DEMO_WS_URL: &str = match option_env!("CONNETTO_TEST_WS") {
+    Some(url) => url,
+    None => "ws://127.0.0.1:7777/",
+};
+/// The browser stack's auth listener, as `CONNETTO_TEST_AUTH_BASE` named it
+/// when this crate was built.
+pub const AUTH_BASE: &str = match option_env!("CONNETTO_TEST_AUTH_BASE") {
+    Some(base) => base,
+    None => "http://127.0.0.1:18099",
+};
+
+/// The auth stack's route that hands back the delivered code in its URL.
+#[must_use]
+pub fn auth_landing() -> String {
+    format!("{AUTH_BASE}/dev/landing")
+}
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
 pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
@@ -115,9 +132,9 @@ async fn boot_with(
             .with_caller_function(CALLER_FUNCTION)
             .with_subjects_function(SUBJECTS_FUNCTION)
             .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                "http://127.0.0.1:18099",
+                AUTH_BASE,
                 "dev-idp",
-                "http://127.0.0.1:18099/dev/landing",
+                auth_landing(),
             )))
             .with_auth_db_name(auth_db),
     )

@@ -1,6 +1,6 @@
 //! R90: a cross-site page cannot spend the refresh cookie.
 //!
-//! The suite's requests go to `http://localhost:18099`, a loopback-resolving
+//! The suite's requests go to `http://localhost` on the auth port, a loopback-resolving
 //! host name, while the test page is served from `http://127.0.0.1:PORT`. For
 //! cookie scoping those are different sites, so every request here is genuinely
 //! cross-site and the `SameSite=Strict` cookie the login set must never ride.
@@ -27,12 +27,19 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 /// The auth stack under its cross-site name. Same process, same listener,
 /// different site.
-const CROSS_BASE: &str = "http://localhost:18099";
+fn cross_base() -> String {
+    let port = connetto_wasm_smoke::AUTH_BASE
+        .strip_prefix("http://127.0.0.1:")
+        .expect("the stack serves auth on 127.0.0.1");
+    format!("http://localhost:{port}")
+}
+
 const PROVIDER: &str = "dev-idp";
 const CROSS_DB: &str = "r90-cross-site.sqlite";
 
 fn cross_config() -> WorkerAuthConfig {
-    WorkerAuthConfig::new(CROSS_BASE, PROVIDER, format!("{CROSS_BASE}/dev/landing"))
+    let base = cross_base();
+    WorkerAuthConfig::new(&base, PROVIDER, format!("{base}/dev/landing"))
 }
 
 /// Walk the login as `subject` and return the code and state, over the
@@ -131,7 +138,7 @@ async fn a_cookie_only_request_reaches_nothing() {
     init.set_method("POST");
     init.set_body(&r#"{"user_id":"someone"}"#.into());
     init.set_credentials(web_sys::RequestCredentials::Include);
-    let request = Request::new_with_str_and_init(&format!("{CROSS_BASE}/auth/refresh"), &init)
+    let request = Request::new_with_str_and_init(&format!("{}/auth/refresh", cross_base()), &init)
         .expect("request");
     request
         .headers()
