@@ -15,16 +15,17 @@
 //! not even contain the table.
 //!
 //! The worker acquires a connetto session via the dev OIDC provider, names the
-//! replica from the identity, and encrypts it at rest. The OAuth callback lands
-//! at `/auth/callback`; the proxy covers `/auth/token`, `/auth/refresh`, and
-//! `/auth/logout`. The DB worker shares this same wasm module and builds its
-//! auth config from `self.location.origin`.
+//! replica from the identity, and encrypts it at rest. Its login navigation and
+//! its `/auth/token`, `/auth/refresh` and `/auth/logout` calls go straight to
+//! the auth origin, and the OAuth callback lands back on this app at
+//! `/auth/callback`. The DB worker shares this same wasm module.
 //!
 //! Run: start the dev IdP (`cargo run --release -p connetto-server --example
 //! dev_idp`) with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set, source
 //! `target/dev-idp.env`, start the server with `CONNETTO_AUTH`,
-//! `CONNETTO_AUTH_BIND`, the OIDC provider vars from `target/dev-idp.env`,
-//! `CONNETTO_READER_URL`, `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
+//! `CONNETTO_AUTH_BIND`, `CONNETTO_AUTH_CORS_ORIGINS=http://127.0.0.1:9912`, the
+//! OIDC provider vars from `target/dev-idp.env`, `CONNETTO_READER_URL`,
+//! `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
 //! `CONNETTO_PG_DDL_FILE`, then `dx serve --port 9912` from this directory.
 
 use std::collections::HashMap;
@@ -98,10 +99,9 @@ const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.
 /// BroadcastChannel on which the worker publishes the authenticated user id
 /// once it has acquired a session.
 const DEMO_UID_CHANNEL: &str = "connetto-demo-uid";
-/// The origin serving `connetto-server`'s auth router, which the login navigation
-/// goes to directly. The worker's `fetch` calls go through this app's own origin
-/// instead, where the dev server proxies them. `CONNETTO_DEMO_AUTH_ORIGIN` at
-/// build time moves it, and the proxy in `Dioxus.toml` has to follow by hand.
+/// The origin serving `connetto-server`'s auth router, which the worker's login
+/// navigation and `fetch` calls go to. `CONNETTO_DEMO_AUTH_ORIGIN` at build time
+/// moves it.
 const AUTH_ORIGIN: &str = match option_env!("CONNETTO_DEMO_AUTH_ORIGIN") {
     Some(origin) => origin,
     None => "http://127.0.0.1:18081",
@@ -312,7 +312,7 @@ fn open_login_popup(url: &str) {
 /// The origin of the worker's own URL, e.g. `http://127.0.0.1:9912`.
 ///
 /// Same as the page origin because the worker script is served from the same
-/// host. Used to build `WorkerAuthConfig` within the worker.
+/// host. The login callback returns here.
 fn worker_origin() -> String {
     js_sys::eval("self.location.origin")
         .ok()
@@ -404,8 +404,8 @@ async fn worker_provider() -> String {
 
 /// Boot the connetto DB tier in the worker context.
 ///
-/// Calls [`workers::boot_db_worker`] with the auth config built from the
-/// worker's own origin. Once the session is acquired, `boot_db_worker` returns
+/// Calls [`workers::boot_db_worker`] with the auth config aimed at
+/// [`AUTH_ORIGIN`]. Once the session is acquired, `boot_db_worker` returns
 /// the identity, account key, and session deadline, which are all broadcast on
 /// [`DEMO_UID_CHANNEL`] so the page can display which account is live, filter
 /// switch-account buttons, and warn before an offline session lapses. The
@@ -418,17 +418,11 @@ async fn worker_provider() -> String {
 /// failure.
 async fn run_db_worker() -> Result<(), JsValue> {
     let origin = worker_origin();
-    let auth = Some(
-        WorkerAuthConfig::new(
-            origin.clone(),
-            worker_provider().await,
-            format!("{origin}{AUTH_CALLBACK_PATH}"),
-        )
-        // The login is a navigation, which the dev server's proxy does not
-        // forward, so it goes straight to the auth origin. A navigation needs
-        // no CORS either way.
-        .with_login_base_url(Some(AUTH_ORIGIN.to_owned())),
-    );
+    let auth = Some(WorkerAuthConfig::new(
+        AUTH_ORIGIN,
+        worker_provider().await,
+        format!("{origin}{AUTH_CALLBACK_PATH}"),
+    ));
     let booted = workers::boot_db_worker::<String>(
         &workers::DbWorkerConfig::new(connetto_demo_deployment::schema_version())
             .with_ws_url(DEMO_WS_URL)

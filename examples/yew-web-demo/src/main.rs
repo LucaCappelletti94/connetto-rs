@@ -23,8 +23,9 @@
 //! Run against the demo stack (dev IdP, server on 7777, `connetto-demo-pg` on
 //! 55456): start the dev IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set,
 //! source `target/dev-idp.env`, start the server with `CONNETTO_AUTH`,
-//! `CONNETTO_AUTH_BIND`, the OIDC provider vars from `target/dev-idp.env`,
-//! `CONNETTO_READER_URL`, `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
+//! `CONNETTO_AUTH_BIND`, `CONNETTO_AUTH_CORS_ORIGINS=http://127.0.0.1:9911`, the
+//! OIDC provider vars from `target/dev-idp.env`, `CONNETTO_READER_URL`,
+//! `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
 //! `CONNETTO_PG_DDL_FILE`, then `trunk serve` from this directory and open
 //! the served URL in several windows.
 
@@ -64,10 +65,9 @@ const DEMO_WS_URL: &str = match option_env!("CONNETTO_DEMO_WS") {
     Some(url) => url,
     None => "ws://127.0.0.1:7777/",
 };
-/// The origin serving `connetto-server`'s auth router, which the login navigation
-/// goes to directly. The worker's `fetch` calls go through this app's own origin
-/// instead, where the dev server proxies them. `CONNETTO_DEMO_AUTH_ORIGIN` at
-/// build time moves it, and the proxy in `Trunk.toml` has to follow by hand.
+/// The origin serving `connetto-server`'s auth router, which the worker's login
+/// navigation and `fetch` calls go to. `CONNETTO_DEMO_AUTH_ORIGIN` at build time
+/// moves it.
 const AUTH_ORIGIN: &str = match option_env!("CONNETTO_DEMO_AUTH_ORIGIN") {
     Some(origin) => origin,
     None => "http://127.0.0.1:18081",
@@ -320,16 +320,11 @@ async fn worker_provider() -> String {
 /// A JS string describing the VFS, upstream connect, or subscribe failure.
 async fn run_db_worker() -> Result<(), JsValue> {
     let origin = worker_origin();
-    let auth = Some(
-        WorkerAuthConfig::new(
-            origin.clone(),
-            worker_provider().await,
-            format!("{origin}/"),
-        )
-        // The login is a navigation; trunk's proxy does not forward a request
-        // that carries a query string, so it goes straight to the auth origin.
-        .with_login_base_url(Some(AUTH_ORIGIN.to_owned())),
-    );
+    let auth = Some(WorkerAuthConfig::new(
+        AUTH_ORIGIN,
+        worker_provider().await,
+        format!("{origin}/"),
+    ));
     let session = workers::boot_db_worker::<String>(
         &workers::DbWorkerConfig::new(connetto_demo_deployment::schema_version())
             .with_ws_url(DEMO_WS_URL)
@@ -416,7 +411,7 @@ fn reload_page() {
 /// The origin of the worker's own URL, e.g. `http://127.0.0.1:9911`.
 ///
 /// Same as the page origin because the worker script is served from the same
-/// host. Used to build `WorkerAuthConfig` within the worker.
+/// host. The login redirect returns here.
 fn worker_origin() -> String {
     js_sys::eval("self.location.origin")
         .ok()
