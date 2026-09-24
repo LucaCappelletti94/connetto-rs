@@ -132,6 +132,8 @@ After `HandshakeAck`, the client re-sends all its `Subscribe` messages.
 
 **Decided (R16 part B): the patch is read, not rebuilt.** The entry already carries the prepared compressed bytes (see Structure), so catchup streams them and `Materializer::encode_patch` leaves this path. Two costs per record per client remain and are not addressed there: one predicate match, and one visibility question, the second of which R5b answers with no round trip in its cheapest tier. Catchup frames are not shared between clients, because two clients resuming from different positions receive different sequences, so catchup gets the copy elimination and not the frame sharing.
 
+**Built (2026-09-24).** Every reconnect-log read a resume makes, the handshake's position and the catchup's window, ceiling and entries, retries a failure to reach the database under one shared backoff of at most 30 seconds per resume, so a resume that straddles a failover waits rather than ending. After reading its entries the catchup reads the oldest retained entry once more, and a window that no longer reaches `last_lsn` takes Case 2 with `CursorOutsideRetention` instead of a replay with a gap. A read that still fails ends the session without a fatal frame, since no reason names it, and the session releases its registration and its subscriptions on that exit as on every other.
+
 ### Case 2: Client's LSN is outside the oplog window (or LSN = 0)
 
 1. The client's resume cursor predates the oldest available oplog entry. It cannot catch up incrementally.
