@@ -53,8 +53,6 @@ A named limit stays open: dropping a `Membership` that has not yet won leadershi
 Named limits, deliberately open:
 
 - **A write committed locally but never pushed is lost with the process.** The capture session is memory-only between the commit and the next flush, so a crash inside that window (typically one pump step) drops the upload while keeping the local row. Closing it means extracting changesets at commit time into the pending table, a different capture pipeline. The hub tier has the process-local sibling window between its replica apply and the worker's push persist.
-- **Evicting past `PENDING_CAP` gives up a replay.** The cap (256 un-acked mutations) is a safety valve against a server that never acknowledges.
-- **Retiring at handshake is silent.** Pending mutations the watermark retires on resume do not synthesize `ClientEvent::MutationApplied`, so a flow awaiting a verdict across a reconnect should also watch `Reconnected`.
 - **Registering a new live query during an outage fails fast** instead of queueing until the resume. The registered queries all survive and resume.
 - **A stale but non-empty snapshot cursor can still regress the resume point** (cursors are opaque to the client, so it cannot compare). Harmless with the in-memory sources (a regressed cursor only widens catchup or forces a resync), but snapshot sources SHOULD return the real watermark of their read.
 - **The hub's upstream reconnect is exercised only indirectly** (its resume and re-subscribe path is the same machinery the native tests pin). A browser test would have to kill the shared demo server mid-run.
