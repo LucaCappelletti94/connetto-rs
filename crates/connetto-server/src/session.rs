@@ -846,6 +846,39 @@ where
     }
 }
 
+/// Take one row subscription out of the session, and with it every membership
+/// subscription no other term still needs (R27 decision 7), returning the
+/// route and registration of each to release. Synchronous so the callers'
+/// futures stay no deeper than their own awaits.
+fn take_row_subscription<Id, Key>(
+    state: &mut SessionState<Id, Key>,
+    label: &str,
+) -> Vec<(u64, SubscriptionId)> {
+    state.paging.retain(|read| read.label != label);
+    let Some(row) = state.subs.remove(label) else {
+        return Vec::new();
+    };
+    let mut taken = vec![(row.reg.consumer_id, row.reg.sub_id)];
+    for member in row.reg.member_tables.iter() {
+        let still_needed = state.subs.values().any(|sibling| {
+            sibling
+                .reg
+                .member_tables
+                .iter()
+                .any(|other| other.table == member.table)
+        });
+        if still_needed {
+            continue;
+        }
+        let hidden_label = membership_label(&member.table);
+        state.paging.retain(|read| read.label != hidden_label);
+        if let Some(hidden) = state.subs.remove(&hidden_label) {
+            taken.push((hidden.reg.consumer_id, hidden.reg.sub_id));
+        }
+    }
+    taken
+}
+
 /// A [`ContentTicketSigner`] for deployments without file handling.
 ///
 /// `mint` always fails rather than panicking, since any client can send a
@@ -3725,27 +3758,9 @@ where
         match msg {
             ControlMessage::Subscribe(sub) => self.handle_subscribe(transport, sub, state).await,
             ControlMessage::Unsubscribe(unsub) => {
-                if let Some(row) = state.subs.remove(&unsub.sub_id) {
-                    self.remove_route(row.reg.consumer_id).await;
-                    self.materializer.lock().await.unregister(row.reg.sub_id);
-                    // R27 decision 7: a membership subscription is torn down
-                    // with the last term subscription that needed it.
-                    for member in row.reg.member_tables.iter() {
-                        let still_needed = state.subs.values().any(|sibling| {
-                            sibling
-                                .reg
-                                .member_tables
-                                .iter()
-                                .any(|other| other.table == member.table)
-                        });
-                        if still_needed {
-                            continue;
-                        }
-                        if let Some(hidden) = state.subs.remove(&membership_label(&member.table)) {
-                            self.remove_route(hidden.reg.consumer_id).await;
-                            self.materializer.lock().await.unregister(hidden.reg.sub_id);
-                        }
-                    }
+                for (consumer_id, sub_id) in take_row_subscription(state, &unsub.sub_id) {
+                    self.remove_route(consumer_id).await;
+                    self.materializer.lock().await.unregister(sub_id);
                 }
                 if let Some(subscription_id) = state.computed_subs.remove(&unsub.sub_id) {
                     self.remove_computed_route(subscription_id).await;
@@ -4451,8 +4466,18 @@ where
                 // subscription the term needs, after the term's own frames so
                 // the announce precedes the hidden subscription's snapshot.
                 for member in members.iter() {
-                    self.open_membership_subscription(transport, state, tier, member)
-                        .await?;
+                    match self
+                        .open_membership_subscription(transport, state, tier, member)
+                        .await
+                    {
+                        Ok(()) => {}
+                        // Without its membership rows the term's local answer is wrong, so the two are refused as a unit.
+                        Err(SessionError::Snapshot(detail) | SessionError::ReadRefused(detail)) => {
+                            tracing::warn!(sub_id = %sub_label, error = %detail, "membership read failed, refusing the term");
+                            return self.refuse_subscription(transport, state, &sub_label).await;
+                        }
+                        Err(other) => return Err(other),
+                    }
                 }
                 Ok(())
             }
@@ -4589,7 +4614,7 @@ where
             Ok((registration, _)) => registration,
             // The query is the server's own rendering over its own catalog,
             // so a refusal here is a server-side defect, never something the
-            // caller sent, and it fails loudly rather than serving the term
+            // caller sent, and the term is refused with it rather than served
             // without the rows its local answer needs.
             Err(err) => return Err(SessionError::Snapshot(err.to_string())),
         };
@@ -5097,10 +5122,9 @@ where
         state: &mut SessionState<Id, Key>,
         label: &str,
     ) -> Result<(), SessionError> {
-        state.paging.retain(|read| read.label != label);
-        if let Some(row) = state.subs.remove(label) {
-            self.remove_route(row.reg.consumer_id).await;
-            self.materializer.lock().await.unregister(row.reg.sub_id);
+        for (consumer_id, sub_id) in take_row_subscription(state, label) {
+            self.remove_route(consumer_id).await;
+            self.materializer.lock().await.unregister(sub_id);
         }
         transport
             .send_control(ControlMessage::NonFatalError(NonFatalError {

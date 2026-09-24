@@ -17,7 +17,7 @@
 use std::time::Duration;
 
 use connetto_core::Cursor;
-use connetto_core::messages::{BulkMessage, ControlMessage, LivePatch};
+use connetto_core::messages::{BulkMessage, ControlMessage, LivePatch, SUBSCRIPTION_REFUSED};
 use connetto_core::traits::Transport;
 use connetto_core::transport::{LoopbackTransport, loopback};
 use connetto_server::{Position, TimelineHistory};
@@ -993,5 +993,64 @@ async fn a_share_key_admits_the_rows_its_membership_grants() {
         replica.ids(),
         vec![0, 11],
         "the key's membership admits the team's rows, which its holder owns none of"
+    );
+}
+
+/// A membership read that fails refuses the term as a unit, and the session stays up.
+///
+/// The failure is a policy on `team_members` that raises for the one read naming that table alone under
+/// the snapshot's repeatable read, which is the hidden subscription's page. The term's own page names
+/// `items` and the term seed runs read committed, so both are served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_membership_read_refuses_the_term_and_keeps_the_session() {
+    let fixture = Fixture::acquire().await;
+    let server = membership_term_fixture(&fixture).await;
+    fixture
+        .exec("INSERT INTO team_members (team_id, member) VALUES (1, 'alice')")
+        .await;
+    fixture
+        .exec(
+            "CREATE FUNCTION refuse_the_mirror_read() RETURNS boolean LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF current_setting('transaction_isolation') = 'repeatable read' \
+                  AND current_query() NOT ILIKE '%items%' THEN \
+                 RAISE EXCEPTION 'the membership read is unavailable'; \
+               END IF; \
+               RETURN true; \
+             END $$; \
+             ALTER TABLE team_members ENABLE ROW LEVEL SECURITY; \
+             CREATE POLICY refuse_the_mirror ON team_members USING (refuse_the_mirror_read())",
+        )
+        .await;
+
+    let mut alice = server.connect();
+    alice.handshake_with("r27-alice", "user:alice").await;
+    alice.subscribe("docs", TERM_QUERY).await;
+    alice.expect_snapshot("docs").await;
+    let announce = alice.next_control().await;
+    assert!(
+        matches!(announce, ControlMessage::MembershipOpened(_)),
+        "the hidden subscription is announced ahead of its read, got {announce:?}"
+    );
+    let refusal = alice.next_control().await;
+    let ControlMessage::NonFatalError(refusal) = refusal else {
+        panic!("the term is refused rather than the connection closed, got {refusal:?}");
+    };
+    assert_eq!(
+        (refusal.related_to.as_deref(), refusal.detail.as_str()),
+        (Some("docs"), SUBSCRIPTION_REFUSED)
+    );
+    assert!(
+        matches!(alice.barrier(9).await, ControlMessage::Pong(_)),
+        "the session stays up"
+    );
+
+    // Refused as a unit, so neither label is live any more.
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (12, 'alice', 1, 'late')")
+        .await;
+    assert!(
+        alice.try_live(QUIET).await.is_none(),
+        "nothing is subscribed any more, on either label"
     );
 }
