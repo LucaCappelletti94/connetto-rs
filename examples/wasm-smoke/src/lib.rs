@@ -28,18 +28,7 @@ pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
 
 pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 
-/// The browser stack's auth listener, as `CONNETTO_TEST_AUTH_BASE` named it
-/// when this crate was built.
-pub const AUTH_BASE: &str = match option_env!("CONNETTO_TEST_AUTH_BASE") {
-    Some(base) => base,
-    None => "http://127.0.0.1:18099",
-};
-
-/// The auth stack's route that hands back the delivered code in its URL.
-#[must_use]
-pub fn auth_landing() -> String {
-    format!("{AUTH_BASE}/dev/landing")
-}
+pub use connetto_demo_deployment::{AUTH_BASE, auth_landing};
 
 /// Where the browser stack serves the share key it minted for this run, a
 /// route on [`AUTH_BASE`].
@@ -198,12 +187,8 @@ pub mod workers {
             .map_err(JsValue::from)
     }
 
-    /// The demo server every smoke context connects to, as `CONNETTO_TEST_WS`
-    /// named it when this crate was built.
-    pub const DEMO_WS_URL: &str = match option_env!("CONNETTO_TEST_WS") {
-        Some(url) => url,
-        None => "ws://127.0.0.1:7777/",
-    };
+    pub use connetto_demo_deployment::DEMO_WS_URL;
+
     /// The synced replica schema, translated from `schema.sql` and
     /// `policies.sql` by build.rs. Hand-copying it here is what used to keep
     /// the browser suite off the translator's real output, which for a

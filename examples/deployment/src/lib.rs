@@ -48,5 +48,25 @@ pub fn schema_version() -> connetto_core::SchemaVersion {
     connetto_core::SchemaVersion::from_sources([SCHEMA_SQL, POLICIES_SQL])
 }
 
+/// The browser stack's sync endpoint, as `CONNETTO_TEST_WS` named it when this
+/// crate was built.
+pub const DEMO_WS_URL: &str = match option_env!("CONNETTO_TEST_WS") {
+    Some(url) => url,
+    None => "ws://127.0.0.1:7777/",
+};
+
+/// The browser stack's auth listener, as `CONNETTO_TEST_AUTH_BASE` named it
+/// when this crate was built.
+pub const AUTH_BASE: &str = match option_env!("CONNETTO_TEST_AUTH_BASE") {
+    Some(base) => base,
+    None => "http://127.0.0.1:18099",
+};
+
+/// The auth stack's route that hands back the delivered code in its URL.
+#[must_use]
+pub fn auth_landing() -> String {
+    format!("{AUTH_BASE}/dev/landing")
+}
+
 #[cfg(feature = "build")]
 pub mod build_support;
