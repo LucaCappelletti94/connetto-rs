@@ -40,9 +40,15 @@ fn ensure_keyring_store() -> Result<(), ClientError> {
         .map_err(|err| ClientError::Auth(format!("keyring setup: {err}")))
 }
 
-#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[cfg(target_os = "macos")]
 fn install_keyring_store() -> keyring_core::Result<()> {
     keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
+    Ok(())
+}
+
+#[cfg(target_os = "ios")]
+fn install_keyring_store() -> keyring_core::Result<()> {
+    keyring_core::set_default_store(apple_native_keyring_store::protected::Store::new()?);
     Ok(())
 }
 
@@ -460,16 +466,17 @@ pub type BrowserOpener = Arc<dyn Fn(&str) -> Result<(), ClientError> + Send + Sy
 
 /// The real opener, launching a detached system browser.
 ///
-/// On Android `webbrowser` hands the URL to the browser app, since the `open`
-/// crate's Android arm runs `xdg-open`, which phones lack. The login page
-/// stays outside the app either way, as RFC 8252 requires.
+/// On Android and iOS `webbrowser` hands the URL to the platform's browser,
+/// since the `open` crate's arms there run `xdg-open` and `uiopen`, which
+/// phones lack. The login page stays outside the app either way, as RFC 8252
+/// requires.
 #[must_use]
 pub fn system_browser_opener() -> BrowserOpener {
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "ios"))]
     return Arc::new(|url: &str| {
         webbrowser::open(url).map_err(|err| ClientError::Auth(format!("open browser: {err}")))
     });
-    #[cfg(not(target_os = "android"))]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     Arc::new(|url: &str| {
         open::that_detached(url).map_err(|err| ClientError::Auth(format!("open browser: {err}")))
     })

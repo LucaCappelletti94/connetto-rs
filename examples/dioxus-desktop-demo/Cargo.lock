@@ -1137,6 +1137,7 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "axum",
+ "base64 0.22.1",
  "connetto-core",
  "connetto-file-core",
  "connetto-file-server",
@@ -1152,6 +1153,7 @@ dependencies = [
  "reqwest 0.13.5",
  "ring",
  "rls2fga",
+ "rustls",
  "serde_json",
  "sqlite-diff-rs",
  "sqlparser",
@@ -1159,6 +1161,7 @@ dependencies = [
  "testcontainers",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tower-http",
  "tracing-subscriber",

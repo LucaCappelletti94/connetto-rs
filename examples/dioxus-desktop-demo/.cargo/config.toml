@@ -1,0 +1,6 @@
+[env]
+# One minimum iOS for rustc and for the C code build scripts compile. Unset,
+# rustc links for iOS 10 while `cc` targets the SDK's own version, and a device
+# link fails on symbols such as `___chkstk_darwin`. It matches the Swift
+# package's floor in `connetto-auth-session`.
+IPHONEOS_DEPLOYMENT_TARGET = "15.0"

@@ -59,7 +59,11 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::JoinHandle;
 
+pub mod demo;
 pub mod fanout;
+pub mod inspector;
+pub mod ios_signing;
+pub mod relay;
 pub mod roster;
 pub mod stack;
 pub mod standby;
@@ -423,6 +427,36 @@ pub fn with_user(url: &str, user: &str, password: &str) -> String {
     format!("{scheme}://{user}:{password}@{host}")
 }
 
+/// Rewrite a URL's host, keeping its scheme, user info, port and path, so an
+/// address the Docker host answers on names one another machine can reach.
+#[must_use]
+pub fn with_host(url: &str, host: &str) -> String {
+    let (scheme, rest) = url
+        .split_once("://")
+        .map_or(("", url), |(scheme, rest)| (scheme, rest));
+    let (authority, path) = rest.find('/').map_or((rest, ""), |at| rest.split_at(at));
+    let (user_info, host_port) = authority
+        .rsplit_once('@')
+        .map_or(("", authority), |(user, host_port)| (user, host_port));
+    let port = host_port.rsplit_once(':').map_or("", |(_, port)| port);
+    let mut rewritten = String::with_capacity(url.len() + host.len());
+    if !scheme.is_empty() {
+        rewritten.push_str(scheme);
+        rewritten.push_str("://");
+    }
+    if !user_info.is_empty() {
+        rewritten.push_str(user_info);
+        rewritten.push('@');
+    }
+    rewritten.push_str(host);
+    if !port.is_empty() {
+        rewritten.push(':');
+        rewritten.push_str(port);
+    }
+    rewritten.push_str(path);
+    rewritten
+}
+
 /// Build a bb8 pool for a conninfo string.
 ///
 /// # Panics
@@ -463,6 +497,16 @@ impl MockOauth {
             _container: container,
             issuer: format!("http://{host}:{port}/{MOCK_OAUTH_ISSUER_ID}"),
         }
+    }
+
+    /// This provider with its issuer on `host`, for clients on other
+    /// machines. The container publishes its port on every interface, and the
+    /// provider names itself after the host a request reached it on, so
+    /// discovery and tokens agree on the rewritten issuer.
+    #[must_use]
+    pub fn advertised_on(mut self, host: &str) -> Self {
+        self.issuer = with_host(&self.issuer, host);
+        self
     }
 
     /// The issuer URL discovered and asserted by `openidconnect`.
@@ -1794,6 +1838,32 @@ pub fn insert_changeset(
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
+}
+
+#[cfg(test)]
+mod url_tests {
+    use super::with_host;
+
+    /// Only the host changes, so credentials, the mapped port and the database
+    /// or issuer path survive.
+    #[test]
+    fn a_rewritten_host_keeps_credentials_port_and_path() {
+        assert_eq!(
+            with_host(
+                "postgres://postgres:postgres@localhost:55001/postgres",
+                "192.168.1.5"
+            ),
+            "postgres://postgres:postgres@192.168.1.5:55001/postgres"
+        );
+        assert_eq!(
+            with_host("http://localhost:59293/default", "192.168.1.5"),
+            "http://192.168.1.5:59293/default"
+        );
+        assert_eq!(
+            with_host("http://127.0.0.1:18081", "mac.local"),
+            "http://mac.local:18081"
+        );
+    }
 }
 
 #[cfg(test)]

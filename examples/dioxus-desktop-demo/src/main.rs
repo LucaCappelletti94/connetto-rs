@@ -32,6 +32,11 @@
 //! `127.0.0.1:7777`), `CONNETTO_DEMO_AUTH_ORIGIN`, the auth server (default
 //! `http://127.0.0.1:18081`), and `CONNETTO_DEMO_PG`, the conninfo the backend
 //! writer buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
+//! A phone runs with no environment of its own, so a build for one can bake
+//! each in as `CONNETTO_DEMO_BUILD_SERVER`, `CONNETTO_DEMO_BUILD_AUTH_ORIGIN` and
+//! `CONNETTO_DEMO_BUILD_PG`, which the running environment still overrides. The
+//! names differ from the runtime ones so that a shell pointed at a stack never
+//! bakes its addresses into a build by accident.
 //! Its server runs `schema.sql` and `policies.sql`, with `schema.sql`,
 //! `connetto_file_server::DEPLOYMENT_DDL`, `connetto_server::epoch::EPOCH_DDL`,
 //! `roles.sql` and `content.sql` applied in that order, and `orders,photos`
@@ -81,16 +86,19 @@ const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// handshake.
 const POLICIES_SQL: &str = include_str!("../policies.sql");
 
+const DEFAULT_SERVER: &str = "127.0.0.1:7777";
 const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
+const DEFAULT_PG: &str = "postgres://postgres:postgres@127.0.0.1:55456/postgres";
 const AUTH_PROVIDER: &str = "dev-idp";
 const REPLICA_PREFIX: &str = "connetto-desktop-demo";
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
 /// The login redirect on a phone, whose scheme is the app's bundle identifier
-/// (`Dioxus.toml`), the scheme the bundled redirect activity claims.
-#[cfg(target_os = "android")]
+/// (`Dioxus.toml`), the scheme the bundled redirect activity claims on Android
+/// and the authentication session catches on iOS.
+#[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
 /// How long a login in the browser tab may take.
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 
 // Declared for `dx`, which bundles `android/`, the module whose manifest turns
@@ -106,16 +114,17 @@ extern "Kotlin" {
 
 /// On a phone, sign in through the platform's in-app browser tab and the app's
 /// own redirect (RFC 8252 section 7.1).
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
     authenticator.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
 }
 
-/// The Custom Tab and the app's redirect, through `connetto-auth-session`.
-#[cfg(target_os = "android")]
+/// The Custom Tab on Android or the authentication session on iOS, and the
+/// app's redirect, through `connetto-auth-session`.
+#[cfg(any(target_os = "android", target_os = "ios"))]
 struct TabSession;
 
-#[cfg(target_os = "android")]
+#[cfg(any(target_os = "android", target_os = "ios"))]
 impl connetto_client::AuthorizationSession for TabSession {
     fn authorize(&self, url: String) -> connetto_client::SessionFuture {
         Box::pin(async move {
@@ -135,7 +144,7 @@ impl connetto_client::AuthorizationSession for TabSession {
 
 /// On a desktop, sign in through the system browser and a loopback listener
 /// (RFC 8252 section 7.3).
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
     authenticator
 }
@@ -188,11 +197,19 @@ struct AuthCtx {
     current_account: String,
 }
 
+/// An endpoint as the running environment sets it, else as the build
+/// environment did, else `default`.
+fn endpoint(runtime: Option<String>, built: Option<&'static str>, default: &str) -> String {
+    runtime
+        .or_else(|| built.map(str::to_owned))
+        .unwrap_or_else(|| default.to_owned())
+}
+
 fn data_dir() -> PathBuf {
     app_data_root().join("connetto-dioxus-demo")
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn app_data_root() -> PathBuf {
     if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
         PathBuf::from(xdg)
@@ -203,10 +220,11 @@ fn app_data_root() -> PathBuf {
     }
 }
 
-/// The app's private files directory, since Android sets neither `HOME` nor
-/// `XDG_DATA_HOME`. A failed lookup is logged and leaves the temp directory,
-/// where the first write then fails with an error setup reports.
-#[cfg(target_os = "android")]
+/// The app's private data directory on a phone, since Android sets neither
+/// `HOME` nor `XDG_DATA_HOME` and the iOS sandbox refuses `HOME/.local`. A
+/// failed lookup is logged and leaves the temp directory, where the first
+/// write then fails with an error setup reports.
+#[cfg(any(target_os = "android", target_os = "ios"))]
 fn app_data_root() -> PathBuf {
     robius_directories::ProjectDirs::from("", "", "connetto-dioxus-demo").map_or_else(
         || {
@@ -371,10 +389,16 @@ fn Session(parts: SessionParts) -> Element {
 async fn setup() -> anyhow::Result<Parts> {
     use anyhow::Context as _;
 
-    let server =
-        std::env::var("CONNETTO_DEMO_SERVER").unwrap_or_else(|_| "127.0.0.1:7777".to_owned());
-    let pg_url = std::env::var("CONNETTO_DEMO_PG")
-        .unwrap_or_else(|_| "postgres://postgres:postgres@127.0.0.1:55456/postgres".to_owned());
+    let server = endpoint(
+        std::env::var("CONNETTO_DEMO_SERVER").ok(),
+        option_env!("CONNETTO_DEMO_BUILD_SERVER"),
+        DEFAULT_SERVER,
+    );
+    let pg_url = endpoint(
+        std::env::var("CONNETTO_DEMO_PG").ok(),
+        option_env!("CONNETTO_DEMO_BUILD_PG"),
+        DEFAULT_PG,
+    );
 
     let stream = TcpStream::connect(&server)
         .await
@@ -493,8 +517,11 @@ async fn setup_authenticated(
     let account =
         remembered_account(token_store.as_ref()).context("reading the remembered account")?;
     let authenticator = Arc::new(platform_sign_in(NativeAuthenticator::new(
-        std::env::var("CONNETTO_DEMO_AUTH_ORIGIN")
-            .unwrap_or_else(|_| DEFAULT_AUTH_ORIGIN.to_owned()),
+        endpoint(
+            std::env::var("CONNETTO_DEMO_AUTH_ORIGIN").ok(),
+            option_env!("CONNETTO_DEMO_BUILD_AUTH_ORIGIN"),
+            DEFAULT_AUTH_ORIGIN,
+        ),
         AUTH_PROVIDER,
         Arc::clone(&token_store)
             as Arc<dyn RefreshTokenStore<Error = connetto_client::ClientError> + Send + Sync>,
@@ -1663,5 +1690,23 @@ fn ImportPanel() -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::endpoint;
+
+    /// The running environment wins, so a desktop build made with the
+    /// variables set still follows what it is launched with, and a phone
+    /// build falls back to what it was built with.
+    #[test]
+    fn a_runtime_endpoint_wins_over_the_built_one_and_both_over_the_default() {
+        assert_eq!(
+            endpoint(Some("run:1".to_owned()), Some("built:2"), "def:3"),
+            "run:1"
+        );
+        assert_eq!(endpoint(None, Some("built:2"), "def:3"), "built:2");
+        assert_eq!(endpoint(None, None, "def:3"), "def:3");
     }
 }

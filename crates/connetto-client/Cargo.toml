@@ -143,9 +143,15 @@ zeroize = { version = "1", default-features = false, features = ["alloc"] }
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled-sqlcipher"] }
 
-[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+[target.'cfg(target_os = "macos")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = [
   "keychain",
+], optional = true }
+
+# iOS has only the Data Protection keychain, which the crate calls `protected`.
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1.0.2", features = [
+  "protected",
 ], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -155,16 +161,19 @@ linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
 windows-native-keyring-store = { version = "1.1.0", optional = true }
 
 # Every other native target launches the browser through `open`.
-[target.'cfg(not(any(target_os = "android", all(target_family = "wasm", target_os = "unknown"))))'.dependencies]
+[target.'cfg(not(any(target_os = "android", target_os = "ios", all(target_family = "wasm", target_os = "unknown"))))'.dependencies]
 open = { version = "5.4", optional = true }
 
-# Android: the Keystore-backed store of the same family, and `webbrowser`,
-# whose Android arm hands the sign-in URL to the browser app through the same
-# activity context. The NDK ships no OpenSSL headers, so SQLCipher builds its
-# own from source here.
+# Phones hand the sign-in URL to the platform's browser through `webbrowser`,
+# since `open` runs `xdg-open` on Android and the jailbreak tool `uiopen` on
+# iOS.
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+webbrowser = { version = "1.2", optional = true }
+
+# Android: the Keystore-backed store of the same family. The NDK ships no
+# OpenSSL headers, so SQLCipher builds its own from source here.
 [target.'cfg(target_os = "android")'.dependencies]
 android-native-keyring-store = { version = "1.0.0", optional = true }
-webbrowser = { version = "1.2", optional = true }
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }

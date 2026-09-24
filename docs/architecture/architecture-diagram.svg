@@ -388,7 +388,7 @@
       <text x="315" y="32" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
       <text x="315" y="46" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
       <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
-      <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates R51 and R52 wait for the mobile demo build R88, R53 blocked on hardware</text>
+      <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates R51 and R52 unblocked by the mobile demo build R88, R53 blocked on hardware</text>
       <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">Linux keyring custody across a reboot: R71</text>
     </g>
 
@@ -455,7 +455,7 @@
       <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#555">mTLS with device certificates, the server still adjudicates later</text>
       <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#555">a lost device's signed queue is recovered through a courier</text>
       <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#555">one dedup domain, the (device key, sequence) frontier</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#555">BLE beacon bootstrap later, phones need R88 first</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#555">BLE beacon bootstrap later, on the R88 phone builds</text>
     </g>
   </g>
 
