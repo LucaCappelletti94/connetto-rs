@@ -1023,6 +1023,7 @@ dependencies = [
  "diesel",
  "diesel-async",
  "dioxus",
+ "manganis",
  "pg2sqlite",
  "robius-directories",
  "rosetta-uuid",
