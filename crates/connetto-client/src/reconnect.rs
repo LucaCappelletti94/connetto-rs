@@ -59,10 +59,11 @@ where
 /// Platform sleep injected into the backoff loop.
 ///
 /// Implemented for any `FnMut(Duration)` closure returning a future, and by
-/// [`TokioSleeper`] on native. Wasm injects a `setTimeout` wrapper.
+/// [`TokioSleeper`] on native. Wasm injects a `setTimeout` wrapper. The sleep
+/// does not borrow the sleeper, so a pump can hold one across its own steps.
 pub trait Sleeper {
     /// Resolve after roughly `duration`.
-    fn sleep(&mut self, duration: Duration) -> impl Future<Output = ()> + MaybeSend;
+    fn sleep(&mut self, duration: Duration) -> impl Future<Output = ()> + MaybeSend + use<Self>;
 }
 
 impl<F, Fut> Sleeper for F
@@ -70,7 +71,7 @@ where
     F: FnMut(Duration) -> Fut,
     Fut: Future<Output = ()> + MaybeSend,
 {
-    fn sleep(&mut self, duration: Duration) -> impl Future<Output = ()> + MaybeSend {
+    fn sleep(&mut self, duration: Duration) -> impl Future<Output = ()> + MaybeSend + use<F, Fut> {
         self(duration)
     }
 }
@@ -82,8 +83,8 @@ pub struct TokioSleeper;
 
 #[cfg(feature = "native-transport")]
 impl Sleeper for TokioSleeper {
-    async fn sleep(&mut self, duration: Duration) {
-        tokio::time::sleep(duration).await;
+    fn sleep(&mut self, duration: Duration) -> impl Future<Output = ()> + MaybeSend + use<> {
+        tokio::time::sleep(duration)
     }
 }
 
@@ -110,7 +111,7 @@ where
 pub(crate) struct NoSleep;
 
 impl Sleeper for NoSleep {
-    fn sleep(&mut self, _duration: Duration) -> impl Future<Output = ()> + MaybeSend {
+    fn sleep(&mut self, _duration: Duration) -> impl Future<Output = ()> + MaybeSend + use<> {
         core::future::ready(())
     }
 }

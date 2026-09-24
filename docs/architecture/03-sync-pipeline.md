@@ -59,7 +59,7 @@ The server sends `MutationConflict(client_seq, table, server_row)`, with the ser
 
 ### 6. Rollback on rejection
 
-On `MutationReject`, the client retires the pending record, inverts the retained changeset with capture suspended (reverting the optimistic local write), and surfaces the rejection with its affected rows to the application.
+On `MutationReject`, the client retires the pending record, inverts the retained changeset with capture suspended (reverting the optimistic local write), and surfaces the rejection with its affected rows to the application. **Built (2026-09-24).** `Indeterminate` is the exception. It means the server could not settle the write, so the record and its rows stay and the write is sent again (`10-subscription-materializer.md`, rows 6 and 8 of the failure inventory).
 
 ---
 

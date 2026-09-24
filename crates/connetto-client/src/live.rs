@@ -50,7 +50,7 @@ use tokio::sync::{Mutex, Notify, broadcast, watch};
 
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
 use crate::subscriptions::DEFAULT_GRACE;
-use crate::{ClientError, ClientEvent, ConnettoConnection};
+use crate::{ClientError, ClientEvent, ConnettoConnection, ResendTimer};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
 /// the bind values the placeholders stand for, in placeholder order.
@@ -2544,6 +2544,8 @@ async fn pump<T, F, S>(
     S: Sleeper + MaybeSend + 'static,
 {
     let mut needs_recovery = false;
+    // The sleep for the armed resend, kept across steps so arriving frames do not restart it.
+    let mut resend = None;
     loop {
         if alive.upgrade().is_none() {
             let mut state = shared.state.lock().await;
@@ -2608,9 +2610,17 @@ async fn pump<T, F, S>(
         }
 
         // 4. One cancellable pump step. A wake interrupts the idle wait so
-        //    lock waiters (watch, with_conn, drops) get in promptly.
-        let wake = Arc::clone(&shared.wake);
-        match state.conn.pump_one_or(wake.notified()).await {
+        //    lock waiters (watch, with_conn, drops) get in promptly, and the
+        //    armed resend of deferred writes interrupts it when it is due.
+        //    With no driver there is no sleeper, so deferred writes wait for
+        //    the next attach.
+        let armed = state.conn.resend_timer();
+        if armed != resend.as_ref().map(|(timer, _)| *timer) {
+            resend = armed
+                .zip(reconnect.as_mut())
+                .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
+        }
+        match step_or_resend(&mut state.conn, &shared.wake, &mut resend).await {
             // A deliberate server close: tell the app why, then take the same
             // path a dropped transport takes. The socket is gone either way.
             Ok(Some(event @ ClientEvent::ServerClosed { .. })) => {
@@ -2655,6 +2665,41 @@ async fn pump<T, F, S>(
         //    and local writes alike.
         refresh_changed(&mut state, &shared.events);
     }
+}
+
+/// One cancellable pump step that also ends when the armed resend is due, and
+/// then sends the deferred writes again.
+///
+/// A due resend means the cancel won, so the step took no frame and an error
+/// from the resend loses none.
+async fn step_or_resend<T, F>(
+    conn: &mut ConnettoConnection<T>,
+    wake: &Notify,
+    resend: &mut Option<(ResendTimer, core::pin::Pin<Box<F>>)>,
+) -> Result<Option<ClientEvent>, ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+    F: Future<Output = ()>,
+{
+    let due = AtomicBool::new(false);
+    let cancel = async {
+        match resend.as_mut() {
+            Some((_, sleep)) => tokio::select! {
+                biased;
+                () = wake.notified() => {}
+                () = sleep.as_mut() => due.store(true, Ordering::Relaxed),
+            },
+            None => wake.notified().await,
+        }
+    };
+    let stepped = conn.pump_one_or(cancel).await;
+    if due.load(Ordering::Relaxed)
+        && let Some((timer, _)) = resend.take()
+    {
+        conn.resend_deferred(timer).await?;
+    }
+    stepped
 }
 
 /// Re-run every live query whose tables were touched since the last step.

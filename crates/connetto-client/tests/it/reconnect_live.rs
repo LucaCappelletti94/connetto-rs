@@ -494,6 +494,124 @@ async fn offline_write_reflushes_after_resume() {
     );
 }
 
+/// A write the database cannot take stays on the replica and lands once it can, without a reconnect.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS orders CASCADE",
+            "DROP TABLE IF EXISTS _connetto_mutations",
+            "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
+        ])
+        .await;
+    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    let writes = diesel_async::pooled_connection::bb8::Pool::builder()
+        .max_size(1)
+        .connection_timeout(Duration::from_millis(100))
+        .build(
+            diesel_async::pooled_connection::AsyncDieselConnectionManager::new(fixture.admin_url()),
+        )
+        .await
+        .expect("build the write pool");
+    let manager = SessionManager::new(
+        Materializer::with_write_catalog(
+            PG_DDL,
+            RuntimeWritableCatalog::builder().writable("orders").build(),
+        )
+        .expect("build materializer"),
+        SeedSnapshot,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
+        test_verifier(),
+        pg_write_target::<ConnettoWatermark>(writes.clone(), PG_DDL).expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default().with_write_retry_budget(Duration::from_millis(200)),
+    );
+    let slot: ServeSlot = Arc::new(Mutex::new(None));
+    let transport = open_session(&manager, &slot).await;
+    let conn = ConnettoConnection::connect(
+        transport,
+        &Replica::in_memory(),
+        SQLITE_DDL,
+        &config("deferred-write"),
+        None,
+    )
+    .await
+    .expect("client connect");
+    let (client, pump) = ConnettoClient::with_reconnect(
+        conn,
+        session_factory(
+            Arc::clone(&manager),
+            Arc::clone(&slot),
+            Arc::new(AtomicBool::new(false)),
+        ),
+        TokioSleeper,
+        fast_policy(),
+    );
+    tokio::spawn(pump);
+    let mut events = client.events();
+
+    let outage = writes.get_owned().await.expect("hold the only connection");
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(orders::table)
+                .values((
+                    orders::id.eq(60_i64),
+                    orders::status.eq("during the outage"),
+                ))
+                .execute(conn.conn())
+                .expect("local insert")
+        })
+        .await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    await_event(
+        &mut events,
+        deadline,
+        |event| matches!(event, ClientEvent::MutationDeferred { .. }),
+        |event| matches!(event, ClientEvent::MutationRejected { .. }),
+    )
+    .await;
+    let kept = client
+        .with_conn(|conn| {
+            orders::table
+                .filter(orders::id.eq(60_i64))
+                .count()
+                .get_result::<i64>(conn.conn())
+                .expect("read the replica")
+        })
+        .await;
+    assert_eq!(kept, 1, "the deferred write stays on the replica");
+
+    drop(outage);
+    await_event(
+        &mut events,
+        deadline,
+        |event| matches!(event, ClientEvent::MutationApplied { .. }),
+        |event| matches!(event, ClientEvent::Reconnecting { .. }),
+    )
+    .await;
+    assert_eq!(target_rows(&fixture, 60).await.len(), 1);
+}
+
+/// Read events until `wanted` arrives by `deadline`, failing on any event `forbidden` names.
+async fn await_event(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+    deadline: tokio::time::Instant,
+    wanted: impl Fn(&ClientEvent) -> bool,
+    forbidden: impl Fn(&ClientEvent) -> bool,
+) {
+    loop {
+        let event = tokio::time::timeout_at(deadline, events.recv())
+            .await
+            .expect("the awaited event arrives within the deadline")
+            .expect("event stream closed");
+        assert!(!forbidden(&event), "unexpected event {event:?}");
+        if wanted(&event) {
+            return;
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let fixture = Fixture::acquire().await;

@@ -67,8 +67,10 @@ pub(crate) enum WriteError {
     Unauthorized,
     /// The changeset failed to parse or apply.
     Materializer(MaterializerError),
-    /// A pool, transaction, or watermark storage failure.
+    /// A transaction or watermark storage failure that trying again cannot clear.
     Backend(String),
+    /// The database could not be reached or cut the connection, so the same write may succeed later.
+    Transient(String),
 }
 
 impl WriteError {
@@ -77,15 +79,25 @@ impl WriteError {
         match self {
             Self::Unauthorized => "unauthorized".to_owned(),
             Self::Materializer(err) => err.to_string(),
-            Self::Backend(detail) => detail.clone(),
+            Self::Backend(detail) | Self::Transient(detail) => detail.clone(),
         }
     }
 }
 
 impl From<diesel::result::Error> for WriteError {
     fn from(err: diesel::result::Error) -> Self {
-        Self::Backend(err.to_string())
+        match crate::reexec::diesel_failure(&err) {
+            crate::reexec::ReadFailure::Transient => Self::Transient(err.to_string()),
+            crate::reexec::ReadFailure::Timeout | crate::reexec::ReadFailure::Other => {
+                Self::Backend(err.to_string())
+            }
+        }
     }
+}
+
+/// A pool that could not hand out a connection is an unreachable database.
+fn pool_failure(err: impl core::fmt::Display) -> WriteError {
+    WriteError::Transient(err.to_string())
 }
 
 /// The client sequence as the storage integer.
@@ -204,17 +216,20 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         let seq = seq_storage(client_seq)?;
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|err| WriteError::Backend(err.to_string()))?;
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
         let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
         let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(async move |c| {
+                // A commit whose answer was lost is already covered, and applying it again would write it twice.
+                if watermark_of::<W>(c, watermark_session)
+                    .await?
+                    .is_some_and(|last| last >= seq)
+                {
+                    return Ok(WriteOutcome::Applied);
+                }
                 binding.apply(c).await?;
                 for op in &plan.ops {
                     let Some(conflict) = &op.conflict else {
@@ -250,7 +265,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             Err(CommitError::Db(err)) if is_rls_violation(&err.to_string()) => {
                 Err(WriteError::Unauthorized)
             }
-            Err(CommitError::Db(err)) => Err(WriteError::Backend(err.to_string())),
+            Err(CommitError::Db(err)) => Err(err.into()),
             Err(CommitError::Probe(err)) => Err(WriteError::Materializer(err)),
         }
     }
@@ -262,18 +277,8 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         &self,
         session_id: SessionId,
     ) -> Result<Option<u64>, WriteError> {
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|err| WriteError::Backend(err.to_string()))?;
-        let filtered = FilterDsl::filter(W::WatermarkQuery::default(), W::wm_pk(session_id));
-        let query = SelectDsl::select(filtered, W::LastSeq::default());
-        let last_seq: Option<i64> = query
-            .first(&mut conn)
-            .await
-            .optional()
-            .map_err(|err| WriteError::Backend(err.to_string()))?;
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        let last_seq = watermark_of::<W>(&mut conn, session_id).await?;
         Ok(last_seq.and_then(|seq| u64::try_from(seq).ok()))
     }
 
@@ -292,11 +297,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     ) -> Result<bool, WriteError> {
         use visibility::connetto_visible_files;
         let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
-        let mut conn = self
-            .pool
-            .get()
-            .await
-            .map_err(|err| WriteError::Backend(err.to_string()))?;
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
         // file_id is [u8; 32] (Copy): derive bytes twice inside the async
         // block so no clone is needed across the await.
         conn.transaction::<bool, diesel::result::Error, _>(async move |c| {
@@ -309,6 +310,18 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
             Ok(visible.into_iter().any(|v| v == expected))
         })
         .await
-        .map_err(|err| WriteError::Backend(err.to_string()))
+        .map_err(WriteError::from)
     }
+}
+
+/// The highest `client_seq` durably applied for `session_id`, read on `conn`.
+async fn watermark_of<W: ConnettoWatermarkSchema>(
+    conn: &mut AsyncPgConnection,
+    session_id: SessionId,
+) -> diesel::QueryResult<Option<i64>> {
+    let filtered = FilterDsl::filter(W::WatermarkQuery::default(), W::wm_pk(session_id));
+    SelectDsl::select(filtered, W::LastSeq::default())
+        .first(conn)
+        .await
+        .optional()
 }
