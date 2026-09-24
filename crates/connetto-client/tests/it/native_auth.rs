@@ -644,7 +644,7 @@ impl ScriptedSession {
 impl AuthorizationSession for ScriptedSession {
     fn authorize(&self, url: String) -> SessionFuture {
         self.opened
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let (subject, die, forge) = (self.subject, self.die, self.forge_state);
         let delivered = Arc::clone(&self.delivered);
         Box::pin(async move {
@@ -770,7 +770,7 @@ async fn a_login_finishes_in_the_process_its_redirect_restarts() {
     let login = second.login::<String>().await.expect("the resumed login");
 
     assert_eq!(
-        opened.load(std::sync::atomic::Ordering::SeqCst),
+        opened.load(std::sync::atomic::Ordering::Relaxed),
         0,
         "the restarted process opens no second tab"
     );
@@ -806,9 +806,47 @@ async fn a_restarted_process_starts_over_on_a_foreign_redirect() {
     let second = claimed(&base, &store, Arc::new(restarted));
     second.login::<String>().await.expect("a fresh login");
     assert_eq!(
-        opened.load(std::sync::atomic::Ordering::SeqCst),
+        opened.load(std::sync::atomic::Ordering::Relaxed),
         1,
         "the foreign redirect is discarded and one new tab opens"
+    );
+}
+
+/// A resumed code the server refuses, as an expired one is, clears the
+/// pending login and starts a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_process_starts_over_when_the_resumed_code_is_refused() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    let mut dying = ScriptedSession::new("mobile-user");
+    dying.die = true;
+    let delivered = Arc::clone(&dying.delivered);
+    let first = claimed(&base, &store, Arc::new(dying));
+    let _ = tokio::time::timeout(std::time::Duration::from_secs(10), first.login::<String>()).await;
+    drop(first);
+    let redirect = delivered.lock().expect("slot").take().expect("a redirect");
+    let (before, after) = redirect.split_once("code=").expect("a code");
+    let rest = after.split_once('&').map_or("", |(_, rest)| rest);
+    *delivered.lock().expect("slot") = Some(format!("{before}code=expired&{rest}"));
+
+    let restarted = ScriptedSession {
+        delivered,
+        ..ScriptedSession::new("mobile-user")
+    };
+    let opened = Arc::clone(&restarted.opened);
+    let second = claimed(&base, &store, Arc::new(restarted));
+    let login = second.login::<String>().await.expect("a fresh login");
+    assert_eq!(
+        opened.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the refused code is dropped and one new tab opens"
+    );
+    assert_eq!(
+        store.accounts().expect("accounts"),
+        vec![encode_identity(&login.user_id).expect("encode account")],
+        "the new login's account is the only record listed"
     );
 }
 
