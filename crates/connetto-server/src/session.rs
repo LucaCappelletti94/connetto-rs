@@ -2260,6 +2260,7 @@ where
                 Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
             };
             let cursor = self.stamp(&patch.cursor);
+            // The ingest loop appends and dispatches one event at a time, so a catchup's ceiling reaches at most this event and this advance never rewinds.
             {
                 counters::timed_lock(&self.materializer)
                     .await
@@ -5232,9 +5233,11 @@ where
                 )
             };
             match advanced {
+                Ok(()) => {}
                 // A live change dispatched since the route went up already moved the cursor past this entry, and its patch queues behind the replay.
-                Ok(())
-                | Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {}
+                Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {
+                    tracing::debug!(sub_id = %sub.sub_id, lsn = record.lsn(), "a live change already moved the cursor past this replayed entry");
+                }
                 Err(err) => return Err(err.into()),
             }
             let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
