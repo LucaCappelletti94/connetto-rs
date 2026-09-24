@@ -74,13 +74,12 @@ async fn main() -> Result<()> {
     let _server = spawn_server(&server_bin, &envs, &sync_bind, &auth_bind).await?;
 
     let pg_url = provisioned.fixture.admin_url();
-    // Each pair is the device port, where the demo dials, then the host port.
-    let reverse = [
-        (DEMO_SYNC_PORT, sync_port),
-        (DEMO_AUTH_PORT, auth_port),
-        (url_port(idp.issuer())?, url_port(idp.issuer())?),
-        (DEMO_PG_PORT, url_port(pg_url)?),
-    ];
+    let reverse = device_reverse(
+        sync_port,
+        auth_port,
+        url_port(idp.issuer())?,
+        url_port(pg_url)?,
+    );
     let reverse_spec = reverse
         .iter()
         .map(|(device, host)| format!("{device}:{host}"))
@@ -117,6 +116,28 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+/// The `adb reverse` pairs, each the device port then the host port. The
+/// demo dials the default ports, while the server builds its login callback
+/// and other absolute URLs from the auth port it binds, which a phone's browser
+/// follows, so a moved auth port is reversed at its own number too.
+fn device_reverse(
+    sync_port: u16,
+    auth_port: u16,
+    issuer_port: u16,
+    pg_port: u16,
+) -> Vec<(u16, u16)> {
+    let mut pairs = vec![
+        (DEMO_SYNC_PORT, sync_port),
+        (DEMO_AUTH_PORT, auth_port),
+        (issuer_port, issuer_port),
+        (DEMO_PG_PORT, pg_port),
+    ];
+    if auth_port != DEMO_AUTH_PORT {
+        pairs.push((auth_port, auth_port));
+    }
+    pairs
+}
+
 /// The port in a `host:port` or a URL with an explicit port.
 fn url_port(address: &str) -> Result<u16> {
     let rest = address.split_once("://").map_or(address, |(_, rest)| rest);
@@ -128,4 +149,30 @@ fn url_port(address: &str) -> Result<u16> {
         .rsplit_once(':')
         .and_then(|(_, port)| port.parse().ok())
         .ok_or_else(|| anyhow!("{address} names no port"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DEMO_AUTH_PORT, DEMO_PG_PORT, DEMO_SYNC_PORT, device_reverse};
+
+    /// The server builds its login callback and every other absolute URL from
+    /// the auth port it binds, and a phone's browser follows them. So a moved
+    /// auth port is reachable on the device at its own number as well as at
+    /// the one the demo dials.
+    #[test]
+    fn a_moved_auth_port_is_reachable_on_the_device_at_its_own_number() {
+        let pairs = device_reverse(17777, 18181, 40000, 50000);
+        assert!(pairs.contains(&(DEMO_AUTH_PORT, 18181)), "{pairs:?}");
+        assert!(pairs.contains(&(18181, 18181)), "{pairs:?}");
+    }
+
+    /// On the default ports each device port is reversed once.
+    #[test]
+    fn default_ports_reverse_each_device_port_once() {
+        let pairs = device_reverse(DEMO_SYNC_PORT, DEMO_AUTH_PORT, 40000, DEMO_PG_PORT);
+        let mut devices = pairs.iter().map(|(device, _)| *device).collect::<Vec<_>>();
+        devices.sort_unstable();
+        devices.dedup();
+        assert_eq!(devices.len(), pairs.len(), "{pairs:?}");
+    }
 }
