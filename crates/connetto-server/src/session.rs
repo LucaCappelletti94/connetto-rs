@@ -790,7 +790,7 @@ fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
 
 /// Read the reconnect log through `read`, reading again after a transient failure while the connection's `budget` of waiting lasts.
 ///
-/// Each wait is the default policy's exact backoff for its attempt, 200 ms doubling to 5 s, cut to what is left and taken from it.
+/// Each read runs its own jittered episode of the default policy, 200 ms doubling to 5 s, so clients resuming together after a promotion do not read again in step, and each wait is cut to what is left of the budget and taken from it.
 async fn read_log<O: Oplog, R, Fut>(
     budget: &mut Duration,
     mut read: impl FnMut() -> Fut,
@@ -799,7 +799,7 @@ where
     Fut: core::future::Future<Output = Result<R, O::Error>>,
 {
     let policy = RetryPolicy::new();
-    let mut attempt: u32 = 0;
+    let mut episode = policy.start();
     loop {
         match read().await {
             Ok(value) => return Ok(value),
@@ -807,8 +807,10 @@ where
                 if budget.is_zero() {
                     return Err(oplog_err(err));
                 }
-                attempt = attempt.saturating_add(1);
-                let wait = policy.backoff(attempt).min(*budget);
+                let Some(wait) = episode.next_wait() else {
+                    return Err(oplog_err(err));
+                };
+                let wait = wait.min(*budget);
                 *budget -= wait;
                 tracing::warn!(error = %err, wait_ms = retry_ms(wait), "the reconnect log did not answer a resume, reading it again");
                 tokio::time::sleep(wait).await;

@@ -789,12 +789,14 @@ async fn a_session_ended_by_an_error_leaves_no_connection_registered() {
 /// One connection's wait on the reconnect log is bounded however many subscriptions it resumes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
+    const BUDGET: Duration = Duration::from_secs(2);
     let fixture = Fixture::acquire().await;
-    let config = SessionConfig::default().with_resume_read_budget(Duration::from_secs(1));
+    let config = SessionConfig::default().with_resume_read_budget(BUDGET);
     let (manager, script, events) = scripted(&fixture, config).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
+    let started = tokio::time::Instant::now();
 
-    // Waits of 200 ms, 400 ms and what is left of the second, spending the whole budget.
+    // Three jittered waits spend between 0.7 s and 1.4 s of the budget, and the catchup still arrives.
     arm(&script, &["min_lsn", "min_lsn", "min_lsn"], true, None);
     subscribe(&mut client).await;
     for event in &events[1..] {
@@ -804,7 +806,8 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
         assert_eq!(live.cursor, cursor_of(event));
     }
 
-    arm(&script, &["min_lsn"], true, None);
+    // The second subscription's reads keep failing, so only what is left of the budget stands before the end.
+    arm(&script, &["min_lsn"; 64], true, None);
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders-again".to_owned(),
@@ -819,9 +822,9 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
         matches!(ended, Ok(None)),
         "the transport ends, got {ended:?}"
     );
-    assert_eq!(
-        script.lock().expect("script").reads,
-        ["min_lsn"],
-        "the second subscription's failure is not read again, the budget being spent"
+    let waited = started.elapsed();
+    assert!(
+        waited < BUDGET + Duration::from_millis(500),
+        "the connection waited {waited:?} on the log, past its budget of {BUDGET:?}"
     );
 }
