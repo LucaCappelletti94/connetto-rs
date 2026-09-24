@@ -1,0 +1,30 @@
+name: Pull the test images
+description: >-
+  Pulls every image connetto-test-harness starts, retrying a truncated
+  download, so the registry stays out of each container's startup budget.
+  The tags match the constants in crates/connetto-test-harness.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        pull() {
+          for attempt in 1 2 3; do
+            docker pull --quiet "$1" && return 0
+            sleep $((attempt * 5))
+          done
+          return 1
+        }
+        pids=()
+        for image in \
+          postgres:16 \
+          postgres:18 \
+          openfga/openfga:v1.21.0 \
+          ghcr.io/navikt/mock-oauth2-server:6.0.2 \
+          python:3.12-slim-bookworm; do
+          pull "$image" &
+          pids+=($!)
+        done
+        for pid in "${pids[@]}"; do
+          wait "$pid"
+        done

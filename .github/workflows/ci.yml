@@ -377,10 +377,10 @@ jobs:
             ${{ matrix.target }}
 
   android:
-    # R88: the phone build of the desktop demo, checked without a device. Its
-    # own job because the matrix legs pass --all-features, which would switch
-    # the desktop renderer on for the phone.
-    name: Compile dioxus-desktop-demo android
+    # R88: the phone build of the desktop demo, built and linked without a
+    # device. Its own job because the matrix legs pass --all-features, which
+    # would switch the desktop renderer on for the phone.
+    name: Build dioxus-desktop-demo android
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -402,7 +402,7 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-linux-android --toolchain stable
 
-      - name: Check the demo for Android
+      - name: Build the demo for Android
         working-directory: examples/dioxus-desktop-demo
         run: |
           ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
@@ -411,15 +411,16 @@ jobs:
           export AR_aarch64_linux_android="$tc/llvm-ar"
           export RANLIB_aarch64_linux_android="$tc/llvm-ranlib"
           export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$tc/aarch64-linux-android29-clang"
-          cargo +stable check \
+          cargo +stable build \
             --target aarch64-linux-android \
             --no-default-features \
             --features mobile
 
   ios:
-    # R88: the phone build of the desktop demo for iOS, checked without a
-    # device, for the same reason the Android leg is its own job.
-    name: Compile dioxus-desktop-demo ios
+    # R88: the phone build of the desktop demo for iOS, built without a
+    # device, for the same reason the Android leg is its own job. It links,
+    # because only the link sees a C object built for another iOS version.
+    name: Build dioxus-desktop-demo ios
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -441,11 +442,11 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-apple-ios aarch64-apple-ios-sim --toolchain stable
 
-      - name: Check the demo for iOS devices and the simulator
+      - name: Build the demo for iOS devices and the simulator
         working-directory: examples/dioxus-desktop-demo
         run: |
           for target in aarch64-apple-ios aarch64-apple-ios-sim; do
-            cargo +stable check \
+            cargo +stable build \
               --target "$target" \
               --no-default-features \
               --features mobile
@@ -516,6 +517,8 @@ jobs:
       - name: Build spawned binaries
         if: matrix.bins != ''
         run: cargo +stable build --release --all-features --bins ${{ matrix.bins }}
+
+      - uses: ./.github/actions/pull-test-images
 
       # nextest rather than cargo test, matching the local runner: each test
       # gets its own process, which the merged tests/it targets rely on for
@@ -648,11 +651,7 @@ jobs:
           echo "${CHROMEWEBDRIVER}" >> "${GITHUB_PATH}"
           echo "CHROMEDRIVER=${CHROMEWEBDRIVER}/chromedriver" >> "${GITHUB_ENV}"
 
-      # The identity-provider image is pulled inside each shard's startup
-      # wait, which a congested ghcr.io can overrun. Pulling it once here
-      # takes the registry out of the container startup budget.
-      - name: Pre-pull the identity provider image
-        run: docker pull ghcr.io/navikt/mock-oauth2-server:6.0.2
+      - uses: ./.github/actions/pull-test-images
 
       - name: Run browser suites
         env:

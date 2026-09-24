@@ -126,7 +126,7 @@ async fn prove(
 
     step("install");
     target.install(&app).await?;
-    let mut inspector = Inspector::start(target).await?;
+    let mut inspector = Inspector::start(target, evidence).await?;
 
     step("sign in");
     target
@@ -182,6 +182,7 @@ async fn prove(
     step("sign out");
     sign_out(&mut app).await?;
     target.record(&mut app, evidence, "signed-out").await?;
+    eprintln!("inspector proxy restarts: {}", inspector.restarts);
     step("proof complete");
     Ok(())
 }
@@ -196,6 +197,7 @@ async fn sign_in(
     evidence: &Path,
 ) -> Result<PageSession> {
     let deadline = Instant::now() + Duration::from_secs(90);
+    let mut demo = String::from("no demo page");
     loop {
         if let Some(mut login) = inspector
             .try_page(|url| url.starts_with(login_prefix))
@@ -211,13 +213,21 @@ async fn sign_in(
         if let Some(mut app) = inspector
             .try_page(|url| url.starts_with("dioxus://"))
             .await?
-            && app.page_text().await?.contains("status: connected")
         {
-            eprintln!("an earlier credential signed the demo in, signing out first");
-            sign_out(&mut app).await?;
+            let text = app.page_text().await?;
+            if text.contains("status: connected") {
+                eprintln!("an earlier credential signed the demo in, signing out first");
+                sign_out(&mut app).await?;
+            }
+            demo = text.split_whitespace().collect::<Vec<_>>().join(" ");
         }
         if Instant::now() >= deadline {
-            bail!("neither the login page nor a signed-in demo appeared within 90s");
+            let shown: String = demo.chars().take(400).collect();
+            bail!(
+                "neither the login page nor a signed-in demo appeared within 90s, the demo \
+                 showed {shown:?}, {}",
+                inspector.state()
+            );
         }
         inspector.keep_alive().await?;
         sleep(Duration::from_secs(1)).await;
@@ -489,9 +499,10 @@ impl Target {
 }
 
 /// Sign every framework `dx` bundled, then the app again with its own
-/// entitlements, in the order Xcode signs. A stand-in until Dioxus signs the
-/// frameworks it bundles, which dx 0.7.10 leaves unsigned so a device refuses
-/// the install. Deleted once a Dioxus release does it.
+/// entitlements, in the order Xcode signs, and verify the result so an
+/// unsigned bundle is named here rather than by the install. A stand-in
+/// awaiting Dioxus, whose dx 0.7.10 leaves the frameworks it bundles unsigned
+/// so a device refuses the install. Deleted once a Dioxus release signs them.
 async fn sign_bundled_frameworks(app: &Path, identity: &str, evidence: &Path) -> Result<()> {
     let entitlements = evidence.join("device-entitlements.plist");
     let extracted = Command::new("codesign")
@@ -519,7 +530,8 @@ async fn sign_bundled_frameworks(app: &Path, identity: &str, evidence: &Path) ->
         ],
         app,
     )
-    .await
+    .await?;
+    codesign(&["--verify", "--deep", "--strict", "--verbose=2"], app).await
 }
 
 async fn codesign(args: &[&str], path: &Path) -> Result<()> {
@@ -531,7 +543,8 @@ async fn codesign(args: &[&str], path: &Path) -> Result<()> {
         .context("starting codesign")?;
     if !output.status.success() {
         bail!(
-            "signing {} failed: {}",
+            "codesign {} {} failed: {}",
+            args.first().copied().unwrap_or_default(),
             path.display(),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -629,6 +642,7 @@ async fn default_simulator() -> Result<String> {
 }
 
 /// `ios_webkit_debug_proxy` for one simulator or device, stopped when dropped.
+/// Its output is appended to `ios_webkit_debug_proxy.log` in the evidence.
 struct Inspector {
     proxy: Child,
     list_port: u16,
@@ -636,7 +650,11 @@ struct Inspector {
     device: String,
     /// The simulators' inspector socket, which a device run does not use.
     socket: Option<String>,
+    log: PathBuf,
     restart_at: Instant,
+    restarts: u32,
+    /// What the latest search saw, for the error when nothing matches.
+    seen: String,
 }
 
 /// How long page searches wait before restarting the proxy, which does not
@@ -644,7 +662,7 @@ struct Inspector {
 const PROXY_RESTART: Duration = Duration::from_secs(15);
 
 impl Inspector {
-    async fn start(target: &Target) -> Result<Self> {
+    async fn start(target: &Target, evidence: &Path) -> Result<Self> {
         let (device, socket) = match target {
             Target::Simulator { .. } => (
                 "SIMULATOR".to_owned(),
@@ -652,35 +670,18 @@ impl Inspector {
             ),
             Target::Device { udid, .. } => (udid.clone(), None),
         };
-        Self::spawn(device, socket)
-    }
-
-    fn spawn(device: String, socket: Option<String>) -> Result<Self> {
+        let log = evidence.join("ios_webkit_debug_proxy.log");
         let list_port = free_port()?;
-        let first_page_port = free_port()?;
-        let mut proxy = Command::new("ios_webkit_debug_proxy");
-        if let Some(socket) = &socket {
-            proxy.args(["-s", &format!("unix:{socket}")]);
-        }
-        let proxy = proxy
-            .args([
-                "-c",
-                &format!(
-                    "null:{list_port},:{first_page_port}-{}",
-                    first_page_port + 100
-                ),
-            ])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true)
-            .spawn()
-            .context("starting ios_webkit_debug_proxy")?;
+        let proxy = spawn_proxy(list_port, socket.as_deref(), &log)?;
         Ok(Self {
             proxy,
             list_port,
             device,
             socket,
+            log,
             restart_at: Instant::now() + PROXY_RESTART,
+            restarts: 0,
+            seen: "nothing yet".to_owned(),
         })
     }
 
@@ -693,7 +694,11 @@ impl Inspector {
                 return Ok(page);
             }
             if Instant::now() >= deadline {
-                bail!("no page on {} matched within 90s", self.device);
+                bail!(
+                    "no page on {} matched within 90s, {}",
+                    self.device,
+                    self.state()
+                );
             }
             self.keep_alive().await?;
             sleep(Duration::from_secs(1)).await;
@@ -716,26 +721,106 @@ impl Inspector {
         if Instant::now() < self.restart_at {
             return Ok(());
         }
+        self.restarts += 1;
+        eprintln!(
+            "restarting ios_webkit_debug_proxy ({}), it last saw {}",
+            self.restarts, self.seen
+        );
         self.proxy.kill().await.ok();
-        let socket = match &self.socket {
-            Some(_) => Some(simulator_inspector_socket().await?),
-            None => None,
-        };
-        *self = Self::spawn(self.device.clone(), socket)?;
+        if self.socket.is_some() {
+            self.socket = Some(simulator_inspector_socket().await?);
+        }
+        self.list_port = free_port()?;
+        self.proxy = spawn_proxy(self.list_port, self.socket.as_deref(), &self.log)?;
+        self.restart_at = Instant::now() + PROXY_RESTART;
         Ok(())
     }
 
-    async fn find(&self, wanted: &impl Fn(&str) -> bool) -> Option<String> {
-        let devices = list_pages(self.list_port).await.ok()?;
-        let target = devices
+    /// The restarts so far and what the latest search saw.
+    fn state(&self) -> String {
+        format!(
+            "after {} proxy restart(s), the last search saw {}, proxy output in {}",
+            self.restarts,
+            self.seen,
+            self.log.display()
+        )
+    }
+
+    async fn find(&mut self, wanted: &impl Fn(&str) -> bool) -> Option<String> {
+        let devices = match list_pages(self.list_port).await {
+            Ok(devices) => devices,
+            Err(err) => {
+                self.seen = format!("no device list ({err:#})");
+                return None;
+            }
+        };
+        let Some(target) = devices
             .iter()
-            .find(|device| device["deviceId"] == self.device.as_str())?;
-        let port = target["url"].as_str()?.rsplit_once(':')?.1.parse().ok()?;
-        list_pages(port).await.ok()?.iter().find_map(|page| {
+            .find(|device| device["deviceId"] == self.device.as_str())
+        else {
+            let listed: Vec<&str> = devices
+                .iter()
+                .filter_map(|device| device["deviceId"].as_str())
+                .collect();
+            self.seen = format!("devices {listed:?} without {}", self.device);
+            return None;
+        };
+        let Some(port) = target["url"]
+            .as_str()
+            .and_then(|url| url.rsplit_once(':'))
+            .and_then(|(_, port)| port.parse().ok())
+        else {
+            self.seen = format!("{} with no page port in {target}", self.device);
+            return None;
+        };
+        let pages = match list_pages(port).await {
+            Ok(pages) => pages,
+            Err(err) => {
+                self.seen = format!("{} with no page list ({err:#})", self.device);
+                return None;
+            }
+        };
+        let found = pages.iter().find_map(|page| {
             wanted(page["url"].as_str()?)
                 .then(|| page["webSocketDebuggerUrl"].as_str().map(str::to_owned))?
-        })
+        });
+        if found.is_none() {
+            let urls: Vec<&str> = pages
+                .iter()
+                .filter_map(|page| page["url"].as_str())
+                .collect();
+            self.seen = format!("pages {urls:?}");
+        }
+        found
     }
+}
+
+/// Start the proxy listing devices on `list_port`, appending its output to
+/// `log`.
+fn spawn_proxy(list_port: u16, socket: Option<&str>, log: &Path) -> Result<Child> {
+    let first_page_port = free_port()?;
+    let output = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log)
+        .with_context(|| format!("opening {}", log.display()))?;
+    let mut proxy = Command::new("ios_webkit_debug_proxy");
+    if let Some(socket) = socket {
+        proxy.args(["-s", &format!("unix:{socket}")]);
+    }
+    proxy
+        .args([
+            "-c",
+            &format!(
+                "null:{list_port},:{first_page_port}-{}",
+                first_page_port.saturating_add(100)
+            ),
+        ])
+        .stdout(output.try_clone().context("sharing the proxy log")?)
+        .stderr(output)
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting ios_webkit_debug_proxy")
 }
 
 /// The `webinspectord` socket the booted simulators share, found among the
