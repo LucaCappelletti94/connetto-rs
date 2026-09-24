@@ -44,7 +44,10 @@ use subql::backend::{CdcEvent, Postgres, ScalarFamily, Value as PgValue};
 use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
-use subql::{CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId, TableLike};
+use subql::{
+    AdvanceCursorError, CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId,
+    TableLike,
+};
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
 
@@ -2257,6 +2260,7 @@ where
                 Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
             };
             let cursor = self.stamp(&patch.cursor);
+            // The ingest loop appends and dispatches one event at a time, so a catchup's ceiling reaches at most this event and this advance never rewinds.
             {
                 counters::timed_lock(&self.materializer)
                     .await
@@ -5221,12 +5225,20 @@ where
                 continue;
             };
             let cursor = self.stamp(&record.lsn().to_be_bytes());
-            {
+            let advanced = {
                 self.materializer.lock().await.advance_cursor(
                     state.session_id.as_u64_key(),
                     reg.sub_id,
                     &cursor,
-                )?;
+                )
+            };
+            match advanced {
+                Ok(()) => {}
+                // A live change dispatched since the route went up already moved the cursor past this entry, and its patch queues behind the replay.
+                Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {
+                    tracing::debug!(sub_id = %sub.sub_id, lsn = record.lsn(), "a live change already moved the cursor past this replayed entry");
+                }
+                Err(err) => return Err(err.into()),
             }
             let live = LivePatch::new(sub.sub_id.clone(), Cursor::new(cursor), payload);
             enqueue_and_flush(
