@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Merged into the demo's generated manifest. It turns off cloud backup and
+    device-to-device transfer, because the replica and the credential records
+    are encrypted with a Keystore key that never leaves the phone, so a copy on
+    another device cannot be read.
+
+    This module is a stand-in awaiting the proper home in Dioxus. dx 0.7.10
+    parses but never applies `[android.raw] application_attrs` and
+    `[android] resources` in Dioxus.toml. Once a Dioxus release applies them,
+    both attributes and the rules file move into Dioxus.toml and this module
+    and its declaration in src/main.rs are deleted.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/connetto_demo_data_extraction_rules" />
+</manifest>

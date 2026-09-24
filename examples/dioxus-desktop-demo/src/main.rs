@@ -93,6 +93,17 @@ const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
 #[cfg(target_os = "android")]
 const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
 
+// Declared for `dx`, which bundles `android/`, the module whose manifest turns
+// off backup and device transfer. It stands in until Dioxus applies
+// `[android.raw] application_attrs` and `[android] resources`, which dx 0.7.10
+// parses and drops. Then both settings move into `Dioxus.toml` and this and
+// `android/` are deleted.
+#[cfg(target_os = "android")]
+#[manganis::ffi("android")]
+extern "Kotlin" {
+    pub type ConnettoDemoBackupPolicy;
+}
+
 /// On a phone, sign in through the platform's in-app browser tab and the app's
 /// own redirect (RFC 8252 section 7.1).
 #[cfg(target_os = "android")]

@@ -38,6 +38,8 @@ base64 = "0.22"
 robius-directories = "6"
 # Sign-in through a Custom Tab and the app's own redirect.
 connetto-auth-session = { path = "../../crates/connetto-auth-session" }
+# Bundles `android/`, the manifest that turns off backup and device transfer.
+manganis = "0.7.10"
 
 [features]
 default = ["desktop"]
