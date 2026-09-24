@@ -28,8 +28,9 @@
 //! ```
 //!
 //! The demo reads `CONNETTO_DEMO_SERVER`, the sync host:port (default
-//! `127.0.0.1:7777`), and `CONNETTO_DEMO_PG`, the conninfo the backend writer
-//! buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
+//! `127.0.0.1:7777`), `CONNETTO_DEMO_AUTH_ORIGIN`, the auth server (default
+//! `http://127.0.0.1:18081`), and `CONNETTO_DEMO_PG`, the conninfo the backend
+//! writer buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
 //! Its server runs `schema.sql` and `policies.sql`, with `schema.sql`,
 //! `connetto_file_server::DEPLOYMENT_DDL`, `connetto_server::epoch::EPOCH_DDL`,
 //! `roles.sql` and `content.sql` applied in that order, and `orders,photos`
@@ -79,7 +80,7 @@ const SCHEMA_SQL: &str = include_str!("../schema.sql");
 /// handshake.
 const POLICIES_SQL: &str = include_str!("../policies.sql");
 
-const AUTH_SERVER: &str = "http://127.0.0.1:18081";
+const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 const AUTH_PROVIDER: &str = "dev-idp";
 const REPLICA_PREFIX: &str = "connetto-desktop-demo";
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
@@ -437,7 +438,8 @@ async fn setup_authenticated(
     let account =
         remembered_account(token_store.as_ref()).context("reading the remembered account")?;
     let authenticator = Arc::new(NativeAuthenticator::new(
-        AUTH_SERVER,
+        std::env::var("CONNETTO_DEMO_AUTH_ORIGIN")
+            .unwrap_or_else(|_| DEFAULT_AUTH_ORIGIN.to_owned()),
         AUTH_PROVIDER,
         Arc::clone(&token_store)
             as Arc<dyn RefreshTokenStore<Error = connetto_client::ClientError> + Send + Sync>,

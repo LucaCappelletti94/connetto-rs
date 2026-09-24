@@ -21,6 +21,7 @@ use connetto_client::{
     cipher::cipher_url, dsl::Watchable,
 };
 use connetto_wasm_smoke::BrowserSocket;
+use connetto_wasm_smoke::workers::DEMO_WS_URL;
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -70,7 +71,7 @@ fn unique_id() -> i64 {
 /// under the replica's key. A reopen uses `.with_existing_tier`, which refuses
 /// to create the tier file if it is missing, so a failed persist fails loudly.
 async fn connect(config: &ClientConfig, first_boot: bool) -> ConnettoConnection<BrowserSocket> {
-    let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
+    let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let url = cipher_url(DB_NAME, "opfs-sahpool");

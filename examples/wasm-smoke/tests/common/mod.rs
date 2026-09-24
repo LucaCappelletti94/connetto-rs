@@ -20,8 +20,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{BroadcastChannel, MessageEvent, Request, RequestInit, Response};
 
-/// Where the login server listens by default.
-pub const AUTH_BASE: &str = "http://127.0.0.1:18099";
+pub use connetto_wasm_smoke::AUTH_BASE;
 /// The provider the login server registers.
 pub const PROVIDER: &str = "dev-idp";
 /// These suites' account index, kept apart from every other suite's.
@@ -29,7 +28,7 @@ pub const ACCOUNT_DB: &str = "e42-accounts.sqlite";
 
 pub fn auth_config() -> WorkerAuthConfig {
     // The stack serves the navigation and the fetch calls on one origin.
-    WorkerAuthConfig::new(AUTH_BASE, PROVIDER, format!("{AUTH_BASE}/dev/landing"))
+    WorkerAuthConfig::new(AUTH_BASE, PROVIDER, connetto_wasm_smoke::auth_landing())
 }
 
 pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::DbWorkerConfig {

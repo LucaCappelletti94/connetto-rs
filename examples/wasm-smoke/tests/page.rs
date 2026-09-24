@@ -17,6 +17,7 @@ use connetto_client::{
     ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
 };
 use connetto_wasm_smoke::BrowserSocket;
+use connetto_wasm_smoke::workers::DEMO_WS_URL;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -50,7 +51,7 @@ fn unique_id() -> i64 {
 }
 
 async fn connect(name: &str, token: String, identity: String) -> ConnettoConnection<BrowserSocket> {
-    let transport = BrowserSocket::connect("ws://127.0.0.1:7777/")
+    let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
     let config = ClientConfig::new(format!("{name}-{}", unique_id()))

@@ -28,13 +28,19 @@ pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
 
 pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 
-/// Where the browser stack serves the share key it minted for this run.
+pub use connetto_demo_deployment::{AUTH_BASE, auth_landing};
+
+/// Where the browser stack serves the share key it minted for this run, a
+/// route on [`AUTH_BASE`].
 ///
 /// A real deployment hands a key to whoever opened a share link. A demo has
-/// no sharing surface of its own, so it asks the stack, at run time rather
-/// than at build time: a value baked into the binary survives a rebuild that
+/// no sharing surface of its own, so it fetches the key from this route when
+/// it runs, because a key baked into the binary would survive a rebuild that
 /// the database's own rows do not.
-pub const SHARE_URL: &str = "http://127.0.0.1:18099/dev/share";
+#[must_use]
+pub fn share_url() -> String {
+    format!("{AUTH_BASE}/dev/share")
+}
 
 /// The share key this run minted, as the signed grant and the subject it
 /// names, with the photo only that key reaches.
@@ -57,7 +63,7 @@ pub async fn fetch_share() -> Result<(String, String, String), String> {
         .dyn_into()
         .map_err(|_| "the share key is fetched from a worker".to_owned())?;
     let response: web_sys::Response =
-        wasm_bindgen_futures::JsFuture::from(scope.fetch_with_str(SHARE_URL))
+        wasm_bindgen_futures::JsFuture::from(scope.fetch_with_str(&share_url()))
             .await
             .map_err(|err| format!("{err:?}"))?
             .dyn_into()
@@ -181,8 +187,8 @@ pub mod workers {
             .map_err(JsValue::from)
     }
 
-    /// The demo server every smoke context connects to.
-    pub const DEMO_WS_URL: &str = "ws://127.0.0.1:7777/";
+    pub use connetto_demo_deployment::DEMO_WS_URL;
+
     /// The synced replica schema, translated from `schema.sql` and
     /// `policies.sql` by build.rs. Hand-copying it here is what used to keep
     /// the browser suite off the translator's real output, which for a
@@ -211,6 +217,14 @@ pub mod workers {
     /// OPFS file for unlock-protocol tests, separate from DB_NAME so the two
     /// suites do not share a replica when running in the same browser session.
     pub const UNLOCK_DB_NAME: &str = "connetto-unlock-relay.sqlite";
+
+    fn dev_auth() -> connetto_web::auth::WorkerAuthConfig {
+        connetto_web::auth::WorkerAuthConfig::new(
+            crate::AUTH_BASE,
+            "dev-idp",
+            crate::auth_landing(),
+        )
+    }
 
     /// Spawn the dedicated DB worker from the co-located `db-worker.js`.
     ///
@@ -250,11 +264,7 @@ pub mod workers {
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
                 .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                    "http://127.0.0.1:18099",
-                    "dev-idp",
-                    "http://127.0.0.1:18099/dev/landing",
-                )))
+                .with_auth(Some(dev_auth()))
                 .with_auth_db_name("connetto-auth.sqlite"),
         )
         .await
@@ -289,11 +299,7 @@ pub mod workers {
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
                 .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                    "http://127.0.0.1:18099",
-                    "dev-idp",
-                    "http://127.0.0.1:18099/dev/landing",
-                )))
+                .with_auth(Some(dev_auth()))
                 .with_auth_db_name("connetto-auth.sqlite"),
         )
         .await
@@ -338,11 +344,7 @@ pub mod workers {
                 .with_caller_function(crate::CALLER_FUNCTION)
                 .with_subjects_function(crate::SUBJECTS_FUNCTION)
                 .with_share_keys(share_keys)
-                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                    "http://127.0.0.1:18099",
-                    "dev-idp",
-                    "http://127.0.0.1:18099/dev/landing",
-                )))
+                .with_auth(Some(dev_auth()))
                 .with_auth_db_name("connetto-auth.sqlite"),
         )
         .await
@@ -377,11 +379,7 @@ pub mod workers {
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
                 .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                    "http://127.0.0.1:18099",
-                    "dev-idp",
-                    "http://127.0.0.1:18099/dev/landing",
-                )))
+                .with_auth(Some(dev_auth()))
                 .with_auth_db_name("connetto-auth.sqlite")
                 .with_connect_gate(PHOTO_CONNECT_CHANNEL),
         )
@@ -412,11 +410,7 @@ pub mod workers {
                 .with_policy_tables(crate::demo_policy_tables())
                 .with_caller_function(crate::CALLER_FUNCTION)
                 .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(connetto_web::auth::WorkerAuthConfig::new(
-                    "http://127.0.0.1:18099",
-                    "dev-idp",
-                    "http://127.0.0.1:18099/dev/landing",
-                )))
+                .with_auth(Some(dev_auth()))
                 .with_auth_db_name("connetto-unlock-auth.sqlite")
                 .with_unlock(true),
         )
