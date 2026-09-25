@@ -74,9 +74,12 @@ async fn a_withdrawn_grant_takes_the_row_off_the_device() {
     fixture
         .exec("DELETE FROM team_members WHERE team_id = 1 AND member = 'alice'")
         .await;
+    // The membership insert above moves a grant too, and its replacement can
+    // arrive first carrying the row, so the one asserted on is read past this.
+    let withdrawn = fixture.committed_position().await;
 
     let (reason, replacement) = alice
-        .try_resync("docs", DELIVERY)
+        .try_resync_past("docs", withdrawn, DELIVERY)
         .await
         .expect("a grant taken away has to reach the device, or it reads rows it may not");
     assert_eq!(
