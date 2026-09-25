@@ -73,10 +73,11 @@ use connetto_client::{
     ImportOutcome, PolicyTables, ResendTimer, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
-    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FullResyncReason,
-    FullResyncRequired, HandshakeAck, LivePatch, MutationApplied, MutationConflict, MutationReject,
-    MutationRejectReason, NonFatalError, Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, SyncStatus,
+    AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
+    FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationApplied,
+    MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited,
+    SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+    SubscriptionPriority, SubscriptionSpec, SyncStatus,
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
@@ -293,7 +294,7 @@ enum TabOut {
 /// A fault while handling one tab's frame: either close that tab, or a
 /// hub-fatal error.
 enum TabFault {
-    /// Close the offending tab, with the reason logged for debugging.
+    /// Close the offending tab, telling it why.
     Close(String),
     /// The hub itself failed.
     Hub(RelayError),
@@ -313,8 +314,8 @@ struct TabState {
     /// Sequence number announced by a `MutationHeader`, awaiting its bulk
     /// patchset frame.
     pending_write: Option<u64>,
-    /// The tab's own id, set by its handshake, keying its durable mutation
-    /// watermark. Absent until the handshake, never a stand-in value.
+    /// The key of the tab's durable mutation watermark, derived from the client
+    /// id its handshake named. Absent until the handshake, never a stand-in value.
     client_id: Option<rosetta_uuid::Uuid>,
     /// Highest tab sequence applied to the worker replica for this client
     /// id, from the hub meta schema at handshake and advanced per apply. A
@@ -2478,7 +2479,12 @@ where
         Ok(()) => Ok(()),
         Err(TabFault::Close(reason)) => {
             tracing::warn!(tab = %id, reason = %reason, "relay hub closed a tab");
-            state.tabs.remove(&id);
+            if let Some(tab) = state.tabs.remove(&id) {
+                // The shovel delivers this before it sees the dropped sender and closes the tab.
+                let _ = tab.out.send(TabOut::Control(ControlMessage::FatalError(
+                    FatalError::new(FatalErrorReason::ProtocolViolation { detail: reason }),
+                )));
+            }
             state.pending_resolve.retain(|resolve| resolve.tab != id);
             Ok(())
         }
@@ -2646,10 +2652,7 @@ where
             if tab.handshaken {
                 return Err(TabFault::Close("second handshake".to_owned()));
             }
-            let client_uuid = handshake
-                .client_id
-                .parse::<rosetta_uuid::Uuid>()
-                .map_err(|_| TabFault::Close("client_id is not a valid UUID".to_owned()))?;
+            let client_uuid = tab_key(&handshake.client_id);
             tab.handshaken = true;
             tab.client_id = Some(client_uuid);
             tab.applied_watermark = tab_watermark(worker, client_uuid)?;
@@ -4366,6 +4369,16 @@ fn changeset_tables(bytes: &[u8]) -> Result<HashSet<String>, RelayError> {
         }
     }
     Ok(tables)
+}
+
+/// Namespace for [`tab_key`], fixed so a label keeps its key across boots.
+const TAB_KEY_NAMESPACE: uuid::Uuid =
+    uuid::Uuid::from_u128(0x30c2_f59b_c387_4bd2_8ad6_eeaa_c0ab_1d65);
+
+/// The watermark key for a tab client id, which like the server's is a label
+/// of any shape.
+fn tab_key(client_id: &str) -> rosetta_uuid::Uuid {
+    uuid::Uuid::new_v5(&TAB_KEY_NAMESPACE, client_id.as_bytes()).into()
 }
 
 /// The hub's durable watermark for one tab client id, if any, from the

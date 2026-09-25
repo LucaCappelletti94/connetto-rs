@@ -474,8 +474,6 @@ struct Boot {
 /// wrap the connection in the reconnecting client so a worker swap recovers.
 async fn boot_window() -> Result<Boot, JsValue> {
     let glue = glue_url();
-    // The relay hub keys each tab's mutation watermark by a typed UUID, so the
-    // tab id must parse as one (the worker mints its own the same way).
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
 
     // Trunk's glue does not self-initialize, so connetto-web spawns the worker

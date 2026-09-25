@@ -46,8 +46,7 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)";
 const TEST_LOCK: &str = "connetto-content-relay-test";
-/// A protocol-shaped id for the scripted tab; the hub stores it as the tab's
-/// watermark key.
+/// The scripted tab's client id, from which the hub derives its watermark key.
 const TAB_CLIENT_ID: &str = "6f1c9d2e-8a4b-4c5d-9e6f-0a1b2c3d4e5f";
 
 /// Distinct bytes per test: a relay a finished test left running keeps driving

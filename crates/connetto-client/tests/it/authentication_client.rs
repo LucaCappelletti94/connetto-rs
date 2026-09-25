@@ -57,6 +57,36 @@ async fn handshake_with_refused_grant_still_succeeds() {
     );
 }
 
+/// A peer that refuses the handshake says why, whether it is a server on
+/// another protocol version or a browser relay hub rejecting a malformed tab,
+/// and the caller receives that reason rather than a bare sequencing error.
+#[tokio::test]
+async fn a_handshake_refusal_surfaces_its_reason() {
+    for reason in [
+        FatalErrorReason::ProtocolVersionMismatch {
+            expected: 9,
+            got: 1,
+        },
+        FatalErrorReason::ProtocolViolation {
+            detail: "second handshake".to_owned(),
+        },
+    ] {
+        let result = ConnettoConnection::connect(
+            FakeTransport::refusing(reason.clone()),
+            &Replica::in_memory(),
+            SQLITE_DDL,
+            &config(),
+            None,
+        )
+        .await;
+        match result {
+            Err(ClientError::Refused { reason: got }) => assert_eq!(got, reason),
+            Err(other) => panic!("expected the refusal's reason, got {other:?}"),
+            Ok(_) => panic!("a refused handshake connected"),
+        }
+    }
+}
+
 /// First-boot `replica`, write `label`, and leave the captured mutation queued,
 /// since the fake server acknowledges the handshake and nothing else. Returns the
 /// pending sequence numbers, captured before the connection drops.
