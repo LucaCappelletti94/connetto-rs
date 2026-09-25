@@ -15,9 +15,11 @@
 
 use std::time::Duration;
 
-use connetto_core::messages::{FullResyncReason, SnapshotPatch};
-use connetto_test_harness::Fixture;
+use connetto_core::messages::{BulkMessage, ControlMessage, FullResyncReason, SnapshotPatch};
+use connetto_core::traits::IncomingFrame;
+use connetto_server::Position;
 use connetto_test_harness::fanout::membership_term_fixture;
+use connetto_test_harness::{Client, Fixture};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp};
 
 /// Long enough for a container round trip, short enough to fail rather than
@@ -49,6 +51,33 @@ fn rows(patches: &[SnapshotPatch]) -> usize {
         .sum()
 }
 
+/// Read until the live patch of a change written at or past `before` arrives, consuming any replacement on the way.
+///
+/// Changes fan out in commit order through one ordered queue, so once that patch is here every replacement an
+/// earlier change caused has arrived too.
+async fn settle_past(client: &mut Client, before: u64) {
+    loop {
+        match tokio::time::timeout(DELIVERY, client.recv())
+            .await
+            .expect("the marker's live patch arrives")
+        {
+            Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(_))) => {
+                client.expect_snapshot("docs").await;
+            }
+            Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
+                let at = Position::from_cursor_bytes(patch.cursor.as_bytes())
+                    .expect("a live cursor carries a position")
+                    .lsn;
+                if at >= before {
+                    return;
+                }
+            }
+            Some(IncomingFrame::Control(_)) => {}
+            other => panic!("expected a live patch or a replacement, got {other:?}"),
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_withdrawn_grant_takes_the_row_off_the_device() {
     let fixture = Fixture::acquire().await;
@@ -69,17 +98,22 @@ async fn a_withdrawn_grant_takes_the_row_off_the_device() {
          withdrawal below mean anything"
     );
 
+    // The membership insert moves a grant too, and its replacement, read before
+    // the withdrawal, may still be on its way. A marker row settles it.
+    let before = fixture.committed_position().await;
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (90, 'bob', 1, 'marker')")
+        .await;
+    settle_past(&mut alice, before).await;
+
     // The withdrawal, in the database, exactly as an application would write
     // it. Nothing tells the client directly.
     fixture
         .exec("DELETE FROM team_members WHERE team_id = 1 AND member = 'alice'")
         .await;
-    // The membership insert above moves a grant too, and its replacement can
-    // arrive first carrying the row, so the one asserted on is read past this.
-    let withdrawn = fixture.committed_position().await;
 
     let (reason, replacement) = alice
-        .try_resync_past("docs", withdrawn, DELIVERY)
+        .try_resync("docs", DELIVERY)
         .await
         .expect("a grant taken away has to reach the device, or it reads rows it may not");
     assert_eq!(

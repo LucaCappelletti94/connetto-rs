@@ -1761,11 +1761,6 @@ impl Client {
     ///
     /// Panics when the first frame is not a `SnapshotBegin` for `sub_id`, when the begin or end names a different subscription, when a mid-snapshot frame is not a `SnapshotPatch` or `SnapshotEnd`, or when the transport returns a receive error.
     pub async fn expect_snapshot(&mut self, sub_id: &str) -> Vec<SnapshotPatch> {
-        self.snapshot_through_end(sub_id).await.0
-    }
-
-    /// [`expect_snapshot`](Self::expect_snapshot) with the cursor its `SnapshotEnd` carried.
-    async fn snapshot_through_end(&mut self, sub_id: &str) -> (Vec<SnapshotPatch>, Cursor) {
         let frame = self.next_control().await;
         let ControlMessage::SnapshotBegin(begin) = frame else {
             panic!("expected snapshot begin, got {frame:?}");
@@ -1786,7 +1781,7 @@ impl Client {
                         end.sub_id, sub_id,
                         "snapshot end for the wrong subscription"
                     );
-                    return (patches, end.cursor);
+                    return patches;
                 }
                 other => panic!("expected snapshot patch or end, got {other:?}"),
             }
@@ -1848,42 +1843,6 @@ impl Client {
         timeout: Duration,
     ) -> Option<(FullResyncReason, Vec<SnapshotPatch>)> {
         let deadline = tokio::time::Instant::now() + timeout;
-        self.next_resync(sub_id, deadline)
-            .await
-            .map(|(reason, patches, _)| (reason, patches))
-    }
-
-    /// The first replacement of `sub_id` read at or past `position`, skipping any read earlier, or [`None`] when none arrives within `timeout`.
-    ///
-    /// A change committed before the one a test waits for can move a grant too, and its replacement may arrive first carrying the older answer.
-    ///
-    /// # Panics
-    ///
-    /// As [`try_resync`](Self::try_resync), and when a replacement's cursor carries no position.
-    pub async fn try_resync_past(
-        &mut self,
-        sub_id: &str,
-        position: u64,
-        timeout: Duration,
-    ) -> Option<(FullResyncReason, Vec<SnapshotPatch>)> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            let (reason, patches, cursor) = self.next_resync(sub_id, deadline).await?;
-            let read_at = connetto_server::Position::from_cursor_bytes(cursor.as_bytes())
-                .expect("a replacement's cursor carries a position")
-                .lsn;
-            if read_at >= position {
-                return Some((reason, patches));
-            }
-        }
-    }
-
-    /// The next resync notice for `sub_id` and the snapshot behind it, with its end cursor.
-    async fn next_resync(
-        &mut self,
-        sub_id: &str,
-        deadline: tokio::time::Instant,
-    ) -> Option<(FullResyncReason, Vec<SnapshotPatch>, Cursor)> {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let Ok(frame) = tokio::time::timeout(remaining, self.transport.recv()).await else {
@@ -1892,8 +1851,8 @@ impl Client {
             match frame.expect("recv frame") {
                 Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(resync))) => {
                     assert_eq!(resync.sub_id, sub_id, "resync for the wrong subscription");
-                    let (patches, cursor) = self.snapshot_through_end(sub_id).await;
-                    return Some((resync.reason, patches, cursor));
+                    let patches = self.expect_snapshot(sub_id).await;
+                    return Some((resync.reason, patches));
                 }
                 // A keepalive pong may interleave, and a live patch in flight
                 // from an earlier commit is kept for the next live read rather
