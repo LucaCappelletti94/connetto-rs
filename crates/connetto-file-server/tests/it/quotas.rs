@@ -18,6 +18,8 @@ struct Fixture {
     pg: Pg,
     app: axum::Router,
     signer: connetto_file_server::TicketSigner,
+    /// The cache the refresh task writes, so a test can wait for it.
+    ceilings: CeilingCache,
     _dir: tempfile::TempDir,
 }
 
@@ -29,7 +31,7 @@ async fn fixture(settings: QuotaSettings) -> Fixture {
         &pg,
         fs_store(&dir),
         settings,
-        ceilings,
+        ceilings.clone(),
         connetto_file_server::CallerSettings::default(),
     )
     .await;
@@ -37,6 +39,7 @@ async fn fixture(settings: QuotaSettings) -> Fixture {
         pg,
         app,
         signer,
+        ceilings,
         _dir: dir,
     }
 }
@@ -299,58 +302,58 @@ async fn commit_past_the_storage_ceiling_answers_503_with_retry_after() {
     let x_data = noise(1, 5 * 1024 * 1024);
     upload(&fx.app, &fx.signer, &x_data).await;
 
-    // Wait for the refresh task to see the stored five MiB. Before it does
-    // a seven new-MiB commit passes, after it the ceiling refuses one.
-    let w_data = noise(2, 7 * 1024 * 1024);
-    for _ in 0..100 {
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        let staged = stage(&fx.app, &fx.signer, &w_data).await;
-        let resp = commit(&fx.app, &staged).await;
-        if resp.status() == StatusCode::SERVICE_UNAVAILABLE {
-            let retry = resp
-                .headers()
-                .get("retry-after")
-                .expect("a storage-ceiling refusal carries Retry-After")
-                .to_str()
-                .unwrap()
-                .parse::<u64>()
-                .expect("Retry-After is seconds");
-            assert!(retry >= 1);
-            // Re-committing an already-committed file stays 200 under the
-            // ceiling, the idempotency the outbox relies on when a commit
-            // response was lost and the entry walks again later.
-            assert_eq!(
-                recommit(&fx.app, &fx.signer, &x_data).await,
-                StatusCode::OK,
-                "re-committing committed bytes must stay idempotent under a full ceiling"
-            );
-            // Y replays the committed bytes as its prefix and appends a
-            // two MiB tail, so its new bytes fit the headroom while the
-            // same commit projected at its seven declared MiB is refused
-            // under this very cache state.
-            let mut y_data = x_data.clone();
-            let tail = noise(3, 2 * 1024 * 1024);
-            y_data.extend_from_slice(&tail);
-            let deduped = stage(&fx.app, &fx.signer, &y_data).await;
-            let resp = commit(&fx.app, &deduped).await;
-            let status = resp.status();
-            let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
-                .await
-                .unwrap();
-            assert_eq!(
-                status,
-                StatusCode::OK,
-                "a deduplicated commit projects its new bytes and must pass, body was {body:?}"
-            );
-            return;
-        }
-        assert_eq!(
-            resp.status(),
-            StatusCode::OK,
-            "until the refresh notices the stored bytes the commit passes"
+    // Once the refresh task holds the stored five MiB, a seven new-MiB
+    // commit is past the ceiling.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while fx.ceilings.read().await.stored_bytes < 5 * 1024 * 1024 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the ceiling cache never counted the stored five MiB"
         );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("the storage ceiling never refused a commit");
+    let w_data = noise(2, 7 * 1024 * 1024);
+    let staged = stage(&fx.app, &fx.signer, &w_data).await;
+    let resp = commit(&fx.app, &staged).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "a commit past the cached storage ceiling"
+    );
+    let retry = resp
+        .headers()
+        .get("retry-after")
+        .expect("a storage-ceiling refusal carries Retry-After")
+        .to_str()
+        .unwrap()
+        .parse::<u64>()
+        .expect("Retry-After is seconds");
+    assert!(retry >= 1);
+    // Re-committing an already-committed file stays 200 under the ceiling,
+    // the idempotency the outbox relies on when a commit response was lost
+    // and the entry walks again later.
+    assert_eq!(
+        recommit(&fx.app, &fx.signer, &x_data).await,
+        StatusCode::OK,
+        "re-committing committed bytes must stay idempotent under a full ceiling"
+    );
+    // Y replays the committed bytes as its prefix and appends a two MiB
+    // tail, so its new bytes fit the headroom while the same commit
+    // projected at its seven declared MiB is refused under this very cache
+    // state.
+    let mut y_data = x_data.clone();
+    y_data.extend_from_slice(&noise(3, 2 * 1024 * 1024));
+    let deduped = stage(&fx.app, &fx.signer, &y_data).await;
+    let resp = commit(&fx.app, &deduped).await;
+    let status = resp.status();
+    let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a deduplicated commit projects its new bytes and must pass, body was {body:?}"
+    );
 }
 
 /// The ledger counts accepted upload bytes and served read bytes, and a
