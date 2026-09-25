@@ -170,6 +170,34 @@ async fn a_first_run_names_no_account_and_asks_for_a_login() {
     );
 }
 
+/// An app that proxies the auth calls through its own origin still sends the
+/// login navigation to the origin that serves the auth router, because a dev
+/// server's proxy does not forward navigations.
+#[wasm_bindgen_test]
+async fn the_login_goes_to_the_login_origin_while_the_calls_stay_on_the_proxy() {
+    let store = fresh_store().await;
+    let config = WorkerAuthConfig::new(
+        "http://127.0.0.1:1",
+        "nobody",
+        "http://127.0.0.1:1/callback",
+    )
+    .with_login_base_url(Some("http://127.0.0.1:2".to_owned()));
+    let Acquired::NeedLogin(pending) = BrowserAuthenticator::new(config, None)
+        .acquire::<String>(&store)
+        .await
+        .expect("an empty index is not an error")
+    else {
+        panic!("a first run logs in");
+    };
+    assert!(
+        pending
+            .login_url
+            .starts_with("http://127.0.0.1:2/auth/login?"),
+        "the navigation goes to the login origin, got {}",
+        pending.login_url
+    );
+}
+
 /// An index written by a build whose id type differs names an account this
 /// build cannot decode. That is a login, not a boot failure: the row outlives
 /// the boot, so an error here would refuse every start from then on.

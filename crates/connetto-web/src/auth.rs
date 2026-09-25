@@ -123,12 +123,15 @@ fn js_error(context: &str, value: &JsValue) -> AuthError {
 /// Worker-side confidential-client configuration for the browser flow.
 #[derive(Debug, Clone)]
 pub struct WorkerAuthConfig {
-    /// The origin serving connetto's auth router, which the login navigation and
-    /// the worker's `fetch` calls to `{base}/auth/token`, `{base}/auth/refresh`
-    /// and `{base}/auth/logout` all go to. Those calls carry the refresh cookie,
-    /// so a page served from another origin needs that origin listed in the
-    /// server's `CONNETTO_AUTH_CORS_ORIGINS`.
+    /// The origin the worker's `fetch` calls to `{base}/auth/token`,
+    /// `{base}/auth/refresh` and `{base}/auth/logout` go to. Those calls carry the
+    /// refresh cookie, so this is either the app's own origin with the auth
+    /// endpoints behind its proxy, or the auth origin itself with the app's
+    /// origin listed in the server's `CONNETTO_AUTH_CORS_ORIGINS`.
     auth_base_url: String,
+    /// The origin the login navigation goes to, when it is not
+    /// [`auth_base_url`](Self::auth_base_url).
+    login_base_url: Option<String>,
     /// The provider name to log in with.
     provider: String,
     /// The app page the login redirect returns to, which posts the code back to
@@ -146,9 +149,24 @@ impl WorkerAuthConfig {
     ) -> Self {
         Self {
             auth_base_url: auth_base_url.into(),
+            login_base_url: None,
             provider: provider.into(),
             redirect_uri: redirect_uri.into(),
         }
+    }
+
+    /// The origin the login navigation goes to, when it is not the auth origin.
+    ///
+    /// A login is a navigation the browser follows, so it needs no CORS, only an
+    /// origin that serves the auth router. `None` means the auth origin. It
+    /// differs when the app proxies its `fetch` calls through its own origin with
+    /// a proxy that does not forward navigations, as a dev server's does, which
+    /// keeps the refresh cookie same-site without the server allowing a
+    /// credentialed cross-origin caller.
+    #[must_use]
+    pub fn with_login_base_url(mut self, login_base_url: Option<String>) -> Self {
+        self.login_base_url = login_base_url;
+        self
     }
 }
 
@@ -1299,7 +1317,10 @@ impl BrowserAuthenticator {
         let state = random_token();
         let login_url = format!(
             "{}/auth/login?provider={}&redirect_uri={}&code_challenge={}&state={}",
-            self.config.auth_base_url,
+            self.config
+                .login_base_url
+                .as_ref()
+                .unwrap_or(&self.config.auth_base_url),
             percent_encode(&self.config.provider),
             percent_encode(&self.config.redirect_uri),
             percent_encode(&challenge),
