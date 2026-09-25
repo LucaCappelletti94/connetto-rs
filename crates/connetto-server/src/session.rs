@@ -3278,39 +3278,6 @@ where
         Ok(true)
     }
 
-    /// Take a row subscription's reader-share permit (R39), or refuse it in
-    /// R19's nonfatal shape and report [`None`], unwinding the registration.
-    /// The route is not attached and the label not recorded at this point, so
-    /// the registration is the one thing to unwind.
-    async fn subscribe_reader_permit<T: Transport>(
-        &self,
-        transport: &mut T,
-        tier: Tier,
-        sub_id: &str,
-        registered: SubscriptionId,
-    ) -> Result<Option<ReaderPermit>, SessionError> {
-        match self.guard.reader_permit(tier).await {
-            Ok(permit) => Ok(Some(permit)),
-            Err(wait) => {
-                let retry_after_ms = retry_ms(wait);
-                tracing::warn!(
-                    sub_id = %sub_id,
-                    retry_after_ms,
-                    "subscription refused, the unreserved reader share is full"
-                );
-                self.materializer.lock().await.unregister(registered);
-                transport
-                    .send_control(ControlMessage::RateLimited(RateLimited {
-                        related_to: Some(sub_id.to_owned()),
-                        retry_after_ms,
-                    }))
-                    .await
-                    .map_err(transport_err)?;
-                Ok(None)
-            }
-        }
-    }
-
     /// Take the content ticket's reader-share permit (R39), or defer the
     /// request in R19's nonfatal shape and report [`None`].
     ///
@@ -4443,6 +4410,7 @@ where
             }
         }
         let members = std::sync::Arc::clone(&reg.member_tables);
+        let membership_permit = reader_permit.clone();
         match self
             .subscribe_row(transport, sub, state, reg, tier, Some(reader_permit))
             .await
@@ -4471,7 +4439,13 @@ where
                 // the announce precedes the hidden subscription's snapshot.
                 for member in members.iter() {
                     match self
-                        .open_membership_subscription(transport, state, tier, member)
+                        .open_membership_subscription(
+                            transport,
+                            state,
+                            tier,
+                            member,
+                            membership_permit.clone(),
+                        )
                         .await
                     {
                         Ok(()) => {}
@@ -4546,12 +4520,17 @@ where
     /// subscription that needs it. Idempotent per session through the
     /// deterministic label, which also covers a reconnect registering the
     /// same term again.
+    ///
+    /// It reads under `permit`, the term's own reader-share slot, because the
+    /// two reads are one operation and a second slot could be refused while the
+    /// term's still paging read holds the first.
     async fn open_membership_subscription<T: Transport>(
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
         tier: Tier,
         member: &MemberTable,
+        permit: ReaderPermit,
     ) -> Result<(), SessionError> {
         let label = membership_label(&member.table);
         if state.subs.contains_key(&label) {
@@ -4631,19 +4610,13 @@ where
                 "a membership subscription registered as something other than rows".to_owned(),
             ));
         };
-        let Some(reader_permit) = self
-            .subscribe_reader_permit(transport, tier, &label, sub_id)
-            .await?
-        else {
-            return Ok(());
-        };
         let reg = RowRegistration {
             consumer_id,
             sub_id,
             pg_sql,
             member_tables: std::sync::Arc::from(Vec::new()),
         };
-        self.subscribe_row(transport, hidden, state, reg, tier, Some(reader_permit))
+        self.subscribe_row(transport, hidden, state, reg, tier, Some(permit))
             .await
     }
 

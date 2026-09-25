@@ -24,7 +24,9 @@ use connetto_core::traits::IncomingFrame;
 use connetto_server::CallerMappings;
 use connetto_server::counters::{self, CountersSnapshot};
 use connetto_server::openfga::{Counted, FgaAuth, ModelSubject, StoreUpkeep, Translated};
-use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog, SessionConfig};
+use connetto_server::{
+    PgSnapshotSource, RequestGuard, RlsAuth, RuntimeWritableCatalog, SessionConfig,
+};
 use diesel::sql_query;
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -428,7 +430,7 @@ async fn run_through(
     shape: PolicyShape,
     executor: Executor,
 ) -> FanoutRun {
-    let server = provision_with(fixture, shape, executor, None).await;
+    let server = provision_with(fixture, shape, executor, None, None).await;
     let mut clients = connect_subscribers(&server, subscribers).await;
     tokio::time::sleep(ROUTE_SETTLE).await;
 
@@ -657,6 +659,7 @@ pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
         PolicyShape::Row,
         Executor::Reachable(Arc::clone(&reachable)),
         None,
+        None,
     )
     .await;
     (server, reachable)
@@ -669,7 +672,14 @@ pub async fn outage_fixture(fixture: &Fixture) -> (Server, Arc<AtomicBool>) {
 /// produces no event on `papers` at all, and the fact that moved names one
 /// bearer rather than everybody.
 pub async fn keyed_share_fixture(fixture: &Fixture) -> Server {
-    provision_with(fixture, PolicyShape::KeyedShare, Executor::Shipped, None).await
+    provision_with(
+        fixture,
+        PolicyShape::KeyedShare,
+        Executor::Shipped,
+        None,
+        None,
+    )
+    .await
 }
 
 /// The row-shaped fixture served through the shipped executor, for a test that
@@ -680,7 +690,7 @@ pub async fn keyed_share_fixture(fixture: &Fixture) -> Server {
 /// provisions the stack and writes nothing beyond the seed row, leaving the
 /// caller to own its rows and their owners.
 pub async fn visibility_fixture(fixture: &Fixture) -> Server {
-    provision_with(fixture, PolicyShape::Row, Executor::Shipped, None).await
+    provision_with(fixture, PolicyShape::Row, Executor::Shipped, None, None).await
 }
 
 /// A server whose policy reads another table: `items` is visible to a member of
@@ -688,7 +698,14 @@ pub async fn visibility_fixture(fixture: &Fixture) -> Server {
 /// are in `items`. What R7's teardown needs, because withdrawing a grant here
 /// produces no row event on the subscribed table at all.
 pub async fn cross_table_visibility_fixture(fixture: &Fixture) -> Server {
-    provision_with(fixture, PolicyShape::CrossTable, Executor::Shipped, None).await
+    provision_with(
+        fixture,
+        PolicyShape::CrossTable,
+        Executor::Shipped,
+        None,
+        None,
+    )
+    .await
 }
 
 /// The membership-policy stack with the term enabled end to end: the engine
@@ -701,6 +718,22 @@ pub async fn membership_term_fixture(fixture: &Fixture) -> Server {
         PolicyShape::CrossTable,
         Executor::Shipped,
         Some(caller_mapping()),
+        None,
+    )
+    .await
+}
+
+/// [`subject_set_term_fixture`] metered by `guard`, for a test of the tier limits a term's reads run under.
+pub async fn subject_set_term_fixture_guarded(
+    fixture: &Fixture,
+    guard: Arc<RequestGuard<String>>,
+) -> Server {
+    provision_with(
+        fixture,
+        PolicyShape::SubjectSet,
+        Executor::Shipped,
+        Some(caller_mapping()),
+        Some(guard),
     )
     .await
 }
@@ -713,6 +746,7 @@ pub async fn subject_set_term_fixture(fixture: &Fixture) -> Server {
         PolicyShape::SubjectSet,
         Executor::Shipped,
         Some(caller_mapping()),
+        None,
     )
     .await
 }
@@ -725,6 +759,7 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
         PolicyShape::OwnerOverTeams,
         Executor::Shipped,
         Some(caller_mapping()),
+        None,
     )
     .await
 }
@@ -748,7 +783,7 @@ fn caller_mapping() -> CallerMappings {
 }
 
 async fn provision(fixture: &Fixture, shape: PolicyShape) -> Server {
-    provision_with(fixture, shape, Executor::Shipped, None).await
+    provision_with(fixture, shape, Executor::Shipped, None, None).await
 }
 
 /// Which executor a run serves through.
@@ -772,6 +807,7 @@ async fn provision_with(
     shape: PolicyShape,
     executor: Executor,
     caller: Option<CallerMappings>,
+    guard: Option<Arc<RequestGuard<String>>>,
 ) -> Server {
     let mut statements: Vec<String> = shape
         .drop_order()
@@ -804,15 +840,20 @@ async fn provision_with(
         // is the one run that compares nothing.
         Executor::Reachable(flag) => HarnessAuth::reachable(flag, fga, upkeep),
     };
+    let config = ServerConfig::new(shape.ddl(), fixture.admin_url())
+        .with_writable(
+            RuntimeWritableCatalog::builder()
+                .writable(shape.data_table())
+                .build(),
+        )
+        .with_translation(translator, caller)
+        .with_replication(shape.published().iter().copied());
+    let config = match guard {
+        Some(guard) => config.with_guard(guard),
+        None => config,
+    };
     let server = spawn_server(
-        ServerConfig::new(shape.ddl(), fixture.admin_url())
-            .with_writable(
-                RuntimeWritableCatalog::builder()
-                    .writable(shape.data_table())
-                    .build(),
-            )
-            .with_translation(translator, caller)
-            .with_replication(shape.published().iter().copied()),
+        config,
         snapshot,
         auth,
         fixture.admin().clone(),

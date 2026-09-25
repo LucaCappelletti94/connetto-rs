@@ -133,7 +133,9 @@ impl ReaderGate {
                 let acquire = Arc::clone(&self.anonymous).acquire_owned();
                 match tokio::time::timeout(ANONYMOUS_WAIT, acquire).await {
                     Ok(permit) => Ok(ReaderPermit {
-                        _permit: Some(permit.expect("the reader gate semaphore is never closed")),
+                        _permit: Some(Arc::new(
+                            permit.expect("the reader gate semaphore is never closed"),
+                        )),
                     }),
                     Err(_deadline) => Err(ANONYMOUS_WAIT),
                 }
@@ -144,9 +146,12 @@ impl ReaderGate {
 
 /// Occupancy of the unreserved share for the span of one reader-pool
 /// operation. Dropping it returns the share.
-#[derive(Debug)]
+///
+/// A clone is the same slot, for a read that belongs to the operation holding
+/// it, and the share returns when the last clone drops.
+#[derive(Debug, Clone)]
 pub(crate) struct ReaderPermit {
-    _permit: Option<OwnedSemaphorePermit>,
+    _permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl ReaderPermit {
@@ -203,6 +208,19 @@ mod tests {
             .acquire(Tier::Anonymous)
             .await
             .expect_err("one split across clones");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cloned_permit_holds_one_slot_until_the_last_clone_drops() {
+        let gate = ReaderReserve::new().with_total(2).with_reserved(1).gate();
+        let held = gate.acquire(Tier::Anonymous).await.expect("the one slot");
+        let shared = held.clone();
+        drop(held);
+        gate.acquire(Tier::Anonymous)
+            .await
+            .expect_err("the clone still holds the slot");
+        drop(shared);
+        let _next = gate.acquire(Tier::Anonymous).await.expect("returned");
     }
 
     #[test]
