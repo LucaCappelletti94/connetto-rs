@@ -788,8 +788,8 @@ async fn a_boot_waiting_on_the_user_is_not_timed_out() {
         hello,
         400,
         vec![
-            format!("waiting:{identity}"),
-            format!("resumed:{identity}"),
+            format!("waiting:{identity}:1"),
+            format!("resumed:{identity}:1"),
             format!("ready:{identity}"),
         ],
     );
@@ -808,7 +808,10 @@ async fn a_resumed_boot_gets_a_fresh_deadline_and_no_more() {
     post_later(
         hello,
         100,
-        vec![format!("waiting:{identity}"), format!("resumed:{identity}")],
+        vec![
+            format!("waiting:{identity}:1"),
+            format!("resumed:{identity}:1"),
+        ],
     );
     let started = Date::now();
     let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 400.0)
@@ -831,7 +834,7 @@ async fn another_boot_waiting_on_its_user_pauses_nothing() {
     let mine = super::boot::BootIdentity::mint();
     let other = super::boot::BootIdentity::mint();
     let hello = "connetto-hello-foreign-waiting";
-    post_later(hello, 50, vec![format!("waiting:{other}")]);
+    post_later(hello, 50, vec![format!("waiting:{other}:1")]);
     let error = crate::workers::intake::await_db_worker_ready_bounded(hello, &[mine], 300.0)
         .await
         .expect_err("a foreign pause must not hold this wait");
@@ -850,7 +853,7 @@ async fn a_boot_failing_during_the_user_step_is_reported() {
         hello,
         50,
         vec![
-            format!("waiting:{identity}"),
+            format!("waiting:{identity}:1"),
             format!("failed:{identity}:login-cancelled"),
         ],
     );
@@ -872,7 +875,7 @@ async fn a_late_waiter_learns_the_boot_is_waiting_on_the_user() {
     let announcer = crate::workers::intake::announce_boot_on(hello, &identity)
         .expect("the hello channel must open");
     if let Ok(sender) = BroadcastChannel::new(hello) {
-        let _ = sender.post_message(&JsValue::from_str(&format!("waiting:{identity}")));
+        let _ = sender.post_message(&JsValue::from_str(&format!("waiting:{identity}:1")));
     }
     crate::workers::sleep(core::time::Duration::from_millis(100)).await;
     post_later(hello, 900, vec![format!("ready:{identity}")]);
@@ -903,6 +906,69 @@ async fn a_user_step_the_worker_runs_pauses_the_wait() {
     crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 300.0)
         .await
         .expect("a user step the worker announces must pause the deadline");
+}
+
+/// The announcer's replay of a user step and the worker's resume come from two senders, so the
+/// replay can reach a page after the resume. That page must stay on the clock, or a worker that
+/// then goes silent is never timed out.
+#[wasm_bindgen_test]
+async fn a_replayed_user_step_arriving_after_its_resume_pauses_nothing() {
+    let identity = super::boot::BootIdentity::mint();
+    let id = identity.to_string();
+    let recorded = "connetto-hello-replay-recorded";
+    let heard: Rc<std::cell::RefCell<Vec<String>>> = Rc::default();
+    let listener = BroadcastChannel::new(recorded).expect("hello channel");
+    let on_message = {
+        let heard = Rc::clone(&heard);
+        Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
+            if let Some(message) = event.data().as_string() {
+                heard.borrow_mut().push(message);
+            }
+        })
+    };
+    listener.set_onmessage(Some(on_message.as_ref().unchecked_ref()));
+    let announcer = crate::workers::intake::announce_boot_on(recorded, &identity)
+        .expect("the hello channel must open");
+    // What the real worker and announcer say around one user step, with a page asking midway.
+    crate::workers::intake::awaiting_user_on(recorded, Some(id.clone()), async {
+        crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+        let _ = listener.post_message(&JsValue::from_str("ask"));
+        crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+    })
+    .await;
+    crate::workers::sleep(core::time::Duration::from_millis(100)).await;
+    drop(announcer);
+    listener.set_onmessage(None);
+    listener.close();
+    let heard = heard.borrow().clone();
+    let waitings: Vec<&String> = heard.iter().filter(|m| m.starts_with("waiting:")).collect();
+    let resumed = heard
+        .iter()
+        .find(|m| m.starts_with("resumed:"))
+        .expect("the worker announces the resume");
+    let (worker_waiting, replay) = match waitings.as_slice() {
+        [worker, replay] => (*worker, *replay),
+        other => panic!("expected the worker's announcement and one replay, heard {other:?}"),
+    };
+
+    // The page hears them in the order the two senders can race into.
+    let page = "connetto-hello-replay-late";
+    post_later(
+        page,
+        50,
+        vec![worker_waiting.clone(), resumed.clone(), replay.clone()],
+    );
+    let known = [identity];
+    let outcome = tokio::select! {
+        outcome = crate::workers::intake::await_db_worker_ready_bounded(page, &known, 400.0) => outcome,
+        () = crate::workers::sleep(core::time::Duration::from_secs(3)) => {
+            panic!("the stale replay paused the wait for good")
+        }
+    };
+    assert!(
+        matches!(&outcome, Err(IntakeError::Timeout { .. })),
+        "a silent worker after the resume must time out, got {outcome:?}"
+    );
 }
 
 /// A module that cannot be fetched fails before any Rust runs, and the spawning context

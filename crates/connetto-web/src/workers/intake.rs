@@ -112,12 +112,46 @@ fn current_boot_in_flight() -> Option<super::boot::BootIdentity> {
 enum BootOutcome {
     /// A failure for this boot can still arrive.
     Pending,
-    /// As [`Pending`](Self::Pending), with the boot waiting on the user.
-    AtUser,
+    /// As [`Pending`](Self::Pending), with the boot waiting on the user in the numbered step.
+    AtUser(u64),
     /// The boot failed, and the reason is still worth telling a waiter that joins now.
     Failed(String),
     /// The worker is up, or a newer boot has been announced, so this one has nothing to say.
     Spent,
+}
+
+/// The highest user step a listener has taken, so a replayed announcement of a step that has
+/// already resumed pauses nothing. Replays and the worker's own announcements come from
+/// different senders, and a channel orders messages per sender only.
+#[derive(Debug, Default)]
+struct UserSteps {
+    step: u64,
+}
+
+impl UserSteps {
+    /// Whether `waiting` for `step` is news, taking it if so.
+    fn waiting(&mut self, step: u64) -> bool {
+        let news = step > self.step;
+        if news {
+            self.step = step;
+        }
+        news
+    }
+
+    /// Whether `resumed` for `step` is current, taking it if so.
+    fn resumed(&mut self, step: u64) -> bool {
+        let current = step >= self.step;
+        if current {
+            self.step = step;
+        }
+        current
+    }
+}
+
+/// The boot identity and step number of a `waiting:` or `resumed:` message.
+fn user_step<'a>(message: &'a str, prefix: &str) -> Option<(&'a str, u64)> {
+    let (id, step) = message.strip_prefix(prefix)?.split_once(':')?;
+    Some((id, step.parse().ok()?))
 }
 
 /// Keeps a boot's identity and its outcome obtainable for as long as they explain anything.
@@ -148,7 +182,7 @@ impl BootAnnouncer {
     pub fn in_flight(&self) -> bool {
         matches!(
             *self.outcome.borrow(),
-            BootOutcome::Pending | BootOutcome::AtUser
+            BootOutcome::Pending | BootOutcome::AtUser(_)
         )
     }
 }
@@ -184,8 +218,8 @@ pub(super) fn announce_boot_on(
         // Readiness carries no identity for the waiters, so only the tagged form retires this
         // announcer: an outgoing worker's queued readiness must not spend the boot replacing it.
         let readiness = format!("ready:{identity}");
-        let waiting = format!("waiting:{identity}");
-        let resumed = format!("resumed:{identity}");
+        let own = identity.clone();
+        let mut steps = UserSteps::default();
         let announcement = announcement.clone();
         let outcome = Rc::clone(&outcome);
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
@@ -198,24 +232,30 @@ pub(super) fn announce_boot_on(
             } else if let Some(detail) = heard.strip_prefix(failure.as_str()) {
                 // Only a pending boot can fail: a worker that has reported ready booted, and an
                 // error it throws later is not this boot's outcome.
-                if matches!(*outcome, BootOutcome::Pending | BootOutcome::AtUser) {
+                if matches!(*outcome, BootOutcome::Pending | BootOutcome::AtUser(_)) {
                     *outcome = BootOutcome::Failed(detail.to_owned());
                 }
             } else if heard.starts_with("booting:") && heard != announcement {
                 // A newer boot is the one a waiter should hear about now.
                 *outcome = BootOutcome::Spent;
-            } else if heard == waiting {
-                if *outcome == BootOutcome::Pending {
-                    *outcome = BootOutcome::AtUser;
+            } else if let Some((id, step)) = user_step(&heard, "waiting:")
+                && own.matches_str(id)
+            {
+                if matches!(*outcome, BootOutcome::Pending | BootOutcome::AtUser(_))
+                    && steps.waiting(step)
+                {
+                    *outcome = BootOutcome::AtUser(step);
                 }
-            } else if heard == resumed {
-                if *outcome == BootOutcome::AtUser {
+            } else if let Some((id, step)) = user_step(&heard, "resumed:")
+                && own.matches_str(id)
+            {
+                if steps.resumed(step) && matches!(*outcome, BootOutcome::AtUser(_)) {
                     *outcome = BootOutcome::Pending;
                 }
             } else if heard == "ask" {
                 let follow_up = match &*outcome {
                     BootOutcome::Pending => None,
-                    BootOutcome::AtUser => Some(waiting.clone()),
+                    BootOutcome::AtUser(step) => Some(format!("waiting:{own}:{step}")),
                     BootOutcome::Failed(detail) => Some(format!("{failure}{detail}")),
                     BootOutcome::Spent => return,
                 };
@@ -284,6 +324,7 @@ pub(super) async fn await_db_worker_ready_bounded(
         let state = Rc::clone(&state);
         let started = Rc::clone(&started);
         let known_ids = Rc::clone(&known_ids);
+        let mut steps = UserSteps::default();
         Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
             let Some(message) = event.data().as_string() else {
                 return;
@@ -304,6 +345,8 @@ pub(super) async fn await_db_worker_ready_bounded(
                 // wait on the user.
                 if trusts_announcements && !is_known(id) {
                     *known_ids.borrow_mut() = vec![super::boot::BootIdentity::from_wire(id)];
+                    // A new boot is a new worker, which numbers its user steps from 1 again.
+                    steps = UserSteps::default();
                     if matches!(*state, HelloReady::AtUser) {
                         *state = HelloReady::Counting;
                         started.set(js_sys::Date::now());
@@ -314,12 +357,15 @@ pub(super) async fn await_db_worker_ready_bounded(
                 && is_known(id)
             {
                 *state = HelloReady::Failed(detail.to_owned());
-            } else if let Some(id) = message.strip_prefix("waiting:")
+            } else if let Some((id, step)) = user_step(&message, "waiting:")
                 && is_known(id)
             {
-                *state = HelloReady::AtUser;
-            } else if let Some(id) = message.strip_prefix("resumed:")
+                if steps.waiting(step) {
+                    *state = HelloReady::AtUser;
+                }
+            } else if let Some((id, step)) = user_step(&message, "resumed:")
                 && is_known(id)
+                && steps.resumed(step)
                 && matches!(*state, HelloReady::AtUser)
             {
                 *state = HelloReady::Counting;
@@ -461,6 +507,11 @@ pub(super) async fn request_custody_bounded(deadline_ms: f64) -> Result<Custody,
     Ok(answered.unwrap_or(Custody::Ephemeral))
 }
 
+thread_local! {
+    /// The user steps this worker has announced, numbering the next one.
+    static USER_STEPS: Cell<u64> = const { Cell::new(0) };
+}
+
 /// Worker side: run `step`, a boot step that waits on the user, announced on the hello channel
 /// so a page waiting for this boot pauses its deadline for as long as the user takes.
 pub(crate) async fn awaiting_user<F: Future>(step: F) -> F::Output {
@@ -481,12 +532,16 @@ pub(super) async fn awaiting_user_on<F: Future>(
 ) -> F::Output {
     let announcing = identity.and_then(|identity| {
         let channel = BroadcastChannel::new(channel_name).ok()?;
-        let _ = channel.post_message(&JsValue::from_str(&format!("waiting:{identity}")));
-        Some((channel, identity))
+        let step = USER_STEPS.with(|taken| {
+            taken.set(taken.get() + 1);
+            taken.get()
+        });
+        let _ = channel.post_message(&JsValue::from_str(&format!("waiting:{identity}:{step}")));
+        Some((channel, identity, step))
     });
     let output = step.await;
-    if let Some((channel, identity)) = announcing {
-        let _ = channel.post_message(&JsValue::from_str(&format!("resumed:{identity}")));
+    if let Some((channel, identity, step)) = announcing {
+        let _ = channel.post_message(&JsValue::from_str(&format!("resumed:{identity}:{step}")));
         channel.close();
     }
     output
