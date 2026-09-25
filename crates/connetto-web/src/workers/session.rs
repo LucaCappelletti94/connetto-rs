@@ -30,7 +30,7 @@ async fn choose_account(
     if accounts.is_empty() && remembered.is_none() {
         return Ok(None);
     }
-    match crate::unlock::ask_account(&accounts).await? {
+    match super::intake::awaiting_user(crate::unlock::ask_account(&accounts)).await? {
         crate::unlock::TabAnswer::Account(crate::unlock::AccountChoice::Named(chosen)) => {
             if !accounts.contains(&chosen) {
                 return Err(AuthError::Context(
@@ -89,7 +89,9 @@ where
     match authenticator.acquire(store).await? {
         crate::auth::Acquired::Access(session) => Ok(session),
         crate::auth::Acquired::NeedLogin(pending) => {
-            let (code, state) = crate::auth::await_login_code(&pending.login_url).await?;
+            let (code, state) =
+                super::intake::awaiting_user(crate::auth::await_login_code(&pending.login_url))
+                    .await?;
             authenticator.complete(&pending, &code, &state, store).await
         }
     }

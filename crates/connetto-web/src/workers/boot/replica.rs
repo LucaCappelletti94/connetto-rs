@@ -112,7 +112,7 @@ async fn run_unlock_ceremony(
     enrolled_ids: Vec<Vec<u8>>,
     key_store: &crate::auth::IdbKeyStore,
 ) -> Result<(), BootError> {
-    match crate::unlock::ask_unlock(enrolled_ids)
+    match crate::workers::intake::awaiting_user(crate::unlock::ask_unlock(enrolled_ids))
         .await
         .map_err(BootError::KeyStore)?
     {
@@ -179,7 +179,7 @@ async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned
 }
 
 async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), BootError> {
-    match crate::unlock::ask_enrol()
+    match crate::workers::intake::awaiting_user(crate::unlock::ask_enrol())
         .await
         .map_err(BootError::KeyStore)?
     {
