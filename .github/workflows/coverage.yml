@@ -89,6 +89,8 @@ jobs:
           source <(cargo +stable llvm-cov show-env --sh)
           cargo +stable build --profile testfast --all-features --bins ${{ matrix.bins }}
 
+      - uses: ./.github/actions/pull-test-images
+
       # testfast is release without the fat link: instrumentation on top of
       # lto and one codegen unit more than doubles the build.
       - name: Run Rust suite under coverage

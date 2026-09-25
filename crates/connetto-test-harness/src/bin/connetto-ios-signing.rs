@@ -8,7 +8,10 @@
 //!
 //! Every step reuses what already exists. The signing key and certificate
 //! live in a keychain of their own, unlocked with a password kept beside the
-//! key, so an SSH session can sign while the login keychain stays locked. The
+//! key, so an SSH session can sign while the login keychain stays locked.
+//! `security` takes that password only as an argument, where other processes
+//! of the same user can read it while it runs, so this suits a single-user
+//! Mac and not a shared runner. The
 //! demo's bundle identifier and every paired iPhone and iPad are registered,
 //! and a development profile covering them is written where `dx` looks for
 //! one. It prints the identity's SHA-1, which `dx build --apple-team-id`
@@ -244,9 +247,8 @@ impl Keychain {
         .await?;
         let p12 = dir.join("identity.p12");
         let p12_password = &self.password;
-        run(
-            "openssl",
-            &[
+        let exported = Command::new("openssl")
+            .args([
                 "pkcs12",
                 "-export",
                 "-legacy",
@@ -257,10 +259,18 @@ impl Keychain {
                 "-out",
                 &p12.display().to_string(),
                 "-passout",
-                &format!("pass:{p12_password}"),
-            ],
-        )
-        .await?;
+                "env:CONNETTO_P12_PASSWORD",
+            ])
+            .env("CONNETTO_P12_PASSWORD", p12_password)
+            .output()
+            .await
+            .context("starting openssl")?;
+        if !exported.status.success() {
+            bail!(
+                "openssl pkcs12 failed: {}",
+                String::from_utf8_lossy(&exported.stderr).trim()
+            );
+        }
         let path = self.path.display().to_string();
         let imported = run(
             "security",

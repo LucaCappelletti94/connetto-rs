@@ -112,6 +112,8 @@ const FGA_GRPC_PORT: u16 = 8081;
 const FGA_HTTP_PORT: u16 = 8080;
 const MOCK_OAUTH_PORT: u16 = 8080;
 const MOCK_OAUTH_ISSUER_ID: &str = "default";
+/// Where a provider serving TLS reads its keystore in its container.
+const MOCK_OAUTH_KEYSTORE: &str = "/tls/issuer.p12";
 
 /// The provider name tests and demos select through connetto.
 pub const MOCK_OAUTH_PROVIDER: &str = "mock-idp";
@@ -496,6 +498,65 @@ impl MockOauth {
         Self {
             _container: container,
             issuer: format!("http://{host}:{port}/{MOCK_OAUTH_ISSUER_ID}"),
+        }
+    }
+
+    /// Start one provider serving HTTPS as `host`, with the PKCS #12
+    /// `keystore` whose certificate names `host` under an empty password. A
+    /// device signs in through this one, because a browser leaving an HTTPS
+    /// page for a plain-HTTP provider tries TLS on it first, and the plain
+    /// server can hold that attempt open for a minute. The provider names
+    /// itself after the host a request reached it on, so discovery and tokens
+    /// agree on `https://host:port`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the Docker daemon is unreachable, when the mapped port is
+    /// unavailable, or when the provider does not answer over TLS on `host`
+    /// within the startup timeout, all of which are setup failures.
+    pub async fn start_tls(host: &str, keystore: Vec<u8>) -> Self {
+        sweep_abandoned_containers();
+        let mut config: serde_json::Value =
+            serde_json::from_str(MOCK_OAUTH_CONFIG).expect("the provider config is JSON");
+        config["httpServer"] = serde_json::json!({
+            "type": "NettyWrapper",
+            "ssl": {
+                "keyPassword": "",
+                "keystoreFile": MOCK_OAUTH_KEYSTORE,
+                "keystoreType": "PKCS12",
+                "keystorePassword": "",
+            },
+        });
+        let request = GenericImage::new(MOCK_OAUTH_IMAGE, MOCK_OAUTH_TAG)
+            .with_exposed_port(MOCK_OAUTH_PORT.tcp())
+            .with_wait_for(WaitFor::Nothing)
+            .with_env_var("JSON_CONFIG", config.to_string())
+            .with_copy_to(MOCK_OAUTH_KEYSTORE, keystore)
+            .with_labels(container_labels("oauth"))
+            .with_startup_timeout(STARTUP_TIMEOUT);
+        let container = start_logged(request, "identity provider").await;
+        let port = container
+            .get_host_port_ipv4(MOCK_OAUTH_PORT.tcp())
+            .await
+            .expect("the mapped oauth port");
+        let alive = format!("https://{host}:{port}/isalive");
+        let deadline = tokio::time::Instant::now() + STARTUP_TIMEOUT;
+        loop {
+            let probe = tokio::time::timeout(PROBE_TIMEOUT, openidconnect::reqwest::get(&alive));
+            if let Ok(Ok(response)) = probe.await
+                && response.status().is_success()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the identity provider never answered {alive}"
+            );
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        Self {
+            _container: container,
+            issuer: format!("https://{host}:{port}/{MOCK_OAUTH_ISSUER_ID}"),
         }
     }
 

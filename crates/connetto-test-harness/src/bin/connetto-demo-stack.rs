@@ -20,8 +20,9 @@
 //! LAN for a phone that has no `adb reverse`, binding every interface and
 //! naming that host in every address it hands out. With it,
 //! `CONNETTO_STACK_TLS_CERT` and `CONNETTO_STACK_TLS_KEY` name a certificate
-//! for that host, and the auth listener, which carries the login callback and
-//! content, is served over TLS in front of the server's plain one.
+//! for that host. The auth listener, which carries the login callback and
+//! content, is then served over TLS in front of the server's plain one, and
+//! the identity provider serves the same certificate itself.
 
 use std::ffi::OsString;
 
@@ -78,10 +79,12 @@ async fn main() -> Result<()> {
 
     let server_bin = ensure_server_bin().await?;
     let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack").await?;
-    let idp = MockOauth::start().await;
-    let idp = match public_host.as_deref() {
-        Some(host) => idp.advertised_on(host),
-        None => idp,
+    let idp = match (public_host.as_deref(), &tls) {
+        (Some(host), Some((cert, key))) => {
+            MockOauth::start_tls(host, pkcs12(cert, key).await?).await
+        }
+        (Some(host), None) => MockOauth::start().await.advertised_on(host),
+        (None, _) => MockOauth::start().await,
     };
     let mut envs = provisioned.server_env(&DEPLOYMENT, &sync_bind, &auth_bind, &auth_base);
     envs.extend(idp.env_pairs(PROVIDER, &format!("{auth_base}/auth/callback")));
@@ -150,6 +153,25 @@ async fn main() -> Result<()> {
         run_process(&program, &args, &demo_env).await?;
     }
     Ok(())
+}
+
+/// The PEM certificate chain and key at `cert` and `key` as PKCS #12 under
+/// an empty password, the keystore the identity provider reads.
+async fn pkcs12(cert: &str, key: &str) -> Result<Vec<u8>> {
+    let output = tokio::process::Command::new("openssl")
+        .args([
+            "pkcs12", "-export", "-inkey", key, "-in", cert, "-passout", "pass:",
+        ])
+        .output()
+        .await
+        .context("starting openssl")?;
+    if !output.status.success() {
+        bail!(
+            "packing {cert} for the identity provider failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(output.stdout)
 }
 
 /// Where the stack listens and what it tells clients, from the environment.
