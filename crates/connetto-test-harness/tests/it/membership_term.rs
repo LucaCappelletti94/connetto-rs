@@ -14,17 +14,21 @@
 //!
 //! Needs Docker: the fixture starts its own Postgres and its own `OpenFGA`.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::Cursor;
 use connetto_core::messages::{BulkMessage, ControlMessage, LivePatch, SUBSCRIPTION_REFUSED};
-use connetto_core::traits::Transport;
+use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::transport::{LoopbackTransport, loopback};
-use connetto_server::{Position, TimelineHistory};
+use connetto_server::{
+    AbuseConfig, Position, ReaderReserve, RequestGuard, ThrottleConfig, TierLimits, TimelineHistory,
+};
 use connetto_test_harness::Client;
 use connetto_test_harness::Fixture;
 use connetto_test_harness::fanout::{
-    SHARE_KEY, membership_term_fixture, subject_set_term_fixture, term_over_owner_fixture,
+    SHARE_KEY, membership_term_fixture, subject_set_term_fixture, subject_set_term_fixture_guarded,
+    term_over_owner_fixture,
 };
 use diesel::prelude::*;
 use sqlite_diff_rs::{
@@ -1053,4 +1057,54 @@ async fn a_failed_membership_read_refuses_the_term_and_keeps_the_session() {
         alice.try_live(QUIET).await.is_none(),
         "nothing is subscribed any more, on either label"
     );
+}
+
+/// A term's membership read runs under the term's own reader-share slot, so a caller the unreserved share
+/// admits once is served both halves even while the term's paged read still holds that slot.
+///
+/// The share is one slot wide and the anonymous tier's page is one row, so the term's read is still paging
+/// when the membership subscription opens.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_paged_term_serves_its_membership_under_its_own_reader_slot() {
+    const SET_QUERY: &str = "SELECT * FROM items WHERE team_id IN \
+        (SELECT team_id FROM team_members WHERE CASE WHEN current_app_subjects() IS NOT NULL \
+          THEN current_app_subjects() <> '' AND instr(member, ',') = 0 \
+          AND instr(',' || current_app_subjects() || ',', ',' || member || ',') > 0 END)";
+
+    let fixture = Fixture::acquire().await;
+    let guard = RequestGuard::new(
+        ThrottleConfig::default().with_anonymous(TierLimits::anonymous().with_page_bytes(1)),
+        AbuseConfig::default(),
+    )
+    .with_reader_gate(ReaderReserve::new().with_total(2).with_reserved(1).gate());
+    let server = subject_set_term_fixture_guarded(&fixture, Arc::new(guard)).await;
+    fixture
+        .exec("INSERT INTO items (id, owner, team_id, label) VALUES (11, 'nobody', 1, 'one')")
+        .await;
+
+    // A key and no identity, so every read takes from the unreserved share.
+    let mut holder = server.connect();
+    holder
+        .handshake_presenting("r27-anonymous-holder", &[SHARE_KEY], None)
+        .await;
+    holder.subscribe("docs", SET_QUERY).await;
+
+    let mut ended = Vec::new();
+    while ended.len() < 2 {
+        match tokio::time::timeout(DELIVERY, holder.recv())
+            .await
+            .expect("the term and its membership finish delivering")
+        {
+            Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_))) => holder.ack_credits(1).await,
+            Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end))) => {
+                ended.push(end.sub_id);
+            }
+            Some(IncomingFrame::Control(
+                ControlMessage::SnapshotBegin(_) | ControlMessage::MembershipOpened(_),
+            )) => {}
+            other => panic!("both reads are served in full, got {other:?}"),
+        }
+    }
+    ended.sort();
+    assert_eq!(ended, vec![MEMBERSHIP_SUB.to_owned(), "docs".to_owned()]);
 }
