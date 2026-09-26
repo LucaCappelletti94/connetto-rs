@@ -24,7 +24,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth};
 use diesel::prelude::*;
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
@@ -117,7 +117,10 @@ fn by_status() -> impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqli
 /// Run `sql` on the emulated source and dispatch every event it produced.
 async fn apply(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>, sql: &str) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
 }

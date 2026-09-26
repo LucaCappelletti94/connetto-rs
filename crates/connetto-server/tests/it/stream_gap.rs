@@ -9,8 +9,9 @@
 //! and then newer ones, and the question a returning client asks, whether
 //! anything it is missing is still retained, answers yes.
 //!
-//! So the server compares where the feed is about to resume against how far it
-//! had already got. Ahead means a hole, whatever opened it. The log then forgets
+//! So the server compares where the feed is about to resume against the end of
+//! the last commit it recorded, which is exactly where an acknowledged slot
+//! resumes. Past it means a hole, whatever opened it. The log then forgets
 //! everything through the resume point, which is what makes that question
 //! answer honestly afterwards, and every live connection is closed so it
 //! re-declares its subscriptions rather than carrying on across the hole.
@@ -32,7 +33,7 @@ use connetto_server::{
     SnapshotSource, catchup_decision, loopback, pg_write_target, slot,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 
 /// Its own slot and table names, so this never contends with the shared fixture
 /// slot the end-to-end suites create and drop.
@@ -41,26 +42,33 @@ const OPLOG: &str = "connetto_oplog_gap";
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 
-/// Three real change records, built the way the ingest loop builds them: driven
-/// through the emulator and turned into records by the materializer, so their
-/// positions are the shape the log actually stores rather than numbers a test
-/// invented.
-async fn records() -> Vec<ChangeRecord> {
+/// Three real change records and the commit after each, built the way the ingest
+/// loop builds them: driven through the emulator and turned into records by the
+/// materializer, so their positions are the shape the log actually stores
+/// rather than numbers a test invented.
+fn records() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
     let mat = Materializer::new(PG_DDL).expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let mut out = Vec::new();
+    let mut commits = Vec::new();
     for id in 1..=3 {
         source
             .execute_sql(&format!(
                 "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 1, 'seed')"
             ))
             .expect("insert");
-        while let Some(event) = source.next_event().await.expect("poll source") {
-            out.push(mat.oplog_record(&event).expect("build oplog record"));
+        for item in source.drain().expect("poll source") {
+            match item {
+                SourceItem::Event(event) => {
+                    out.push(mat.oplog_record(&event).expect("build oplog record"));
+                }
+                SourceItem::Commit(commit) => commits.push(commit),
+            }
         }
     }
     assert_eq!(out.len(), 3, "one record per statement");
-    out
+    assert_eq!(commits.len(), 3, "one commit per statement");
+    (out, commits)
 }
 
 /// A snapshot source serving nothing. This suite never reads a snapshot; it
@@ -111,8 +119,8 @@ impl SnapshotSource for NoSnapshot {
 
 #[tokio::test]
 async fn forgetting_through_the_gap_makes_the_catchup_question_honest() {
-    let records = records().await;
-    let (first, last) = (records[0].lsn(), records[2].lsn());
+    let (records, _) = records();
+    let (first, last) = (records[0].position(), records[2].position());
     let oplog = InMemoryOplog::new(OplogConfig::default());
     for record in records {
         oplog.append(record).await.expect("append");
@@ -120,26 +128,29 @@ async fn forgetting_through_the_gap_makes_the_catchup_question_honest() {
     assert_eq!(
         catchup_decision(
             first,
-            oplog.min_lsn().await.expect("min"),
-            oplog.current_lsn().await.expect("current"),
+            oplog.min_position().await.expect("min"),
+            oplog.current_position().await.expect("current"),
         ),
         CatchupDecision::Catchup,
         "with no hole, a client inside the window catches up",
     );
 
-    // A hole ending past everything the log holds, which is what a recreated
-    // slot looks like.
-    let boundary = last + 1_000;
+    // A hole ending past everything the log holds, which is what a recreated slot looks like.
+    let boundary = PgCommitPosition::before_commit(PgLsn(last.commit_lsn().0 + 1_000));
     oplog.forget_through(boundary).await.expect("forget");
     assert!(
-        oplog.entries_since(0).await.expect("entries").is_empty(),
+        oplog
+            .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+            .await
+            .expect("entries")
+            .is_empty(),
         "nothing at or below the boundary survives",
     );
     assert_eq!(
         catchup_decision(
             first,
-            oplog.min_lsn().await.expect("min"),
-            oplog.current_lsn().await.expect("current"),
+            oplog.min_position().await.expect("min"),
+            oplog.current_position().await.expect("current"),
         ),
         CatchupDecision::FullResync,
         "and a client whose position predates the resume point can no longer be \
@@ -158,6 +169,7 @@ async fn a_recreated_slot_resumes_past_what_was_delivered() {
                  WHERE slot_name = '{SLOT}'"
             ),
             &format!("DROP TABLE IF EXISTS {OPLOG}"),
+            &format!("DROP TABLE IF EXISTS {}", PgOplog::commit_table(OPLOG)),
             "CREATE TABLE IF NOT EXISTS gap_churn (id BIGINT PRIMARY KEY, body TEXT)",
         ])
         .await;
@@ -240,6 +252,7 @@ async fn a_recreated_slot_resumes_past_what_was_delivered() {
         .setup(&[
             &format!("SELECT pg_drop_replication_slot('{SLOT}')"),
             &format!("DROP TABLE IF EXISTS {OPLOG}"),
+            &format!("DROP TABLE IF EXISTS {}", PgOplog::commit_table(OPLOG)),
             "DROP TABLE IF EXISTS gap_churn",
         ])
         .await;
@@ -250,17 +263,29 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin();
     fixture
-        .setup(&[&format!("DROP TABLE IF EXISTS {OPLOG}")])
+        .setup(&[
+            &format!("DROP TABLE IF EXISTS {OPLOG}"),
+            &format!("DROP TABLE IF EXISTS {}", PgOplog::commit_table(OPLOG)),
+        ])
         .await;
     // Two handles over one table: the manager owns its own, and the probe is
     // how the test sees what the manager did to it.
     let probe = PgOplog::new(admin.clone(), OPLOG, OplogConfig::default());
     probe.ensure_schema().await.expect("provision the oplog");
-    let records = records().await;
-    let last = records[2].lsn();
+    let (records, commits) = records();
+    let last = records[2].position();
     for record in records {
         probe.append(record).await.expect("append");
     }
+    // The ingest records each commit before acknowledging it, and the slot then resumes exactly at its end.
+    for commit in &commits {
+        probe.record_commit(*commit).await.expect("record commit");
+    }
+    let acknowledged = commits[2].end_lsn().0;
+    assert!(
+        acknowledged > last.commit_lsn().0,
+        "a commit record ends past where it starts, which is why the start cannot stand in for it",
+    );
 
     let manager = SessionManager::with_oplog(
         Materializer::new(PG_DDL).expect("build materializer"),
@@ -294,27 +319,34 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
 
     // An ordinary reconnect resumes at or behind what was delivered, and must
     // not be mistaken for a hole.
+    for resume in [acknowledged, commits[1].end_lsn().0] {
+        assert_eq!(
+            manager.reconcile_stream(resume).await.expect("reconcile"),
+            None,
+            "resuming at or behind the last recorded commit's end is not a gap",
+        );
+    }
     assert_eq!(
-        manager.reconcile_stream(last).await.expect("reconcile"),
-        None,
-        "resuming exactly where the feed stopped is not a gap",
-    );
-    assert_eq!(
-        probe.current_lsn().await.expect("current"),
+        probe.current_position().await.expect("current"),
         Some(last),
         "so nothing was forgotten",
     );
 
-    let boundary = last + 1_000;
+    let boundary = acknowledged + 1;
     assert_eq!(
         manager.reconcile_stream(boundary).await.expect("reconcile"),
         Some(boundary),
-        "resuming past what was delivered is a gap, bounded by the resume point",
+        "resuming one byte past the last recorded commit's end is a gap, bounded by the resume point",
     );
     assert_eq!(
-        probe.current_lsn().await.expect("current"),
+        probe.current_position().await.expect("current"),
         None,
         "the log forgot everything through the boundary",
+    );
+    assert_eq!(
+        manager.reconcile_stream(boundary).await.expect("reconcile"),
+        None,
+        "the boundary is recorded, so reconnecting there again before any new commit is not a second gap",
     );
 
     let IncomingFrame::Control(ControlMessage::FatalError(fatal)) = next_frame(&mut client).await
@@ -330,7 +362,10 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
     session.await.expect("join session").expect("session ok");
 
     fixture
-        .setup(&[&format!("DROP TABLE IF EXISTS {OPLOG}")])
+        .setup(&[
+            &format!("DROP TABLE IF EXISTS {OPLOG}"),
+            &format!("DROP TABLE IF EXISTS {}", PgOplog::commit_table(OPLOG)),
+        ])
         .await;
 }
 

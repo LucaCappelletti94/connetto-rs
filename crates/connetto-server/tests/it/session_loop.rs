@@ -30,7 +30,7 @@ use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::Postgres;
 use subql::visibility::VisibilityPolicy;
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 
 const PG_DDL: &str =
@@ -178,7 +178,10 @@ async fn drive_cdc<S, A>(
     A::Error: core::fmt::Display,
 {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await

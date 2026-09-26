@@ -68,6 +68,12 @@ pub static AUTHORIZATION_CALLS: AtomicU64 = AtomicU64::new(0);
 /// row-level security can answer about.
 pub static VISIBILITY_DISAGREEMENTS: AtomicU64 = AtomicU64::new(0);
 
+/// Live cursor advances refused as a rewind, on the fan-out or a membership move.
+///
+/// **Zero is the only acceptable reading.** Positions follow commit order, so
+/// a live change can only move a subscription's cursor forward, and a refusal
+/// means a change is being delivered out of the order it committed in.
+pub static CURSOR_REWINDS: AtomicU64 = AtomicU64::new(0);
 /// Maintenance-tier transitions: a subscription that outgrew its fold budget
 /// or lost an image it needed and now answers by database read (R30's
 /// demotion). Correctness is unchanged, cost is not, which is why this is a
@@ -126,6 +132,8 @@ pub struct CountersSnapshot {
     pub authorization_calls: u64,
     /// [`VISIBILITY_DISAGREEMENTS`] at the reading.
     pub visibility_disagreements: u64,
+    /// [`CURSOR_REWINDS`] at the reading.
+    pub cursor_rewinds: u64,
 }
 
 impl CountersSnapshot {
@@ -141,6 +149,7 @@ impl CountersSnapshot {
             authorization_calls: self.authorization_calls - earlier.authorization_calls,
             visibility_disagreements: self.visibility_disagreements
                 - earlier.visibility_disagreements,
+            cursor_rewinds: self.cursor_rewinds - earlier.cursor_rewinds,
         }
     }
 }
@@ -155,6 +164,7 @@ pub fn snapshot() -> CountersSnapshot {
         fanout_route_clones: FANOUT_ROUTE_CLONES.load(Ordering::Relaxed),
         authorization_calls: AUTHORIZATION_CALLS.load(Ordering::Relaxed),
         visibility_disagreements: VISIBILITY_DISAGREEMENTS.load(Ordering::Relaxed),
+        cursor_rewinds: CURSOR_REWINDS.load(Ordering::Relaxed),
     }
 }
 

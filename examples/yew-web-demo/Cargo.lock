@@ -2025,7 +2025,7 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#787815b7cb578e1407b524e7f43c73be91bd6b5b"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#8d05c614b3a1ad2faad586d41830249e8af5139e"
 dependencies = [
  "sql-traits",
  "sqlparser",
@@ -2035,9 +2035,9 @@ dependencies = [
 
 [[package]]
 name = "pg_walstream"
-version = "0.8.1"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4cb204bf29c07ccaedb26f3c6c87fd02fc7cb99021bf7b40f339ddb3aae7fcc2"
+checksum = "f6bdc4f0d36c6f314ce9468ff12ca0d3e814ac4ba51c46758c57d9e470ceefa2"
 dependencies = [
  "bytes",
  "chrono",
@@ -2810,9 +2810,9 @@ checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
 name = "smallvec"
-version = "1.16.0"
+version = "1.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9be42f50aa861c555654aa3a37f52f4b1074bacf4e48fe0ef7fa584e80f1f0f"
+checksum = "f9395f0f0eee849a9b707b2f06bb92a6a422090e2123bb2ef8e87a0e61892a8e"
 dependencies = [
  "serde",
 ]
@@ -2840,7 +2840,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#7e068a8c14ed9ec7eed0112427121d4e89799be8"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#4e5d19a4aed629ff0fc6221c79fa1f460b2afae1"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -2861,9 +2861,9 @@ dependencies = [
 
 [[package]]
 name = "sqlite-diff-rs"
-version = "0.14.0"
+version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "26dd4527d7fe7a00a76907a4512c2fdefaa3b5dc20a5c7801d8ff614eae9dc4a"
+checksum = "6a3feca792d8f7372e3a79a16703d53648ffd8b2d3ccfe5398ebd2cbdb1eb7b4"
 dependencies = [
  "hashbrown 0.17.1",
  "indexmap",
@@ -2904,7 +2904,7 @@ dependencies = [
 [[package]]
 name = "sqlparser"
 version = "0.63.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f354ee25fc7ac9919adbbf6e5a3b6da2f6eadc80"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#560a13c32b6c3b9f1a202d6b9a9020c016bbf7be"
 dependencies = [
  "log",
  "recursive",
@@ -2914,8 +2914,8 @@ dependencies = [
 
 [[package]]
 name = "sqlparser-canonicalize"
-version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#bec4fd1fc464c5ada922c341cd63754420b9f2b0"
+version = "0.2.1"
+source = "git+https://github.com/LucaCappelletti94/sqlparser-canonicalize?branch=main#12ff22066305050314923d204054833ced5f7f56"
 dependencies = [
  "seahash",
  "sqlparser",
@@ -2934,7 +2934,7 @@ dependencies = [
 [[package]]
 name = "sqlparser_derive"
 version = "0.6.0"
-source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#f354ee25fc7ac9919adbbf6e5a3b6da2f6eadc80"
+source = "git+https://github.com/apache/datafusion-sqlparser-rs?branch=main#560a13c32b6c3b9f1a202d6b9a9020c016bbf7be"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -2975,7 +2975,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#daa081889b8fd6fa9734de25da1fe4438126ecb8"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#f4a0018de09da385a6e4f9ce1a121fa40f00a022"
 dependencies = [
  "arc-swap",
  "async-lock",

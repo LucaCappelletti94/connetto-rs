@@ -11,6 +11,7 @@ mod fanout_delegated;
 mod fanout_load;
 
 mod grant_withdrawal;
+mod interleaved_commit;
 
 mod membership_term;
 

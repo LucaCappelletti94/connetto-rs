@@ -221,7 +221,10 @@ mod pg {
     use sqlite_diff_rs::PatchsetOp;
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{Postgres, Value};
-    use subql::{ColumnId, DatabaseLike, ParserDB, PgLsn, TableId, catalog_helpers};
+    use subql::{
+        Checkpoint, ColumnId, DatabaseLike, ParserDB, PgCommitPosition, PgLsn, TableId,
+        catalog_helpers,
+    };
 
     use connetto_core::messages::BindValue;
     use connetto_core::{Cursor, Principal};
@@ -831,8 +834,9 @@ mod pg {
             } else {
                 None
             };
+            // A read sits before every commit it did not see, which is ordinal 0 of that commit.
             let cursor = PgLsn::parse(&lsn)
-                .map(|lsn| lsn.0.to_be_bytes().to_vec())
+                .map(|lsn| PgCommitPosition::before_commit(lsn).to_opaque().0)
                 .unwrap_or_default();
             Ok(SnapshotPage {
                 patchset: built.build(),

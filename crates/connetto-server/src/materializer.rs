@@ -11,7 +11,7 @@
 //!
 //! * [`Materializer::register`] / [`Materializer::unregister`] manage engine
 //!   subscriptions keyed by a caller-chosen consumer id.
-//! * [`Materializer::dispatch`] runs one CDC [`ChangeEvent`] through matching,
+//! * [`Materializer::dispatch`] runs one CDC [`PgChangeEvent`] through matching,
 //!   folds the matched event into a `sqlite-diff-rs` patchset with
 //!   [`pgoutput_patchset`], compresses it, and returns one [`MatchedPatch`]
 //!   per notified consumer.
@@ -59,8 +59,8 @@ use subql::reexec::{
 };
 use subql::{
     AggValue, AggregateBootstrap, AggregateResultValue, AggregateValueChange, AggregateValueUpdate,
-    AsyncSubscriptionDispatch, ChangeEvent, DatabaseLike, DefaultIds, MaintenanceTransition,
-    NumericValue, OpaqueCheckpoint, ParserDB, PgLsn, SubscriptionEngine, SubscriptionId,
+    AsyncSubscriptionDispatch, Checkpoint, DatabaseLike, DefaultIds, MaintenanceTransition,
+    NumericValue, OpaqueCheckpoint, ParserDB, PgChangeEvent, SubscriptionEngine, SubscriptionId,
     SubscriptionRequest, TableId, TableLike, Tier, catalog_helpers,
 };
 
@@ -76,11 +76,11 @@ type WireValue = Value<String, Vec<u8>>;
 /// Aggregate value update pinned to connetto's backend and default id set.
 type AggUpdate = AggregateValueUpdate<DefaultIds, Postgres>;
 /// Scalar re-execution update pinned to connetto's backend and default id set.
-type ScalarUpd = ScalarUpdate<DefaultIds, Postgres, PgLsn>;
+type ScalarUpd = ScalarUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 /// Re-executed rows update pinned to connetto's backend and default id set.
-type RowsUpd = RowsUpdate<DefaultIds, Postgres, PgLsn>;
+type RowsUpd = RowsUpdate<DefaultIds, Postgres, subql::PgCommitPosition>;
 /// Row-level keyed delta pinned to connetto's backend and default id set.
-type RowDlt = RowDelta<DefaultIds, Postgres, PgLsn>;
+type RowDlt = RowDelta<DefaultIds, Postgres, subql::PgCommitPosition>;
 
 /// Zstd level for bulk payloads. Level 3 is the library default: a sound size
 /// versus speed tradeoff for patchset-sized blobs.
@@ -156,7 +156,7 @@ pub struct MatchedPatch {
     pub consumer_id: u64,
     /// Zstd-compressed patchset bytes ready to frame as a bulk payload.
     pub payload_zstd: Vec<u8>,
-    /// Resume cursor for this event (the source `PgLsn`, big-endian).
+    /// Resume cursor for this event, its commit position in `Checkpoint::to_opaque` form.
     pub cursor: Vec<u8>,
     /// Whether this payload is a synthesized departure notice: the row still
     /// exists and merely left this consumer's window. The session layer does
@@ -441,7 +441,7 @@ pub struct ComputedChange {
 /// batching, and paging, driving `C` for every database read. The lock-held
 /// read this implies is a recorded measured-risk item whose exit is
 /// `docs/upstream-subql-nonblocking-read-tier-drive.md`.
-type Engine<DB, C> = AutoResolvingEngine<ChangeEvent, DefaultIds, DB, AsyncMode<C>>;
+type Engine<DB, C> = AutoResolvingEngine<PgChangeEvent, DefaultIds, DB, AsyncMode<C>>;
 
 /// The connector shape the materializer drives: connetto's budget rides the
 /// per-registration auth context, so every read the engine issues is bounded
@@ -449,7 +449,7 @@ type Engine<DB, C> = AutoResolvingEngine<ChangeEvent, DefaultIds, DB, AsyncMode<
 pub trait ReadConnector:
     AsyncConnector<
         Backend = Postgres,
-        Checkpoint = subql::PgLsn,
+        Checkpoint = subql::PgCommitPosition,
         AuthContext = crate::reexec::ConnettoReadSetup,
         Error: core::fmt::Display + crate::reexec::FailedRead + Send,
     > + Send
@@ -460,7 +460,7 @@ pub trait ReadConnector:
 impl<C> ReadConnector for C where
     C: AsyncConnector<
             Backend = Postgres,
-            Checkpoint = subql::PgLsn,
+            Checkpoint = subql::PgCommitPosition,
             AuthContext = crate::reexec::ConnettoReadSetup,
             Error: core::fmt::Display + crate::reexec::FailedRead + Send,
         > + Send
@@ -469,7 +469,7 @@ impl<C> ReadConnector for C where
 }
 
 /// Hosts one `subql` engine over a Postgres-flavored catalog on the pgoutput
-/// vehicle ([`ChangeEvent`], the `pg_walstream` event type both matching and
+/// vehicle ([`PgChangeEvent`], the `pg_walstream` event type both matching and
 /// emission consume), plus the write policy the mutation path consults.
 pub struct Materializer<DB = ParserDB, W = RuntimeWritableCatalog, C = crate::reexec::NoConnector>
 where
@@ -996,7 +996,7 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         value: PgValue<Postgres>,
-        checkpoint: Option<subql::PgLsn>,
+        checkpoint: Option<subql::PgCommitPosition>,
     ) -> Result<ComputedChange, MaterializerError> {
         let update = subql::Install::install(
             &mut self.engine,
@@ -1039,7 +1039,7 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         rows: Vec<Vec<PgValue<Postgres>>>,
-        read_at: Option<subql::PgLsn>,
+        read_at: Option<subql::PgCommitPosition>,
     ) -> Result<FoldSeeded, MaterializerError> {
         let output = subql::Install::install(
             &mut self.engine,
@@ -1185,7 +1185,10 @@ where
     /// [`MaterializerError::Read`] when a triggered read failed,
     /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
-    pub async fn dispatch(&mut self, event: &ChangeEvent) -> Result<Dispatched, MaterializerError> {
+    pub async fn dispatch(
+        &mut self,
+        event: &PgChangeEvent,
+    ) -> Result<Dispatched, MaterializerError> {
         // The drain is the only way to the in-process half, which is what
         // keeps one delivery path for every computed movement (R82). Whole-row
         // captures, scalar extremes and keyed rows arrive as the read half,
@@ -1202,10 +1205,7 @@ where
         let notifications = settled.dispatched;
         let resolved = settled.reads.map_err(reexec_error)?;
         Self::log_transitions(&resolved.transitions);
-        let cursor = event
-            .checkpoint()
-            .map(|lsn| lsn.0.to_be_bytes().to_vec())
-            .unwrap_or_default();
+        let cursor = event.position().to_opaque().0;
         Self::log_transitions(&notifications.transitions);
 
         let computed = Self::computed_changes(
@@ -1237,8 +1237,9 @@ where
         let patches = if consumers.is_empty() {
             Vec::new()
         } else {
-            let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event))
-                .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
+            let built =
+                pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
+                    .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
             // One extra encode on an event that has departures, not one per
             // departing consumer: the notice carries a table and a primary key
             // and nothing consumer-specific, so every consumer that lost this
@@ -1382,15 +1383,14 @@ where
     ///
     /// Resolves the table name and a stable primary-key encoding from the
     /// catalog once, so the oplog and the catchup auth filter carry them without
-    /// a second catalog pass. Returns `None` when the event carries no checkpoint
-    /// or its table is absent from the catalog. Call only after
+    /// a second catalog pass. Returns `None` when the event's table is absent
+    /// from the catalog. Call only after
     /// [`dispatch`](Self::dispatch) has accepted the event, which guarantees it
     /// is a row event.
     #[must_use]
-    pub fn oplog_record(&self, event: &ChangeEvent) -> Option<ChangeRecord> {
-        let lsn = event.checkpoint()?.0;
+    pub fn oplog_record(&self, event: &PgChangeEvent) -> Option<ChangeRecord> {
         let (table, pk) = self.event_identity(event)?;
-        Some(ChangeRecord::new(lsn, table, pk, event.clone()))
+        Some(ChangeRecord::new(table, pk, event.clone()))
     }
 
     /// The catchup payload for one consumer, and whether it is a departure.
@@ -1414,7 +1414,7 @@ where
     /// [`MaterializerError::Compression`] on a compression failure.
     pub fn replay_patch(
         &mut self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         consumer_id: u64,
     ) -> Result<Option<(Vec<u8>, bool)>, MaterializerError> {
         let (matched, departing) = {
@@ -1429,7 +1429,7 @@ where
         if !matched {
             return Ok(None);
         }
-        let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event))
+        let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         if departing && let Some(notice) = Self::departure_patchset(&built) {
             return Ok(Some((compress(&notice)?, true)));
@@ -1446,8 +1446,8 @@ where
     ///
     /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
-    pub fn encode_patch(&self, event: &ChangeEvent) -> Result<Vec<u8>, MaterializerError> {
-        let raw = pgoutput_patchset(&self.catalog, std::slice::from_ref(event))
+    pub fn encode_patch(&self, event: &PgChangeEvent) -> Result<Vec<u8>, MaterializerError> {
+        let raw = pgoutput_patchset(&self.catalog, std::slice::from_ref(event.change()))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         Ok(compress(&raw)?)
     }
@@ -1505,9 +1505,9 @@ where
     /// [`MaterializerError::Compression`] on a compression failure.
     pub(crate) fn withdrawal_patch(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
     ) -> Result<Option<Vec<u8>>, MaterializerError> {
-        let built = pgoutput_changeset_builder(&self.catalog, std::slice::from_ref(event))
+        let built = pgoutput_changeset_builder(&self.catalog, std::slice::from_ref(event.change()))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
         let Some(op) = built.iter().next() else {
             return Ok(None);
@@ -1522,7 +1522,7 @@ where
     /// read filter. Primary-key columns are read from the event's PK image and
     /// encoded by [`crate::pk`] into a stable, self-describing byte string the
     /// auth policy treats as opaque and decodes back into typed values.
-    fn event_identity(&self, event: &ChangeEvent) -> Option<(String, Vec<u8>)> {
+    fn event_identity(&self, event: &PgChangeEvent) -> Option<(String, Vec<u8>)> {
         let db = &self.catalog;
         let table_id = event.table_id(db);
         let index = usize::try_from(table_id).ok()?;
@@ -1956,9 +1956,9 @@ where
 }
 
 /// A resume cursor from a read's stream position, empty when unknown.
-fn cursor_bytes(checkpoint: Option<&subql::PgLsn>) -> Vec<u8> {
+fn cursor_bytes(checkpoint: Option<&subql::PgCommitPosition>) -> Vec<u8> {
     checkpoint
-        .map(|lsn| lsn.0.to_be_bytes().to_vec())
+        .map(|position| position.to_opaque().0)
         .unwrap_or_default()
 }
 

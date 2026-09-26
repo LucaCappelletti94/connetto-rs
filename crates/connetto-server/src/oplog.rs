@@ -1,6 +1,6 @@
-//! Retention-bounded, LSN-keyed oplog and the reconnect catchup decision.
+//! Retention-bounded, commit-ordered oplog and the reconnect catchup decision.
 //!
-//! The oplog is an ordered log of [`ChangeRecord`]s keyed by their source LSN.
+//! The oplog is an ordered log of [`ChangeRecord`]s keyed by their commit position.
 //! On reconnect the server replays the records a client missed instead of
 //! re-snapshotting, falling back to a full snapshot only when the client's
 //! resume position has fallen outside the retained window. Deletes are kept as
@@ -41,7 +41,7 @@ use diesel::pg::{Pg, PgValue};
 use diesel::serialize::{self, IsNull, Output, ToSql};
 use parking_lot::Mutex;
 use subql::backend::CdcEvent;
-use subql::{ChangeEvent, ClockHandle, EventKind, StdClock};
+use subql::{ClockHandle, EventKind, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, StdClock};
 
 /// Default retention age: 72 hours (`06-reconnect.md` line 69).
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(72 * 60 * 60);
@@ -89,19 +89,18 @@ impl OplogConfig {
     }
 }
 
-/// One change retained in the oplog, keyed by its source LSN.
+/// One change retained in the oplog, keyed by its commit position.
 ///
-/// The [`ChangeEvent`] is the source of truth replayed on catchup: catchup runs
+/// The [`PgChangeEvent`] is the source of truth replayed on catchup: catchup runs
 /// it back through the same matching and patchset encoding the live path uses.
 /// The table name and primary-key bytes are resolved once at append time (they
 /// need the catalog, which the oplog impls do not carry) so the auth read filter
 /// on the catchup path has them without a second catalog pass.
 #[derive(Debug, Clone)]
 pub struct ChangeRecord {
-    lsn: u64,
     table: String,
     pk: Vec<u8>,
-    event: ChangeEvent,
+    event: PgChangeEvent,
 }
 
 impl ChangeRecord {
@@ -112,20 +111,19 @@ impl ChangeRecord {
     /// reaches a successful dispatch. [`op`](Self::op) and
     /// [`is_tombstone`](Self::is_tombstone) rely on that invariant.
     #[must_use]
-    pub fn new(lsn: u64, table: impl Into<String>, pk: Vec<u8>, event: ChangeEvent) -> Self {
+    pub fn new(table: impl Into<String>, pk: Vec<u8>, event: PgChangeEvent) -> Self {
         Self {
-            lsn,
             table: table.into(),
             pk,
             event,
         }
     }
 
-    /// The source LSN, the oplog key. The wire cursor is this value stamped
-    /// with the timeline it was read on ([`crate::timeline`]).
+    /// The change's commit position, the oplog key. The wire cursor is this
+    /// value stamped with the timeline it was read on ([`crate::timeline`]).
     #[must_use]
-    pub const fn lsn(&self) -> u64 {
-        self.lsn
+    pub const fn position(&self) -> PgCommitPosition {
+        self.event.position()
     }
 
     /// The table the change touched.
@@ -142,7 +140,7 @@ impl ChangeRecord {
 
     /// The retained CDC event, replayed on catchup.
     #[must_use]
-    pub const fn event(&self) -> &ChangeEvent {
+    pub const fn event(&self) -> &PgChangeEvent {
         &self.event
     }
 
@@ -238,7 +236,7 @@ impl FromSql<ChangeOpSql, Pg> for ChangeOp {
     }
 }
 
-/// A retention-bounded, LSN-keyed log of [`ChangeRecord`]s.
+/// A retention-bounded, commit-ordered log of [`ChangeRecord`]s.
 ///
 /// The seam the session layer appends to on every dispatched event and reads
 /// from on reconnect. Shaped like [`SnapshotSource`](crate::session::SnapshotSource):
@@ -259,39 +257,63 @@ pub trait Oplog: Send + Sync {
 
     /// Append one record, then drop whatever the retention window no longer
     /// covers. Pruning is not a separate seam: an external caller would race
-    /// the append it belongs to.
+    /// the append it belongs to. A record at a position already appended is
+    /// ignored, since a source resuming after a failed dispatch delivers it again.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backing-store write failure.
     async fn append(&self, record: ChangeRecord) -> Result<(), Self::Error>;
 
-    /// Records with an LSN strictly greater than `lsn`, in ascending LSN order.
+    /// Records strictly after `after`, in commit order.
     ///
-    /// The client already applied `lsn`, so catchup replays everything after it.
-    ///
-    /// # Errors
-    ///
-    /// Implementation-defined: a backing-store read failure.
-    async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, Self::Error>;
-
-    /// The smallest retained LSN, or `None` when the log holds no entries.
+    /// The client already applied `after`, so catchup replays everything past it,
+    /// the rest of `after`'s own transaction included.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backing-store read failure.
-    async fn min_lsn(&self) -> Result<Option<u64>, Self::Error>;
+    async fn entries_since(
+        &self,
+        after: PgCommitPosition,
+    ) -> Result<Vec<ChangeRecord>, Self::Error>;
 
-    /// The server's current LSN watermark: the highest LSN ever appended. It
+    /// The earliest retained position, or `None` when the log holds no entries.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    async fn min_position(&self) -> Result<Option<PgCommitPosition>, Self::Error>;
+
+    /// The server's current watermark: the latest position ever appended. It
     /// does not decrease when the window prunes, so it names the server's live
     /// position. `None` when nothing has been appended.
     ///
     /// # Errors
     ///
     /// Implementation-defined: a backing-store read failure.
-    async fn current_lsn(&self) -> Result<Option<u64>, Self::Error>;
+    async fn current_position(&self) -> Result<Option<PgCommitPosition>, Self::Error>;
 
-    /// Drop every record at or below `lsn`, because continuity across it can no
+    /// Remember `commit` as the last transaction the change feed delivered in full,
+    /// unless a later one is already recorded.
+    ///
+    /// Its `end_lsn` is where the replication slot resumes once the commit is
+    /// acknowledged, so it is recorded before the acknowledgement, and a slot past
+    /// it on the next connect names changes this log never received.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store write failure.
+    async fn record_commit(&self, commit: PgCommit) -> Result<(), Self::Error>;
+
+    /// The last commit [`record_commit`](Self::record_commit) kept, `None` before the first.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    async fn last_commit(&self) -> Result<Option<PgCommit>, Self::Error>;
+
+    /// Drop every record at or before `through`, because continuity across it can no
     /// longer be proven.
     ///
     /// This is retention with a different trigger, not a new concept: the log
@@ -304,17 +326,17 @@ pub trait Oplog: Send + Sync {
     /// # Errors
     ///
     /// Implementation-defined: a backing-store write failure.
-    async fn forget_through(&self, lsn: u64) -> Result<(), Self::Error>;
+    async fn forget_through(&self, through: PgCommitPosition) -> Result<(), Self::Error>;
 }
 
-/// Decide whether a client resuming from `resume_lsn` can catch up from the
-/// oplog, given its `min_lsn` (smallest retained) and `current_lsn` (watermark).
+/// Decide whether a client resuming from `resume` can catch up from the
+/// oplog, given its `min` (earliest retained) and `current` (watermark).
 ///
 /// `true` replays the gap; `false` forces a full resync. The rule:
 ///
-/// * `resume_lsn == 0` (never synced) always resyncs.
-/// * A non-empty log replays when `resume_lsn >= min_lsn`: everything the client
-///   is missing (LSNs greater than `resume_lsn`) is then retained. The check is
+/// * A resume at the origin (never synced) always resyncs.
+/// * A non-empty log replays when `resume >= min`: everything the client is
+///   missing (positions after `resume`) is then retained. The check is
 ///   deliberately conservative at the exact boundary, favoring a full resync
 ///   over a replay it cannot prove complete.
 /// * An empty log resyncs, whichever kind of empty it is. Nothing in it can
@@ -324,18 +346,18 @@ pub trait Oplog: Send + Sync {
 ///   silently, because the shipped binary keeps the log in memory (R32).
 #[must_use]
 pub fn catchup_decision(
-    resume_lsn: u64,
-    min_lsn: Option<u64>,
-    current_lsn: Option<u64>,
+    resume: PgCommitPosition,
+    min: Option<PgCommitPosition>,
+    current: Option<PgCommitPosition>,
 ) -> CatchupDecision {
-    if resume_lsn == 0 {
+    if resume.commit_lsn() == PgLsn(0) {
         return CatchupDecision::FullResync;
     }
-    match (min_lsn, current_lsn) {
+    match (min, current) {
         // Non-empty log: replay when the client sits at or after the oldest
         // retained entry, so nothing it is missing has been pruned.
         (Some(min), _) => {
-            if resume_lsn >= min {
+            if resume >= min {
                 CatchupDecision::Catchup
             } else {
                 CatchupDecision::FullResync
@@ -350,9 +372,9 @@ pub fn catchup_decision(
 /// Outcome of [`catchup_decision`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CatchupDecision {
-    /// Replay the oplog gap since the client's resume LSN.
+    /// Replay the oplog gap since the client's resume position.
     Catchup,
-    /// The resume LSN is outside the retained window: send a full snapshot.
+    /// The resume position is outside the retained window: send a full snapshot.
     FullResync,
 }
 
@@ -364,10 +386,12 @@ struct Entry {
 
 /// Mutable interior of an [`InMemoryOplog`].
 struct Inner {
-    /// Entries ordered by ascending LSN (equivalently, ascending append time).
+    /// Entries in commit order (equivalently, ascending append time).
     entries: VecDeque<Entry>,
-    /// Highest LSN ever appended. Monotone: never lowered by pruning.
-    max_lsn: Option<u64>,
+    /// Latest position ever appended. Monotone: never lowered by pruning.
+    max_position: Option<PgCommitPosition>,
+    /// The last commit recorded, the one ending furthest along the log.
+    last_commit: Option<PgCommit>,
 }
 
 /// An in-memory ring-buffer [`Oplog`] for Docker-free tests and single-node use.
@@ -395,7 +419,8 @@ impl InMemoryOplog {
         Self {
             inner: Mutex::new(Inner {
                 entries: VecDeque::new(),
-                max_lsn: None,
+                max_position: None,
+                last_commit: None,
             }),
             config,
             clock,
@@ -435,8 +460,12 @@ impl Oplog for InMemoryOplog {
     async fn append(&self, record: ChangeRecord) -> Result<(), Infallible> {
         let now = self.clock.now_micros();
         let mut inner = self.inner.lock();
-        let lsn = record.lsn();
-        inner.max_lsn = Some(inner.max_lsn.map_or(lsn, |prev| prev.max(lsn)));
+        let position = record.position();
+        // Positions arrive in commit order, so one at or before the latest was appended already.
+        if inner.max_position.is_some_and(|latest| position <= latest) {
+            return Ok(());
+        }
+        inner.max_position = Some(position);
         inner.entries.push_back(Entry {
             appended_micros: now,
             record,
@@ -449,12 +478,15 @@ impl Oplog for InMemoryOplog {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, Infallible> {
+    async fn entries_since(
+        &self,
+        after: PgCommitPosition,
+    ) -> Result<Vec<ChangeRecord>, Infallible> {
         let inner = self.inner.lock();
         Ok(inner
             .entries
             .iter()
-            .filter(|entry| entry.record.lsn() > lsn)
+            .filter(|entry| entry.record.position() > after)
             .map(|entry| entry.record.clone())
             .collect())
     }
@@ -463,25 +495,51 @@ impl Oplog for InMemoryOplog {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn min_lsn(&self) -> Result<Option<u64>, Infallible> {
+    async fn min_position(&self) -> Result<Option<PgCommitPosition>, Infallible> {
         let inner = self.inner.lock();
-        Ok(inner.entries.front().map(|entry| entry.record.lsn()))
+        Ok(inner.entries.front().map(|entry| entry.record.position()))
     }
 
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn current_lsn(&self) -> Result<Option<u64>, Infallible> {
-        Ok(self.inner.lock().max_lsn)
+    async fn current_position(&self) -> Result<Option<PgCommitPosition>, Infallible> {
+        Ok(self.inner.lock().max_position)
     }
 
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn forget_through(&self, lsn: u64) -> Result<(), Infallible> {
-        self.inner.lock().entries.retain(|e| e.record.lsn() > lsn);
+    async fn record_commit(&self, commit: PgCommit) -> Result<(), Infallible> {
+        let mut inner = self.inner.lock();
+        if inner
+            .last_commit
+            .is_none_or(|last| last.end_lsn() < commit.end_lsn())
+        {
+            inner.last_commit = Some(commit);
+        }
+        Ok(())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn last_commit(&self) -> Result<Option<PgCommit>, Infallible> {
+        Ok(self.inner.lock().last_commit)
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn forget_through(&self, through: PgCommitPosition) -> Result<(), Infallible> {
+        self.inner
+            .lock()
+            .entries
+            .retain(|e| e.record.position() > through);
         Ok(())
     }
 }
@@ -494,7 +552,7 @@ mod pg {
     use diesel::{QueryableByName, sql_query};
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::bb8::Pool;
-    use subql::ChangeEvent;
+    use subql::{ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn};
 
     use super::{CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Oplog, OplogConfig};
 
@@ -510,19 +568,22 @@ mod pg {
         /// A retained event could not be (de)serialized.
         #[error("oplog event codec error: {0}")]
         Codec(#[from] serde_json::Error),
-        /// An LSN did not fit the signed BIGINT column. Real `pg_lsn` values are
-        /// far below this bound, so this signals corruption or a bad write.
-        #[error("oplog lsn {0} is out of BIGINT range")]
+        /// A commit LSN or ordinal did not fit its signed BIGINT column. Real
+        /// values are far below this bound, so this signals corruption or a bad write.
+        #[error("oplog position part {0} is out of BIGINT range")]
         LsnRange(u64),
     }
 
     /// A Postgres-table [`Oplog`], the production target.
     ///
+    /// The last recorded commit lives in a one-row companion table named after
+    /// the log with `_commit` appended ([`PgOplog::commit_table`]).
+    ///
     /// The log is a single table, which a promoted standby carries with every
     /// other table. The row image plus routing metadata
     /// (`table_name`, `op`, `pk`, `is_tombstone`) are stored as typed columns for
-    /// indexing and observability, and the full [`ChangeEvent`] is stored as a
-    /// serialized blob so catchup replays it losslessly.
+    /// indexing and observability, and the decoded change is stored as a
+    /// serialized blob beside its position so catchup replays it losslessly.
     pub struct PgOplog {
         pool: Pool<diesel_async::AsyncPgConnection>,
         table: String,
@@ -533,7 +594,9 @@ mod pg {
     #[derive(QueryableByName)]
     struct OplogRow {
         #[diesel(sql_type = BigInt)]
-        lsn: i64,
+        commit_lsn: i64,
+        #[diesel(sql_type = BigInt)]
+        ordinal: i64,
         #[diesel(sql_type = Text)]
         table_name: String,
         #[diesel(sql_type = Binary)]
@@ -542,24 +605,44 @@ mod pg {
         event: Vec<u8>,
     }
 
-    /// A single scalar LSN read back from an aggregate query.
+    /// The recorded commit, read back from the companion table.
     #[derive(QueryableByName)]
-    struct LsnRow {
-        #[diesel(sql_type = diesel::sql_types::Nullable<BigInt>)]
-        lsn: Option<i64>,
+    struct CommitRow {
+        #[diesel(sql_type = BigInt)]
+        commit_lsn: i64,
+        #[diesel(sql_type = BigInt)]
+        end_lsn: i64,
     }
 
-    /// Widen an LSN into the signed BIGINT column. `pg_lsn` values fit i64, so an
+    /// One end of the retained window, read back from an ordered single-row query.
+    #[derive(QueryableByName)]
+    struct PositionRow {
+        #[diesel(sql_type = BigInt)]
+        commit_lsn: i64,
+        #[diesel(sql_type = BigInt)]
+        ordinal: i64,
+    }
+
+    /// Widen one position part into its signed BIGINT column. Both fit i64, so an
     /// overflow is corruption, surfaced rather than silently wrapped.
-    fn lsn_to_i64(lsn: u64) -> Result<i64, PgOplogError> {
-        i64::try_from(lsn).map_err(|_| PgOplogError::LsnRange(lsn))
+    fn part_to_i64(part: u64) -> Result<i64, PgOplogError> {
+        i64::try_from(part).map_err(|_| PgOplogError::LsnRange(part))
     }
 
-    /// Read an LSN back from the signed BIGINT column.
-    fn lsn_from_i64(value: i64) -> u64 {
-        // The column only ever holds values written by `lsn_to_i64`, which are
+    /// The two BIGINT columns a position is stored as.
+    fn position_to_i64(position: PgCommitPosition) -> Result<(i64, i64), PgOplogError> {
+        Ok((
+            part_to_i64(position.commit_lsn().0)?,
+            part_to_i64(position.ordinal())?,
+        ))
+    }
+
+    /// Read a position back from its two BIGINT columns.
+    fn position_from_i64(commit_lsn: i64, ordinal: i64) -> PgCommitPosition {
+        // The columns only ever hold values written by `part_to_i64`, which are
         // non-negative, so this widening is lossless.
-        u64::try_from(value).unwrap_or(0)
+        let part = |value: i64| u64::try_from(value).unwrap_or(0);
+        PgCommitPosition::new(PgLsn(part(commit_lsn)), part(ordinal))
     }
 
     impl PgOplog {
@@ -577,7 +660,13 @@ mod pg {
             }
         }
 
-        /// Create the `op` enum type and the oplog table if either is absent.
+        /// The companion table holding the last recorded commit, the log's name with `_commit` appended.
+        #[must_use]
+        pub fn commit_table(table: &str) -> String {
+            format!("{table}_commit")
+        }
+
+        /// Create the `op` enum type, the oplog table and its commit table if any is absent.
         ///
         /// Postgres has no `CREATE TYPE IF NOT EXISTS`, so the type goes in
         /// through a `DO` block that swallows only `duplicate_object`.
@@ -602,28 +691,42 @@ mod pg {
             sql_query(create_type).execute(&mut *conn).await?;
             let ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table} (\
-                     lsn BIGINT PRIMARY KEY, \
+                     commit_lsn BIGINT NOT NULL, \
+                     ordinal BIGINT NOT NULL, \
                      table_name TEXT NOT NULL, \
                      op {CHANGE_OP_TYPE} NOT NULL, \
                      pk BYTEA NOT NULL, \
                      is_tombstone BOOLEAN NOT NULL, \
                      event BYTEA NOT NULL, \
-                     appended_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+                     appended_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                     PRIMARY KEY (commit_lsn, ordinal))",
                 table = quote_ident(&self.table),
             );
             sql_query(ddl).execute(&mut *conn).await?;
+            let commit_ddl = format!(
+                "CREATE TABLE IF NOT EXISTS {table} (\
+                     only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row), \
+                     commit_lsn BIGINT NOT NULL, \
+                     end_lsn BIGINT NOT NULL)",
+                table = quote_ident(&Self::commit_table(&self.table)),
+            );
+            sql_query(commit_ddl).execute(&mut *conn).await?;
             Ok(())
         }
 
-        /// The LSN watermark from `expr` (`MIN(lsn)` or `MAX(lsn)`).
-        async fn watermark(&self, expr: &str) -> Result<Option<u64>, PgOplogError> {
+        /// One end of the window, `direction` being `ASC` for the earliest or `DESC` for the latest.
+        async fn end(&self, direction: &str) -> Result<Option<PgCommitPosition>, PgOplogError> {
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT {expr} AS lsn FROM {table}",
+                "SELECT commit_lsn, ordinal FROM {table} \
+                 ORDER BY commit_lsn {direction}, ordinal {direction} LIMIT 1",
                 table = quote_ident(&self.table),
             );
-            let row: LsnRow = sql_query(sql).get_result(&mut *conn).await?;
-            Ok(row.lsn.map(lsn_from_i64))
+            let rows: Vec<PositionRow> = sql_query(sql).load(&mut *conn).await?;
+            Ok(rows
+                .into_iter()
+                .next()
+                .map(|row| position_from_i64(row.commit_lsn, row.ordinal)))
         }
 
         /// Drop whatever the retention window no longer covers. Called by
@@ -634,8 +737,9 @@ mod pg {
             // Count-based: keep the newest `max_entries` rows, drop the rest.
             let keep = i64::try_from(self.config.max_entries).unwrap_or(i64::MAX);
             let by_count = format!(
-                "DELETE FROM {table} WHERE lsn IN (\
-                     SELECT lsn FROM {table} ORDER BY lsn DESC OFFSET $1)",
+                "DELETE FROM {table} WHERE (commit_lsn, ordinal) IN (\
+                     SELECT commit_lsn, ordinal FROM {table} \
+                     ORDER BY commit_lsn DESC, ordinal DESC OFFSET $1)",
             );
             sql_query(by_count)
                 .bind::<BigInt, _>(keep)
@@ -673,16 +777,17 @@ mod pg {
         }
 
         async fn append(&self, record: ChangeRecord) -> Result<(), PgOplogError> {
-            let event_bytes = serde_json::to_vec(record.event())?;
-            let lsn = lsn_to_i64(record.lsn())?;
+            let event_bytes = serde_json::to_vec(record.event().change())?;
+            let (commit_lsn, ordinal) = position_to_i64(record.position())?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "INSERT INTO {table} (lsn, table_name, op, pk, is_tombstone, event) \
-                 VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (lsn) DO NOTHING",
+                "INSERT INTO {table} (commit_lsn, ordinal, table_name, op, pk, is_tombstone, event) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (commit_lsn, ordinal) DO NOTHING",
                 table = quote_ident(&self.table),
             );
             sql_query(sql)
-                .bind::<BigInt, _>(lsn)
+                .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(ordinal)
                 .bind::<Text, _>(record.table().to_owned())
                 .bind::<ChangeOpSql, _>(record.op())
                 .bind::<Binary, _>(record.pk().to_vec())
@@ -693,47 +798,88 @@ mod pg {
             self.prune().await
         }
 
-        async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, PgOplogError> {
-            let lsn = lsn_to_i64(lsn)?;
+        async fn entries_since(
+            &self,
+            after: PgCommitPosition,
+        ) -> Result<Vec<ChangeRecord>, PgOplogError> {
+            let (commit_lsn, ordinal) = position_to_i64(after)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT lsn, table_name, pk, event FROM {table} WHERE lsn > $1 ORDER BY lsn",
+                "SELECT commit_lsn, ordinal, table_name, pk, event FROM {table} \
+                 WHERE (commit_lsn, ordinal) > ($1, $2) ORDER BY commit_lsn, ordinal",
                 table = quote_ident(&self.table),
             );
             let rows: Vec<OplogRow> = sql_query(sql)
-                .bind::<BigInt, _>(lsn)
+                .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(ordinal)
                 .load(&mut *conn)
                 .await?;
             rows.into_iter()
                 .map(|row| {
-                    let event: ChangeEvent = serde_json::from_slice(&row.event)?;
+                    let change: ChangeEvent = serde_json::from_slice(&row.event)?;
+                    let position = position_from_i64(row.commit_lsn, row.ordinal);
                     Ok(ChangeRecord::new(
-                        lsn_from_i64(row.lsn),
                         row.table_name,
                         row.pk,
-                        event,
+                        PgChangeEvent::new(change, position),
                     ))
                 })
                 .collect()
         }
 
-        async fn min_lsn(&self) -> Result<Option<u64>, PgOplogError> {
-            self.watermark("MIN(lsn)").await
+        async fn min_position(&self) -> Result<Option<PgCommitPosition>, PgOplogError> {
+            self.end("ASC").await
         }
 
-        async fn current_lsn(&self) -> Result<Option<u64>, PgOplogError> {
-            self.watermark("MAX(lsn)").await
+        async fn current_position(&self) -> Result<Option<PgCommitPosition>, PgOplogError> {
+            self.end("DESC").await
         }
 
-        async fn forget_through(&self, lsn: u64) -> Result<(), PgOplogError> {
-            let lsn = lsn_to_i64(lsn)?;
+        async fn record_commit(&self, commit: PgCommit) -> Result<(), PgOplogError> {
+            let commit_lsn = part_to_i64(commit.position().commit_lsn().0)?;
+            let end_lsn = part_to_i64(commit.end_lsn().0)?;
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let table = quote_ident(&Self::commit_table(&self.table));
+            let sql = format!(
+                "INSERT INTO {table} (commit_lsn, end_lsn) VALUES ($1, $2) \
+                 ON CONFLICT (only_row) DO UPDATE SET \
+                 commit_lsn = EXCLUDED.commit_lsn, end_lsn = EXCLUDED.end_lsn \
+                 WHERE {table}.end_lsn < EXCLUDED.end_lsn",
+            );
+            sql_query(sql)
+                .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(end_lsn)
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+
+        async fn last_commit(&self) -> Result<Option<PgCommit>, PgOplogError> {
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "DELETE FROM {table} WHERE lsn <= $1",
+                "SELECT commit_lsn, end_lsn FROM {table}",
+                table = quote_ident(&Self::commit_table(&self.table)),
+            );
+            let rows: Vec<CommitRow> = sql_query(sql).load(&mut *conn).await?;
+            let part = |value: i64| PgLsn(u64::try_from(value).unwrap_or(0));
+            Ok(rows.into_iter().next().map(|row| {
+                PgCommit::new(
+                    PgCommitPosition::at_commit(part(row.commit_lsn)),
+                    part(row.end_lsn),
+                )
+            }))
+        }
+
+        async fn forget_through(&self, through: PgCommitPosition) -> Result<(), PgOplogError> {
+            let (commit_lsn, ordinal) = position_to_i64(through)?;
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let sql = format!(
+                "DELETE FROM {table} WHERE (commit_lsn, ordinal) <= ($1, $2)",
                 table = quote_ident(&self.table),
             );
             sql_query(sql)
-                .bind::<BigInt, _>(lsn)
+                .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(ordinal)
                 .execute(&mut *conn)
                 .await?;
             Ok(())
@@ -768,24 +914,32 @@ mod tests {
         assert!(!PgOplog::is_transient(&PgOplogError::Codec(codec)));
     }
 
+    /// A row of one transaction at `lsn`.
+    fn at(lsn: u64) -> PgCommitPosition {
+        PgCommitPosition::new(PgLsn(lsn), 1)
+    }
+
     #[test]
     fn decision_zero_resume_always_resyncs() {
         assert_eq!(
-            catchup_decision(0, Some(1), Some(9)),
+            catchup_decision(at(0), Some(at(1)), Some(at(9))),
             CatchupDecision::FullResync,
         );
-        assert_eq!(catchup_decision(0, None, None), CatchupDecision::FullResync);
+        assert_eq!(
+            catchup_decision(at(0), None, None),
+            CatchupDecision::FullResync
+        );
     }
 
     #[test]
     fn decision_within_window_catches_up() {
-        // Client at or after the oldest retained LSN replays the gap.
+        // Client at or after the oldest retained position replays the gap.
         assert_eq!(
-            catchup_decision(5, Some(3), Some(9)),
+            catchup_decision(at(5), Some(at(3)), Some(at(9))),
             CatchupDecision::Catchup,
         );
         assert_eq!(
-            catchup_decision(3, Some(3), Some(9)),
+            catchup_decision(at(3), Some(at(3)), Some(at(9))),
             CatchupDecision::Catchup,
         );
     }
@@ -793,7 +947,7 @@ mod tests {
     #[test]
     fn decision_behind_window_resyncs() {
         assert_eq!(
-            catchup_decision(2, Some(3), Some(9)),
+            catchup_decision(at(2), Some(at(3)), Some(at(9))),
             CatchupDecision::FullResync,
         );
     }
@@ -802,11 +956,70 @@ mod tests {
     fn decision_empty_log_resyncs() {
         // Never recorded, which is what every restart looks like: the log
         // cannot prove the client is current, so it must not claim to.
-        assert_eq!(catchup_decision(5, None, None), CatchupDecision::FullResync);
+        assert_eq!(
+            catchup_decision(at(5), None, None),
+            CatchupDecision::FullResync
+        );
         // Recorded then fully pruned: same answer for the same reason.
         assert_eq!(
-            catchup_decision(5, None, Some(9)),
+            catchup_decision(at(5), None, Some(at(9))),
             CatchupDecision::FullResync,
+        );
+    }
+
+    /// An insert of `id` into `orders` at `position`.
+    fn row(id: i64, position: PgCommitPosition) -> ChangeRecord {
+        use subql::ChangeEvent;
+        let mut data = pg_walstream::RowData::with_capacity(1);
+        data.push(
+            Arc::from("id"),
+            pg_walstream::ColumnValue::text(&id.to_string()),
+        );
+        let change = ChangeEvent::insert(
+            "public",
+            "orders",
+            1,
+            data,
+            pg_walstream::Lsn::new(position.commit_lsn().0),
+        );
+        ChangeRecord::new(
+            "orders",
+            id.to_be_bytes().to_vec(),
+            PgChangeEvent::new(change, position),
+        )
+    }
+
+    /// Two rows of one transaction share its commit LSN, so a client holding the first still catches up the second.
+    #[tokio::test]
+    async fn a_cursor_at_a_transactions_first_row_replays_its_second() {
+        let log = InMemoryOplog::default();
+        let first = PgCommitPosition::new(PgLsn(0x100), 1);
+        let second = PgCommitPosition::new(PgLsn(0x100), 2);
+        log.append(row(1, first)).await.expect("append");
+        log.append(row(2, second)).await.expect("append");
+        let replayed: Vec<_> = log
+            .entries_since(first)
+            .await
+            .expect("read")
+            .iter()
+            .map(ChangeRecord::position)
+            .collect();
+        assert_eq!(replayed, vec![second]);
+    }
+
+    /// A row delivered again after a failed dispatch is kept once.
+    #[tokio::test]
+    async fn a_row_appended_again_is_kept_once() {
+        let log = InMemoryOplog::default();
+        let position = PgCommitPosition::new(PgLsn(0x100), 1);
+        log.append(row(1, position)).await.expect("append");
+        log.append(row(1, position)).await.expect("append again");
+        assert_eq!(
+            log.entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+                .await
+                .expect("read")
+                .len(),
+            1
         );
     }
 }
