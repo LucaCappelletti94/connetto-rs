@@ -25,9 +25,10 @@ use connetto_test_harness::{Fixture, PUBLICATION, SLOT};
 use openidconnect::reqwest;
 
 use super::e2e::{
-    Authorization, ChildGuard, NO_POLICIES, PG_DDL, PG_SERIAL, QUERY, ReplicaDir, build_auth_stack,
-    client_bin, free_port, keyring_entry, mint_refresh_token, mint_token, orders, reset_fixture,
-    spawn_client_env, spawn_server_cfg, wait_for_port, wait_for_rows, with_user_url,
+    Authorization, ChildGuard, NO_POLICIES, PG_DDL, PG_SERIAL, Ports, QUERY, ReplicaDir,
+    build_auth_stack, client_bin, keyring_entry, mint_refresh_token, mint_token, orders,
+    reset_fixture, restart_server, spawn_client_env, spawn_server_cfg, start_server, wait_for_rows,
+    with_user_url,
 };
 
 /// How the deployment backs up and restores.
@@ -321,16 +322,6 @@ async fn seeded_primary(fixture: &Fixture, url: &str) -> Pool<AsyncPgConnection>
     primary
 }
 
-/// Wait until every listener accepts a connection.
-async fn await_listening(addrs: [&str; 2]) {
-    for addr in addrs {
-        assert!(
-            wait_for_port(addr, Duration::from_secs(30)).await,
-            "{addr} did not open"
-        );
-    }
-}
-
 async fn demonstrate(method: Method) -> Observation {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     assert!(client_bin().exists(), "build the client binary first");
@@ -342,37 +333,37 @@ async fn demonstrate(method: Method) -> Observation {
 
     let keys = tempfile::tempdir().expect("tempdir");
     let (private, public) = signing_keys(&keys);
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let auth_stack = build_auth_stack(auth_port).await;
-    let mut envs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    envs.push(("CONNETTO_JWT_PRIVATE_KEY_FILE", &private));
-    envs.push(("CONNETTO_JWT_PUBLIC_KEY_FILE", &public));
-    envs.push(("CONNETTO_AUTH", "database"));
-    let auth_bind = format!("127.0.0.1:{auth_port}");
+    let auth_stack = build_auth_stack().await;
+    let extra = [
+        ("CONNETTO_JWT_PRIVATE_KEY_FILE", private.as_str()),
+        ("CONNETTO_JWT_PUBLIC_KEY_FILE", public.as_str()),
+        ("CONNETTO_AUTH", "database"),
+    ];
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     let secs = Duration::from_secs(30);
 
     let reader = with_user_url(&primary_url, "app_reader", "app_reader");
-    let server = spawn_server_cfg(
-        &primary_url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader),
-        &authorization,
-        &envs,
-    );
-    await_listening([&bind, &auth_bind]).await;
-    let (token, _) = mint_token(&auth_stack.auth_base).await;
-    let holder = mint_refresh_token(&auth_stack.auth_base).await;
-    let stale = mint_refresh_token(&auth_stack.auth_base).await;
+    let spawn_on = |database_url: &str, reader: &str, ports: Ports, auth_pairs: &[(&str, &str)]| {
+        let mut envs = auth_pairs.to_vec();
+        envs.extend(extra);
+        spawn_server_cfg(
+            database_url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(reader),
+            &authorization,
+            &envs,
+        )
+    };
+    let (server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_on(&primary_url, &reader, ports, auth_pairs)
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
+    let (token, _) = mint_token(&auth_base).await;
+    let holder = mint_refresh_token(&auth_base).await;
+    let stale = mint_refresh_token(&auth_base).await;
 
     let mut dir = ReplicaDir::new();
     let db = dir.replica("restore-client.db");
@@ -383,16 +374,8 @@ async fn demonstrate(method: Method) -> Observation {
         "the client syncs the seed"
     );
 
-    let (holder, client_before) = back_up_then_advance(
-        &fixture,
-        method,
-        &primary,
-        &auth_stack.auth_base,
-        holder,
-        &stale,
-        &db,
-    )
-    .await;
+    let (holder, client_before) =
+        back_up_then_advance(&fixture, method, &primary, &auth_base, holder, &stale, &db).await;
 
     // A client binary exits when its server goes away, so the restart below is
     // the application relaunching on the replica it already holds.
@@ -404,20 +387,14 @@ async fn demonstrate(method: Method) -> Observation {
 
     let restored = pool_for(&target_url).await;
     let reader = with_user_url(&target_url, "app_reader", "app_reader");
-    let _server = spawn_server_cfg(
-        &target_url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader),
-        &authorization,
-        &envs,
-    );
-    await_listening([&bind, &auth_bind]).await;
-    let (holder_refresh_after_restore, _) = refresh(&auth_stack.auth_base, &holder).await;
-    let (stale_refresh_after_restore, _) = refresh(&auth_stack.auth_base, &stale).await;
+    let _server = restart_server(&auth_stack, ports, secs, |ports, auth_pairs| {
+        spawn_on(&target_url, &reader, ports, auth_pairs)
+    })
+    .await;
+    let (holder_refresh_after_restore, _) = refresh(&auth_base, &holder).await;
+    let (stale_refresh_after_restore, _) = refresh(&auth_base, &stale).await;
     insert_order(&restored, 6).await;
-    let (token, _) = mint_token(&auth_stack.auth_base).await;
+    let (token, _) = mint_token(&auth_base).await;
     let _client = launch(&ws, &db, &token);
     // No count to wait for, since which count is right is what is being
     // observed, so the client gets a fixed time to catch up or resync.
@@ -554,29 +531,21 @@ async fn authorization_facts_across_a_restore() {
         .start_replication(&["docs", "project_members"])
         .await;
     let authorization = Authorization::provision(&fixture, MEMBERSHIP_POLICIES).await;
-    let bind = format!("127.0.0.1:{}", free_port());
     let reader = with_user_url(&url, "app_reader", "app_reader");
     let secs = Duration::from_secs(30);
-    let auth_stack = build_auth_stack(free_port()).await;
-    let auth: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
-    let server = spawn_server_cfg(
-        &url,
-        &bind,
-        MEMBERSHIP_DDL,
-        "",
-        Some(&reader),
-        &authorization,
-        &auth,
-    );
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
+    let auth_stack = build_auth_stack().await;
+    let spawn = |ports: Ports, auth_pairs: &[(&str, &str)]| {
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            MEMBERSHIP_DDL,
+            "",
+            Some(&reader),
+            &authorization,
+            auth_pairs,
+        )
+    };
+    let (server, ports) = start_server(&auth_stack, secs, spawn).await;
     let alice_at_boot = await_tuples(&authorization, "alice").await;
 
     fixture.shell(DUMP).await;
@@ -597,19 +566,7 @@ async fn authorization_facts_across_a_restore() {
             "psql -d postgres -q -c \"SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')\""
         ))
         .await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        MEMBERSHIP_DDL,
-        "",
-        Some(&reader),
-        &authorization,
-        &auth,
-    );
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "the restored server did not open {bind}"
-    );
+    let _server = restart_server(&auth_stack, ports, secs, spawn).await;
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     eprintln!(
