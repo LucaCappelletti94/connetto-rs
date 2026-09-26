@@ -1007,6 +1007,20 @@ mod tests {
         assert_eq!(replayed, vec![second]);
     }
 
+    /// The recorded commit only moves forward, since the slot never resumes before a commit it was released past.
+    #[tokio::test]
+    async fn the_later_of_two_recorded_commits_stands() {
+        let log = InMemoryOplog::default();
+        let earlier = PgCommit::new(PgCommitPosition::at_commit(PgLsn(0x100)), PgLsn(0x130));
+        let later = PgCommit::new(PgCommitPosition::at_commit(PgLsn(0x200)), PgLsn(0x230));
+        assert_eq!(log.last_commit().await.expect("read"), None);
+        log.record_commit(later).await.expect("record");
+        log.record_commit(earlier)
+            .await
+            .expect("record an older commit");
+        assert_eq!(log.last_commit().await.expect("read"), Some(later));
+    }
+
     /// A row delivered again after a failed dispatch is kept once.
     #[tokio::test]
     async fn a_row_appended_again_is_kept_once() {

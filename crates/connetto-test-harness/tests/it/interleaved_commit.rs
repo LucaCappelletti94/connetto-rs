@@ -46,14 +46,17 @@ fn inserted_ids(patchset_zstd: &[u8]) -> Vec<i64> {
 }
 
 /// Read live patches until `expected` ids have all arrived, returning the ids in arrival order and each patch's position.
+///
+/// One deadline covers the whole read, since a feed that restarts on a change it cannot place delivers the same earlier row again and again.
 async fn receive(client: &mut Client, expected: &BTreeSet<i64>) -> Vec<(i64, Position)> {
+    let deadline = tokio::time::Instant::now() + DELIVERY;
     let mut arrived = Vec::new();
     while !expected
         .iter()
         .all(|id| arrived.iter().any(|(seen, _)| seen == id))
     {
         let patch = client
-            .try_live(DELIVERY)
+            .try_live(deadline.saturating_duration_since(tokio::time::Instant::now()))
             .await
             .unwrap_or_else(|| panic!("only {arrived:?} of {expected:?} arrived"));
         let position = Position::from_cursor_bytes(patch.cursor.as_bytes()).expect("a live cursor");
