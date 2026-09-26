@@ -290,3 +290,98 @@ async fn catching_up_leaves_the_same_rows_as_staying_connected() {
     back.close().await;
     drop(server);
 }
+
+/// A change committed while a snapshot is being read reaches a caller who
+/// resumes from that snapshot's cursor, even when the connection dropped
+/// before the change's own live patch arrived.
+///
+/// The read is slowed by a policy that sleeps under the snapshot's repeatable
+/// read, so the insert commits after the read's MVCC snapshot is taken and
+/// before the read ends. The caller keeps the `SnapshotEnd` cursor, which is
+/// what a client persists as its resume point, and never applies the patch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_committed_during_a_snapshot_read_survives_a_resume_from_its_cursor() {
+    let fixture = Fixture::acquire().await;
+    let server = visibility_fixture(&fixture).await;
+    fixture
+        .exec("INSERT INTO items (id, owner, label) VALUES (61, 'alice', 'before')")
+        .await;
+    fixture
+        .exec(
+            "CREATE FUNCTION slow_snapshot_read() RETURNS boolean LANGUAGE plpgsql AS $$ \
+             BEGIN \
+               IF current_setting('transaction_isolation') = 'repeatable read' THEN \
+                 PERFORM pg_sleep(2); \
+               END IF; \
+               RETURN true; \
+             END $$; \
+             CREATE POLICY slow_snapshot ON items AS RESTRICTIVE USING (slow_snapshot_read())",
+        )
+        .await;
+
+    let mut alice = server.connect();
+    alice.handshake_with("r6-gap", "user:alice#gap").await;
+    alice.subscribe("items", QUERY).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    fixture
+        .exec("INSERT INTO items (id, owner, label) VALUES (62, 'alice', 'during')")
+        .await;
+
+    let mut replica = Replica::new();
+    let resume_from = loop {
+        match tokio::time::timeout(DELIVERY, alice.recv())
+            .await
+            .expect("the snapshot completes")
+        {
+            Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
+                replica.apply(&patch.patchset_zstd);
+            }
+            Some(IncomingFrame::Control(ControlMessage::SnapshotEnd(end))) => break end.cursor,
+            Some(IncomingFrame::Control(_)) => {}
+            other => panic!("expected the snapshot, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        replica.ids(),
+        vec![61],
+        "the insert has to land after the read's snapshot for this run to test anything"
+    );
+    // The change was ingested and sent, and this caller drops before applying it.
+    alice.wait_for_live(DELIVERY).await;
+    alice.close().await;
+
+    let mut back = server.connect();
+    back.handshake_resuming("r6-gap", "user:alice#gap", resume_from)
+        .await;
+    back.subscribe("items", QUERY).await;
+    let mut replaced = false;
+    loop {
+        match tokio::time::timeout(QUIET, back.recv()).await {
+            Ok(Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch)))) => {
+                replica.apply(&patch.patchset_zstd);
+            }
+            Ok(Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch)))) => {
+                replaced = true;
+                replica.apply(&patch.patchset_zstd);
+            }
+            Ok(Some(IncomingFrame::Control(ControlMessage::FullResyncRequired(_)))) => {
+                replaced = true;
+            }
+            Ok(Some(IncomingFrame::Control(_))) => {}
+            Ok(Some(IncomingFrame::Bulk(other))) => panic!("unexpected bulk frame: {other:?}"),
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        !replaced,
+        "the resume was answered with a fresh copy instead of a catch-up, so this run \
+         says nothing about the cursor the catch-up starts from"
+    );
+    assert_eq!(
+        replica.ids(),
+        vec![61, 62],
+        "the row committed during the read reaches the device after the resume"
+    );
+    back.close().await;
+    drop(server);
+}
