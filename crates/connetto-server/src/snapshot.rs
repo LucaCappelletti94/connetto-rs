@@ -749,13 +749,18 @@ mod pg {
                 .get()
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
-            let (read, lsn) = conn
-                .transaction::<(BinaryRows, String), diesel::result::Error, _>(async move |c| {
-                    // Pin one MVCC snapshot so this page's rows and its LSN
-                    // agree. Successive pages are separate moments by
-                    // design (R58 decision 9): a page is read after every
-                    // frame already sent, so it can never carry a value
-                    // older than one the client has applied.
+            // Read before the transaction, so the cursor never counts a change the snapshot below cannot see.
+            let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
+                .get_result(&mut conn)
+                .await
+                .map_err(|err| SnapshotError::Backend(err.to_string()))?;
+            let lsn = lsn.lsn;
+            let read = conn
+                .transaction::<BinaryRows, diesel::result::Error, _>(async move |c| {
+                    // Successive pages are separate moments by design (R58
+                    // decision 9): a page is read after every frame already
+                    // sent, so it can never carry a value older than one the
+                    // client has applied.
                     sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                         .execute(c)
                         .await?;
@@ -769,11 +774,7 @@ mod pg {
                     // Establish the requesting caller's RLS context so the
                     // read returns only rows it may see.
                     binding.apply(c).await?;
-                    let read = BinaryRows::load(c, query).await?;
-                    let lsn: LsnRow = sql_query("SELECT pg_current_wal_lsn()::text AS lsn")
-                        .get_result(c)
-                        .await?;
-                    Ok((read, lsn.lsn))
+                    BinaryRows::load(c, query).await
                 })
                 .await
                 .map_err(|err| {
