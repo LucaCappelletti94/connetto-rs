@@ -145,7 +145,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R30~~ | Grouped aggregates revisited, a design, from which R82 to R85 derive |
 | done | ~~R88~~ | The mobile build of a demo, Android on this workstation, iOS through the Mac |
 | blocked | R51 | Native Apple gate. Blocked on R94's gate setting, with two upstream keychain changes patched in until released, R88's iOS leg being done |
-| blocked | R52 | Native Android gate. Blocked on R94's gate setting, R88's Android leg being done |
+| blocked | R52 | Native Android gate. Blocked on R94's gate setting, with one upstream keystore change patched in until released, R88's Android leg being done |
 | blocked | R53 | Windows gate. Blocked on hardware |
 | any | R21 | One page codec. Its step zero decides whether the phase proceeds at all |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
@@ -210,7 +210,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
 | R23 user-verified unlock (browser gate, custody, chapter 14) | **DONE** (2026-08-20) | nothing. Nine decisions recorded in the R23 section. Natives and Windows split to R51, R52, R53 | no |
 | R51 native Apple gate | NOT STARTED, probe I5 measured 2026-09-25 | R94, whose `Gate` setting carries the default and the re-check, and the shared-authentication changes requested of `apple-native-keyring-store` (#26) and `security-framework` (#263, #264) on 2026-09-25, taken through pinned patches until released. Split out of R23 (2026-08-19), mechanism measured on macOS and on the iPhone and iPad | no |
-| R52 native Android gate | NOT STARTED | R94, whose `Gate` setting carries the default and the re-check. Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
+| R52 native Android gate | NOT STARTED, device probe measured 2026-09-26 | R94, whose `Gate` setting carries the default and the re-check, and the unlock-once store option requested of `android-native-keyring-store` under #16 on 2026-09-26, taken through a pinned patch until released. Split out of R23 (2026-08-19), mechanism measured on the Galaxy M52 | no |
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
@@ -402,6 +402,7 @@ graph TD
   R94[R94 one client builder per platform] --> R51
   U8[upstream apple-native-keyring-store and security-framework:<br/>one authentication shared across keychain reads] -.->|patched until released| R51
   R94 --> R52
+  U9[upstream android-native-keyring-store:<br/>one approval opens the store until locked] -.->|patched until released| R52
   R94 --> R95[R95 share keys on a running client]
   R96[R96 one server builder]
   R26 --> R56[R56 local data import]
@@ -2736,15 +2737,36 @@ The probe app remains the platform evidence for prompting behaviour, since provi
 
 ## R52: native Android gate for stored secrets
 
-**Status.** NOT STARTED. Split out of R23 on 2026-08-19.
+**Status.** NOT STARTED, device probe measured on the Galaxy M52 2026-09-26. Split out of R23 on 2026-08-19.
 
-**Blocked on R94 for its wiring only**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). Its device probe on the Galaxy M52, the decision on how Android reaches one prompt per launch, and its upstream request are not blocked and come first. `android-native-keyring-store` 1.0.0, which the tree installs (`install_keyring_store` in `crates/connetto-client/src/auth.rs`), creates its one Keystore key per store with `set_user_authentication_required(false)` and offers no option, so an opt-in is requested upstream and patched in until released, as R51 does. R88's Android leg is the installed app this phase's Keystore key and `BiometricPrompt` shell live in, and it wires the ungated `android-native-keyring-store` entry this phase replaces with the hand-built gated key.
+**Blocked on R94 for its wiring only**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). Its probe, its decision and its upstream request are done, and the upstream change below is patched in until released. R88's Android leg is the installed app this phase's gated store and `BiometricPrompt` live in.
 
-Gate both items through a Keystore key requiring user authentication (probe A6: `set_user_authentication_required(true)` gates correctly, an ungated read is refused by the Keystore), reached through `android-native-keyring-store` with the opt-in requested upstream. Whether that key is per-use or time-bound, how many prompts a launch then raises, and whether adding a fingerprint destroys it are unmeasured and decided from the device probe. The prompt (`BiometricPrompt`) belongs to the application shell, in the Kotlin layer of `connetto-auth-session`, and the demo carries it. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
+Gate the two stores behind the R41 seam through `android-native-keyring-store` (1.0.0 in the lockfile, installed by `install_keyring_store` in `crates/connetto-client/src/auth.rs`), which creates its one Keystore key per store with `set_user_authentication_required(false)` (`src/by_store/vault.rs:276`) and offers no option. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
+
+**The device probe ran on 2026-09-26** on the Galaxy M52 (Android 13, TEE-backed keys), a throwaway Java class in the demo's Android module building keys as the crate does except for the authentication parameters. The measurements are in `plans/r52-android-gate.md`. Six results bind this phase.
+
+- **A per-use key raises a prompt for every read and every write.** An approved `CryptoObject` covers exactly one operation, and a prompt without one never opens the key.
+- **A time-bound key opens for its timeout after any strong authentication, the phone's own unlock included.** A PIN or fingerprint unlock reopened the probe keys with no prompt from the app, and so did a fingertip on the M52's power-key sensor while locking. The key stays open through a screen lock. So the app's prompt adds nothing after a recent unlock, and the window is fixed when the key is made.
+- **A key accepting the fingerprint alone dies when a finger is re-registered**, per use as `KeyPermanentlyInvalidatedException`, time-bound as a `UserNotAuthenticatedException` no approval clears. Every key that also accepts the PIN survived.
+- **Removing the screen lock deletes every gated key**, and no gated key can be created without one. Face on the M52 is `BIOMETRIC_WEAK`, which the Keystore accepts for no key.
+- **Samsung froze the app 70 s after it went to the background**, so time away is measured from timestamps on return, as R94 decision 9 says.
+- **The crate reports a refusal for missing authentication as a generic platform failure or as corrupt data**, and its code replaces a deleted store key with a fresh one beside the old entries, which then read as corrupt.
+
+**Decided 2026-09-26 with the maintainer: one approval per launch opens the store until connetto locks it**, through a store option requested upstream. A per-use Keystore key unwraps the store's data key once at launch through a `CryptoObject` the app approves, the store holds that key in memory, and a lock call drops it, which is where R94's re-check grace acts. It is the same bearer capability as R51's shared `LAContext`. Rejected: reviving PR #14's time-bound switch, since any unlock of the phone reopens the secrets and a token rotation after the window prompts again, and a connetto-owned Android store, which reverses R51's choice of upstream changes over code connetto maintains.
+
+**Two points follow from the measurements and were not asked.** The key accepts `AUTH_BIOMETRIC_STRONG | AUTH_DEVICE_CREDENTIAL`, never the fingerprint alone. `BiometricPrompt` lives in `connetto-auth-session`'s Kotlin layer, since the crate is pure JNI and cannot subclass the prompt's callback.
+
+**Requested upstream on 2026-09-26** of `open-source-cooperative/android-native-keyring-store`, under its open issue #16, which asks for biometric support as a store option (PR #14, a time-bound switch, was closed by a force-push of `main` and never resubmitted). The request also asks for a recognisable "unlock first" error and for a lost key to be reported rather than replaced. The document is `upstream/android-native-keyring-store-user-authentication.md`, carried by the upstream session on branch `upstream/store-unlock-once` of the maintainer's fork.
+
+### Steps
+
+1. ~~Probe the Keystore on the Galaxy M52.~~ **Done 2026-09-26**, results above.
+2. Patch `android-native-keyring-store` to the fork branch in the root and demo workspaces through `[patch.crates-io]`, pinned by `rev` to the head of its pull request, and check the Android build.
+3. Wire the gated store behind the seam with the unlock prompt in `connetto-auth-session`, report through R23's custody surface, treat a deleted store key as R23's wipe-and-resync, and extend chapter 14.
 
 ### Proof
 
-On the physical device, per the probe's A4 rule that the emulator on hand is not evidence for this platform.
+On the physical device, per the probe's A4 rule that the emulator on hand is not evidence for this platform. connetto's wiring is proven by a locked store refusing reads and writes, plus custody tests.
 
 ---
 
