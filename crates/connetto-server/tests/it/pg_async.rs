@@ -31,7 +31,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 
 diesel::table! {
     /// Row from the notes test fixture.
@@ -485,17 +485,20 @@ async fn pg_oplog_appends_and_reads_back() {
     // test-side stamping is needed.
     let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
-    let mut expected: Vec<(u64, String, bool, Vec<u8>)> = Vec::new();
+    let mut expected: Vec<(PgCommitPosition, String, bool, Vec<u8>)> = Vec::new();
     for sql in [
         "INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'paid')",
         "UPDATE orders SET quantity = 7 WHERE id = 1",
         "DELETE FROM orders WHERE id = 1",
     ] {
         source.execute_sql(sql).expect("execute dml");
-        while let Some(event) = source.next_event().await.expect("poll source") {
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            let SourceItem::Event(event) = item else {
+                continue;
+            };
             let record = mat.oplog_record(&event).expect("build oplog record");
             expected.push((
-                record.lsn(),
+                record.position(),
                 record.table().to_owned(),
                 record.is_tombstone(),
                 record.pk().to_vec(),
@@ -504,21 +507,27 @@ async fn pg_oplog_appends_and_reads_back() {
         }
     }
     assert_eq!(expected.len(), 3, "one record per statement");
-    let first_lsn = expected[0].0;
-    let last_lsn = expected[expected.len() - 1].0;
+    let first_position = expected[0].0;
+    let last_position = expected[expected.len() - 1].0;
 
-    assert_eq!(oplog.min_lsn().await.expect("min lsn"), Some(first_lsn));
     assert_eq!(
-        oplog.current_lsn().await.expect("current lsn"),
-        Some(last_lsn)
+        oplog.min_position().await.expect("min position"),
+        Some(first_position)
+    );
+    assert_eq!(
+        oplog.current_position().await.expect("current position"),
+        Some(last_position)
     );
 
-    let entries = oplog.entries_since(0).await.expect("read entries");
-    let got: Vec<(u64, String, bool, Vec<u8>)> = entries
+    let entries = oplog
+        .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+        .await
+        .expect("read entries");
+    let got: Vec<(PgCommitPosition, String, bool, Vec<u8>)> = entries
         .iter()
         .map(|record| {
             (
-                record.lsn(),
+                record.position(),
                 record.table().to_owned(),
                 record.is_tombstone(),
                 record.pk().to_vec(),
@@ -538,12 +547,15 @@ async fn pg_oplog_appends_and_reads_back() {
         "the delete round-trips as a tombstone",
     );
 
-    // A mid-stream read returns only the entries after the given LSN.
-    let tail = oplog.entries_since(first_lsn).await.expect("read tail");
+    // A mid-stream read returns only the entries after the given position.
+    let tail = oplog
+        .entries_since(first_position)
+        .await
+        .expect("read tail");
     assert_eq!(
         tail.len(),
         2,
-        "entries_since is strictly greater than the lsn"
+        "entries_since is strictly after the position"
     );
 
     // Nothing in the read path consults the verb column, so these three
@@ -551,10 +563,12 @@ async fn pg_oplog_appends_and_reads_back() {
     // text. Each pins something the others do not: the values written, the
     // column's declared type, and the refusal.
     let mut conn = pool.get().await.expect("get connection");
-    let ops: Vec<OpRow> = sql_query("SELECT op FROM connetto_oplog_test ORDER BY lsn")
-        .load(&mut *conn)
-        .await
-        .expect("read the verbs back");
+    // `ORDER BY` on a dynamic table name requires raw SQL; no typed `table!` covers it.
+    let ops: Vec<OpRow> =
+        sql_query("SELECT op FROM connetto_oplog_test ORDER BY commit_lsn, ordinal")
+            .load(&mut *conn)
+            .await
+            .expect("read the verbs back");
     assert_eq!(
         ops.iter().map(|row| row.op).collect::<Vec<_>>(),
         vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
@@ -575,8 +589,8 @@ async fn pg_oplog_appends_and_reads_back() {
     // No cast, so the column's own type is what rejects this.
     let refused = sql_query(
         "INSERT INTO connetto_oplog_test \
-         (lsn, table_name, op, pk, is_tombstone, event) \
-         VALUES (9999, 'orders', 'nonsense', '\\x00', false, '\\x00')",
+         (commit_lsn, ordinal, table_name, op, pk, is_tombstone, event) \
+         VALUES (9999, 0, 'orders', 'nonsense', '\\x00', false, '\\x00')",
     )
     .execute(&mut *conn)
     .await;
@@ -634,7 +648,10 @@ async fn pg_oplog_round_trips_a_composite_key() {
         "INSERT INTO pairs (tenant, id, note) VALUES ('acme', 2, 'third')",
     ] {
         source.execute_sql(sql).expect("execute dml");
-        while let Some(event) = source.next_event().await.expect("poll source") {
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            let SourceItem::Event(event) = item else {
+                continue;
+            };
             let record = mat.oplog_record(&event).expect("build oplog record");
             appended.push(record.pk().to_vec());
             oplog.append(record).await.expect("append record");
@@ -642,7 +659,10 @@ async fn pg_oplog_round_trips_a_composite_key() {
     }
     assert_eq!(appended.len(), 3, "one record per insert");
 
-    let entries = oplog.entries_since(0).await.expect("read entries");
+    let entries = oplog
+        .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+        .await
+        .expect("read entries");
     let read_back: Vec<Vec<u8>> = entries.iter().map(|r| r.pk().to_vec()).collect();
     assert_eq!(
         read_back, appended,

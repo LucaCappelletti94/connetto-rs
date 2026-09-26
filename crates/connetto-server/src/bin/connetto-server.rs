@@ -886,21 +886,23 @@ async fn prepare_change_log(
     // watermark table (see `docs/architecture/11-authentication.md`) and the
     // `ConnettoWatermark` reference schema keys on it.
     //
-    // The same rule makes these four a startup refusal rather than a
+    // The same rule makes these five a startup refusal rather than a
     // discovery. Absent, the slot and the publication turn the change stream
-    // into a retry loop that never succeeds, and the oplog table turns the
-    // first change into a failure on a boot that looked healthy (R32). The
-    // fourth is a property rather than an object: a replicated table that does
+    // into a retry loop that never succeeds, and the oplog table and its commit
+    // table turn the first change into a failure on a boot that looked healthy
+    // (R32). The fifth is a property rather than an object: a replicated table that does
     // not record the row as it was cannot answer whether a caller could see the
     // version that has just gone, so the change path refuses that table on
     // every event (R6). Checked after the publication, since it reads the
     // publication's own table list.
+    let commit_table = PgOplog::commit_table(oplog_table);
     preflight::require(
         pool,
         &[
             Artifact::ReplicationSlot(slot),
             Artifact::Publication(publication),
             Artifact::Table(oplog_table),
+            Artifact::Table(&commit_table),
             Artifact::PreviousImages { publication },
         ],
     )
@@ -1577,9 +1579,8 @@ async fn run(
     let ddl = pg_ddl.to_owned();
     tokio::spawn(async move {
         // Reconnect the replication stream forever. An ordinary drop loses no
-        // events, because the slot resumes from its confirmed position, which
-        // is behind what was already delivered and logged.
-        let connect = || {
+        // events, because the stream resumes right after the last one dispatched.
+        let connect = |resume: connetto_server::ResumePoint| {
             let (url, slot, publication, ddl) =
                 (url.clone(), slot.clone(), publication.clone(), ddl.clone());
             let (pool, manager, service) =
@@ -1592,7 +1593,8 @@ async fn run(
                     .await
                     .map_err(|err| anyhow!("{err}"))?;
                 settle_epoch(&manager, &service, &pool, check, Found::WhileRunning).await?;
-                let config = PgStreamingConfig::new(url, slot, publication);
+                // Read after the checks, which clear it on a changed timeline or a skipped stretch.
+                let config = PgStreamingConfig::new(url, slot, publication).start(resume.get());
                 PgStreamingCdcSource::connect(config, catalog)
                     .await
                     .map_err(|err| anyhow!("opening CDC stream: {err}"))

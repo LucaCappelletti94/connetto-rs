@@ -1245,7 +1245,7 @@ pub trait StoreUpkeep: Send + Sync {
     /// the event arrived on.
     fn keep_current<'a>(
         &'a self,
-        event: &'a subql::ChangeEvent,
+        event: &'a subql::PgChangeEvent,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>>;
 }
 
@@ -1278,7 +1278,7 @@ where
 {
     fn keep_current<'a>(
         &'a self,
-        event: &'a subql::ChangeEvent,
+        event: &'a subql::PgChangeEvent,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
         Box::pin(async move {
             let (diff, requeries) = match self.shapes.diff(event) {
@@ -1695,7 +1695,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
     /// leaves the gate to the replay.
     fn moved(
         &self,
-        event: &subql::ChangeEvent,
+        event: &subql::PgChangeEvent,
         diff: &StoreDiff,
         replayed: &BTreeMap<String, String>,
     ) -> Vec<GrantMove> {

@@ -26,7 +26,7 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::sync::Mutex;
 
 const PG_DDL: &str =
@@ -173,7 +173,10 @@ async fn target_rows(fixture: &Fixture, id: i64) -> Vec<Order> {
 /// to whatever sessions are alive.
 async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await

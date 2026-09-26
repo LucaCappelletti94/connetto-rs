@@ -22,8 +22,8 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog, OplogConfig, PgOplog,
-    PgSnapshotSource, Position, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager,
-    TimelineHistory, loopback, pg_write_target, timeline,
+    PgSnapshotSource, Position, ReconnectPolicy, RequestGuard, ResumePoint, SessionConfig,
+    SessionManager, TimelineHistory, loopback, pg_write_target, timeline,
 };
 use connetto_test_harness::Fixture;
 use connetto_test_harness::standby::{Pair, Switchboard};
@@ -36,7 +36,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
+use subql::{ParserDB, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -251,7 +251,7 @@ async fn a_handshake_under_way_meets_a_history_read_during_it() {
     let past_the_old_end = Position {
         system: TimelineHistory::default().system(),
         timeline: 1,
-        lsn: 0x20,
+        at: PgCommitPosition::before_commit(PgLsn(0x20)),
     };
     let handshake = {
         let manager = Arc::clone(&manager);
@@ -345,7 +345,7 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
     let ingest = {
         let (manager, url, pool) = (Arc::clone(&manager), url.clone(), pool.clone());
         tokio::spawn(async move {
-            let connect = || {
+            let connect = |resume: ResumePoint| {
                 let (manager, url, pool) = (Arc::clone(&manager), url.clone(), pool.clone());
                 async move {
                     let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL)
@@ -355,7 +355,7 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
                         .await
                         .map_err(|err| err.to_string())?;
                     PgStreamingCdcSource::connect(
-                        PgStreamingConfig::new(url, SLOT, PUBLICATION),
+                        PgStreamingConfig::new(url, SLOT, PUBLICATION).start(resume.get()),
                         catalog,
                     )
                     .await
@@ -391,9 +391,9 @@ async fn a_lossy_promotion_resyncs_the_lost_rows_and_resumes_the_rest() {
     let last_beat = *kept.last().expect("at least the first order");
     let delivered = Position::from_cursor_bytes(live(&mut watcher, last_beat).await.as_bytes())
         .expect("a stamped cursor")
-        .lsn;
+        .at;
     let log = PgOplog::new(pool.clone(), OPLOG_TABLE, OplogConfig::default());
-    while log.current_lsn().await.expect("read the log") < Some(delivered) {
+    while log.current_position().await.expect("read the log") < Some(delivered) {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     pair.wait_replayed(&pair.primary_position().await).await;

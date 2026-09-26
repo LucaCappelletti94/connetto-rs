@@ -24,6 +24,7 @@ use connetto_server::{
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
 use pg_walstream::{ChangeEvent, Lsn};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn};
 use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
@@ -409,9 +410,9 @@ async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
             // A truncate is served as a replacement rather than as a patch that
             // applies nothing (R48).
             serving
-                .dispatch_event(&ChangeEvent::truncate(
-                    vec![Arc::from("things")],
-                    Lsn::new(1),
+                .dispatch_event(&PgChangeEvent::new(
+                    ChangeEvent::truncate(vec![Arc::from("things")], false, false, Lsn::new(1)),
+                    PgCommitPosition::new(PgLsn(1), 1),
                 ))
                 .await
                 .expect("dispatch the truncate");
@@ -456,7 +457,7 @@ mod aggregates {
         loopback, pg_write_target,
     };
     use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
-    use subql::{CdcSource, PgSqliteEmuSource};
+    use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
     use tracing::Instrument;
 
     /// A manager whose aggregates read through connetto's own connector.
@@ -536,7 +537,10 @@ mod aggregates {
             "DELETE FROM counts WHERE id = 1",
         ] {
             source.execute_sql(sql).expect("execute dml");
-            while let Some(event) = source.next_event().await.expect("poll source") {
+            while let Some(item) = source.next_item().await.expect("poll source") {
+                let SourceItem::Event(event) = item else {
+                    continue;
+                };
                 manager.dispatch_event(&event).await.expect("dispatch");
             }
         }

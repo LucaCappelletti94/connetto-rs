@@ -23,7 +23,7 @@ use connetto_server::{
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
-use subql::{CdcSource, ChangeEvent, PgLsn, PgSqliteEmuSource};
+use subql::{CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
 
@@ -33,7 +33,7 @@ struct CountingUpkeep(Arc<AtomicU64>);
 impl StoreUpkeep for CountingUpkeep {
     fn keep_current<'a>(
         &'a self,
-        _event: &'a ChangeEvent,
+        _event: &'a PgChangeEvent,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
         self.0.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move { Ok(Vec::new()) })
@@ -86,24 +86,26 @@ impl SnapshotSource for EmptySnapshot {
 }
 
 /// A source that yields one event then signals a clean shutdown.
-struct OneEvent(Option<ChangeEvent>);
+struct OneEvent(Option<PgChangeEvent>);
 
 impl CdcSource for OneEvent {
-    type Event = ChangeEvent;
+    type Commit = PgCommit;
+    type Event = PgChangeEvent;
     type Error = io::Error;
 
-    fn next_event(
+    fn next_item(
         &mut self,
-    ) -> impl Future<Output = Result<Option<ChangeEvent>, io::Error>> + Send {
+    ) -> impl Future<Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, io::Error>> + Send
+    {
         let next = self.0.take();
-        async move { Ok(next) }
+        async move { Ok(next.map(SourceItem::Event)) }
     }
 
     #[expect(
         clippy::unused_async_trait_impl,
         reason = "test double has no async work to do"
     )]
-    async fn ack(&mut self, _upto: PgLsn) -> Result<(), io::Error> {
+    async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), io::Error> {
         Ok(())
     }
 }
@@ -140,9 +142,10 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
         .execute_sql("INSERT INTO notes (id, body) VALUES (1, 'hello')")
         .expect("execute dml");
     let event = source
-        .next_event()
+        .next_item()
         .await
         .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
         .expect("one event");
 
     manager

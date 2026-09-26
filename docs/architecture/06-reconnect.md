@@ -29,7 +29,7 @@ The client persists the following in local SQLite across process restarts:
 
 | Item | Description |
 |---|---|
-| `last_applied_lsn` | The cursor of the last frame the client applied to local SQLite, opaque to the client. The server writes twenty bytes, the cluster's system identifier, the timeline and then the position (R73 and R70, see Failover). |
+| `last_applied_lsn` | The cursor of the last frame the client applied to local SQLite, opaque to the client. The server writes twenty-eight bytes, the cluster's system identifier, the timeline, the commit LSN of the change's transaction and the change's ordinal in it, all big-endian so byte order is commit order (R73 and R70, see Failover). |
 | `pending_mutations` | The local mutation queue (see `03-sync-pipeline.md`). |
 | `subscriptions` | The set of subscriptions to re-declare on reconnect (spec + sub_id). |
 | `session_token` | Durable session handle. **Built (R2, R3)**: for an identified run the auth store's session id is the handle, an unidentified run gets one minted at handshake, and the `resume_token` credential returned beside it is what proves the handle on the next connect. The client persists the pair outside the local replica (natively where the refresh token lives, worker-only in the browser). Cursors, the watermark and the connection registry key on it (chapter 12). |
@@ -50,15 +50,27 @@ The server maintains an **oplog**: an ordered log of `ChangeRecord`s. The oplog 
 CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate');
 
 CREATE TABLE oplog (
-    lsn          BIGINT PRIMARY KEY,
+    commit_lsn   BIGINT NOT NULL,
+    ordinal      BIGINT NOT NULL,
     table_name   TEXT NOT NULL,
     op           connetto_change_op NOT NULL,
     pk           BYTEA NOT NULL,
     is_tombstone BOOLEAN NOT NULL DEFAULT FALSE,
     event        BYTEA NOT NULL,
-    appended_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    appended_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (commit_lsn, ordinal)
+);
+
+CREATE TABLE oplog_commit (
+    only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    commit_lsn BIGINT NOT NULL,
+    end_lsn    BIGINT NOT NULL
 );
 ```
+
+**Built (2026-09-26): an entry is keyed by its commit position.** subql stamps every Postgres row event with `PgCommitPosition`, the commit LSN its transaction's begin names and the row's ordinal in that transaction, so positions strictly increase in the order changes commit. A change's own WAL record position does not, since an older transaction that commits after a newer one arrives second with the lower record position, and the cursor advance refuses any position below the one it holds. A snapshot's cursor is `PgCommitPosition::before_commit` of the position read before its transaction, which sorts before every row of a commit the snapshot did not see. `entries_since`, `min_position`, `current_position` and `forget_through` all compare the pair, so a client holding a transaction's first row still catches up its second, and an entry appended twice, which a source resuming after a failed dispatch delivers, is kept once. `crates/connetto-test-harness/tests/it/interleaved_commit.rs` proves the interleaved shape end to end.
+
+**Built (2026-09-26): the log records where the slot resumes.** The source yields each transaction's rows and then its commit, which carries the commit's position and where its record ends. The ingest writes that commit into the one-row `oplog_commit` table and only then acknowledges it, and acknowledging a commit is the only thing that moves the slot, to exactly that end. So before every connect, a slot whose confirmed position is past the recorded end names changes the log never received, and one at or behind it does not. A reconnect in the same process starts right after the last row or commit the ingest handled (`ResumePoint`), so no engine cursor sees a position twice, and a changed timeline or a declared gap clears it, so the slot's own position decides.
 
 **Built, and two corrections against an earlier version of this block** (`PgOplog::ensure_schema` in `crates/connetto-server/src/oplog.rs`). The row images are one `event` blob, the serialized `ChangeEvent`, rather than the separate `old_row` and `new_row` that block named, because catchup replays the whole event through the same encoder the live path uses and never reads the two images apart. And `op` is a closed set of four, so it is an enum type rather than text carrying one of four words. `ensure_schema` creates the type and the column, `ChangeRecord::op` returns a `ChangeOp` rather than a string, and `crates/connetto-server/tests/pg_async.rs::pg_oplog_appends_and_reads_back` asserts the column's declared type and that Postgres refuses a verb outside the set, because nothing on the read path consults that column and it would otherwise be free to drift back.
 
@@ -194,7 +206,7 @@ Tombstones enable delete replay for rows the caller holds locally. Per the read-
 
 The server process stays up. Its database connections drop, and its change feed reconnects with backoff until the address answers again. Before the feed reopens the server reads the database's timeline history over a replication connection, and a new timeline closes every live connection with `FatalErrorReason::DatabaseTimelineChanged`, because a live connection never presents its cursor again. A planned switchover that lost nothing closes every connection too, and each resumes by catching up, with no re-download.
 
-Every cursor carries the cluster and the timeline it was issued on, twenty bytes with the system identifier and the timeline ahead of the position. A reconnecting client whose cursor lies on the current timeline, or on an earlier one at or before the point where that timeline ended, catches up from the reconnect log with no re-download. One past that point was sent changes the promoted database never received, so its subscriptions, hidden membership subscriptions included, get `FullResyncRequired { reason: CursorBeyondHistory }` and a replacement read from the new primary, and those rows leave the device. A nonempty cursor the server cannot read, the earlier eight-byte and twelve-byte layouts included, takes the same resync, and so does one naming another cluster. The synced slot can trail what the old primary confirmed, so the feed may be sent a change twice, and the reconnect log keeps one entry per position.
+Every cursor carries the cluster and the timeline it was issued on, twenty-eight bytes with the system identifier and the timeline ahead of the commit position. A reconnecting client whose cursor lies on the current timeline, or on an earlier one at or before the point where that timeline ended, catches up from the reconnect log with no re-download. One past that point was sent changes the promoted database never received, so its subscriptions, hidden membership subscriptions included, get `FullResyncRequired { reason: CursorBeyondHistory }` and a replacement read from the new primary, and those rows leave the device. A nonempty cursor the server cannot read, the earlier eight-byte, twelve-byte and twenty-byte layouts included, takes the same resync, and so does one naming another cluster. The synced slot can trail what the old primary confirmed, so the feed may be sent a change twice, and the reconnect log keeps one entry per position.
 
 What a restore to an earlier point does to a client whose queued writes are ahead of the watermark is `R70`'s, after `R75`. A database restored into another cluster starts again at timeline 1, which this check does not see, and the identifier the cursor carries resyncs it (`20-deployment.md`).
 

@@ -15,7 +15,7 @@
 | `_connetto_mutations`, the exactly-once watermark | `connetto_watermark_table!` | Yes | No check. The first client write fails (`11-authentication.md`) |
 | `connetto_bans` | `ban.rs` | Yes | No check |
 | The audit table, only under `CONNETTO_AUDIT=database` | `connetto_audit_table!` | Yes | No check |
-| The reconnect log, `connetto_oplog` | `CONNETTO_OPLOG_TABLE` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
+| The reconnect log, `connetto_oplog`, and its last commit, `connetto_oplog_commit` | `CONNETTO_OPLOG_TABLE`, with `_commit` appended for the second | Yes | Both refused by `preflight::require` (`Artifact::Table`) |
 | `connetto_epoch`, the cluster the deployment last served from | `connetto_server::epoch::EPOCH_DDL` | Yes, which is what lets a restore into another cluster be seen | Refused by `preflight::require` (`Artifact::Table`) |
 | The publication and its previous images | `CONNETTO_PUBLICATION` | Yes | Refused (`Artifact::Publication`, `Artifact::PreviousImages`, and `Artifact::PublishedTable` for every table a policy reads) |
 | The logical replication slot | `CONNETTO_SLOT` | **No**, under every method | Refused (`Artifact::ReplicationSlot`) |

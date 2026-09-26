@@ -67,7 +67,9 @@ async fn settle_past(client: &mut Client, before: u64) {
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
                 let at = Position::from_cursor_bytes(patch.cursor.as_bytes())
                     .expect("a live cursor carries a position")
-                    .lsn;
+                    .at
+                    .commit_lsn()
+                    .0;
                 if at >= before {
                     return;
                 }

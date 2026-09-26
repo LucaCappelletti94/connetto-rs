@@ -21,7 +21,7 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{AsyncConnector, ReadQuery, RowPage, Snapshot as ConnectorRead};
-use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);";
 
@@ -47,7 +47,7 @@ impl QueuedConnector {
 impl AsyncConnector for QueuedConnector {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
-    type Checkpoint = PgLsn;
+    type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
     fn execute_scalar(
@@ -56,11 +56,11 @@ impl AsyncConnector for QueuedConnector {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
     > + Send {
         let next = self.responses.lock().expect("queue poisoned").pop_front();
         async move {
-            next.map(|n| (PgValue::Int(n), Some(PgLsn(1))))
+            next.map(|n| (PgValue::Int(n), Some(PgCommitPosition::new(PgLsn(1), 1))))
                 .ok_or_else(|| std::io::Error::other("no more canned responses"))
         }
     }
@@ -71,7 +71,7 @@ impl AsyncConnector for QueuedConnector {
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgCommitPosition>, std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("read_page not used in reexec tests")) }
     }
@@ -144,7 +144,10 @@ fn aggregate_value(msg: ControlMessage) -> String {
 
 async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await

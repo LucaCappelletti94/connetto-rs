@@ -97,9 +97,9 @@ pub use reexec::{
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use session::{
-    NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, SessionConfig, SessionError,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, StreamCheck, StreamCheckError,
-    subject_set_reach,
+    NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, ResumePoint, SessionConfig,
+    SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, StreamCheck,
+    StreamCheckError, subject_set_reach,
 };
 pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};

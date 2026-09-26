@@ -11,7 +11,7 @@ use connetto_server::Materializer;
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -74,7 +74,10 @@ async fn drain_to_replica(
     mat: &mut Materializer,
     replica: &mut SqliteConnection,
 ) {
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         for patch in mat.dispatch(&event).await.expect("dispatch event").patches {
             mat.apply_diffset(&patch.payload_zstd, replica)
                 .expect("apply matched patch to replica");
@@ -157,7 +160,10 @@ async fn in_process_loop_round_trips_cdc_and_a_mutation() {
     assert_eq!(orders(&mut replica), vec![order(7, 9.5, 5, "paid")]);
 
     // Ack the last consumed position back to the source loop.
-    source.ack(subql::PgLsn(0)).await.expect("ack source");
+    source
+        .ack(PgCommitPosition::before_commit(PgLsn(0)))
+        .await
+        .expect("ack source");
 
     // Inbound write path: a client MutationPatch lands on a backend target.
     let mut target = sqlite_target();
