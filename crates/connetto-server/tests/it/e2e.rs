@@ -312,11 +312,22 @@ const START_ATTEMPTS: u32 = 3;
 pub(super) async fn start_server(
     auth: &AuthStack,
     timeout: Duration,
+    spawn: impl FnMut(Ports, &[(&str, &str)]) -> ChildGuard,
+) -> (ChildGuard, Ports) {
+    start_server_on(auth, timeout, Ports::reserve, spawn).await
+}
+
+/// [`start_server`] with the ports each attempt starts on coming from
+/// `reserve`.
+async fn start_server_on(
+    auth: &AuthStack,
+    timeout: Duration,
+    mut reserve: impl FnMut() -> Ports,
     mut spawn: impl FnMut(Ports, &[(&str, &str)]) -> ChildGuard,
 ) -> (ChildGuard, Ports) {
     let mut attempt = 1;
     loop {
-        let ports = Ports::reserve();
+        let ports = reserve();
         let pairs = auth.env_pairs(ports.auth);
         let pairs: Vec<(&str, &str)> = pairs
             .iter()
@@ -1041,6 +1052,59 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         vec![(1, alice_id.clone()), (3, alice_id.clone())],
         "RLS did not enforce the write policy through the binaries"
     );
+}
+
+/// A server whose login port another process took before the server bound it
+/// is started again on fresh ports, and the test proceeds against it.
+#[tokio::test]
+async fn e2e_a_taken_port_starts_the_server_again_on_fresh_ports() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+
+    let auth_stack = build_auth_stack().await;
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let mut taken: Option<(Ports, std::net::TcpListener)> = None;
+    let reserve = || {
+        let ports = Ports::reserve();
+        if taken.is_none() {
+            let thief = std::net::TcpListener::bind(format!("127.0.0.1:{}", ports.auth))
+                .expect("take the first login port");
+            taken = Some((ports, thief));
+        }
+        ports
+    };
+    let (_server, ports) = start_server_on(
+        &auth_stack,
+        Duration::from_secs(20),
+        reserve,
+        |ports, auth_pairs| {
+            spawn_server_cfg(
+                &url,
+                &ports.bind(),
+                PG_DDL,
+                "orders",
+                Some(&reader_url),
+                &authorization,
+                auth_pairs,
+            )
+        },
+    )
+    .await;
+
+    let (first, _thief) = taken.expect("the first start reserved ports");
+    assert_ne!(
+        ports.auth, first.auth,
+        "the server serves on fresh ports, not the taken one"
+    );
+    let (access, _) = mint_token(&ports.auth_base()).await;
+    assert!(!access.is_empty(), "the restarted server signs a user in");
 }
 
 /// R5b's unrestricted-table evidence, relocated here by R40: R40 added a real
