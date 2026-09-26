@@ -18,6 +18,8 @@ This programme closes a security defect in how connetto decides who a caller is,
 
 **The last section holds exploratory phases.** Those are not committed work, each may conclude it should not be built, and deleting one after its investigation changes nothing else. Every phase before that section is committed.
 
+**No phase waits on an upstream merge. Decided 2026-09-26 with the maintainer.** A phase that needs a change in a dependency requests it upstream, then builds against the fork through a `[patch.crates-io]` entry pinned to a commit, as its own first step, and drops the entry once a release carries the change. A review that takes months therefore holds nothing, and an upstream finding lists no phase in its blockers. The probes and decisions that shape an upstream request are a phase's own first steps, run even while the phase is blocked on something else.
+
 **Record deviations in place, with the reason.** A plan that silently diverges from what was built is worse than no plan, because the next session trusts it.
 
 ## Step zero, before any phase
@@ -2703,7 +2705,7 @@ Found while gating `R62` by mirroring `ci.yml` job for job instead of running th
 
 **Status.** NOT STARTED. Split out of R23 on 2026-08-19 so each surface lands alone.
 
-**Blocked on R94**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25), with the two upstream changes below patched in until released. R88's iOS leg is the signed provisioned `.app` this phase's gated item lives in.
+**Blocked on R94 for its wiring only**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). Its probe, decisions and upstream requests are not blocked and are done, and the two upstream changes below are patched in until released. R88's iOS leg is the signed provisioned `.app` this phase's gated item lives in.
 
 Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `ReplicaKeyStore` implementations) through `apple-native-keyring-store`'s `protected::Store` (measured at 1.0.1 on macOS, 1.0.2 in the lockfile and on iOS) with `AccessPolicy::RequireUserPresence`, measured equivalent to biometry-any combined with device passcode on all three points including surviving a fingerprint-set change (probe N1 to N3, macOS). The policy needs nothing upstream, but the crate passes no authentication context to the keychain, which one unlock per launch needs, per the decision below. The gated item exists only in a provisioned signed `.app` (AMFI kills a bare signed CLI at exec, rc 137, because the data protection keychain needs the `keychain-access-groups` entitlement), so the implementation detects the store-time refusal and downgrades custody honestly, packaging-cannot as a flavour of platform-cannot.
 
@@ -2736,9 +2738,9 @@ The probe app remains the platform evidence for prompting behaviour, since provi
 
 **Status.** NOT STARTED. Split out of R23 on 2026-08-19.
 
-**Blocked on R94**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). R88's Android leg is the installed app this phase's Keystore key and `BiometricPrompt` shell live in, and it wires the ungated `android-native-keyring-store` entry this phase replaces with the hand-built gated key.
+**Blocked on R94 for its wiring only**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). Its device probe on the Galaxy M52, the decision on how Android reaches one prompt per launch, and its upstream request are not blocked and come first. `android-native-keyring-store` 1.0.0, which the tree installs (`install_keyring_store` in `crates/connetto-client/src/auth.rs`), creates its one Keystore key per store with `set_user_authentication_required(false)` and offers no option, so an opt-in is requested upstream and patched in until released, as R51 does. R88's Android leg is the installed app this phase's Keystore key and `BiometricPrompt` shell live in, and it wires the ungated `android-native-keyring-store` entry this phase replaces with the hand-built gated key.
 
-Gate both items through a hand-built Keystore key with `set_user_authentication_required(true)` (probe A6: the flag gates correctly, an ungated read is refused by the Keystore). Stock `keyring::Entry` in `android-keyring` 0.2.0 hardcodes the flag off, so the key is built by hand, and the crate is a single-author dependency that would hold the key to every local replica, which this phase weighs explicitly (use, wrap, vendor, or contribute). The read-past-refusal prompt (`BiometricPrompt` plus `CryptoObject`) belongs to the application shell, and the demo carries a minimal one. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
+Gate both items through a Keystore key requiring user authentication (probe A6: `set_user_authentication_required(true)` gates correctly, an ungated read is refused by the Keystore), reached through `android-native-keyring-store` with the opt-in requested upstream. Whether that key is per-use or time-bound, how many prompts a launch then raises, and whether adding a fingerprint destroys it are unmeasured and decided from the device probe. The prompt (`BiometricPrompt`) belongs to the application shell, in the Kotlin layer of `connetto-auth-session`, and the demo carries it. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
 
 ### Proof
 
