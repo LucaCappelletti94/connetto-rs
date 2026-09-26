@@ -99,12 +99,35 @@ pub(super) fn client_bin() -> PathBuf {
 }
 
 /// Kills its child on drop so a panicking assertion never leaks a process.
-pub(super) struct ChildGuard(Child);
+pub(super) struct ChildGuard(Option<Child>);
+
+impl ChildGuard {
+    pub(super) fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    /// The child's exit status, if it has exited.
+    fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.0.as_mut()?.try_wait().ok().flatten()
+    }
+
+    /// Kill the child and collect what it wrote to its piped streams.
+    pub(super) async fn kill_and_collect(mut self) -> std::process::Output {
+        let mut child = self.0.take().expect("a child the guard still holds");
+        child.kill().expect("kill the child");
+        tokio::task::spawn_blocking(move || child.wait_with_output())
+            .await
+            .expect("spawn_blocking task panicked")
+            .expect("read the child's output")
+    }
+}
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        if let Some(child) = self.0.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
@@ -203,25 +226,179 @@ pub(super) async fn wait_for_rows(db_path: &Path, want: i64, timeout: Duration) 
     }
 }
 
-/// Poll until a TCP connect to `addr` succeeds or the timeout elapses.
-pub(super) async fn wait_for_port(addr: &str, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return true;
+/// Start a server again on the ports an earlier start of it used, and wait
+/// until it serves as [`start_server`] does. The ports are not reserved in
+/// between, so another process can take one, and this then fails naming the
+/// exit rather than starting on fresh ports, since the test observes a
+/// restart.
+pub(super) async fn restart_server(
+    auth: &AuthStack,
+    ports: Ports,
+    timeout: Duration,
+    spawn: impl FnOnce(Ports, &[(&str, &str)]) -> ChildGuard,
+) -> ChildGuard {
+    let pairs = auth.env_pairs(ports.auth);
+    let pairs: Vec<(&str, &str)> = pairs
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    let mut server = spawn(ports, &pairs);
+    match await_serving(&mut server, ports, timeout).await {
+        Ok(()) => server,
+        Err(Startup::Exited(status)) => {
+            panic!("the restarted server on {ports:?} exited with {status}")
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        Err(Startup::Silent(seen)) => panic!(
+            "the restarted server on {ports:?} did not answer within {timeout:?}, last seen {seen}"
+        ),
     }
-    false
 }
 
-/// A free localhost port, released before the caller binds it.
+/// A free localhost port, released before the caller binds it, so anything
+/// else may take it first. A server started on one goes through
+/// [`start_server`], which notices that and starts it again.
 pub(super) fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("bind ephemeral port")
         .local_addr()
         .expect("local addr")
         .port()
+}
+
+/// The sync and auth ports one server listens on.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct Ports {
+    pub(super) sync: u16,
+    pub(super) auth: u16,
+}
+
+impl Ports {
+    fn reserve() -> Self {
+        let sync = free_port();
+        loop {
+            let auth = free_port();
+            if auth != sync {
+                return Self { sync, auth };
+            }
+        }
+    }
+
+    pub(super) fn bind(self) -> String {
+        format!("127.0.0.1:{}", self.sync)
+    }
+
+    pub(super) fn ws(self) -> String {
+        format!("ws://127.0.0.1:{}/", self.sync)
+    }
+
+    /// Base URL of the auth endpoints, which also serve the file routes.
+    pub(super) fn auth_base(self) -> String {
+        format!("http://127.0.0.1:{}", self.auth)
+    }
+}
+
+/// How many times [`start_server`] starts a server before giving up on
+/// losing its ports.
+const START_ATTEMPTS: u32 = 3;
+
+/// Start a server through `spawn` on freshly reserved ports, and wait until
+/// both listeners answer as that server: the login endpoint redirects to the
+/// provider and the sync port completes a WebSocket handshake.
+///
+/// A reserved port is free only until the server binds it, and a container
+/// published in between can take it. The server then exits naming the bind,
+/// and this starts it again on fresh ports, at most [`START_ATTEMPTS`] times.
+/// `spawn` gets the ports and the auth settings for them.
+pub(super) async fn start_server(
+    auth: &AuthStack,
+    timeout: Duration,
+    mut spawn: impl FnMut(Ports, &[(&str, &str)]) -> ChildGuard,
+) -> (ChildGuard, Ports) {
+    let mut attempt = 1;
+    loop {
+        let ports = Ports::reserve();
+        let pairs = auth.env_pairs(ports.auth);
+        let pairs: Vec<(&str, &str)> = pairs
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        let mut server = spawn(ports, &pairs);
+        match await_serving(&mut server, ports, timeout).await {
+            Ok(()) => return (server, ports),
+            Err(Startup::Exited(status)) if attempt < START_ATTEMPTS => {
+                eprintln!(
+                    "the server on {ports:?} exited with {status} while starting, starting it again"
+                );
+                attempt += 1;
+            }
+            Err(Startup::Exited(status)) => {
+                panic!("the server exited with {status} while starting, {START_ATTEMPTS} times")
+            }
+            Err(Startup::Silent(seen)) => {
+                panic!(
+                    "the server on {ports:?} did not answer within {timeout:?}, last seen {seen}"
+                )
+            }
+        }
+    }
+}
+
+/// Why a started server is not serving.
+enum Startup {
+    Exited(std::process::ExitStatus),
+    Silent(String),
+}
+
+/// How long one readiness probe may take, so a listener that accepts and
+/// never answers cannot hold the wait past its deadline.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn await_serving(
+    server: &mut ChildGuard,
+    ports: Ports,
+    timeout: Duration,
+) -> Result<(), Startup> {
+    let agent = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(PROBE_TIMEOUT)
+        .build()
+        .expect("build the readiness HTTP client");
+    let deadline = Instant::now() + timeout;
+    let mut seen = String::from("nothing");
+    loop {
+        if let Some(status) = server.exited() {
+            return Err(Startup::Exited(status));
+        }
+        if Instant::now() >= deadline {
+            return Err(Startup::Silent(seen));
+        }
+        match agent
+            .get(format!("{}/auth/login", ports.auth_base()))
+            .query(&[("provider", MOCK_OAUTH_PROVIDER)])
+            .send()
+            .await
+        {
+            Ok(login) if login.status().is_redirection() => {
+                let handshake = tokio::time::timeout(PROBE_TIMEOUT, async {
+                    let tcp = tokio::net::TcpStream::connect(ports.bind())
+                        .await
+                        .map_err(|err| format!("the sync port closed ({err})"))?;
+                    connetto_server::WebSocketTransport::connect(&ports.ws(), tcp)
+                        .await
+                        .map_err(|err| format!("the sync port refusing a handshake ({err})"))
+                })
+                .await;
+                match handshake {
+                    Ok(Ok(_)) => return Ok(()),
+                    Ok(Err(why)) => seen = why,
+                    Err(_) => "the sync port silent through a handshake".clone_into(&mut seen),
+                }
+            }
+            Ok(login) => seen = format!("the login endpoint answering {}", login.status()),
+            Err(err) => seen = format!("the login endpoint unreachable ({err})"),
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 /// What a spawned server needs to build its change-path executor: the policy
@@ -287,7 +464,7 @@ pub(super) fn spawn_server_cfg(
         command.env(k, v);
     }
     let child = command.spawn().expect("spawn server");
-    ChildGuard(child)
+    ChildGuard::new(child)
 }
 
 pub(super) fn spawn_client(
@@ -350,7 +527,7 @@ pub(super) fn spawn_client_env(
         command.env_remove("CONNETTO_WRITE");
     }
     let child = command.spawn().expect("spawn client");
-    ChildGuard(child)
+    ChildGuard::new(child)
 }
 
 /// Run a single DDL/DML statement in its own transaction (autocommit).
@@ -475,34 +652,34 @@ async fn wait_for_pg_count(
     }
 }
 
-/// A loopback identity provider plus the env pairs the server binary needs to
-/// discover and use it. Holds the provider guard alive for the test.
+/// A loopback identity provider the server binary signs users in through.
+/// Started before any port is reserved, since the container's published port
+/// comes from the same range [`free_port`] draws from.
 pub(super) struct AuthStack {
-    _idp: MockOauth,
-    /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_PROVIDERS` settings.
-    pub(super) env_pairs: Vec<(String, String)>,
-    /// Base URL of the server binary's auth endpoints.
-    pub(super) auth_base: String,
+    idp: MockOauth,
 }
 
-/// Start the mock OAuth provider and configure connetto's auth callback at
-/// `auth_port`.
-pub(super) async fn build_auth_stack(auth_port: u16) -> AuthStack {
-    let callback = format!("http://127.0.0.1:{auth_port}/auth/callback");
-    let idp = MockOauth::start().await;
-    let auth_base = format!("http://127.0.0.1:{auth_port}");
-    let mut env_pairs = vec![
-        ("CONNETTO_AUTH".to_owned(), "in-memory".to_owned()),
-        (
-            "CONNETTO_AUTH_BIND".to_owned(),
-            format!("127.0.0.1:{auth_port}"),
-        ),
-    ];
-    env_pairs.extend(idp.env_pairs(MOCK_OAUTH_PROVIDER, &callback));
+impl AuthStack {
+    /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_PROVIDERS`
+    /// settings for a server whose auth endpoints listen on `auth_port`.
+    pub(super) fn env_pairs(&self, auth_port: u16) -> Vec<(String, String)> {
+        let callback = format!("http://127.0.0.1:{auth_port}/auth/callback");
+        let mut pairs = vec![
+            ("CONNETTO_AUTH".to_owned(), "in-memory".to_owned()),
+            (
+                "CONNETTO_AUTH_BIND".to_owned(),
+                format!("127.0.0.1:{auth_port}"),
+            ),
+        ];
+        pairs.extend(self.idp.env_pairs(MOCK_OAUTH_PROVIDER, &callback));
+        pairs
+    }
+}
+
+/// Start the mock OAuth provider.
+pub(super) async fn build_auth_stack() -> AuthStack {
     AuthStack {
-        _idp: idp,
-        env_pairs,
-        auth_base,
+        idp: MockOauth::start().await,
     }
 }
 
@@ -607,42 +784,26 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
 
     reset_fixture(&pool, &fixture).await;
 
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-
-    let auth_stack = build_auth_stack(auth_port).await;
-    let auth_pairs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader_url),
-        &authorization,
-        &auth_pairs,
-    );
     let secs = Duration::from_secs(20);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
-    assert!(
-        wait_for_port(&auth_bind, secs).await,
-        "auth endpoints did not open {auth_bind}"
-    );
+    let (_server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(&reader_url),
+            &authorization,
+            auth_pairs,
+        )
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
 
-    let (token_a, _) = mint_token(&auth_stack.auth_base).await;
-    let (token_b, _) = mint_token(&auth_stack.auth_base).await;
+    let (token_a, _) = mint_token(&auth_base).await;
+    let (token_b, _) = mint_token(&auth_base).await;
 
     let mut dir = ReplicaDir::new();
     let db_a = dir.replica("client-a.db");
@@ -709,42 +870,26 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
 
     reset_fixture(&pool, &fixture).await;
 
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-
-    let auth_stack = build_auth_stack(auth_port).await;
-    let auth_pairs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader_url),
-        &authorization,
-        &auth_pairs,
-    );
     let secs = Duration::from_secs(20);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
-    assert!(
-        wait_for_port(&auth_bind, secs).await,
-        "auth endpoints did not open {auth_bind}"
-    );
+    let (_server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(&reader_url),
+            &authorization,
+            auth_pairs,
+        )
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
 
-    let (token_reader, _) = mint_token(&auth_stack.auth_base).await;
-    let (token_writer, _) = mint_token(&auth_stack.auth_base).await;
+    let (token_reader, _) = mint_token(&auth_base).await;
+    let (token_writer, _) = mint_token(&auth_base).await;
 
     let mut dir = ReplicaDir::new();
     let db_writer = dir.replica("writer.db");
@@ -802,13 +947,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
 
     let _serial = PG_SERIAL.lock().await;
 
-    let auth_port = free_port();
-    let auth_stack = build_auth_stack(auth_port).await;
-    let auth_pairs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
+    let auth_stack = build_auth_stack().await;
 
     // The server applies writes as `app_writer`, which is subject to the policy.
     for stmt in [
@@ -835,35 +974,26 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
 
     let reader_url = with_user_url(&url, "app_writer", "app_writer");
 
-    let port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-
     let authorization = Authorization::provision(&fixture, OWNED_POLICIES).await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        OWNED_PG_DDL,
-        "owned",
-        Some(&reader_url),
-        &authorization,
-        &auth_pairs,
-    );
     let secs = Duration::from_secs(20);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
-    assert!(
-        wait_for_port(&auth_bind, secs).await,
-        "auth endpoints did not open {auth_bind}"
-    );
+    let (_server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            OWNED_PG_DDL,
+            "owned",
+            Some(&reader_url),
+            &authorization,
+            auth_pairs,
+        )
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
 
     // Mint alice's token and derive the row owner from the resolved user_id.
     // The in-memory store maps (issuer, subject) to a UUID v5, and the RLS
     // policy compares owner against app.user_id, so the owner must be that UUID.
-    let (alice_token, alice_id) = mint_token(&auth_stack.auth_base).await;
+    let (alice_token, alice_id) = mint_token(&auth_base).await;
 
     let mut dir = ReplicaDir::new();
     let db = dir.replica("alice.db");
@@ -945,41 +1075,25 @@ async fn e2e_unrestricted_table_delivers_without_policy() {
 
     reset_fixture(&pool, &fixture).await;
 
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-
-    let auth_stack = build_auth_stack(auth_port).await;
-    let auth_pairs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader_url),
-        &authorization,
-        &auth_pairs,
-    );
     let secs = Duration::from_secs(20);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
-    assert!(
-        wait_for_port(&auth_bind, secs).await,
-        "auth endpoints did not open {auth_bind}"
-    );
+    let (_server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(&reader_url),
+            &authorization,
+            auth_pairs,
+        )
+    })
+    .await;
+    let (ws, auth_base) = (ports.ws(), ports.auth_base());
 
-    let (token, _) = mint_token(&auth_stack.auth_base).await;
+    let (token, _) = mint_token(&auth_base).await;
 
     let mut dir = ReplicaDir::new();
     let db = dir.replica("client.db");
@@ -1042,10 +1156,9 @@ async fn e2e_startup_refuses_without_a_reader_role() {
 
     // Auth must be configured so the server reaches the reader-role check.
     // The server exits before binding auth endpoints, so auth_port is a placeholder.
-    let auth_port = free_port();
-    let auth_stack = build_auth_stack(auth_port).await;
-    let auth_pairs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs(free_port());
+    let auth_pairs: Vec<(&str, &str)> = auth_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
@@ -1247,40 +1360,30 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
 
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-
-    let mut command = Command::new(server_bin());
-    command
-        .env("DATABASE_URL", &url)
-        .env("CONNETTO_BIND", &bind)
-        .env("CONNETTO_PG_DDL", PG_DDL)
-        .env("CONNETTO_WRITABLE", "orders")
-        .env("CONNETTO_SLOT", SLOT)
-        .env("CONNETTO_PUBLICATION", PUBLICATION)
-        .env("CONNETTO_READER_URL", &reader_url)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    for (key, value) in &auth_stack.env_pairs {
-        command.env(key, value);
-    }
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    for (key, value) in authorization.env_pairs() {
-        command.env(key, value);
-    }
-    let mut server = command.spawn().expect("spawn server");
-
     let secs = Duration::from_secs(20);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
+    let (server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        let mut command = Command::new(server_bin());
+        command
+            .env("DATABASE_URL", &url)
+            .env("CONNETTO_BIND", ports.bind())
+            .env("CONNETTO_PG_DDL", PG_DDL)
+            .env("CONNETTO_WRITABLE", "orders")
+            .env("CONNETTO_SLOT", SLOT)
+            .env("CONNETTO_PUBLICATION", PUBLICATION)
+            .env("CONNETTO_READER_URL", &reader_url)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        command.envs(auth_pairs.iter().copied());
+        command.envs(authorization.env_pairs());
+        ChildGuard::new(command.spawn().expect("spawn server"))
+    })
+    .await;
+    let (bind, ws) = (ports.bind(), ports.ws());
 
-    let (token, user_id) = mint_token(&auth_stack.auth_base).await;
+    let (token, user_id) = mint_token(&ports.auth_base()).await;
     let mut dir = ReplicaDir::new();
     let db = dir.replica("log-probe.db");
     let client = spawn_client(&ws, &db, "log-probe", &token, None);
@@ -1293,11 +1396,7 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
 
     // Rust's stdout is line buffered, so every line already emitted is in the
     // pipe and a kill loses none of them.
-    server.kill().expect("kill the server");
-    let output = tokio::task::spawn_blocking(move || server.wait_with_output())
-        .await
-        .expect("spawn_blocking task panicked")
-        .expect("read the server's output");
+    let output = server.kill_and_collect().await;
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<serde_json::Value> = stdout
         .lines()
@@ -1357,41 +1456,33 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
 
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-
-    let mut command = Command::new(server_bin());
-    command
-        .env("DATABASE_URL", &url)
-        .env("CONNETTO_BIND", &bind)
-        .env("CONNETTO_PG_DDL", PG_DDL)
-        .env("CONNETTO_WRITABLE", "orders")
-        .env("CONNETTO_SLOT", SLOT)
-        .env("CONNETTO_PUBLICATION", PUBLICATION)
-        .env("CONNETTO_READER_URL", &reader_url)
-        // The switch under test. Without it the server records nothing, which
-        // is the default and is what shipped by accident.
-        .env("CONNETTO_AUDIT", "database")
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    for (key, value) in &auth_stack.env_pairs {
-        command.env(key, value);
-    }
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    for (key, value) in authorization.env_pairs() {
-        command.env(key, value);
-    }
-    let _server = ChildGuard(command.spawn().expect("spawn server"));
-
-    let secs = Duration::from_secs(20);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}: with CONNETTO_AUDIT=database it refuses to \
-         start unless the audit table matches"
-    );
+    // With CONNETTO_AUDIT=database the server refuses to start unless the
+    // audit table matches, which start_server reports as an exit.
+    let (_server, ports) =
+        start_server(&auth_stack, Duration::from_secs(20), |ports, auth_pairs| {
+            let mut command = Command::new(server_bin());
+            command
+                .env("DATABASE_URL", &url)
+                .env("CONNETTO_BIND", ports.bind())
+                .env("CONNETTO_PG_DDL", PG_DDL)
+                .env("CONNETTO_WRITABLE", "orders")
+                .env("CONNETTO_SLOT", SLOT)
+                .env("CONNETTO_PUBLICATION", PUBLICATION)
+                .env("CONNETTO_READER_URL", &reader_url)
+                // The switch under test. Without it the server records nothing, which
+                // is the default and is what shipped by accident.
+                .env("CONNETTO_AUDIT", "database")
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::inherit());
+            command.envs(auth_pairs.iter().copied());
+            command.envs(authorization.env_pairs());
+            ChildGuard::new(command.spawn().expect("spawn server"))
+        })
+        .await;
+    let auth_base = ports.auth_base();
 
     assert_eq!(
         audit_ops(&pool).await,
@@ -1399,10 +1490,10 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
         "logging in changes nobody's access, so it records nothing"
     );
 
-    let refresh_token = mint_refresh_token(&auth_stack.auth_base).await;
+    let refresh_token = mint_refresh_token(&auth_base).await;
     let agent = reqwest::Client::new();
     let logout = agent
-        .post(format!("{}/auth/logout", auth_stack.auth_base))
+        .post(format!("{auth_base}/auth/logout"))
         .header(reqwest::header::CONTENT_TYPE, "application/json")
         .body(json!({ "refresh_token": refresh_token }).to_string())
         .send()
@@ -1537,53 +1628,38 @@ async fn e2e_content_routes_mount_on_the_auth_listener() {
     let key_dir = TempDir::new().expect("content key dir");
     let key_path = key_dir.path().join("ticket.der");
     generate_ticket_key(&key_path);
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let content_base = format!("http://127.0.0.1:{auth_port}");
     let store_spec = format!("fs:{}", store.path().display());
+    let key = key_path.to_str().expect("utf-8 path");
 
-    let auth_stack = build_auth_stack(auth_port).await;
-    let mut envs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    envs.extend([
-        ("CONNETTO_CONTENT_URL", content_base.as_str()),
-        ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
-        (
-            "CONNETTO_CONTENT_KEY",
-            key_path.to_str().expect("utf-8 path"),
-        ),
-        ("CONNETTO_CONTENT_SWEEP_SECS", "1"),
-    ]);
-
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader_url),
-        &authorization,
-        &envs,
-    );
-    let secs = Duration::from_secs(30);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-    assert!(
-        wait_for_port(&auth_bind, secs).await,
-        "auth endpoints did not open {auth_bind}"
-    );
+    let (_server, ports) =
+        start_server(&auth_stack, Duration::from_secs(30), |ports, auth_pairs| {
+            let content_base = ports.auth_base();
+            let mut envs = auth_pairs.to_vec();
+            envs.extend([
+                ("CONNETTO_CONTENT_URL", content_base.as_str()),
+                ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+                ("CONNETTO_CONTENT_KEY", key),
+                ("CONNETTO_CONTENT_SWEEP_SECS", "1"),
+            ]);
+            spawn_server_cfg(
+                &url,
+                &ports.bind(),
+                PG_DDL,
+                "orders",
+                Some(&reader_url),
+                &authorization,
+                &envs,
+            )
+        })
+        .await;
+    let content_base = ports.auth_base();
 
     // The login dance through the same listener still works with the file
     // routes mounted beside it.
-    let (_token, _user) = mint_token(&auth_stack.auth_base).await;
+    let (_token, _user) = mint_token(&content_base).await;
 
     let agent = reqwest::Client::new();
     let id = sample_file_id();
@@ -1627,14 +1703,14 @@ async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
     apply_content_deployment(&pool, false).await;
 
     let auth_port = free_port();
-    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs(auth_port);
     let content_base = format!("http://127.0.0.1:{auth_port}");
     let store = TempDir::new().expect("content store dir");
     let store_spec = format!("fs:{}", store.path().display());
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
-    let mut envs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
+    let mut envs: Vec<(&str, &str)> = auth_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
@@ -1669,12 +1745,12 @@ async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
     fixture.start_replication(&["orders"]).await;
 
     let auth_port = free_port();
-    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs(auth_port);
     let content_base = format!("http://127.0.0.1:{auth_port}");
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
-    let mut envs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
+    let mut envs: Vec<(&str, &str)> = auth_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
@@ -1713,7 +1789,8 @@ async fn e2e_content_startup_names_each_refused_setting() {
     apply_content_deployment(&pool, true).await;
 
     let auth_port = free_port();
-    let auth_stack = build_auth_stack(auth_port).await;
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs(auth_port);
     let content_base = format!("http://127.0.0.1:{auth_port}");
     let query_base = format!("{content_base}/?probe=1");
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1771,8 +1848,7 @@ async fn e2e_content_startup_names_each_refused_setting() {
         ),
     ];
     for (extra, expected) in cases {
-        let mut envs: Vec<(&str, &str)> = auth_stack
-            .env_pairs
+        let mut envs: Vec<(&str, &str)> = auth_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
@@ -1822,47 +1898,33 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
     exec(&pool, "GRANT SELECT ON photos TO app_reader").await;
 
     let store = TempDir::new().expect("content store dir");
-    let port = free_port();
-    let auth_port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let ws = format!("ws://127.0.0.1:{port}/");
-    let content_base = format!("http://127.0.0.1:{auth_port}");
     let store_spec = format!("fs:{}", store.path().display());
 
-    let auth_stack = build_auth_stack(auth_port).await;
-    let mut envs: Vec<(&str, &str)> = auth_stack
-        .env_pairs
-        .iter()
-        .map(|(k, v)| (k.as_str(), v.as_str()))
-        .collect();
-    envs.extend([
-        ("CONNETTO_CONTENT_URL", content_base.as_str()),
-        ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
-    ]);
-
+    let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
-    let _server = spawn_server_cfg(
-        &url,
-        &bind,
-        PG_DDL,
-        "orders",
-        Some(&reader_url),
-        &authorization,
-        &envs,
-    );
     let secs = Duration::from_secs(30);
-    assert!(
-        wait_for_port(&bind, secs).await,
-        "server did not open {bind}"
-    );
-    let auth_bind = format!("127.0.0.1:{auth_port}");
-    assert!(
-        wait_for_port(&auth_bind, secs).await,
-        "auth endpoints did not open {auth_bind}"
-    );
+    let (_server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
+        let content_base = ports.auth_base();
+        let mut envs = auth_pairs.to_vec();
+        envs.extend([
+            ("CONNETTO_CONTENT_URL", content_base.as_str()),
+            ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+        ]);
+        spawn_server_cfg(
+            &url,
+            &ports.bind(),
+            PG_DDL,
+            "orders",
+            Some(&reader_url),
+            &authorization,
+            &envs,
+        )
+    })
+    .await;
+    let (bind, ws, content_base) = (ports.bind(), ports.ws(), ports.auth_base());
 
-    let (token, _user) = mint_token(&auth_stack.auth_base).await;
+    let (token, _user) = mint_token(&content_base).await;
     let tcp = TcpStream::connect(&bind).await.expect("connect ws");
     let mut client = WebSocketTransport::connect(&ws, tcp)
         .await

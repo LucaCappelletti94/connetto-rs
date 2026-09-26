@@ -102,6 +102,7 @@
 //!   allows is bounded by this interval times the deployment's throughput
 //!   (default 10).
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -1216,7 +1217,8 @@ async fn main() -> Result<()> {
         &comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")),
         &comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")),
         cookie_same_site,
-    );
+    )
+    .await?;
     run(
         &manager,
         &service,
@@ -1294,7 +1296,11 @@ fn comma_list(text: &str) -> Vec<String> {
 /// to hand the response to the page. Loopback origins are always allowed,
 /// mirroring the redirect policy's loopback rule and for the same reason:
 /// script on a loopback origin is already on the machine.
-fn spawn_auth_endpoints(
+///
+/// The listener is bound before this returns, so an address another process
+/// holds stops the start instead of leaving a server that cannot sign anyone
+/// in. Returns the bound address.
+async fn spawn_auth_endpoints(
     service: &Arc<AuthService<ServerStore>>,
     registry: Arc<ProviderRegistry>,
     file_router: Option<axum::Router>,
@@ -1302,7 +1308,7 @@ fn spawn_auth_endpoints(
     redirect_allowlist: &[String],
     cors_origins: &[String],
     cookie_same_site: CookieSameSite,
-) {
+) -> Result<SocketAddr> {
     let router = mount_on_auth_listener(
         auth_router(
             Arc::clone(service),
@@ -1313,20 +1319,19 @@ fn spawn_auth_endpoints(
         file_router,
     )
     .layer(cors_layer(cors_origins));
-    let auth_bind = auth_bind.to_owned();
+    let listener = TcpListener::bind(auth_bind)
+        .await
+        .with_context(|| format!("binding the auth endpoints at {auth_bind}"))?;
+    let bound = listener
+        .local_addr()
+        .with_context(|| format!("reading the auth endpoints' address {auth_bind}"))?;
+    tracing::info!(bind = %bound, "auth endpoints listening");
     tokio::spawn(async move {
-        match TcpListener::bind(&auth_bind).await {
-            Ok(listener) => {
-                tracing::info!(bind = %auth_bind, "auth endpoints listening");
-                if let Err(err) = axum::serve(listener, router).await {
-                    tracing::error!(error = %err, "auth endpoint server stopped");
-                }
-            }
-            Err(err) => {
-                tracing::error!(bind = %auth_bind, error = %err, "binding the auth endpoints failed");
-            }
+        if let Err(err) = axum::serve(listener, router).await {
+            tracing::error!(error = %err, "auth endpoint server stopped");
         }
     });
+    Ok(bound)
 }
 
 /// How long a shutdown waits for the live sessions to flush their close frame
@@ -1772,10 +1777,10 @@ mod tests {
         }
     }
 
-    /// Both bind outcomes of the auth listener are survivable: the bound
-    /// router keeps serving, a refused bind is an error line, not a panic.
+    /// A taken auth address stops the start, because a server left without
+    /// its login endpoints cannot sign anyone in. A free one serves them.
     #[tokio::test]
-    async fn the_auth_endpoints_survive_binding_and_a_refused_bind() {
+    async fn a_taken_auth_address_stops_the_start_and_a_free_one_serves() {
         let config = AuthConfig::default();
         let authority = TokenAuthority::generate(&config).expect("an ephemeral token authority");
         let store = ServerStore::InMemory(InMemoryAuthStore::new(config.refresh_lifetimes()));
@@ -1787,28 +1792,44 @@ mod tests {
             AuthService::new(Arc::new(authority), Arc::new(store), Arc::clone(&guard))
                 .with_registry(Arc::new(ProviderRegistry::new())),
         );
-        spawn_auth_endpoints(
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold an address");
+        let taken_addr = taken.local_addr().expect("the held address").to_string();
+        let refused = spawn_auth_endpoints(
+            &service,
+            Arc::new(ProviderRegistry::new()),
+            None,
+            &taken_addr,
+            &[],
+            &[],
+            CookieSameSite::default(),
+        )
+        .await
+        .expect_err("a taken address must stop the start");
+        assert!(
+            format!("{refused:#}").contains(&taken_addr),
+            "the refusal names the address, got {refused:#}"
+        );
+
+        let bound = spawn_auth_endpoints(
             &service,
             Arc::new(ProviderRegistry::new()),
             Some(
                 axum::Router::new().route("/files/{id}", axum::routing::get(|| async { "served" })),
             ),
             "127.0.0.1:0",
-            &["https://app.example".to_owned()],
-            &["https://app.example".to_owned()],
-            CookieSameSite::default(),
-        );
-        spawn_auth_endpoints(
-            &service,
-            Arc::new(ProviderRegistry::new()),
-            None,
-            "not a socket address",
             &[],
             &[],
             CookieSameSite::default(),
-        );
-        // The bind arms run inside the spawned tasks; give them a turn.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        )
+        .await
+        .expect("a free address binds");
+        let body = openidconnect::reqwest::get(format!("http://{bound}/files/abc"))
+            .await
+            .expect("the bound listener answers")
+            .text()
+            .await
+            .expect("a body");
+        assert_eq!(body, "served");
     }
 
     #[tokio::test]
