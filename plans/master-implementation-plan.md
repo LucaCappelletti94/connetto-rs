@@ -142,8 +142,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R25~~ | Device-to-device sync, a design, from which R74 to R80 derive |
 | done | ~~R30~~ | Grouped aggregates revisited, a design, from which R82 to R85 derive |
 | done | ~~R88~~ | The mobile build of a demo, Android on this workstation, iOS through the Mac |
-| any | R51 | Native Apple gate. Needs R88's iOS leg, and nothing depends on it |
-| any | R52 | Native Android gate. Needs R88's Android leg, and nothing depends on it |
+| blocked | R51 | Native Apple gate. Blocked on R94's gate setting, with two upstream keychain changes patched in until released, R88's iOS leg being done |
+| blocked | R52 | Native Android gate. Blocked on R94's gate setting, R88's Android leg being done |
 | blocked | R53 | Windows gate. Blocked on hardware |
 | any | R21 | One page codec. Its step zero decides whether the phase proceeds at all |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
@@ -166,6 +166,9 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
 | any | R92 | Synced tables without local references, with SQLite's own enforcement for the tier. Needs nothing |
 | any | R93 | The file replica for bots. Needs R71's headless custody and R91's template |
+| any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52 and R95 wait on it |
+| blocked | R95 | Share keys added and removed on a running client. Blocked on R94 |
+| any | R96 | One server builder for programs that embed the server. Minted undesigned, so it starts with its design |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
@@ -204,14 +207,17 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R50 the policy answers a write it never asks | **DONE** (2026-08-18) | nothing | no, discharged |
 | R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
 | R23 user-verified unlock (browser gate, custody, chapter 14) | **DONE** (2026-08-20) | nothing. Nine decisions recorded in the R23 section. Natives and Windows split to R51, R52, R53 | no |
-| R51 native Apple gate | NOT STARTED | nothing. Split out of R23 (2026-08-19), mechanism measured on macOS, first step verifies iOS (probe I5) | no |
-| R52 native Android gate | NOT STARTED | nothing. Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
+| R51 native Apple gate | NOT STARTED, probe I5 measured 2026-09-25 | R94, whose `Gate` setting carries the default and the re-check, and the shared-authentication changes requested of `apple-native-keyring-store` (#26) and `security-framework` (#263, #264) on 2026-09-25, taken through pinned patches until released. Split out of R23 (2026-08-19), mechanism measured on macOS and on the iPhone and iPad | no |
+| R52 native Android gate | NOT STARTED | R94, whose `Gate` setting carries the default and the re-check. Split out of R23 (2026-08-19), mechanism measured (probe A6) | no |
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
 | R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R71 and R91. Two decisions in the section | no |
+| R94 one client builder per platform | NOT STARTED, minted and designed 2026-09-25 while planning R51 | nothing. Thirteen decisions in the section | no |
+| R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | R94. One decision and one open question in the section | no |
+| R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, undesigned | nothing, its design comes first | no |
 | R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -391,6 +397,11 @@ graph TD
   P --> R51[R51 native Apple gate]
   P --> R52[R52 native Android gate]
   P --> R53[R53 Windows gate]
+  R94[R94 one client builder per platform] --> R51
+  U8[upstream apple-native-keyring-store and security-framework:<br/>one authentication shared across keychain reads] -.->|patched until released| R51
+  R94 --> R52
+  R94 --> R95[R95 share keys on a running client]
+  R96[R96 one server builder]
   R26 --> R56[R56 local data import]
   R54[R54 every demo carries every feature] --> R57[R57 demo gaps from the export audit]
   R58[R58 read ceiling and keyset paging]
@@ -2692,14 +2703,28 @@ Found while gating `R62` by mirroring `ci.yml` job for job instead of running th
 
 **Status.** NOT STARTED. Split out of R23 on 2026-08-19 so each surface lands alone.
 
-**Blocked on nothing.** R88's iOS leg is the signed provisioned `.app` this phase's gated item lives in.
+**Blocked on R94**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25), with the two upstream changes below patched in until released. R88's iOS leg is the signed provisioned `.app` this phase's gated item lives in.
 
-Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `ReplicaKeyStore` implementations) through `apple-native-keyring-store` 1.0.1 `protected::Store` with `AccessPolicy::RequireUserPresence`, measured equivalent to biometry-any combined with device passcode on all three points including surviving a fingerprint-set change (probe N1 to N3, macOS). Nothing needs contributing upstream. The gated item exists only in a provisioned signed `.app` (AMFI kills a bare signed CLI at exec, rc 137, because the data protection keychain needs the `keychain-access-groups` entitlement), so the implementation detects the store-time refusal and downgrades custody honestly, packaging-cannot as a flavour of platform-cannot.
+Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `ReplicaKeyStore` implementations) through `apple-native-keyring-store`'s `protected::Store` (measured at 1.0.1 on macOS, 1.0.2 in the lockfile and on iOS) with `AccessPolicy::RequireUserPresence`, measured equivalent to biometry-any combined with device passcode on all three points including surviving a fingerprint-set change (probe N1 to N3, macOS). The policy needs nothing upstream, but the crate passes no authentication context to the keychain, which one unlock per launch needs, per the decision below. The gated item exists only in a provisioned signed `.app` (AMFI kills a bare signed CLI at exec, rc 137, because the data protection keychain needs the `keychain-access-groups` entitlement), so the implementation detects the store-time refusal and downgrades custody honestly, packaging-cannot as a flavour of platform-cannot.
+
+**Probe I5 ran on 2026-09-25**, on an iPhone 15 Pro Max with Face ID and an iPad (A16) with Touch ID, both iOS 26.6.2, and on the simulator. The measurements are in `plans/r51-apple-gate.md`. Four results bind this phase.
+
+- **Every read and every update of a gated item raises its own sheet when the query carries no authentication context.** `apple-native-keyring-store` passes none, so the keychain makes a fresh one per call. Creating and deleting raise none.
+- **One `LAContext` shared across queries raises one sheet for every gated item.** Apple's `kSecUseAuthenticationContext` reuses a context "previously authenticated" with no further prompt. Two items, an update and reads through a 30-second screen lock and a 78-second suspension all went through on the one sheet, while a read without the context still raised one. `security-framework` 3.7.0 carries the context on `ItemSearchOptions`, which `search` and `update_item` both take, but handing it an `LAContext` needs `unsafe`, which the root workspace forbids.
+- **Without `NSFaceIDUsageDescription` iOS never offers Face ID** and asks for the passcode instead. Dioxus writes the key from `[permissions] biometrics` in `Dioxus.toml`.
+- **The simulator does not enforce the gate.** Every gated read returned in about a millisecond with no sheet, Face ID enrolled or not, so the gate's proof is a device run with a person.
+
+**Decided 2026-09-25 with the maintainer: one unlock per launch comes from Apple's shared `LAContext`**, evaluated at the first gated access and passed on every keychain read and update for the life of the process, rather than from a gated wrapping key or from secrets cached after their first read. The context is a bearer capability like an in-memory wrapping key, and its advantage is that R88's items stay where they are.
+
+**Decided 2026-09-25 with the maintainer: the context reaches the keychain through upstream changes, not through code connetto maintains.** Two requests were opened the same day. `open-source-cooperative/apple-native-keyring-store` is asked for a store option that shares one authentication across its protected entries and a call that invalidates it, which is all connetto calls, and it also reports an entry read back from the keychain with the default policy whatever the item carries. `kornelski/rust-security-framework` is asked for a typed way to attach an `LAContext` to item queries and to `PasswordOptions`, so the store needs no `unsafe` either. Rejected: the gated calls in connetto's own Swift layer or in a connetto crate on the `objc2` bindings, both of which leave keychain security code for connetto to maintain. The requests are open as `apple-native-keyring-store` issue #25 and PR #26 (the opt-in `shared-authentication` store key and `Store::reset_authentication()`), which builds on `rust-security-framework` PR #264 (a safe `AuthenticationContext` behind a `local-authentication` feature), stacked on #263 (`PasswordOptions::set_local_authentication_context`). The request documents are `upstream/apple-native-keyring-store-shared-authentication.md` and `upstream/security-framework-typed-authentication-context.md`.
+
+**Decided 2026-09-25 with the maintainer: R51 builds against the two fork branches through `[patch.crates-io]` until both are released**, so the phase does not wait on either maintainer. Both entries are pinned by `rev`, not by branch, since this is key custody code, and both are needed, because the keychain crate's own patch of `security-framework` does not reach connetto. The `security-framework` patch also replaces the copy `native-tls` uses for the WebSocket TLS, and the pinned branch is upstream `main` (8 commits past the 3.7.0 release on 2026-09-26) plus exactly the two commits of #263 and #264, none of the fork's other branches, which R51 states when it lands. The patches go when both releases are out. They land as R51's first step, not before, since nothing calls the new API until R51 does (decided with the maintainer the same day).
 
 ### Steps
 
-1. Verify the iOS native leg first (probe I5 on the iPhone): the access-control flags and their prompting are not guaranteed to match between macOS and iOS, and Face ID may change the fallback behaviour.
-2. Wire the gated store behind the seam, report through R23's custody surface, extend chapter 14.
+1. ~~Verify the iOS native leg first (probe I5 on the iPhone): the access-control flags and their prompting are not guaranteed to match between macOS and iOS, and Face ID may change the fallback behaviour.~~ **Done 2026-09-25**, results above.
+2. Patch `apple-native-keyring-store` and `security-framework` to the fork branches in the root and demo workspaces, each pinned by `rev` to the head of its open pull request (the `security-framework` branch carries exactly #263 and #264 on upstream `main`, none of the fork's other open pull requests), and check both builds on the macOS CI job.
+3. Wire the gated store behind the seam, report through R23's custody surface, extend chapter 14.
 
 ### Proof
 
@@ -2711,7 +2736,7 @@ The probe app remains the platform evidence for prompting behaviour, since provi
 
 **Status.** NOT STARTED. Split out of R23 on 2026-08-19.
 
-**Blocked on nothing.** R88's Android leg is the installed app this phase's Keystore key and `BiometricPrompt` shell live in, and it wires the ungated `android-native-keyring-store` entry this phase replaces with the hand-built gated key.
+**Blocked on R94**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). R88's Android leg is the installed app this phase's Keystore key and `BiometricPrompt` shell live in, and it wires the ungated `android-native-keyring-store` entry this phase replaces with the hand-built gated key.
 
 Gate both items through a hand-built Keystore key with `set_user_authentication_required(true)` (probe A6: the flag gates correctly, an ungated read is refused by the Keystore). Stock `keyring::Entry` in `android-keyring` 0.2.0 hardcodes the flag off, so the key is built by hand, and the crate is a single-author dependency that would hold the key to every local replica, which this phase weighs explicitly (use, wrap, vendor, or contribute). The read-past-refusal prompt (`BiometricPrompt` plus `CryptoObject`) belongs to the application shell, and the demo carries a minimal one. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
 
@@ -5399,6 +5424,100 @@ A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that
 ### Done when
 
 The template ships the file-replica path for bots with device-local tables, proven by the restart test, and chapter 13's bot paragraph names it.
+
+---
+
+## R94: one client builder per platform, from shared configuration pieces
+
+**Status.** NOT STARTED, designed 2026-09-25 with the maintainer while planning R51. The working notes, with the tree facts each decision rests on, are in `plans/client-builder.md`.
+
+**Blocked on nothing.** R51 and R52 wait on it for the `Gate` setting, and R95 for the starting set of share keys.
+
+### Purpose
+
+A native application builds its client by hand. The desktop demo spends about 120 lines on it (`examples/dioxus-desktop-demo/src/main.rs:392-617`). It dials and wraps the transport, makes the two keyring stores, reads the remembered account, builds `NativeAuthenticator` with the platform sign-in, acquires a session, names the replica from the identity, loads or provisions its key, opens the replica, fills `ClientConfig`, calls `connect` or `connect_existing`, attaches the token source, starts `ConnettoClient::with_reconnect` with a redial closure, and attaches the content client. The browser already has one object and one call for the same sequence, `DbWorkerConfig` and `boot_db_worker` (`crates/connetto-web/src/workers/boot/mod.rs:127` and `:674`), but several of its required fields are empty-string sentinels found at run time, and it has no sync tuning at all.
+
+`ClientConfig` (`crates/connetto-client/src/lib.rs:603`) mixes four kinds of value. The client id, the login grant, the capabilities, the caller's value and the subjects come from the signed-in identity at run time. The schema version, SQL functions, policy tables, unrecorded tables and caller function name are one build artifact. The trim, statistics and residual fields are tuning. `custody` is a report. `DbWorkerConfig` repeats the build artifact through its own setters. R37 settled the setter style and this phase settles the grouping.
+
+**Scope, counted by R37 on 2026-08-09 and recounted when this phase starts.** `ClientConfig` at 59 construction sites (R37's sweep first said 73 and corrected it), `DbWorkerConfig` at 7, `WorkerAuthConfig` at 9, `ReconnectPolicy` at 11, across six cargo workspaces, including `examples/dioxus-desktop-demo`, which the root gate does not build.
+
+### Decisions
+
+All taken with the maintainer on 2026-09-25.
+
+1. **Six shared value pieces, identical on both platforms, each with R37 setters.** `SyncSchema`, `SyncTuning`, `ReconnectPolicy`, `Auth`, `Gate` and `Content`. What differs by platform (the redial, the sign-in hook, the storage location, the gate's mechanism) stays on the platform builder.
+2. **connetto ships the schema build step, and `SyncSchema` is its one output.** It takes the Postgres schema and policy sources and emits the translated replica DDL, the policy tables and views, the caller and subjects function names and the schema version together, and the builder accepts only that value, so an app cannot pair a regenerated DDL with a stale version. The demos' own build scripts go away. Rejected: passing the pieces separately, which is how five values that must agree are kept in agreement by hand today (`main.rs:76-87`).
+3. **The schema version covers the translator.** `SchemaVersion::from_sources` (`crates/connetto-core/src/schema.rs:58`) hashes the source SQL alone, so two apps whose DDL came from different pg2sqlite revisions present one version to one server. The bundle records the translator version it was generated with, the server reports the one it was built with, and the handshake refuses a mismatch as it refuses an outdated schema. The check needs both sides, so this phase carries the server's half.
+4. **`SyncTuning` holds today's five native settings on both platforms, plus a client-wide default watch grace.** Trim threshold 25%, trim budget 1000 pages, rested statistics cap 256, residual threshold 10 000 rows and residual pass automatic, so browser apps gain settings `DbWorkerConfig` never exposed. The grace defaults to `DEFAULT_GRACE` (5 minutes), is clamped to `MAX_GRACE` (10 minutes, `crates/connetto-client/src/subscriptions.rs:156-161`), which stays a constant because R29 made it the boundary with pins, and `watch_with_grace` still overrides it per query.
+5. **The gate is on wherever the platform supports it, and an application turns it off explicitly.** `Gate` holds that switch and one re-check grace, absent meaning once per launch, zero meaning every return. A user can still dismiss the platform's prompt. This amends chapter 14 and reverses the browser's current default (`DbWorkerConfig::with_unlock` is false unless set). Rejected: off unless the application turns it on.
+6. **Each builder takes its required values in `new`, has one typed fork, and plain setters for the rest.** `new(server, schema)` takes what has no honest default, R37's rule. `.signed_in(auth)` returns a second type offering the account choice, and its durable-replica step (decision 12) alone offers the gate, the re-check and the data directory or database prefix, since an in-memory replica has nothing durable to protect. Chapter 12 already puts the same pairing in the type. Rejected: setters only with run-time refusal, and a full cascade where every setting unlocks the next, whose order is arbitrary for most settings and whose generics reach every helper.
+7. **Two builders sharing the pieces.** `NativeClientBuilder` in `connetto-client` and `WebClientBuilder` in `connetto-web`, each listing only its platform's settings. The web builder replaces `DbWorkerConfig`, and native values take owned strings and paths rather than the worker's `&'static str`. Rejected: one builder whose platform methods appear per compile target.
+8. **`connect().await` returns a ready, running client**, with its sync loop, reconnects and files already running when `Content` is given, as `boot_db_worker` does in the browser. Natively it runs on the application's tokio runtime, and the pump stays available for an application that drives its own executor, as `with_pump` allows today. The pump runs while any clone of the client lives, and the client gains one `close()` that ends it and closes the transport, both documented on the type. Files are on exactly when a `Content` value is given, the same rule as attaching a content client today. Rejected: returning a connection the application starts.
+9. **connetto learns that the application went away itself.** On iOS and iPadOS through the Swift layer `connetto-auth-session` ships, on Android through its Kotlin layer and the activity lifecycle Dioxus Mobile publishes, and in the browser through page visibility, which the tab passes to the worker. On the desktop only the UI toolkit knows about focus, so `connetto-dioxus` and `connetto-yew` forward it, and an application with neither calls a method the re-check setting names. Time away is the difference between the two signals' timestamps, never a timer, since a suspended iOS process runs none (R51's probe saw a 78-second suspension only on resume). Rejected: the application forwarding every signal, which leaves the setting inert wherever it forgets.
+10. **`Auth` takes an optional starting set of share keys, read back from what R95 persists.** Share keys usually arrive while the application runs, so adding and removing them on a running client is R95.
+11. **Custody is derived and `ClientConfig` leaves the public surface.** `with_custody` goes, since a settable level is the hazard `crates/connetto-core/src/custody.rs` warns about, and the level comes from what the build did. `ClientConfig` becomes the handshake's internal input, and ordinary applications stop constructing `NativeAuthenticator` and the stores. The server gets the same treatment in R96, minted here.
+12. **The fork is two steps, signing in and then choosing a durable replica, and bots use the same builders** (decided with the maintainer the same day, from the review). R91's bots sign in with a key rather than through a provider and run on `Replica::in_memory()` per login (R91 decision 9), and R93 gives some of them the encrypted file, so identity and durability are separate axes. `.signed_in(auth)` takes either a provider sign-in or a bot key, and a durable replica is a second step on the signed-in builder, which alone offers the data directory or database prefix, the gate and the re-check. An anonymous client stays in memory. Rejected: bots outside the builders, with R91's template hand-writing its own sequence.
+13. **A store states its own protection, and the client reports the weaker of that and what the build knows** (decided with the maintainer the same day, from the review). The two secret stores are pluggable through the R41 seam, and tests and embedding applications hand in their own, which the build cannot inspect. So `RefreshTokenStore` and `ReplicaKeyStore` each report the protection their stored items carry, connetto's own stores report what they wrote, and the connection's custody is the weaker of the two stores' claims and what the build did. A custom store that really gates can say so. `apple-native-keyring-store` PR #26 does not yet report the policy of an entry read back from the keychain (`build_from_search_result` reports the default), so connetto's Apple store answers from what it wrote until that is fixed upstream. Rejected: any supplied store reporting `Unverified(NoGate::Unsupported)`, which is honest but lets no gated custom store claim its gate.
+
+### Steps
+
+1. The schema build step and `SyncSchema`, with the translator version in the schema version on both sides.
+2. The six shared pieces in `connetto-client`, usable from `connetto-web`.
+3. `NativeClientBuilder`, with the demo's sequence moved into `connect()`.
+4. `WebClientBuilder`, replacing `DbWorkerConfig` and keeping `boot_db_worker`'s sequence.
+5. The away signal per platform and the re-check it drives, with the gate's default.
+6. Every construction site in all six workspaces moved onto the builders, `with_custody` removed and `ClientConfig` made internal.
+7. Measure whether trimming shrinks the browser's OPFS file under sqlite-wasm. `trim_replica` (`crates/connetto-client/src/lib.rs:4375`) runs there with no platform gate, and the two trim settings are documented as effective in the browser only once measured.
+8. Chapter 13 for the builders, chapter 14 for the gate's default and the re-check.
+
+### Proof
+
+1. The desktop, Android, iOS and web demos build their clients through the builders, and R88's device proofs pass on them unchanged.
+2. A compile-fail test shows the gate, the re-check, the data directory and the account choice are absent from an anonymous builder.
+3. A handshake between a bundle and a server whose translator versions differ is refused with the outdated-schema reason, and one with equal versions succeeds.
+4. With an injected clock, time away shorter than the grace resumes without a prompt and longer asks again, including across a simulated suspension in which no timer runs.
+5. Dropping the last clone ends the pump, `close()` ends it with clones alive, and neither leaves the transport open.
+6. All six workspaces build and their tests pass.
+
+### Done when
+
+Both platforms build their clients from one builder each over the shared pieces, the demos carry no hand-written connection sequence, and chapters 13 and 14 describe the builders and the gate's default.
+
+---
+
+## R95: share keys added and removed on a running client
+
+**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 10.
+
+**Blocked on R94**, whose `Auth` holds the starting set this phase persists.
+
+### Purpose
+
+A share key usually reaches an application while it runs, when a user opens a share link, but both platforms take share keys only before the handshake (`ClientConfig::with_share_keys`, `DbWorkerConfig::with_share_keys`), and neither has a call to change them afterwards. The same keys feed the replica's subjects function, which every translated policy and `INSTEAD OF` trigger reads locally.
+
+### Decisions
+
+1. **The running client gets a call to add and remove share keys** (2026-09-25, with the maintainer). It re-renders the subjects function and refreshes the live queries it affects, so rows a new key reveals appear at once rather than after the next reconnect. It persists the set in the store that holds the refresh token, gated like it under R51 and R52, and R94's starting set is read back from what it persisted, so there is one list.
+
+### Open question
+
+1. How the server learns of a key added mid-session. Grants are presented at the handshake today, so the call either sends a new grant over the live session, which the protocol has no message for, or reconnects under the hood. Decided before building.
+
+### Proof
+
+A key added on a running client makes its rows appear in an open live query without a reconnect, a removed one makes them disappear, and both survive a restart.
+
+---
+
+## R96: one server builder for programs that embed the server
+
+**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 11 at the maintainer's word, undesigned.
+
+**Blocked on nothing.** Its design comes first.
+
+### Purpose
+
+The shipped server is configured by environment variables and builds its `SessionManager` and `Materializer` itself (`crates/connetto-server/src/bin/connetto-server.rs`). R37 gave the server's settings types `with_*` setters, but a Rust program embedding the server has no single builder, and the only `ServerConfig` is the test harness's. This phase gives it one, in the shape R94 settles for the client. Its contents and structure are designed with the maintainer before any code, as R94's were.
 
 ---
 

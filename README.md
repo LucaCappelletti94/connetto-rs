@@ -30,7 +30,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 95 phases, 74 done and 21 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 98 phases, 74 done and 24 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -41,6 +41,7 @@ The plan in `plans/master-implementation-plan.md` tracks 95 phases, 74 done and 
 | Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
+| One client builder per platform, share keys on a running client, one server builder | R94 to R96 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
 

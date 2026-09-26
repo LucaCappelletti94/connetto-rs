@@ -388,7 +388,7 @@
       <text x="315" y="32" text-anchor="middle" font-size="9.5" fill="#555">SQLCipher, per-replica key, OS keyring custody</text>
       <text x="315" y="46" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
       <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
-      <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates R51 and R52 unblocked by the mobile demo build R88, R53 blocked on hardware</text>
+      <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates R51 and R52 wait on the client builder R94, R53 blocked on hardware</text>
       <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">Linux keyring custody across a reboot: R71</text>
     </g>
 
