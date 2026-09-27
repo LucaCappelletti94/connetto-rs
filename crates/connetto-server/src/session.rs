@@ -2297,16 +2297,20 @@ where
                 Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
             };
             let cursor = self.stamp_opaque(&patch.cursor);
-            // Positions follow commit order and the ingest dispatches one event at a time, so a catchup's ceiling reaches at most this event and this advance never rewinds.
             let advanced = {
                 counters::timed_lock(&self.materializer)
                     .await
                     .advance_cursor(route.session_key, route.sub_id, &cursor)
             };
-            if let Err(err) = advanced {
-                counters::add(&counters::CURSOR_REWINDS, 1);
-                tracing::error!(sub_id = %route.label, error = %err, "a live change's cursor advance was refused");
-                return Err(err.into());
+            match advanced {
+                Ok(()) => {}
+                // After a restart the slot re-delivers rows the durable log already served this route through catchup.
+                Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {
+                    counters::add(&counters::CURSOR_REWINDS, 1);
+                    tracing::debug!(sub_id = %route.label, position = ?event.position(), "the route is already past this re-delivered row");
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
             }
             let live = LivePatch::new(route.label, Cursor::new(cursor), payload);
             // A dropped session receiver just means the client is gone.
@@ -5653,8 +5657,12 @@ mod tests {
     fn a_cursor_resumes_only_while_the_history_holds_its_position() {
         let history = twice_promoted();
         assert_eq!(judged(&at(3, 0x900), &history), Resume::At(row(0x900)));
-        assert_eq!(judged(&at(2, 0x200), &history), Resume::At(row(0x200)));
-        assert_eq!(judged(&at(2, 0x201), &history), Resume::BeyondHistory);
+        assert_eq!(judged(&at(2, 0x1FF), &history), Resume::At(row(0x1FF)));
+        assert_eq!(
+            judged(&at(2, 0x200), &history),
+            Resume::BeyondHistory,
+            "a commit starting at the switchpoint is on the new timeline's side"
+        );
         assert_eq!(judged(&at(1, 0x101), &history), Resume::BeyondHistory);
         assert_eq!(
             judged(&at(4, 0x10), &history),
