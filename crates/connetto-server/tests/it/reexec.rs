@@ -21,7 +21,7 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{AsyncConnector, ReadQuery, RowPage, Snapshot as ConnectorRead};
-use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);";
 
@@ -56,11 +56,11 @@ impl AsyncConnector for QueuedConnector {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgSnapshotFence>), std::io::Error>,
     > + Send {
         let next = self.responses.lock().expect("queue poisoned").pop_front();
         async move {
-            next.map(|n| (PgValue::Int(n), Some(PgCommitPosition::new(PgLsn(1), 1))))
+            next.map(|n| (PgValue::Int(n), PgSnapshotFence::parse("1:1:", PgLsn(1))))
                 .ok_or_else(|| std::io::Error::other("no more canned responses"))
         }
     }

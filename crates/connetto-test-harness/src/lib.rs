@@ -50,7 +50,10 @@ use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
+use subql::{
+    ParserDB, PgChangeEvent, PgCommitPosition, PgLsn, PgStreamingCdcSource, PgStreamingConfig,
+    PgXid,
+};
 use testcontainers::core::logs::LogFrame;
 use testcontainers::core::wait::HttpWaitStrategy;
 use testcontainers::core::{CmdWaitFor, ExecCommand, IntoContainerPort, WaitFor};
@@ -703,6 +706,16 @@ fn uuid_like() -> String {
     )
 }
 
+/// `event` re-stamped as a change of the transaction `at` names, keeping its place in that transaction.
+///
+/// The emulated source counts positions and transaction ids from zero, which no real read can place, so a test that reads the fixture's Postgres stamps each emulated transaction with [`Fixture::commit_now`].
+#[must_use]
+pub fn committed_at(event: PgChangeEvent, at: (PgLsn, PgXid)) -> PgChangeEvent {
+    let (commit_lsn, xid) = at;
+    let position = PgCommitPosition::new(commit_lsn, xid, event.position().ordinal());
+    PgChangeEvent::new(event.into_change(), position)
+}
+
 /// The oplog table name the server binary defaults to.
 pub const OPLOG_TABLE: &str = "connetto_oplog";
 
@@ -943,6 +956,37 @@ impl Fixture {
         .await
         .expect("read the committed position");
         u64::try_from(row.position).expect("a WAL position is never negative")
+    }
+
+    /// A transaction the database committed just now, and a commit position no later than its commit record.
+    ///
+    /// A read of this database taken before the call sees neither and orders before the position, and one taken after sees the transaction.
+    ///
+    /// # Panics
+    ///
+    /// Panics when no admin connection is available or a read fails.
+    pub async fn commit_now(&self) -> (PgLsn, PgXid) {
+        #[derive(diesel::QueryableByName)]
+        struct Number {
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            number: i64,
+        }
+        let mut conn = self.admin.get().await.expect("admin connection");
+        let before: Number = sql_query(
+            "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), '0/0'::pg_lsn)::bigint AS number",
+        )
+        .get_result(&mut *conn)
+        .await
+        .expect("read the insert position");
+        // Outside a transaction block, so the id is assigned and committed by this statement.
+        let xid: Number = sql_query("SELECT (txid_current() % 4294967296)::bigint AS number")
+            .get_result(&mut *conn)
+            .await
+            .expect("commit a transaction");
+        (
+            PgLsn(u64::try_from(before.number).expect("a WAL position is never negative")),
+            PgXid(u32::try_from(xid.number).expect("the remainder fits 32 bits")),
+        )
     }
 
     /// Run a batch of fixture DDL statements as admin, in order.

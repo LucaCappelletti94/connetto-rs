@@ -17,7 +17,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
+use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
 
@@ -88,13 +88,22 @@ async fn take_aggregates(
 }
 
 /// Run `sql` on the emulated source and dispatch every event it produced.
-async fn apply(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>, sql: &str) {
+async fn apply(
+    fixture: &Fixture,
+    source: &mut PgSqliteEmuSource,
+    manager: &Arc<Manager>,
+    sql: &str,
+) {
     source.execute_sql(sql).expect("execute dml");
+    let at = fixture.commit_now().await;
     while let Some(item) = source.next_item().await.expect("poll source") {
         let SourceItem::Event(event) = item else {
             continue;
         };
-        manager.dispatch_event(&event).await.expect("dispatch");
+        manager
+            .dispatch_event(&committed_at(event, at))
+            .await
+            .expect("dispatch");
     }
 }
 
@@ -130,6 +139,7 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     apply(
+        &fixture,
         &mut source,
         &manager,
         "INSERT INTO orders VALUES (4, 'open')",
@@ -147,6 +157,7 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
     // A group born on the change stream appears under a new key, and
     // emptying it again is a keyed removal.
     apply(
+        &fixture,
         &mut source,
         &manager,
         "INSERT INTO orders VALUES (100, 'done')",
@@ -157,7 +168,13 @@ async fn a_grouped_subscription_delivers_per_group_deltas_with_the_key_populated
     assert_ne!(done_key.as_slice(), open_key.as_slice());
     assert_eq!(born.result_json.as_deref(), Some("1"));
     assert!(!born.is_full_result);
-    apply(&mut source, &manager, "DELETE FROM orders WHERE id = 100").await;
+    apply(
+        &fixture,
+        &mut source,
+        &manager,
+        "DELETE FROM orders WHERE id = 100",
+    )
+    .await;
     let removed = take_aggregates(&mut client, "by-status", 1).await.remove(0);
     assert_eq!(
         removed.group_key.as_deref(),

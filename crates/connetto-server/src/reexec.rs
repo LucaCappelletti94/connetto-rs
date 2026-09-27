@@ -27,12 +27,12 @@
 use core::future::Future;
 use core::time::Duration;
 
-use subql::PgCommitPosition;
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, ReadQuery, RowPage, SessionSetup,
     Snapshot,
 };
+use subql::{PgCommitPosition, PgSnapshotFence};
 
 /// What one re-execution read may spend, passed per call.
 ///
@@ -239,7 +239,7 @@ impl AsyncConnector for NoConnector {
         _query: &ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
-    ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>> + Send
+    ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgSnapshotFence>), std::io::Error>> + Send
     {
         async {
             Err(std::io::Error::other(

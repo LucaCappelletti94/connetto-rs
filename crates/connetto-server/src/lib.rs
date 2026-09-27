@@ -27,6 +27,7 @@ pub mod ban;
 pub mod capability;
 pub mod counters;
 pub mod epoch;
+pub mod fence;
 pub mod guard;
 mod key_filter;
 pub mod materializer;
@@ -55,6 +56,7 @@ pub use auth::{RlsAuth, RlsAuthError};
 pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
 pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel};
 pub use connetto_core::auth::CapabilityKey;
+pub use fence::{ReadFence, Unseen, snapshot_cursor, split_snapshot_cursor};
 pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.

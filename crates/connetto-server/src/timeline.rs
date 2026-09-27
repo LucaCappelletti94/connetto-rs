@@ -8,6 +8,8 @@
 use pg_walstream::PgReplicationConnection;
 use subql::{Checkpoint, OpaqueCheckpoint, PgCommitPosition, PgLsn};
 
+use crate::fence::ReadFence;
+
 /// The timeline of a database that was never promoted.
 const FIRST_TIMELINE: u32 = 1;
 
@@ -24,7 +26,7 @@ pub struct Position {
 
 impl Position {
     /// A cursor's length on the wire.
-    const ENCODED_LEN: usize = 28;
+    const ENCODED_LEN: usize = 32;
 
     /// The wire cursor, the cluster then the timeline then the position, so byte order stays issue order across a promotion.
     #[must_use]
@@ -34,6 +36,27 @@ impl Position {
         bytes.extend_from_slice(&self.timeline.to_be_bytes());
         bytes.extend_from_slice(&self.at.to_opaque().0);
         bytes
+    }
+
+    /// The wire cursor followed by `fence`, the snapshot a `SnapshotEnd` cursor was issued after.
+    #[must_use]
+    pub fn fenced_cursor_bytes(self, fence: Option<&ReadFence>) -> Vec<u8> {
+        let mut bytes = self.to_cursor_bytes();
+        if let Some(fence) = fence {
+            fence.encode_into(&mut bytes);
+        }
+        bytes
+    }
+
+    /// Read a wire cursor and the fence after it, `None` for bytes neither form produces.
+    #[must_use]
+    pub fn from_fenced_cursor(bytes: &[u8]) -> Option<(Self, Option<ReadFence>)> {
+        let (position, fence) = bytes.split_at_checked(Self::ENCODED_LEN)?;
+        let position = Self::from_cursor_bytes(position)?;
+        if fence.is_empty() {
+            return Some((position, None));
+        }
+        Some((position, Some(ReadFence::decode(fence)?)))
     }
 
     /// Read a wire cursor, `None` for any other length, every earlier layout included.
@@ -226,7 +249,7 @@ fn read_history_blocking(conninfo: &str) -> Result<TimelineHistory, TimelineErro
 #[cfg(test)]
 mod tests {
     use super::{Position, TimelineHistory, replication_conninfo};
-    use subql::{PgCommitPosition, PgLsn};
+    use subql::{PgCommitPosition, PgLsn, PgXid};
 
     /// The history Postgres 18.6 wrote for timeline 3 after two promotions,
     /// with the reason column it carries.
@@ -240,7 +263,7 @@ mod tests {
         Position {
             system: CLUSTER,
             timeline,
-            at: PgCommitPosition::new(PgLsn(lsn), 1),
+            at: PgCommitPosition::new(PgLsn(lsn), PgXid(1), 1),
         }
     }
 
@@ -302,7 +325,7 @@ mod tests {
     #[test]
     fn a_stamped_cursor_reads_back_and_sorts_by_timeline_first() {
         let history = TimelineHistory::parse(CLUSTER, 2, "1\t0/10\treason").expect("parse");
-        let stamped = history.stamp(PgCommitPosition::new(PgLsn(0x20), 1));
+        let stamped = history.stamp(PgCommitPosition::new(PgLsn(0x20), PgXid(1), 1));
         assert_eq!(Position::from_cursor_bytes(&stamped), Some(at(2, 0x20)));
         assert!(at(1, u64::MAX).to_cursor_bytes() < at(2, 0).to_cursor_bytes());
     }
@@ -311,11 +334,30 @@ mod tests {
     #[test]
     fn cursor_bytes_sort_by_commit_then_ordinal() {
         let cursor = |lsn: u64, ordinal: u64| {
-            TimelineHistory::first(CLUSTER).stamp(PgCommitPosition::new(PgLsn(lsn), ordinal))
+            TimelineHistory::first(CLUSTER).stamp(PgCommitPosition::new(
+                PgLsn(lsn),
+                PgXid(1),
+                ordinal,
+            ))
         };
         assert!(cursor(0x100, 2) < cursor(0x101, 1));
         assert!(cursor(0x100, 1) < cursor(0x100, 2));
         assert!(cursor(0xFF, 256) < cursor(0x100, 0));
+    }
+
+    #[test]
+    fn a_fenced_cursor_reads_back_its_position_and_fence() {
+        let fence = crate::fence::ReadFence::parse("740:745:742", PgLsn(0x2000)).expect("parse");
+        let bytes = at(1, 0x20).fenced_cursor_bytes(Some(&fence));
+        assert_eq!(
+            Position::from_fenced_cursor(&bytes),
+            Some((at(1, 0x20), Some(fence)))
+        );
+        assert_eq!(
+            Position::from_fenced_cursor(&at(1, 0x20).to_cursor_bytes()),
+            Some((at(1, 0x20), None))
+        );
+        assert_eq!(Position::from_fenced_cursor(&bytes[..40]), None);
     }
 
     #[test]

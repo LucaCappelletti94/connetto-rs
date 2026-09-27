@@ -123,6 +123,7 @@ CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate'
 
 CREATE TABLE connetto_oplog (
     commit_lsn   BIGINT NOT NULL,
+    xid          BIGINT NOT NULL,
     ordinal      BIGINT NOT NULL,
     table_name   TEXT NOT NULL,
     op           connetto_change_op NOT NULL,
@@ -130,12 +131,13 @@ CREATE TABLE connetto_oplog (
     is_tombstone BOOLEAN NOT NULL,
     event        BYTEA NOT NULL,
     appended_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    PRIMARY KEY (commit_lsn, ordinal)
+    PRIMARY KEY (commit_lsn, xid, ordinal)
 );
 
 CREATE TABLE connetto_oplog_commit (
     only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
     commit_lsn BIGINT NOT NULL,
+    xid        BIGINT NOT NULL,
     end_lsn    BIGINT NOT NULL
 );
 ```
