@@ -1527,23 +1527,46 @@ async fn conflicting_write_converges_to_server_after_rollback() {
 /// for the Postgres backend in the Docker-free aggregate loop.
 #[derive(Clone)]
 struct QueuedConnector {
-    responses: Arc<Mutex<VecDeque<PgValue<Postgres>>>>,
+    responses: Arc<Mutex<VecDeque<Canned<PgValue<Postgres>>>>>,
     rows: Arc<Mutex<VecDeque<Vec<PgValue<Postgres>>>>>,
 }
 
+/// A canned answer and the fence of the moment it stands for.
+type Canned<V> = (V, Option<PgSnapshotFence>);
+
+/// A read taken before every emulated change, whose commits all start past WAL position 1.
+fn before_every_change() -> Option<PgSnapshotFence> {
+    PgSnapshotFence::parse("1:1:", PgLsn(1))
+}
+
+/// A read taken after every emulated change: it sees the emulator's small transaction ids and ends past its positions.
+fn after_every_change() -> Option<PgSnapshotFence> {
+    PgSnapshotFence::parse("1000000:1000000:", PgLsn(1 << 40))
+}
+
 impl QueuedConnector {
-    fn new(responses: impl IntoIterator<Item = i64>) -> Self {
+    /// Canned scalar answers, each with the fence of the moment it stands for.
+    fn new(responses: impl IntoIterator<Item = (i64, Option<PgSnapshotFence>)>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(
-                responses.into_iter().map(PgValue::Int).collect(),
+                responses
+                    .into_iter()
+                    .map(|(value, fence)| (PgValue::Int(value), fence))
+                    .collect(),
             )),
             rows: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
 
+    /// Canned scalar answers read before every change.
     fn with_scalars(responses: impl IntoIterator<Item = PgValue<Postgres>>) -> Self {
         Self {
-            responses: Arc::new(Mutex::new(responses.into_iter().collect())),
+            responses: Arc::new(Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|value| (value, before_every_change()))
+                    .collect(),
+            )),
             rows: Arc::new(Mutex::new(VecDeque::new())),
         }
     }
@@ -1575,10 +1598,7 @@ impl AsyncConnector for QueuedConnector {
         Output = Result<(PgValue<Postgres>, Option<PgSnapshotFence>), std::io::Error>,
     > + Send {
         let next = self.responses.lock().expect("queue poisoned").pop_front();
-        async move {
-            next.map(|value| (value, PgSnapshotFence::parse("1:1:", PgLsn(1))))
-                .ok_or_else(|| std::io::Error::other("no more canned responses"))
-        }
+        async move { next.ok_or_else(|| std::io::Error::other("no more canned responses")) }
     }
 
     fn read_page(
@@ -1639,8 +1659,8 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     // through the connector, folds a lower insert in-process, and re-executes
     // through the connector when the current extreme is deleted. Each value
     // reaches the client as a ClientEvent::Aggregate.
-    // Bootstrap answers 3; the re-execution after the delete answers 9.
-    let connector = QueuedConnector::new([3, 9]);
+    // Bootstrap answers 3 before any change, the re-execution after the delete answers 9 and holds both changes.
+    let connector = QueuedConnector::new([(3, before_every_change()), (9, after_every_change())]);
     let materializer = Materializer::with_read_connector(
         PG_DDL,
         RuntimeWritableCatalog::default(),
