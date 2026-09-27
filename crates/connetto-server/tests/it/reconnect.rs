@@ -9,7 +9,9 @@
 //! * outside the window (after a prune): the client receives
 //!   `FullResyncRequired { CursorOutsideRetention }` followed by a fresh
 //!   snapshot;
-//! * a delete replays as a tombstone so the client drops the row.
+//! * a delete replays as a tombstone so the client drops the row;
+//! * after a restart, the feed re-delivering rows a caught-up client already
+//!   holds keeps running and sends that client only what it lacks.
 //!
 //! Reads and seeds go through typed diesel queries, matching the other tests;
 //! DML against the emulated backend stays as SQL strings.
@@ -25,8 +27,8 @@ use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     ChangeRecord, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog,
-    OplogConfig, PageSpec, Position, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, TimelineHistory, loopback, pg_write_target,
+    OplogConfig, PageSpec, PgOplog, Position, RequestGuard, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -892,6 +894,146 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
             panic!("expected the replay and then the live change");
         };
         assert_eq!(patch.cursor, cursor_of(event));
+    }
+    expect_idle(&mut client).await;
+}
+
+/// Its own log table, shared by the manager before the restart and the one after it.
+const RESTART_OPLOG: &str = "connetto_oplog_restart";
+
+type RestartManager =
+    SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark, NoConnector, PgOplog>;
+
+/// A manager over the existing restart log table, as a restarted process builds it.
+fn restarted_manager(fixture: &Fixture) -> Arc<RestartManager> {
+    SessionManager::with_oplog(
+        Materializer::new(PG_DDL).expect("build materializer"),
+        SeedSnapshot,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        PgOplog::new(
+            fixture.admin().clone(),
+            RESTART_OPLOG,
+            OplogConfig::default(),
+        ),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+        None,
+        NoSigner,
+    )
+}
+
+/// Open a session on a restart manager resuming at `resume`, returning the client half once the ack arrived.
+async fn open_restarted_session(
+    manager: &Arc<RestartManager>,
+    resume: Cursor,
+) -> LoopbackTransport {
+    let (server_transport, mut client) = loopback();
+    let server = manager.clone();
+    tokio::spawn(async move {
+        server.serve(server_transport).await.expect("session ok");
+    });
+    let handshake = Handshake::new(PROTOCOL_VERSION, "client-a")
+        .with_grant(connetto_core::messages::Grant::new(
+            "user:client-a".to_owned(),
+        ))
+        .with_cursor(resume);
+    client
+        .send_control(ControlMessage::Handshake(handshake))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+}
+
+/// After a restart the slot re-delivers rows the durable log already holds. A client that caught up from the log first is past them, and the feed skips them for that client instead of stopping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restarted_feed_replaying_rows_a_caught_up_client_holds_keeps_running() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            &format!("DROP TABLE IF EXISTS {RESTART_OPLOG}"),
+            &format!(
+                "DROP TABLE IF EXISTS {}",
+                PgOplog::commit_table(RESTART_OPLOG)
+            ),
+        ])
+        .await;
+    PgOplog::new(
+        fixture.admin().clone(),
+        RESTART_OPLOG,
+        OplogConfig::default(),
+    )
+    .ensure_schema()
+    .await
+    .expect("provision the log");
+
+    // Four inserts reach the log, and the process stops before any is acknowledged.
+    let before = restarted_manager(&fixture);
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    for id in 1..=4 {
+        events.extend(
+            drive(
+                &mut source,
+                &before,
+                &format!(
+                    "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 2, 'paid')"
+                ),
+            )
+            .await,
+        );
+    }
+    drop(before);
+
+    // A client synced through the second insert reconnects to the restarted process and catches up from the log.
+    let after = restarted_manager(&fixture);
+    let mut client = open_restarted_session(&after, cursor_of(&events[1])).await;
+    subscribe(&mut client).await;
+    for event in &events[2..] {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(
+            live.cursor,
+            cursor_of(event),
+            "catchup replays the log in order"
+        );
+    }
+    let held = cursor_of(&events[3]);
+
+    // The restarted feed re-delivers every unacknowledged insert, then a new one.
+    for (index, event) in events.iter().enumerate() {
+        after
+            .dispatch_event(event)
+            .await
+            .unwrap_or_else(|err| panic!("re-delivering insert {index} stopped the feed: {err}"));
+    }
+    let fresh = drive(
+        &mut source,
+        &after,
+        "INSERT INTO orders (id, price, quantity, status) VALUES (5, 1.0, 2, 'paid')",
+    )
+    .await;
+    let fresh = cursor_of(&fresh[0]);
+
+    loop {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a live patch");
+        };
+        assert!(
+            live.cursor.as_bytes() >= held.as_bytes(),
+            "a row the client already holds came back at {:?}",
+            live.cursor
+        );
+        if live.cursor == fresh {
+            break;
+        }
     }
     expect_idle(&mut client).await;
 }

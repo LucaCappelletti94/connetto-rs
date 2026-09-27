@@ -1,7 +1,7 @@
 //! Which cluster and which timeline of the database a resume cursor belongs to (R73, R70).
 //!
 //! A promoted standby's history ends the old timeline where the standby stopped
-//! receiving, so a cursor past that point names changes the database lost.
+//! receiving, so a cursor naming a commit at or past that point names changes the database lost.
 //! A dump restored into another cluster starts again at timeline 1 under another
 //! system identifier, so a cursor naming the old identifier names changes it never had.
 
@@ -136,13 +136,16 @@ impl TimelineHistory {
         })
     }
 
-    /// Whether `position` is on this cluster, on the current timeline or on an ancestor at or before its end.
+    /// Whether `position` is on this cluster, on the current timeline or on an ancestor before its end.
+    ///
+    /// Postgres ends a timeline exclusively at its switchpoint, so a commit starting there is on the new timeline's side, while a read there claims only earlier commits.
     #[must_use]
     pub fn contains(&self, position: Position) -> bool {
         position.system == self.system
             && (position.timeline == self.current
                 || self.ended.iter().any(|&(timeline, end)| {
-                    timeline == position.timeline && position.at.commit_lsn() <= PgLsn(end)
+                    timeline == position.timeline
+                        && position.at <= PgCommitPosition::before_commit(PgLsn(end))
                 }))
     }
 
@@ -241,14 +244,29 @@ mod tests {
         }
     }
 
+    /// A read at `lsn`, which orders before every commit starting there.
+    fn read(timeline: u32, lsn: u64) -> Position {
+        Position {
+            system: CLUSTER,
+            timeline,
+            at: PgCommitPosition::before_commit(PgLsn(lsn)),
+        }
+    }
+
     #[test]
-    fn an_ancestor_holds_positions_up_to_where_it_ended_and_no_further() {
+    fn an_ancestor_holds_commits_before_where_it_ended_and_reads_up_to_it() {
         let history = TimelineHistory::parse(CLUSTER, 3, TWICE_PROMOTED).expect("parse");
         let first_end = 0x0303_4A08;
-        assert!(history.contains(at(1, first_end)));
-        assert!(!history.contains(at(1, first_end + 1)));
-        assert!(history.contains(at(2, 0x0500_0000)));
-        assert!(!history.contains(at(2, 0x0500_0001)));
+        assert!(history.contains(at(1, first_end - 1)));
+        assert!(
+            !history.contains(at(1, first_end)),
+            "a commit starting at the switchpoint is on the new timeline's side"
+        );
+        assert!(history.contains(read(1, first_end)));
+        assert!(!history.contains(read(1, first_end + 1)));
+        assert!(history.contains(at(2, 0x04FF_FFFF)));
+        assert!(!history.contains(at(2, 0x0500_0000)));
+        assert!(history.contains(read(2, 0x0500_0000)));
         assert!(history.contains(at(3, u64::MAX)));
         assert!(
             !history.contains(at(4, 0)),
