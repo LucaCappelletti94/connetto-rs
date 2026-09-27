@@ -28,7 +28,7 @@ use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
-use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 
 fn test_verifier() -> Arc<dyn HandshakeAuthority> {
@@ -170,7 +170,7 @@ struct SeedRows {
 impl AsyncConnector for SeedRows {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
-    type Checkpoint = PgLsn;
+    type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
     fn execute_scalar(
@@ -179,7 +179,7 @@ impl AsyncConnector for SeedRows {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("not used")) }
     }
@@ -190,7 +190,7 @@ impl AsyncConnector for SeedRows {
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgCommitPosition>, std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("not used")) }
     }
@@ -201,13 +201,17 @@ impl AsyncConnector for SeedRows {
         _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
+        Output = Result<
+            (Vec<PgValue<Postgres>>, Option<PgCommitPosition>),
+            ScalarRowError<std::io::Error>,
+        >,
     > + Send {
         let next = self.rows.lock().expect("queue poisoned").pop();
         async move {
-            next.map(|row| (row, Some(PgLsn(1)))).ok_or_else(|| {
-                ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
-            })
+            next.map(|row| (row, Some(PgCommitPosition::new(PgLsn(1), 1))))
+                .ok_or_else(|| {
+                    ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
+                })
         }
     }
 }
@@ -359,7 +363,10 @@ async fn use_live_renders_and_follows_cdc() {
             "INSERT INTO orders (id, quantity) VALUES ({WITHHELD_ID}, 1)",
         ))
         .expect("emu insert withheld");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
     render_until(&mut vdom, |html| {
@@ -436,7 +443,10 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         .values((orders::id.eq(WITHHELD_ID), orders::quantity.eq(1_i64)))
         .execute(source.connection())
         .expect("emu insert withheld");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
     render_until(&mut vdom, |html| html.contains("boxed-rows:2")).await;

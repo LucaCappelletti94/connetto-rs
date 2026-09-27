@@ -24,7 +24,7 @@ use connetto_server::{
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, pool_for, with_user};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
 /// The catalog DDL carries the RLS marker: subql classifies the table from
 /// the parsed DDL, and without it the aggregate registers as a shared fold
@@ -136,7 +136,10 @@ fn count_of(update: &AggregateUpdate) -> i64 {
 /// Run `sql` on the emulated source and dispatch every event it produced.
 async fn apply(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>, sql: &str) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
 }

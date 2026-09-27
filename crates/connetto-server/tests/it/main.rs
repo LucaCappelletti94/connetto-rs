@@ -91,6 +91,8 @@ mod snapshot_nonfatal;
 
 mod snapshot_order;
 
+mod resume_point;
+
 mod stream_gap;
 
 mod subscription_translate;

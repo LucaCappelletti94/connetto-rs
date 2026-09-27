@@ -42,6 +42,7 @@ use subql::backend::{Postgres, Value};
 use subql::catalog_helpers;
 use subql::visibility::openfga::OpenFgaPolicy;
 use subql::visibility::{RowWrite, Verdict, VisibilityPolicy};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn};
 
 /// The schema clients sync.
 const SCHEMA: &str = "CREATE TABLE r5b_notes (id INT PRIMARY KEY, owner TEXT NOT NULL);";
@@ -328,15 +329,18 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
     let notes = catalog_helpers::table_id::<Postgres, _>(shapes.catalog(), "r5b_notes")
         .expect("in the catalog");
     let after: [Value<Postgres>; 2] = [Value::Int(1), Value::String("carol".to_owned())];
-    let event = ChangeEvent::update(
-        "public",
-        "r5b_notes",
-        0,
-        Some(row_data(&[("id", "1"), ("owner", "alice")])),
-        row_data(&[("id", "1"), ("owner", "carol")]),
-        ReplicaIdentity::Full,
-        vec![Arc::from("id")],
-        Lsn::new(1),
+    let event = PgChangeEvent::new(
+        ChangeEvent::update(
+            "public",
+            "r5b_notes",
+            0,
+            Some(row_data(&[("id", "1"), ("owner", "alice")])),
+            row_data(&[("id", "1"), ("owner", "carol")]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(1),
+        ),
+        PgCommitPosition::new(PgLsn(1), 1),
     );
 
     upkeep
@@ -502,14 +506,17 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
     );
 
     // The withdrawal, as the change stream carries it.
-    let event = ChangeEvent::delete(
-        "public",
-        "r7_members",
-        0,
-        row_data(&[("team_id", "1"), ("member", "alice")]),
-        ReplicaIdentity::Full,
-        vec![Arc::from("team_id"), Arc::from("member")],
-        Lsn::new(2),
+    let event = PgChangeEvent::new(
+        ChangeEvent::delete(
+            "public",
+            "r7_members",
+            0,
+            row_data(&[("team_id", "1"), ("member", "alice")]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("team_id"), Arc::from("member")],
+            Lsn::new(2),
+        ),
+        PgCommitPosition::new(PgLsn(2), 1),
     );
     upkeep
         .keep_current(&event)
@@ -816,14 +823,17 @@ async fn a_replayed_share_is_withdrawn_when_its_row_goes() {
             .await
             .expect("the share row goes");
     }
-    let event = ChangeEvent::delete(
-        "public",
-        "r86_shares",
-        0,
-        row_data(&[("paper_id", "1"), ("viewer", "alice"), ("weight", "10")]),
-        ReplicaIdentity::Full,
-        vec![Arc::from("paper_id"), Arc::from("viewer")],
-        Lsn::new(2),
+    let event = PgChangeEvent::new(
+        ChangeEvent::delete(
+            "public",
+            "r86_shares",
+            0,
+            row_data(&[("paper_id", "1"), ("viewer", "alice"), ("weight", "10")]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("paper_id"), Arc::from("viewer")],
+            Lsn::new(2),
+        ),
+        PgCommitPosition::new(PgLsn(2), 1),
     );
     let moves = upkeep
         .keep_current(&event)
@@ -878,15 +888,18 @@ async fn a_replayed_change_costs_more_than_a_settled_one_and_is_measured() {
 
     // A change to the guarded table itself settles from its own row, so it pays
     // no replay. This is the baseline the re-run is measured against.
-    let settled = ChangeEvent::update(
-        "public",
-        "r86_papers",
-        0,
-        Some(row_data(&[("id", "1"), ("owner", "zoe")])),
-        row_data(&[("id", "1"), ("owner", "yolanda")]),
-        ReplicaIdentity::Full,
-        vec![Arc::from("id")],
-        Lsn::new(2),
+    let settled = PgChangeEvent::new(
+        ChangeEvent::update(
+            "public",
+            "r86_papers",
+            0,
+            Some(row_data(&[("id", "1"), ("owner", "zoe")])),
+            row_data(&[("id", "1"), ("owner", "yolanda")]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("id")],
+            Lsn::new(2),
+        ),
+        PgCommitPosition::new(PgLsn(2), 1),
     );
     let mut settled_total = Duration::ZERO;
     for _ in 0..ROUNDS {
@@ -899,19 +912,22 @@ async fn a_replayed_change_costs_more_than_a_settled_one_and_is_measured() {
     }
 
     // A change to the share table replays the query and reconciles the slice.
-    let replayed = ChangeEvent::update(
-        "public",
-        "r86_shares",
-        0,
-        Some(row_data(&[
-            ("paper_id", "1"),
-            ("viewer", "carol"),
-            ("weight", "1"),
-        ])),
-        row_data(&[("paper_id", "1"), ("viewer", "carol"), ("weight", "2")]),
-        ReplicaIdentity::Full,
-        vec![Arc::from("paper_id"), Arc::from("viewer")],
-        Lsn::new(3),
+    let replayed = PgChangeEvent::new(
+        ChangeEvent::update(
+            "public",
+            "r86_shares",
+            0,
+            Some(row_data(&[
+                ("paper_id", "1"),
+                ("viewer", "carol"),
+                ("weight", "1"),
+            ])),
+            row_data(&[("paper_id", "1"), ("viewer", "carol"), ("weight", "2")]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("paper_id"), Arc::from("viewer")],
+            Lsn::new(3),
+        ),
+        PgCommitPosition::new(PgLsn(3), 1),
     );
     let mut replayed_total = Duration::ZERO;
     for _ in 0..ROUNDS {
@@ -976,14 +992,17 @@ async fn a_replay_that_cannot_run_refuses_rather_than_letting_the_row_through() 
             .expect("the share table goes");
     }
 
-    let event = ChangeEvent::delete(
-        "public",
-        "r86_shares",
-        0,
-        row_data(&[("paper_id", "1"), ("viewer", "alice"), ("weight", "10")]),
-        ReplicaIdentity::Full,
-        vec![Arc::from("paper_id"), Arc::from("viewer")],
-        Lsn::new(2),
+    let event = PgChangeEvent::new(
+        ChangeEvent::delete(
+            "public",
+            "r86_shares",
+            0,
+            row_data(&[("paper_id", "1"), ("viewer", "alice"), ("weight", "10")]),
+            ReplicaIdentity::Full,
+            vec![Arc::from("paper_id"), Arc::from("viewer")],
+            Lsn::new(2),
+        ),
+        PgCommitPosition::new(PgLsn(2), 1),
     );
     let refused = upkeep
         .keep_current(&event)
@@ -1105,19 +1124,22 @@ fn ck_paper_row(tenant: i64, id: i64, owner: &str) -> [Value<Postgres>; 3] {
 }
 
 /// The deletion of tenant 1's share row, as the change stream reports it.
-fn ck_share_delete_event() -> ChangeEvent {
-    ChangeEvent::delete(
-        "public",
-        "ck_shares",
-        0,
-        row_data(&[("tenant_id", "1"), ("paper_id", "1"), ("viewer", "viewer1")]),
-        ReplicaIdentity::Full,
-        vec![
-            Arc::from("tenant_id"),
-            Arc::from("paper_id"),
-            Arc::from("viewer"),
-        ],
-        Lsn::new(2),
+fn ck_share_delete_event() -> PgChangeEvent {
+    PgChangeEvent::new(
+        ChangeEvent::delete(
+            "public",
+            "ck_shares",
+            0,
+            row_data(&[("tenant_id", "1"), ("paper_id", "1"), ("viewer", "viewer1")]),
+            ReplicaIdentity::Full,
+            vec![
+                Arc::from("tenant_id"),
+                Arc::from("paper_id"),
+                Arc::from("viewer"),
+            ],
+            Lsn::new(2),
+        ),
+        PgCommitPosition::new(PgLsn(2), 1),
     )
 }
 
@@ -1387,16 +1409,19 @@ async fn a_replayed_keyed_grant_names_the_bearer_it_reached() {
             .expect("the share row lands");
     }
     let granted = upkeep
-        .keep_current(&ChangeEvent::insert(
-            "public",
-            "r86k_shares",
-            0,
-            row_data(&[
-                ("paper_id", "1"),
-                ("viewer", REPLAY_KEY_B),
-                ("weight", "10"),
-            ]),
-            Lsn::new(2),
+        .keep_current(&PgChangeEvent::new(
+            ChangeEvent::insert(
+                "public",
+                "r86k_shares",
+                0,
+                row_data(&[
+                    ("paper_id", "1"),
+                    ("viewer", REPLAY_KEY_B),
+                    ("weight", "10"),
+                ]),
+                Lsn::new(2),
+            ),
+            PgCommitPosition::new(PgLsn(2), 1),
         ))
         .await
         .expect("the grant reached the store");
@@ -1448,18 +1473,21 @@ async fn a_replayed_keyed_withdrawal_names_the_bearer_that_lost_it() {
         .expect("the share row goes");
     }
     let withdrawn = upkeep
-        .keep_current(&ChangeEvent::delete(
-            "public",
-            "r86k_shares",
-            0,
-            row_data(&[
-                ("paper_id", "1"),
-                ("viewer", REPLAY_KEY_A),
-                ("weight", "10"),
-            ]),
-            ReplicaIdentity::Full,
-            vec![Arc::from("paper_id"), Arc::from("viewer")],
-            Lsn::new(3),
+        .keep_current(&PgChangeEvent::new(
+            ChangeEvent::delete(
+                "public",
+                "r86k_shares",
+                0,
+                row_data(&[
+                    ("paper_id", "1"),
+                    ("viewer", REPLAY_KEY_A),
+                    ("weight", "10"),
+                ]),
+                ReplicaIdentity::Full,
+                vec![Arc::from("paper_id"), Arc::from("viewer")],
+                Lsn::new(3),
+            ),
+            PgCommitPosition::new(PgLsn(3), 1),
         ))
         .await
         .expect("the withdrawal reached the store");

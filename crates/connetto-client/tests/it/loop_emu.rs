@@ -41,7 +41,7 @@ use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
-use subql::{CdcSource, PgLsn, PgSqliteEmuSource};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
@@ -649,7 +649,10 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
             "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
         ))
         .expect("emu insert withheld");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -820,7 +823,10 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
             "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
         ))
         .expect("emu insert withheld");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -844,7 +850,10 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     source
         .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (8, 4.0, 2, 'more')")
         .expect("insert 8");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -1461,7 +1470,10 @@ async fn conflicting_write_converges_to_server_after_rollback() {
             "INSERT INTO orders (id, price, quantity, status) VALUES ({WITHHELD_ID}, 0.0, 1, 'withheld')"
         ))
         .expect("emu insert withheld");
-    while let Some(event) = source.next_event().await.expect("poll event") {
+    while let Some(item) = source.next_item().await.expect("poll event") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -1551,7 +1563,7 @@ impl QueuedConnector {
 impl AsyncConnector for QueuedConnector {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
-    type Checkpoint = PgLsn;
+    type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
     fn execute_scalar(
@@ -1560,11 +1572,11 @@ impl AsyncConnector for QueuedConnector {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
     > + Send {
         let next = self.responses.lock().expect("queue poisoned").pop_front();
         async move {
-            next.map(|value| (value, Some(PgLsn(1))))
+            next.map(|value| (value, Some(PgCommitPosition::new(PgLsn(1), 1))))
                 .ok_or_else(|| std::io::Error::other("no more canned responses"))
         }
     }
@@ -1575,7 +1587,7 @@ impl AsyncConnector for QueuedConnector {
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgCommitPosition>, std::io::Error>,
     > + Send {
         async {
             Err(std::io::Error::other(
@@ -1590,13 +1602,17 @@ impl AsyncConnector for QueuedConnector {
         _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
+        Output = Result<
+            (Vec<PgValue<Postgres>>, Option<PgCommitPosition>),
+            ScalarRowError<std::io::Error>,
+        >,
     > + Send {
         let next = self.rows.lock().expect("queue poisoned").pop_front();
         async move {
-            next.map(|row| (row, Some(PgLsn(1)))).ok_or_else(|| {
-                ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
-            })
+            next.map(|row| (row, Some(PgCommitPosition::new(PgLsn(1), 1))))
+                .ok_or_else(|| {
+                    ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
+                })
         }
     }
 }
@@ -1680,7 +1696,10 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     source
         .execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (5, 1.0, 1, 'x')")
         .expect("emu insert");
-    while let Some(event) = source.next_event().await.expect("poll event") {
+    while let Some(item) = source.next_item().await.expect("poll event") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -1697,7 +1716,10 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     source
         .execute_sql("DELETE FROM orders WHERE id = 5")
         .expect("emu delete");
-    while let Some(event) = source.next_event().await.expect("poll event") {
+    while let Some(item) = source.next_item().await.expect("poll event") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -1783,13 +1805,19 @@ async fn drain_events<S, C, O>(
     source: &mut PgSqliteEmuSource,
 ) where
     S: SnapshotSource,
-    C: AsyncConnector<Backend = Postgres, Checkpoint = PgLsn, AuthContext = ConnettoReadSetup>
-        + Send
+    C: AsyncConnector<
+            Backend = Postgres,
+            Checkpoint = PgCommitPosition,
+            AuthContext = ConnettoReadSetup,
+        > + Send
         + Sync,
     C::Error: core::fmt::Display + connetto_server::FailedRead,
     O: Oplog,
 {
-    while let Some(event) = source.next_event().await.expect("poll event") {
+    while let Some(item) = source.next_item().await.expect("poll event") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -1972,7 +2000,7 @@ struct GatedSeed {
 impl AsyncConnector for GatedSeed {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
-    type Checkpoint = PgLsn;
+    type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
     fn execute_scalar(
@@ -1981,7 +2009,7 @@ impl AsyncConnector for GatedSeed {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("the gated seed serves no scalars")) }
     }
@@ -1992,7 +2020,7 @@ impl AsyncConnector for GatedSeed {
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<ConnectorRead<RowPage<Postgres>, PgLsn>, std::io::Error>,
+        Output = Result<ConnectorRead<RowPage<Postgres>, PgCommitPosition>, std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("the gated seed serves no pages")) }
     }
@@ -2003,7 +2031,10 @@ impl AsyncConnector for GatedSeed {
         _kinds: &[ScalarFamily],
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(Vec<PgValue<Postgres>>, Option<PgLsn>), ScalarRowError<std::io::Error>>,
+        Output = Result<
+            (Vec<PgValue<Postgres>>, Option<PgCommitPosition>),
+            ScalarRowError<std::io::Error>,
+        >,
     > + Send {
         let next = self.rows.lock().expect("queue poisoned").pop_front();
         let entered = Arc::clone(&self.entered);
@@ -2016,9 +2047,10 @@ impl AsyncConnector for GatedSeed {
             // top of it. A position at or past an event's LSN would mean that
             // event was already inside the read, and the engine would rightly
             // not replay it.
-            next.map(|row| (row, Some(PgLsn(0)))).ok_or_else(|| {
-                ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
-            })
+            next.map(|row| (row, Some(PgCommitPosition::before_commit(PgLsn(0)))))
+                .ok_or_else(|| {
+                    ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
+                })
         }
     }
 }
@@ -3618,7 +3650,10 @@ async fn drive_cdc<S: SnapshotSource>(
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -4119,7 +4154,10 @@ async fn drive_insert<O: Oplog>(
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await

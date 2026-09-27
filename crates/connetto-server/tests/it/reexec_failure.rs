@@ -17,7 +17,7 @@ use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
 
 const DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
@@ -133,7 +133,7 @@ async fn a_poisoned_computed_read_ends_alone_after_one_retry() {
                 .execute_sql("INSERT INTO counts (id, n) VALUES (10, 10)")
                 .expect("seed emu");
             source
-                .next_event()
+                .next_item()
                 .await
                 .expect("drain emu")
                 .expect("insert event");
@@ -143,7 +143,10 @@ async fn a_poisoned_computed_read_ends_alone_after_one_retry() {
             source
                 .execute_sql("DELETE FROM counts WHERE id = 10")
                 .expect("execute dml");
-            while let Some(event) = source.next_event().await.expect("poll source") {
+            while let Some(item) = source.next_item().await.expect("poll source") {
+                let SourceItem::Event(event) = item else {
+                    continue;
+                };
                 manager
                     .dispatch_event(&event)
                     .await
@@ -229,7 +232,10 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
     source
         .execute_sql("INSERT INTO counts (id, n) VALUES (1, 1)")
         .expect("stage insert");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await

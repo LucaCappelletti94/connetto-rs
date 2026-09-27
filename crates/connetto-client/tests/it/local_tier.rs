@@ -27,7 +27,7 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{PatchSet, SimpleTable};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
@@ -539,7 +539,10 @@ async fn mixed_row_query_subscribes_synced_tables_whole() {
     source
         .execute_sql("INSERT INTO orders (id, quantity) VALUES (1, 5)")
         .expect("emu insert");
-    while let Some(event) = source.next_event().await.expect("poll event") {
+    while let Some(item) = source.next_item().await.expect("poll event") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
     loop {
@@ -581,7 +584,10 @@ async fn mixed_row_query_subscribes_synced_tables_whole() {
             "INSERT INTO orders (id, quantity) VALUES ({WITHHELD_ID}, 1)"
         ))
         .expect("withheld emu insert");
-    while let Some(event) = source.next_event().await.expect("poll event") {
+    while let Some(item) = source.next_item().await.expect("poll event") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
     client.ping(9).await.expect("ping");

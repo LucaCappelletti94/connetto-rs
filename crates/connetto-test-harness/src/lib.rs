@@ -19,7 +19,7 @@
 
 use std::collections::VecDeque;
 use std::process::Command;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -35,8 +35,8 @@ use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
     InMemoryOplog, LoopbackTransport, Materializer, NoSigner, OidcProviderConfig, PgReadConnector,
-    PgSnapshotSource, ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError, RuntimeWritableCatalog,
-    SessionConfig, SessionManager, loopback, pg_write_target,
+    PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1378,6 +1378,8 @@ impl ServerConfig {
 pub struct Server {
     manager: Arc<HarnessManager>,
     ingest: JoinHandle<()>,
+    /// How many times the change feed had to be reconnected.
+    restarts: Arc<AtomicU64>,
 }
 
 impl Drop for Server {
@@ -1391,6 +1393,12 @@ impl Server {
     #[must_use]
     pub fn manager(&self) -> &Arc<HarnessManager> {
         &self.manager
+    }
+
+    /// How many times the change feed failed and had to be reconnected, which a healthy stream never does.
+    #[must_use]
+    pub fn ingest_restarts(&self) -> u64 {
+        AtomicU64::load(&self.restarts, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Ask Postgres row-level security about every current row alongside the
@@ -1515,30 +1523,47 @@ pub async fn spawn_server(
         "nothing else installs a withdrawal source"
     );
 
-    let ingest = spawn_ingest_task(admin_url, pg_ddl, Arc::clone(&manager));
+    let restarts = Arc::new(AtomicU64::new(0));
+    let ingest = spawn_ingest_task(
+        admin_url,
+        pg_ddl,
+        Arc::clone(&manager),
+        Arc::clone(&restarts),
+    );
 
-    Server { manager, ingest }
+    Server {
+        manager,
+        ingest,
+        restarts,
+    }
 }
 /// Spawn the CDC ingest loop that drives `manager` from the replication stream.
 fn spawn_ingest_task(
     admin_url: String,
     pg_ddl: String,
     manager: Arc<HarnessManager>,
+    restarts: Arc<AtomicU64>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let connect = || {
+        let connect = |resume: connetto_server::ResumePoint| {
             let (url, ddl) = (admin_url.clone(), pg_ddl.clone());
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
                     .map_err(|err| format!("parsing catalog DDL: {err:?}"))?;
-                let config = PgStreamingConfig::new(url, SLOT.to_owned(), PUBLICATION.to_owned());
+                let config = PgStreamingConfig::new(url, SLOT.to_owned(), PUBLICATION.to_owned())
+                    .start(resume.get());
                 PgStreamingCdcSource::connect(config, catalog)
                     .await
                     .map_err(|err| format!("opening CDC stream: {err}"))
             }
         };
         let _ = manager
-            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |_event| {})
+            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
+                if let ReconnectEvent::Retrying { error, .. } = &event {
+                    restarts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    eprintln!("the harness change feed failed and reconnects: {error}");
+                }
+            })
             .await;
     })
 }

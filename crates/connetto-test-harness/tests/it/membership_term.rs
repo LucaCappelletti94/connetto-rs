@@ -34,6 +34,7 @@ use diesel::prelude::*;
 use sqlite_diff_rs::{
     DiffOps, Insert, ParsedDiffSet, PatchSet, PatchsetOp, SimpleTable, Value as WireValue,
 };
+use subql::{PgCommitPosition, PgLsn};
 
 /// The motivating filter, in the client's own SQLite dialect: the caller is
 /// the no-arg function the deployment mapped `current_setting` onto.
@@ -283,7 +284,9 @@ impl Accounted {
 fn position_of(cursor: &Cursor) -> u64 {
     Position::from_cursor_bytes(cursor.as_bytes())
         .expect("a live cursor carries a position")
-        .lsn
+        .at
+        .commit_lsn()
+        .0
 }
 
 /// The wire cursor of `lsn` on a database never promoted.
@@ -292,7 +295,7 @@ fn cursor_at(lsn: u64) -> Cursor {
         Position {
             system: TimelineHistory::default().system(),
             timeline: 1,
-            lsn,
+            at: PgCommitPosition::new(PgLsn(lsn), 1),
         }
         .to_cursor_bytes(),
     )

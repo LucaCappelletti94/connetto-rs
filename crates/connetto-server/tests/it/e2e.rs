@@ -1239,6 +1239,34 @@ async fn e2e_startup_refuses_without_a_reader_role() {
     );
 }
 
+/// A reconnect log without its commit table refuses startup naming the table, since a gap check with no recorded commit could not tell a caught-up feed from a skipped one.
+#[tokio::test]
+async fn e2e_startup_refuses_a_reconnect_log_without_its_commit_table() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    let commit_table = connetto_server::PgOplog::commit_table(connetto_test_harness::OPLOG_TABLE);
+    exec(&pool, &format!("DROP TABLE {commit_table}")).await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let output = run_server_exit_output(&url, Some(&reader_url), &[]).await;
+    // The next test's reset provisions the log again, commit table included.
+    connetto_test_harness::provision_oplog(&pool).await;
+    assert!(
+        !output.status.success(),
+        "expected a refusal without the commit table"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(&commit_table),
+        "expected the refusal to name {commit_table}, got: {stderr}"
+    );
+}
+
 #[tokio::test]
 async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
     let _keyring = connetto_test_harness::isolated_session_keyring();

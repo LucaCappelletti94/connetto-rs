@@ -25,8 +25,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PageSpec, ReconnectPolicy, RequestGuard, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    Materializer, PageSpec, ReconnectPolicy, RequestGuard, ResumePoint, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoWatermark, Fixture, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID,
@@ -205,12 +205,12 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
     let url = fixture.admin_url().to_owned();
     let ingest_manager = manager.clone();
     let _ingest = tokio::spawn(async move {
-        let connect = || {
+        let connect = |resume: ResumePoint| {
             let url = url.clone();
             async move {
                 let catalog = ParserDB::parse::<PostgreSqlDialect>(PG_DDL)
                     .map_err(|err| format!("{err:?}"))?;
-                let config = PgStreamingConfig::new(url, SLOT, PUBLICATION);
+                let config = PgStreamingConfig::new(url, SLOT, PUBLICATION).start(resume.get());
                 PgStreamingCdcSource::connect(config, catalog)
                     .await
                     .map_err(|err| err.to_string())

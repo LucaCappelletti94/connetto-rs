@@ -27,7 +27,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
 
 const PG_DDL: &str =
@@ -386,13 +386,16 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
             "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, {id}, 'row')"
         );
         source.execute_sql(&sql).expect("execute dml");
-        while let Some(event) = source.next_event().await.expect("poll source") {
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            let SourceItem::Event(event) = item else {
+                continue;
+            };
             manager
                 .dispatch_event(&event)
                 .await
                 .expect("dispatch event");
             if first_lsn.is_none() {
-                first_lsn = Some(event.checkpoint().expect("row event has a checkpoint").0);
+                first_lsn = event.checkpoint();
             }
         }
     }
@@ -400,7 +403,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         Position {
             system: TimelineHistory::default().system(),
             timeline: 1,
-            lsn: first_lsn.expect("at least one event"),
+            at: first_lsn.expect("at least one event"),
         }
         .to_cursor_bytes(),
     );

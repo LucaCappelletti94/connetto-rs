@@ -58,13 +58,13 @@ zstd = "0.13"
 # from this crate for the session layer and tests.
 # Parsing an uploaded diffset into ops for authorization and conflict detection,
 # and the Value type bound into conflict-detection queries.
-sqlite-diff-rs = { version = "0.14", default-features = false }
+sqlite-diff-rs = { version = "0.15", default-features = false }
 # Reading the current server row back as a JSON object for MutationConflict.
 serde_json = "1"
 # Reading the database's timeline history over a replication connection
 # (`timeline.rs`, R73). Already in the graph through sqlite-diff-rs, at the same
 # version and default features.
-pg_walstream = "0.8"
+pg_walstream = "0.9"
 
 # Synchronous lock guarding the SQLite write target (never held across .await).
 parking_lot = "0.12"

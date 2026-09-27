@@ -19,10 +19,10 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, Materializer, Oplog, OplogConfig, PageSpec, PgOplog,
-    PgReadConnector, PgSnapshotSource, ReadBudget, RequestGuard, RuntimeWritableCatalog,
-    SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
-    pg_write_target,
+    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Materializer, Oplog, OplogConfig,
+    PageSpec, PgOplog, PgReadConnector, PgSnapshotSource, ReadBudget, RequestGuard,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -31,7 +31,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 
 diesel::table! {
     /// Row from the notes test fixture.
@@ -485,17 +485,20 @@ async fn pg_oplog_appends_and_reads_back() {
     // test-side stamping is needed.
     let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
-    let mut expected: Vec<(u64, String, bool, Vec<u8>)> = Vec::new();
+    let mut expected: Vec<(PgCommitPosition, String, bool, Vec<u8>)> = Vec::new();
     for sql in [
         "INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'paid')",
         "UPDATE orders SET quantity = 7 WHERE id = 1",
         "DELETE FROM orders WHERE id = 1",
     ] {
         source.execute_sql(sql).expect("execute dml");
-        while let Some(event) = source.next_event().await.expect("poll source") {
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            let SourceItem::Event(event) = item else {
+                continue;
+            };
             let record = mat.oplog_record(&event).expect("build oplog record");
             expected.push((
-                record.lsn(),
+                record.position(),
                 record.table().to_owned(),
                 record.is_tombstone(),
                 record.pk().to_vec(),
@@ -504,21 +507,27 @@ async fn pg_oplog_appends_and_reads_back() {
         }
     }
     assert_eq!(expected.len(), 3, "one record per statement");
-    let first_lsn = expected[0].0;
-    let last_lsn = expected[expected.len() - 1].0;
+    let first_position = expected[0].0;
+    let last_position = expected[expected.len() - 1].0;
 
-    assert_eq!(oplog.min_lsn().await.expect("min lsn"), Some(first_lsn));
     assert_eq!(
-        oplog.current_lsn().await.expect("current lsn"),
-        Some(last_lsn)
+        oplog.min_position().await.expect("min position"),
+        Some(first_position)
+    );
+    assert_eq!(
+        oplog.current_position().await.expect("current position"),
+        Some(last_position)
     );
 
-    let entries = oplog.entries_since(0).await.expect("read entries");
-    let got: Vec<(u64, String, bool, Vec<u8>)> = entries
+    let entries = oplog
+        .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+        .await
+        .expect("read entries");
+    let got: Vec<(PgCommitPosition, String, bool, Vec<u8>)> = entries
         .iter()
         .map(|record| {
             (
-                record.lsn(),
+                record.position(),
                 record.table().to_owned(),
                 record.is_tombstone(),
                 record.pk().to_vec(),
@@ -538,12 +547,15 @@ async fn pg_oplog_appends_and_reads_back() {
         "the delete round-trips as a tombstone",
     );
 
-    // A mid-stream read returns only the entries after the given LSN.
-    let tail = oplog.entries_since(first_lsn).await.expect("read tail");
+    // A mid-stream read returns only the entries after the given position.
+    let tail = oplog
+        .entries_since(first_position)
+        .await
+        .expect("read tail");
     assert_eq!(
         tail.len(),
         2,
-        "entries_since is strictly greater than the lsn"
+        "entries_since is strictly after the position"
     );
 
     // Nothing in the read path consults the verb column, so these three
@@ -551,10 +563,12 @@ async fn pg_oplog_appends_and_reads_back() {
     // text. Each pins something the others do not: the values written, the
     // column's declared type, and the refusal.
     let mut conn = pool.get().await.expect("get connection");
-    let ops: Vec<OpRow> = sql_query("SELECT op FROM connetto_oplog_test ORDER BY lsn")
-        .load(&mut *conn)
-        .await
-        .expect("read the verbs back");
+    // `ORDER BY` on a dynamic table name requires raw SQL; no typed `table!` covers it.
+    let ops: Vec<OpRow> =
+        sql_query("SELECT op FROM connetto_oplog_test ORDER BY commit_lsn, ordinal")
+            .load(&mut *conn)
+            .await
+            .expect("read the verbs back");
     assert_eq!(
         ops.iter().map(|row| row.op).collect::<Vec<_>>(),
         vec![ChangeOp::Insert, ChangeOp::Update, ChangeOp::Delete],
@@ -575,8 +589,8 @@ async fn pg_oplog_appends_and_reads_back() {
     // No cast, so the column's own type is what rejects this.
     let refused = sql_query(
         "INSERT INTO connetto_oplog_test \
-         (lsn, table_name, op, pk, is_tombstone, event) \
-         VALUES (9999, 'orders', 'nonsense', '\\x00', false, '\\x00')",
+         (commit_lsn, ordinal, table_name, op, pk, is_tombstone, event) \
+         VALUES (9999, 0, 'orders', 'nonsense', '\\x00', false, '\\x00')",
     )
     .execute(&mut *conn)
     .await;
@@ -634,7 +648,10 @@ async fn pg_oplog_round_trips_a_composite_key() {
         "INSERT INTO pairs (tenant, id, note) VALUES ('acme', 2, 'third')",
     ] {
         source.execute_sql(sql).expect("execute dml");
-        while let Some(event) = source.next_event().await.expect("poll source") {
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            let SourceItem::Event(event) = item else {
+                continue;
+            };
             let record = mat.oplog_record(&event).expect("build oplog record");
             appended.push(record.pk().to_vec());
             oplog.append(record).await.expect("append record");
@@ -642,7 +659,10 @@ async fn pg_oplog_round_trips_a_composite_key() {
     }
     assert_eq!(appended.len(), 3, "one record per insert");
 
-    let entries = oplog.entries_since(0).await.expect("read entries");
+    let entries = oplog
+        .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+        .await
+        .expect("read entries");
     let read_back: Vec<Vec<u8>> = entries.iter().map(|r| r.pk().to_vec()).collect();
     assert_eq!(
         read_back, appended,
@@ -661,6 +681,169 @@ async fn pg_oplog_round_trips_a_composite_key() {
         .execute(&mut *conn)
         .await
         .expect("drop oplog table");
+}
+
+/// Two transactions as the emulator stamps them, the first of two rows and the second of one, with their records and commits.
+fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
+    let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
+    let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
+    let mut records = Vec::new();
+    let mut commits = Vec::new();
+    for statements in [
+        &[
+            "INSERT INTO orders (id, price, quantity, status) VALUES (1, 1.0, 1, 'a')",
+            "INSERT INTO orders (id, price, quantity, status) VALUES (2, 2.0, 2, 'b')",
+        ][..],
+        &["INSERT INTO orders (id, price, quantity, status) VALUES (3, 3.0, 3, 'c')"][..],
+    ] {
+        for sql in statements {
+            source.execute_sql(sql).expect("execute dml");
+        }
+        for item in source.drain().expect("drain") {
+            match item {
+                SourceItem::Event(event) => {
+                    records.push(mat.oplog_record(&event).expect("build oplog record"));
+                }
+                SourceItem::Commit(commit) => commits.push(commit),
+            }
+        }
+    }
+    assert_eq!(records.len(), 3);
+    assert_eq!(commits.len(), 2);
+    assert_eq!(
+        records[0].position().commit_lsn(),
+        records[1].position().commit_lsn(),
+        "the first two rows share one commit"
+    );
+    (records, commits)
+}
+
+/// A fresh `PgOplog` over `table`, whose window keeps at most `max_entries` rows.
+async fn fresh_oplog(pool: &Pool<AsyncPgConnection>, table: &str, max_entries: usize) -> PgOplog {
+    let mut conn = pool.get().await.expect("get connection");
+    for drop in [table.to_owned(), PgOplog::commit_table(table)] {
+        sql_query(format!("DROP TABLE IF EXISTS {drop}"))
+            .execute(&mut *conn)
+            .await
+            .expect("drop oplog table");
+    }
+    let oplog = PgOplog::new(
+        pool.clone(),
+        table,
+        OplogConfig::default().with_max_entries(max_entries),
+    );
+    oplog.ensure_schema().await.expect("ensure schema");
+    oplog
+}
+
+/// Rows of one transaction share its commit LSN in Postgres too, so every read, trim and prune orders by the commit and then the ordinal.
+#[tokio::test]
+async fn pg_oplog_orders_the_rows_of_one_transaction_by_their_ordinal() {
+    let fixture = Fixture::acquire().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    let (records, _) = two_transactions();
+    let at: Vec<PgCommitPosition> = records.iter().map(ChangeRecord::position).collect();
+    let positions = |entries: Vec<ChangeRecord>| -> Vec<PgCommitPosition> {
+        entries.iter().map(ChangeRecord::position).collect()
+    };
+
+    let oplog = fresh_oplog(&pool, "connetto_oplog_ordinals", 100).await;
+    for record in records.iter().cloned() {
+        oplog.append(record).await.expect("append");
+    }
+    oplog
+        .append(records[1].clone())
+        .await
+        .expect("append a row delivered again");
+    assert_eq!(
+        positions(oplog.entries_since(at[0]).await.expect("read")),
+        vec![at[1], at[2]],
+        "a client holding the first row catches up the second row of its transaction and the next transaction"
+    );
+    assert_eq!(
+        positions(oplog.entries_since(at[1]).await.expect("read")),
+        vec![at[2]]
+    );
+    assert_eq!(oplog.min_position().await.expect("min"), Some(at[0]));
+    assert_eq!(
+        oplog.current_position().await.expect("current"),
+        Some(at[2]),
+        "the window's ends are whole positions, ordinal included"
+    );
+    oplog.forget_through(at[0]).await.expect("forget");
+    assert_eq!(
+        positions(
+            oplog
+                .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+                .await
+                .expect("read")
+        ),
+        vec![at[1], at[2]],
+        "trimming through a transaction's first row keeps its second"
+    );
+
+    let pruned = fresh_oplog(&pool, "connetto_oplog_pruned", 2).await;
+    for record in records.iter().cloned() {
+        pruned.append(record).await.expect("append");
+    }
+    assert_eq!(
+        positions(
+            pruned
+                .entries_since(PgCommitPosition::before_commit(PgLsn(0)))
+                .await
+                .expect("read")
+        ),
+        vec![at[1], at[2]],
+        "a window of two keeps the newest two in commit order, dropping the transaction's first row"
+    );
+
+    let mut conn = pool.get().await.expect("get connection");
+    for table in ["connetto_oplog_ordinals", "connetto_oplog_pruned"] {
+        for drop in [table.to_owned(), PgOplog::commit_table(table)] {
+            sql_query(format!("DROP TABLE IF EXISTS {drop}"))
+                .execute(&mut *conn)
+                .await
+                .expect("drop oplog table");
+        }
+    }
+}
+
+/// The recorded commit only moves forward, since the slot never resumes before a commit it was released past.
+#[tokio::test]
+async fn pg_oplog_keeps_the_later_of_two_recorded_commits() {
+    let fixture = Fixture::acquire().await;
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    let (_, commits) = two_transactions();
+    let (earlier, later) = (commits[0], commits[1]);
+    assert!(earlier.end_lsn() < later.end_lsn());
+
+    let oplog = fresh_oplog(&pool, "connetto_oplog_commits", 100).await;
+    assert_eq!(oplog.last_commit().await.expect("read"), None);
+    oplog.record_commit(earlier).await.expect("record");
+    assert_eq!(oplog.last_commit().await.expect("read"), Some(earlier));
+    oplog.record_commit(later).await.expect("record");
+    oplog
+        .record_commit(earlier)
+        .await
+        .expect("record an older commit");
+    assert_eq!(
+        oplog.last_commit().await.expect("read"),
+        Some(later),
+        "an older commit recorded after a newer one leaves the newer in place"
+    );
+
+    let mut conn = pool.get().await.expect("get connection");
+    for drop in [
+        "connetto_oplog_commits".to_owned(),
+        PgOplog::commit_table("connetto_oplog_commits"),
+    ] {
+        sql_query(format!("DROP TABLE IF EXISTS {drop}"))
+            .execute(&mut *conn)
+            .await
+            .expect("drop oplog table");
+    }
 }
 
 /// Subscribe to an aggregate and return the bootstrap value the server seeds

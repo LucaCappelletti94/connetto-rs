@@ -6,45 +6,46 @@
 //! system identifier, so a cursor naming the old identifier names changes it never had.
 
 use pg_walstream::PgReplicationConnection;
+use subql::{Checkpoint, OpaqueCheckpoint, PgCommitPosition, PgLsn};
 
 /// The timeline of a database that was never promoted.
 const FIRST_TIMELINE: u32 = 1;
 
-/// A write-ahead log position on the cluster and timeline it was issued from.
+/// A change's place in commit order, on the cluster and timeline it was issued from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Position {
     /// The system identifier of the cluster the position was issued on.
     pub system: u64,
     /// The timeline the position was issued on.
     pub timeline: u32,
-    /// The byte offset into the write-ahead log.
-    pub lsn: u64,
+    /// The commit the change belongs to and its ordinal in it, or a read's position.
+    pub at: PgCommitPosition,
 }
 
 impl Position {
     /// A cursor's length on the wire.
-    const ENCODED_LEN: usize = 20;
+    const ENCODED_LEN: usize = 28;
 
-    /// The wire cursor, the cluster then the timeline, so byte order stays issue order across a promotion.
+    /// The wire cursor, the cluster then the timeline then the position, so byte order stays issue order across a promotion.
     #[must_use]
     pub fn to_cursor_bytes(self) -> Vec<u8> {
         let mut bytes = Vec::with_capacity(Self::ENCODED_LEN);
         bytes.extend_from_slice(&self.system.to_be_bytes());
         bytes.extend_from_slice(&self.timeline.to_be_bytes());
-        bytes.extend_from_slice(&self.lsn.to_be_bytes());
+        bytes.extend_from_slice(&self.at.to_opaque().0);
         bytes
     }
 
-    /// Read a wire cursor, `None` for any other length, the layouts without a cluster included.
+    /// Read a wire cursor, `None` for any other length, every earlier layout included.
     #[must_use]
     pub fn from_cursor_bytes(bytes: &[u8]) -> Option<Self> {
         let bytes: &[u8; Self::ENCODED_LEN] = bytes.try_into().ok()?;
         let (system, rest) = bytes.split_at(8);
-        let (timeline, lsn) = rest.split_at(4);
+        let (timeline, at) = rest.split_at(4);
         Some(Self {
             system: u64::from_be_bytes(system.try_into().ok()?),
             timeline: u32::from_be_bytes(timeline.try_into().ok()?),
-            lsn: u64::from_be_bytes(lsn.try_into().ok()?),
+            at: PgCommitPosition::from_opaque(&OpaqueCheckpoint(at.to_vec()))?,
         })
     }
 }
@@ -140,22 +141,18 @@ impl TimelineHistory {
     pub fn contains(&self, position: Position) -> bool {
         position.system == self.system
             && (position.timeline == self.current
-                || self
-                    .ended
-                    .iter()
-                    .any(|&(timeline, end)| timeline == position.timeline && position.lsn <= end))
+                || self.ended.iter().any(|&(timeline, end)| {
+                    timeline == position.timeline && position.at.commit_lsn() <= PgLsn(end)
+                }))
     }
 
-    /// An eight-byte offset cursor stamped with the cluster and the current timeline, empty staying empty.
+    /// `at` as a cursor stamped with the cluster and the current timeline.
     #[must_use]
-    pub fn stamp(&self, lsn_cursor: &[u8]) -> Vec<u8> {
-        let Ok(lsn) = <[u8; 8]>::try_from(lsn_cursor) else {
-            return lsn_cursor.to_vec();
-        };
+    pub fn stamp(&self, at: PgCommitPosition) -> Vec<u8> {
         Position {
             system: self.system,
             timeline: self.current,
-            lsn: u64::from_be_bytes(lsn),
+            at,
         }
         .to_cursor_bytes()
     }
@@ -226,6 +223,7 @@ fn read_history_blocking(conninfo: &str) -> Result<TimelineHistory, TimelineErro
 #[cfg(test)]
 mod tests {
     use super::{Position, TimelineHistory, replication_conninfo};
+    use subql::{PgCommitPosition, PgLsn};
 
     /// The history Postgres 18.6 wrote for timeline 3 after two promotions,
     /// with the reason column it carries.
@@ -239,7 +237,7 @@ mod tests {
         Position {
             system: CLUSTER,
             timeline,
-            lsn,
+            at: PgCommitPosition::new(PgLsn(lsn), 1),
         }
     }
 
@@ -269,8 +267,7 @@ mod tests {
     fn a_position_from_another_cluster_is_outside_every_history() {
         let other = |timeline, lsn| Position {
             system: CLUSTER + 1,
-            timeline,
-            lsn,
+            ..at(timeline, lsn)
         };
         assert!(!TimelineHistory::first(CLUSTER).contains(other(1, 0x10)));
         let history = TimelineHistory::parse(CLUSTER, 3, TWICE_PROMOTED).expect("parse");
@@ -287,20 +284,34 @@ mod tests {
     #[test]
     fn a_stamped_cursor_reads_back_and_sorts_by_timeline_first() {
         let history = TimelineHistory::parse(CLUSTER, 2, "1\t0/10\treason").expect("parse");
-        let stamped = history.stamp(&0x20_u64.to_be_bytes());
+        let stamped = history.stamp(PgCommitPosition::new(PgLsn(0x20), 1));
         assert_eq!(Position::from_cursor_bytes(&stamped), Some(at(2, 0x20)));
         assert!(at(1, u64::MAX).to_cursor_bytes() < at(2, 0).to_cursor_bytes());
-        assert!(
-            history.stamp(&[]).is_empty(),
-            "no position stays no position"
-        );
+    }
+
+    /// Byte order is commit order, the ordinal breaking ties within one commit, which is what `advance_cursor` compares.
+    #[test]
+    fn cursor_bytes_sort_by_commit_then_ordinal() {
+        let cursor = |lsn: u64, ordinal: u64| {
+            TimelineHistory::first(CLUSTER).stamp(PgCommitPosition::new(PgLsn(lsn), ordinal))
+        };
+        assert!(cursor(0x100, 2) < cursor(0x101, 1));
+        assert!(cursor(0x100, 1) < cursor(0x100, 2));
+        assert!(cursor(0xFF, 256) < cursor(0x100, 0));
     }
 
     #[test]
-    fn the_layouts_without_a_cluster_read_as_no_position() {
+    fn every_earlier_layout_reads_as_no_position() {
         assert_eq!(Position::from_cursor_bytes(&7_u64.to_be_bytes()), None);
         let timeline_only = [&2_u32.to_be_bytes()[..], &7_u64.to_be_bytes()].concat();
         assert_eq!(Position::from_cursor_bytes(&timeline_only), None);
+        let single_lsn = [
+            &CLUSTER.to_be_bytes()[..],
+            &1_u32.to_be_bytes(),
+            &7_u64.to_be_bytes(),
+        ]
+        .concat();
+        assert_eq!(Position::from_cursor_bytes(&single_lsn), None);
         assert_eq!(Position::from_cursor_bytes(&[]), None);
     }
 

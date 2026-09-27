@@ -15,9 +15,9 @@ use std::sync::Arc;
 
 use pg_walstream::{ChangeEvent, ColumnValue, Lsn, ReplicaIdentity, RowData};
 use sqlparser::dialect::PostgreSqlDialect;
-use subql::ParserDB;
 use subql::backend::Value;
 use subql::visibility::{EventRow, RowView};
+use subql::{ParserDB, PgChangeEvent, PgCommitPosition, PgLsn};
 
 const SCHEMA: &str = "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT NOT NULL);";
 
@@ -50,6 +50,7 @@ fn the_reconnect_log_round_trips_the_row_as_it_was() {
 
     let stored = serde_json::to_vec(&event).expect("the log stores the event");
     let read_back: ChangeEvent = serde_json::from_slice(&stored).expect("the log reads it back");
+    let read_back = PgChangeEvent::new(read_back, PgCommitPosition::new(PgLsn(1), 1));
 
     let previous = EventRow::previous(&read_back, &catalog).expect("the old image is still there");
     assert_eq!(

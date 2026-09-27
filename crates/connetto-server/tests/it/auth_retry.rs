@@ -192,9 +192,10 @@ async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
         .execute_sql("INSERT INTO items (id, data) VALUES (1, 'hello')")
         .expect("execute dml");
     let event = source
-        .next_event()
+        .next_item()
         .await
         .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
         .expect("one event");
 
     // The key assertion. Before the fix: Ok(()) (error discarded, cursor

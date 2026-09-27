@@ -7,7 +7,7 @@
 
 use connetto_server::{Materializer, Registration, SeedPlan};
 use subql::backend::{ScalarFamily, Value as PgValue};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
 
@@ -112,7 +112,10 @@ async fn dispatch_without_installed_fold_yields_no_computed() {
     source
         .execute_sql("INSERT INTO orders (id, quantity) VALUES (1, 10)")
         .expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         let dispatched = mat.dispatch(&event).await.expect("dispatch");
         assert!(
             dispatched.computed.is_empty(),
@@ -140,7 +143,10 @@ async fn dispatch_folds_an_installed_ungrouped_count() {
         .execute_sql("INSERT INTO orders (id, quantity) VALUES (1, 10)")
         .expect("execute dml");
     let mut folded = Vec::new();
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         folded.extend(mat.dispatch(&event).await.expect("dispatch").computed);
     }
     assert_eq!(folded.len(), 1, "one insert moves the count exactly once");
@@ -212,13 +218,16 @@ async fn dispatch_folds_a_grouped_count_per_group() {
     source
         .execute_sql("INSERT INTO orders (id, quantity, status) VALUES (1, 10, 'a'), (2, 20, 'b')")
         .expect("baseline rows");
-    while let Some(_baseline) = source.next_event().await.expect("poll source") {}
+    while source.next_item().await.expect("poll source").is_some() {}
 
     source
         .execute_sql("INSERT INTO orders (id, quantity, status) VALUES (3, 30, 'a')")
         .expect("insert into a");
     let mut moved = Vec::new();
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         moved.extend(mat.dispatch(&event).await.expect("dispatch").computed);
     }
     assert_eq!(moved.len(), 1, "only the touched group moves");
@@ -237,7 +246,10 @@ async fn dispatch_folds_a_grouped_count_per_group() {
         .execute_sql("DELETE FROM orders WHERE status = 'b'")
         .expect("delete b");
     let mut removed = Vec::new();
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         removed.extend(mat.dispatch(&event).await.expect("dispatch").computed);
     }
     assert_eq!(removed.len(), 1, "the emptied group produces one removal");

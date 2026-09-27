@@ -27,7 +27,7 @@
 use core::future::Future;
 use core::time::Duration;
 
-use subql::PgLsn;
+use subql::PgCommitPosition;
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, DieselAsyncError, PgAsyncDieselConnector, ReadQuery, RowPage, SessionSetup,
@@ -231,7 +231,7 @@ pub struct NoConnector;
 impl AsyncConnector for NoConnector {
     type AuthContext = ConnettoReadSetup;
     type Error = std::io::Error;
-    type Checkpoint = PgLsn;
+    type Checkpoint = PgCommitPosition;
     type Backend = Postgres;
 
     fn execute_scalar(
@@ -239,7 +239,7 @@ impl AsyncConnector for NoConnector {
         _query: &ReadQuery<'_, Postgres>,
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
-    ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgLsn>), std::io::Error>> + Send
+    ) -> impl Future<Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>> + Send
     {
         async {
             Err(std::io::Error::other(
@@ -253,7 +253,7 @@ impl AsyncConnector for NoConnector {
         _query: &ReadQuery<'_, Postgres>,
         _max_bytes: usize,
         _setup: &ConnettoReadSetup,
-    ) -> impl Future<Output = Result<Snapshot<RowPage<Postgres>, PgLsn>, std::io::Error>> + Send
+    ) -> impl Future<Output = Result<Snapshot<RowPage<Postgres>, PgCommitPosition>, std::io::Error>> + Send
     {
         async {
             Err(std::io::Error::other(

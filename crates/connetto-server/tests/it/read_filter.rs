@@ -25,16 +25,19 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    LoopbackTransport, Materializer, PageSpec, ReconnectPolicy, RequestGuard, SessionConfig,
-    SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
-    pg_write_target,
+    LoopbackTransport, Materializer, PageSpec, ReconnectPolicy, RequestGuard, ResumePoint,
+    SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::{Postgres, Value};
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
-use subql::{CdcSource, ChangeEvent, PgLsn, PgSqliteEmuSource};
+use subql::{
+    CdcSource, ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource,
+    SourceItem,
+};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -259,7 +262,10 @@ async fn live_read_filter_withholds_a_denied_row_and_its_tombstone() {
         "DELETE FROM orders WHERE id = 2",
     ] {
         source.execute_sql(sql).expect("execute dml");
-        while let Some(event) = source.next_event().await.expect("poll source") {
+        while let Some(item) = source.next_item().await.expect("poll source") {
+            let SourceItem::Event(event) = item else {
+                continue;
+            };
             manager
                 .dispatch_event(&event)
                 .await
@@ -304,17 +310,19 @@ async fn live_read_filter_withholds_a_denied_row_and_its_tombstone() {
 
 /// A source that yields one event and then ends cleanly, so what the ingest loop
 /// does with that event is the whole of what a run observes.
-struct OneEvent(Option<ChangeEvent>);
+struct OneEvent(Option<PgChangeEvent>);
 
 impl CdcSource for OneEvent {
-    type Event = ChangeEvent;
+    type Commit = PgCommit;
+    type Event = PgChangeEvent;
     type Error = std::io::Error;
 
-    fn next_event(
+    fn next_item(
         &mut self,
-    ) -> impl Future<Output = Result<Option<ChangeEvent>, std::io::Error>> + Send {
+    ) -> impl Future<Output = Result<Option<SourceItem<PgChangeEvent, PgCommit>>, std::io::Error>> + Send
+    {
         let next = self.0.take();
-        async move { Ok(next) }
+        async move { Ok(next.map(SourceItem::Event)) }
     }
 
     // reason: the trait wants a `Send` future and clippy's other arm wants
@@ -324,7 +332,7 @@ impl CdcSource for OneEvent {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn ack(&mut self, _upto: PgLsn) -> Result<(), std::io::Error> {
+    async fn ack(&mut self, _upto: PgCommitPosition) -> Result<(), std::io::Error> {
         Ok(())
     }
 }
@@ -350,7 +358,10 @@ async fn a_stream_that_cannot_report_the_old_row_refuses_instead_of_retrying() {
     let mut seed = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     seed.execute_sql("INSERT INTO orders (id, price, quantity, status) VALUES (1, 9.5, 3, 'a')")
         .expect("execute dml");
-    while let Some(event) = seed.next_event().await.expect("poll source") {
+    while let Some(item) = seed.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -361,14 +372,17 @@ async fn a_stream_that_cannot_report_the_old_row_refuses_instead_of_retrying() {
     // is not FULL: the key, and no other column.
     let mut old = pg_walstream::RowData::with_capacity(1);
     old.push(Arc::from("id"), pg_walstream::ColumnValue::text("1"));
-    let event = ChangeEvent::delete(
-        "public",
-        "orders",
-        0,
-        old,
-        pg_walstream::ReplicaIdentity::Default,
-        vec![Arc::from("id")],
-        pg_walstream::Lsn::new(1),
+    let event = PgChangeEvent::new(
+        ChangeEvent::delete(
+            "public",
+            "orders",
+            0,
+            old,
+            pg_walstream::ReplicaIdentity::Default,
+            vec![Arc::from("id")],
+            pg_walstream::Lsn::new(1),
+        ),
+        subql::PgCommitPosition::new(PgLsn(1), 1),
     );
 
     let refused = manager.dispatch_event(&event).await.expect_err(
@@ -385,7 +399,7 @@ async fn a_stream_that_cannot_report_the_old_row_refuses_instead_of_retrying() {
     let outcome = tokio::time::timeout(
         Duration::from_secs(5),
         manager.ingest_with_reconnect(
-            || {
+            |_resume: ResumePoint| {
                 let event = event.clone();
                 async move { Ok::<_, std::io::Error>(OneEvent(Some(event))) }
             },

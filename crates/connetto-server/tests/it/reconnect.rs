@@ -34,7 +34,7 @@ use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{CdcEvent, Postgres};
 use subql::visibility::VisibilityPolicy;
-use subql::{CdcSource, ChangeEvent, PgSqliteEmuSource};
+use subql::{CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -181,7 +181,7 @@ async fn drive<A, O>(
     source: &mut PgSqliteEmuSource,
     manager: &SessionManager<SeedSnapshot, A, ConnettoWatermark, NoConnector, O>,
     sql: &str,
-) -> Vec<ChangeEvent>
+) -> Vec<PgChangeEvent>
 where
     A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
     A::Error: core::fmt::Display,
@@ -189,7 +189,10 @@ where
 {
     source.execute_sql(sql).expect("execute dml");
     let mut events = Vec::new();
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager
             .dispatch_event(&event)
             .await
@@ -201,16 +204,13 @@ where
 
 /// The resume cursor a client would persist after applying `event`, on the
 /// first timeline of a database never promoted.
-fn cursor_of(event: &ChangeEvent) -> Cursor {
-    let lsn = event
-        .checkpoint()
-        .expect("row event carries a checkpoint")
-        .0;
+fn cursor_of(event: &PgChangeEvent) -> Cursor {
+    let at = event.checkpoint().expect("row event carries a checkpoint");
     Cursor::new(
         Position {
             system: TimelineHistory::default().system(),
             timeline: 1,
-            lsn,
+            at,
         }
         .to_cursor_bytes(),
     )
@@ -529,7 +529,7 @@ struct Script {
     /// Whether a refusal is one a later read may get past.
     transient: bool,
     /// Where to prune the log, once, when the first refusal happens.
-    prune_through: Option<u64>,
+    prune_through: Option<PgCommitPosition>,
     /// Every read asked for since the script was armed.
     reads: Vec<&'static str>,
     armed: bool,
@@ -580,9 +580,9 @@ impl ScriptedOplog {
                 (None, None)
             }
         };
-        if let Some(lsn) = prune {
+        if let Some(through) = prune {
             self.inner
-                .forget_through(lsn)
+                .forget_through(through)
                 .await
                 .unwrap_or_else(|never| match never {});
         }
@@ -604,7 +604,7 @@ impl Oplog for ScriptedOplog {
             .map_err(|never| match never {})
     }
 
-    async fn entries_since(&self, lsn: u64) -> Result<Vec<ChangeRecord>, Refused> {
+    async fn entries_since(&self, after: PgCommitPosition) -> Result<Vec<ChangeRecord>, Refused> {
         let hold = self.script.lock().expect("script").hold.take();
         if let Some((arrived, release)) = hold {
             arrived.notify_one();
@@ -612,27 +612,44 @@ impl Oplog for ScriptedOplog {
         }
         self.gate("entries_since").await?;
         self.inner
-            .entries_since(lsn)
+            .entries_since(after)
             .await
             .map_err(|never| match never {})
     }
 
-    async fn min_lsn(&self) -> Result<Option<u64>, Refused> {
-        self.gate("min_lsn").await?;
-        self.inner.min_lsn().await.map_err(|never| match never {})
-    }
-
-    async fn current_lsn(&self) -> Result<Option<u64>, Refused> {
-        self.gate("current_lsn").await?;
+    async fn min_position(&self) -> Result<Option<PgCommitPosition>, Refused> {
+        self.gate("min_position").await?;
         self.inner
-            .current_lsn()
+            .min_position()
             .await
             .map_err(|never| match never {})
     }
 
-    async fn forget_through(&self, lsn: u64) -> Result<(), Refused> {
+    async fn current_position(&self) -> Result<Option<PgCommitPosition>, Refused> {
+        self.gate("current_position").await?;
         self.inner
-            .forget_through(lsn)
+            .current_position()
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn forget_through(&self, through: PgCommitPosition) -> Result<(), Refused> {
+        self.inner
+            .forget_through(through)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn record_commit(&self, commit: PgCommit) -> Result<(), Refused> {
+        self.inner
+            .record_commit(commit)
+            .await
+            .map_err(|never| match never {})
+    }
+
+    async fn last_commit(&self) -> Result<Option<PgCommit>, Refused> {
+        self.inner
+            .last_commit()
             .await
             .map_err(|never| match never {})
     }
@@ -672,7 +689,7 @@ async fn scripted(
 ) -> (
     Arc<ScriptedManager>,
     Arc<std::sync::Mutex<Script>>,
-    Vec<ChangeEvent>,
+    Vec<PgChangeEvent>,
     PgSqliteEmuSource,
 ) {
     let script = Arc::new(std::sync::Mutex::new(Script::default()));
@@ -709,7 +726,7 @@ fn arm(
     script: &std::sync::Mutex<Script>,
     reads: &[&'static str],
     transient: bool,
-    prune_through: Option<u64>,
+    prune_through: Option<PgCommitPosition>,
 ) {
     let mut script = script.lock().expect("script");
     script.refuse = reads.iter().copied().collect();
@@ -727,7 +744,12 @@ async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     arm(
         &script,
-        &["min_lsn", "current_lsn", "current_lsn", "entries_since"],
+        &[
+            "min_position",
+            "current_position",
+            "current_position",
+            "entries_since",
+        ],
         true,
         None,
     );
@@ -744,15 +766,15 @@ async fn every_resume_read_that_fails_for_a_moment_is_read_again() {
     assert_eq!(
         script.reads,
         [
-            "min_lsn",
-            "min_lsn",
-            "current_lsn",
-            "current_lsn",
-            "current_lsn",
-            "current_lsn",
+            "min_position",
+            "min_position",
+            "current_position",
+            "current_position",
+            "current_position",
+            "current_position",
             "entries_since",
             "entries_since",
-            "min_lsn",
+            "min_position",
         ],
         "the decision's two reads, the replay's ceiling and entries, each read again once, then the retention check"
     );
@@ -764,7 +786,7 @@ async fn a_catchup_whose_entries_were_pruned_while_it_waited_resyncs() {
     let fixture = Fixture::acquire().await;
     let (manager, script, events, _source) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
-    let second = events[1].checkpoint().expect("a checkpoint").0;
+    let second = events[1].checkpoint().expect("a checkpoint");
     arm(&script, &["entries_since"], true, Some(second));
     subscribe(&mut client).await;
 
@@ -781,7 +803,7 @@ async fn a_session_ended_by_an_error_leaves_no_connection_registered() {
     let (manager, script, events, _source) = scripted(&fixture, SessionConfig::default()).await;
     let mut client = open_scripted(&manager, cursor_of(&events[0])).await;
     assert_eq!(manager.live_connections().await, 1);
-    arm(&script, &["min_lsn"], false, None);
+    arm(&script, &["min_position"], false, None);
     subscribe(&mut client).await;
 
     let ended = tokio::time::timeout(Duration::from_secs(10), client.recv())
@@ -805,7 +827,12 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
     let started = tokio::time::Instant::now();
 
     // Three jittered waits spend between 0.7 s and 1.4 s of the budget, and the catchup still arrives.
-    arm(&script, &["min_lsn", "min_lsn", "min_lsn"], true, None);
+    arm(
+        &script,
+        &["min_position", "min_position", "min_position"],
+        true,
+        None,
+    );
     subscribe(&mut client).await;
     for event in &events[1..] {
         let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
@@ -815,7 +842,7 @@ async fn a_connection_shares_one_wait_budget_across_its_subscriptions() {
     }
 
     // The second subscription's reads keep failing, so only what is left of the budget stands before the end.
-    arm(&script, &["min_lsn"; 64], true, None);
+    arm(&script, &["min_position"; 64], true, None);
     client
         .send_control(ControlMessage::Subscribe(Subscribe {
             sub_id: "orders-again".to_owned(),

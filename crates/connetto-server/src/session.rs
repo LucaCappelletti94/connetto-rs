@@ -45,8 +45,8 @@ use subql::term::{TermCaller, TermDescription};
 use subql::visibility::transition::{Transition, TransitionError, Transitions, transitions};
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
-    AdvanceCursorError, CdcSource, ChangeEvent, DatabaseLike, EventKind, ParserDB, SubscriptionId,
-    TableLike,
+    AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
+    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, SourceItem, SubscriptionId, TableLike,
 };
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -642,6 +642,26 @@ const fn attempt_limit_reached(max_attempts: Option<u32>, failures: u32) -> bool
     }
 }
 
+/// Where a reconnected change feed resumes, shared between the ingest that moves it and the `connect` that reads it.
+///
+/// A handle rather than a value, because the checks a `connect` runs before
+/// opening the stream can clear it, and a value read before them would resume
+/// past a changed timeline or a skipped stretch and silently drop newer changes.
+#[derive(Debug, Clone, Default)]
+pub struct ResumePoint(Arc<parking_lot::Mutex<Option<PgCommitPosition>>>);
+
+impl ResumePoint {
+    /// The position the next stream starts after, for `PgStreamingConfig::start`, `None` when the slot's own position decides.
+    #[must_use]
+    pub fn get(&self) -> Option<PgCommitPosition> {
+        *self.0.lock()
+    }
+
+    fn set(&self, position: Option<PgCommitPosition>) {
+        *self.0.lock() = position;
+    }
+}
+
 /// An event from [`SessionManager::ingest_with_reconnect`], for logging or
 /// metrics. The loop is otherwise silent, so a caller wanting visibility into
 /// reconnect churn observes it here.
@@ -924,7 +944,7 @@ enum Resume {
     /// No position, which a client holding no rows presents.
     Fresh,
     /// A position the database's history still holds.
-    At(u64),
+    At(PgCommitPosition),
     /// A position past where its timeline ended, naming changes the database lost, or one this server cannot read (R73).
     BeyondHistory,
 }
@@ -939,8 +959,8 @@ impl Resume {
             return Self::Fresh;
         };
         match Position::from_cursor_bytes(bytes) {
-            Some(Position { lsn: 0, .. }) => Self::Fresh,
-            Some(position) if history.contains(position) => Self::At(position.lsn),
+            Some(position) if position.at.commit_lsn() == PgLsn(0) => Self::Fresh,
+            Some(position) if history.contains(position) => Self::At(position.at),
             Some(_) | None => Self::BeyondHistory,
         }
     }
@@ -1436,6 +1456,8 @@ pub struct SessionManager<
     signer: S,
     /// The timeline history last read, `None` before the first read and treated as never promoted.
     history: parking_lot::RwLock<Option<TimelineHistory>>,
+    /// Where a reconnect of the change feed resumes, the last row or commit the ingest finished handling.
+    resume: ResumePoint,
 }
 
 impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
@@ -1572,6 +1594,7 @@ where
             withdrawal_source: OnceLock::new(),
             signer,
             history: parking_lot::RwLock::new(None),
+            resume: ResumePoint::default(),
         })
     }
 }
@@ -1630,7 +1653,7 @@ where
     /// server refuses to serve rather than retrying for ever (R6 decision 4).
     fn transition_refusal(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         err: TransitionError<Auth::Error>,
     ) -> SessionError {
         match err {
@@ -1647,7 +1670,7 @@ where
     }
 
     /// The event's table, for a message a person has to act on.
-    fn event_table(&self, event: &ChangeEvent) -> String {
+    fn event_table(&self, event: &PgChangeEvent) -> String {
         let catalog = self.catalog.as_ref();
         let id = event.table_id(catalog);
         usize::try_from(id)
@@ -1663,7 +1686,7 @@ where
     ///
     /// Empty when the event carries no readable image, which an audit row
     /// records as a change naming no row rather than as a wrong one.
-    fn event_key(&self, event: &ChangeEvent) -> Vec<subql::backend::Value<Postgres>> {
+    fn event_key(&self, event: &PgChangeEvent) -> Vec<subql::backend::Value<Postgres>> {
         let catalog = self.catalog.as_ref();
         let Some(row) =
             EventRow::current(event, catalog).or_else(|| EventRow::previous(event, catalog))
@@ -1686,7 +1709,7 @@ where
     /// makes the comparison recoverable here without asking twice.
     async fn ask_second_opinion(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         watchers: &[Arc<Principal<Id, Key>>],
         verdicts: &[Transition],
     ) {
@@ -1812,6 +1835,8 @@ where
                 Some(held) => held.current(),
             }
         };
+        // A position past the switch names changes the new primary never had, and resuming after it would skip newer ones.
+        self.resume.set(None);
         let closed = self
             .close_all(FatalErrorReason::DatabaseTimelineChanged)
             .await;
@@ -1824,12 +1849,18 @@ where
         );
     }
 
-    /// An eight-byte offset cursor stamped with the timeline last read.
-    fn stamp(&self, lsn_cursor: &[u8]) -> Vec<u8> {
+    /// `at` as a cursor stamped with the timeline last read.
+    fn stamp(&self, at: PgCommitPosition) -> Vec<u8> {
         match self.history.read().as_ref() {
-            Some(history) => history.stamp(lsn_cursor),
-            None => TimelineHistory::default().stamp(lsn_cursor),
+            Some(history) => history.stamp(at),
+            None => TimelineHistory::default().stamp(at),
         }
+    }
+
+    /// A position in `Checkpoint::to_opaque` form stamped with the timeline last read, empty staying empty.
+    fn stamp_opaque(&self, opaque: &[u8]) -> Vec<u8> {
+        PgCommitPosition::from_opaque(&OpaqueCheckpoint(opaque.to_vec()))
+            .map_or_else(Vec::new, |at| self.stamp(at))
     }
 
     /// Where `cursor` lets a connection resume, against the history last read.
@@ -1844,10 +1875,11 @@ where
     /// declaring a resync epoch when the feed skipped a stretch.
     ///
     /// Called before each connect with the position the stream is about to
-    /// resume from. Everything the feed delivered was appended to the log
-    /// before being acknowledged, so in ordinary operation the resume position
-    /// is at or behind the log's own high-water mark and this does nothing. A
-    /// resume position **ahead** of it means changes happened that the feed
+    /// resume from, the slot's confirmed position. The slot is only ever
+    /// released to the end of a commit the log recorded first
+    /// ([`Oplog::record_commit`]), so in ordinary operation the resume position
+    /// equals that end or trails it, and this does nothing. A resume position
+    /// **past** the recorded end means changes happened that the feed
     /// never delivered: an invalidated slot the deployment recreated, a
     /// database restored from a backup, or a slot dropped under a running
     /// server. Detecting the hole rather than the cause is deliberate, since
@@ -1856,18 +1888,14 @@ where
     /// Postgres version and to the causes somebody enumerated (R32).
     ///
     /// **The boundary reported is the resume position, not the last record
-    /// ingested, and today nothing turns on that.** Trimming through either
-    /// deletes the same rows, because the last record ingested is by definition
-    /// the highest the log holds. The resume position is the honest number to
-    /// name because it is where the epoch actually starts, and the difference
-    /// would matter the moment a boundary were stored and compared rather than
-    /// applied: a client's cursor can sit above the last record without being
-    /// current, since a snapshot's cursor is the write-ahead position when it
-    /// was read and that advances for reasons other than changes.
+    /// ingested.** It is where the epoch starts, and it is recorded as the last
+    /// commit, so the next check before any new traffic is not another gap.
     ///
-    /// Two things follow, and both are needed. The log forgets everything
+    /// Three things follow, and all are needed. The log forgets everything
     /// through the boundary, so every later handshake is judged against what
-    /// can still be proven. And every live connection is closed, because a
+    /// can still be proven. The feed's [`ResumePoint`] is cleared, so the next
+    /// stream starts where the slot is rather than after a position this
+    /// database may never have had. And every live connection is closed, because a
     /// connection never asks that question again: reconnecting re-declares its
     /// subscriptions through the ordinary path, which rebuilds a running total
     /// from its source rather than repairing one that accumulated across the
@@ -1881,18 +1909,26 @@ where
     /// must not begin streaming on an error: an undeclared gap is the silence
     /// this exists to remove.
     pub async fn reconcile_stream(&self, resume_lsn: u64) -> Result<Option<u64>, SessionError> {
-        let Some(ingested) = self.oplog.current_lsn().await.map_err(oplog_err)? else {
+        let Some(ingested) = self.oplog.last_commit().await.map_err(oplog_err)? else {
             // Nothing recorded, so there is nothing to be past. A log in that
             // state already resyncs every client that presents a cursor.
             return Ok(None);
         };
+        let ingested = ingested.end_lsn().0;
         if resume_lsn <= ingested {
             return Ok(None);
         }
+        let boundary = PgCommitPosition::before_commit(PgLsn(resume_lsn));
         self.oplog
-            .forget_through(resume_lsn)
+            .forget_through(boundary)
             .await
             .map_err(oplog_err)?;
+        // The feed resumes at the boundary now, so the next check without new traffic is not another gap.
+        self.oplog
+            .record_commit(PgCommit::new(boundary, PgLsn(resume_lsn)))
+            .await
+            .map_err(oplog_err)?;
+        self.resume.set(None);
         let closed = self.close_all(FatalErrorReason::ChangeStreamGap).await;
         tracing::error!(
             ingested,
@@ -1924,9 +1960,10 @@ where
         self.reconcile_history(history).await;
         let gap = match crate::slot::resume_position(pool, slot).await? {
             Some(resume) => {
-                let ingested = self.oplog.current_lsn().await.map_err(oplog_err)?;
+                // The slot resumes exactly at the end of the last commit acknowledged, and that commit was recorded first.
+                let ingested = self.oplog.last_commit().await.map_err(oplog_err)?;
                 ingested
-                    .is_some_and(|ingested| resume > ingested)
+                    .is_some_and(|ingested| resume > ingested.end_lsn().0)
                     .then_some(resume)
             }
             None => None,
@@ -2060,7 +2097,7 @@ where
     ///
     /// [`SessionError`] when dispatch, a triggered read, a cursor advance, or
     /// the oplog append fails.
-    pub async fn dispatch_event(&self, event: &ChangeEvent) -> Result<(), SessionError> {
+    pub async fn dispatch_event(&self, event: &PgChangeEvent) -> Result<(), SessionError> {
         self.dispatch_with_grants(event, &[]).await
     }
 
@@ -2071,7 +2108,7 @@ where
     /// policy visibility of held rows flip (see `move_out`).
     async fn dispatch_with_grants(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         grant_moves: &[GrantMove],
     ) -> Result<(), SessionError> {
         // Three classes, three dispositions (R89 decision 1). A timeout is
@@ -2176,7 +2213,7 @@ where
     /// [`SessionError::Materializer`] when a cursor advance fails.
     async fn fan_out_rows(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         deliveries: Vec<(MatchedPatch, Route<Id, Key>)>,
     ) -> Result<(), SessionError> {
         let watchers: Vec<_> = deliveries
@@ -2259,12 +2296,17 @@ where
                 Transition::Deliver => patch.payload_zstd,
                 Transition::Withdraw => withdrawal.clone().unwrap_or(patch.payload_zstd),
             };
-            let cursor = self.stamp(&patch.cursor);
-            // The ingest loop appends and dispatches one event at a time, so a catchup's ceiling reaches at most this event and this advance never rewinds.
-            {
+            let cursor = self.stamp_opaque(&patch.cursor);
+            // Positions follow commit order and the ingest dispatches one event at a time, so a catchup's ceiling reaches at most this event and this advance never rewinds.
+            let advanced = {
                 counters::timed_lock(&self.materializer)
                     .await
-                    .advance_cursor(route.session_key, route.sub_id, &cursor)?;
+                    .advance_cursor(route.session_key, route.sub_id, &cursor)
+            };
+            if let Err(err) = advanced {
+                counters::add(&counters::CURSOR_REWINDS, 1);
+                tracing::error!(sub_id = %route.label, error = %err, "a live change's cursor advance was refused");
+                return Err(err.into());
             }
             let live = LivePatch::new(route.label, Cursor::new(cursor), payload);
             // A dropped session receiver just means the client is gone.
@@ -2294,19 +2336,14 @@ where
     /// proof asserts.
     async fn fan_out_moves(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         moves: Vec<TermMove>,
         grant_moves: &[GrantMove],
     ) {
         if moves.is_empty() {
             return;
         }
-        let cursor = self.stamp(
-            &event
-                .checkpoint()
-                .map(|lsn| lsn.0.to_be_bytes().to_vec())
-                .unwrap_or_default(),
-        );
+        let cursor = self.stamp(event.position());
         for term_move in moves {
             let route = {
                 self.routes
@@ -2517,14 +2554,32 @@ where
     }
 
     /// Advance the subscription's cursor to the causing event and queue one
-    /// live patch for it. Returns whether it was queued.
+    /// live patch for it. Returns whether it was queued, and a refused advance
+    /// is logged, since the caller replaces the subscription in its place.
     async fn send_move(&self, route: &Route<Id, Key>, cursor: &[u8], payload: Vec<u8>) -> bool {
         let advanced = {
             counters::timed_lock(&self.materializer)
                 .await
                 .advance_cursor(route.session_key, route.sub_id, cursor)
         };
-        if advanced.is_err() {
+        if let Err(err) = advanced {
+            counters::add(&counters::CURSOR_REWINDS, 1);
+            let rewound = match &err {
+                MaterializerError::Cursor(AdvanceCursorError::NonMonotonic {
+                    previous,
+                    attempted,
+                }) => Some((
+                    Position::from_cursor_bytes(&previous.0),
+                    Position::from_cursor_bytes(&attempted.0),
+                )),
+                _ => None,
+            };
+            tracing::error!(
+                sub_id = %route.label,
+                error = %err,
+                ?rewound,
+                "a membership move's cursor advance was refused, replacing the subscription instead"
+            );
             return false;
         }
         let live = LivePatch::new(route.label.clone(), Cursor::new(cursor.to_vec()), payload);
@@ -2554,7 +2609,7 @@ where
     /// takes the same path.
     async fn keep_store_current(
         &self,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
     ) -> Result<Vec<GrantMove>, SessionError> {
         match &self.upkeep {
             Some(upkeep) => upkeep
@@ -2574,7 +2629,7 @@ where
     /// One audit row per connection told, which is connetto's own act: a
     /// permission change nobody is connected for records nothing here, and the
     /// grant row itself is the application's to keep (R7 decision 8).
-    async fn announce_grant_moves(&self, event: &ChangeEvent, moves: &[GrantMove]) {
+    async fn announce_grant_moves(&self, event: &PgChangeEvent, moves: &[GrantMove]) {
         if moves.is_empty() {
             return;
         }
@@ -2636,8 +2691,8 @@ where
         }
     }
 
-    /// Drive a CDC source to completion, dispatching every event and acking its
-    /// checkpoint so the upstream can recycle its log.
+    /// Drive a CDC source to completion, dispatching every row and, at each
+    /// commit, recording it and acking it so the upstream can recycle its log.
     ///
     /// When `dispatch_event` returns [`SessionError::AuthUnavailable`] or
     /// [`SessionError::ReadUnavailable`] the loop holds the event, broadcasts
@@ -2657,12 +2712,21 @@ where
         on_event: &mut impl FnMut(ReconnectEvent<'_>),
     ) -> Result<(), SessionError>
     where
-        Src: CdcSource<Event = ChangeEvent>,
+        Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
         Src::Error: core::fmt::Display,
     {
         loop {
-            match source.next_event().await {
-                Ok(Some(event)) => {
+            match source.next_item().await {
+                Ok(Some(SourceItem::Commit(commit))) => {
+                    // Recorded before the acknowledgement, so the slot never resumes past a commit the log does not hold.
+                    self.oplog.record_commit(commit).await.map_err(oplog_err)?;
+                    source
+                        .ack(commit.position())
+                        .await
+                        .map_err(|err| SessionError::Transport(err.to_string()))?;
+                    self.resume.set(Some(commit.position()));
+                }
+                Ok(Some(SourceItem::Event(event))) => {
                     // One hold loop for both pause causes (R89 decision 2):
                     // an unreachable auth service and a transient computed
                     // read share the arm, each with its own cause and shared
@@ -2740,12 +2804,8 @@ where
                             Err(other) => return Err(other),
                         }
                     }
-                    if let Some(lsn) = event.checkpoint() {
-                        source
-                            .ack(lsn)
-                            .await
-                            .map_err(|err| SessionError::Transport(err.to_string()))?;
-                    }
+                    // A row is acknowledged with its commit, since acknowledging it alone moves nothing.
+                    self.resume.set(Some(event.position()));
                 }
                 Ok(None) => return Ok(()),
                 Err(err) => return Err(SessionError::Transport(err.to_string())),
@@ -2756,9 +2816,15 @@ where
     /// Ingest CDC events, reconnecting the source with backoff when the stream
     /// fails.
     ///
-    /// `connect` produces a fresh source each time, resuming from the
-    /// replication slot's confirmed position, so a dropped connection loses no
-    /// events. `on_event` observes each retry and the final give-up, for logging
+    /// `connect` produces a fresh source each time and is handed where to
+    /// resume, a [`ResumePoint`] whose [`get`](ResumePoint::get) goes to the
+    /// source's `start`. It names the last row or commit this manager handled,
+    /// or nothing before the first, when the slot's confirmed position decides.
+    /// Resuming exactly after it keeps an engine cursor from ever seeing a
+    /// position twice, and loses nothing because the slot was only released
+    /// past commits already handled. Read it after any
+    /// [`check_before_stream`](Self::check_before_stream), which clears it when
+    /// the timeline changed or the feed skipped a stretch. `on_event` observes each retry and the final give-up, for logging
     /// or metrics. Returns `Ok(())` when a source signals a clean shutdown, or
     /// an error only once `policy` exhausts its attempts (a policy with no
     /// `max_attempts` retries forever).
@@ -2774,15 +2840,15 @@ where
         mut on_event: impl FnMut(ReconnectEvent<'_>),
     ) -> Result<(), SessionError>
     where
-        Src: CdcSource<Event = ChangeEvent>,
+        Src: CdcSource<Event = PgChangeEvent, Commit = PgCommit>,
         Src::Error: core::fmt::Display,
-        Connect: FnMut() -> F,
+        Connect: FnMut(ResumePoint) -> F,
         F: core::future::Future<Output = Result<Src, E>>,
         E: core::fmt::Display,
     {
         let mut episode = policy.start();
         loop {
-            let error = match connect().await {
+            let error = match connect(self.resume.clone()).await {
                 Ok(mut source) => {
                     let started = Instant::now();
                     match self.ingest(&mut source, &mut on_event).await {
@@ -2986,8 +3052,8 @@ where
         }
 
         let mut resume_read_budget = self.config.resume_read_budget;
-        let current_lsn =
-            read_log::<O, _, _>(&mut resume_read_budget, || self.oplog.current_lsn()).await?;
+        let current_position =
+            read_log::<O, _, _>(&mut resume_read_budget, || self.oplog.current_position()).await?;
         // The durable mutation watermark: the client retires pending records
         // at or below it and replays the rest. Its read is the handshake's one
         // reader-pool checkout, so an unidentified caller takes a share permit
@@ -3026,7 +3092,7 @@ where
         // either shows here or closes this connection (R73).
         let resume = self.resume_from(handshake.last_cursor.as_ref());
         let current_cursor =
-            Cursor::new(current_lsn.map_or_else(Vec::new, |lsn| self.stamp(&lsn.to_be_bytes())));
+            Cursor::new(current_position.map_or_else(Vec::new, |at| self.stamp(at)));
 
         if let Err(err) = transport
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
@@ -4483,16 +4549,18 @@ where
         let resync = match state.resume {
             Resume::Fresh => None,
             Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
-            Resume::At(lsn) => {
-                let min =
-                    read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_lsn())
-                        .await?;
-                let current =
-                    read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.current_lsn())
-                        .await?;
-                match catchup_decision(lsn, min, current) {
+            Resume::At(at) => {
+                let min = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+                    self.oplog.min_position()
+                })
+                .await?;
+                let current = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+                    self.oplog.current_position()
+                })
+                .await?;
+                match catchup_decision(at, min, current) {
                     CatchupDecision::Catchup => {
-                        return self.catch_up_row(transport, sub, state, &reg, lsn).await;
+                        return self.catch_up_row(transport, sub, state, &reg, at).await;
                     }
                     CatchupDecision::FullResync => Some(FullResyncReason::CursorOutsideRetention),
                 }
@@ -4823,7 +4891,7 @@ where
                 }
             })?;
         admit_page(&sub.sub_id, &page, max_rows, estimate.width, limits)?;
-        let cursor = Cursor::new(self.stamp(page.cursor.as_bytes()));
+        let cursor = Cursor::new(self.stamp_opaque(page.cursor.as_bytes()));
         if let Some(reason) = resync {
             transport
                 .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
@@ -5114,7 +5182,7 @@ where
 
     /// Catch a resuming row subscription up from the oplog.
     ///
-    /// Registers the route first, so live events for LSNs past the watermark
+    /// Registers the route first, so live events for positions past the watermark
     /// queue behind the catchup (the run loop is blocked here until this
     /// returns, so nothing is delivered meanwhile), then replays each retained
     /// entry the subscription matches as a `LivePatch` carrying that entry's
@@ -5129,26 +5197,26 @@ where
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
-        from: u64,
+        from: PgCommitPosition,
     ) -> Result<(), SessionError> {
         self.attach_row_route(&sub, state, reg).await;
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so
         // replaying it cannot duplicate a live patch.
-        let ceiling =
-            read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.current_lsn())
-                .await?
-                .unwrap_or(0);
+        let ceiling = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+            self.oplog.current_position()
+        })
+        .await?;
         let entries = read_log::<O, _, _>(&mut state.resume_read_budget, || {
             self.oplog.entries_since(from)
         })
         .await?;
         // Retention only moves forward, so a log that still reaches the cursor now reached it when the entries were read.
-        let min =
-            read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_lsn()).await?;
+        let min = read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_position())
+            .await?;
         if matches!(
-            catchup_decision(from, min, Some(ceiling)),
+            catchup_decision(from, min, ceiling),
             CatchupDecision::FullResync
         ) {
             return self
@@ -5165,7 +5233,7 @@ where
         let watchers = [Arc::clone(&state.principal)];
         let mut verdicts = Transitions::new();
         for record in entries {
-            if record.lsn() > ceiling {
+            if ceiling.is_none_or(|ceiling| record.position() > ceiling) {
                 continue;
             }
             let replayed = {
@@ -5197,7 +5265,7 @@ where
             else {
                 continue;
             };
-            let cursor = self.stamp(&record.lsn().to_be_bytes());
+            let cursor = self.stamp(record.position());
             let advanced = {
                 self.materializer.lock().await.advance_cursor(
                     state.session_id.as_u64_key(),
@@ -5209,7 +5277,7 @@ where
                 Ok(()) => {}
                 // A live change dispatched since the route went up already moved the cursor past this entry, and its patch queues behind the replay.
                 Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {
-                    tracing::debug!(sub_id = %sub.sub_id, lsn = record.lsn(), "a live change already moved the cursor past this replayed entry");
+                    tracing::debug!(sub_id = %sub.sub_id, position = ?record.position(), "a live change already moved the cursor past this replayed entry");
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -5241,7 +5309,7 @@ where
     async fn replay_payload<T: Transport>(
         &self,
         transport: &mut T,
-        event: &ChangeEvent,
+        event: &PgChangeEvent,
         watchers: &[Arc<Principal<Id, Key>>],
         verdicts: &mut Transitions,
         built: Vec<u8>,
@@ -5553,6 +5621,7 @@ mod tests {
     };
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
+    use subql::{PgCommitPosition, PgLsn};
 
     fn judged(cursor: &[u8], history: &TimelineHistory) -> Resume {
         Resume::of(Some(&Cursor::new(cursor.to_vec())), history)
@@ -5561,11 +5630,16 @@ mod tests {
     /// The cluster the histories here belong to.
     const CLUSTER: u64 = 42;
 
+    /// A row at commit `lsn`.
+    fn row(lsn: u64) -> PgCommitPosition {
+        PgCommitPosition::new(PgLsn(lsn), 1)
+    }
+
     fn at(timeline: u32, lsn: u64) -> Vec<u8> {
         Position {
             system: CLUSTER,
             timeline,
-            lsn,
+            at: row(lsn),
         }
         .to_cursor_bytes()
     }
@@ -5578,8 +5652,8 @@ mod tests {
     #[test]
     fn a_cursor_resumes_only_while_the_history_holds_its_position() {
         let history = twice_promoted();
-        assert_eq!(judged(&at(3, 0x900), &history), Resume::At(0x900));
-        assert_eq!(judged(&at(2, 0x200), &history), Resume::At(0x200));
+        assert_eq!(judged(&at(3, 0x900), &history), Resume::At(row(0x900)));
+        assert_eq!(judged(&at(2, 0x200), &history), Resume::At(row(0x200)));
         assert_eq!(judged(&at(2, 0x201), &history), Resume::BeyondHistory);
         assert_eq!(judged(&at(1, 0x101), &history), Resume::BeyondHistory);
         assert_eq!(
@@ -5596,7 +5670,7 @@ mod tests {
         assert_eq!(judged(&at(1, 0x10), &restored), Resume::BeyondHistory);
         assert_eq!(
             judged(&at(1, 0x10), &TimelineHistory::first(CLUSTER)),
-            Resume::At(0x10)
+            Resume::At(row(0x10))
         );
     }
 

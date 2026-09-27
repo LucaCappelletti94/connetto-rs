@@ -99,7 +99,7 @@ A structured inventory of every component that must exist. This is not a depende
 | Piece | Description |
 |---|---|
 | Client cursor | Client persists its last-known server position, stamped with the database's timeline, and sends it in the reconnect handshake. |
-| Server oplog | Ring buffer (or table) of recent `ChangeRecord`s keyed by LSN; retention window is configurable. |
+| Server oplog | Ring buffer (or table) of recent `ChangeRecord`s keyed by commit position; retention window is configurable. |
 | Catchup replayer | On reconnect: if client's LSN is within the window, replays changes since that LSN filtered by subscriptions. |
 | Full re-sync trigger | If client's LSN is outside the window, past where its timeline ended, or unreadable, triggers full snapshot re-delivery for each subscription. |
 | Tombstone store | Deleted rows are retained in the oplog (with a tombstone flag) so deletes can be replayed during catchup. |

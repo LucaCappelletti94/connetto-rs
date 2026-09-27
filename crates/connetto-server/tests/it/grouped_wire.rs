@@ -18,7 +18,7 @@ use connetto_server::{
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
-use subql::{CdcSource, PgSqliteEmuSource};
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
@@ -90,7 +90,10 @@ async fn take_aggregates(
 /// Run `sql` on the emulated source and dispatch every event it produced.
 async fn apply(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>, sql: &str) {
     source.execute_sql(sql).expect("execute dml");
-    while let Some(event) = source.next_event().await.expect("poll source") {
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
         manager.dispatch_event(&event).await.expect("dispatch");
     }
 }

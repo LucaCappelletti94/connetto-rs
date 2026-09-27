@@ -122,13 +122,21 @@ CREATE TABLE _connetto_mutations (
 CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate');
 
 CREATE TABLE connetto_oplog (
-    lsn          BIGINT PRIMARY KEY,
+    commit_lsn   BIGINT NOT NULL,
+    ordinal      BIGINT NOT NULL,
     table_name   TEXT NOT NULL,
     op           connetto_change_op NOT NULL,
     pk           BYTEA NOT NULL,
     is_tombstone BOOLEAN NOT NULL,
     event        BYTEA NOT NULL,
-    appended_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+    appended_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (commit_lsn, ordinal)
+);
+
+CREATE TABLE connetto_oplog_commit (
+    only_row   BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row),
+    commit_lsn BIGINT NOT NULL,
+    end_lsn    BIGINT NOT NULL
 );
 ```
 
