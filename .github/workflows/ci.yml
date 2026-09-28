@@ -769,7 +769,7 @@ jobs:
           sudo udevadm trigger --name-match=kvm
 
       - name: Walk the proof on an emulator
-        uses: reactivecircus/android-emulator-runner@v2
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
         env:
           CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
         with:
