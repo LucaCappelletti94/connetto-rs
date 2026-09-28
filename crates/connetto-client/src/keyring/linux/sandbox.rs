@@ -2,9 +2,14 @@
 //! per-application secret (R71 decision 14).
 
 use std::ffi::OsString;
+use std::io::Read as _;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
+use oo7::ashpd::desktop::secret::{RetrieveOptions, Secret};
 use oo7::file::{Item, UnlockedKeyring};
+use zeroize::Zeroizing;
 
 use super::{attributes, backend_error, decode, encode};
 use crate::ClientError;
@@ -16,16 +21,27 @@ pub(super) struct Sandbox {
 
 impl Sandbox {
     pub(super) async fn open() -> Result<Self, ClientError> {
-        let bound = super::secret_service::PROMPT_BOUND;
-        let secret = tokio::time::timeout(bound, oo7::ashpd::desktop::secret::retrieve())
+        let bus = zbus::Connection::session()
             .await
-            .map_err(|_| SecretStoreError::TimedOut(bound))?
-            .map_err(|err| backend_error("the Secret portal", err))?;
-        let path = keyring_path().ok_or_else(|| {
+            .map_err(|err| backend_error("the session bus", err))?;
+        Self::open_with(&bus, super::secret_service::PROMPT_BOUND, keyring_path()).await
+    }
+
+    /// The keyring at `path`, opened with the secret the portal on `bus` hands
+    /// over within `bound`.
+    pub(super) async fn open_with(
+        bus: &zbus::Connection,
+        bound: Duration,
+        path: Option<PathBuf>,
+    ) -> Result<Self, ClientError> {
+        let path = path.ok_or_else(|| {
             SecretStoreError::Backend(
                 "the sandbox has no data directory for its keyring".to_owned(),
             )
         })?;
+        let secret = tokio::time::timeout(bound, portal_secret(bus))
+            .await
+            .map_err(|_| SecretStoreError::TimedOut(bound))??;
         Self::load(&path, oo7::Secret::from(secret)).await
     }
 
@@ -81,6 +97,28 @@ impl Sandbox {
             .await
             .map_err(|err| backend_error("the sandbox keyring", err))
     }
+}
+
+/// The application's own secret, which the portal writes into a socket it is handed.
+async fn portal_secret(bus: &zbus::Connection) -> Result<Zeroizing<Vec<u8>>, ClientError> {
+    let portal = Secret::with_connection(bus.clone())
+        .await
+        .map_err(|err| backend_error("the Secret portal", err))?;
+    let (mut reader, writer) =
+        UnixStream::pair().map_err(|err| backend_error("the Secret portal socket", err))?;
+    portal
+        .retrieve(&writer, RetrieveOptions::default())
+        .await
+        .map_err(|err| backend_error("the Secret portal", err))?;
+    // The portal holds its own copy, so the read below ends once the portal closes it.
+    drop(writer);
+    tokio::task::spawn_blocking(move || {
+        let mut secret = Zeroizing::new(Vec::with_capacity(64));
+        reader.read_to_end(&mut secret).map(|_| secret)
+    })
+    .await
+    .map_err(|err| backend_error("the Secret portal socket", err))?
+    .map_err(|err| backend_error("the Secret portal socket", err))
 }
 
 /// libsecret's own path for the sandbox keyring, which `oo7` keeps crate-private.

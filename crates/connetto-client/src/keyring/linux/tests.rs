@@ -756,3 +756,281 @@ fn the_sandbox_keyring_lives_where_libsecret_puts_it() {
     assert_eq!(path(None, Some("")), None);
     assert_eq!(path(None, None), None);
 }
+
+/// A private session bus, stopped on drop.
+struct PrivateBus {
+    daemon: std::process::Child,
+    address: String,
+}
+
+impl PrivateBus {
+    fn start() -> Self {
+        use std::io::BufRead as _;
+        let mut daemon = std::process::Command::new("dbus-daemon")
+            .args(["--session", "--nofork", "--print-address=1"])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("start dbus-daemon");
+        let mut address = String::new();
+        std::io::BufReader::new(daemon.stdout.take().expect("daemon stdout"))
+            .read_line(&mut address)
+            .expect("read the bus address");
+        Self {
+            daemon,
+            address: address.trim().to_owned(),
+        }
+    }
+
+    async fn connect(&self) -> zbus::Connection {
+        zbus::connection::Builder::address(self.address.as_str())
+            .expect("bus address")
+            .build()
+            .await
+            .expect("connect to the private bus")
+    }
+
+    /// Serves a fake Secret portal that answers with `secret`, or never answers.
+    async fn serve_portal(&self, secret: Option<Vec<u8>>) -> zbus::Connection {
+        zbus::connection::Builder::address(self.address.as_str())
+            .expect("bus address")
+            .name("org.freedesktop.portal.Desktop")
+            .expect("portal name")
+            .serve_at("/org/freedesktop/portal/desktop", FakePortal { secret })
+            .expect("serve the portal")
+            .build()
+            .await
+            .expect("portal connection")
+    }
+}
+
+impl Drop for PrivateBus {
+    fn drop(&mut self) {
+        let _ = self.daemon.kill();
+        let _ = self.daemon.wait();
+    }
+}
+
+struct FakePortal {
+    secret: Option<Vec<u8>>,
+}
+
+#[zbus::interface(name = "org.freedesktop.portal.Secret")]
+impl FakePortal {
+    async fn retrieve_secret(
+        &self,
+        fd: zbus::zvariant::OwnedFd,
+        options: HashMap<String, OwnedValue>,
+        #[zbus(header)] header: zbus::message::Header<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) -> OwnedObjectPath {
+        use std::io::Write as _;
+        let token = options
+            .get("handle_token")
+            .and_then(|value| <&str>::try_from(value).ok())
+            .expect("a handle token")
+            .to_owned();
+        let sender = header.sender().expect("a sender").to_owned();
+        let request = OwnedObjectPath::try_from(format!(
+            "/org/freedesktop/portal/desktop/request/{}/{token}",
+            sender.trim_start_matches(':').replace('.', "_")
+        ))
+        .expect("request path");
+        if let Some(secret) = &self.secret {
+            std::fs::File::from(std::os::fd::OwnedFd::from(fd))
+                .write_all(secret)
+                .expect("hand the secret over");
+            connection
+                .emit_signal(
+                    Some(zbus::names::BusName::from(sender.clone())),
+                    &request,
+                    "org.freedesktop.portal.Request",
+                    "Response",
+                    &(0_u32, HashMap::<&str, Value<'_>>::new()),
+                )
+                .await
+                .expect("answer the request");
+        }
+        request
+    }
+
+    #[zbus(property)]
+    #[expect(
+        clippy::unused_self,
+        reason = "a zbus property is read through the object"
+    )]
+    fn version(&self) -> u32 {
+        1
+    }
+}
+
+const PORTAL_SECRET: [u8; 64] = [11; 64];
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sandbox_keyring_opens_with_the_portals_secret_and_reopens() {
+    let bus = PrivateBus::start();
+    let _portal = bus.serve_portal(Some(PORTAL_SECRET.to_vec())).await;
+    let client = bus.connect().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("keyrings").join("default.keyring");
+    std::fs::create_dir_all(path.parent().expect("parent")).expect("keyrings directory");
+
+    let first =
+        super::sandbox::Sandbox::open_with(&client, Duration::from_secs(5), Some(path.clone()))
+            .await
+            .expect("the portal answers");
+    first
+        .write("tokens", "\"alice\"", "alice-refresh")
+        .await
+        .expect("write");
+    drop(first);
+
+    let second =
+        super::sandbox::Sandbox::open_with(&client, Duration::from_secs(5), Some(path.clone()))
+            .await
+            .expect("reopen");
+    assert_eq!(
+        second
+            .read("tokens", "\"alice\"")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("alice-refresh")
+    );
+    let direct = super::sandbox::Sandbox::load(&path, oo7::Secret::from(PORTAL_SECRET.to_vec()))
+        .await
+        .expect("the file opens under the portal's secret");
+    assert!(
+        direct
+            .read("tokens", "\"alice\"")
+            .await
+            .expect("read")
+            .is_some()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_portal_that_never_answers_is_refused_at_the_bound() {
+    let bus = PrivateBus::start();
+    let _portal = bus.serve_portal(None).await;
+    let client = bus.connect().await;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let err = super::sandbox::Sandbox::open_with(
+        &client,
+        Duration::from_millis(300),
+        Some(dir.path().join("default.keyring")),
+    )
+    .await
+    .err()
+    .expect("an unanswered portal refuses");
+    assert!(
+        matches!(err, ClientError::SecretStore(SecretStoreError::TimedOut(_))),
+        "got {err}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_sandbox_with_no_data_directory_refuses_before_asking_the_portal() {
+    let bus = PrivateBus::start();
+    let client = bus.connect().await;
+    let err = super::sandbox::Sandbox::open_with(&client, Duration::from_secs(5), None)
+        .await
+        .err()
+        .expect("no data directory refuses");
+    assert!(err.to_string().contains("no data directory"), "got {err}");
+}
+
+/// One side of the session-bus run, driven by the environment. Run alone it does nothing.
+#[tokio::test]
+#[ignore = "a phase the session-bus sandbox test runs in a child process"]
+async fn sandbox_session_phase() {
+    if std::env::var_os("CONNETTO_R71_SANDBOX_PHASE").is_none() {
+        return;
+    }
+    let sandbox = super::sandbox::Sandbox::open()
+        .await
+        .expect("open through the session bus");
+    sandbox
+        .write("tokens", "\"alice\"", "alice-refresh")
+        .await
+        .expect("write");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sandbox_opens_through_the_session_bus_at_libsecrets_path() {
+    let bus = PrivateBus::start();
+    let _portal = bus.serve_portal(Some(PORTAL_SECRET.to_vec())).await;
+    let data = tempfile::tempdir().expect("data home");
+    std::fs::create_dir_all(data.path().join("keyrings")).expect("keyrings directory");
+    let exe = std::env::current_exe().expect("the test binary");
+    let (address, data_home) = (bus.address.clone(), data.path().to_owned());
+    let status = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(exe)
+            .args([
+                "keyring::linux::tests::sandbox_session_phase",
+                "--exact",
+                "--ignored",
+            ])
+            .env("CONNETTO_R71_SANDBOX_PHASE", "1")
+            .env("DBUS_SESSION_BUS_ADDRESS", address)
+            .env("XDG_DATA_HOME", data_home)
+            .status()
+    })
+    .await
+    .expect("join")
+    .expect("spawn the phase");
+    assert!(status.success(), "the child phase failed");
+
+    let path = data.path().join("keyrings").join("default.keyring");
+    let keyring = super::sandbox::Sandbox::load(&path, oo7::Secret::from(PORTAL_SECRET.to_vec()))
+        .await
+        .expect("the child wrote libsecret's file under XDG_DATA_HOME");
+    assert_eq!(
+        keyring
+            .read("tokens", "\"alice\"")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("alice-refresh")
+    );
+}
+
+#[test]
+fn an_unusable_state_directory_refuses_naming_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("not-a-directory");
+    std::fs::write(&file, b"").expect("a regular file");
+    let err = Sealed::open(file.join("state"), &CURRENT, None)
+        .err()
+        .expect("a state directory under a file refuses");
+    assert!(
+        matches!(&err, ClientError::SecretStore(SecretStoreError::Backend(message)) if message.contains("not-a-directory")),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_secret_service_that_answers_with_errors_refuses() {
+    let (server, client) = tokio::net::UnixStream::pair().expect("socket pair");
+    let guid = zbus::Guid::generate();
+    // An object server with nothing at the Secret Service's path answers every call with an error.
+    let server = zbus::connection::Builder::unix_stream(server)
+        .server(guid)
+        .expect("server")
+        .p2p()
+        .serve_at("/unrelated", FakePortal { secret: None })
+        .expect("serve")
+        .build();
+    let client = zbus::connection::Builder::unix_stream(client).p2p().build();
+    let (_server, client) = tokio::join!(server, client);
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        ensure_default(&client.expect("client"), Duration::from_secs(5)),
+    )
+    .await
+    .expect("the error comes back rather than a hang")
+    .expect_err("a service with no objects refuses");
+    assert!(
+        matches!(&err, ClientError::SecretStore(SecretStoreError::Backend(message)) if message.starts_with("the Secret Service")),
+        "got {err}"
+    );
+}

@@ -28,6 +28,22 @@ async fn the_in_memory_refresh_store_lists_every_account_it_holds() {
 }
 
 #[tokio::test]
+async fn the_remembered_account_is_the_identity_record() {
+    use connetto_client::auth::remembered_account;
+    use connetto_core::traits::RefreshTokenStore as _;
+    let store = MemoryRefreshStore::default();
+    assert_eq!(remembered_account(&store).await.expect("read"), None);
+    store
+        .store(IDENTITY_RECORD, "\"alice\"")
+        .await
+        .expect("remember alice");
+    assert_eq!(
+        remembered_account(&store).await.expect("read").as_deref(),
+        Some("\"alice\"")
+    );
+}
+
+#[tokio::test]
 async fn the_in_memory_key_store_keeps_two_accounts_apart() {
     two_accounts_keep_their_own_key(&MemoryKeyStore::default(), "alice", "bob").await;
 }
@@ -77,9 +93,19 @@ mod linux {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut reports = Vec::new();
         for (label, store) in stores(dir.path()) {
-            let tokens =
-                KeyringStore::with_linux_store(format!("connetto-r71-report-{label}"), store);
-            reports.push(tokens.backend().await.expect("the store opens"));
+            let tokens = KeyringStore::with_linux_store(
+                format!("connetto-r71-report-{label}"),
+                store.clone(),
+            );
+            let report = tokens.backend().await.expect("the store opens");
+            let keys =
+                KeyringKeyStore::with_linux_store(format!("connetto-r71-report-{label}"), store);
+            assert_eq!(
+                keys.backend().await.expect("the key store opens"),
+                report,
+                "both stores report alike"
+            );
+            reports.push(report);
         }
         assert_eq!(
             reports,

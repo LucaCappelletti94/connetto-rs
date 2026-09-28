@@ -187,15 +187,50 @@ async fn run() -> Result<()> {
 
 /// The replica-key store `CONNETTO_KEY_STORE` names, or the detected one.
 fn key_store() -> anyhow::Result<KeyringKeyStore> {
-    match std::env::var("CONNETTO_KEY_STORE").as_deref() {
-        Err(_) => Ok(KeyringKeyStore::new(KEYRING_SERVICE)),
+    key_store_named(std::env::var("CONNETTO_KEY_STORE").ok().as_deref())
+}
+
+fn key_store_named(name: Option<&str>) -> anyhow::Result<KeyringKeyStore> {
+    match name {
+        None => Ok(KeyringKeyStore::new(KEYRING_SERVICE)),
         #[cfg(target_os = "linux")]
-        Ok("keyutils") => Ok(KeyringKeyStore::with_linux_store(
+        Some("keyutils") => Ok(KeyringKeyStore::with_linux_store(
             KEYRING_SERVICE,
             connetto_client::LinuxStore::Keyutils,
         )),
-        Ok(other) => Err(anyhow!(
+        Some(other) => Err(anyhow!(
             "CONNETTO_KEY_STORE={other} names no store this platform has"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_store_named;
+
+    #[test]
+    fn an_unknown_store_name_is_refused_naming_it() {
+        let err = key_store_named(Some("secret-service"))
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string()
+                .contains("CONNETTO_KEY_STORE=secret-service"),
+            "got {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn keyutils_and_detection_are_the_two_choices() {
+        let keyutils = key_store_named(Some("keyutils")).expect("keyutils");
+        assert_eq!(
+            keyutils.backend().await.expect("opens"),
+            connetto_client::Backend::Keyutils
+        );
+        assert!(
+            key_store_named(None).is_ok(),
+            "unset means the detected store"
+        );
     }
 }

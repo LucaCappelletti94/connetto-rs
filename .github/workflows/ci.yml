@@ -507,10 +507,12 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
 
-      - name: Install keyring helper
+      # dbus-daemon backs the fake Secret portal the client suite starts, and
+      # gnome-keyring the Secret Service group below (R71).
+      - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils
+          sudo apt-get install -y keyutils dbus gnome-keyring
 
       - uses: taiki-e/install-action@nextest
 
@@ -528,10 +530,6 @@ jobs:
         run: keyctl session -- cargo +stable nextest run --release --all-features --test-threads 4 ${{ matrix.packages }}
 
       # R71's groups that need a private session bus, root, or Docker.
-      - name: Install Secret Service tools
-        if: matrix.name == 'client'
-        run: sudo apt-get install -y gnome-keyring dbus
-
       - name: Run Secret Service custody tests
         if: matrix.name == 'client'
         run: scripts/linux-secret-store-tests.sh secret-service
