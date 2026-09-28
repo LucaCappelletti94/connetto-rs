@@ -147,7 +147,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | blocked | R51 | Native Apple gate. Blocked on R94's gate setting, with two upstream keychain changes patched in until released, R88's iOS leg being done |
 | blocked | R52 | Native Android gate. Blocked on R94's gate setting, with one upstream keystore change patched in until released, R88's Android leg being done |
 | blocked | R53 | Windows gate. Blocked on hardware |
-| any | R21 | One page codec. Its step zero decides whether the phase proceeds at all |
+| blocked | R21 | One page codec. Blocked on the maintainers agreeing to the shared cipher source crates in `rusqlite/rusqlite` discussion #1908, without which it would run on permanent forks |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
 | any | R11 | The shared public store. Off the critical path |
@@ -231,7 +231,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R45 reconciliation fix bundle | **DONE** (2026-08-09) | nothing | no |
 | R46 the wasm-smoke intermittent hang | **DONE** (2026-08-09, upstream finding) | nothing | **yes, wasm-bindgen** (finding written, workaround local) |
 | R47 one helper per job | **DONE** (2026-08-09) | nothing | no |
-| R21 one page codec on both backends | NOT STARTED, designed 2026-09-22 | nothing. Ten decisions in the section | **yes, `libsqlite3-sys`** (a bundled SQLite3MC feature and the agreed option set) **and `sqlite-wasm-rs`** (the agreed option set), carried on a fork meanwhile, and the phase closes on the fork |
+| R21 one page codec on both backends | NOT STARTED, designed 2026-09-22 | the `libsqlite3-sys` and `sqlite-wasm-rs` maintainers agreeing to the route in `rusqlite/rusqlite` discussion #1908 (decided 2026-09-28), without which the forks below never retire. Ten decisions in the section | **yes, `libsqlite3-sys`** (a bundled SQLite3MC feature and the agreed option set) **and `sqlite-wasm-rs`** (the agreed option set), carried on a fork meanwhile, and the phase closes on the fork |
 | R20 start with no reachable server | **DONE** (2026-08-08) | nothing | no |
 | R41 one seam for the two secret stores | **DONE** (2026-08-07) | nothing | no |
 | R17 local tier name and key scope | **DONE** (2026-08-07) | nothing | no |
@@ -390,6 +390,7 @@ graph TD
   R91[R91 apps, installations and the bot template] --> R93
   R92[R92 synced tables carry no local references]
   U7[upstream libsqlite3-sys and sqlite-wasm-rs:<br/>SQLite3MC feature, one option set] -.->|fork until released| R21
+  RQ1908[rusqlite discussion 1908:<br/>maintainers agree on the shared cipher source crates] --> R21
   R55[R55 containerised test services and CI]
   R2 -.->|registry only| R8
   R48[R48 a truncate empties the client's copy]
@@ -3831,7 +3832,9 @@ A row that stops matching a subscription is removed from that subscriber's repli
 
 **Status.** NOT STARTED, designed 2026-09-22.
 
-**Blocked on nothing.** Phase E0 of an earlier series measured the browser codec reading a file the native codec wrote under the pin, and nothing has measured native running SQLite3MC, which is step 0's job. Ten decisions were taken with the maintainer on 2026-09-22, listed below.
+**Blocked on** the `libsqlite3-sys` and `sqlite-wasm-rs` maintainers agreeing to the route proposed in [`rusqlite/rusqlite` discussion #1908](https://github.com/rusqlite/rusqlite/discussions/1908) (decided with the maintainer 2026-09-28). Without that agreement the native codec and the option set of decision 7 live on forks that no release ever retires, and a published `connetto-client` cannot reach a `[patch.crates-io]` fork, so the phase does not start on the forks alone. The discussion opened 2026-09-23 with `sqlite3mc-src` as one SQLite3MC source crate for both `-sys` crates, and on 2026-09-25 widened to two source crates, `sqlcipher-src` and `sqlite3mc-src`, each pinned with `=` by both `-sys` crates, with forks of `libsqlite3-sys` and `sqlite-wasm-rs` passing their CI. No maintainer had answered the widened proposal by 2026-09-28. Before it, `utelle` (SQLite3MC) favoured one library on both targets, `gwenn` (`rusqlite`) asked how many users SQLite3MC has against SQLCipher, and `Spxg` (`sqlite-wasm-rs`) welcomed a `sqlcipher` feature but objected to taking it from a separate crate, because `wasm32-unknown-unknown` has no libc and a second crate must move in step with the first. Which library the maintainers accept on both targets decides whether decisions 1 and 4 stand, since SQLCipher has no ChaCha20 scheme.
+
+Phase E0 of an earlier series measured the browser codec reading a file the native codec wrote under the pin, and nothing has measured native running SQLite3MC, which is step 0's job. Ten decisions were taken with the maintainer on 2026-09-22, listed below.
 
 ### Decisions
 
