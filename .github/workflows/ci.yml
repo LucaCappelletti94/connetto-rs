@@ -47,8 +47,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -67,6 +68,16 @@ jobs:
       - name: Check formatting
         working-directory: ${{ matrix.cwd }}
         run: cargo +stable fmt --all -- --check
+
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
   lint:
     name: Lint ${{ matrix.name }}
@@ -100,8 +111,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -147,6 +159,16 @@ jobs:
             -- \
             -D warnings
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   nightly-lint:
     name: Nightly lint ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -180,8 +202,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -227,6 +250,16 @@ jobs:
             -- \
             -D warnings
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   docs:
     name: Docs ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -259,8 +292,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -302,6 +336,16 @@ jobs:
               --all-features \
               ${{ matrix.target }}
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   compile:
     name: Compile ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -334,8 +378,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -376,6 +421,16 @@ jobs:
             --all-features \
             ${{ matrix.target }}
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   android:
     # R88: the phone build of the desktop demo, built and linked without a
     # device. Its own job because the matrix legs pass --all-features, which
@@ -386,8 +441,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -416,6 +472,16 @@ jobs:
             --no-default-features \
             --features mobile
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   ios:
     # R88: the phone build of the desktop demo for iOS, built without a
     # device, for the same reason the Android leg is its own job. It links,
@@ -426,8 +492,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -452,6 +519,16 @@ jobs:
               --features mobile
           done
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   ios-simulator:
     # R88's proof, walked on an iOS simulator. The runner cannot run Docker,
     # so the backend runs as plain processes and the simulator build carries
@@ -462,8 +539,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -473,16 +551,18 @@ jobs:
           restore-keys: |
             dl-${{ runner.os }}-
 
-      - name: Cache native build output
-        uses: actions/cache@v6
+      - name: Restore native build output
+        id: cache-2
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: t-ios-simulator-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
             t-ios-simulator-${{ runner.os }}-
 
-      - name: Cache the demo's build output
-        uses: actions/cache@v6
+      - name: Restore the demo's build output
+        id: cache-3
+        uses: actions/cache/restore@v6
         with:
           path: examples/dioxus-desktop-demo/target
           key: t-ios-simulator-demo-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
@@ -542,6 +622,30 @@ jobs:
           rm -rf examples/dioxus-desktop-demo/target/debug/incremental
           rm -rf examples/dioxus-desktop-demo/target/aarch64-apple-ios-sim/debug/incremental
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save native build output
+        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+      - name: Save the demo's build output
+        if: github.event_name == 'push' && steps.cache-3.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: examples/dioxus-desktop-demo/target
+          key: ${{ steps.cache-3.outputs.cache-primary-key }}
+
   rust-tests:
     name: Rust tests ${{ matrix.name }}
     runs-on: ubuntu-latest
@@ -575,8 +679,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -586,8 +691,9 @@ jobs:
           restore-keys: |
             dl-${{ runner.os }}-
 
-      - name: Cache rust test output
-        uses: actions/cache@v6
+      - name: Restore rust test output
+        id: cache-2
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: t-rust-tests-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
@@ -626,6 +732,23 @@ jobs:
           rm -rf target/wasm32-unknown-unknown/release/incremental
           rm -rf target/tmp
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save rust test output
+        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
   browser-build:
     name: Browser stack build
     runs-on: ubuntu-latest
@@ -635,8 +758,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -646,8 +770,9 @@ jobs:
           restore-keys: |
             dl-${{ runner.os }}-
 
-      - name: Cache native build output
-        uses: actions/cache@v6
+      - name: Restore native build output
+        id: cache-2
+        uses: actions/cache/restore@v6
         with:
           path: target
           key: t-browser-native-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
@@ -700,6 +825,23 @@ jobs:
           rm -rf target/release/incremental
           rm -rf target/tmp
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save native build output
+        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
   browser-tests:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
@@ -715,8 +857,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -727,8 +870,9 @@ jobs:
             dl-${{ runner.os }}-
 
       # The wasm tree in target-wasm is the one graph a shard still builds.
-      - name: Cache wasm build output
-        uses: actions/cache@v6
+      - name: Restore wasm build output
+        id: cache-2
+        uses: actions/cache/restore@v6
         with:
           path: target-wasm
           key: t-browser-wasm-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
@@ -772,6 +916,23 @@ jobs:
           rm -rf target-wasm/wasm32-unknown-unknown/debug/incremental
           rm -rf target-wasm/debug/incremental
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save wasm build output
+        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target-wasm
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
   android-emulator:
     # R88's proof, walked on an emulator from the APK dx bundles, so the
     # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
@@ -782,8 +943,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -793,8 +955,9 @@ jobs:
           restore-keys: |
             dl-${{ runner.os }}-
 
-      - name: Cache the demo's build output
-        uses: actions/cache@v6
+      - name: Restore the demo's build output
+        id: cache-2
+        uses: actions/cache/restore@v6
         with:
           path: examples/dioxus-desktop-demo/target
           key: t-android-emulator-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
@@ -881,6 +1044,23 @@ jobs:
           rm -rf examples/dioxus-desktop-demo/target/debug/incremental
           rm -rf examples/dioxus-desktop-demo/target/x86_64-linux-android/debug/incremental
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save the demo's build output
+        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: examples/dioxus-desktop-demo/target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
   file-core-wasm:
     name: File core wasm
     runs-on: ubuntu-latest
@@ -888,8 +1068,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -921,6 +1102,16 @@ jobs:
       - name: Run file core wasm tests
         run: wasm-pack test --headless --chrome crates/connetto-file-core
 
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   passkey-gate:
     name: Passkey gate
     runs-on: ubuntu-latest
@@ -928,8 +1119,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -939,8 +1131,9 @@ jobs:
           restore-keys: |
             dl-${{ runner.os }}-
 
-      - name: Cache passkey build output
-        uses: actions/cache@v6
+      - name: Restore passkey build output
+        id: cache-2
+        uses: actions/cache/restore@v6
         with:
           path: examples/webauthn-unlock/target
           key: t-passkey-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
@@ -977,3 +1170,20 @@ jobs:
         run: |
           rm -rf examples/webauthn-unlock/target/release/incremental
           rm -rf examples/webauthn-unlock/target/wasm32-unknown-unknown/release/incremental
+
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save passkey build output
+        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: examples/webauthn-unlock/target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
