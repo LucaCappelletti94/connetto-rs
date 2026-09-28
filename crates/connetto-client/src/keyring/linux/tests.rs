@@ -630,3 +630,53 @@ async fn the_sandbox_keyring_keeps_base64_text_a_second_open_reads_back() {
             .is_none()
     );
 }
+
+#[tokio::test]
+async fn a_named_credential_that_the_unit_does_not_hand_over_refuses_naming_it() {
+    let err = super::open_named(
+        &super::LinuxStore::SystemdCredential,
+        &environment(false, None, None),
+    )
+    .await
+    .err()
+    .expect("no credentials directory");
+    assert!(
+        matches!(err, ClientError::SecretStore(SecretStoreError::NoStore { probed }) if probed.contains("connetto.wrap-key")),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_named_key_file_with_a_previous_key_reseals_and_reports_it_no_longer_needed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (key, previous) = (dir.path().join("wrap.key"), dir.path().join("previous.key"));
+    std::fs::write(&key, CURRENT).expect("key");
+    std::fs::write(&previous, PREVIOUS).expect("previous key");
+    let old = sealed(&dir.path().join("state").join(SEALED_DIR), &PREVIOUS, None);
+    old.write("tokens", "alice", b"alice-refresh")
+        .expect("write under the old key");
+    drop(old);
+
+    let store = super::Store::named(super::LinuxStore::KeyFile(
+        super::KeyFile::new(&key, dir.path().join("state")).with_previous(&previous),
+    ));
+    assert_eq!(
+        store.backend().await.expect("opens"),
+        Backend::KeyFile {
+            previous_key_needed: false
+        }
+    );
+    std::fs::remove_file(&previous).expect("retire the previous key");
+    let reopened = super::Store::named(super::LinuxStore::KeyFile(super::KeyFile::new(
+        &key,
+        dir.path().join("state"),
+    )));
+    assert_eq!(
+        reopened
+            .read("tokens", "alice")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("alice-refresh")
+    );
+}

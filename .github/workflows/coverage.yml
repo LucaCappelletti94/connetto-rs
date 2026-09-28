@@ -101,6 +101,13 @@ jobs:
             --all-features \
             --test-threads 4 \
             ${{ matrix.packages }}
+          # The desktop Secret Service path, whose child processes inherit the
+          # profile environment. The systemd and container groups run with a
+          # clean environment, so ci.yml runs them uninstrumented.
+          if [ "${{ matrix.name }}" = client ]; then
+            sudo apt-get install -y gnome-keyring dbus
+            CARGO_TEST_PROFILE=testfast scripts/linux-secret-store-tests.sh secret-service
+          fi
           cargo +stable llvm-cov report \
             --profile testfast \
             --codecov \
