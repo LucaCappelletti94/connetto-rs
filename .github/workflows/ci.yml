@@ -866,13 +866,21 @@ jobs:
           api-level: 35
           target: google_apis
           arch: x86_64
+          # The action's defaults, plus the device log written by the emulator
+          # itself, which outlives the adb server restarts the proof makes.
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -logcat *:v -logcat-output ${{ runner.temp }}/emulator-logcat.txt
           script: android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --apk examples/dioxus-desktop-demo/target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk
 
+      # The adb server's own log records every change of the device's
+      # transport, such as it going offline.
       - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: android-proof-evidence
-          path: target/android-proof
+          path: |
+            target/android-proof
+            ${{ runner.temp }}/emulator-logcat.txt
+            /tmp/adb.*.log
           retention-days: 7
 
       - name: Prune the demo's target cache
