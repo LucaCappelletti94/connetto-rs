@@ -12,7 +12,9 @@
 //! ```
 //!
 //! A simulator build links the keychain entitlements into the executable as
-//! Xcode does, under the team prefix of the Mac's Apple Development
+//! Xcode does, under the team ID `CONNETTO_IOS_TEAM_ID` names or else the
+//! team prefix of the Mac's Apple Development certificate. The simulator
+//! checks no signature against that ID, so any ID serves a Mac without the
 //! certificate. A device build is signed with the identity
 //! `connetto-ios-signing` prepared, whose keychain the driver unlocks, and a
 //! device run needs the stack on a host the device reaches, which on the
@@ -47,6 +49,8 @@ const APP: &str = "target/dx/connetto-dioxus-desktop-demo/debug/ios/ConnettoDiox
 const USER: &str = "alice";
 /// The simulator a run uses when none is named.
 const DEFAULT_SIMULATOR: &str = "iPhone 17 Pro";
+/// The variable naming the team ID a simulator build's entitlements carry.
+const TEAM_ID_VAR: &str = "CONNETTO_IOS_TEAM_ID";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -328,7 +332,11 @@ impl Target {
         match self {
             Self::Simulator { .. } => {
                 let entitlements = evidence.join("simulator-entitlements.plist");
-                tokio::fs::write(&entitlements, simulator_entitlements(&team_prefix().await?))
+                let team = match std::env::var(TEAM_ID_VAR) {
+                    Ok(team) => team,
+                    Err(_) => team_prefix().await?,
+                };
+                tokio::fs::write(&entitlements, simulator_entitlements(&team))
                     .await
                     .context("writing the simulator entitlements")?;
                 dx.args(["--target", "aarch64-apple-ios-sim"]).env(

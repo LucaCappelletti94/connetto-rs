@@ -89,13 +89,21 @@ pub struct Provisioned {
     pub fga_store: String,
 }
 
-/// Provision `deployment` into a fresh fixture and generate its keys.
+/// Provision `deployment` into a fresh fixture, over `running` services when
+/// given and in containers otherwise, and generate its keys.
 ///
 /// # Errors
 ///
 /// When key generation or the content directory fails.
-pub async fn provision(deployment: &Deployment, label: &str) -> Result<Provisioned> {
-    let fixture = Fixture::acquire().await;
+pub async fn provision(
+    deployment: &Deployment,
+    label: &str,
+    running: Option<&RunningServices>,
+) -> Result<Provisioned> {
+    let fixture = match running {
+        Some(services) => Fixture::on_cluster(&services.postgres, &services.openfga).await,
+        None => Fixture::acquire().await,
+    };
     fixture.setup(&[deployment.schema]).await;
     fixture.setup(&[DEPLOYMENT_SQL]).await;
     fixture.setup(&[connetto_server::epoch::EPOCH_DDL]).await;
@@ -326,6 +334,53 @@ pub const PUBLIC_HOST_VAR: &str = "CONNETTO_STACK_PUBLIC_HOST";
 pub const TLS_CERT_VAR: &str = "CONNETTO_STACK_TLS_CERT";
 /// See [`TLS_CERT_VAR`].
 pub const TLS_KEY_VAR: &str = "CONNETTO_STACK_TLS_KEY";
+/// The variables naming services a stack uses in place of the containers it
+/// would start, all three together. See [`RunningServices`].
+pub const POSTGRES_URL_VAR: &str = "CONNETTO_STACK_POSTGRES_URL";
+/// See [`POSTGRES_URL_VAR`].
+pub const OPENFGA_URL_VAR: &str = "CONNETTO_STACK_OPENFGA_URL";
+/// See [`POSTGRES_URL_VAR`].
+pub const ISSUER_VAR: &str = "CONNETTO_STACK_ISSUER";
+
+/// Services something else started for a stack, where Docker cannot run.
+pub struct RunningServices {
+    /// The admin URL of a Postgres cluster running with `wal_level=logical`.
+    pub postgres: String,
+    /// The gRPC endpoint of an authorization service.
+    pub openfga: String,
+    /// The issuer URL of a mock identity provider configured as its container is.
+    pub issuer: String,
+}
+
+impl RunningServices {
+    /// The services the environment names, or `None` when it names none.
+    ///
+    /// # Errors
+    ///
+    /// When it names some of the three but not all.
+    pub fn from_env() -> Result<Option<Self>> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// The services `var` names, as [`Self::from_env`] reads them.
+    ///
+    /// # Errors
+    ///
+    /// When `var` names some of the three but not all.
+    pub fn from_lookup(var: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        match (var(POSTGRES_URL_VAR), var(OPENFGA_URL_VAR), var(ISSUER_VAR)) {
+            (Some(postgres), Some(openfga), Some(issuer)) => Ok(Some(Self {
+                postgres,
+                openfga,
+                issuer,
+            })),
+            (None, None, None) => Ok(None),
+            _ => Err(anyhow!(
+                "{POSTGRES_URL_VAR}, {OPENFGA_URL_VAR} and {ISSUER_VAR} go together"
+            )),
+        }
+    }
+}
 
 /// Each `(variable, default)` port as `var` reads it.
 ///
@@ -521,4 +576,52 @@ pub fn now_millis() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ISSUER_VAR, OPENFGA_URL_VAR, POSTGRES_URL_VAR, RunningServices};
+
+    fn lookup(set: &[&str]) -> impl Fn(&str) -> Option<String> {
+        let set: Vec<String> = set.iter().map(|name| (*name).to_owned()).collect();
+        move |name| {
+            set.iter()
+                .any(|set| set == name)
+                .then(|| format!("{name}-value"))
+        }
+    }
+
+    #[test]
+    fn all_three_variables_name_the_running_services() {
+        let services =
+            RunningServices::from_lookup(lookup(&[POSTGRES_URL_VAR, OPENFGA_URL_VAR, ISSUER_VAR]))
+                .unwrap()
+                .expect("all three are set");
+        assert_eq!(services.postgres, format!("{POSTGRES_URL_VAR}-value"));
+        assert_eq!(services.openfga, format!("{OPENFGA_URL_VAR}-value"));
+        assert_eq!(services.issuer, format!("{ISSUER_VAR}-value"));
+    }
+
+    #[test]
+    fn no_variable_leaves_the_containers() {
+        assert!(RunningServices::from_lookup(lookup(&[])).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_partial_set_is_refused_rather_than_falling_back_to_containers() {
+        let partial: [&[&str]; 6] = [
+            &[POSTGRES_URL_VAR],
+            &[OPENFGA_URL_VAR],
+            &[ISSUER_VAR],
+            &[POSTGRES_URL_VAR, OPENFGA_URL_VAR],
+            &[POSTGRES_URL_VAR, ISSUER_VAR],
+            &[OPENFGA_URL_VAR, ISSUER_VAR],
+        ];
+        for set in partial {
+            assert!(
+                RunningServices::from_lookup(lookup(set)).is_err(),
+                "{set:?} was accepted"
+            );
+        }
+    }
 }
