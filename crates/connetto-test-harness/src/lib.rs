@@ -2290,3 +2290,53 @@ while True:
         start_logged(request, "failing server").await;
     }
 }
+
+#[cfg(test)]
+mod running_services_tests {
+    use diesel::QueryDsl as _;
+    use diesel_async::RunQueryDsl as _;
+    use openfga_client::client::{GetStoreRequest, OpenFgaServiceClient};
+    use openfga_client::tonic::transport::Channel;
+
+    use super::Fixture;
+    use super::watermark::_connetto_mutations;
+
+    /// A second database in a container's cluster stands in for a cluster
+    /// something else started, beside that container's authorization service.
+    #[tokio::test]
+    async fn a_fixture_over_a_running_cluster_provisions_it_and_keeps_its_authorization_service() {
+        let owner = Fixture::acquire().await;
+        owner.exec("CREATE DATABASE elsewhere").await;
+        let (cluster, _) = owner
+            .admin_url()
+            .rsplit_once('/')
+            .expect("the admin URL names a database");
+        let elsewhere = format!("{cluster}/elsewhere");
+        let fga = owner.fga_url().await.to_owned();
+
+        let fixture = Fixture::on_cluster(&elsewhere, &fga).await;
+
+        let mut conn = fixture
+            .admin
+            .get()
+            .await
+            .expect("a connection to elsewhere");
+        let pending: i64 = _connetto_mutations::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the watermark table was provisioned in elsewhere");
+        assert_eq!(pending, 0);
+        assert_eq!(fixture.fga_url().await, fga);
+        let (_, store) = fixture.fga_store().await;
+        let channel = Channel::from_shared(fga)
+            .expect("a service endpoint")
+            .connect()
+            .await
+            .expect("the owner's authorization service answers");
+        OpenFgaServiceClient::new(channel)
+            .get_store(GetStoreRequest { store_id: store })
+            .await
+            .expect("the fixture's store lives on the service it was given");
+    }
+}
