@@ -68,9 +68,16 @@ nohup openfga/openfga run \
 echo $! >> pids
 
 # The image's application tree, pulled from the registry without a daemon.
-mkdir -p mock-oauth
-go run "github.com/google/go-containerregistry/cmd/crane@$crane" \
-  export --platform linux/arm64 "$mock_oauth" - \
+# An empty DOCKER_CONFIG keeps crane anonymous, whatever credential helper the
+# machine's own Docker configuration names.
+archive=go-containerregistry_Darwin_arm64.tar.gz
+base=https://github.com/google/go-containerregistry/releases/download/$crane
+curl -fsSL --retry 3 "$base/checksums.txt" \
+  | grep " $archive\$" \
+  | fetch_checked "$base/$archive"
+mkdir -p crane crane-config mock-oauth
+tar xzf "$archive" -C crane crane
+DOCKER_CONFIG="$PWD/crane-config" crane/crane export --platform linux/arm64 "$mock_oauth" - \
   | tar x -C mock-oauth app
 JSON_CONFIG=$(cat "$config") SERVER_PORT=$oauth_port nohup "${JAVA_HOME:+$JAVA_HOME/bin/}java" \
   -cp "mock-oauth/app/resources:mock-oauth/app/classes:mock-oauth/app/libs/*" \
