@@ -71,7 +71,8 @@ pub use session_id::{SessionId, SessionIdParseError};
 pub use sql::quote_ident;
 pub use traits::{
     ContentTicketSigner, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority,
-    IncomingFrame, PendingMutation, RefreshTokenStore, ReplicaKeyStore, Store, Transport,
+    IncomingFrame, PendingMutation, RefreshFuture, RefreshTokenStore, ReplicaKeyStore, Store,
+    Transport,
 };
 #[cfg(feature = "loopback")]
 pub use transport::{LoopbackError, LoopbackTransport, loopback};

@@ -13,14 +13,14 @@
 //! so a reconnect silently refreshes with no user interaction.
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::ReplicaKey;
 use connetto_core::percent::{percent_decode, percent_encode};
-use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::traits::{RefreshFuture, RefreshTokenStore, ReplicaKeyStore};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -28,112 +28,11 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use zeroize::{Zeroize, Zeroizing};
 
+use crate::keyring::Keyring;
 use crate::replica::PENDING_LOGIN_RECORD;
 use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
-
-fn ensure_keyring_store() -> Result<(), ClientError> {
-    static STORE: OnceLock<Result<(), Arc<str>>> = OnceLock::new();
-    STORE
-        .get_or_init(|| install_keyring_store().map_err(|err| Arc::<str>::from(err.to_string())))
-        .as_ref()
-        .copied()
-        .map_err(|err| ClientError::Auth(format!("keyring setup: {err}")))
-}
-
-#[cfg(target_os = "macos")]
-fn install_keyring_store() -> keyring_core::Result<()> {
-    keyring_core::set_default_store(apple_native_keyring_store::keychain::Store::new()?);
-    Ok(())
-}
-
-#[cfg(target_os = "ios")]
-fn install_keyring_store() -> keyring_core::Result<()> {
-    keyring_core::set_default_store(apple_native_keyring_store::protected::Store::new()?);
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn install_keyring_store() -> keyring_core::Result<()> {
-    keyring_core::set_default_store(linux_keyutils_keyring_store::Store::new()?);
-    Ok(())
-}
-
-#[cfg(target_os = "android")]
-fn install_keyring_store() -> keyring_core::Result<()> {
-    keyring_core::set_default_store(android_native_keyring_store::Store::new()?);
-    Ok(())
-}
-
-#[cfg(target_os = "windows")]
-fn install_keyring_store() -> keyring_core::Result<()> {
-    keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
-    Ok(())
-}
-
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    target_os = "linux",
-    target_os = "macos",
-    target_os = "windows"
-)))]
-fn install_keyring_store() -> keyring_core::Result<()> {
-    Err(keyring_core::Error::Invalid(
-        "platform".to_owned(),
-        "native auth has no keyring store for this platform".to_owned(),
-    ))
-}
-
-/// The keyring sequence both secret stores here perform.
-///
-/// One service holds one entry per name, so the sequence lives here once.
-struct Keyring {
-    service: String,
-}
-
-impl Keyring {
-    fn new(service: impl Into<String>) -> Self {
-        Self {
-            service: service.into(),
-        }
-    }
-
-    /// The keyring entry for `name`.
-    fn entry(&self, name: &str) -> Result<keyring_core::Entry, ClientError> {
-        ensure_keyring_store()?;
-        keyring_core::Entry::new(&self.service, name)
-            .map_err(|err| ClientError::Auth(format!("keyring open: {err}")))
-    }
-
-    /// The secret stored under `name`, or `None` when none was stored.
-    fn read(&self, name: &str) -> Result<Option<String>, ClientError> {
-        let entry = self.entry(name)?;
-        match entry.get_password() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring_core::Error::NoEntry) => Ok(None),
-            Err(err) => Err(ClientError::Auth(format!("keyring load: {err}"))),
-        }
-    }
-
-    /// Persist `secret` under `name`, replacing any prior one.
-    fn write(&self, name: &str, secret: &str) -> Result<(), ClientError> {
-        self.entry(name)?
-            .set_password(secret)
-            .map_err(|err| ClientError::Auth(format!("keyring store: {err}")))
-    }
-
-    /// Remove the entry stored under `name`, if any.
-    fn clear(&self, name: &str) -> Result<(), ClientError> {
-        let entry = self.entry(name)?;
-        match entry.delete_credential() {
-            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(err) => Err(ClientError::Auth(format!("keyring clear: {err}"))),
-        }
-    }
-}
-
 /// OS secure storage for the refresh token: Keychain on Apple platforms,
-/// Credential Manager on Windows, and keyutils on Linux.
+/// Credential Manager on Windows, and on Linux the store [`LinuxStore`](crate::LinuxStore) names.
 ///
 /// One service holds one entry per account, exactly as [`KeyringKeyStore`]
 /// holds one per replica record.
@@ -142,12 +41,31 @@ pub struct KeyringStore {
 }
 
 impl KeyringStore {
-    /// Store refresh tokens under `service` in the OS keyring.
+    /// Store refresh tokens under `service` in the detected OS store.
     #[must_use]
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             keyring: Keyring::new(service),
         }
+    }
+
+    /// Store refresh tokens under `service` in the Linux store the application names.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_linux_store(service: impl Into<String>, store: crate::LinuxStore) -> Self {
+        Self {
+            keyring: Keyring::with_linux_store(service, store),
+        }
+    }
+
+    /// Which Linux store holds the tokens, opening it on first use.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::SecretStore`] if no store can be opened.
+    #[cfg(target_os = "linux")]
+    pub async fn backend(&self) -> Result<crate::Backend, ClientError> {
+        self.keyring.backend().await
     }
 
     /// The indexed accounts, empty when nothing was ever stored.
@@ -156,18 +74,19 @@ impl KeyringStore {
     /// a hint about what to offer, and refusing to open the store over it would
     /// turn a listing problem into a lockout. The credentials themselves are
     /// untouched, and the next sign-in rewrites it.
-    fn index(&self) -> Result<Vec<String>, ClientError> {
-        let Some(raw) = self.keyring.read(crate::replica::ACCOUNTS_RECORD)? else {
+    async fn index(&self) -> Result<Vec<String>, ClientError> {
+        let Some(raw) = self.keyring.read(crate::replica::ACCOUNTS_RECORD).await? else {
             return Ok(Vec::new());
         };
         Ok(serde_json::from_str(&raw).unwrap_or_default())
     }
 
-    fn write_index(&self, accounts: &[String]) -> Result<(), ClientError> {
+    async fn write_index(&self, accounts: &[String]) -> Result<(), ClientError> {
         let encoded = serde_json::to_string(accounts)
             .map_err(|err| ClientError::Auth(format!("encoding the account index: {err}")))?;
         self.keyring
             .write(crate::replica::ACCOUNTS_RECORD, &encoded)
+            .await
     }
 }
 
@@ -203,8 +122,8 @@ fn indexed_without(known: &[String], account: &str) -> Option<Vec<String>> {
 impl RefreshTokenStore for KeyringStore {
     type Error = ClientError;
 
-    fn load(&self, account: &str) -> Result<Option<String>, ClientError> {
-        self.keyring.read(account)
+    fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, ClientError> {
+        Box::pin(self.keyring.read(account))
     }
 
     /// Writes the entry, then records the account in the index so
@@ -213,12 +132,14 @@ impl RefreshTokenStore for KeyringStore {
     /// The index is maintained here rather than by the authenticator so that no
     /// caller can write a credential without it being listable. A reserved
     /// record is not an account and is not indexed.
-    fn store(&self, account: &str, token: &str) -> Result<(), ClientError> {
-        self.keyring.write(account, token)?;
-        match indexed_with(&self.index()?, account) {
-            Some(updated) => self.write_index(&updated),
-            None => Ok(()),
-        }
+    fn store<'a>(&'a self, account: &'a str, token: &'a str) -> RefreshFuture<'a, (), ClientError> {
+        Box::pin(async move {
+            self.keyring.write(account, token).await?;
+            match indexed_with(&self.index().await?, account) {
+                Some(updated) => self.write_index(&updated).await,
+                None => Ok(()),
+            }
+        })
     }
 
     /// Removes the entry and drops the account from the index.
@@ -230,19 +151,21 @@ impl RefreshTokenStore for KeyringStore {
     ///
     /// Clearing the last account clears the index record rather than writing an
     /// empty list, since an absent index reads as empty.
-    fn clear(&self, account: &str) -> Result<(), ClientError> {
-        self.keyring.clear(account)?;
-        match indexed_without(&self.index()?, account) {
-            Some(updated) if updated.is_empty() => {
-                self.keyring.clear(crate::replica::ACCOUNTS_RECORD)
+    fn clear<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, (), ClientError> {
+        Box::pin(async move {
+            self.keyring.clear(account).await?;
+            match indexed_without(&self.index().await?, account) {
+                Some(updated) if updated.is_empty() => {
+                    self.keyring.clear(crate::replica::ACCOUNTS_RECORD).await
+                }
+                Some(updated) => self.write_index(&updated).await,
+                None => Ok(()),
             }
-            Some(updated) => self.write_index(&updated),
-            None => Ok(()),
-        }
+        })
     }
 
-    fn accounts(&self) -> Result<Vec<String>, ClientError> {
-        self.index()
+    fn accounts(&self) -> RefreshFuture<'_, Vec<String>, ClientError> {
+        Box::pin(self.index())
     }
 }
 
@@ -255,41 +178,43 @@ pub struct MemoryRefreshStore {
 impl RefreshTokenStore for MemoryRefreshStore {
     type Error = ClientError;
 
-    fn load(&self, account: &str) -> Result<Option<String>, ClientError> {
-        Ok(self
+    fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, ClientError> {
+        let token = self
             .inner
             .lock()
             .expect("refresh store lock")
             .get(account)
-            .cloned())
+            .cloned();
+        Box::pin(std::future::ready(Ok(token)))
     }
 
-    fn store(&self, account: &str, token: &str) -> Result<(), ClientError> {
+    fn store<'a>(&'a self, account: &'a str, token: &'a str) -> RefreshFuture<'a, (), ClientError> {
         self.inner
             .lock()
             .expect("refresh store lock")
             .insert(account.to_owned(), token.to_owned());
-        Ok(())
+        Box::pin(std::future::ready(Ok(())))
     }
 
-    fn clear(&self, account: &str) -> Result<(), ClientError> {
+    fn clear<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, (), ClientError> {
         self.inner
             .lock()
             .expect("refresh store lock")
             .remove(account);
-        Ok(())
+        Box::pin(std::future::ready(Ok(())))
     }
 
     /// Enumerated from the map itself, so it cannot disagree with what is stored.
-    fn accounts(&self) -> Result<Vec<String>, ClientError> {
-        Ok(self
+    fn accounts(&self) -> RefreshFuture<'_, Vec<String>, ClientError> {
+        let accounts = self
             .inner
             .lock()
             .expect("refresh store lock")
             .keys()
             .filter(|name| !crate::is_reserved_record(name))
             .cloned()
-            .collect())
+            .collect();
+        Box::pin(std::future::ready(Ok(accounts)))
     }
 }
 
@@ -307,11 +232,11 @@ impl RefreshTokenStore for MemoryRefreshStore {
 /// # Errors
 ///
 /// [`ClientError`] if the store cannot be read.
-pub fn remembered_account<S>(store: &S) -> Result<Option<String>, ClientError>
+pub async fn remembered_account<S>(store: &S) -> Result<Option<String>, ClientError>
 where
     S: RefreshTokenStore<Error = ClientError> + ?Sized,
 {
-    store.load(IDENTITY_RECORD)
+    store.load(IDENTITY_RECORD).await
 }
 
 /// The effective key for the replica `name`, minting one when this device has
@@ -370,7 +295,7 @@ fn mint_replica_key() -> Result<ReplicaKey, ClientError> {
 }
 
 /// OS secure storage for the per-replica encryption keys, using the same
-/// keyring backend as [`KeyringStore`].
+/// store as [`KeyringStore`].
 ///
 /// The keyring account is the record name, so one service holds one entry per
 /// identity.
@@ -379,29 +304,41 @@ pub struct KeyringKeyStore {
 }
 
 impl KeyringKeyStore {
-    /// Store replica keys under `service` in the OS keyring.
+    /// Store replica keys under `service` in the detected OS store.
     #[must_use]
     pub fn new(service: impl Into<String>) -> Self {
         Self {
             keyring: Keyring::new(service),
         }
     }
+
+    /// Store replica keys under `service` in the Linux store the application names.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub fn with_linux_store(service: impl Into<String>, store: crate::LinuxStore) -> Self {
+        Self {
+            keyring: Keyring::with_linux_store(service, store),
+        }
+    }
+
+    /// Which Linux store holds the keys, opening it on first use.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::SecretStore`] if no store can be opened.
+    #[cfg(target_os = "linux")]
+    pub async fn backend(&self) -> Result<crate::Backend, ClientError> {
+        self.keyring.backend().await
+    }
 }
 
-// Every method here returns before it yields, which is the cost decision 2 of
-// R41 accepted: the trait awaits because the browser must, and the keychain
-// call blocks whoever polls it. Bounded, since key custody runs at open and at
-// logout rather than per change.
-#[expect(
-    clippy::unused_async_trait_impl,
-    reason = "the trait method is async and this body finishes without awaiting"
-)]
 impl ReplicaKeyStore for KeyringKeyStore {
     type Error = ClientError;
 
     async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
         self.keyring
-            .read(name)?
+            .read(name)
+            .await?
             // The keyring hands back an owned hex string, which is key
             // material until it is wiped, hence the `Zeroizing` wrapper.
             .map(|hex| {
@@ -417,11 +354,11 @@ impl ReplicaKeyStore for KeyringKeyStore {
         for byte in key.as_bytes() {
             let _ = write!(&mut *hex, "{byte:02x}");
         }
-        self.keyring.write(name, &hex)
+        self.keyring.write(name, &hex).await
     }
 
     async fn clear(&self, name: &str) -> Result<(), ClientError> {
-        self.keyring.clear(name)
+        self.keyring.clear(name).await
     }
 }
 
@@ -646,7 +583,7 @@ impl NativeAuthenticator {
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
         if let Some(account) = self.account()
-            && self.store.load(&account)?.is_some()
+            && self.store.load(&account).await?.is_some()
             && let Ok(session) = self.refresh_access().await
         {
             return Ok(session);
@@ -665,7 +602,7 @@ impl NativeAuthenticator {
         &self,
     ) -> Result<AcquiredSession<Id>, ClientError> {
         let response = self.refresh_tokens::<Id>().await?;
-        self.remember(&response.user_id)?;
+        self.remember(encode_identity(&response.user_id)?).await?;
         Ok(response.into())
     }
 
@@ -682,7 +619,8 @@ impl NativeAuthenticator {
             .ok_or_else(|| ClientError::Auth("no account to refresh".to_owned()))?;
         let refresh = self
             .store
-            .load(&account)?
+            .load(&account)
+            .await?
             .ok_or_else(|| ClientError::Auth("no stored refresh token".to_owned()))?;
         let response: TokenResponse<Id> = self
             .post_json(
@@ -690,7 +628,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await?;
-        self.store.store(&account, &response.refresh_token)?;
+        self.store.store(&account, &response.refresh_token).await?;
         Ok(response)
     }
 
@@ -736,10 +674,10 @@ impl NativeAuthenticator {
             };
             let pending = serde_json::to_string(&pending)
                 .map_err(|err| ClientError::Auth(format!("recording the login: {err}")))?;
-            self.store.store(PENDING_LOGIN_RECORD, &pending)?;
+            self.store.store(PENDING_LOGIN_RECORD, &pending).await?;
             let delivered = claimed.session.authorize(login_url(&claimed.uri)).await;
             // This process saw the login end, so nothing is left to resume.
-            self.store.clear(PENDING_LOGIN_RECORD)?;
+            self.store.clear(PENDING_LOGIN_RECORD).await?;
             let delivered = delivered?;
             code_and_state(query_of(&delivered), "redirect")?
         } else {
@@ -766,10 +704,10 @@ impl NativeAuthenticator {
         &self,
         claimed: &ClaimedRedirect,
     ) -> Result<Option<AcquiredSession<Id>>, ClientError> {
-        let Some(pending) = self.store.load(PENDING_LOGIN_RECORD)? else {
+        let Some(pending) = self.store.load(PENDING_LOGIN_RECORD).await? else {
             return Ok(None);
         };
-        self.store.clear(PENDING_LOGIN_RECORD)?;
+        self.store.clear(PENDING_LOGIN_RECORD).await?;
         let Some(delivered) = claimed.session.delivered() else {
             return Ok(None);
         };
@@ -806,11 +744,13 @@ impl NativeAuthenticator {
         // Keyed off the response, because a first login has no account to key on
         // and learns it here. The marker's value is the same encoding, so it is
         // literally the key of the record it points at.
-        self.store.store(
-            &encode_identity(&response.user_id)?,
-            &response.refresh_token,
-        )?;
-        self.remember(&response.user_id)?;
+        self.store
+            .store(
+                &encode_identity(&response.user_id)?,
+                &response.refresh_token,
+            )
+            .await?;
+        self.remember(encode_identity(&response.user_id)?).await?;
         Ok(response.into())
     }
 
@@ -819,9 +759,8 @@ impl NativeAuthenticator {
     /// Both token paths call it, because either can be the one that establishes
     /// who this device is: a silent refresh on a start, or an interactive login
     /// on a first run or after the credential lapsed.
-    fn remember<Id: serde::Serialize>(&self, user_id: &Id) -> Result<(), ClientError> {
-        let account = encode_identity(user_id)?;
-        self.store.store(IDENTITY_RECORD, &account)?;
+    async fn remember(&self, account: String) -> Result<(), ClientError> {
+        self.store.store(IDENTITY_RECORD, &account).await?;
         *self
             .account
             .lock()
@@ -896,7 +835,7 @@ impl NativeAuthenticator {
         let Some(account) = self.account() else {
             return Ok(());
         };
-        let Some(refresh) = self.store.load(&account)? else {
+        let Some(refresh) = self.store.load(&account).await? else {
             return Ok(());
         };
         let revoked = self
@@ -905,7 +844,7 @@ impl NativeAuthenticator {
                 &serde_json::json!({ "refresh_token": refresh }),
             )
             .await;
-        self.store.clear(&account)?;
+        self.store.clear(&account).await?;
         revoked.map(drop)
     }
 
@@ -1099,19 +1038,25 @@ mod tests {
     /// This reads the index back through the store's own keyring, which needs a
     /// live secret store, so it stands beside the pure-logic
     /// `the_account_index_drops_only_the_account_signed_out` above.
-    #[test]
-    fn clearing_the_last_account_removes_the_index_record() {
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn clearing_the_last_account_removes_the_index_record() {
         let _keyring = connetto_test_harness::isolated_session_keyring();
         let service = format!("connetto-index-clear-{}", std::process::id());
-        let store = KeyringStore::new(&service);
+        let store = KeyringStore::with_linux_store(&service, crate::LinuxStore::Keyutils);
         store
             .store("\"alice\"", "token")
+            .await
             .expect("store one account");
-        store.clear("\"alice\"").expect("clear the only account");
+        store
+            .clear("\"alice\"")
+            .await
+            .expect("clear the only account");
         assert_eq!(
             store
                 .keyring
                 .read(crate::replica::ACCOUNTS_RECORD)
+                .await
                 .expect("read the index record"),
             None,
             "the last account's departure removes the index record rather than leaving it holding []",

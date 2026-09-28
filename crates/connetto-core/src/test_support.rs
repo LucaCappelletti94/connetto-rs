@@ -300,8 +300,7 @@ impl Transport for FakeTransport {
 /// alone.
 ///
 /// One caller written against the trait rather than against any store, run
-/// against every implementation on both targets. That is the property the seam
-/// exists to buy, and the reason this lives here rather than in either suite.
+/// against every implementation. That is the property the seam exists to buy.
 ///
 /// Both records are cleared on the way in and on the way out, so a durable
 /// store survives a rerun.
@@ -309,48 +308,55 @@ impl Transport for FakeTransport {
 /// # Panics
 ///
 /// If either account reads back anything but its own token.
-pub fn two_accounts_keep_their_own_token<S: crate::traits::RefreshTokenStore>(
+pub async fn two_accounts_keep_their_own_token<S: crate::traits::RefreshTokenStore>(
     store: &S,
     alice: &str,
     bob: &str,
 ) {
     assert_ne!(alice, bob, "the two accounts must differ");
-    store.clear(alice).expect("clear alice");
-    store.clear(bob).expect("clear bob");
+    store.clear(alice).await.expect("clear alice");
+    store.clear(bob).await.expect("clear bob");
 
-    assert_eq!(store.load(alice).expect("load alice"), None, "starts empty");
-
-    store.store(alice, "alice-refresh").expect("store alice");
     assert_eq!(
-        store.load(bob).expect("load bob"),
+        store.load(alice).await.expect("load alice"),
+        None,
+        "starts empty"
+    );
+
+    store
+        .store(alice, "alice-refresh")
+        .await
+        .expect("store alice");
+    assert_eq!(
+        store.load(bob).await.expect("load bob"),
         None,
         "alice's write did not reach bob"
     );
 
-    store.store(bob, "bob-refresh").expect("store bob");
+    store.store(bob, "bob-refresh").await.expect("store bob");
     assert_eq!(
-        store.load(alice).expect("load alice").as_deref(),
+        store.load(alice).await.expect("load alice").as_deref(),
         Some("alice-refresh"),
         "alice reads her own token back"
     );
     assert_eq!(
-        store.load(bob).expect("load bob").as_deref(),
+        store.load(bob).await.expect("load bob").as_deref(),
         Some("bob-refresh"),
         "and bob his"
     );
 
-    store.clear(alice).expect("clear alice");
+    store.clear(alice).await.expect("clear alice");
     assert_eq!(
-        store.load(alice).expect("load alice"),
+        store.load(alice).await.expect("load alice"),
         None,
         "the clear removed alice"
     );
     assert_eq!(
-        store.load(bob).expect("load bob").as_deref(),
+        store.load(bob).await.expect("load bob").as_deref(),
         Some("bob-refresh"),
         "and left bob alone"
     );
-    store.clear(bob).expect("clear bob");
+    store.clear(bob).await.expect("clear bob");
 }
 
 /// Every stored account is listed, and connetto's own records are not, driven
@@ -358,10 +364,7 @@ pub fn two_accounts_keep_their_own_token<S: crate::traits::RefreshTokenStore>(
 /// alone.
 ///
 /// The sibling of [`two_accounts_keep_their_own_token`] and the same doctrine:
-/// one caller written against the trait, run against every implementation on both
-/// targets, because the two answer it by different means. The browser reads the
-/// rows the tokens live in, and the native store reads an index it maintains,
-/// since `keyring` exposes no enumeration on any backend.
+/// one caller written against the trait, run against every implementation.
 ///
 /// `reserved` is one of connetto's own record names, which the caller supplies
 /// because the core does not define them. Writing it and finding it absent from
@@ -375,7 +378,7 @@ pub fn two_accounts_keep_their_own_token<S: crate::traits::RefreshTokenStore>(
 ///
 /// If a stored account is missing from the list, a cleared one survives in it, or
 /// a reserved record appears in it.
-pub fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
+pub async fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
     store: &S,
     alice: &str,
     bob: &str,
@@ -383,25 +386,28 @@ pub fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
 ) {
     assert_ne!(alice, bob, "the two accounts must differ");
     for name in [alice, bob, reserved] {
-        store.clear(name).expect("clear");
+        store.clear(name).await.expect("clear");
     }
 
-    let listed = store.accounts().expect("list an empty store");
+    let listed = store.accounts().await.expect("list an empty store");
     assert!(
         !listed.contains(&alice.to_owned()) && !listed.contains(&bob.to_owned()),
         "an empty store offers neither account, got {listed:?}"
     );
 
-    store.store(alice, "alice-refresh").expect("store alice");
-    let listed = store.accounts().expect("list one account");
+    store
+        .store(alice, "alice-refresh")
+        .await
+        .expect("store alice");
+    let listed = store.accounts().await.expect("list one account");
     assert!(listed.contains(&alice.to_owned()), "alice is listed");
     assert!(
         !listed.contains(&bob.to_owned()),
         "bob is not, having stored nothing"
     );
 
-    store.store(bob, "bob-refresh").expect("store bob");
-    let listed = store.accounts().expect("list two accounts");
+    store.store(bob, "bob-refresh").await.expect("store bob");
+    let listed = store.accounts().await.expect("list two accounts");
     assert!(
         listed.contains(&alice.to_owned()) && listed.contains(&bob.to_owned()),
         "both accounts are signed in at once, got {listed:?}"
@@ -409,8 +415,9 @@ pub fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
 
     store
         .store(reserved, "not-an-account")
+        .await
         .expect("store the reserved record");
-    let listed = store.accounts().expect("list past a reserved record");
+    let listed = store.accounts().await.expect("list past a reserved record");
     assert!(
         !listed.contains(&reserved.to_owned()),
         "connetto's own record is not somebody to sign in as, got {listed:?}"
@@ -420,8 +427,8 @@ pub fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
         "and it hid neither account, got {listed:?}"
     );
 
-    store.clear(alice).expect("clear alice");
-    let listed = store.accounts().expect("list after a clear");
+    store.clear(alice).await.expect("clear alice");
+    let listed = store.accounts().await.expect("list after a clear");
     assert!(
         !listed.contains(&alice.to_owned()),
         "a signed-out account is no longer offered, got {listed:?}"
@@ -432,7 +439,7 @@ pub fn every_stored_account_is_listed<S: crate::traits::RefreshTokenStore>(
     );
 
     for name in [bob, reserved] {
-        store.clear(name).expect("clear");
+        store.clear(name).await.expect("clear");
     }
 }
 

@@ -72,6 +72,8 @@ mod clock;
 pub mod dsl;
 mod grant_expiry;
 pub mod harden;
+#[cfg(feature = "native-auth")]
+mod keyring;
 pub mod live;
 pub mod reconnect;
 pub mod replica;
@@ -92,6 +94,10 @@ pub use auth::{
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
+#[cfg(feature = "native-auth")]
+pub use keyring::SecretStoreError;
+#[cfg(all(feature = "native-auth", target_os = "linux"))]
+pub use keyring::{Backend, KeyFile, LinuxStore};
 pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
@@ -173,6 +179,10 @@ pub enum ClientError {
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),
+    /// An OS secret store refused.
+    #[cfg(feature = "native-auth")]
+    #[error("secret store: {0}")]
+    SecretStore(keyring::SecretStoreError),
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///

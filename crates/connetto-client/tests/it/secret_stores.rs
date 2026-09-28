@@ -2,10 +2,7 @@
 //!
 //! What this buys over the per-store suites next to it is the caller. Both
 //! exercises are written in `connetto_core::test_support` against the traits
-//! alone and know nothing about a keyring, an `IndexedDB` database, or an
-//! encrypted `SQLite` file. `connetto-web`'s `secret_stores.rs` runs the same
-//! two functions against the browser stores, so the seam is proven by one
-//! caller working on both targets rather than by the rename.
+//! alone and know nothing about a keyring.
 
 use connetto_client::{IDENTITY_RECORD, MemoryKeyStore, MemoryRefreshStore};
 use connetto_core::test_support::{
@@ -13,20 +10,21 @@ use connetto_core::test_support::{
     two_accounts_keep_their_own_token,
 };
 
-#[test]
-fn the_in_memory_refresh_store_keeps_two_accounts_apart() {
-    two_accounts_keep_their_own_token(&MemoryRefreshStore::default(), "alice", "bob");
+#[tokio::test]
+async fn the_in_memory_refresh_store_keeps_two_accounts_apart() {
+    two_accounts_keep_their_own_token(&MemoryRefreshStore::default(), "alice", "bob").await;
 }
 
 /// R42: the account list the picker is built on, against the enumerable store.
-#[test]
-fn the_in_memory_refresh_store_lists_every_account_it_holds() {
+#[tokio::test]
+async fn the_in_memory_refresh_store_lists_every_account_it_holds() {
     every_stored_account_is_listed(
         &MemoryRefreshStore::default(),
         "alice",
         "bob",
         IDENTITY_RECORD,
-    );
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -34,31 +32,89 @@ async fn the_in_memory_key_store_keeps_two_accounts_apart() {
     two_accounts_keep_their_own_key(&MemoryKeyStore::default(), "alice", "bob").await;
 }
 
-/// The production stores use names unique to this process, so reruns do not collide.
-#[test]
-fn the_keyring_refresh_store_keeps_two_accounts_apart() {
-    use connetto_client::KeyringStore;
-    let _keyring = connetto_test_harness::isolated_session_keyring();
+/// The Linux keyring stores, each named explicitly so no test writes into the
+/// desktop's own keyring (R71 decision 7).
+#[cfg(target_os = "linux")]
+mod linux {
+    use connetto_client::{
+        Backend, IDENTITY_RECORD, KeyFile, KeyringKeyStore, KeyringStore, LinuxStore,
+    };
+    use connetto_core::test_support::{
+        every_stored_account_is_listed, two_accounts_keep_their_own_key,
+        two_accounts_keep_their_own_token,
+    };
 
-    let service = format!("connetto-r41-refresh-{}", std::process::id());
-    two_accounts_keep_their_own_token(&KeyringStore::new(service), "alice", "bob");
-}
+    /// Every durable store and keyutils, each under a service unique to this process.
+    fn stores(dir: &std::path::Path) -> Vec<(&'static str, LinuxStore)> {
+        let key = dir.join("wrap.key");
+        std::fs::write(&key, [3_u8; 32]).expect("write a wrap key");
+        vec![
+            ("keyutils", LinuxStore::Keyutils),
+            (
+                "key-file",
+                LinuxStore::KeyFile(KeyFile::new(key, dir.join("state"))),
+            ),
+        ]
+    }
 
-/// R42: the same property against the store that cannot be enumerated.
-#[test]
-fn the_keyring_refresh_store_lists_every_account_it_holds() {
-    use connetto_client::KeyringStore;
-    let _keyring = connetto_test_harness::isolated_session_keyring();
+    #[tokio::test]
+    async fn every_store_keeps_two_accounts_apart_and_lists_them() {
+        let _keyring = connetto_test_harness::isolated_session_keyring();
+        let dir = tempfile::tempdir().expect("tempdir");
+        for (label, store) in stores(dir.path()) {
+            let service = format!("connetto-r71-{label}-{}", std::process::id());
+            let tokens = KeyringStore::with_linux_store(&service, store.clone());
+            two_accounts_keep_their_own_token(&tokens, "alice", "bob").await;
+            every_stored_account_is_listed(&tokens, "alice", "bob", IDENTITY_RECORD).await;
+            let keys = KeyringKeyStore::with_linux_store(&service, store);
+            two_accounts_keep_their_own_key(&keys, "alice", "bob").await;
+        }
+    }
 
-    let service = format!("connetto-r42-refresh-{}", std::process::id());
-    every_stored_account_is_listed(&KeyringStore::new(service), "alice", "bob", IDENTITY_RECORD);
-}
+    #[tokio::test]
+    async fn the_report_names_the_store_and_whether_it_survives_a_reboot() {
+        let _keyring = connetto_test_harness::isolated_session_keyring();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut reports = Vec::new();
+        for (label, store) in stores(dir.path()) {
+            let tokens =
+                KeyringStore::with_linux_store(format!("connetto-r71-report-{label}"), store);
+            reports.push(tokens.backend().await.expect("the store opens"));
+        }
+        assert_eq!(
+            reports,
+            [
+                Backend::Keyutils,
+                Backend::KeyFile {
+                    previous_key_needed: false
+                }
+            ]
+        );
+        assert!(
+            !reports[0].survives_reboot(),
+            "keyutils says it is lost at reboot"
+        );
+        assert!(reports[1].survives_reboot());
+    }
 
-#[tokio::test]
-async fn the_keyring_key_store_keeps_two_accounts_apart() {
-    use connetto_client::KeyringKeyStore;
-    let _keyring = connetto_test_harness::isolated_session_keyring();
-
-    let service = format!("connetto-r41-keys-{}", std::process::id());
-    two_accounts_keep_their_own_key(&KeyringKeyStore::new(service), "alice", "bob").await;
+    #[tokio::test]
+    async fn a_named_key_file_of_the_wrong_length_refuses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let key = dir.path().join("short.key");
+        std::fs::write(&key, [3_u8; 16]).expect("write a short key");
+        let tokens = KeyringStore::with_linux_store(
+            "connetto-r71-short",
+            LinuxStore::KeyFile(KeyFile::new(key, dir.path().join("state"))),
+        );
+        let err = tokens.backend().await.expect_err("a 16-byte key refuses");
+        assert!(
+            matches!(
+                err,
+                connetto_client::ClientError::SecretStore(
+                    connetto_client::SecretStoreError::WrapKeyLength { len: 16, .. }
+                )
+            ),
+            "got {err}"
+        );
+    }
 }

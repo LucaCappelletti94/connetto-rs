@@ -527,6 +527,23 @@ jobs:
       - name: Run Rust suite
         run: keyctl session -- cargo +stable nextest run --release --all-features --test-threads 4 ${{ matrix.packages }}
 
+      # R71's groups that need a private session bus, root, or Docker.
+      - name: Install Secret Service tools
+        if: matrix.name == 'client'
+        run: sudo apt-get install -y gnome-keyring dbus
+
+      - name: Run Secret Service custody tests
+        if: matrix.name == 'client'
+        run: scripts/linux-secret-store-tests.sh secret-service
+
+      - name: Run systemd unit custody tests
+        if: matrix.name == 'client'
+        run: scripts/linux-secret-store-tests.sh systemd
+
+      - name: Run container custody tests
+        if: matrix.name == 'client'
+        run: scripts/linux-secret-store-tests.sh container
+
       - name: Prune target cache
         if: always()
         run: |

@@ -193,6 +193,8 @@ struct AuthCtx {
     key_store: Arc<KeyringKeyStore>,
     key_name: String,
     token_store: Arc<KeyringStore>,
+    /// The signed-in accounts as the store listed them at startup, since every change restarts.
+    accounts: Vec<String>,
     session_expires_at: std::time::SystemTime,
     current_account: String,
 }
@@ -514,8 +516,9 @@ async fn setup_authenticated(
     let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));
     let key_store = Arc::new(KeyringKeyStore::new(KEYRING_SERVICE));
 
-    let account =
-        remembered_account(token_store.as_ref()).context("reading the remembered account")?;
+    let account = remembered_account(token_store.as_ref())
+        .await
+        .context("reading the remembered account")?;
     let authenticator = Arc::new(platform_sign_in(NativeAuthenticator::new(
         endpoint(
             std::env::var("CONNETTO_DEMO_AUTH_ORIGIN").ok(),
@@ -603,12 +606,17 @@ async fn setup_authenticated(
     };
 
     let conn = conn.with_token_source(authenticator.token_source());
+    let accounts = token_store
+        .accounts()
+        .await
+        .context("listing the signed-in accounts")?;
 
     let auth_ctx = AuthCtx {
         authenticator,
         db_path,
         key_store,
         key_name,
+        accounts,
         token_store,
         session_expires_at,
         current_account,
@@ -1013,8 +1021,8 @@ async fn change_account(
         return;
     }
     let pointed = match account {
-        Some(key) => token_store.store(IDENTITY_RECORD, key),
-        None => token_store.clear(IDENTITY_RECORD),
+        Some(key) => token_store.store(IDENTITY_RECORD, key).await,
+        None => token_store.clear(IDENTITY_RECORD).await,
     };
     match pointed {
         Ok(()) => restart.request(),
@@ -1028,7 +1036,7 @@ fn AccountsPanel(wipe_state: Signal<WipeState>) -> Element {
     let client = use_context::<ConnettoClient<Ws>>();
     let auth_ctx = use_context::<AuthCtx>();
     let mut add_picking: Signal<bool> = use_signal(|| false);
-    let accounts_list = use_signal(|| auth_ctx.token_store.accounts().unwrap_or_default());
+    let accounts_list = use_signal(|| auth_ctx.accounts.clone());
     let current_account = auth_ctx.current_account.clone();
     let token_store = Arc::clone(&auth_ctx.token_store);
     let add_client = client.clone();

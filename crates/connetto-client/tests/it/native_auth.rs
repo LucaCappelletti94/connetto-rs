@@ -232,6 +232,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
     let encoded_account = encode_identity(&login.user_id).expect("encode account");
     let first_refresh = store
         .load(&encoded_account)
+        .await
         .expect("load")
         .expect("refresh stored");
 
@@ -255,6 +256,7 @@ async fn native_login_refreshes_and_silently_reacquires() {
     assert_eq!(refreshed.user_id, login.user_id, "identity is continuous");
     let second_refresh = store
         .load(&encoded_account)
+        .await
         .expect("load")
         .expect("refresh stored");
     assert_ne!(first_refresh, second_refresh, "refresh token rotated");
@@ -299,7 +301,11 @@ async fn a_first_login_refreshes_for_its_own_reconnect() {
     );
     let login = authenticator.login::<String>().await.expect("login");
     let account = encode_identity(&login.user_id).expect("encode account");
-    let issued = store.load(&account).expect("load").expect("refresh stored");
+    let issued = store
+        .load(&account)
+        .await
+        .expect("load")
+        .expect("refresh stored");
 
     let token = authenticator
         .token_source()
@@ -307,7 +313,11 @@ async fn a_first_login_refreshes_for_its_own_reconnect() {
         .await
         .expect("the token source refreshes for the account the login revealed");
     assert!(!token.is_empty(), "a fresh access token");
-    let rotated = store.load(&account).expect("load").expect("refresh stored");
+    let rotated = store
+        .load(&account)
+        .await
+        .expect("load")
+        .expect("refresh stored");
     assert_ne!(issued, rotated, "the refresh rotated that account's token");
 }
 
@@ -432,6 +442,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     let encoded_account = encode_identity(&login.user_id).expect("encode account");
     let refresh = store
         .load(&encoded_account)
+        .await
         .expect("load")
         .expect("the refresh token is stored");
 
@@ -456,7 +467,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
 
     // Local state is gone, so nothing on this device can silently reacquire.
     assert_eq!(
-        store.load(&encoded_account).expect("load"),
+        store.load(&encoded_account).await.expect("load"),
         None,
         "the refresh token is cleared",
     );
@@ -477,6 +488,7 @@ async fn a_logout_revokes_the_session_and_clears_the_local_credential() {
     // cannot be resurrected into a fresh access token.
     let kept = MemoryRefreshStore::default();
     kept.store(&encoded_account, &refresh)
+        .await
         .expect("seed the copy");
     let resurrect = NativeAuthenticator::new(
         base,
@@ -516,7 +528,7 @@ async fn a_first_login_logout_revokes_its_own_session() {
     authenticator.logout().await.expect("logout");
 
     assert_eq!(
-        store.load(&account).expect("load"),
+        store.load(&account).await.expect("load"),
         None,
         "the refresh token is cleared"
     );
@@ -541,6 +553,7 @@ async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed()
     let store: SharedRefresh = Arc::new(MemoryRefreshStore::default());
     store
         .store(&encoded_account, "session-id.secret")
+        .await
         .expect("seed a credential");
     // Port 1 is reserved and nothing listens there, which is this test's stand-in
     // for a device with no connectivity.
@@ -557,29 +570,32 @@ async fn an_offline_logout_still_clears_local_state_and_says_the_revoke_failed()
         Ok(()) => panic!("an unreachable server must not report a successful revoke"),
     }
     assert_eq!(
-        store.load(&encoded_account).expect("load"),
+        store.load(&encoded_account).await.expect("load"),
         None,
         "the credential is cleared even when the revoke never landed",
     );
 }
 
-#[test]
-fn memory_refresh_store_round_trips() {
+#[tokio::test]
+async fn memory_refresh_store_round_trips() {
     let store = MemoryRefreshStore::default();
-    assert!(store.load("any-key").unwrap().is_none(), "empty at first");
-    store.store("any-key", "refresh-abc").unwrap();
+    assert!(
+        store.load("any-key").await.unwrap().is_none(),
+        "empty at first"
+    );
+    store.store("any-key", "refresh-abc").await.unwrap();
     assert_eq!(
-        store.load("any-key").unwrap().as_deref(),
+        store.load("any-key").await.unwrap().as_deref(),
         Some("refresh-abc")
     );
-    store.store("any-key", "refresh-def").unwrap();
+    store.store("any-key", "refresh-def").await.unwrap();
     assert_eq!(
-        store.load("any-key").unwrap().as_deref(),
+        store.load("any-key").await.unwrap().as_deref(),
         Some("refresh-def"),
         "replaces"
     );
-    store.clear("any-key").unwrap();
-    assert!(store.load("any-key").unwrap().is_none(), "cleared");
+    store.clear("any-key").await.unwrap();
+    assert!(store.load("any-key").await.unwrap().is_none(), "cleared");
 }
 
 /// The redirect a mobile build registers with its operating system.
@@ -707,16 +723,16 @@ async fn a_claimed_redirect_login_completes_through_the_apps_session() {
 
     let account = encode_identity(&login.user_id).expect("encode account");
     assert!(
-        store.load(&account).expect("load").is_some(),
+        store.load(&account).await.expect("load").is_some(),
         "the refresh token is stored for the account the login revealed"
     );
     assert_eq!(
-        store.accounts().expect("accounts"),
+        store.accounts().await.expect("accounts"),
         vec![account],
         "a finished login lists only the account"
     );
     assert_eq!(
-        store.load("connetto-pending-login").expect("load"),
+        store.load("connetto-pending-login").await.expect("load"),
         None,
         "a finished login leaves no pending record"
     );
@@ -781,12 +797,12 @@ async fn a_login_finishes_in_the_process_its_redirect_restarts() {
     );
     let account = encode_identity(&login.user_id).expect("encode account");
     assert_eq!(
-        store.accounts().expect("accounts"),
+        store.accounts().await.expect("accounts"),
         vec![account],
         "the resumed login lists only the account"
     );
     assert_eq!(
-        store.load("connetto-pending-login").expect("load"),
+        store.load("connetto-pending-login").await.expect("load"),
         None,
         "the pending record is gone once the login finishes"
     );
@@ -854,7 +870,7 @@ async fn a_restarted_process_starts_over_when_the_resumed_code_is_refused() {
         "the refused code is dropped and one new tab opens"
     );
     assert_eq!(
-        store.accounts().expect("accounts"),
+        store.accounts().await.expect("accounts"),
         vec![encode_identity(&login.user_id).expect("encode account")],
         "the new login's account is the only record listed"
     );
@@ -874,7 +890,7 @@ async fn a_restarted_process_without_a_redirect_starts_over() {
     let _ = tokio::time::timeout(std::time::Duration::from_secs(10), first.login::<String>()).await;
     drop(first);
     assert!(
-        store.accounts().expect("accounts").is_empty(),
+        store.accounts().await.expect("accounts").is_empty(),
         "a pending login is never listed as an account"
     );
 
@@ -882,7 +898,7 @@ async fn a_restarted_process_without_a_redirect_starts_over() {
     let second = claimed(&base, &store, Arc::new(restarted));
     let login = second.login::<String>().await.expect("a fresh login");
     assert_eq!(
-        store.accounts().expect("accounts"),
+        store.accounts().await.expect("accounts"),
         vec![encode_identity(&login.user_id).expect("encode account")],
         "the new login's account is the only record listed"
     );

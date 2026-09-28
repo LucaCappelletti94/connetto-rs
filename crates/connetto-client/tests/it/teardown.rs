@@ -253,9 +253,9 @@ async fn a_purge_removes_the_content_directory_but_keeps_the_key() {
 /// once the guard drops it is gone again, so a passing or panicking keyring test
 /// frees its keys rather than leaking one per run against the per-user quota.
 #[cfg(target_os = "linux")]
-#[test]
-fn the_session_guard_leaves_the_persistent_keyring_as_it_found_it() {
-    use connetto_client::KeyringStore;
+#[tokio::test]
+async fn the_session_guard_leaves_the_persistent_keyring_as_it_found_it() {
+    use connetto_client::{KeyringStore, LinuxStore};
     use connetto_core::traits::RefreshTokenStore as _;
 
     let service = format!("connetto-guard-{}", std::process::id());
@@ -265,9 +265,10 @@ fn the_session_guard_leaves_the_persistent_keyring_as_it_found_it() {
     );
     {
         let _keyring = connetto_test_harness::isolated_session_keyring();
-        let store = KeyringStore::new(&service);
+        let store = KeyringStore::with_linux_store(&service, LinuxStore::Keyutils);
         store
             .store("\"alice\"", "token")
+            .await
             .expect("store one account under the guard");
         assert!(
             connetto_test_harness::persistent_keyring_holds_service(&service),
@@ -422,6 +423,7 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
     let alice_account = encode_identity("alice").expect("encode alice account");
     refresh
         .store(&alice_account, "session-id.secret")
+        .await
         .expect("seed a credential");
     // Port 1 is reserved and nothing listens there. The revoke can therefore
     // never land, which is deliberate: the guard must refuse before the request
@@ -439,7 +441,7 @@ async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
         Ok(()) => panic!("forget_device must not silently drop queued writes"),
     }
     assert_eq!(
-        refresh.load(&alice_account).expect("load").as_deref(),
+        refresh.load(&alice_account).await.expect("load").as_deref(),
         Some("session-id.secret"),
         "the credential is intact, so the queued writes can still be uploaded"
     );
