@@ -23,14 +23,20 @@
 //! for that host. The auth listener, which carries the login callback and
 //! content, is then served over TLS in front of the server's plain one, and
 //! the identity provider serves the same certificate itself.
+//!
+//! Where Docker cannot run, `CONNETTO_STACK_POSTGRES_URL`,
+//! `CONNETTO_STACK_OPENFGA_URL` and `CONNETTO_STACK_ISSUER` together name a
+//! running Postgres cluster with `wal_level=logical`, an authorization service
+//! and a mock identity provider, which it uses in place of containers. That
+//! identity provider cannot take the TLS certificate.
 
 use std::ffi::OsString;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
-    AUTH_PORT_VAR, Deployment, PUBLIC_HOST_VAR, SYNC_PORT_VAR, TLS_CERT_VAR, TLS_KEY_VAR,
-    ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
+    AUTH_PORT_VAR, Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR,
+    TLS_KEY_VAR, ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
 };
 use connetto_test_harness::{MockOauth, with_host};
 
@@ -77,15 +83,13 @@ async fn main() -> Result<()> {
         args.remove(0);
     }
 
+    let running = RunningServices::from_env()?;
+    if running.is_some() && tls.is_some() {
+        bail!("a running identity provider cannot serve {TLS_CERT_VAR}");
+    }
     let server_bin = ensure_server_bin().await?;
-    let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack").await?;
-    let idp = match (public_host.as_deref(), &tls) {
-        (Some(host), Some((cert, key))) => {
-            MockOauth::start_tls(host, pkcs12(cert, key).await?).await
-        }
-        (Some(host), None) => MockOauth::start().await.advertised_on(host),
-        (None, _) => MockOauth::start().await,
-    };
+    let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack", running.as_ref()).await?;
+    let idp = identity_provider(running, public_host.as_deref(), tls.as_ref()).await?;
     let mut envs = provisioned.server_env(&DEPLOYMENT, &sync_bind, &auth_bind, &auth_base);
     envs.extend(idp.env_pairs(PROVIDER, &format!("{auth_base}/auth/callback")));
     envs.push((
@@ -153,6 +157,29 @@ async fn main() -> Result<()> {
         run_process(&program, &args, &demo_env).await?;
     }
     Ok(())
+}
+
+/// The running provider `running` names, or else a container, advertised on
+/// `public_host` and serving `tls` when given.
+async fn identity_provider(
+    running: Option<RunningServices>,
+    public_host: Option<&str>,
+    tls: Option<&(String, String)>,
+) -> Result<MockOauth> {
+    Ok(match (running, public_host, tls) {
+        (Some(services), host, _) => {
+            let idp = MockOauth::running(services.issuer);
+            match host {
+                Some(host) => idp.advertised_on(host),
+                None => idp,
+            }
+        }
+        (None, Some(host), Some((cert, key))) => {
+            MockOauth::start_tls(host, pkcs12(cert, key).await?).await
+        }
+        (None, Some(host), None) => MockOauth::start().await.advertised_on(host),
+        (None, None, _) => MockOauth::start().await,
+    })
 }
 
 /// The PEM certificate chain and key at `cert` and `key` as PKCS #12 under

@@ -1,0 +1,10 @@
+name: Start the native test services
+description: >-
+  Starts Postgres, OpenFGA and the mock identity provider as plain processes
+  on a macOS arm64 runner, which cannot run Docker, and exports the
+  CONNETTO_STACK_* variables connetto-demo-stack uses in place of containers.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: bash "${{ github.action_path }}/start.sh" "${{ runner.temp }}/native-services"

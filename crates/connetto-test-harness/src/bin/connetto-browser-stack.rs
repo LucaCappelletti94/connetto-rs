@@ -353,7 +353,7 @@ fn parse_shard(value: &str) -> Result<Shard> {
 }
 
 async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<Services> {
-    let provisioned = provision(&DEPLOYMENT, "connetto-browser-stack").await?;
+    let provisioned = provision(&DEPLOYMENT, "connetto-browser-stack", None).await?;
     let share = seed_share(&provisioned.fixture, &provisioned.keys).await?;
     let idp = MockOauth::start().await;
     let schema_file = repo_path(&["examples", "deployment", "schema.sql"])?;

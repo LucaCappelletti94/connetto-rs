@@ -125,24 +125,9 @@ pub const MOCK_OAUTH_CLIENT_ID: &str = "connetto";
 /// Static client secret accepted by the mock provider.
 pub const MOCK_OAUTH_CLIENT_SECRET: &str = "connetto-secret";
 
-const MOCK_OAUTH_CONFIG: &str = r#"{
-  "interactiveLogin": true,
-  "tokenCallbacks": [
-    {
-      "issuerId": "default",
-      "requestMappings": [
-        {
-          "requestParam": "subject",
-          "match": ".*",
-          "claims": {
-            "sub": "${subject}",
-            "email": "${subject}@example.test"
-          }
-        }
-      ]
-    }
-  ]
-}"#;
+/// The provider's `JSON_CONFIG`, shared with the CI action that starts it
+/// without Docker.
+const MOCK_OAUTH_CONFIG: &str = include_str!("../mock-oauth-config.json");
 
 /// What Postgres logs once it serves. The temporary server `initdb` runs logs
 /// the same line to stdout first, so the wait watches stderr alone.
@@ -472,13 +457,24 @@ pub async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
     Pool::builder().build(manager).await.expect("build pool")
 }
 
-/// A containerised OIDC provider for code-flow tests.
+/// An OIDC provider for code-flow tests, in a container or already running.
 pub struct MockOauth {
-    _container: ContainerAsync<GenericImage>,
+    /// Held to keep a containerised provider alive, absent for a running one.
+    _container: Option<ContainerAsync<GenericImage>>,
     issuer: String,
 }
 
 impl MockOauth {
+    /// A provider something else started, configured as [`Self::start`]
+    /// configures its container, at `issuer`.
+    #[must_use]
+    pub fn running(issuer: impl Into<String>) -> Self {
+        Self {
+            _container: None,
+            issuer: issuer.into(),
+        }
+    }
+
     /// Start one provider and return the host-reachable issuer URL.
     ///
     /// # Panics
@@ -499,7 +495,7 @@ impl MockOauth {
             .await
             .expect("the mapped oauth port");
         Self {
-            _container: container,
+            _container: Some(container),
             issuer: format!("http://{host}:{port}/{MOCK_OAUTH_ISSUER_ID}"),
         }
     }
@@ -558,7 +554,7 @@ impl MockOauth {
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
         Self {
-            _container: container,
+            _container: Some(container),
             issuer: format!("https://{host}:{port}/{MOCK_OAUTH_ISSUER_ID}"),
         }
     }
@@ -778,7 +774,8 @@ pub struct Fixture {
     admin_url: String,
     admin: Pool<AsyncPgConnection>,
     /// Held to keep the database alive, and the target of [`Self::shell`].
-    postgres: ContainerAsync<GenericImage>,
+    /// Absent on a fixture over a running cluster.
+    postgres: Option<ContainerAsync<GenericImage>>,
     /// The admin conninfo on the mapped spare port, present on a restorable fixture only.
     spare_url: Option<String>,
     /// Started on the first ask, because most tests never ask and an unused
@@ -790,8 +787,9 @@ pub struct Fixture {
 
 /// The authorization service one fixture owns, and where it listens.
 struct Authorization {
-    /// Never read: holding the handle is what keeps the service alive.
-    _container: ContainerAsync<GenericImage>,
+    /// Never read: holding the handle is what keeps a containerised service
+    /// alive. Absent for a running one.
+    _container: Option<ContainerAsync<GenericImage>>,
     url: String,
 }
 
@@ -817,6 +815,32 @@ impl Fixture {
     pub async fn acquire_restorable() -> Self {
         let scope = COUNTER_SCOPE.read().await;
         Self::acquire_with(Some(scope), None, true).await
+    }
+
+    /// A fixture over a Postgres cluster at `admin_url` and an authorization
+    /// service at `fga_url` that something else started and keeps running.
+    /// The cluster must run with `wal_level=logical`, as a container does.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the cluster does not answer or watermark provisioning fails, both setup failures.
+    pub async fn on_cluster(admin_url: &str, fga_url: &str) -> Self {
+        let scope = COUNTER_SCOPE.read().await;
+        let admin = pool_when_ready(admin_url).await;
+        provision_watermark(&admin).await;
+        exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
+        Self {
+            admin_url: admin_url.to_owned(),
+            admin,
+            postgres: None,
+            spare_url: None,
+            fga: OnceCell::new_with(Some(Authorization {
+                _container: None,
+                url: fga_url.to_owned(),
+            })),
+            _shared_counter_scope: Some(scope),
+            _exclusive_counter_scope: None,
+        }
     }
 
     async fn acquire_with(
@@ -869,7 +893,7 @@ impl Fixture {
         Self {
             admin_url,
             admin,
-            postgres,
+            postgres: Some(postgres),
             spare_url,
             fga: OnceCell::new(),
             _shared_counter_scope: shared_counter_scope,
@@ -882,11 +906,14 @@ impl Fixture {
     ///
     /// # Panics
     ///
-    /// Panics when the exec cannot start or the script exits nonzero, printing
-    /// the script's standard error.
+    /// Panics when the fixture runs over a cluster it did not start, when the
+    /// exec cannot start, or when the script exits nonzero, printing the
+    /// script's standard error.
     pub async fn shell(&self, script: &str) -> String {
         let mut run = self
             .postgres
+            .as_ref()
+            .expect("a shell needs the fixture's own container")
             .exec(
                 ExecCommand::new(["gosu", "postgres", "bash", "-euo", "pipefail", "-c", script])
                     .with_cmd_ready_condition(CmdWaitFor::exit()),
@@ -1074,7 +1101,7 @@ impl Fixture {
                     .await
                     .expect("the mapped grpc port");
                 Authorization {
-                    _container: container,
+                    _container: Some(container),
                     url: format!("http://{host}:{port}"),
                 }
             })
@@ -2261,5 +2288,55 @@ while True:
             .with_labels(container_labels("probe-test"))
             .with_startup_timeout(Duration::from_secs(5));
         start_logged(request, "failing server").await;
+    }
+}
+
+#[cfg(test)]
+mod running_services_tests {
+    use diesel::QueryDsl as _;
+    use diesel_async::RunQueryDsl as _;
+    use openfga_client::client::{GetStoreRequest, OpenFgaServiceClient};
+    use openfga_client::tonic::transport::Channel;
+
+    use super::Fixture;
+    use super::watermark::_connetto_mutations;
+
+    /// A second database in a container's cluster stands in for a cluster
+    /// something else started, beside that container's authorization service.
+    #[tokio::test]
+    async fn a_fixture_over_a_running_cluster_provisions_it_and_keeps_its_authorization_service() {
+        let owner = Fixture::acquire().await;
+        owner.exec("CREATE DATABASE elsewhere").await;
+        let (cluster, _) = owner
+            .admin_url()
+            .rsplit_once('/')
+            .expect("the admin URL names a database");
+        let elsewhere = format!("{cluster}/elsewhere");
+        let fga = owner.fga_url().await.to_owned();
+
+        let fixture = Fixture::on_cluster(&elsewhere, &fga).await;
+
+        let mut conn = fixture
+            .admin
+            .get()
+            .await
+            .expect("a connection to elsewhere");
+        let pending: i64 = _connetto_mutations::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the watermark table was provisioned in elsewhere");
+        assert_eq!(pending, 0);
+        assert_eq!(fixture.fga_url().await, fga);
+        let (_, store) = fixture.fga_store().await;
+        let channel = Channel::from_shared(fga)
+            .expect("a service endpoint")
+            .connect()
+            .await
+            .expect("the owner's authorization service answers");
+        OpenFgaServiceClient::new(channel)
+            .get_store(GetStoreRequest { store_id: store })
+            .await
+            .expect("the fixture's store lives on the service it was given");
     }
 }

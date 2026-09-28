@@ -452,6 +452,96 @@ jobs:
               --features mobile
           done
 
+  ios-simulator:
+    # R88's proof, walked on an iOS simulator. The runner cannot run Docker,
+    # so the backend runs as plain processes and the simulator build carries
+    # an invented team ID, which the simulator does not check.
+    name: iOS simulator proof
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Cache native build output
+        uses: actions/cache@v6
+        with:
+          path: target
+          key: t-ios-simulator-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            t-ios-simulator-${{ runner.os }}-
+
+      - name: Cache the demo's build output
+        uses: actions/cache@v6
+        with:
+          path: examples/dioxus-desktop-demo/target
+          key: t-ios-simulator-demo-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
+          restore-keys: |
+            t-ios-simulator-demo-${{ runner.os }}-
+
+      - name: Install stable toolchain with the simulator target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios-sim --toolchain stable
+
+      - name: Install dx
+        run: |
+          base=https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10
+          curl -fsSLO "$base/dx-aarch64-apple-darwin.tar.gz"
+          curl -fsSL "$base/dx-aarch64-apple-darwin.sha256" \
+            | grep ' dx-aarch64-apple-darwin.tar.gz$' \
+            | shasum -a 256 -c
+          tar xzf dx-aarch64-apple-darwin.tar.gz -C ~/.cargo/bin dx
+          rm dx-aarch64-apple-darwin.tar.gz
+          dx --version
+
+      # libpq links the server and the harness, and the proof reads the
+      # simulator's pages through ios_webkit_debug_proxy.
+      - name: Install libpq and ios_webkit_debug_proxy
+        run: |
+          brew install libpq ios-webkit-debug-proxy
+          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> "${GITHUB_ENV}"
+
+      - name: Build the server and the proof
+        run: |
+          cargo +stable build --release --all-features -p connetto-server --bin connetto-server
+          cargo +stable build -p connetto-test-harness --bin connetto-demo-stack --bin connetto-ios-proof
+
+      - uses: ./.github/actions/start-native-services
+
+      - name: Walk the proof on a simulator
+        env:
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/release/connetto-server
+          CONNETTO_IOS_TEAM_ID: ABCDE12345
+        run: target/debug/connetto-demo-stack target/debug/connetto-ios-proof
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: ios-proof-evidence
+          path: |
+            target/ios-proof
+            ${{ runner.temp }}/native-services/logs
+          retention-days: 7
+
+      - name: Prune target caches
+        if: always()
+        run: |
+          rm -rf target/debug/incremental
+          rm -rf target/release/incremental
+          rm -rf examples/dioxus-desktop-demo/target/debug/incremental
+          rm -rf examples/dioxus-desktop-demo/target/aarch64-apple-ios-sim/debug/incremental
+
   rust-tests:
     name: Rust tests ${{ matrix.name }}
     runs-on: ubuntu-latest
