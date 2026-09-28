@@ -25,14 +25,9 @@ const NAVIGATED: [&str; 2] = [
 ];
 
 /// Marks a request the page dropped by navigating, see [`NAVIGATED`].
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
+#[error("the page navigated while a request ran")]
 struct Navigated;
-
-impl std::fmt::Display for Navigated {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("the page navigated while a request ran")
-    }
-}
 
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
