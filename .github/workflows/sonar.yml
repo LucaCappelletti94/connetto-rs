@@ -34,8 +34,9 @@ jobs:
           # Full history improves blame-based new-code attribution.
           fetch-depth: 0
 
-      - name: Cache cargo downloads
-        uses: actions/cache@v6
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
         with:
           path: |
             ~/.cargo/registry/index
@@ -55,3 +56,13 @@ jobs:
         uses: SonarSource/sonarqube-scan-action@v8
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+
+      - name: Save cargo downloads
+        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
