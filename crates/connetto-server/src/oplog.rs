@@ -43,6 +43,8 @@ use parking_lot::Mutex;
 use subql::backend::CdcEvent;
 use subql::{ClockHandle, EventKind, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, StdClock};
 
+use crate::fence::Unseen;
+
 /// Default retention age: 72 hours (`06-reconnect.md` line 69).
 const DEFAULT_MAX_AGE: Duration = Duration::from_secs(72 * 60 * 60);
 /// Default retention count: one million entries (`06-reconnect.md` line 69).
@@ -278,6 +280,13 @@ pub trait Oplog: Send + Sync {
         after: PgCommitPosition,
     ) -> Result<Vec<ChangeRecord>, Self::Error>;
 
+    /// Records of the transactions `unseen` names, in commit order, for the changes a snapshot missed.
+    ///
+    /// # Errors
+    ///
+    /// Implementation-defined: a backing-store read failure.
+    async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, Self::Error>;
+
     /// The earliest retained position, or `None` when the log holds no entries.
     ///
     /// # Errors
@@ -495,6 +504,20 @@ impl Oplog for InMemoryOplog {
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
+    async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, Infallible> {
+        let inner = self.inner.lock();
+        Ok(inner
+            .entries
+            .iter()
+            .filter(|entry| unseen.contains(entry.record.position().xid()))
+            .map(|entry| entry.record.clone())
+            .collect())
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
     async fn min_position(&self) -> Result<Option<PgCommitPosition>, Infallible> {
         let inner = self.inner.lock();
         Ok(inner.entries.front().map(|entry| entry.record.position()))
@@ -548,11 +571,13 @@ pub use pg::{PgOplog, PgOplogError};
 
 mod pg {
     use connetto_core::quote_ident;
-    use diesel::sql_types::{BigInt, Binary, Bool, Text};
+    use diesel::sql_types::{Array, BigInt, Binary, Bool, Text};
     use diesel::{QueryableByName, sql_query};
     use diesel_async::RunQueryDsl;
     use diesel_async::pooled_connection::bb8::Pool;
-    use subql::{ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn};
+    use subql::{ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgXid};
+
+    use crate::fence::Unseen;
 
     use super::{CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Oplog, OplogConfig};
 
@@ -596,6 +621,8 @@ mod pg {
         #[diesel(sql_type = BigInt)]
         commit_lsn: i64,
         #[diesel(sql_type = BigInt)]
+        xid: i64,
+        #[diesel(sql_type = BigInt)]
         ordinal: i64,
         #[diesel(sql_type = Text)]
         table_name: String,
@@ -611,6 +638,8 @@ mod pg {
         #[diesel(sql_type = BigInt)]
         commit_lsn: i64,
         #[diesel(sql_type = BigInt)]
+        xid: i64,
+        #[diesel(sql_type = BigInt)]
         end_lsn: i64,
     }
 
@@ -619,6 +648,8 @@ mod pg {
     struct PositionRow {
         #[diesel(sql_type = BigInt)]
         commit_lsn: i64,
+        #[diesel(sql_type = BigInt)]
+        xid: i64,
         #[diesel(sql_type = BigInt)]
         ordinal: i64,
     }
@@ -629,20 +660,25 @@ mod pg {
         i64::try_from(part).map_err(|_| PgOplogError::LsnRange(part))
     }
 
-    /// The two BIGINT columns a position is stored as.
-    fn position_to_i64(position: PgCommitPosition) -> Result<(i64, i64), PgOplogError> {
+    /// The three BIGINT columns a position is stored as.
+    fn position_to_i64(position: PgCommitPosition) -> Result<(i64, i64, i64), PgOplogError> {
         Ok((
             part_to_i64(position.commit_lsn().0)?,
+            i64::from(position.xid().0),
             part_to_i64(position.ordinal())?,
         ))
     }
 
-    /// Read a position back from its two BIGINT columns.
-    fn position_from_i64(commit_lsn: i64, ordinal: i64) -> PgCommitPosition {
-        // The columns only ever hold values written by `part_to_i64`, which are
-        // non-negative, so this widening is lossless.
+    /// Read a position back from its three BIGINT columns.
+    fn position_from_i64(commit_lsn: i64, xid: i64, ordinal: i64) -> PgCommitPosition {
+        // The columns only ever hold values written by `position_to_i64`, which are
+        // non-negative and an xid within u32, so these narrowings are lossless.
         let part = |value: i64| u64::try_from(value).unwrap_or(0);
-        PgCommitPosition::new(PgLsn(part(commit_lsn)), part(ordinal))
+        PgCommitPosition::new(
+            PgLsn(part(commit_lsn)),
+            PgXid(u32::try_from(xid).unwrap_or(0)),
+            part(ordinal),
+        )
     }
 
     impl PgOplog {
@@ -692,6 +728,7 @@ mod pg {
             let ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table} (\
                      commit_lsn BIGINT NOT NULL, \
+                     xid BIGINT NOT NULL, \
                      ordinal BIGINT NOT NULL, \
                      table_name TEXT NOT NULL, \
                      op {CHANGE_OP_TYPE} NOT NULL, \
@@ -699,14 +736,21 @@ mod pg {
                      is_tombstone BOOLEAN NOT NULL, \
                      event BYTEA NOT NULL, \
                      appended_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
-                     PRIMARY KEY (commit_lsn, ordinal))",
+                     PRIMARY KEY (commit_lsn, xid, ordinal))",
                 table = quote_ident(&self.table),
             );
             sql_query(ddl).execute(&mut *conn).await?;
+            let xid_index = format!(
+                "CREATE INDEX IF NOT EXISTS {index} ON {table} (xid)",
+                index = quote_ident(&format!("{}_xid", self.table)),
+                table = quote_ident(&self.table),
+            );
+            sql_query(xid_index).execute(&mut *conn).await?;
             let commit_ddl = format!(
                 "CREATE TABLE IF NOT EXISTS {table} (\
                      only_row BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (only_row), \
                      commit_lsn BIGINT NOT NULL, \
+                     xid BIGINT NOT NULL, \
                      end_lsn BIGINT NOT NULL)",
                 table = quote_ident(&Self::commit_table(&self.table)),
             );
@@ -714,19 +758,30 @@ mod pg {
             Ok(())
         }
 
+        /// A record read back from its row.
+        fn record(row: OplogRow) -> Result<ChangeRecord, PgOplogError> {
+            let change: ChangeEvent = serde_json::from_slice(&row.event)?;
+            let position = position_from_i64(row.commit_lsn, row.xid, row.ordinal);
+            Ok(ChangeRecord::new(
+                row.table_name,
+                row.pk,
+                PgChangeEvent::new(change, position),
+            ))
+        }
+
         /// One end of the window, `direction` being `ASC` for the earliest or `DESC` for the latest.
         async fn end(&self, direction: &str) -> Result<Option<PgCommitPosition>, PgOplogError> {
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, ordinal FROM {table} \
-                 ORDER BY commit_lsn {direction}, ordinal {direction} LIMIT 1",
+                "SELECT commit_lsn, xid, ordinal FROM {table} \
+                 ORDER BY commit_lsn {direction}, xid {direction}, ordinal {direction} LIMIT 1",
                 table = quote_ident(&self.table),
             );
             let rows: Vec<PositionRow> = sql_query(sql).load(&mut *conn).await?;
             Ok(rows
                 .into_iter()
                 .next()
-                .map(|row| position_from_i64(row.commit_lsn, row.ordinal)))
+                .map(|row| position_from_i64(row.commit_lsn, row.xid, row.ordinal)))
         }
 
         /// Drop whatever the retention window no longer covers. Called by
@@ -737,9 +792,9 @@ mod pg {
             // Count-based: keep the newest `max_entries` rows, drop the rest.
             let keep = i64::try_from(self.config.max_entries).unwrap_or(i64::MAX);
             let by_count = format!(
-                "DELETE FROM {table} WHERE (commit_lsn, ordinal) IN (\
-                     SELECT commit_lsn, ordinal FROM {table} \
-                     ORDER BY commit_lsn DESC, ordinal DESC OFFSET $1)",
+                "DELETE FROM {table} WHERE (commit_lsn, xid, ordinal) IN (\
+                     SELECT commit_lsn, xid, ordinal FROM {table} \
+                     ORDER BY commit_lsn DESC, xid DESC, ordinal DESC OFFSET $1)",
             );
             sql_query(by_count)
                 .bind::<BigInt, _>(keep)
@@ -778,15 +833,16 @@ mod pg {
 
         async fn append(&self, record: ChangeRecord) -> Result<(), PgOplogError> {
             let event_bytes = serde_json::to_vec(record.event().change())?;
-            let (commit_lsn, ordinal) = position_to_i64(record.position())?;
+            let (commit_lsn, xid, ordinal) = position_to_i64(record.position())?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "INSERT INTO {table} (commit_lsn, ordinal, table_name, op, pk, is_tombstone, event) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (commit_lsn, ordinal) DO NOTHING",
+                "INSERT INTO {table} (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (commit_lsn, xid, ordinal) DO NOTHING",
                 table = quote_ident(&self.table),
             );
             sql_query(sql)
                 .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(xid)
                 .bind::<BigInt, _>(ordinal)
                 .bind::<Text, _>(record.table().to_owned())
                 .bind::<ChangeOpSql, _>(record.op())
@@ -802,29 +858,48 @@ mod pg {
             &self,
             after: PgCommitPosition,
         ) -> Result<Vec<ChangeRecord>, PgOplogError> {
-            let (commit_lsn, ordinal) = position_to_i64(after)?;
+            let (commit_lsn, xid, ordinal) = position_to_i64(after)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, ordinal, table_name, pk, event FROM {table} \
-                 WHERE (commit_lsn, ordinal) > ($1, $2) ORDER BY commit_lsn, ordinal",
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event FROM {table} \
+                 WHERE (commit_lsn, xid, ordinal) > ($1, $2, $3) ORDER BY commit_lsn, xid, ordinal",
                 table = quote_ident(&self.table),
             );
             let rows: Vec<OplogRow> = sql_query(sql)
                 .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(xid)
                 .bind::<BigInt, _>(ordinal)
                 .load(&mut *conn)
                 .await?;
-            rows.into_iter()
-                .map(|row| {
-                    let change: ChangeEvent = serde_json::from_slice(&row.event)?;
-                    let position = position_from_i64(row.commit_lsn, row.ordinal);
-                    Ok(ChangeRecord::new(
-                        row.table_name,
-                        row.pk,
-                        PgChangeEvent::new(change, position),
-                    ))
-                })
-                .collect()
+            rows.into_iter().map(Self::record).collect()
+        }
+
+        async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, PgOplogError> {
+            const IDS: i64 = 1 << 32;
+            let running: Vec<i64> = unseen.running.iter().map(|xid| i64::from(xid.0)).collect();
+            // The 2^31 ids from `from` as at most two ranges the xid index serves, the second one past the wrap.
+            let from = i64::from(unseen.from.0);
+            let end = from + (1 << 31);
+            let (upto, wrapped) = if end <= IDS {
+                (end, 0)
+            } else {
+                (IDS, end - IDS)
+            };
+            let mut conn = self.pool.get().await.map_err(pool_err)?;
+            let sql = format!(
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event FROM {table} \
+                 WHERE xid = ANY($1) OR (xid >= $2 AND xid < $3) OR xid < $4 \
+                 ORDER BY commit_lsn, xid, ordinal",
+                table = quote_ident(&self.table),
+            );
+            let rows: Vec<OplogRow> = sql_query(sql)
+                .bind::<Array<BigInt>, _>(running)
+                .bind::<BigInt, _>(from)
+                .bind::<BigInt, _>(upto)
+                .bind::<BigInt, _>(wrapped)
+                .load(&mut *conn)
+                .await?;
+            rows.into_iter().map(Self::record).collect()
         }
 
         async fn min_position(&self) -> Result<Option<PgCommitPosition>, PgOplogError> {
@@ -836,18 +911,21 @@ mod pg {
         }
 
         async fn record_commit(&self, commit: PgCommit) -> Result<(), PgOplogError> {
+            // A commit's ordinal is `u64::MAX`, which no column holds, and the table stores only what names the commit.
             let commit_lsn = part_to_i64(commit.position().commit_lsn().0)?;
+            let xid = i64::from(commit.position().xid().0);
             let end_lsn = part_to_i64(commit.end_lsn().0)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let table = quote_ident(&Self::commit_table(&self.table));
             let sql = format!(
-                "INSERT INTO {table} (commit_lsn, end_lsn) VALUES ($1, $2) \
+                "INSERT INTO {table} (commit_lsn, xid, end_lsn) VALUES ($1, $2, $3) \
                  ON CONFLICT (only_row) DO UPDATE SET \
-                 commit_lsn = EXCLUDED.commit_lsn, end_lsn = EXCLUDED.end_lsn \
+                 commit_lsn = EXCLUDED.commit_lsn, xid = EXCLUDED.xid, end_lsn = EXCLUDED.end_lsn \
                  WHERE {table}.end_lsn < EXCLUDED.end_lsn",
             );
             sql_query(sql)
                 .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(xid)
                 .bind::<BigInt, _>(end_lsn)
                 .execute(&mut *conn)
                 .await?;
@@ -857,28 +935,32 @@ mod pg {
         async fn last_commit(&self) -> Result<Option<PgCommit>, PgOplogError> {
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, end_lsn FROM {table}",
+                "SELECT commit_lsn, xid, end_lsn FROM {table}",
                 table = quote_ident(&Self::commit_table(&self.table)),
             );
             let rows: Vec<CommitRow> = sql_query(sql).load(&mut *conn).await?;
             let part = |value: i64| PgLsn(u64::try_from(value).unwrap_or(0));
             Ok(rows.into_iter().next().map(|row| {
                 PgCommit::new(
-                    PgCommitPosition::at_commit(part(row.commit_lsn)),
+                    PgCommitPosition::at_commit(
+                        part(row.commit_lsn),
+                        PgXid(u32::try_from(row.xid).unwrap_or(0)),
+                    ),
                     part(row.end_lsn),
                 )
             }))
         }
 
         async fn forget_through(&self, through: PgCommitPosition) -> Result<(), PgOplogError> {
-            let (commit_lsn, ordinal) = position_to_i64(through)?;
+            let (commit_lsn, xid, ordinal) = position_to_i64(through)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "DELETE FROM {table} WHERE (commit_lsn, ordinal) <= ($1, $2)",
+                "DELETE FROM {table} WHERE (commit_lsn, xid, ordinal) <= ($1, $2, $3)",
                 table = quote_ident(&self.table),
             );
             sql_query(sql)
                 .bind::<BigInt, _>(commit_lsn)
+                .bind::<BigInt, _>(xid)
                 .bind::<BigInt, _>(ordinal)
                 .execute(&mut *conn)
                 .await?;
@@ -890,6 +972,7 @@ mod pg {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use subql::PgXid;
 
     /// Only a failure to reach the database may pass on a second read, so the default of no never hides a missing override.
     #[test]
@@ -916,7 +999,7 @@ mod tests {
 
     /// A row of one transaction at `lsn`.
     fn at(lsn: u64) -> PgCommitPosition {
-        PgCommitPosition::new(PgLsn(lsn), 1)
+        PgCommitPosition::new(PgLsn(lsn), PgXid(1), 1)
     }
 
     #[test]
@@ -993,8 +1076,8 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_at_a_transactions_first_row_replays_its_second() {
         let log = InMemoryOplog::default();
-        let first = PgCommitPosition::new(PgLsn(0x100), 1);
-        let second = PgCommitPosition::new(PgLsn(0x100), 2);
+        let first = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 1);
+        let second = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 2);
         log.append(row(1, first)).await.expect("append");
         log.append(row(2, second)).await.expect("append");
         let replayed: Vec<_> = log
@@ -1011,8 +1094,14 @@ mod tests {
     #[tokio::test]
     async fn the_later_of_two_recorded_commits_stands() {
         let log = InMemoryOplog::default();
-        let earlier = PgCommit::new(PgCommitPosition::at_commit(PgLsn(0x100)), PgLsn(0x130));
-        let later = PgCommit::new(PgCommitPosition::at_commit(PgLsn(0x200)), PgLsn(0x230));
+        let earlier = PgCommit::new(
+            PgCommitPosition::at_commit(PgLsn(0x100), PgXid(1)),
+            PgLsn(0x130),
+        );
+        let later = PgCommit::new(
+            PgCommitPosition::at_commit(PgLsn(0x200), PgXid(1)),
+            PgLsn(0x230),
+        );
         assert_eq!(log.last_commit().await.expect("read"), None);
         log.record_commit(later).await.expect("record");
         log.record_commit(earlier)
@@ -1025,7 +1114,7 @@ mod tests {
     #[tokio::test]
     async fn a_row_appended_again_is_kept_once() {
         let log = InMemoryOplog::default();
-        let position = PgCommitPosition::new(PgLsn(0x100), 1);
+        let position = PgCommitPosition::new(PgLsn(0x100), PgXid(1), 1);
         log.append(row(1, position)).await.expect("append");
         log.append(row(1, position)).await.expect("append again");
         assert_eq!(

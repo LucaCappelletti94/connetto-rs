@@ -42,7 +42,7 @@ use subql::backend::{Postgres, Value};
 use subql::catalog_helpers;
 use subql::visibility::openfga::OpenFgaPolicy;
 use subql::visibility::{RowWrite, Verdict, VisibilityPolicy};
-use subql::{PgChangeEvent, PgCommitPosition, PgLsn};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgXid};
 
 /// The schema clients sync.
 const SCHEMA: &str = "CREATE TABLE r5b_notes (id INT PRIMARY KEY, owner TEXT NOT NULL);";
@@ -340,7 +340,7 @@ async fn a_changed_owner_reaches_the_store_before_the_row_is_delivered() {
             vec![Arc::from("id")],
             Lsn::new(1),
         ),
-        PgCommitPosition::new(PgLsn(1), 1),
+        PgCommitPosition::new(PgLsn(1), PgXid(1), 1),
     );
 
     upkeep
@@ -516,7 +516,7 @@ async fn a_withdrawn_grant_is_refused_at_once_for_both_questions() {
             vec![Arc::from("team_id"), Arc::from("member")],
             Lsn::new(2),
         ),
-        PgCommitPosition::new(PgLsn(2), 1),
+        PgCommitPosition::new(PgLsn(2), PgXid(1), 1),
     );
     upkeep
         .keep_current(&event)
@@ -833,7 +833,7 @@ async fn a_replayed_share_is_withdrawn_when_its_row_goes() {
             vec![Arc::from("paper_id"), Arc::from("viewer")],
             Lsn::new(2),
         ),
-        PgCommitPosition::new(PgLsn(2), 1),
+        PgCommitPosition::new(PgLsn(2), PgXid(1), 1),
     );
     let moves = upkeep
         .keep_current(&event)
@@ -899,7 +899,7 @@ async fn a_replayed_change_costs_more_than_a_settled_one_and_is_measured() {
             vec![Arc::from("id")],
             Lsn::new(2),
         ),
-        PgCommitPosition::new(PgLsn(2), 1),
+        PgCommitPosition::new(PgLsn(2), PgXid(1), 1),
     );
     let mut settled_total = Duration::ZERO;
     for _ in 0..ROUNDS {
@@ -927,7 +927,7 @@ async fn a_replayed_change_costs_more_than_a_settled_one_and_is_measured() {
             vec![Arc::from("paper_id"), Arc::from("viewer")],
             Lsn::new(3),
         ),
-        PgCommitPosition::new(PgLsn(3), 1),
+        PgCommitPosition::new(PgLsn(3), PgXid(1), 1),
     );
     let mut replayed_total = Duration::ZERO;
     for _ in 0..ROUNDS {
@@ -1002,7 +1002,7 @@ async fn a_replay_that_cannot_run_refuses_rather_than_letting_the_row_through() 
             vec![Arc::from("paper_id"), Arc::from("viewer")],
             Lsn::new(2),
         ),
-        PgCommitPosition::new(PgLsn(2), 1),
+        PgCommitPosition::new(PgLsn(2), PgXid(1), 1),
     );
     let refused = upkeep
         .keep_current(&event)
@@ -1139,7 +1139,7 @@ fn ck_share_delete_event() -> PgChangeEvent {
             ],
             Lsn::new(2),
         ),
-        PgCommitPosition::new(PgLsn(2), 1),
+        PgCommitPosition::new(PgLsn(2), PgXid(1), 1),
     )
 }
 
@@ -1421,7 +1421,7 @@ async fn a_replayed_keyed_grant_names_the_bearer_it_reached() {
                 ]),
                 Lsn::new(2),
             ),
-            PgCommitPosition::new(PgLsn(2), 1),
+            PgCommitPosition::new(PgLsn(2), PgXid(1), 1),
         ))
         .await
         .expect("the grant reached the store");
@@ -1487,7 +1487,7 @@ async fn a_replayed_keyed_withdrawal_names_the_bearer_that_lost_it() {
                 vec![Arc::from("paper_id"), Arc::from("viewer")],
                 Lsn::new(3),
             ),
-            PgCommitPosition::new(PgLsn(3), 1),
+            PgCommitPosition::new(PgLsn(3), PgXid(1), 1),
         ))
         .await
         .expect("the withdrawal reached the store");

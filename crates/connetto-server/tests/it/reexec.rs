@@ -21,19 +21,32 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{AsyncConnector, ReadQuery, RowPage, Snapshot as ConnectorRead};
-use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, amount INT);";
 
-/// A connector that answers `execute_scalar` from a queue of canned integers.
+/// A connector that answers `execute_scalar` from a queue of canned integers, each with the fence of the moment it stands for.
 /// Backed by an `Arc` so it can be cloned for the materializer and the session.
 #[derive(Clone)]
 struct QueuedConnector {
-    responses: Arc<Mutex<VecDeque<i64>>>,
+    responses: Arc<Mutex<VecDeque<Canned<i64>>>>,
+}
+
+/// A canned answer and the fence of the moment it stands for.
+type Canned<V> = (V, Option<PgSnapshotFence>);
+
+/// A read taken before every emulated change, whose commits all start past WAL position 1.
+fn before_every_change() -> Option<PgSnapshotFence> {
+    PgSnapshotFence::parse("1:1:", PgLsn(1))
+}
+
+/// A read taken after every emulated change: it sees the emulator's small transaction ids and ends past its positions.
+fn after_every_change() -> Option<PgSnapshotFence> {
+    PgSnapshotFence::parse("1000000:1000000:", PgLsn(1 << 40))
 }
 
 impl QueuedConnector {
-    fn new(responses: impl IntoIterator<Item = i64>) -> Self {
+    fn new(responses: impl IntoIterator<Item = (i64, Option<PgSnapshotFence>)>) -> Self {
         Self {
             responses: Arc::new(Mutex::new(responses.into_iter().collect())),
         }
@@ -56,11 +69,11 @@ impl AsyncConnector for QueuedConnector {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgSnapshotFence>), std::io::Error>,
     > + Send {
         let next = self.responses.lock().expect("queue poisoned").pop_front();
         async move {
-            next.map(|n| (PgValue::Int(n), Some(PgCommitPosition::new(PgLsn(1), 1))))
+            next.map(|(n, fence)| (PgValue::Int(n), fence))
                 .ok_or_else(|| std::io::Error::other("no more canned responses"))
         }
     }
@@ -158,8 +171,8 @@ async fn drive(source: &mut PgSqliteEmuSource, manager: &Manager, sql: &str) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reexec_bootstraps_folds_and_retriggers() {
     let fixture = Fixture::acquire().await;
-    let connector = QueuedConnector::new([10, 20]);
-    // Bootstrap answers 10, the re-execution after the delete answers 20.
+    // Bootstrap answers 10 before any change, the re-execution after the delete answers 20 and holds both changes.
+    let connector = QueuedConnector::new([(10, before_every_change()), (20, after_every_change())]);
     let materializer = Materializer::with_read_connector(
         PG_DDL,
         RuntimeWritableCatalog::default(),

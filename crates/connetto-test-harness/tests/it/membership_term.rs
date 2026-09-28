@@ -34,7 +34,7 @@ use diesel::prelude::*;
 use sqlite_diff_rs::{
     DiffOps, Insert, ParsedDiffSet, PatchSet, PatchsetOp, SimpleTable, Value as WireValue,
 };
-use subql::{PgCommitPosition, PgLsn};
+use subql::{PgCommitPosition, PgLsn, PgXid};
 
 /// The motivating filter, in the client's own SQLite dialect: the caller is
 /// the no-arg function the deployment mapped `current_setting` onto.
@@ -295,7 +295,7 @@ fn cursor_at(lsn: u64) -> Cursor {
         Position {
             system: TimelineHistory::default().system(),
             timeline: 1,
-            at: PgCommitPosition::new(PgLsn(lsn), 1),
+            at: PgCommitPosition::new(PgLsn(lsn), PgXid(1), 1),
         }
         .to_cursor_bytes(),
     )

@@ -1867,7 +1867,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -2421,9 +2421,9 @@ dependencies = [
 
 [[package]]
 name = "sql-scalar-text"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "53c8a68d907abe87d261288a6753ba0ce1451ecef845ad13dba2be60b652605c"
+checksum = "fe4d9c3734c9dfc32e255461a2ae1fb7493956adf798817f9adaa0af7f7c9d6c"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -2558,7 +2558,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#f4a0018de09da385a6e4f9ce1a121fa40f00a022"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#3da65f19279266b4ca95a30e20663b0a8c79f56f"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -3270,7 +3270,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]

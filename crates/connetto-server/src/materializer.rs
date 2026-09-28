@@ -431,9 +431,6 @@ pub struct ComputedChange {
     /// Whether this replaces the subscription's whole result rather than
     /// upserting one key.
     pub is_full_result: bool,
-    /// Resume cursor of the event that produced it, empty when the movement
-    /// came from a seed or a read with no position.
-    pub cursor: Vec<u8>,
 }
 
 /// The engine the materializer hosts: subql's auto-resolving wrapper in async
@@ -988,6 +985,9 @@ where
     /// Install a scalar extreme's seed value, read by the session through its
     /// own connector under the subscribing caller's tier.
     ///
+    /// Returns `None` when a change the read missed removed its answer, so the
+    /// caller reads again.
+    ///
     /// # Errors
     ///
     /// [`MaterializerError::Install`] when the subscription is unknown or is
@@ -996,23 +996,29 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         value: PgValue<Postgres>,
-        checkpoint: Option<subql::PgCommitPosition>,
-    ) -> Result<ComputedChange, MaterializerError> {
-        let update = subql::Install::install(
+        fence: Option<subql::PgSnapshotFence>,
+    ) -> Result<Option<ComputedChange>, MaterializerError> {
+        let installed = subql::Install::install(
             &mut self.engine,
             subscription_id,
-            subql::ScalarInstall { value, checkpoint },
+            subql::ScalarInstall {
+                value,
+                checkpoint: None,
+                fence,
+            },
         )
         .map_err(|err| MaterializerError::Install(err.to_string()))?;
-        Ok(ComputedChange {
+        let subql::reexec::ScalarInstalled::Value(update) = installed else {
+            return Ok(None);
+        };
+        Ok(Some(ComputedChange {
             subscription_id: update.subscription_id,
             consumer_id: update.consumer_id,
             group_key: None,
             group_values_json: None,
             result_json: Some(value_to_json(&update.value)),
             is_full_result: true,
-            cursor: cursor_bytes(update.checkpoint.as_ref()),
-        })
+        }))
     }
 
     /// Drop a subscription of any tier by its engine id. Returns whether it
@@ -1026,9 +1032,8 @@ where
     /// connector outside the materializer lock.
     ///
     /// The engine buffers changes dispatched while the read was in flight and
-    /// reconciles them against `read_at`, so nothing committed inside the
-    /// window is folded into nothing (the guarantee `expect_aggregate` used to
-    /// approximate connetto-side, now the engine's own).
+    /// judges each against the read's `fence`, so a change the read already
+    /// holds is not counted twice and one it missed is not lost.
     ///
     /// # Errors
     ///
@@ -1039,12 +1044,12 @@ where
         &mut self,
         subscription_id: SubscriptionId,
         rows: Vec<Vec<PgValue<Postgres>>>,
-        read_at: Option<subql::PgCommitPosition>,
+        fence: Option<subql::PgSnapshotFence>,
     ) -> Result<FoldSeeded, MaterializerError> {
         let output = subql::Install::install(
             &mut self.engine,
             subscription_id,
-            subql::AggregateSeedInstall { rows, read_at },
+            subql::AggregateSeedInstall { rows, fence },
         )
         .map_err(|err| MaterializerError::Install(err.to_string()))?;
         Self::log_transitions(&output.transitions);
@@ -1052,7 +1057,7 @@ where
             changes: output
                 .updates
                 .into_iter()
-                .map(|update| Self::aggregate_change(update, Vec::new()))
+                .map(Self::aggregate_change)
                 .collect(),
             needs_snapshot: !output.triggers.is_empty(),
         })
@@ -1084,7 +1089,7 @@ where
             return Ok(Vec::new());
         };
         Ok(match result {
-            subql::reexec::SnapshotResult::Scalar(value, checkpoint) => {
+            subql::reexec::SnapshotResult::Scalar(value, _) => {
                 vec![ComputedChange {
                     subscription_id,
                     consumer_id,
@@ -1092,31 +1097,18 @@ where
                     group_values_json: None,
                     result_json: Some(value_to_json(&value)),
                     is_full_result: true,
-                    cursor: cursor_bytes(checkpoint.as_ref()),
                 }]
             }
-            subql::reexec::SnapshotResult::GroupedAggregate {
-                updates,
-                checkpoint,
-            } => {
-                let cursor = cursor_bytes(checkpoint.as_ref());
-                updates
-                    .into_iter()
-                    .map(|update| Self::aggregate_change(update, cursor.clone()))
-                    .collect()
+            subql::reexec::SnapshotResult::GroupedAggregate { updates, .. } => {
+                updates.into_iter().map(Self::aggregate_change).collect()
             }
-            subql::reexec::SnapshotResult::Rows {
-                columns,
-                rows,
-                checkpoint,
-            } => vec![ComputedChange {
+            subql::reexec::SnapshotResult::Rows { columns, rows, .. } => vec![ComputedChange {
                 subscription_id,
                 consumer_id,
                 group_key: None,
                 group_values_json: None,
                 result_json: Some(rows_json(&columns, &rows)),
                 is_full_result: true,
-                cursor: cursor_bytes(checkpoint.as_ref()),
             }],
             // The enum is non_exhaustive upstream: a tier this build does not
             // know cannot be delivered, so it refuses rather than sending a
@@ -1130,7 +1122,7 @@ where
     }
 
     /// One wire-shaped change from an engine aggregate movement.
-    fn aggregate_change(update: AggUpdate, cursor: Vec<u8>) -> ComputedChange {
+    fn aggregate_change(update: AggUpdate) -> ComputedChange {
         let is_full_result = update.group.is_none();
         let (group_key, group_values_json) = match update.group {
             Some(group) => (Some(group.key), Some(values_json(&group.values))),
@@ -1151,7 +1143,6 @@ where
                 AggregateValueChange::Remove => None,
             },
             is_full_result,
-            cursor,
         }
     }
 
@@ -1215,7 +1206,6 @@ where
             resolved.scalar_updates,
             resolved.rows_updates,
             resolved.row_deltas,
-            &cursor,
         );
 
         let engine = &notifications.engine;
@@ -1293,11 +1283,10 @@ where
         resolved_scalar: Vec<ScalarUpd>,
         rows_updates: Vec<RowsUpd>,
         row_deltas: Vec<RowDlt>,
-        cursor: &[u8],
     ) -> Vec<ComputedChange> {
         let mut computed = Vec::new();
         for update in agg_updates.into_iter().chain(resolved_agg) {
-            computed.push(Self::aggregate_change(update, cursor.to_vec()));
+            computed.push(Self::aggregate_change(update));
         }
         for update in scalar_updates.into_iter().chain(resolved_scalar) {
             computed.push(ComputedChange {
@@ -1307,10 +1296,9 @@ where
                 group_values_json: None,
                 result_json: Some(value_to_json(&update.value)),
                 is_full_result: true,
-                cursor: cursor.to_vec(),
             });
         }
-        computed.extend(Self::rows_changes(rows_updates, cursor));
+        computed.extend(Self::rows_changes(rows_updates));
         for delta in row_deltas {
             computed.push(ComputedChange {
                 subscription_id: delta.subscription_id,
@@ -1321,7 +1309,6 @@ where
                     .row
                     .map(|row| row_json(&delta.columns, row.as_slice())),
                 is_full_result: false,
-                cursor: cursor.to_vec(),
             });
         }
         computed
@@ -1334,7 +1321,7 @@ where
     /// only the newest generation per subscription survives and its pages
     /// concatenate into one wire frame: the wire's full-result replacement is
     /// atomic where a paged delivery would show a half-replaced answer.
-    fn rows_changes(updates: Vec<RowsUpd>, cursor: &[u8]) -> Vec<ComputedChange> {
+    fn rows_changes(updates: Vec<RowsUpd>) -> Vec<ComputedChange> {
         /// One subscription's newest re-read, its pages concatenated.
         struct PendingRows {
             consumer_id: u64,
@@ -1374,7 +1361,6 @@ where
                 group_values_json: None,
                 result_json: Some(rows_json(&pending.columns, &pending.rows)),
                 is_full_result: true,
-                cursor: cursor.to_vec(),
             })
             .collect()
     }
@@ -1953,13 +1939,6 @@ where
         },
         other => MaterializerError::Install(other.to_string()),
     }
-}
-
-/// A resume cursor from a read's stream position, empty when unknown.
-fn cursor_bytes(checkpoint: Option<&subql::PgCommitPosition>) -> Vec<u8> {
-    checkpoint
-        .map(|position| position.to_opaque().0)
-        .unwrap_or_default()
 }
 
 /// One row as a JSON object keyed by column name, so the client deserializes

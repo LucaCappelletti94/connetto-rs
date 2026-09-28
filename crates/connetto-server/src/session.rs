@@ -46,7 +46,7 @@ use subql::visibility::transition::{Transition, TransitionError, Transitions, tr
 use subql::visibility::{EventRow, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
     AdvanceCursorError, CdcSource, Checkpoint, DatabaseLike, EventKind, OpaqueCheckpoint, ParserDB,
-    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, SourceItem, SubscriptionId, TableLike,
+    PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, Seen, SourceItem, SubscriptionId, TableLike,
 };
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
@@ -54,6 +54,7 @@ use tracing::Instrument;
 use crate::abuse::{Caller, Reaction};
 use crate::audit::{AuthEvent, AuthOp};
 use crate::counters;
+use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
 use crate::materializer::{
     ComputedCapture, ComputedChange, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
@@ -61,7 +62,7 @@ use crate::materializer::{
     TermSeed, compress, narrowed_sql, typed_subscriber,
 };
 use crate::openfga::{GrantHolder, GrantMove};
-use crate::oplog::{CatchupDecision, InMemoryOplog, Oplog, catchup_decision};
+use crate::oplog::{CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, catchup_decision};
 use crate::reexec::{FailedRead, NoConnector, ReadBudget, ReadFailure};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
@@ -939,12 +940,12 @@ fn retry_ms(wait: Duration) -> u64 {
 }
 
 /// Where a handshake's cursor lets its subscriptions resume.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Resume {
     /// No position, which a client holding no rows presents.
     Fresh,
-    /// A position the database's history still holds.
-    At(PgCommitPosition),
+    /// A position the database's history still holds, and the fence of the snapshot that issued it.
+    At(PgCommitPosition, Option<Arc<ReadFence>>),
     /// A position past where its timeline ended, naming changes the database lost, or one this server cannot read (R73).
     BeyondHistory,
 }
@@ -958,9 +959,11 @@ impl Resume {
         else {
             return Self::Fresh;
         };
-        match Position::from_cursor_bytes(bytes) {
-            Some(position) if position.at.commit_lsn() == PgLsn(0) => Self::Fresh,
-            Some(position) if history.contains(position) => Self::At(position.at),
+        match Position::from_fenced_cursor(bytes) {
+            Some((position, _)) if position.at.commit_lsn() == PgLsn(0) => Self::Fresh,
+            Some((position, fence)) if history.contains(position) => {
+                Self::At(position.at, fence.map(Arc::new))
+            }
             Some(_) | None => Self::BeyondHistory,
         }
     }
@@ -1052,6 +1055,9 @@ struct Route<Id, Key> {
     /// served incrementally by the term's own move (R27 decision 2), so the
     /// R7 resend is suppressed for exactly these tables.
     member_tables: std::sync::Arc<[MemberTable]>,
+    /// The fence of the snapshot a resumed subscription was issued after, which
+    /// decides whether a change below where catchup left its cursor was missed.
+    fence: Option<Arc<ReadFence>>,
 }
 
 /// Route from an aggregate subscription (re-execution query or delta aggregate)
@@ -1328,6 +1334,15 @@ enum Deferral {
 }
 
 /// Mutable per-session state carried through the run loop.
+/// A snapshot whose first page's fence missed transactions, owed their rows from the log.
+struct MissedReplay {
+    label: String,
+    consumer_id: u64,
+    fence: ReadFence,
+    /// The snapshot's own fenced cursor, which each replayed row carries, so resuming from it would replay them again.
+    cursor: Cursor,
+}
+
 struct SessionState<Id, Key> {
     credits: u32,
     pending: VecDeque<Deliverable>,
@@ -1339,6 +1354,8 @@ struct SessionState<Id, Key> {
     /// subscriptions take turns rather than one finishing before the next
     /// starts.
     paging: VecDeque<PagedRead>,
+    /// Snapshots whose fence missed transactions the log may hold, replayed by the run loop before its next frame.
+    missed: Vec<MissedReplay>,
     /// Computed subscriptions by client label: the engine subscription id,
     /// one id space for every tier.
     computed_subs: HashMap<String, SubscriptionId>,
@@ -2304,11 +2321,18 @@ where
             };
             match advanced {
                 Ok(()) => {}
-                // After a restart the slot re-delivers rows the durable log already served this route through catchup.
                 Err(MaterializerError::Cursor(AdvanceCursorError::NonMonotonic { .. })) => {
                     counters::add(&counters::CURSOR_REWINDS, 1);
-                    tracing::debug!(sub_id = %route.label, position = ?event.position(), "the route is already past this re-delivered row");
-                    continue;
+                    let missed = route
+                        .fence
+                        .as_ref()
+                        .is_some_and(|fence| fence.seen(event.position()) == Seen::Missed);
+                    // After a restart the slot re-delivers rows the durable log already served this route through catchup.
+                    if !missed {
+                        tracing::debug!(sub_id = %route.label, position = ?event.position(), "the route is already past this re-delivered row");
+                        continue;
+                    }
+                    tracing::debug!(sub_id = %route.label, position = ?event.position(), "delivering a transaction the route's snapshot missed below its cursor");
                 }
                 Err(err) => return Err(err.into()),
             }
@@ -2322,6 +2346,10 @@ where
     /// How many times a membership move read retries in place before the
     /// subscription is replaced through the R7 machinery instead.
     const MOVE_ATTEMPTS: u32 = 3;
+
+    /// How many scalar reads a first answer takes before refusing the
+    /// subscription, each read again because a change it missed removed its answer.
+    const SCALAR_READ_ATTEMPTS: u32 = 3;
 
     /// How many short-backoff retries the unknown read class gets before its
     /// subscription ends (R89 decision 1).
@@ -3551,6 +3579,7 @@ where
             pending: VecDeque::new(),
             subs: HashMap::new(),
             paging: VecDeque::new(),
+            missed: Vec::new(),
             computed_subs: HashMap::new(),
             outbound: outbound_tx,
             principal,
@@ -3567,6 +3596,12 @@ where
         let ended: Result<(), SessionError> = loop {
             if state.closing {
                 break Ok(());
+            }
+            // Between two frames, so the rows a snapshot missed precede every live patch still queued, which all commit later.
+            if !state.missed.is_empty()
+                && let Err(err) = self.replay_missed(&mut transport, &mut state).await
+            {
+                break Err(err);
             }
             // One task, two arms. The transport arm awaits a whole subscribe,
             // including its first page of rows, so the outbound arm cannot
@@ -4550,10 +4585,10 @@ where
         tier: Tier,
         permit: Option<ReaderPermit>,
     ) -> Result<(), SessionError> {
-        let resync = match state.resume {
+        let resync = match state.resume.clone() {
             Resume::Fresh => None,
             Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
-            Resume::At(at) => {
+            Resume::At(at, fence) => {
                 let min = read_log::<O, _, _>(&mut state.resume_read_budget, || {
                     self.oplog.min_position()
                 })
@@ -4564,7 +4599,9 @@ where
                 .await?;
                 match catchup_decision(at, min, current) {
                     CatchupDecision::Catchup => {
-                        return self.catch_up_row(transport, sub, state, &reg, at).await;
+                        return self
+                            .catch_up_row(transport, sub, state, &reg, at, fence)
+                            .await;
                     }
                     CatchupDecision::FullResync => Some(FullResyncReason::CursorOutsideRetention),
                 }
@@ -4707,6 +4744,7 @@ where
         sub: &Subscribe,
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
+        fence: Option<Arc<ReadFence>>,
     ) {
         self.add_route(
             reg.consumer_id,
@@ -4720,6 +4758,7 @@ where
                 pg_sql: reg.pg_sql.as_str().into(),
                 binds: sub.spec.binds.clone().into(),
                 member_tables: reg.member_tables.clone(),
+                fence,
             },
         )
         .await;
@@ -4849,10 +4888,11 @@ where
             permit,
             restarted,
         } = start;
-        self.attach_row_route(&sub, state, &reg).await;
+        self.attach_row_route(&sub, state, &reg, None).await;
         // Any read still arriving in pages for this label is abandoned: this
         // call is its replacement.
         state.paging.retain(|read| read.label != sub.sub_id);
+        state.missed.retain(|replay| replay.label != sub.sub_id);
         let limits = self.guard.read_limits(tier);
         let estimate = self
             .snapshot_source
@@ -4895,7 +4935,7 @@ where
                 }
             })?;
         admit_page(&sub.sub_id, &page, max_rows, estimate.width, limits)?;
-        let cursor = Cursor::new(self.stamp_opaque(page.cursor.as_bytes()));
+        let (cursor, replay) = self.first_page_end(&page.cursor, &sub.sub_id, reg.consumer_id);
         if let Some(reason) = resync {
             transport
                 .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
@@ -4915,33 +4955,123 @@ where
         let delivered = self
             .send_page(transport, state, &sub.sub_id, page.patchset)
             .await?;
-        match page.next {
-            // More to come. The producer waits in `state.paging` and the next
-            // page is taken when the client acknowledges this one, because the
-            // only path that can read that acknowledgement is the one a
-            // waiting read would block (R33).
-            Some(after) => {
-                state.paging.push_back(PagedRead {
-                    label: sub.sub_id.clone(),
-                    sub,
-                    reg,
-                    after,
-                    max_rows,
-                    limits,
-                    average_width: estimate.width,
-                    cursor,
-                    delivered,
-                    tier,
-                    restarted,
-                    permit,
-                });
-                Ok(())
+        state.missed.extend(replay);
+        // More to come. The producer waits in `state.paging` and the next
+        // page is taken when the client acknowledges this one, because the
+        // only path that can read that acknowledgement is the one a
+        // waiting read would block (R33).
+        if let Some(after) = page.next {
+            state.paging.push_back(PagedRead {
+                label: sub.sub_id.clone(),
+                sub,
+                reg,
+                after,
+                max_rows,
+                limits,
+                average_width: estimate.width,
+                cursor,
+                delivered,
+                tier,
+                restarted,
+                permit,
+            });
+            Ok(())
+        } else {
+            self.complete_snapshot(transport, state, sub.sub_id, cursor, delivered)
+                .await
+        }
+    }
+
+    /// Send each fenced snapshot the rows of the transactions its fence missed that the log already holds, in commit order, as live patches under the snapshot's own cursor.
+    ///
+    /// Those were dispatched before the route existed, so the live path never sent them, and the snapshot does not hold them either (the state table in `plans/design-commit-positions.md`). A client that drops before they arrive resumes from that cursor and is sent them again. A missed truncate cannot be sent as a patch and a read taken now would miss it again, so the subscription is refused.
+    async fn replay_missed<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        for replay in std::mem::take(&mut state.missed) {
+            let unseen = replay.fence.unseen();
+            let records = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+                self.oplog.entries_of(&unseen)
+            })
+            .await?;
+            let watchers = [Arc::clone(&state.principal)];
+            let mut verdicts = Transitions::new();
+            let mut payloads = Vec::new();
+            let mut truncated = false;
+            for record in records {
+                if replay.fence.seen(record.position()) != Seen::Missed {
+                    continue;
+                }
+                let replayed = {
+                    self.materializer
+                        .lock()
+                        .await
+                        .replay_patch(record.event(), replay.consumer_id)?
+                };
+                let Some((payload, _departure)) = replayed else {
+                    continue;
+                };
+                if record.event().kind() == EventKind::Truncate {
+                    truncated = true;
+                    break;
+                }
+                if let Some(payload) = self
+                    .replay_payload(transport, record.event(), &watchers, &mut verdicts, payload)
+                    .await?
+                {
+                    payloads.push(payload);
+                }
             }
-            None => {
-                self.complete_snapshot(transport, state, sub.sub_id, cursor, delivered)
-                    .await
+            if truncated {
+                tracing::warn!(sub_id = %replay.label, "a truncate the snapshot missed is not yet visible, refusing the subscription");
+                self.refuse_subscription(transport, state, &replay.label)
+                    .await?;
+                continue;
+            }
+            for payload in payloads {
+                let live = LivePatch::new(replay.label.clone(), replay.cursor.clone(), payload);
+                enqueue_and_flush(
+                    transport,
+                    &mut state.credits,
+                    &mut state.pending,
+                    Deliverable::Rows(BulkMessage::LivePatch(live)),
+                )
+                .await
+                .map_err(transport_err)?;
             }
         }
+        Ok(())
+    }
+
+    /// The cursor a read's `SnapshotEnd` carries, from its first page's, and the replay its fence owes.
+    fn first_page_end(
+        &self,
+        page_cursor: &Cursor,
+        label: &str,
+        consumer_id: u64,
+    ) -> (Cursor, Option<MissedReplay>) {
+        let Some((read, fence)) = split_snapshot_cursor(page_cursor.as_bytes()) else {
+            return (Cursor::new(Vec::new()), None);
+        };
+        let cursor = Cursor::new(self.stamp_fenced(read, fence.as_ref()));
+        let replay = fence.map(|fence| MissedReplay {
+            label: label.to_owned(),
+            consumer_id,
+            fence,
+            cursor: cursor.clone(),
+        });
+        (cursor, replay)
+    }
+
+    /// A snapshot's cursor for the wire: `read` stamped with the timeline last read, then `fence`.
+    fn stamp_fenced(&self, read: PgCommitPosition, fence: Option<&ReadFence>) -> Vec<u8> {
+        let mut bytes = self.stamp(read);
+        if let Some(fence) = fence {
+            fence.encode_into(&mut bytes);
+        }
+        bytes
     }
 
     /// Deliver one page's rows, returning what the frame carried.
@@ -5202,8 +5332,9 @@ where
         state: &mut SessionState<Id, Key>,
         reg: &RowRegistration,
         from: PgCommitPosition,
+        fence: Option<Arc<ReadFence>>,
     ) -> Result<(), SessionError> {
-        self.attach_row_route(&sub, state, reg).await;
+        self.attach_row_route(&sub, state, reg, fence.clone()).await;
 
         // Watermark just after the route exists. An entry at or below it was
         // appended before this consumer could receive live delivery, so
@@ -5212,10 +5343,7 @@ where
             self.oplog.current_position()
         })
         .await?;
-        let entries = read_log::<O, _, _>(&mut state.resume_read_budget, || {
-            self.oplog.entries_since(from)
-        })
-        .await?;
+        let entries = self.catchup_entries(state, from, fence.as_deref()).await?;
         // Retention only moves forward, so a log that still reaches the cursor now reached it when the entries were read.
         let min = read_log::<O, _, _>(&mut state.resume_read_budget, || self.oplog.min_position())
             .await?;
@@ -5296,6 +5424,40 @@ where
             .map_err(transport_err)?;
         }
         Ok(())
+    }
+
+    /// The log's records a cursor at `from` resumes with, in commit order.
+    ///
+    /// A fenced cursor was issued by a snapshot, which misses the transactions it did not see below its read and holds some above it.
+    async fn catchup_entries(
+        &self,
+        state: &mut SessionState<Id, Key>,
+        from: PgCommitPosition,
+        fence: Option<&ReadFence>,
+    ) -> Result<Vec<ChangeRecord>, SessionError> {
+        let mut entries = match fence {
+            Some(fence) => {
+                let unseen = fence.unseen();
+                read_log::<O, _, _>(&mut state.resume_read_budget, || {
+                    self.oplog.entries_of(&unseen)
+                })
+                .await?
+                .into_iter()
+                .filter(|record| {
+                    record.position() <= from && fence.seen(record.position()) == Seen::Missed
+                })
+                .collect()
+            }
+            None => Vec::new(),
+        };
+        let since = read_log::<O, _, _>(&mut state.resume_read_budget, || {
+            self.oplog.entries_since(from)
+        })
+        .await?;
+        entries.extend(since.into_iter().filter(|record| {
+            fence.is_none_or(|fence| fence.seen(record.position()) != Seen::Held)
+        }));
+        Ok(entries)
     }
 
     /// What one replayed event delivers to this caller, or [`None`] when it
@@ -5467,33 +5629,37 @@ where
                     .await;
             }
             SeedPlan::Scalar { query, kind } => {
-                let (value, lsn) = self
-                    .connector
-                    .execute_scalar(&query.as_read_query(), *kind, &caller_setup())
-                    .await
-                    .map_err(|err| err.to_string())?;
-                let change = {
-                    self.materializer
-                        .lock()
+                for _ in 0..Self::SCALAR_READ_ATTEMPTS {
+                    let (value, fence) = self
+                        .connector
+                        .execute_scalar(&query.as_read_query(), *kind, &caller_setup())
                         .await
-                        .install_scalar(subscription_id, value, lsn)
-                        .map_err(|err| err.to_string())?
-                };
-                return Ok(vec![change]);
+                        .map_err(|err| err.to_string())?;
+                    let installed = {
+                        self.materializer
+                            .lock()
+                            .await
+                            .install_scalar(subscription_id, value, fence)
+                            .map_err(|err| err.to_string())?
+                    };
+                    if let Some(change) = installed {
+                        return Ok(vec![change]);
+                    }
+                }
+                return Err("changes the scalar reads missed kept removing their answer".to_owned());
             }
             SeedPlan::Fold { bootstrap } => bootstrap,
         };
         let setup = caller_setup();
         // The engine buffers changes dispatched while this read is in flight
-        // and reconciles them against the read's position, so registering
-        // before reading loses nothing (the guarantee R28 part B built
-        // connetto-side now lives upstream).
-        let (rows, lsn) = if bootstrap.group_columns == 0 {
+        // and judges them against the read's fence, so registering before
+        // reading neither loses a change nor counts one twice.
+        let (rows, fence) = if bootstrap.group_columns == 0 {
             // One row of component columns under one snapshot.
             self.connector
                 .execute_scalar_row(&bootstrap.query.as_read_query(), &bootstrap.kinds, &setup)
                 .await
-                .map(|(row, lsn)| (vec![row], lsn))
+                .map(|(row, fence)| (vec![row], fence))
                 .map_err(|err| err.to_string())?
         } else {
             // One row per group. One generous page: a grouped seed is bounded
@@ -5512,13 +5678,13 @@ where
             if page.value.more {
                 return Err("the grouped seed exceeded one page".to_owned());
             }
-            (page.value.rows, page.checkpoint)
+            (page.value.rows, page.fence)
         };
         let seeded = {
             self.materializer
                 .lock()
                 .await
-                .install_fold_seed(subscription_id, rows, lsn)
+                .install_fold_seed(subscription_id, rows, fence)
                 .map_err(|err| err.to_string())?
         };
         if seeded.needs_snapshot {
@@ -5625,7 +5791,7 @@ mod tests {
     };
     use crate::timeline::{Position, TimelineHistory};
     use connetto_core::Cursor;
-    use subql::{PgCommitPosition, PgLsn};
+    use subql::{PgCommitPosition, PgLsn, PgXid};
 
     fn judged(cursor: &[u8], history: &TimelineHistory) -> Resume {
         Resume::of(Some(&Cursor::new(cursor.to_vec())), history)
@@ -5636,7 +5802,7 @@ mod tests {
 
     /// A row at commit `lsn`.
     fn row(lsn: u64) -> PgCommitPosition {
-        PgCommitPosition::new(PgLsn(lsn), 1)
+        PgCommitPosition::new(PgLsn(lsn), PgXid(1), 1)
     }
 
     fn at(timeline: u32, lsn: u64) -> Vec<u8> {
@@ -5656,8 +5822,14 @@ mod tests {
     #[test]
     fn a_cursor_resumes_only_while_the_history_holds_its_position() {
         let history = twice_promoted();
-        assert_eq!(judged(&at(3, 0x900), &history), Resume::At(row(0x900)));
-        assert_eq!(judged(&at(2, 0x1FF), &history), Resume::At(row(0x1FF)));
+        assert_eq!(
+            judged(&at(3, 0x900), &history),
+            Resume::At(row(0x900), None)
+        );
+        assert_eq!(
+            judged(&at(2, 0x1FF), &history),
+            Resume::At(row(0x1FF), None)
+        );
         assert_eq!(
             judged(&at(2, 0x200), &history),
             Resume::BeyondHistory,
@@ -5678,7 +5850,7 @@ mod tests {
         assert_eq!(judged(&at(1, 0x10), &restored), Resume::BeyondHistory);
         assert_eq!(
             judged(&at(1, 0x10), &TimelineHistory::first(CLUSTER)),
-            Resume::At(row(0x10))
+            Resume::At(row(0x10), None)
         );
     }
 

@@ -11,7 +11,11 @@
 //!   snapshot;
 //! * a delete replays as a tombstone so the client drops the row;
 //! * after a restart, the feed re-delivering rows a caught-up client already
-//!   holds keeps running and sends that client only what it lacks.
+//!   holds keeps running and sends that client only what it lacks;
+//! * a transaction a snapshot missed, flushed before its read but not yet
+//!   visible to it, reaches the client right after the snapshot, through
+//!   catchup from the fenced cursor the snapshot issued, or live below that
+//!   cursor.
 //!
 //! Reads and seeds go through typed diesel queries, matching the other tests;
 //! DML against the emulated backend stays as SQL strings.
@@ -27,8 +31,9 @@ use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
     ChangeRecord, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog,
-    OplogConfig, PageSpec, PgOplog, Position, RequestGuard, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, loopback, pg_write_target,
+    OplogConfig, PageSpec, PgOplog, Position, ReadFence, RequestGuard, SessionConfig,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen,
+    loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -36,7 +41,10 @@ use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::backend::{CdcEvent, Postgres};
 use subql::visibility::VisibilityPolicy;
-use subql::{CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgSqliteEmuSource, SourceItem};
+use subql::{
+    CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, PgXid,
+    SourceItem,
+};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -619,6 +627,14 @@ impl Oplog for ScriptedOplog {
             .map_err(|never| match never {})
     }
 
+    async fn entries_of(&self, unseen: &Unseen) -> Result<Vec<ChangeRecord>, Refused> {
+        self.gate("entries_of").await?;
+        self.inner
+            .entries_of(unseen)
+            .await
+            .map_err(|never| match never {})
+    }
+
     async fn min_position(&self) -> Result<Option<PgCommitPosition>, Refused> {
         self.gate("min_position").await?;
         self.inner
@@ -1035,5 +1051,249 @@ async fn a_restarted_feed_replaying_rows_a_caught_up_client_holds_keeps_running(
             break;
         }
     }
+    expect_idle(&mut client).await;
+}
+
+/// A snapshot source serving the one seed row under a cursor the test sets once it knows the positions.
+#[derive(Clone, Default)]
+struct FencedSeed {
+    cursor: Arc<parking_lot::Mutex<Vec<u8>>>,
+}
+
+impl SnapshotSource for FencedSeed {
+    type Error = std::convert::Infallible;
+
+    async fn estimate(
+        &self,
+        select_sql: &str,
+        binds: &[connetto_core::messages::BindValue],
+        caller: &connetto_core::Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        SeedSnapshot.estimate(select_sql, binds, caller).await
+    }
+
+    async fn snapshot_page(
+        &self,
+        select_sql: &str,
+        binds: &[connetto_core::messages::BindValue],
+        auth: &connetto_core::Principal,
+        page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        let seed = SeedSnapshot
+            .snapshot_page(select_sql, binds, auth, page)
+            .await?;
+        Ok(SnapshotPage {
+            cursor: Cursor::new(self.cursor.lock().clone()),
+            ..seed
+        })
+    }
+}
+
+type FencedManager = SessionManager<FencedSeed, RosterAuth, ConnettoWatermark>;
+
+fn fenced_manager(fixture: &Fixture, seed: FencedSeed) -> Arc<FencedManager> {
+    SessionManager::new(
+        Materializer::new(PG_DDL).expect("build materializer"),
+        seed,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
+        test_verifier(),
+        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+        Arc::new(RequestGuard::default()),
+        SessionConfig::default(),
+    )
+}
+
+/// Open a session on a fenced manager, presenting `resume` when given.
+async fn open_fenced_session(
+    manager: &Arc<FencedManager>,
+    resume: Option<Cursor>,
+) -> LoopbackTransport {
+    let (server_transport, mut client) = loopback();
+    let server = manager.clone();
+    tokio::spawn(async move {
+        server.serve(server_transport).await.expect("session ok");
+    });
+    let mut handshake = Handshake::new(PROTOCOL_VERSION, "client-a").with_grant(
+        connetto_core::messages::Grant::new("user:client-a".to_owned()),
+    );
+    if let Some(cursor) = resume {
+        handshake = handshake.with_cursor(cursor);
+    }
+    client
+        .send_control(ControlMessage::Handshake(handshake))
+        .await
+        .expect("send handshake");
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+}
+
+/// `position` stamped the way a never-promoted database's server stamps it, with `fence` after it.
+fn fenced_cursor(position: PgCommitPosition, fence: Option<&ReadFence>) -> Cursor {
+    Cursor::new(
+        Position {
+            system: TimelineHistory::default().system(),
+            timeline: 1,
+            at: position,
+        }
+        .fenced_cursor_bytes(fence),
+    )
+}
+
+/// One insert of order `id`, as the emulator stamps it.
+async fn insert(source: &mut PgSqliteEmuSource, id: i64) -> PgChangeEvent {
+    source
+        .execute_sql(&format!(
+            "INSERT INTO orders (id, price, quantity, status) VALUES ({id}, 1.0, 2, 'paid')"
+        ))
+        .expect("execute dml");
+    let mut events = Vec::new();
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        if let SourceItem::Event(event) = item {
+            events.push(event);
+        }
+    }
+    let [event] = <[PgChangeEvent; 1]>::try_from(events).expect("one row per insert");
+    event
+}
+
+/// A transaction flushed before the snapshot's read but not yet visible to it, dispatched before the subscription existed, follows the snapshot under the snapshot's own fenced cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_snapshot_replays_a_transaction_it_missed_that_was_dispatched_before_it() {
+    let fixture = Fixture::acquire().await;
+    let seed = FencedSeed::default();
+    let manager = fenced_manager(&fixture, seed.clone());
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let held = insert(&mut source, 1).await;
+    let missed = insert(&mut source, 2).await;
+    manager.dispatch_event(&held).await.expect("dispatch");
+    manager.dispatch_event(&missed).await.expect("dispatch");
+
+    // The read sees the first transaction and not the second, which is still running.
+    let after = PgLsn(missed.position().commit_lsn().0 + 1);
+    let (held_xid, missed_xid) = (held.position().xid().0, missed.position().xid().0);
+    let fence = ReadFence::parse(
+        &format!("{held_xid}:{}:{missed_xid}", missed_xid + 1),
+        after,
+    )
+    .expect("fence");
+    *seed.cursor.lock() =
+        connetto_server::snapshot_cursor(PgCommitPosition::before_commit(after), Some(&fence));
+
+    let mut client = open_fenced_session(&manager, None).await;
+    subscribe(&mut client).await;
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    let mut replica = client_replica();
+    let applier = Materializer::new(PG_DDL).expect("build applier");
+    let BulkMessage::SnapshotPatch(page) = next_bulk(&mut client).await else {
+        panic!("expected the seed page");
+    };
+    applier
+        .apply_diffset(&page.patchset_zstd, &mut replica)
+        .expect("apply the seed page");
+    let ControlMessage::SnapshotEnd(end) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+    let snapshot_cursor = fenced_cursor(PgCommitPosition::before_commit(after), Some(&fence));
+    assert_eq!(
+        end.cursor, snapshot_cursor,
+        "the snapshot's cursor names its read and carries its fence"
+    );
+    let frame = tokio::time::timeout(Duration::from_secs(10), next_bulk(&mut client))
+        .await
+        .expect("the missed transaction follows the snapshot");
+    let BulkMessage::LivePatch(live) = frame else {
+        panic!("expected the missed transaction as a live patch");
+    };
+    assert_eq!(
+        live.cursor, snapshot_cursor,
+        "under the snapshot's own cursor, so resuming from it replays the row again"
+    );
+    applier
+        .apply_diffset(&live.patchset_zstd, &mut replica)
+        .expect("apply the missed transaction");
+    assert_eq!(
+        orders(&mut replica)
+            .iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>(),
+        vec![1, 2],
+        "the missed transaction's row joins the seed"
+    );
+    expect_idle(&mut client).await;
+}
+
+/// A client resuming from a snapshot's fenced cursor catches up on what the snapshot missed and skips what it held, and a missed transaction dispatched later still reaches it below its cursor.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fenced_cursor_catches_up_what_its_snapshot_missed_and_nothing_it_held() {
+    let fixture = Fixture::acquire().await;
+    let manager = fenced_manager(&fixture, FencedSeed::default());
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut events = Vec::new();
+    for id in 1..=5 {
+        events.push(insert(&mut source, id).await);
+    }
+    let [held_below, missed_below, held_above, beyond, late] =
+        <[PgChangeEvent; 5]>::try_from(events).expect("five inserts");
+    // The fifth insert stands for a transaction the snapshot missed that commits below the fourth.
+    let xid = |event: &PgChangeEvent| event.position().xid().0;
+    let late = PgChangeEvent::new(
+        late.into_change(),
+        PgCommitPosition::new(
+            PgLsn(held_above.position().commit_lsn().0 + 1),
+            PgXid(xid(&beyond) + 1),
+            1,
+        ),
+    );
+    for event in [&held_below, &missed_below, &held_above, &beyond] {
+        manager.dispatch_event(event).await.expect("dispatch");
+    }
+
+    // The read ran between the second and third commits, missing the second and the late one, and its insert position is the fourth commit.
+    let read = PgCommitPosition::before_commit(PgLsn(missed_below.position().commit_lsn().0 + 1));
+    let fence = ReadFence::parse(
+        &format!(
+            "{}:{}:{},{}",
+            xid(&held_below),
+            xid(&beyond) + 2,
+            xid(&missed_below),
+            xid(&beyond) + 1
+        ),
+        beyond.position().commit_lsn(),
+    )
+    .expect("fence");
+    let mut client = open_fenced_session(&manager, Some(fenced_cursor(read, Some(&fence)))).await;
+    subscribe(&mut client).await;
+    for event in [&missed_below, &beyond] {
+        let BulkMessage::LivePatch(live) = next_bulk(&mut client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(
+            live.cursor,
+            cursor_of(event),
+            "catchup replays only what the snapshot lacked"
+        );
+    }
+    expect_idle(&mut client).await;
+
+    manager
+        .dispatch_event(&late)
+        .await
+        .expect("dispatch the late transaction");
+    let late_patch = tokio::time::timeout(Duration::from_secs(10), next_bulk(&mut client))
+        .await
+        .expect("the late missed transaction is delivered below the cursor");
+    let BulkMessage::LivePatch(live) = late_patch else {
+        panic!("expected a live patch");
+    };
+    assert_eq!(live.cursor, cursor_of(&late));
+    manager
+        .dispatch_event(&held_above)
+        .await
+        .expect("re-deliver a held transaction");
     expect_idle(&mut client).await;
 }

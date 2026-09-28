@@ -13,7 +13,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
+use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -143,12 +143,13 @@ async fn a_poisoned_computed_read_ends_alone_after_one_retry() {
             source
                 .execute_sql("DELETE FROM counts WHERE id = 10")
                 .expect("execute dml");
+            let at = fixture.commit_now().await;
             while let Some(item) = source.next_item().await.expect("poll source") {
                 let SourceItem::Event(event) = item else {
                     continue;
                 };
                 manager
-                    .dispatch_event(&event)
+                    .dispatch_event(&committed_at(event, at))
                     .await
                     .unwrap_or_else(|err| panic!("dispatch failed: {err:?}"));
             }
@@ -232,12 +233,13 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
     source
         .execute_sql("INSERT INTO counts (id, n) VALUES (1, 1)")
         .expect("stage insert");
+    let at = fixture.commit_now().await;
     while let Some(item) = source.next_item().await.expect("poll source") {
         let SourceItem::Event(event) = item else {
             continue;
         };
         manager
-            .dispatch_event(&event)
+            .dispatch_event(&committed_at(event, at))
             .await
             .expect("dispatch insert");
     }

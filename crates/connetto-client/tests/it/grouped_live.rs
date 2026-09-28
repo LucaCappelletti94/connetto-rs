@@ -22,7 +22,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits,
     WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth};
+use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, committed_at};
 use diesel::prelude::*;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
@@ -115,13 +115,22 @@ fn by_status() -> impl diesel::query_builder::QueryFragment<diesel::sqlite::Sqli
 }
 
 /// Run `sql` on the emulated source and dispatch every event it produced.
-async fn apply(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>, sql: &str) {
+async fn apply(
+    fixture: &Fixture,
+    source: &mut PgSqliteEmuSource,
+    manager: &Arc<Manager>,
+    sql: &str,
+) {
     source.execute_sql(sql).expect("execute dml");
+    let at = fixture.commit_now().await;
     while let Some(item) = source.next_item().await.expect("poll source") {
         let SourceItem::Event(event) = item else {
             continue;
         };
-        manager.dispatch_event(&event).await.expect("dispatch");
+        manager
+            .dispatch_event(&committed_at(event, at))
+            .await
+            .expect("dispatch");
     }
 }
 
@@ -191,6 +200,7 @@ async fn a_grouped_watch_maintains_one_entry_per_group() {
     // A fold delta moves the existing entry.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     apply(
+        &fixture,
         &mut source,
         &manager,
         "INSERT INTO orders VALUES (4, 'open')",
@@ -201,6 +211,7 @@ async fn a_grouped_watch_maintains_one_entry_per_group() {
 
     // A group born on the change stream appears beside it.
     apply(
+        &fixture,
         &mut source,
         &manager,
         "INSERT INTO orders VALUES (100, 'done')",
@@ -213,7 +224,13 @@ async fn a_grouped_watch_maintains_one_entry_per_group() {
     );
 
     // Emptying the young group removes exactly its entry.
-    apply(&mut source, &manager, "DELETE FROM orders WHERE id = 100").await;
+    apply(
+        &fixture,
+        &mut source,
+        &manager,
+        "DELETE FROM orders WHERE id = 100",
+    )
+    .await;
     next_change(&mut groups).await;
     assert_eq!(groups.map(), HashMap::from([entry("open", 3)]));
 
@@ -363,6 +380,7 @@ async fn a_row_shaped_watch_replaces_the_answer_whole() {
     fixture.exec("INSERT INTO orders VALUES (100, 'z')").await;
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     apply(
+        &fixture,
         &mut source,
         &manager,
         "INSERT INTO orders VALUES (100, 'z')",

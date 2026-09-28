@@ -28,7 +28,7 @@ use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
-use subql::{CdcSource, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
+use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 
 fn test_verifier() -> Arc<dyn HandshakeAuthority> {
@@ -179,7 +179,7 @@ impl AsyncConnector for SeedRows {
         _kind: ScalarFamily,
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
-        Output = Result<(PgValue<Postgres>, Option<PgCommitPosition>), std::io::Error>,
+        Output = Result<(PgValue<Postgres>, Option<PgSnapshotFence>), std::io::Error>,
     > + Send {
         async { Err(std::io::Error::other("not used")) }
     }
@@ -202,13 +202,13 @@ impl AsyncConnector for SeedRows {
         _setup: &ConnettoReadSetup,
     ) -> impl core::future::Future<
         Output = Result<
-            (Vec<PgValue<Postgres>>, Option<PgCommitPosition>),
+            (Vec<PgValue<Postgres>>, Option<PgSnapshotFence>),
             ScalarRowError<std::io::Error>,
         >,
     > + Send {
         let next = self.rows.lock().expect("queue poisoned").pop();
         async move {
-            next.map(|row| (row, Some(PgCommitPosition::new(PgLsn(1), 1))))
+            next.map(|row| (row, PgSnapshotFence::parse("1:1:", PgLsn(1))))
                 .ok_or_else(|| {
                     ScalarRowError::Connector(std::io::Error::other("no more canned rows"))
                 })

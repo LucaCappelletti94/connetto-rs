@@ -24,7 +24,7 @@ use connetto_server::{
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
 use pg_walstream::{ChangeEvent, Lsn};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
-use subql::{PgChangeEvent, PgCommitPosition, PgLsn};
+use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgXid};
 use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
@@ -412,7 +412,7 @@ async fn a_refused_replacement_ends_the_subscription_instead_of_retrying() {
             serving
                 .dispatch_event(&PgChangeEvent::new(
                     ChangeEvent::truncate(vec![Arc::from("things")], false, false, Lsn::new(1)),
-                    PgCommitPosition::new(PgLsn(1), 1),
+                    PgCommitPosition::new(PgLsn(1), PgXid(1), 1),
                 ))
                 .await
                 .expect("dispatch the truncate");
@@ -456,7 +456,7 @@ mod aggregates {
         RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits,
         loopback, pg_write_target,
     };
-    use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
+    use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
     use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
     use tracing::Instrument;
 
@@ -531,17 +531,25 @@ mod aggregates {
     /// Remove the row holding the current extreme, which is what makes subql
     /// re-execute rather than fold: the answer is no longer derivable from the
     /// value it holds.
-    async fn retire_the_extreme(source: &mut PgSqliteEmuSource, manager: &Arc<Manager>) {
+    async fn retire_the_extreme(
+        fixture: &Fixture,
+        source: &mut PgSqliteEmuSource,
+        manager: &Arc<Manager>,
+    ) {
         for sql in [
             "INSERT INTO counts (id, n) VALUES (1, 1)",
             "DELETE FROM counts WHERE id = 1",
         ] {
             source.execute_sql(sql).expect("execute dml");
+            let at = fixture.commit_now().await;
             while let Some(item) = source.next_item().await.expect("poll source") {
                 let SourceItem::Event(event) = item else {
                     continue;
                 };
-                manager.dispatch_event(&event).await.expect("dispatch");
+                manager
+                    .dispatch_event(&committed_at(event, at))
+                    .await
+                    .expect("dispatch");
             }
         }
     }
@@ -603,7 +611,7 @@ mod aggregates {
 
                 let mut source =
                     PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
-                retire_the_extreme(&mut source, &manager).await;
+                retire_the_extreme(&fixture, &mut source, &manager).await;
 
                 let ControlMessage::NonFatalError(refusal) = client.next_control().await else {
                     panic!("a triggered read past the shared bound must be refused");
@@ -642,7 +650,7 @@ mod aggregates {
         };
 
         let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
-        retire_the_extreme(&mut source, &manager).await;
+        retire_the_extreme(&fixture, &mut source, &manager).await;
 
         // Postgres still holds every row, so the re-execution answers the same
         // extreme. The assertion is that it answered at all.

@@ -222,8 +222,7 @@ mod pg {
     use sqlparser::dialect::PostgreSqlDialect;
     use subql::backend::{Postgres, Value};
     use subql::{
-        Checkpoint, ColumnId, DatabaseLike, ParserDB, PgCommitPosition, PgLsn, TableId,
-        catalog_helpers,
+        ColumnId, DatabaseLike, ParserDB, PgCommitPosition, PgLsn, TableId, catalog_helpers,
     };
 
     use connetto_core::messages::BindValue;
@@ -474,6 +473,26 @@ mod pg {
 
     #[derive(QueryableByName)]
     struct LsnRow {
+        #[diesel(sql_type = Text)]
+        lsn: String,
+    }
+
+    /// A page's cursor: where the read sits, before every commit it did not see, which is ordinal 0 of that commit, then its fence, naming the ones below that position it did not see either. Empty when Postgres printed a position this cannot read.
+    fn page_cursor(lsn: &str, fence: &FenceRow) -> Vec<u8> {
+        let fence = PgLsn::parse(&fence.lsn)
+            .and_then(|insert_lsn| crate::fence::ReadFence::parse(&fence.snapshot, insert_lsn));
+        PgLsn::parse(lsn)
+            .map(|lsn| {
+                crate::fence::snapshot_cursor(PgCommitPosition::before_commit(lsn), fence.as_ref())
+            })
+            .unwrap_or_default()
+    }
+
+    /// A read's snapshot as Postgres prints it, and the WAL insert position read inside it.
+    #[derive(QueryableByName)]
+    struct FenceRow {
+        #[diesel(sql_type = Text)]
+        snapshot: String,
         #[diesel(sql_type = Text)]
         lsn: String,
     }
@@ -758,8 +777,8 @@ mod pg {
                 .await
                 .map_err(|err| SnapshotError::Backend(err.to_string()))?;
             let lsn = lsn.lsn;
-            let read = conn
-                .transaction::<BinaryRows, diesel::result::Error, _>(async move |c| {
+            let (read, fence) = conn
+                .transaction::<(BinaryRows, FenceRow), diesel::result::Error, _>(async move |c| {
                     // Successive pages are separate moments by design (R58
                     // decision 9): a page is read after every frame already
                     // sent, so it can never carry a value older than one the
@@ -767,6 +786,13 @@ mod pg {
                     sql_query("SET TRANSACTION READ ONLY ISOLATION LEVEL REPEATABLE READ")
                         .execute(c)
                         .await?;
+                    // The first statement takes the snapshot the page is read under, so this names exactly it.
+                    let fence: FenceRow = sql_query(
+                        "SELECT pg_current_snapshot()::text AS snapshot, \
+                         pg_current_wal_insert_lsn()::text AS lsn",
+                    )
+                    .get_result(c)
+                    .await?;
                     // The row cap bounds connetto's memory and the wire and
                     // not Postgres's work: a sort on an unindexed column
                     // reads the whole table to return a capped page, so the
@@ -777,7 +803,7 @@ mod pg {
                     // Establish the requesting caller's RLS context so the
                     // read returns only rows it may see.
                     binding.apply(c).await?;
-                    BinaryRows::load(c, query).await
+                    Ok((BinaryRows::load(c, query).await?, fence))
                 })
                 .await
                 .map_err(|err| {
@@ -834,10 +860,7 @@ mod pg {
             } else {
                 None
             };
-            // A read sits before every commit it did not see, which is ordinal 0 of that commit.
-            let cursor = PgLsn::parse(&lsn)
-                .map(|lsn| PgCommitPosition::before_commit(lsn).to_opaque().0)
-                .unwrap_or_default();
+            let cursor = page_cursor(&lsn, &fence);
             Ok(SnapshotPage {
                 patchset: built.build(),
                 cursor: Cursor::new(cursor),

@@ -22,7 +22,7 @@ use connetto_server::{
     CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Materializer, Oplog, OplogConfig,
     PageSpec, PgOplog, PgReadConnector, PgSnapshotSource, ReadBudget, RequestGuard,
     RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, loopback, pg_write_target,
+    SnapshotSource, loopback, pg_write_target, split_snapshot_cursor,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -31,7 +31,9 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
-use subql::{CdcSource, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
+use subql::{
+    CdcSource, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, PgXid, Seen, SourceItem,
+};
 
 diesel::table! {
     /// Row from the notes test fixture.
@@ -565,7 +567,7 @@ async fn pg_oplog_appends_and_reads_back() {
     let mut conn = pool.get().await.expect("get connection");
     // `ORDER BY` on a dynamic table name requires raw SQL; no typed `table!` covers it.
     let ops: Vec<OpRow> =
-        sql_query("SELECT op FROM connetto_oplog_test ORDER BY commit_lsn, ordinal")
+        sql_query("SELECT op FROM connetto_oplog_test ORDER BY commit_lsn, xid, ordinal")
             .load(&mut *conn)
             .await
             .expect("read the verbs back");
@@ -589,8 +591,8 @@ async fn pg_oplog_appends_and_reads_back() {
     // No cast, so the column's own type is what rejects this.
     let refused = sql_query(
         "INSERT INTO connetto_oplog_test \
-         (commit_lsn, ordinal, table_name, op, pk, is_tombstone, event) \
-         VALUES (9999, 0, 'orders', 'nonsense', '\\x00', false, '\\x00')",
+         (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event) \
+         VALUES (9999, 1, 0, 'orders', 'nonsense', '\\x00', false, '\\x00')",
     )
     .execute(&mut *conn)
     .await;
@@ -1074,5 +1076,92 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
             TranslatedRow { id: 3, quantity: 9 },
         ],
         "the bound predicate filtered on the backend"
+    );
+}
+
+/// A page's cursor carries the fence of the snapshot it was read under, holding a transaction committed before it and missing one still running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_page_cursor_fences_the_snapshot_it_was_read_under() {
+    const DDL: &str = "CREATE TABLE fenced (id INT PRIMARY KEY, body TEXT);";
+    #[derive(diesel::QueryableByName)]
+    struct Xid {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        xid: i64,
+    }
+    async fn own_xid(conn: &mut AsyncPgConnection) -> PgXid {
+        let row: Xid = sql_query("SELECT (txid_current() % 4294967296)::bigint AS xid")
+            .get_result(conn)
+            .await
+            .expect("read the transaction id");
+        PgXid(u32::try_from(row.xid).expect("the remainder fits 32 bits"))
+    }
+
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&["DROP TABLE IF EXISTS fenced", DDL.trim_end_matches(';')])
+        .await;
+    let pool = fixture.admin().clone();
+    let mut committing = pool.get().await.expect("connection");
+    sql_query("BEGIN")
+        .execute(&mut *committing)
+        .await
+        .expect("begin");
+    sql_query("INSERT INTO fenced VALUES (1, 'committed')")
+        .execute(&mut *committing)
+        .await
+        .expect("insert");
+    let committed = own_xid(&mut committing).await;
+    sql_query("COMMIT")
+        .execute(&mut *committing)
+        .await
+        .expect("commit");
+    let mut running_conn = pool.get().await.expect("connection");
+    sql_query("BEGIN")
+        .execute(&mut *running_conn)
+        .await
+        .expect("begin");
+    sql_query("INSERT INTO fenced VALUES (2, 'running')")
+        .execute(&mut *running_conn)
+        .await
+        .expect("insert");
+    let running = own_xid(&mut running_conn).await;
+
+    let source = PgSnapshotSource::from_ddl(pool.clone(), DDL).expect("build source");
+    let page = source
+        .snapshot_page(
+            "SELECT * FROM fenced",
+            &[],
+            &connetto_core::Principal::<String, String>::unidentified(
+                connetto_core::SessionId::from_token_hash("test-user"),
+            ),
+            &PageSpec {
+                after: None,
+                max_rows: 1024,
+                timeout: std::time::Duration::from_secs(30),
+            },
+        )
+        .await
+        .expect("read a page");
+    sql_query("ROLLBACK")
+        .execute(&mut *running_conn)
+        .await
+        .expect("rollback");
+
+    let (read, fence) = split_snapshot_cursor(page.cursor.as_bytes()).expect("a page cursor");
+    let fence = fence.expect("a read of Postgres takes a fence");
+    let below = PgLsn(read.commit_lsn().0 - 1);
+    assert_eq!(
+        fence.seen(PgCommitPosition::new(below, committed, 1)),
+        Seen::Held,
+        "a transaction committed before the read is in it"
+    );
+    assert_eq!(
+        fence.seen(PgCommitPosition::new(below, running, 1)),
+        Seen::Missed,
+        "one still running is not, whatever position its commit takes below the read"
+    );
+    assert!(
+        fence.unseen().contains(running),
+        "{running:?} is among the transactions {fence:?} did not see"
     );
 }

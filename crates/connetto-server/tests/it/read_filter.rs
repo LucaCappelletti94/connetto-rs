@@ -36,7 +36,7 @@ use subql::backend::{Postgres, Value};
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{
     CdcSource, ChangeEvent, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource,
-    SourceItem,
+    PgXid, SourceItem,
 };
 
 const PG_DDL: &str =
@@ -382,7 +382,7 @@ async fn a_stream_that_cannot_report_the_old_row_refuses_instead_of_retrying() {
             vec![Arc::from("id")],
             pg_walstream::Lsn::new(1),
         ),
-        subql::PgCommitPosition::new(PgLsn(1), 1),
+        subql::PgCommitPosition::new(PgLsn(1), PgXid(1), 1),
     );
 
     let refused = manager.dispatch_event(&event).await.expect_err(
