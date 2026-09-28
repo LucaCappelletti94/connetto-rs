@@ -17,6 +17,18 @@ use tokio_tungstenite::tungstenite::Message;
 /// How long one request may take to answer.
 pub const REPLY_BOUND: Duration = Duration::from_secs(10);
 
+/// The `DevTools` messages of a request the page dropped because it
+/// navigated, or its target closed, while the request ran.
+const NAVIGATED: [&str; 2] = [
+    "Inspected target navigated or closed",
+    "Execution context was destroyed.",
+];
+
+/// Marks a request the page dropped by navigating, see [`NAVIGATED`].
+#[derive(Debug, thiserror::Error)]
+#[error("the page navigated while a request ran")]
+struct Navigated;
+
 type Socket =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -125,7 +137,13 @@ impl PageSession {
             };
             if reply["id"] == id {
                 if let Some(error) = reply.get("error") {
-                    bail!("inspector request {id} failed: {error}");
+                    let failure = anyhow!("inspector request {id} failed: {error}");
+                    let navigated = NAVIGATED.contains(&error["message"].as_str().unwrap_or(""));
+                    return Err(if navigated {
+                        failure.context(Navigated)
+                    } else {
+                        failure
+                    });
                 }
                 return Ok(reply["result"].clone());
             }
@@ -171,7 +189,8 @@ impl PageSession {
     }
 
     /// Wait until the page shows `text`, failing at once when it shows one of
-    /// `refusals` instead.
+    /// `refusals` instead. A read the page drops because it navigated is
+    /// retried, since a page under a wait may still be loading.
     ///
     /// # Errors
     ///
@@ -184,7 +203,17 @@ impl PageSession {
     ) -> Result<()> {
         let deadline = Instant::now() + limit;
         loop {
-            let page = self.page_text().await?;
+            let page = match self.page_text().await {
+                Ok(page) => page,
+                Err(error) if error.is::<Navigated>() => {
+                    if Instant::now() >= deadline {
+                        return Err(error.context(format!("the page never showed {text:?}")));
+                    }
+                    sleep(Duration::from_millis(500)).await;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if page.contains(text) {
                 return Ok(());
             }
@@ -247,4 +276,71 @@ pub async fn list_pages(port: u16) -> Result<Vec<serde_json::Value>> {
         .json()
         .await
         .context("reading inspector pages")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `DevTools` endpoint answering each `Runtime.evaluate` with the next
+    /// entry of `replies`, as an `error` or a string `value`.
+    async fn endpoint(replies: Vec<Result<&'static str, serde_json::Value>>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for reply in replies {
+                let Some(Ok(Message::Text(text))) = socket.next().await else {
+                    return;
+                };
+                let request: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let answer = match reply {
+                    Ok(value) => serde_json::json!({
+                        "id": request["id"],
+                        "result": { "result": { "type": "string", "value": value } },
+                    }),
+                    Err(error) => serde_json::json!({ "id": request["id"], "error": error }),
+                };
+                socket
+                    .send(Message::Text(answer.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        format!("ws://{address}")
+    }
+
+    #[tokio::test]
+    async fn a_wait_outlasts_the_page_navigating_under_it() {
+        let url = endpoint(vec![
+            Err(serde_json::json!({
+                "code": -32000,
+                "message": "Inspected target navigated or closed",
+            })),
+            Ok("status: connected"),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        page.wait_for_text("status: connected", Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_wait_stops_at_the_first_other_page_error() {
+        let url = endpoint(vec![
+            Err(
+                serde_json::json!({ "code": -32601, "message": "'Runtime.evaluate' wasn't found" }),
+            ),
+            Ok("status: connected"),
+        ])
+        .await;
+        let mut page = PageSession::devtools(&url).await.unwrap();
+        let error = page
+            .wait_for_text("status: connected", Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("wasn't found"), "{error:#}");
+    }
 }
