@@ -265,7 +265,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R68 browser file client | **DONE** (2026-09-10) | nothing. Worker-owned encrypted OPFS with memory fallback, browser fetch, reference-counted object URLs, and version 3 archives that restore unsent content through the production worker relay. The offline photo survives export, import under another key, local display and later upload. The browser stack passed and the full release suite passed 738 tests with 3 skipped | no |
 | R69 files in every demo | **DONE** (A through G complete 2026-09-19), designed (2026-09-12) | nothing. A is #28, B is #29, C is #30, G is #31, the browser stack boots the executable's file half with the online photo flow proven by `photo_flow.rs` and F's offline and two-viewer proofs by `photo_offline.rs` and `photo_visibility.rs`. E is #34, the photos surface in both web demos, and D is #35, the desktop photos surface on the native content client proven by the Docker-gated `demo_photos_flow.rs` | no |
 | R70 backup and restore story | STARTED 2026-09-22, nineteen decisions taken, steps 1 and 2's pre-R75 legs written into chapter 20, the chunk-store fix built (boot reconcile, `lost`, healing on native and browser, one content retention rule and pin API on both, heal entries in the outbox) | one subql request (decision 6) for the OpenFGA reconcile, and R75 for step 2's frontier leg. Decisions 4, 5, 8, 10, 18 and 19 are built, so every restore method resyncs its clients and revokes every session. Chapter 20 is shared with R73 | no |
-| R71 Linux key custody survives reboot | NOT STARTED, designed 2026-09-22 | nothing. Nine decisions in the section | no |
+| R71 Linux key custody survives reboot | NOT STARTED, designed 2026-09-22, two more decisions 2026-09-28 | nothing. Eleven decisions in the section | no |
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
 | R74 device identity and certificates | NOT STARTED | nothing | no |
 | R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
@@ -4979,19 +4979,21 @@ The story is written, and a Docker-gated test drives a client against a server r
 
 **Status.** NOT STARTED. Minted 2026-08-21: the 14-at-rest-encryption chapter records the behavior, the review found nobody owning it, and the same day's crypto discussion named it the one real safety failure the encryption has caused.
 
-**Blocked on nothing.** Nine decisions were taken with the maintainer on 2026-09-22, listed below.
+**Blocked on nothing.** Nine decisions were taken with the maintainer on 2026-09-22 and two more on 2026-09-28, listed below.
 
 ### Decisions
 
 1. **Every durable Linux secret survives a reboot** (2026-09-22). The replica key, the refresh token and R74's device key share one Linux custody, as they share one on macOS and Windows.
-2. **A desktop session keeps them in the Secret Service** (2026-09-22), through `zbus-secret-service-keyring-store`. Corrected the same day. This section used to charge the Secret Service with "the lock hazard that has already wedged this repository's own test runs", and the gate record of 2026-08-22 traced that wedge to a missing `keyctl session`, not to a locked collection. Its real costs are a D-Bus session bus and a collection that PAM unlocks at graphical login and that stays locked after an auto-login or over SSH.
+2. **A desktop session keeps them in the Secret Service** (2026-09-22), through `zbus-secret-service-keyring-store`. Corrected the same day. This section used to charge the Secret Service with "the lock hazard that has already wedged this repository's own test runs", and the gate record of 2026-08-22 traced that wedge to a missing `keyctl session`, not to a locked collection. Its real costs are a D-Bus session bus and a collection that PAM unlocks at graphical login and that stays locked after an auto-login or over SSH, which decision 10 answers. The store takes the crate's pure-Rust session encryption (`crypto-rust`), so it links no `libcrypto`, and which of the crate's runtime features works under connetto's tokio callers is measured before anything is built on it (2026-09-28).
 3. **A headless host keeps them under a systemd credential** (2026-09-22). The operator's unit declares `LoadCredentialEncrypted=` and connetto reads from `$CREDENTIALS_DIRECTORY`.
-4. **The credential holds a wrap key, and the secrets live beside it** (2026-09-22). The credential is a 32-byte key-encryption key. Each secret (replica key, refresh token, device key) is its own file under the unit's `$STATE_DIRECTORY`, sealed with XChaCha20-Poly1305 with the record name as associated data. `$CREDENTIALS_DIRECTORY` is read-only to the service, and the client writes a rotated refresh token and an enrolled device key, so a credential holding the secrets themselves has nowhere to put them.
-5. **Detect, else refuse unless the application opts in** (2026-09-22). A credential wins when the unit provides one, the Secret Service is used otherwise, and with neither reachable the client refuses with a typed error naming what it probed. An application may name its store explicitly, keyutils included, and choosing keyutils accepts losing every key at reboot, which the custody report then states. Rejected: refusing with no opt-in, which leaves a tool over SSH unable to sign in, and falling back to keyutils on its own, which keeps the loss R71 exists to end.
+4. **The credential holds a wrap key, and the secrets live beside it** (2026-09-22). The credential is a 32-byte key-encryption key. Each secret (replica key, refresh token, device key) is its own file under the unit's `$STATE_DIRECTORY`, named from its store's service and its record name and sealed with XChaCha20-Poly1305 with both as associated data, so two stores sharing one state directory can neither read nor swap each other's records (2026-09-28). `$CREDENTIALS_DIRECTORY` is read-only to the service, and the client writes a rotated refresh token and an enrolled device key, so a credential holding the secrets themselves has nowhere to put them.
+5. **Detect, else refuse unless the application opts in** (2026-09-22). A credential wins when the unit provides one, the Secret Service is used otherwise, and with neither reachable the client refuses with a typed error naming what it probed. An application may name its store explicitly, keyutils and decision 11's wrap-key file included, and choosing keyutils accepts losing every key at reboot, which the custody report then states. Rejected: refusing with no opt-in, which leaves a tool over SSH unable to sign in, and falling back to keyutils on its own, which keeps the loss R71 exists to end.
 6. **A key already in keyutils moves once** (2026-09-22). The first open after R71 reads it, writes it to the new store, reads it back, and only then clears the keyutils copy.
 7. **The gate and CI run the real Secret Service and a real systemd unit** (2026-09-22, the systemd half decided with the maintainer 2026-09-28). The Secret Service test group runs an unlocked `gnome-keyring-daemon` under `dbus-run-session`, locally and on the CI runners. The credential path is tested in two layers. Unit tests point `$CREDENTIALS_DIRECTORY` and `$STATE_DIRECTORY` at temporary directories and run everywhere. A root-only group runs the client inside transient system services started by `systemd-run` with `LoadCredentialEncrypted=`, over a wrap key sealed by `systemd-creds encrypt`, and with `StateDirectory=`, so systemd itself decrypts the credential, mounts its directory read-only and creates the state directory. That group is `#[ignore]`d, and CI runs it on `ubuntu-latest` through the runner's passwordless `sudo`. Every other test names its store explicitly. Rejected: a QEMU/KVM virtual machine rebooted between a write run and a read run, because once the secrets live on disk a reboot adds only a test of the distribution's disks, PAM and systemd, and a fresh process under a fresh session keyring already shows nothing depends on keyutils.
 8. **The bot file replica is not R71's** (2026-09-22). It edits the bot template, which only R91 produces, while `plans/apps-and-bots.md` (on R91's branch) said it "is gated on R71 and arrives with it" and the R91 rows here called it R71's to ship. No hard cycle existed, since R91 ships in-memory bots without it and R71's custody needs nothing from R91, but a template feature had been assigned to a custody phase. It is R93, which needs both, so R71 and R91 each close on their own. Rejected: a gated step inside R91, and one inside R71, either of which holds a phase open on the other.
 9. **The store is chosen per instance, not per process** (2026-09-22). Today `ensure_keyring_store` (`auth.rs`) installs one default store per process behind a `OnceLock`, so the choice is made once and cannot differ between two stores in one binary. Decisions 5 and 7 need both, an application naming its store and one test binary driving the Secret Service and the credential paths. So `KeyringKeyStore` and `KeyringStore` each hold the store they were constructed with, detection is the default constructor, and the process-global default stops being the mechanism.
+10. **A locked collection asks the desktop to unlock it, then refuses** (2026-09-28). The client calls the Secret Service's `Unlock` on the collection and completes the prompt it returns, so the desktop shows its own password dialog, as every libsecret application does after an auto-login. It waits up to a stated bound and refuses with a typed error when the dialog is dismissed, the bound passes, or no dialog can be shown, as over SSH. Rejected: refusing at once, which leaves an application unable to open its replica after an auto-login until the user unlocks the keyring some other way.
+11. **A headless host without systemd names a wrap-key file** (2026-09-28). The sealed-file store of decision 4 takes its 32-byte wrap key from either of two sources, the systemd credential decision 3 detects, or a key file and a state directory the application names as its explicit store under decision 5. That covers Docker and Kubernetes, which mount secrets as files and run no systemd, and where Docker's default seccomp profile blocks `keyctl`, so keyutils is not even available as an opt-in. The library reads no environment variable for it, and R91's bot template maps both paths from its own environment. Rejected: recording containers as unsupported, which leaves R93's bots without a durable store in a container.
 
 ### Purpose
 
@@ -4999,7 +5001,7 @@ On Linux the replica key lives in the kernel session keyring, which does not sur
 
 ### Steps
 
-1. Implement decisions 2 to 6 and 9 in `KeyringKeyStore`'s and `KeyringStore`'s Linux arms, leaving the other platforms' stores untouched.
+1. Implement decisions 2 to 6 and 9 to 11 in `KeyringKeyStore`'s and `KeyringStore`'s Linux arms, leaving the other platforms' stores untouched.
 2. Prove it with the list under Proof.
 3. Amend chapter 14's Linux custody paragraph.
 
@@ -5008,16 +5010,17 @@ On Linux the replica key lives in the kernel session keyring, which does not sur
 1. A key, a refresh token and a device key written by one process are read by a fresh process with a fresh session keyring, and the replica and tier reopen without a re-mint, under a real unlocked `gnome-keyring-daemon` and under a credential with `$CREDENTIALS_DIRECTORY` and `$STATE_DIRECTORY` pointing at temporary directories.
 2. A sealed record file holds no key bytes, a flipped byte fails the load with a typed error, a record file renamed to another record's name fails, and a wrong wrap key fails with a typed error and never mints a replacement key.
 3. With a credential and the Secret Service both present the credential wins, with only the Secret Service it is used, with neither the client refuses naming what it probed, and an explicit keyutils choice works with the custody report stating that the keys do not survive a reboot.
-4. A locked collection or an absent bus becomes a typed refusal within a stated bound, never a hang.
+4. With no dialog available or no bus, a locked collection becomes a typed refusal within the stated bound, never a hang. A dismissed dialog, a dialog left past the bound, and a collection unlocked through the dialog and then used are shown by a recorded manual run on a desktop session, since no CI runner has a prompter.
 5. A key held only in keyutils moves once and leaves keyutils empty, a failure between the write and the clear leaves both copies and the next open finishes the move, and a read-back that does not match aborts without clearing the old copy.
 6. After `wipe_replica`, logout or `forget_device`, a fresh process finds nothing in either durable store, and clearing the last account removes the index record.
 7. Two accounts stay apart on each store and `accounts()` enumerates them, and two stores on different backends in one process do not interfere.
 8. A rotated refresh token reloads as the latest, a record file is replaced by write then rename and is never torn, and every record file is mode `0600`.
 9. Under decision 7's real systemd unit, one transient service writes the replica key and the refresh token (and the device key once R74 builds it), a second transient service reads them back and reopens the replica without a re-mint, nothing is written under `$CREDENTIALS_DIRECTORY`, and every record file under `$STATE_DIRECTORY` is mode `0600`.
+10. With no systemd, a wrap-key file and a state directory named by the application let a second process read back what the first wrote, inside a container run under Docker's default seccomp profile with the key file mounted read-only as Docker mounts a secret, and a key file whose length is not 32 bytes is refused with a typed error.
 
 ### Done when
 
-A fresh Linux session reopens the replica and the device tier without re-minting under both durable stores, a moved key survives, a wiped key is gone from the durable store, and a second transient systemd service reads what the first one wrote, proven by test, and chapter 14 states the new custody.
+A fresh Linux session reopens the replica and the device tier without re-minting under both durable stores, a moved key survives, a wiped key is gone from the durable store, a second transient systemd service reads what the first one wrote, and a restarted container reads its keys back through a mounted wrap-key file, proven by test, and chapter 14 states the new custody.
 
 ---
 
@@ -5427,7 +5430,7 @@ Synced tables carry no references on either backend, enforcement is on at every 
 
 ### Purpose
 
-A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that declares device-local tables needs the file replica, encrypted under the replica key, whose Linux custody across a reboot R71's systemd credential provides. The template that has to offer it is R91's. This phase joins the two.
+A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that declares device-local tables needs the file replica, encrypted under the replica key, whose Linux custody across a reboot or a container restart R71's sealed-file store provides. The template that has to offer it is R91's. This phase joins the two.
 
 ### Decisions
 
@@ -5437,7 +5440,7 @@ A bot's replica is `Replica::in_memory()` per login (R91 decision 9). A bot that
 ### Steps
 
 1. The template opens `Replica::encrypted_file` with a tier when the bot declares device-local tables, and stays in memory otherwise.
-2. Its key custody is R71's detection, so the operator's unit supplies the wrap-key credential and `StateDirectory=`, and the template's guidance names both unit lines.
+2. Its key custody is R71's. Under systemd the operator's unit supplies the wrap-key credential and `StateDirectory=`, in a container the template maps R71 decision 11's wrap-key file and state directory from its environment, and the template's guidance names both setups.
 
 ### Proof
 
