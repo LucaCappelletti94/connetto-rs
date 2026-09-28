@@ -340,6 +340,8 @@ fn only_keyutils_is_lost_at_reboot() {
 
 #[derive(Clone, Copy, Debug)]
 enum Answer {
+    /// The service creates or unlocks at once and hands back no prompt.
+    Immediate,
     Never,
     Dismiss,
     Complete,
@@ -443,6 +445,13 @@ impl Service {
             .get("org.freedesktop.Secret.Collection.Label")
             .and_then(|value| <&str>::try_from(value).ok().map(str::to_owned));
         assert_eq!(label.as_deref(), Some("Default keyring"));
+        let mut state = self.0.state.lock().expect("fake state");
+        if matches!(state.answer, Answer::Immediate) {
+            let created = OwnedObjectPath::try_from(COLLECTION).expect("path");
+            state.alias = Some(created.clone());
+            state.locked = false;
+            return (created, OwnedObjectPath::try_from("/").expect("path"));
+        }
         (
             OwnedObjectPath::try_from("/").expect("path"),
             OwnedObjectPath::try_from(PROMPT).expect("path"),
@@ -452,6 +461,11 @@ impl Service {
     fn unlock(&self, objects: Vec<OwnedObjectPath>) -> (Vec<OwnedObjectPath>, OwnedObjectPath) {
         self.0.record("Unlock");
         assert_eq!(objects.len(), 1);
+        let mut state = self.0.state.lock().expect("fake state");
+        if matches!(state.answer, Answer::Immediate) {
+            state.locked = false;
+            return (objects, OwnedObjectPath::try_from("/").expect("path"));
+        }
         (Vec::new(), OwnedObjectPath::try_from(PROMPT).expect("path"))
     }
 }
@@ -478,7 +492,7 @@ impl Prompt {
         );
         let answer = self.0.state.lock().expect("fake state").answer;
         match answer {
-            Answer::Never => {}
+            Answer::Immediate | Answer::Never => {}
             Answer::Dismiss => {
                 Self::completed(&emitter, true, Value::from(""))
                     .await
@@ -679,4 +693,66 @@ async fn a_named_key_file_with_a_previous_key_reseals_and_reports_it_no_longer_n
             .as_deref(),
         Some("alice-refresh")
     );
+}
+
+#[tokio::test]
+async fn a_service_that_unlocks_without_a_prompt_needs_no_dialog() {
+    let (fake, bus) = FakeSecretService::start(Answer::Immediate).await;
+    ensure_default(&bus, Duration::from_secs(5))
+        .await
+        .expect("unlocked at once");
+    ensure_default(&bus, Duration::from_secs(5))
+        .await
+        .expect("already unlocked");
+    assert_eq!(fake.calls(), ["ReadAlias", "Unlock", "ReadAlias"]);
+}
+
+#[tokio::test]
+async fn a_service_that_creates_the_default_without_a_prompt_needs_no_dialog() {
+    let (fake, bus) = FakeSecretService::start_with(Answer::Immediate, false).await;
+    ensure_default(&bus, Duration::from_secs(5))
+        .await
+        .expect("created at once");
+    ensure_default(&bus, Duration::from_secs(5))
+        .await
+        .expect("found the second time");
+    assert_eq!(fake.calls(), ["ReadAlias", "CreateCollection", "ReadAlias"]);
+}
+
+#[test]
+fn a_truncated_record_refuses_rather_than_minting_or_panicking() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = sealed(dir.path(), &CURRENT, Some(&PREVIOUS));
+    store.write("keys", "alice", b"alice-key").expect("write");
+    let path = dir.path().join(stem("keys", "alice"));
+    let whole = std::fs::read(&path).expect("read");
+    // Empty, shorter than the header, and cut inside the nonce.
+    for length in [0, 3, 5 + 10] {
+        std::fs::write(&path, &whole[..length]).expect("truncate");
+        let err = store
+            .read("keys", "alice")
+            .expect_err("a truncated record refuses");
+        assert!(is_unsealable(&err), "length {length}: got {err}");
+    }
+}
+
+#[test]
+fn the_sandbox_keyring_lives_where_libsecret_puts_it() {
+    use std::ffi::OsString;
+    let path = |xdg: Option<&str>, home: Option<&str>| {
+        super::sandbox::keyring_path_from(xdg.map(OsString::from), home.map(OsString::from))
+    };
+    assert_eq!(
+        path(Some("/data"), Some("/home/app")),
+        Some("/data/keyrings/default.keyring".into())
+    );
+    for ignored in [Some(""), Some("relative/data"), None] {
+        assert_eq!(
+            path(ignored, Some("/home/app")),
+            Some("/home/app/.local/share/keyrings/default.keyring".into()),
+            "XDG_DATA_HOME {ignored:?} falls back to HOME"
+        );
+    }
+    assert_eq!(path(None, Some("")), None);
+    assert_eq!(path(None, None), None);
 }

@@ -1,6 +1,7 @@
 //! libsecret's sandbox keyring, a file opened with the Secret portal's
 //! per-application secret (R71 decision 14).
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use oo7::file::{Item, UnlockedKeyring};
@@ -84,13 +85,20 @@ impl Sandbox {
 
 /// libsecret's own path for the sandbox keyring, which `oo7` keeps crate-private.
 fn keyring_path() -> Option<PathBuf> {
-    let data = std::env::var_os("XDG_DATA_HOME")
+    keyring_path_from(std::env::var_os("XDG_DATA_HOME"), std::env::var_os("HOME"))
+}
+
+/// The keyring path under `XDG_DATA_HOME` when it is absolute, else under `HOME`.
+pub(super) fn keyring_path_from(
+    xdg_data_home: Option<OsString>,
+    home: Option<OsString>,
+) -> Option<PathBuf> {
+    let data = xdg_data_home
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .filter(|dir| dir.is_absolute())
         .or_else(|| {
-            std::env::var_os("HOME")
-                .filter(|home| !home.is_empty())
+            home.filter(|home| !home.is_empty())
                 .map(|home| PathBuf::from(home).join(".local/share"))
         })?;
     Some(data.join("keyrings").join("default.keyring"))
