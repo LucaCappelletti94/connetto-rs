@@ -53,6 +53,7 @@ native-auth = [
   "dep:webbrowser",
   "dep:open",
   "dep:getrandom",
+  "tokio/signal",
 ]
 
 [[bin]]

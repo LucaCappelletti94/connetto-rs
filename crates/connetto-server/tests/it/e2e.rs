@@ -99,21 +99,39 @@ pub(super) fn client_bin() -> PathBuf {
 }
 
 /// Kills its child on drop so a panicking assertion never leaks a process.
-pub(super) struct ChildGuard(Option<Child>);
+pub(super) struct ChildGuard {
+    child: Option<Child>,
+    terminate_first: bool,
+}
+
+/// How long a child asked to terminate may take before it is killed.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 
 impl ChildGuard {
     pub(super) fn new(child: Child) -> Self {
-        Self(Some(child))
+        Self {
+            child: Some(child),
+            terminate_first: false,
+        }
+    }
+
+    /// A guard that sends SIGTERM and waits before it kills, so an
+    /// instrumented child exits normally and writes its coverage.
+    pub(super) fn terminating(child: Child) -> Self {
+        Self {
+            child: Some(child),
+            terminate_first: true,
+        }
     }
 
     /// The child's exit status, if it has exited.
     fn exited(&mut self) -> Option<std::process::ExitStatus> {
-        self.0.as_mut()?.try_wait().ok().flatten()
+        self.child.as_mut()?.try_wait().ok().flatten()
     }
 
     /// Kill the child and collect what it wrote to its piped streams.
     pub(super) async fn kill_and_collect(mut self) -> std::process::Output {
-        let mut child = self.0.take().expect("a child the guard still holds");
+        let mut child = self.child.take().expect("a child the guard still holds");
         child.kill().expect("kill the child");
         tokio::task::spawn_blocking(move || child.wait_with_output())
             .await
@@ -124,10 +142,25 @@ impl ChildGuard {
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(child) = self.0.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+        let Some(child) = self.child.as_mut() else {
+            return;
+        };
+        if self.terminate_first
+            && Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .is_ok_and(|status| status.success())
+        {
+            let deadline = Instant::now() + TERMINATE_GRACE;
+            while Instant::now() < deadline {
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }
 
@@ -539,7 +572,7 @@ pub(super) fn spawn_client_env(
         command.env_remove("CONNETTO_WRITE");
     }
     let child = command.spawn().expect("spawn client");
-    ChildGuard::new(child)
+    ChildGuard::terminating(child)
 }
 
 /// Run a single DDL/DML statement in its own transaction (autocommit).

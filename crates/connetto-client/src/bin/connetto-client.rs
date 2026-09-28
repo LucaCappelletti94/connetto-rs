@@ -28,7 +28,8 @@
 //!   Postgres.
 //!
 //! Connects, subscribes, and pumps inbound frames, printing each client event
-//! until the server closes the connection. When `CONNETTO_WRITE` is set, the
+//! until the server closes the connection or a SIGINT or SIGTERM arrives, either
+//! of which ends the process normally. When `CONNETTO_WRITE` is set, the
 //! client applies those writes locally and pushes them right after subscribing,
 //! then observes its own rows echoed back over CDC.
 
@@ -48,6 +49,34 @@ const KEYRING_SERVICE: &str = "connetto-client";
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
+    // Armed before any work, so a SIGTERM at any point ends the process by returning from main.
+    let terminated = terminate_signal()?;
+    tokio::select! {
+        result = run() => result,
+        () = terminated => {
+            tracing::info!("terminated");
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on the first SIGINT, or on unix the first SIGTERM.
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+async fn run() -> Result<()> {
     let server = var_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
     let db_path = std::env::var("CONNETTO_DB").context("set CONNETTO_DB to a file path")?;
     let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
