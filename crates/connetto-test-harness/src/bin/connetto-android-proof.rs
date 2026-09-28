@@ -48,6 +48,8 @@ const INTERSTITIALS: [&str; 3] = [
     "com.android.chrome:id/terms_accept",
 ];
 const BROWSER_ROLE: &str = "android.app.role.BROWSER";
+/// The global setting `svc power stayon` writes.
+const STAY_ON: &str = "stay_on_while_plugged_in";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -67,6 +69,8 @@ async fn main() -> Result<()> {
     // The login tab is read through Chrome's DevTools socket, so Chrome holds
     // the browser role for the run and the device's own choice returns after.
     let previous = device.browser_role_holder().await?;
+    // The proof keeps the screen on, and a phone left on the cable must not stay lit after it.
+    let stay_on = device.stay_on().await?;
     device.set_browser_role_holder(BROWSER).await?;
     let outcome = prove(&device, apk, &stack, &evidence).await;
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
@@ -94,7 +98,20 @@ async fn main() -> Result<()> {
             .await
             .map(drop),
     };
-    outcome.and(restored)
+    let screen = match stay_on.as_deref() {
+        Some(value) => {
+            device
+                .adb(&["shell", "settings", "put", "global", STAY_ON, value])
+                .await
+        }
+        None => {
+            device
+                .adb(&["shell", "settings", "delete", "global", STAY_ON])
+                .await
+        }
+    }
+    .map(drop);
+    outcome.and(restored).and(screen)
 }
 
 /// What `connetto-demo-stack` tells its command.
@@ -441,6 +458,16 @@ impl Device {
             .split(';')
             .map(str::trim)
             .find(|holder| !holder.is_empty())
+            .map(ToOwned::to_owned))
+    }
+
+    /// The device's own stay-on setting, `None` when it holds none.
+    async fn stay_on(&self) -> Result<Option<String>> {
+        let value = self
+            .adb(&["shell", "settings", "get", "global", STAY_ON])
+            .await?;
+        Ok(Some(value.trim())
+            .filter(|value| *value != "null")
             .map(ToOwned::to_owned))
     }
 
