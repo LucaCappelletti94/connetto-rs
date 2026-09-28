@@ -362,7 +362,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
     let oplog = InMemoryOplog::new(
         OplogConfig::new()
             .with_max_entries(2)
-            .with_max_age(Duration::from_secs(72 * 60 * 60)),
+            .with_max_age(Duration::from_hours(72)),
     );
     let manager = SessionManager::with_oplog(
         materializer,

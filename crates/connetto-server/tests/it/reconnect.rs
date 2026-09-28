@@ -393,7 +393,7 @@ async fn cursor_outside_window_forces_full_resync() {
     let oplog = InMemoryOplog::new(
         OplogConfig::new()
             .with_max_entries(2)
-            .with_max_age(Duration::from_secs(72 * 60 * 60)),
+            .with_max_age(Duration::from_hours(72)),
     );
     let manager = SessionManager::with_oplog(
         materializer,

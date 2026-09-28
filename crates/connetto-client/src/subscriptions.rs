@@ -153,12 +153,12 @@ fn decode_bind(kind: i32, value: Option<Vec<u8>>) -> Result<BindValue, ClientErr
 
 /// How long a watch-backed subscription outlives its last handle by default.
 /// Navigating away and back inside this window pays no fresh snapshot.
-pub const DEFAULT_GRACE: Duration = Duration::from_secs(5 * 60);
+pub const DEFAULT_GRACE: Duration = Duration::from_mins(5);
 
 /// The longest grace any watch may ask for. Wanting to outlive this is by
 /// definition a pin, and the cap is what enforces that boundary mechanically
 /// rather than by documentation.
-pub const MAX_GRACE: Duration = Duration::from_secs(10 * 60);
+pub const MAX_GRACE: Duration = Duration::from_mins(10);
 
 /// One row of the join behind [`declared`]: id, query text, priority, pin
 /// name, stop moment, grace.
@@ -754,7 +754,7 @@ mod tests {
     fn a_grace_past_the_cap_is_clamped() {
         let mut db = replica();
         let spec = SubscriptionSpec::new("SELECT * FROM orders");
-        remember(&mut db, "wire-0", &spec, Duration::from_secs(60 * 60 * 24)).expect("remember");
+        remember(&mut db, "wire-0", &spec, Duration::from_hours(24)).expect("remember");
         let stored: i64 = subscription::table
             .filter(subscription::id.eq("wire-0"))
             .select(subscription::grace_secs)

@@ -21,18 +21,18 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 /// Default access-token lifetime. Short by design: a re-auth cadence, not the
 /// revocation bound.
-const DEFAULT_ACCESS_TTL: Duration = Duration::from_secs(15 * 60);
+const DEFAULT_ACCESS_TTL: Duration = Duration::from_mins(15);
 /// Default sliding refresh window, extended on each successful online refresh.
-const DEFAULT_REFRESH_IDLE_WINDOW: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const DEFAULT_REFRESH_IDLE_WINDOW: Duration = Duration::from_hours(336);
 /// Default absolute refresh ceiling, a hard maximum regardless of use.
-const DEFAULT_REFRESH_ABSOLUTE_CEILING: Duration = Duration::from_secs(90 * 24 * 60 * 60);
+const DEFAULT_REFRESH_ABSOLUTE_CEILING: Duration = Duration::from_hours(2160);
 /// Default window in which a caller with no identity may keep resuming.
-const DEFAULT_RESUME_TTL: Duration = Duration::from_secs(14 * 24 * 60 * 60);
+const DEFAULT_RESUME_TTL: Duration = Duration::from_hours(336);
 /// Default share-key lifetime. A week is the ordinary span of a share link.
-const DEFAULT_CAPABILITY_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+const DEFAULT_CAPABILITY_TTL: Duration = Duration::from_hours(168);
 /// Default ceiling on a share-key lifetime. It is what makes "a share key must
 /// expire" something the server enforces rather than advice.
-const DEFAULT_CAPABILITY_MAX_TTL: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const DEFAULT_CAPABILITY_MAX_TTL: Duration = Duration::from_hours(720);
 
 /// Server-side authentication configuration: token identity and lifetimes.
 ///

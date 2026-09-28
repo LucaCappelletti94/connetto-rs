@@ -518,6 +518,7 @@ pub(super) fn spawn_client_env(
     let mut command = Command::new(client_bin());
     command
         .env("CONNETTO_SERVER", ws)
+        .env("CONNETTO_KEY_STORE", "keyutils")
         .env("CONNETTO_DB", db_path)
         .env("CONNETTO_SQLITE_DDL", sqlite_ddl)
         // The client hashes the SAME canonical source the server does, so the
