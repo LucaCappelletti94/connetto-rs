@@ -156,19 +156,19 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R70 | Backup and restore. Step 4's OpenFGA reconcile waits on one subql request, and step 2's frontier leg on R75, whose frontier is what it demonstrates against |
 | any | R71 | Linux replica-key custody. Independent, and it makes R74's Linux caveat go away |
 | any | R72 | Clock discipline. Independent, and it absorbs the certificate clock rule R74 states |
-| any | R74 | Device identity and certificates, first of the peer phases. Needs nothing |
+| blocked | R74 | Device identity and certificates, first of the peer phases. Blocked on R94, whose builders take the device key's store, the certificate lifetime setting and the enrolment step |
 | any | R75 | The per-device applied frontier. Needs R74 |
-| any | R76 | The peer link. Needs R74, and R88 for its platform notes to be real on a phone |
+| any | R76 | The peer link. Needs R74 |
 | any | R77 | The exchange and the provisional tier. Needs R75, R76 and R57 step 8 |
 | any | R78 | Courier recovery. Needs R75 and R77 |
 | any | R79 | Media over the peer link. Needs R77 and R67 |
-| any | R80 | Peer sync in every demo. Needs R77, R78, R79 and R88 |
+| any | R80 | Peer sync in every demo. Needs R77, R78 and R79 |
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | done | ~~R90~~ | The browser's refresh token into an `HttpOnly` cookie |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
 | any | R92 | Synced tables without local references, with SQLite's own enforcement for the tier. Needs nothing |
 | any | R93 | The file replica for bots. Needs R71's headless custody and R91's template |
-| any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52 and R95 wait on it |
+| any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52, R74 and R95 wait on it |
 | blocked | R95 | Share keys added and removed on a running client. Blocked on R94 |
 | any | R96 | One server builder for programs that embed the server. Minted undesigned, so it starts with its design |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
@@ -267,7 +267,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R70 backup and restore story | STARTED 2026-09-22, nineteen decisions taken, steps 1 and 2's pre-R75 legs written into chapter 20, the chunk-store fix built (boot reconcile, `lost`, healing on native and browser, one content retention rule and pin API on both, heal entries in the outbox) | one subql request (decision 6) for the OpenFGA reconcile, and R75 for step 2's frontier leg. Decisions 4, 5, 8, 10, 18 and 19 are built, so every restore method resyncs its clients and revokes every session. Chapter 20 is shared with R73 | no |
 | R71 Linux key custody survives reboot | NOT STARTED, designed 2026-09-22 | nothing. Nine decisions in the section | no |
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
-| R74 device identity and certificates | NOT STARTED | nothing | no |
+| R74 device identity and certificates | NOT STARTED | R94, whose builders take the device key's store, the certificate lifetime setting and the enrolment step (decided 2026-09-28) | no |
 | R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
 | R76 the peer link | NOT STARTED | R74 | no |
 | R77 the peer exchange and provisional tier | NOT STARTED | R75 and R76. The retraction's reason rides on R57 step 8's fix | no |
@@ -404,6 +404,7 @@ graph TD
   R94 --> R52
   U9[upstream android-native-keyring-store:<br/>one approval opens the store until locked] -.->|patched until released| R52
   R94 --> R95[R95 share keys on a running client]
+  R94 --> R74
   R96[R96 one server builder]
   R26 --> R56[R56 local data import]
   R54[R54 every demo carries every feature] --> R57[R57 demo gaps from the export audit]
@@ -5047,7 +5048,9 @@ X6 is closed with a per-timer rule recorded, and the code matches the rule every
 
 **Status.** NOT STARTED. First of the seven peer-sync phases R25's design derived on 2026-08-22 at the maintainer's instruction. R25's section and chapter 19 are normative wherever these seven are silent.
 
-**Blocked on nothing.** Two edges weighed 2026-09-12 with the maintainer and left unblocking. R71: on Linux the device key rides the kernel session keyring beside the replica key and both die at reboot, so a rebooted Linux device has already lost its replica and the device key's loss adds no failure of its own. R71 fixes both keys at once and this phase states the caveat rather than waiting. R72: certificate validity is the one wall-clock check a peer cannot correct against a server, so step 4 below states the clock rule itself and R72's later inventory cites it. Rejected: R71 gating the whole peer programme on a Linux custody decision whose every candidate has a named cost, and R72 preceding with an inventory that touches only built code.
+**Blocked on** R94 (decided with the maintainer 2026-09-28). This phase adds a third secret beside the two stores R94 decision 15 injects by setter, an application-requested certificate lifetime, and an enrolment run after sign-in inside the connection sequence R94 step 3 moves into `connect()`. R94 decisions 11 and 15 make `ClientConfig` and `ConnettoConnection::connect` internal, so the device key's store, its protection report under R94 decision 13, the lifetime setting and the enrolment are built once, on the builders. R96 does not gate it, because the server half (the CA keypair checked at startup and the lifetime ceiling) is server settings types with R37 setters, which R96's builder gathers.
+
+Two edges weighed 2026-09-12 with the maintainer and left unblocking. R71: on Linux the device key rides the kernel session keyring beside the replica key and both die at reboot, so a rebooted Linux device has already lost its replica and the device key's loss adds no failure of its own. R71 fixes both keys at once and this phase states the caveat rather than waiting. R72: certificate validity is the one wall-clock check a peer cannot correct against a server, so step 4 below states the clock rule itself and R72's later inventory cites it. Rejected: R71 gating the whole peer programme on a Linux custody decision whose every candidate has a named cost, and R72 preceding with an inventory that touches only built code.
 
 ### Purpose
 
@@ -5455,7 +5458,7 @@ The template ships the file-replica path for bots with device-local tables, prov
 
 **Status.** NOT STARTED, designed 2026-09-25 with the maintainer while planning R51, and five points left open against the tree at `674e722` decided with the maintainer on 2026-09-28 (decisions 3, 9, 10, 12, 14 and 15). The working notes, with the tree facts each 2026-09-25 decision rests on, are in `plans/client-builder.md` of the `connetto-rs-r88` worktree, copied to `~/.local/share/connetto-r88/notes/client-builder.md`.
 
-**Blocked on nothing.** R51 and R52 wait on it for the `Gate` setting, and R95 for the starting set of share keys.
+**Blocked on nothing.** R51 and R52 wait on it for the `Gate` setting, R74 for the device key's store, the certificate lifetime setting and the enrolment step, and R95 for the starting set of share keys.
 
 ### Purpose
 
