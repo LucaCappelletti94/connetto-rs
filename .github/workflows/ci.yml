@@ -575,14 +575,31 @@ jobs:
             -- \
             --build-only browser-bins
 
+      # The Android emulator job runs these against browser-bins' server.
+      - name: Build the Android proof
+        run: |
+          cargo +stable build \
+            -p connetto-test-harness \
+            --bin connetto-demo-stack \
+            --bin connetto-android-proof
+          mkdir android-bins
+          cp target/debug/connetto-demo-stack target/debug/connetto-android-proof android-bins/
+
       # The debug stack is mostly DWARF. Panic locations do not need it.
       - name: Strip debug sections from the prebuilt binaries
-        run: strip --strip-debug browser-bins/*
+        run: strip --strip-debug browser-bins/* android-bins/*
 
       - uses: actions/upload-artifact@v7
         with:
           name: browser-bins
           path: browser-bins
+          retention-days: 1
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android-bins
+          path: android-bins
           retention-days: 1
           if-no-files-found: error
 
@@ -664,6 +681,115 @@ jobs:
         run: |
           rm -rf target-wasm/wasm32-unknown-unknown/debug/incremental
           rm -rf target-wasm/debug/incremental
+
+  android-emulator:
+    # R88's proof, walked on an emulator from the APK dx bundles, so the
+    # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
+    name: Android emulator proof
+    needs: browser-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Cache cargo downloads
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            dl-${{ runner.os }}-
+
+      - name: Cache the demo's build output
+        uses: actions/cache@v6
+        with:
+          path: examples/dioxus-desktop-demo/target
+          key: t-android-emulator-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
+          restore-keys: |
+            t-android-emulator-${{ runner.os }}-
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: browser-bins
+          path: browser-bins
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: android-bins
+          path: android-bins
+
+      # Artifacts drop the executable bit.
+      - name: Mark the prebuilt binaries executable
+        run: chmod +x browser-bins/* android-bins/*
+
+      - name: Install stable toolchain with the emulator's target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add x86_64-linux-android --toolchain stable
+
+      - name: Install dx
+        run: |
+          base=https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10
+          curl -fsSLO "$base/dx-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL "$base/dx-x86_64-unknown-linux-gnu.sha256" \
+            | grep ' dx-x86_64-unknown-linux-gnu.tar.gz$' \
+            | sha256sum --check
+          tar xzf dx-x86_64-unknown-linux-gnu.tar.gz -C ~/.cargo/bin dx
+          rm dx-x86_64-unknown-linux-gnu.tar.gz
+          dx --version
+
+      - name: Point dx at the runner's Android SDK
+        run: |
+          ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+          echo "ANDROID_NDK_HOME=$ndk" >> "${GITHUB_ENV}"
+          echo "NDK_HOME=$ndk" >> "${GITHUB_ENV}"
+          echo "${ANDROID_HOME}/platform-tools" >> "${GITHUB_PATH}"
+
+      # The same command the proof runs without --apk, built before the
+      # emulator boots so the emulator's time goes to the proof.
+      - name: Build the demo's APK
+        working-directory: examples/dioxus-desktop-demo
+        run: |
+          dx build \
+            --android \
+            --target x86_64-linux-android \
+            --no-default-features \
+            --features mobile
+
+      - uses: ./.github/actions/pull-test-images
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Walk the proof on an emulator
+        uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+        env:
+          CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          script: android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --apk examples/dioxus-desktop-demo/target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: android-proof-evidence
+          path: target/android-proof
+          retention-days: 7
+
+      - name: Prune the demo's target cache
+        if: always()
+        run: |
+          rm -rf examples/dioxus-desktop-demo/target/debug/incremental
+          rm -rf examples/dioxus-desktop-demo/target/x86_64-linux-android/debug/incremental
 
   file-core-wasm:
     name: File core wasm

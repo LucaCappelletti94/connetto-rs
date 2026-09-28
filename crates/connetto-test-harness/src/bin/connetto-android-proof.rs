@@ -257,16 +257,20 @@ async fn sign_in_across_a_killed_process(
     step("sign in across a killed process");
     let mut tab = device.login_tab(issuer).await?;
     let killed = device.adb(&["shell", "pidof", PACKAGE]).await?;
-    device.adb(&["shell", "am", "kill", PACKAGE]).await?;
     let deadline = Instant::now() + Duration::from_secs(10);
-    while device.adb(&["shell", "pidof", PACKAGE]).await.is_ok() {
+    // `am kill` spares a visible process, and the app stays visible briefly after the tab opens.
+    loop {
+        device.adb(&["shell", "am", "kill", PACKAGE]).await?;
+        sleep(Duration::from_millis(250)).await;
+        if device.adb(&["shell", "pidof", PACKAGE]).await.is_err() {
+            break;
+        }
         if Instant::now() >= deadline {
             bail!(
                 "the backgrounded app (pid {}) was not killed",
                 killed.trim()
             );
         }
-        sleep(Duration::from_millis(250)).await;
     }
     submit_login(&mut tab).await?;
     drop(tab);
