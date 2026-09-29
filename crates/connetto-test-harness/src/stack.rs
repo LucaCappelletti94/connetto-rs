@@ -344,9 +344,11 @@ pub const TLS_KEY_VAR: &str = "CONNETTO_STACK_TLS_KEY";
 /// The variables naming services a stack uses in place of the containers it
 /// would start, all three together. See [`RunningServices`].
 pub const POSTGRES_URL_VAR: &str = "CONNETTO_STACK_POSTGRES_URL";
-/// See [`POSTGRES_URL_VAR`].
+/// See [`POSTGRES_URL_VAR`]. A fixture also uses it alone, see
+/// [`Fixture::acquire`](crate::Fixture::acquire).
 pub const OPENFGA_URL_VAR: &str = "CONNETTO_STACK_OPENFGA_URL";
-/// See [`POSTGRES_URL_VAR`].
+/// See [`POSTGRES_URL_VAR`]. A provider also uses it alone, see
+/// [`MockOauth::start`](crate::MockOauth::start).
 pub const ISSUER_VAR: &str = "CONNETTO_STACK_ISSUER";
 
 /// Services something else started for a stack, where Docker cannot run.
@@ -609,8 +611,6 @@ mod tests {
         assert_eq!(services.issuer, format!("{ISSUER_VAR}-value"));
     }
 
-    #[test]
-    fn no_variable_leaves_the_containers() {
     /// Fixtures made in one instant each start a cluster in a directory of
     /// their own, so two directories made back to back must differ.
     #[tokio::test]
@@ -622,6 +622,8 @@ mod tests {
         }
     }
 
+    #[test]
+    fn no_variable_leaves_the_containers() {
         assert!(RunningServices::from_lookup(lookup(&[])).unwrap().is_none());
     }
 
