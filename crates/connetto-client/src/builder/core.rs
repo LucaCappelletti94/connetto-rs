@@ -224,6 +224,111 @@ pub(crate) struct ShareKeys {
     pub(crate) keys: Vec<(Grant, String)>,
 }
 
+impl ShareKeys {
+    /// The keys `keys` names, rendered through their own key type.
+    pub(crate) fn new<K: CapabilityKey>(
+        keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
+    ) -> Self {
+        Self {
+            separator: K::SEPARATOR,
+            keys: keys
+                .into_iter()
+                .map(|(grant, subject)| (grant, subject.key().to_string()))
+                .collect(),
+        }
+    }
+}
+
+impl<T: Transport, C> Base<T, C> {
+    /// The same build with `content` as its content piece.
+    pub(crate) fn with_content<A>(self, content: A) -> Base<T, A> {
+        Base {
+            schema: self.schema,
+            tuning: self.tuning,
+            policy: self.policy,
+            content: Some(content),
+            share_keys: self.share_keys,
+            dialer: self.dialer,
+            sleeper: self.sleeper,
+            client_id: self.client_id,
+        }
+    }
+
+    /// The same build dialing through `dialer`.
+    #[cfg(feature = "native-transport")]
+    pub(crate) fn with_dialer<U: Transport>(self, dialer: BoxedDialer<U>) -> Base<U, C> {
+        Base {
+            schema: self.schema,
+            tuning: self.tuning,
+            policy: self.policy,
+            content: self.content,
+            share_keys: self.share_keys,
+            dialer,
+            sleeper: self.sleeper,
+            client_id: self.client_id,
+        }
+    }
+}
+
+/// The setters the core builder and the native layer over it share before
+/// the sign-in fork, written once for both.
+macro_rules! base_setters {
+    ($builder:ident) => {
+        /// The tuning levers the build carries.
+        #[must_use]
+        pub fn with_tuning(mut self, tuning: SyncTuning) -> Self {
+            self.base.tuning = tuning;
+            self
+        }
+
+        /// The reconnect policy the pump drives.
+        #[must_use]
+        pub fn with_reconnect(mut self, policy: ReconnectPolicy) -> Self {
+            self.base.policy = policy;
+            self
+        }
+
+        /// The client id an anonymous build presents, replacing the core
+        /// prefix. A signed-in build presents the replica name the credential
+        /// carries, so this names nothing there.
+        #[must_use]
+        pub fn with_client_id(mut self, id: impl Into<String>) -> Self {
+            self.base.client_id = Some(id.into());
+            self
+        }
+
+        /// Attach content handling, the platform's file layer plugged in
+        /// through [`AttachContent`].
+        #[must_use]
+        pub fn with_content<A>(self, content: A) -> $builder<T, A>
+        where
+            A: AttachContent<T>,
+        {
+            $builder {
+                base: self.base.with_content(content),
+            }
+        }
+
+        /// Present the share keys the build holds, each beside the subject it
+        /// renders as. The subject function is the core constant, never
+        /// settable, and its separator is the key's.
+        ///
+        /// The build applies them to the replica's subjects function and the
+        /// handshake on every platform, so the replica's local answer and the
+        /// server's binding agree about which keys are held.
+        #[must_use]
+        pub fn with_share_keys<K: CapabilityKey>(
+            mut self,
+            keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
+        ) -> Self {
+            self.base.share_keys = Some(ShareKeys::new(keys));
+            self
+        }
+    };
+}
+#[cfg(feature = "native-transport")]
+pub(crate) use base_setters;
+
 /// The resolved inputs a connect runs, owned so the pump it returns borrows
 /// nothing.
 pub(crate) struct RunInputs {
@@ -300,20 +405,15 @@ pub(crate) fn build_config(
         .with_sql_functions(schema.sql_functions().clone())
         .with_policy_tables(schema.policy_tables().clone())
         .with_unrecorded_tables(schema.unrecorded_tables().iter().cloned())
-        .with_trim_threshold(tuning.trim_threshold())
-        .with_trim_budget(tuning.trim_budget())
-        .with_rested_statistics_cap(tuning.rested_statistics_cap())
-        .with_residual_threshold(tuning.residual_threshold())
-        .with_residual_pass(tuning.residual_pass())
+        .with_tuning(*tuning)
         .with_custody(custody)
 }
 
-/// The config aspects the build folds into the base config after it, the
-/// default watch grace and the share keys, applied on every platform so the
-/// replica's subjects function and the handshake agree about the keys held.
+/// The share keys the build folds into the base config after it, applied on
+/// every platform so the replica's subjects function and the handshake agree
+/// about the keys held.
 pub(crate) fn fold_config_aspects(
     config: ClientConfig,
-    tuning: &SyncTuning,
     share_keys: Option<ShareKeys>,
 ) -> ClientConfig {
     // The subjects function is registered even for a build holding no key,
@@ -322,9 +422,7 @@ pub(crate) fn fold_config_aspects(
         separator: <String as CapabilityKey>::SEPARATOR,
         keys: Vec::new(),
     });
-    config
-        .with_watch_grace(tuning.watch_grace())
-        .with_share_keys_rendered(keys.separator, keys.keys)
+    config.with_share_keys_rendered(keys.separator, keys.keys)
 }
 
 /// A running connetto client a build's terminal returns.
@@ -477,28 +575,7 @@ where
     T::Error: Display,
     C: AttachContent<T>,
 {
-    /// The tuning levers the build carries.
-    #[must_use]
-    pub fn with_tuning(mut self, tuning: SyncTuning) -> Self {
-        self.base.tuning = tuning;
-        self
-    }
-
-    /// The reconnect policy the pump drives.
-    #[must_use]
-    pub fn with_reconnect(mut self, policy: ReconnectPolicy) -> Self {
-        self.base.policy = policy;
-        self
-    }
-
-    /// The client id an anonymous build presents, replacing the core
-    /// prefix. A signed-in build presents the replica name the credential
-    /// carries, so this names nothing there.
-    #[must_use]
-    pub fn with_client_id(mut self, id: impl Into<String>) -> Self {
-        self.base.client_id = Some(id.into());
-        self
-    }
+    base_setters!(ClientBuilder);
 
     /// The backoff sleep the reconnect driver waits on, replacing the
     /// platform default. The closure resolves a fresh future per pause, so a
@@ -511,59 +588,6 @@ where
     {
         let boxed: SleeperFn = Box::new(move |d| Box::pin(sleeper(d)));
         self.base.sleeper = Some(boxed);
-        self
-    }
-
-    /// Attach content handling, the platform's file layer plugged in through
-    /// [`AttachContent`].
-    #[must_use]
-    pub fn with_content<A>(self, content: A) -> ClientBuilder<T, A>
-    where
-        A: AttachContent<T>,
-    {
-        let Base {
-            schema,
-            tuning,
-            policy,
-            content: _,
-            share_keys,
-            dialer,
-            sleeper,
-            client_id,
-        } = self.base;
-        ClientBuilder {
-            base: Base {
-                schema,
-                tuning,
-                policy,
-                content: Some(content),
-                share_keys,
-                dialer,
-                sleeper,
-                client_id,
-            },
-        }
-    }
-
-    /// Present the share keys the build holds, each beside the subject it
-    /// renders as. The subject function is the core constant, never
-    /// settable, and its separator is the key's.
-    ///
-    /// The build applies them to the replica's subjects function and the
-    /// handshake on every platform, so the replica's local answer and the
-    /// server's binding agree about which keys are held.
-    #[must_use]
-    pub fn with_share_keys<K: CapabilityKey>(
-        mut self,
-        keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
-    ) -> Self {
-        self.base.share_keys = Some(ShareKeys {
-            separator: K::SEPARATOR,
-            keys: keys
-                .into_iter()
-                .map(|(grant, subject)| (grant, subject.key().to_string()))
-                .collect(),
-        });
         self
     }
 
@@ -641,32 +665,7 @@ where
     ///
     /// [`ClientError`] on a dial, database, or handshake failure.
     pub async fn connect_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        let mut base = self.base;
-        let client_id = base
-            .client_id
-            .take()
-            .unwrap_or_else(|| REPLICA_PREFIX.to_owned());
-        let tier = base.schema.local_tier_ddl().map(str::to_owned);
-        let replica = in_memory_replica(tier.as_deref());
-        let config = build_config(
-            &base.schema,
-            &base.tuning,
-            &client_id,
-            None,
-            None,
-            Custody::Ephemeral,
-        );
-        let config = fold_config_aspects(config, &base.tuning, base.share_keys);
-        offline_connect_core(
-            &replica,
-            &base.schema,
-            &config,
-            true,
-            None,
-            &mut base.dialer,
-            FirstDial::Required,
-        )
-        .await
+        self.driven().connect().await
     }
 
     /// Open anonymous and in memory with no transport, returning the
@@ -677,23 +676,25 @@ where
     ///
     /// [`ClientError`] on a database or cipher failure.
     pub fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
+        self.driven().open()
+    }
+
+    /// The anonymous build's driven inputs.
+    fn driven(self) -> Driven<T> {
         let mut base = self.base;
         let client_id = base
             .client_id
             .take()
             .unwrap_or_else(|| REPLICA_PREFIX.to_owned());
-        let tier = base.schema.local_tier_ddl().map(str::to_owned);
-        let replica = in_memory_replica(tier.as_deref());
-        let config = build_config(
-            &base.schema,
-            &base.tuning,
-            &client_id,
-            None,
-            None,
-            Custody::Ephemeral,
-        );
-        let config = fold_config_aspects(config, &base.tuning, base.share_keys);
-        open_driven_core(&replica, &base.schema, &config, true, None)
+        Driven {
+            base,
+            client_id,
+            login: None,
+            caller: None,
+            custody: Custody::Ephemeral,
+            token_source: None,
+            replica: DrivenReplica::InMemory,
+        }
     }
 }
 
@@ -794,29 +795,7 @@ where
     ///
     /// [`ClientError`] on a dial, database, or handshake failure.
     pub async fn connect_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        let mut base = self.base;
-        let (name, caller, login, token_source) = self.credential.into_parts();
-        let tier = base.schema.local_tier_ddl().map(str::to_owned);
-        let replica = in_memory_replica(tier.as_deref());
-        let config = build_config(
-            &base.schema,
-            &base.tuning,
-            &name,
-            Some(login),
-            Some(&caller),
-            Custody::Ephemeral,
-        );
-        let config = fold_config_aspects(config, &base.tuning, base.share_keys);
-        offline_connect_core(
-            &replica,
-            &base.schema,
-            &config,
-            true,
-            token_source,
-            &mut base.dialer,
-            FirstDial::Required,
-        )
-        .await
+        self.driven().connect().await
     }
 
     /// Open signed in, in memory, with no transport, returning the unstarted,
@@ -827,20 +806,21 @@ where
     ///
     /// [`ClientError`] on a database or cipher failure.
     pub fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        let base = self.base;
+        self.driven().open()
+    }
+
+    /// The signed-in build's driven inputs.
+    fn driven(self) -> Driven<T> {
         let (name, caller, login, token_source) = self.credential.into_parts();
-        let tier = base.schema.local_tier_ddl().map(str::to_owned);
-        let replica = in_memory_replica(tier.as_deref());
-        let config = build_config(
-            &base.schema,
-            &base.tuning,
-            &name,
-            Some(login),
-            Some(&caller),
-            Custody::Ephemeral,
-        );
-        let config = fold_config_aspects(config, &base.tuning, base.share_keys);
-        open_driven_core(&replica, &base.schema, &config, true, token_source)
+        Driven {
+            base: self.base,
+            client_id: name,
+            login: Some(login),
+            caller: Some(caller),
+            custody: Custody::Ephemeral,
+            token_source,
+            replica: DrivenReplica::InMemory,
+        }
     }
 }
 
@@ -1110,38 +1090,7 @@ where
     /// [`ClientError`] on a key, dial, database, or handshake failure,
     /// including a first dial that fails, since nothing here retries it.
     pub async fn connect_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        let DurableResolved {
-            mut base,
-            name,
-            caller,
-            login,
-            token_source,
-            key,
-            located,
-            ddl,
-            custody,
-            ..
-        } = self.resolve().await?;
-        let replica = open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref())?;
-        let config = build_config(
-            &base.schema,
-            &base.tuning,
-            &name,
-            Some(login),
-            Some(&caller),
-            custody,
-        );
-        let config = fold_config_aspects(config, &base.tuning, base.share_keys);
-        offline_connect_core(
-            &replica,
-            &base.schema,
-            &config,
-            !located.exists,
-            token_source,
-            &mut base.dialer,
-            FirstDial::Required,
-        )
-        .await
+        self.driven().await?.connect().await
     }
 
     /// Open the durable replica with no transport, returning the unstarted
@@ -1152,6 +1101,11 @@ where
     ///
     /// [`ClientError`] on a key, database, or cipher failure.
     pub async fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
+        self.driven().await?.open()
+    }
+
+    /// The durable build's driven inputs, once its key is resolved.
+    async fn driven(self) -> Result<Driven<T>, ClientError> {
         let DurableResolved {
             base,
             name,
@@ -1160,27 +1114,121 @@ where
             token_source,
             key,
             located,
-            ddl,
             custody,
             ..
         } = self.resolve().await?;
-        let replica = open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref())?;
-        let config = build_config(
-            &base.schema,
-            &base.tuning,
-            &name,
-            Some(login),
-            Some(&caller),
+        Ok(Driven {
+            base,
+            client_id: name,
+            login: Some(login),
+            caller: Some(caller),
             custody,
-        );
-        let config = fold_config_aspects(config, &base.tuning, base.share_keys);
-        open_driven_core(
-            &replica,
-            &base.schema,
-            &config,
-            !located.exists,
             token_source,
-        )
+            replica: DrivenReplica::Encrypted { located, key },
+        })
+    }
+}
+
+/// Where a driven terminal opens its replica.
+enum DrivenReplica {
+    /// In process, with the device-private tier when the schema has one.
+    InMemory,
+    /// The located file under its key.
+    Encrypted { located: Located, key: ReplicaKey },
+}
+
+/// The owned inputs every driven terminal runs, so the connect and the open
+/// build the replica and the config one way on every stage.
+struct Driven<T: Transport> {
+    base: Base<T, ()>,
+    client_id: String,
+    login: Option<Grant>,
+    caller: Option<String>,
+    custody: Custody,
+    token_source: Option<AccessTokenSource>,
+    replica: DrivenReplica,
+}
+
+impl<T> Driven<T>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+{
+    /// The client config the stage's identity and custody make.
+    fn config(&self) -> ClientConfig {
+        let config = build_config(
+            &self.base.schema,
+            &self.base.tuning,
+            &self.client_id,
+            self.login.clone(),
+            self.caller.as_deref(),
+            self.custody,
+        );
+        fold_config_aspects(config, self.base.share_keys.clone())
+    }
+
+    /// Open the replica, then dial once, failing when the dial fails.
+    async fn connect(self) -> Result<ConnettoConnection<T>, ClientError> {
+        let config = self.config();
+        let Self {
+            mut base,
+            token_source,
+            replica,
+            ..
+        } = self;
+        let tier = base.schema.local_tier_ddl().map(str::to_owned);
+        match replica {
+            DrivenReplica::InMemory => {
+                let replica = in_memory_replica(tier.as_deref());
+                offline_connect_core(
+                    &replica,
+                    &base.schema,
+                    &config,
+                    true,
+                    token_source,
+                    &mut base.dialer,
+                    FirstDial::Required,
+                )
+                .await
+            }
+            DrivenReplica::Encrypted { located, key } => {
+                let fresh = !located.exists;
+                let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
+                offline_connect_core(
+                    &replica,
+                    &base.schema,
+                    &config,
+                    fresh,
+                    token_source,
+                    &mut base.dialer,
+                    FirstDial::Required,
+                )
+                .await
+            }
+        }
+    }
+
+    /// Open the replica with no transport.
+    fn open(self) -> Result<ConnettoConnection<T>, ClientError> {
+        let config = self.config();
+        let Self {
+            base,
+            token_source,
+            replica,
+            ..
+        } = self;
+        let tier = base.schema.local_tier_ddl().map(str::to_owned);
+        match replica {
+            DrivenReplica::InMemory => {
+                let replica = in_memory_replica(tier.as_deref());
+                open_driven_core(&replica, &base.schema, &config, true, token_source)
+            }
+            DrivenReplica::Encrypted { located, key } => {
+                let fresh = !located.exists;
+                let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
+                open_driven_core(&replica, &base.schema, &config, fresh, token_source)
+            }
+        }
     }
 }
 
@@ -1291,7 +1339,7 @@ where
         inputs.caller.as_deref(),
         inputs.custody,
     );
-    let config = fold_config_aspects(config, &tuning, share_keys);
+    let config = fold_config_aspects(config, share_keys);
     let conn = offline_connect_core(
         replica,
         &schema,

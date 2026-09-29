@@ -9,7 +9,7 @@ use connetto_client::live::ConnettoClient;
 use connetto_client::{AttachContent, ClientError, ContentPlace, TokioSleeper};
 use connetto_core::Transport;
 use connetto_core::traits::MaybeSend;
-use connetto_file_core::MemStore;
+use connetto_file_core::{ChunkInventory, MemStore};
 
 use crate::http::{DEFAULT_IDLE_BOUND, ReqwestHttp};
 use crate::{ContentClient, FsStore};
@@ -76,47 +76,47 @@ where
         place: ContentPlace,
     ) -> Result<ContentHandle<T>, ClientError> {
         let http = ReqwestHttp::new().with_idle_bound(self.idle_bound);
-        let heal_queries = self.heal_queries;
-        let content = match place {
-            ContentPlace::Durable(dir) => {
-                let mut content = ContentClient::attach(client, FsStore::new(dir), root_key, http)
-                    .await
-                    .map_err(|err| ClientError::Content(err.to_string()))?;
-                for (query, column) in &heal_queries {
-                    content = content
-                        .heal_lost(query, column)
-                        .await
-                        .map_err(|err| ClientError::Content(err.to_string()))?;
-                }
-                let content = Arc::new(content);
-                tokio::spawn({
-                    let content = Arc::clone(&content);
-                    async move {
-                        content.drive_outbox(TokioSleeper).await;
-                    }
-                });
-                ContentHandle::Durable(content)
-            }
-            ContentPlace::InMemory => {
-                let mut content = ContentClient::attach(client, MemStore::new(), root_key, http)
-                    .await
-                    .map_err(|err| ClientError::Content(err.to_string()))?;
-                for (query, column) in &heal_queries {
-                    content = content
-                        .heal_lost(query, column)
-                        .await
-                        .map_err(|err| ClientError::Content(err.to_string()))?;
-                }
-                let content = Arc::new(content);
-                tokio::spawn({
-                    let content = Arc::clone(&content);
-                    async move {
-                        content.drive_outbox(TokioSleeper).await;
-                    }
-                });
-                ContentHandle::InMemory(content)
-            }
-        };
-        Ok(content)
+        let heal = &self.heal_queries;
+        Ok(match place {
+            ContentPlace::Durable(dir) => ContentHandle::Durable(
+                running(client, FsStore::new(dir), root_key, http, heal).await?,
+            ),
+            ContentPlace::InMemory => ContentHandle::InMemory(
+                running(client, MemStore::new(), root_key, http, heal).await?,
+            ),
+        })
     }
+}
+
+/// A content client over `store`, healing through `heal`, with its outbox
+/// driven on the tokio runtime.
+async fn running<T, B>(
+    client: ConnettoClient<T>,
+    store: B,
+    root_key: [u8; 32],
+    http: ReqwestHttp,
+    heal: &[(String, String)],
+) -> Result<Arc<ContentClient<T, B, ReqwestHttp>>, ClientError>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+    B: ChunkInventory + Clone + Sync + MaybeSend + 'static,
+{
+    let mut content = ContentClient::attach(client, store, root_key, http)
+        .await
+        .map_err(|err| ClientError::Content(err.to_string()))?;
+    for (query, column) in heal {
+        content = content
+            .heal_lost(query, column)
+            .await
+            .map_err(|err| ClientError::Content(err.to_string()))?;
+    }
+    let content = Arc::new(content);
+    tokio::spawn({
+        let content = Arc::clone(&content);
+        async move {
+            content.drive_outbox(TokioSleeper).await;
+        }
+    });
+    Ok(content)
 }

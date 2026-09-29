@@ -22,7 +22,7 @@ use crate::auth::{KeyringKeyStore, NativeAuthenticator, remembered_account};
 use crate::builder::content::{AttachContent, ContentPlace};
 use crate::builder::core::{
     Base, BoxedDialer, ClientBuilder, CoreClient, CoreDurable, CorePump, CoreSignedIn, DialFailure,
-    Located, ReplicaPlace, ShareKeys,
+    Located, ReplicaPlace, ShareKeys, base_setters,
 };
 use crate::builder::gate::Gate;
 use crate::builder::schema::SyncSchema;
@@ -151,77 +151,7 @@ where
     T::Error: Display,
     C: AttachContent<T>,
 {
-    /// The tuning levers the build carries.
-    #[must_use]
-    pub fn with_tuning(mut self, tuning: SyncTuning) -> Self {
-        self.base.tuning = tuning;
-        self
-    }
-
-    /// The reconnect policy the pump drives.
-    #[must_use]
-    pub fn with_reconnect(mut self, policy: ReconnectPolicy) -> Self {
-        self.base.policy = policy;
-        self
-    }
-
-    /// The client id an anonymous build presents, replacing the core
-    /// prefix. A signed-in build presents the replica name the credential
-    /// carries, so this names nothing there.
-    #[must_use]
-    pub fn with_client_id(mut self, id: impl Into<String>) -> Self {
-        self.base.client_id = Some(id.into());
-        self
-    }
-
-    /// Attach content handling, the platform's file layer plugged in through
-    /// [`AttachContent`].
-    #[must_use]
-    pub fn with_content<A>(self, content: A) -> NativeClientBuilder<T, A>
-    where
-        A: AttachContent<T>,
-    {
-        let Base {
-            schema,
-            tuning,
-            policy,
-            content: _,
-            share_keys,
-            dialer,
-            sleeper,
-            client_id,
-        } = self.base;
-        NativeClientBuilder {
-            base: Base {
-                schema,
-                tuning,
-                policy,
-                content: Some(content),
-                share_keys,
-                dialer,
-                sleeper,
-                client_id,
-            },
-        }
-    }
-
-    /// Present the share keys the build holds, each beside the subject it
-    /// renders as. The subject function is the core constant, never
-    /// settable, and its separator is the key's.
-    #[must_use]
-    pub fn with_share_keys<K: CapabilityKey>(
-        mut self,
-        keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
-    ) -> Self {
-        self.base.share_keys = Some(ShareKeys {
-            separator: K::SEPARATOR,
-            keys: keys
-                .into_iter()
-                .map(|(grant, subject)| (grant, subject.key().to_string()))
-                .collect(),
-        });
-        self
-    }
+    base_setters!(NativeClientBuilder);
 
     /// Dial fresh transports through the caller's factory instead of the
     /// default, for a transport other than the platform one or a test that
@@ -233,27 +163,8 @@ where
         F::Transport: Transport + MaybeSend + 'static,
         F::Error: Display,
     {
-        let Base {
-            schema,
-            tuning,
-            policy,
-            content,
-            share_keys,
-            dialer: _,
-            sleeper,
-            client_id,
-        } = self.base;
         NativeClientBuilder {
-            base: Base {
-                schema,
-                tuning,
-                policy,
-                content,
-                share_keys,
-                dialer: BoxedDialer::injected(factory),
-                sleeper,
-                client_id,
-            },
+            base: self.base.with_dialer(BoxedDialer::injected(factory)),
         }
     }
 
@@ -297,7 +208,7 @@ where
     ///
     /// [`ClientError`] on a dial, database, or handshake failure.
     pub async fn connect(self) -> Result<NativeClient<T, C::Handle>, ClientError> {
-        let (client, pump) = self.run().await?;
+        let (client, pump) = self.connect_with_pump().await?;
         tokio::spawn(pump);
         Ok(client)
     }
@@ -311,10 +222,6 @@ where
     pub async fn connect_with_pump(
         self,
     ) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
-        self.run().await
-    }
-
-    async fn run(self) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
         let (core, pump) = ClientBuilder { base: self.base }
             .connect_with_pump()
             .await?;
@@ -385,7 +292,7 @@ where
     ///
     /// [`ClientError`] on a sign-in, dial, database, or handshake failure.
     pub async fn connect(self) -> Result<NativeClient<T, C::Handle>, ClientError> {
-        let (client, pump) = self.run().await?;
+        let (client, pump) = self.connect_with_pump().await?;
         tokio::spawn(pump);
         Ok(client)
     }
@@ -399,10 +306,6 @@ where
     pub async fn connect_with_pump(
         self,
     ) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
-        self.run().await
-    }
-
-    async fn run(self) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
         let (core, resolved) = self.into_core().await?;
         let (core, pump) = core.connect_with_pump().await?;
         #[cfg(not(feature = "native-auth"))]

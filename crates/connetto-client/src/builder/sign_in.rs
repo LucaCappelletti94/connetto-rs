@@ -215,6 +215,39 @@ impl WebSignIn for Auth {
     }
 }
 
+/// The native sign-in hooks both provider forks take, written once for both.
+#[cfg(feature = "native-auth")]
+macro_rules! provider_hooks {
+    () => {
+        /// The platform's chooser, consulted when the account choice is `Ask`.
+        #[must_use]
+        pub fn with_account_chooser(mut self, chooser: AccountChooser) -> Self {
+            self.inner.chooser = Some(chooser);
+            self
+        }
+
+        /// Replace the browser opener that runs the interactive login.
+        #[must_use]
+        pub fn with_browser_opener(mut self, opener: BrowserOpener) -> Self {
+            self.inner.opener = Some(opener);
+            self
+        }
+
+        /// Log in through `redirect_uri`, a redirect the app registered with its
+        /// operating system, with `session` running the browser and returning
+        /// what the redirect delivered.
+        #[must_use]
+        pub fn with_claimed_redirect(
+            mut self,
+            redirect_uri: impl Into<String>,
+            session: Arc<dyn AuthorizationSession>,
+        ) -> Self {
+            self.inner.claimed = Some((redirect_uri.into(), session));
+            self
+        }
+    };
+}
+
 /// A native provider sign-in whose credentials live in the OS keyring named
 /// by the app id, which names both the refresh-token and the replica-key
 /// services.
@@ -227,32 +260,7 @@ pub struct KeyringAuth {
 
 #[cfg(feature = "native-auth")]
 impl KeyringAuth {
-    /// The platform's chooser, consulted when the account choice is `Ask`.
-    #[must_use]
-    pub fn with_account_chooser(mut self, chooser: AccountChooser) -> Self {
-        self.inner.chooser = Some(chooser);
-        self
-    }
-
-    /// Replace the browser opener that runs the interactive login.
-    #[must_use]
-    pub fn with_browser_opener(mut self, opener: BrowserOpener) -> Self {
-        self.inner.opener = Some(opener);
-        self
-    }
-
-    /// Log in through `redirect_uri`, a redirect the app registered with its
-    /// operating system, with `session` running the browser and returning
-    /// what the redirect delivered.
-    #[must_use]
-    pub fn with_claimed_redirect(
-        mut self,
-        redirect_uri: impl Into<String>,
-        session: Arc<dyn AuthorizationSession>,
-    ) -> Self {
-        self.inner.claimed = Some((redirect_uri.into(), session));
-        self
-    }
+    provider_hooks!();
 }
 
 #[cfg(feature = "native-auth")]
@@ -281,32 +289,7 @@ pub struct StoredAuth<R> {
 
 #[cfg(feature = "native-auth")]
 impl<R: RefreshTokenStore<Error = ClientError> + Send + Sync> StoredAuth<R> {
-    /// The platform's chooser, consulted when the account choice is `Ask`.
-    #[must_use]
-    pub fn with_account_chooser(mut self, chooser: AccountChooser) -> Self {
-        self.inner.chooser = Some(chooser);
-        self
-    }
-
-    /// Replace the browser opener that runs the interactive login.
-    #[must_use]
-    pub fn with_browser_opener(mut self, opener: BrowserOpener) -> Self {
-        self.inner.opener = Some(opener);
-        self
-    }
-
-    /// Log in through `redirect_uri`, a redirect the app registered with its
-    /// operating system, with `session` running the browser and returning
-    /// what the redirect delivered.
-    #[must_use]
-    pub fn with_claimed_redirect(
-        mut self,
-        redirect_uri: impl Into<String>,
-        session: Arc<dyn AuthorizationSession>,
-    ) -> Self {
-        self.inner.claimed = Some((redirect_uri.into(), session));
-        self
-    }
+    provider_hooks!();
 }
 
 #[cfg(feature = "native-auth")]

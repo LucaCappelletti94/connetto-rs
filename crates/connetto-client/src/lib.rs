@@ -726,35 +726,14 @@ pub(crate) struct ClientConfig {
     ///
     /// `None` when no policy names the set.
     subjects: Option<SubjectSource>,
-    /// Percentage of `page_count` the freelist must reach before the trimming
-    /// pass runs. Local to this device and never sent to the server: trimming
-    /// is a whole-replica operation, not a handshake input. Defaults to
-    /// [`DEFAULT_TRIM_THRESHOLD`].
-    trim_threshold: u8,
-    /// Pages one `incremental_vacuum` call reclaims, bounding a single step so a
-    /// large freelist never stalls the pump. Local, like `trim_threshold`.
-    /// Defaults to [`DEFAULT_TRIM_BUDGET`].
-    trim_budget: u32,
-    /// Cap on distinct rested statistics kept in `_connetto_aggregates`. Local
-    /// to this device, never a handshake input: the resting table is client
-    /// storage. Defaults to [`DEFAULT_RESTED_STATISTICS_CAP`].
-    rested_statistics_cap: usize,
-    /// How many applied rows, summed across tables since the last `tidy`, arm
-    /// the residual pass and its crossing event. Local to this device, like
-    /// the trim knobs. Defaults to [`DEFAULT_RESIDUAL_THRESHOLD`].
-    residual_threshold: u64,
-    /// Who runs the residual pass at the crossing. Defaults to
-    /// [`ResidualPass::Automatic`].
-    residual_pass: ResidualPass,
+    /// The local tuning levers, the trim pass, the resting cap, the residual
+    /// pass and the watch grace. Never a handshake input.
+    tuning: SyncTuning,
     /// How the key protecting this connection is held. The default is honest
     /// for every native target today: no native gate exists until R51 and R52
     /// land, so reporting anything stronger would claim protection connetto
     /// does not yet provide.
     custody: Custody,
-    /// The grace a watcher may outlive the connection that created it, the
-    /// leeway for a read that started just before the last client dropped.
-    /// Defaults to [`DEFAULT_GRACE`].
-    watch_grace: Duration,
 }
 
 impl ClientConfig {
@@ -771,13 +750,8 @@ impl ClientConfig {
             unrecorded_tables: HashSet::new(),
             caller: None,
             subjects: None,
-            trim_threshold: DEFAULT_TRIM_THRESHOLD,
-            trim_budget: DEFAULT_TRIM_BUDGET,
-            rested_statistics_cap: DEFAULT_RESTED_STATISTICS_CAP,
-            residual_threshold: DEFAULT_RESIDUAL_THRESHOLD,
-            residual_pass: ResidualPass::default(),
+            tuning: SyncTuning::default(),
             custody: Custody::Unverified(NoGate::Unsupported),
-            watch_grace: DEFAULT_GRACE,
         }
     }
 
@@ -897,49 +871,10 @@ impl ClientConfig {
         self
     }
 
-    /// The percentage of the replica's pages that must sit on the freelist
-    /// before the trimming pass reclaims any, clamped to `0..=100`. A larger
-    /// value trims less often and lets the file hold more slack. Defaults to
-    /// [`DEFAULT_TRIM_THRESHOLD`].
+    /// The local tuning levers the build carries.
     #[must_use]
-    pub fn with_trim_threshold(mut self, percent: u8) -> Self {
-        self.trim_threshold = percent.min(100);
-        self
-    }
-
-    /// The number of pages one `incremental_vacuum` call reclaims, bounding the
-    /// work of a single trimming step. Defaults to [`DEFAULT_TRIM_BUDGET`].
-    #[must_use]
-    pub fn with_trim_budget(mut self, pages: u32) -> Self {
-        self.trim_budget = pages;
-        self
-    }
-
-    /// The cap on distinct rested statistics kept in the resting table.
-    /// Defaults to [`DEFAULT_RESTED_STATISTICS_CAP`].
-    #[must_use]
-    pub fn with_rested_statistics_cap(mut self, cap: usize) -> Self {
-        self.rested_statistics_cap = cap;
-        self
-    }
-
-    /// How many applied rows, summed across tables since the last `tidy`, arm
-    /// the residual pass and [`ClientEvent::TidyDue`]. Defaults to
-    /// [`DEFAULT_RESIDUAL_THRESHOLD`]. A value of zero is clamped to one because
-    /// zero would make `residual_check` fire after every patch, including
-    /// rowless cursor-only ones where no rows changed at all.
-    #[must_use]
-    pub fn with_residual_threshold(mut self, rows: u64) -> Self {
-        self.residual_threshold = rows.max(1);
-        self
-    }
-
-    /// Who runs the residual pass at the threshold crossing. Defaults to
-    /// [`ResidualPass::Automatic`]; [`ResidualPass::Manual`] keeps the
-    /// crossing event and leaves the pass to the application.
-    #[must_use]
-    pub fn with_residual_pass(mut self, pass: ResidualPass) -> Self {
-        self.residual_pass = pass;
+    pub fn with_tuning(mut self, tuning: SyncTuning) -> Self {
+        self.tuning = tuning;
         self
     }
 
@@ -953,14 +888,6 @@ impl ClientConfig {
     #[must_use]
     pub fn with_custody(mut self, custody: Custody) -> Self {
         self.custody = custody;
-        self
-    }
-
-    /// The watch grace a query outlives its last handle for. The builder and
-    /// the manual path both feed it, keeping the default when they do not.
-    #[must_use]
-    pub fn with_watch_grace(mut self, grace: Duration) -> Self {
-        self.watch_grace = grace;
         self
     }
 }
@@ -3356,7 +3283,7 @@ where
     /// The grace a watcher may outlive this connection, from the config.
     #[must_use]
     pub(crate) const fn watch_grace(&self) -> Duration {
-        self.config.watch_grace
+        self.config.tuning.watch_grace()
     }
 
     /// Update the custody level, for example after a gate is enrolled while the
@@ -3554,7 +3481,11 @@ where
         aggregates::apply_frame(&mut self.db, query_id, &binds, frame, now)?;
         // A removal cannot add a statistic, so only a write needs the cap.
         if frame.result_json.is_some() {
-            aggregates::enforce_cap(&mut self.db, self.config.rested_statistics_cap, &protected)?;
+            aggregates::enforce_cap(
+                &mut self.db,
+                self.config.tuning.rested_statistics_cap(),
+                &protected,
+            )?;
         }
         Ok(())
     }
@@ -4480,14 +4411,16 @@ where
             return Ok(());
         }
         let free = self.db.freelist_count(None)?;
-        if free.saturating_mul(100) < i64::from(self.config.trim_threshold).saturating_mul(total) {
+        if free.saturating_mul(100)
+            < i64::from(self.config.tuning.trim_threshold()).saturating_mul(total)
+        {
             return Ok(());
         }
         // Each call frees up to the budget and runs to completion for that
         // bound, so a large freelist drains over several calls without one
         // stalling step. Stop when the freelist stops shrinking, which also ends
         // the loop if a page cannot be reclaimed.
-        let budget = self.config.trim_budget;
+        let budget = self.config.tuning.trim_budget();
         loop {
             let before = self.db.freelist_count(None)?;
             if before == 0 {
@@ -4718,11 +4651,11 @@ where
             .applied_rows
             .lock()
             .map_or(0, |counts| counts.values().sum());
-        if total < self.config.residual_threshold {
+        if total < self.config.tuning.residual_threshold() {
             return Ok(());
         }
         self.residual_warned = true;
-        if self.config.residual_pass == ResidualPass::Automatic
+        if self.config.tuning.residual_pass() == ResidualPass::Automatic
             && let Err(err) = self.tidy()
         {
             self.residual_warned = false;
