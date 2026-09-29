@@ -438,6 +438,7 @@ fn run_container_phase(probe: &Path, phase: &str, key: &Path, state: &Path) {
             "ubuntu:24.04",
             "/probe",
             phase,
+            "key-file",
             "/run/secrets/connetto-wrap-key",
             "/state",
         ])
@@ -480,6 +481,7 @@ fn a_restarted_container_reads_its_keys_back_through_a_mounted_key_file() {
             "ubuntu:24.04",
             "/probe",
             "read",
+            "key-file",
             "/run/secrets/connetto-wrap-key",
             "/tmp/state",
         ])

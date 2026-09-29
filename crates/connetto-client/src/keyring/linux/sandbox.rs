@@ -15,8 +15,11 @@ use super::{attributes, backend_error, decode, encode};
 use crate::ClientError;
 use crate::keyring::SecretStoreError;
 
+/// The keyring file and the secret that opens it, reopened for every operation
+/// so a second store or process writing the same file is never overwritten.
 pub(super) struct Sandbox {
-    keyring: UnlockedKeyring,
+    path: PathBuf,
+    secret: oo7::Secret,
 }
 
 impl Sandbox {
@@ -45,12 +48,20 @@ impl Sandbox {
         Self::load(&path, oo7::Secret::from(secret)).await
     }
 
+    /// Checks that `secret` opens the file at `path` before any record is used.
     pub(super) async fn load(path: &Path, secret: oo7::Secret) -> Result<Self, ClientError> {
-        Ok(Self {
-            keyring: UnlockedKeyring::load(path, secret)
-                .await
-                .map_err(|err| backend_error("the sandbox keyring", err))?,
-        })
+        let sandbox = Self {
+            path: path.to_owned(),
+            secret,
+        };
+        sandbox.keyring().await?;
+        Ok(sandbox)
+    }
+
+    async fn keyring(&self) -> Result<UnlockedKeyring, ClientError> {
+        UnlockedKeyring::load(&self.path, self.secret.clone())
+            .await
+            .map_err(|err| backend_error("the sandbox keyring", err))
     }
 
     pub(super) async fn read(
@@ -59,7 +70,8 @@ impl Sandbox {
         name: &str,
     ) -> Result<Option<String>, ClientError> {
         let item = self
-            .keyring
+            .keyring()
+            .await?
             .lookup_item(&attributes(service, name))
             .await
             .map_err(|err| backend_error("the sandbox keyring", err))?;
@@ -79,7 +91,8 @@ impl Sandbox {
         name: &str,
         secret: &str,
     ) -> Result<(), ClientError> {
-        self.keyring
+        self.keyring()
+            .await?
             .create_item(
                 service,
                 &attributes(service, name),
@@ -92,7 +105,8 @@ impl Sandbox {
     }
 
     pub(super) async fn clear(&self, service: &str, name: &str) -> Result<(), ClientError> {
-        self.keyring
+        self.keyring()
+            .await?
             .delete(&attributes(service, name))
             .await
             .map_err(|err| backend_error("the sandbox keyring", err))
