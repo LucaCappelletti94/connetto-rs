@@ -15,8 +15,11 @@
 use std::sync::Arc;
 
 use connetto_client::harden::{AttachPermits, attach_in_window};
-use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica, SqlFunctions};
-use connetto_core::test_support::{FakeTransport, replica_key};
+use connetto_client::{
+    ClientBuilder, ConnettoConnection, DataDir, HeldCredential, SqlFunctions, SyncSchema,
+};
+use connetto_core::schema::SchemaBundle;
+use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use diesel::sqlite::{SqliteFunctionBehavior, SqliteLimit};
@@ -62,16 +65,24 @@ diesel::table! {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r18").with_login(Some(Grant::new("user:tester")))
+/// The identity this module's builds sign in as.
+fn credential() -> HeldCredential {
+    super::support::held("tester")
 }
 
 /// A replica in its own directory, opened offline, with no tier.
-fn open_plain(dir: &TempDir) -> ConnettoConnection<FakeTransport> {
-    let path = dir.path().join("replica.sqlite");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key");
-    ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).expect("open")
+async fn open_plain(dir: &TempDir) -> ConnettoConnection<FakeTransport> {
+    let credential = credential();
+    let store = super::support::key_store(&credential).await;
+    ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open")
 }
 
 /// Create a plaintext database at `path` so an attach has something to find.
@@ -81,10 +92,10 @@ fn seed(path: &str) {
         .expect("seed schema");
 }
 
-#[test]
-fn every_configured_knob_holds_on_a_fresh_replica() {
+#[tokio::test]
+async fn every_configured_knob_holds_on_a_fresh_replica() {
     let dir = tempdir().expect("tempdir");
-    let mut conn = open_plain(&dir);
+    let mut conn = open_plain(&dir).await;
     let db = conn.conn();
 
     assert!(
@@ -153,15 +164,28 @@ fn every_configured_knob_holds_on_a_fresh_replica() {
     );
 }
 
-#[test]
-fn a_tier_rests_at_one_attached_database_and_stays_writable() {
+#[tokio::test]
+async fn a_tier_rests_at_one_attached_database_and_stays_writable() {
     let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("replica.sqlite");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key")
-        .with_tier(TIER_DDL);
-    let mut conn =
-        ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).expect("open");
+    let credential = credential();
+    let store = super::support::key_store(&credential).await;
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open");
 
     assert_eq!(
         conn.conn().get_limit(SqliteLimit::Attached),
@@ -190,10 +214,10 @@ fn a_tier_rests_at_one_attached_database_and_stays_writable() {
     );
 }
 
-#[test]
-fn a_window_without_the_create_permit_refuses_a_missing_file() {
+#[tokio::test]
+async fn a_window_without_the_create_permit_refuses_a_missing_file() {
     let dir = tempdir().expect("tempdir");
-    let mut conn = open_plain(&dir);
+    let mut conn = open_plain(&dir).await;
     let missing = dir.path().join("absent.sqlite");
     let missing_path = missing.to_str().expect("utf-8 path");
 
@@ -219,26 +243,41 @@ fn a_window_without_the_create_permit_refuses_a_missing_file() {
     );
 }
 
-#[test]
-fn a_missing_tier_file_fails_the_open_rather_than_appearing() {
+#[tokio::test]
+async fn a_missing_tier_file_fails_the_open_rather_than_appearing() {
     let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("replica.sqlite");
-    let tier = dir.path().join("replica.sqlite-tier");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key")
-        .with_existing_tier();
-
+    let credential = credential();
+    let name = credential.replica_name().to_owned();
+    let tier = dir.path().join(format!("{name}-tier"));
+    open_plain(&dir).await;
+    let store = super::support::key_store(&credential).await;
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
     assert!(
-        ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).is_err(),
+        ClientBuilder::new(
+            schema,
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .signed_in(credential)
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await
+        .is_err(),
         "an existing tier that does not exist is an error, not an empty database"
     );
     assert!(!tier.exists(), "and no file was created for it");
 }
 
-#[test]
-fn a_create_window_creates_the_file_and_leaves_it_writable() {
+#[tokio::test]
+async fn a_create_window_creates_the_file_and_leaves_it_writable() {
     let dir = tempdir().expect("tempdir");
-    let mut conn = open_plain(&dir);
+    let mut conn = open_plain(&dir).await;
     let store = dir.path().join("store.sqlite");
     let store_path = store.to_str().expect("utf-8 path");
 
@@ -273,8 +312,8 @@ fn a_create_window_creates_the_file_and_leaves_it_writable() {
     );
 }
 
-#[test]
-fn a_column_default_may_only_call_an_innocuous_function() {
+#[tokio::test]
+async fn a_column_default_may_only_call_an_innocuous_function() {
     const MINTED_DDL: &str = "CREATE TABLE minted \
         (id BIGINT PRIMARY KEY DEFAULT (next_seq()) NOT NULL, label TEXT NOT NULL)";
 
@@ -284,15 +323,16 @@ fn a_column_default_may_only_call_an_innocuous_function() {
         next_seq_utils::register_nondeterministic_impl(conn, || 1i64)
     }));
     let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("plain.sqlite");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key");
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &replica,
-        MINTED_DDL,
-        &config().with_sql_functions(plain),
-        None,
+    let first = credential();
+    let store = super::support::key_store(&first).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(MINTED_DDL).with_sql_functions(plain),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .signed_in(first)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("registering it and creating the table both succeed");
     let refused = diesel::insert_into(minted::table)
         .values(minted::label.eq("first"))
@@ -309,15 +349,17 @@ fn a_column_default_may_only_call_an_innocuous_function() {
             7i64
         })
     }));
-    let path = dir.path().join("innocuous.sqlite");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key");
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &replica,
-        MINTED_DDL,
-        &config().with_sql_functions(innocuous),
-        None,
+    let dir = tempdir().expect("tempdir");
+    let second = credential();
+    let store = super::support::key_store(&second).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(MINTED_DDL).with_sql_functions(innocuous),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .signed_in(second)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("open");
     diesel::insert_into(minted::table)
         .values(minted::label.eq("first"))
@@ -336,12 +378,11 @@ fn a_column_default_may_only_call_an_innocuous_function() {
 /// The translated schema is Postgres's dialect, where `LIKE` is case
 /// sensitive, and the pragma that makes SQLite agree is connection state, so
 /// a reopen that runs no DDL must set it as much as the first boot does.
-#[test]
-fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
+#[tokio::test]
+async fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
     let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("replica.sqlite");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key");
+    let first = credential();
+    let store = super::support::key_store(&first).await;
     let lowercase_matches = |conn: &mut ConnettoConnection<FakeTransport>| {
         items::table
             .filter(items::label.like("a%"))
@@ -350,8 +391,15 @@ fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
             .expect("count the lowercase matches")
     };
 
-    let mut conn =
-        ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None).expect("open");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(first)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open");
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::label.eq("Alpha")))
         .execute(conn.conn())
@@ -363,8 +411,17 @@ fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
     );
     drop(conn);
 
-    let mut conn = ConnettoConnection::<FakeTransport>::open_existing(&replica, &config(), None)
-        .expect("reopen with no DDL");
+    let reopened = credential();
+    let store = super::support::key_store(&reopened).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(reopened)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("reopen with no DDL");
     assert_eq!(
         lowercase_matches(&mut conn),
         0,
@@ -375,17 +432,30 @@ fn like_is_case_sensitive_on_a_first_boot_and_on_a_reopen() {
 /// pg2sqlite leads every script it emits with the dialect pragma, and a tier
 /// script is one of those, so the pragma passes through and the table still
 /// lands in the tier.
-#[test]
-fn a_tier_script_may_lead_with_a_pragma() {
+#[tokio::test]
+async fn a_tier_script_may_lead_with_a_pragma() {
     const PRAGMA_LED_TIER_DDL: &str = "PRAGMA case_sensitive_like = 1;\n\
         CREATE TABLE drafts (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
     let dir = tempdir().expect("tempdir");
-    let path = dir.path().join("replica.sqlite");
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(replica_key()))
-        .expect("a resolved key")
-        .with_tier(PRAGMA_LED_TIER_DDL);
-    let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None)
-        .expect("a pragma in the tier script is not a refusal");
+    let credential = credential();
+    let store = super::support::key_store(&credential).await;
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(PRAGMA_LED_TIER_DDL),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("a pragma in the tier script is not a refusal");
     diesel::insert_into(drafts::table)
         .values((drafts::id.eq(1), drafts::body.eq("in the tier")))
         .execute(conn.conn())

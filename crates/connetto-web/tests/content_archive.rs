@@ -8,12 +8,14 @@ use std::rc::Rc;
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientConfig, ConnettoConnection, ExportScope, Grant, ImportChoices, Replica,
+    ClientBuilder, ConnettoConnection, ExportScope, FirstThen, Grant, HeldCredential,
+    ImportChoices, SyncSchema,
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, SubscriptionSpec,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{FileId, MimeClass};
@@ -166,29 +168,52 @@ impl Transport for TicketTransport {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("browser-content-archive").with_login(Some(Grant::new("user:browser")))
+/// The client schema over [`DDL`].
+fn schema() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
+/// A dialer that never reaches a server.
+fn never<T: Transport + 'static>() -> impl FnMut() -> core::future::Ready<Result<T, &'static str>> {
+    || core::future::ready(Err("offline"))
+}
+
+/// The signed-in build every case opens, dialing through `dialer`.
+fn build<F: connetto_client::TransportFactory<Transport = TicketTransport> + 'static>(
+    dialer: F,
+) -> connetto_client::CoreSignedIn<TicketTransport> {
+    ClientBuilder::new(schema(), dialer).signed_in(
+        HeldCredential::new(Grant::new("user:browser"), "browser")
+            .expect("a string identity serializes"),
+    )
 }
 
 fn offline_client() -> ConnettoClient<TicketTransport> {
-    let connection =
-        ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
-            .expect("open offline replica");
+    let connection = build(never()).open_driven().expect("open offline replica");
     let (client, pump) = ConnettoClient::with_pump(connection);
     spawn_local(pump);
     client
 }
 
 async fn connected_client() -> ConnettoClient<TicketTransport> {
-    let connection = ConnettoConnection::connect(
-        TicketTransport::new(),
-        &Replica::in_memory(),
-        DDL,
-        &config(),
-        None,
-    )
-    .await
-    .expect("connect replacement replica");
+    let connection = build(once(TicketTransport::new()))
+        .connect_driven()
+        .await
+        .expect("connect replacement replica");
     let (client, pump) = ConnettoClient::with_pump(connection);
     spawn_local(pump);
     client
@@ -234,9 +259,7 @@ async fn an_offline_photo_restores_displays_locally_and_uploads() {
 async fn a_relay_import_drives_the_worker_outbox() {
     let serial = locks::hold_lock(TEST_LOCK).await;
     let (archive, _) = stage_source(RELAY_PHOTO).await;
-    let worker =
-        ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
-            .expect("open relay replica");
+    let worker = build(never()).open_driven().expect("open relay replica");
     let scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .expect("dedicated worker");
@@ -261,9 +284,7 @@ async fn a_relay_import_drives_the_worker_outbox() {
 async fn hub_requests_are_served_while_a_content_upload_is_in_flight() {
     let serial = locks::hold_lock(TEST_LOCK).await;
     let (archive, _) = stage_source(CONCURRENT_PHOTO).await;
-    let worker =
-        ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
-            .expect("open relay replica");
+    let worker = build(never()).open_driven().expect("open relay replica");
     let scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .expect("dedicated worker");
@@ -344,9 +365,7 @@ fn uploads_of(uploaded: &RefCell<Vec<Vec<u8>>>, photo: &[u8]) -> usize {
 }
 
 async fn relay_round_trip(archive: &[u8]) -> Vec<u8> {
-    let mut worker =
-        ConnettoConnection::<TicketTransport>::open(&Replica::in_memory(), DDL, &config(), None)
-            .expect("open relay replica");
+    let mut worker = build(never()).open_driven().expect("open relay replica");
     worker
         .subscribe_spec("stalled", SubscriptionSpec::new("SELECT * FROM photos"))
         .await

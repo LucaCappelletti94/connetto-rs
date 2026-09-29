@@ -14,9 +14,10 @@
 
 mod common;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_wasm_smoke::BrowserSocket;
-use connetto_wasm_smoke::workers::DEMO_WS_URL;
+use connetto_wasm_smoke::build;
+use connetto_wasm_smoke::workers::demo_schema;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -49,17 +50,6 @@ fn local_orders(conn: &mut ConnettoConnection<BrowserSocket>) -> Vec<Order> {
         .expect("read local replica")
 }
 
-/// A row id unique enough across smoke runs: milliseconds since the epoch,
-/// well above the desktop demo's id bands.
-fn unique_id() -> i64 {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "Date::now in milliseconds fits i64 until the year 285428751"
-    )]
-    let millis = js_sys::Date::now() as i64;
-    10_000_000_000 + millis
-}
-
 /// Pump the client until an event matches `pred`, applying every frame in
 /// between. The harness timeout bounds the wait.
 async fn pump_until(
@@ -77,29 +67,12 @@ async fn pump_until(
 
 #[wasm_bindgen_test]
 async fn full_sync_loop_in_a_dedicated_worker() {
-    let transport = BrowserSocket::connect(DEMO_WS_URL)
-        .await
-        .expect("connect to connetto-server");
     let (token, identity) = common::mint_session().await;
-    let config = ClientConfig::new(format!("wasm-smoke-{}", unique_id()))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(
-            connetto_wasm_smoke::CALLER_FUNCTION,
-            Some(identity.as_str()),
-        )
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let mut conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        connetto_wasm_smoke::workers::DEMO_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect");
+    let mut conn = ClientBuilder::new(demo_schema(), build::server())
+        .signed_in(build::held(token, &identity))
+        .connect_driven()
+        .await
+        .expect("client connect");
 
     // Subscribe and take the snapshot of whatever the backend holds.
     conn.subscribe("orders", QUERY).await.expect("subscribe");

@@ -37,7 +37,7 @@ async fn unsent_content_restores_under_the_receiving_key_with_its_row_and_outbox
 }
 
 async fn export_source(base: &std::path::Path) -> (Vec<u8>, FileId, Vec<u8>) {
-    let client = offline_client(&base.join("replica.sqlite"));
+    let client = offline_client(&base.join("replica.sqlite")).await;
     let chunks = base.join("chunks");
     let content = ContentClient::attach(
         client,
@@ -62,7 +62,7 @@ async fn import_target(
     ContentClient<Scripted, FsStore, RecordingHttp>,
     ConnettoClient<Scripted>,
 ) {
-    let client = offline_client(&base.join("replica.sqlite"));
+    let client = offline_client(&base.join("replica.sqlite")).await;
     let content = ContentClient::attach(
         client.clone(),
         FsStore::new(base.join("chunks")),
@@ -101,6 +101,7 @@ async fn assert_restored(
                 .first(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("read restored row");
     assert_eq!(row_id, file_id.as_bytes());
     assert_eq!(
@@ -139,7 +140,7 @@ async fn fetched_cache_is_absent_from_the_archive() {
         .expect("export");
     let target_dir = tempdir().expect("target directory");
     let target = attach_content(
-        offline_client(&target_dir.path().join("replica.sqlite")),
+        offline_client(&target_dir.path().join("replica.sqlite")).await,
         &target_dir.path().join("chunks"),
         RecordingHttp::default(),
     )
@@ -154,7 +155,7 @@ async fn fetched_cache_is_absent_from_the_archive() {
 #[tokio::test]
 async fn independently_pending_content_restores_without_replica_rows_or_writes() {
     let source_dir = tempdir().expect("source directory");
-    let source_client = offline_client(&source_dir.path().join("replica.sqlite"));
+    let source_client = offline_client(&source_dir.path().join("replica.sqlite")).await;
     let file_id = FileId::from_chunks([PHOTO]);
     let archive = raw_archive(
         &source_client,
@@ -164,7 +165,7 @@ async fn independently_pending_content_restores_without_replica_rows_or_writes()
 
     let target_dir = tempdir().expect("target directory");
     let target = attach_content(
-        offline_client(&target_dir.path().join("replica.sqlite")),
+        offline_client(&target_dir.path().join("replica.sqlite")).await,
         &target_dir.path().join("chunks"),
         RecordingHttp::default(),
     )
@@ -194,7 +195,7 @@ async fn independently_pending_content_restores_without_replica_rows_or_writes()
 #[tokio::test]
 async fn corrupt_lengths_hashes_and_file_identities_are_refused_before_apply() {
     let dir = tempdir().expect("directory");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content = attach_content(
         client.clone(),
         &dir.path().join("chunks"),
@@ -231,7 +232,7 @@ async fn corrupt_lengths_hashes_and_file_identities_are_refused_before_apply() {
 #[tokio::test]
 async fn attachments_owned_by_another_layer_are_refused() {
     let dir = tempdir().expect("directory");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content = attach_content(
         client.clone(),
         &dir.path().join("chunks"),
@@ -300,6 +301,7 @@ async fn raw_archive(
             export.finish()
         })
         .await
+        .expect("gate not locked")
         .expect("build test archive")
 }
 
@@ -373,7 +375,7 @@ async fn content_only_import_wakes_outbox_driver() {
     const INTENT: &str = "https://files.test/files/\
         0000000000000000000000000000000000000000000000000000000000000000/intent?t=TOKEN";
     let source_dir = tempdir().expect("source dir");
-    let source = offline_client(&source_dir.path().join("replica.sqlite"));
+    let source = offline_client(&source_dir.path().join("replica.sqlite")).await;
     let file_id = FileId::from_chunks([PHOTO]);
     let archive = raw_archive(
         &source,
@@ -454,6 +456,7 @@ async fn forget_retired_content_is_all_or_nothing() {
             ))
         })
         .await
+        .expect("gate not locked")
         .expect("insert retired records and trigger");
     let result = content.forget_retired_content(&[file_a, file_b]).await;
     assert!(
@@ -482,7 +485,7 @@ async fn refused_import_leaves_chunk_store_empty() {
     const CHUNK_A: &[u8] = b"first chunk of content for file A";
     const CHUNK_B: &[u8] = b"second chunk of content for file B";
     let dir = tempdir().expect("temp dir");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content = attach_content(
         client.clone(),
         &dir.path().join("chunks"),
@@ -567,7 +570,7 @@ async fn a_source_that_changes_between_the_passes_is_refused() {
     const CHUNK: &[u8] = b"a chunk that will be rewritten under the importer";
     const REWRITTEN: &[u8] = b"a chunk that was rewritten under the importer !!!";
     let dir = tempdir().expect("temp dir");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content = attach_content(
         client.clone(),
         &dir.path().join("chunks"),
@@ -769,7 +772,7 @@ async fn export_reads_one_chunk_at_a_time() {
         written_at_read: Arc::clone(&written_at_read),
         written: Arc::clone(&written),
     };
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content = ContentClient::attach(client, spy, [1; 32], RecordingHttp::default())
         .await
         .expect("attach content");

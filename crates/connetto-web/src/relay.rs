@@ -57,6 +57,7 @@
 //! describes rows the tab has not received yet.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -69,12 +70,13 @@ use crate::workers::blob_io::BlobSource;
 use crate::workers::helpers::sleep_ms;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
-    AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, ImportChoices,
-    ImportOutcome, PolicyTables, ResendTimer, subscription_is_aggregate, subscription_tables,
+    AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
+    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer,
+    subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
-    FullResyncReason, FullResyncRequired, HandshakeAck, LivePatch, MutationApplied,
+    FullResyncReason, FullResyncRequired, GateState, HandshakeAck, LivePatch, MutationApplied,
     MutationConflict, MutationReject, MutationRejectReason, NonFatalError, Pong, RateLimited,
     SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
     SubscriptionPriority, SubscriptionSpec, SyncStatus,
@@ -278,6 +280,9 @@ enum HubEvent {
     /// One content-protocol message from a tab's internal lane. A `Stage`
     /// arrives with its blob; the other frames carry none.
     Internal(TabId, ContentFrame, Option<web_sys::Blob>),
+    /// The worker's gate state, emitted by the hub's gate controller as it
+    /// locks and unlocks.
+    Gate(GateState),
 }
 
 /// One outbound frame toward a tab. Dropping a tab's sender closes it: the
@@ -487,6 +492,10 @@ struct HubState {
     /// is told the current answer rather than having to wait for the next
     /// change, which may never come.
     sync_status: SyncStatus,
+    /// The worker's gate state, as the hub's gate controller last said it, so
+    /// a tab arriving while the gate is locked starts refusing. `None` until
+    /// the gate has been installed and said a state.
+    gate: Option<GateState>,
     /// Aggregate subscriptions multiplexed onto the worker connection,
     /// keyed by the private upstream sub id the hub registered
     /// (`agg-{tab}-{sub}`). Each entry demuxes the worker's
@@ -528,6 +537,10 @@ struct PendingHubResolve {
 pub struct RelayHub {
     events: UnboundedSender<HubEvent>,
     next_tab: Arc<AtomicU64>,
+    /// The worker's gate controller, armed by [`crate::gate::install_worker_gate`].
+    /// Its sink states each transition into the hub's event intake, which
+    /// forwards it to the tabs.
+    gate: Rc<GateController>,
 }
 
 /// Upstream reconnect wiring for a hub: how to make fresh server
@@ -760,22 +773,35 @@ impl RelayHub {
             content.as_ref().map(HubContent::archive),
         )?;
         let (events_tx, events_rx) = unbounded_channel();
+        let gate = Rc::new(GateController::new(Arc::new(HubGateSink {
+            events: events_tx.clone(),
+        })));
         let (notices_tx, notices_rx) = unbounded_channel();
         let hub = Self {
             events: events_tx,
             next_tab: Arc::new(AtomicU64::new(0)),
+            gate: Rc::clone(&gate),
         };
         Ok((
             hub,
-            run_hub(
-                worker,
-                local_tables,
-                events_rx,
-                notices_tx,
-                reconnect,
-                content,
-                content_sleeper,
-            ),
+            async move {
+                let state = initial_hub_state(&worker, reconnect.as_ref(), local_tables);
+                HubRuntime {
+                    worker,
+                    state,
+                    notices: notices_tx,
+                    content,
+                    events: events_rx,
+                    retry: ContentRetry::default(),
+                    walk: WalkState {
+                        unswept: true,
+                        ..WalkState::default()
+                    },
+                    gate,
+                }
+                .run(reconnect, content_sleeper)
+                .await
+            },
             notices_rx,
         ))
     }
@@ -799,6 +825,12 @@ impl RelayHub {
         let internal_rx = tab.take_internal_inbox();
         let replier: Box<dyn InternalReplier> = Box::new(InternalLaneReplier(tab.internal_lane()));
         self.spawn_tab(tab, internal_rx, Some(replier))
+    }
+
+    /// The hub's gate controller, armed by
+    /// [`crate::gate::install_worker_gate`].
+    pub(crate) fn gate(&self) -> &Rc<GateController> {
+        &self.gate
     }
 
     fn spawn_tab<D>(
@@ -1142,6 +1174,8 @@ struct HubRuntime<U: Transport> {
     notices: UnboundedSender<HubNotice>,
     content: Option<HubContent>,
     events: UnboundedReceiver<HubEvent>,
+    /// The worker's gate controller, whose prompt future the cycle drives.
+    gate: Rc<GateController>,
     retry: ContentRetry,
     walk: WalkState,
 }
@@ -1183,6 +1217,8 @@ enum Wake {
     Resolve,
     /// The worker's resend of the writes the server deferred fell due.
     Resend,
+    /// The worker's gate prompt resolved.
+    Gate(Option<GateAskOutcome>),
 }
 
 impl<U> HubRuntime<U>
@@ -1252,6 +1288,9 @@ where
             }
         };
         tokio::pin!(resend_wait);
+        // The in-flight gate prompt, if any, driven alongside the other
+        // wakes and handed back to the controller when another wake wins.
+        let mut ask = self.gate.take_ask();
         // Each arm only names its wake reason, so a losing branch leaves
         // nothing half applied: every mpsc receive loses nothing when dropped.
         let wake = {
@@ -1261,6 +1300,14 @@ where
                 retry,
                 ..
             } = self;
+            let prompting = ask.is_some();
+            let ask_wait = async {
+                match ask.as_mut() {
+                    Some(prompt) => prompt.await,
+                    None => core::future::pending().await,
+                }
+            };
+            tokio::pin!(ask_wait);
             tokio::select! {
                 () = &mut content_wait => Wake::Content,
                 event = events.recv() => Wake::Local(event),
@@ -1270,12 +1317,25 @@ where
                 () = core::future::ready(()), if unverified => Wake::Verify,
                 () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
                 () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
+                outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
             }
         };
+        // A losing wake keeps the prompt for the next cycle.
+        if !matches!(wake, Wake::Gate(_))
+            && let Some(ask) = ask.take()
+        {
+            self.gate.restore_ask(ask);
+        }
         match wake {
             Wake::Content => self.drive_content(reconnect).await,
             Wake::Local(event) => self.serve_local(event).await,
             Wake::Upstream(event) => self.serve_upstream(reconnect, event).await,
+            Wake::Gate(outcome) => {
+                // The controller applies the outcome and states the
+                // transition through its sink.
+                self.gate.apply_outcome(&mut ask, outcome);
+                Ok(true)
+            }
             Wake::Verify => self.verify_turn().await,
             Wake::Resolve => {
                 expire_resolves(&mut self.state);
@@ -1443,6 +1503,7 @@ where
             content,
             events,
             retry,
+            gate: _,
             walk,
         } = self;
         let Some(content) = content.as_ref() else {
@@ -1656,43 +1717,6 @@ where
     WalkTurn::Taken
 }
 
-/// The hub core: one task owning the worker connection and every tab's
-/// state, fed exclusively by channels. With reconnect wiring, an upstream
-/// transport drop is recovered in place: tabs stay attached and their
-/// queued frames are served after the resume.
-async fn run_hub<U, F, S, CS>(
-    worker: ConnettoConnection<U>,
-    local_tables: HashSet<String>,
-    events: UnboundedReceiver<HubEvent>,
-    notices: UnboundedSender<HubNotice>,
-    reconnect: Option<HubReconnect<F, S>>,
-    content: Option<HubContent>,
-    content_sleeper: Option<CS>,
-) -> Result<(), RelayError>
-where
-    U: Transport + MaybeSend + 'static,
-    U::Error: core::fmt::Display,
-    F: TransportFactory<Transport = U>,
-    S: Sleeper,
-    CS: Sleeper,
-{
-    let state = initial_hub_state(&worker, reconnect.as_ref(), local_tables);
-    HubRuntime {
-        worker,
-        state,
-        notices,
-        content,
-        events,
-        retry: ContentRetry::default(),
-        walk: WalkState {
-            unswept: true,
-            ..WalkState::default()
-        },
-    }
-    .run(reconnect, content_sleeper)
-    .await
-}
-
 /// One granted upload, run to completion while local events keep being served.
 async fn finish_content_upload<U>(
     worker: &mut ConnettoConnection<U>,
@@ -1890,6 +1914,11 @@ where
             }
         }
         HubEvent::Gone(id) | HubEvent::Kill(id) => remove_tab(worker, state, id).await,
+        // The worker's gate state is recorded and pushed the same way the
+        // hub's own sync status is.
+        HubEvent::Gate(gate) => {
+            forward_gate_state(state, gate);
+        }
     }
     Ok(())
 }
@@ -2691,6 +2720,20 @@ where
             let _ = tab.out.send(TabOut::Control(ControlMessage::SyncStatus(
                 state.sync_status,
             )));
+            // The tab's mirror runs the worker's translated schema, whose
+            // views filter on who is signed in, and the tab holds no
+            // credential, so it answers them as the worker does.
+            let identity = worker.relay_identity().map_err(RelayError::from)?;
+            let _ = tab
+                .out
+                .send(TabOut::Control(ControlMessage::TabIdentity(identity)));
+            // A tab that arrives while the gate is locked learns it at the
+            // same moment, so it starts refusing.
+            if let Some(gate) = state.gate {
+                let _ = tab
+                    .out
+                    .send(TabOut::Control(ControlMessage::GateState(gate)));
+            }
             let _ = notices.send(HubNotice::Handshake {
                 tab: id,
                 client_id: handshake.client_id,
@@ -3892,6 +3935,39 @@ where
     }
 }
 
+/// Record the worker's gate state and push it to the tabs that have finished
+/// their own handshake, because a control frame ahead of a tab's ack is a protocol
+/// violation to that tab, and it learns the current state as part of
+/// handshaking anyway.
+fn forward_gate_state(state: &mut HubState, gate: GateState) {
+    state.gate = Some(gate);
+    for tab in state.tabs.values().filter(|tab| tab.handshaken) {
+        let _ = tab
+            .out
+            .send(TabOut::Control(ControlMessage::GateState(gate)));
+    }
+}
+
+/// The gate's sink into the hub's event intake, which states each transition
+/// to the tabs the way the hub's own sync status is stated.
+struct HubGateSink {
+    events: UnboundedSender<HubEvent>,
+}
+
+impl GateSink for HubGateSink {
+    fn locked(&self) {
+        let _ = self.events.send(HubEvent::Gate(GateState::Locked));
+    }
+
+    fn unlocked(&self) {
+        let _ = self.events.send(HubEvent::Gate(GateState::Unlocked));
+    }
+
+    fn unlock_dismissed(&self) {
+        let _ = self.events.send(HubEvent::Gate(GateState::UnlockDismissed));
+    }
+}
+
 /// Re-snapshot every tab subscription reading a table of a just-resynced
 /// upstream sub. The worker replica has already applied the fresh snapshot
 /// (its own client cleared the stale rows on `FullResyncRequired`), so each
@@ -4447,9 +4523,9 @@ fn session_err<E: core::fmt::Display>(err: E) -> RelayError {
 #[cfg(test)]
 mod tests {
     use super::{
-        BrowserHttp, ContentFrame, HubContent, HubEvent, TabApplyError, apply_local_changeset,
-        changeset_blob_values, recovery_interrupts_attach, recovery_serves_idle,
-        schedule_recovery_event,
+        BrowserHttp, ContentFrame, GateController, GateSink, HubContent, HubEvent, TabApplyError,
+        apply_local_changeset, changeset_blob_values, recovery_interrupts_attach,
+        recovery_serves_idle, schedule_recovery_event,
     };
     use connetto_file_core::FileId;
     use diesel::connection::SimpleConnection;
@@ -4460,6 +4536,63 @@ mod tests {
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
     const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
+
+    /// A build over `ddl` that never reaches a server.
+    fn offline_build(
+        ddl: &str,
+    ) -> connetto_client::ClientBuilder<connetto_core::test_support::FakeTransport> {
+        connetto_client::ClientBuilder::new(
+            connetto_client::SyncSchema::new(connetto_core::schema::SchemaBundle::new(
+                "",
+                "",
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )),
+            || async { Err::<connetto_core::test_support::FakeTransport, _>("offline") },
+        )
+    }
+
+    /// A worker signed in as `token`, opened offline.
+    fn offline_signed_in(
+        ddl: &str,
+    ) -> connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport> {
+        offline_build(ddl)
+            .signed_in(
+                connetto_client::HeldCredential::new(
+                    connetto_client::Grant::new("user:token"),
+                    "token",
+                )
+                .expect("a string identity serializes"),
+            )
+            .open_driven()
+            .expect("the worker opens offline")
+    }
+
+    /// An anonymous worker, opened offline.
+    fn offline_anonymous(
+        ddl: &str,
+    ) -> connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport> {
+        offline_build(ddl)
+            .open_driven()
+            .expect("the worker opens offline")
+    }
+
+    /// A sink that drops the gate's transitions, for a runtime under test.
+    struct TestGateSink;
+
+    impl GateSink for TestGateSink {
+        fn locked(&self) {}
+
+        fn unlocked(&self) {}
+
+        fn unlock_dismissed(&self) {}
+    }
+
+    fn test_gate() -> std::rc::Rc<GateController> {
+        std::rc::Rc::new(GateController::new(std::sync::Arc::new(TestGateSink)))
+    }
 
     #[wasm_bindgen_test]
     fn a_local_recovery_request_cannot_overtake_an_ordinary_event() {
@@ -4938,7 +5071,6 @@ mod tests {
     /// the server would have sent.
     #[wasm_bindgen_test]
     async fn a_tab_aggregate_watch_is_answered_from_rest_while_offline() {
-        use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
         use connetto_core::messages::{
             AggregateUpdate, ControlMessage, Subscribe, SubscriptionSpec,
         };
@@ -4950,7 +5082,6 @@ mod tests {
         const AGG_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER)";
         let query = "SELECT COUNT(*) FROM orders";
         let spec = SubscriptionSpec::new(query);
-        let config = ClientConfig::new("worker").with_login(Some(Grant::new("user:token")));
 
         // A fake server that acks the handshake, delivers one scalar bootstrap
         // for the worker's upstream subscription, then drains so the worker
@@ -4968,13 +5099,7 @@ mod tests {
         // identity the instant it lands, then attach the fake server and pump
         // until it drains, which drains the connect notice, rests the
         // bootstrap, and takes the close.
-        let mut worker = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            AGG_DDL,
-            &config,
-            None,
-        )
-        .expect("worker opens offline");
+        let mut worker = offline_signed_in(AGG_DDL);
         worker
             .subscribe_spec("wire-0", spec.clone())
             .await
@@ -5035,13 +5160,10 @@ mod tests {
     /// rows are durable and the outbox driver retries the upload.
     #[wasm_bindgen_test]
     async fn a_committed_import_survives_a_failing_replay() {
-        use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Grant, Replica};
+        use connetto_client::ExportScope;
         use connetto_core::test_support::FakeTransport;
 
-        let config = ClientConfig::new("worker").with_login(Some(Grant::new("user:token")));
-        let mut source =
-            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
-                .expect("source opens offline");
+        let mut source = offline_signed_in(DDL);
         source
             .conn()
             .batch_execute("INSERT INTO drafts VALUES (1, 'restored')")
@@ -5056,9 +5178,7 @@ mod tests {
             .into_blob()
             .expect("the sink closes into one blob");
 
-        let mut target =
-            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
-                .expect("target opens offline");
+        let mut target = offline_signed_in(DDL);
         target
             .attach(FakeTransport::accepting_but_failing_bulk())
             .await
@@ -5082,14 +5202,10 @@ mod tests {
     /// leaves chunks no manifest names.
     #[wasm_bindgen_test]
     async fn an_import_schedules_the_orphan_sweep() {
-        use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica};
-        use connetto_core::test_support::FakeTransport;
+        use connetto_client::ExportScope;
         use tokio::sync::mpsc::unbounded_channel;
 
-        let config = ClientConfig::new("worker");
-        let mut source =
-            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
-                .expect("the source opens offline");
+        let mut source = offline_anonymous(DDL);
         source
             .conn()
             .batch_execute("INSERT INTO drafts VALUES (1, 'swept')")
@@ -5100,9 +5216,7 @@ mod tests {
             .into_blob()
             .expect("the sink closes into one blob");
 
-        let worker =
-            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
-                .expect("the worker opens offline");
+        let worker = offline_anonymous(DDL);
         let (notices, _notice_rx) = unbounded_channel();
         let (_events, event_rx) = unbounded_channel();
         let mut runtime = super::HubRuntime {
@@ -5112,6 +5226,7 @@ mod tests {
             content: None,
             events: event_rx,
             retry: super::ContentRetry::default(),
+            gate: test_gate(),
             walk: super::WalkState::default(),
         };
 
@@ -5134,17 +5249,12 @@ mod tests {
     /// tab attachments and upstream frames is never held by a long outbox.
     #[wasm_bindgen_test]
     async fn the_content_integrity_walk_checks_one_file_per_turn() {
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_client::{BrowserStore, ContentArchive};
         use connetto_file_core::FileId;
         use std::collections::VecDeque;
         use tokio::sync::mpsc::unbounded_channel;
 
-        let config = ClientConfig::new("worker");
-        let mut worker =
-            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
-                .expect("the worker opens offline");
+        let mut worker = offline_anonymous(DDL);
         let content = ContentArchive::new(BrowserStore::ephemeral(), [5; 32]);
         content.install(&mut worker).expect("content tables");
         let (notices, _notice_rx) = unbounded_channel();
@@ -5159,6 +5269,7 @@ mod tests {
             }),
             events: event_rx,
             retry: super::ContentRetry::default(),
+            gate: test_gate(),
             walk: super::WalkState {
                 unverified: VecDeque::from([
                     FileId::from_bytes([7; 32]),
@@ -5192,16 +5303,11 @@ mod tests {
     #[wasm_bindgen_test]
     async fn a_hub_request_answers_refusals_and_a_hub_retry_clears_the_mark() {
         use super::{ContentRetry, HubEvent, HubRuntime, HubState, WalkState};
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_client::{BrowserStore, ContentArchive};
         use connetto_file_core::FileId;
         use tokio::sync::mpsc::unbounded_channel;
 
-        let config = ClientConfig::new("worker");
-        let mut worker =
-            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
-                .expect("the worker opens offline");
+        let mut worker = offline_anonymous(DDL);
         let content = ContentArchive::new(BrowserStore::ephemeral(), [5; 32]);
         content.install(&mut worker).expect("content tables");
 
@@ -5233,6 +5339,7 @@ mod tests {
             }),
             events: event_rx,
             retry: ContentRetry::default(),
+            gate: test_gate(),
             walk: WalkState::default(),
         };
 

@@ -14,10 +14,8 @@ pub use archive_channel::{
     serve_import_requests_on,
 };
 pub use blob_io::{BlobError, BlobSink, BlobSource};
-pub use boot::{
-    BootError, BootIdentity, BootedSession, DbWorkerConfig, WorkerBootstrap, boot_db_worker,
-    spawn_db_worker,
-};
+pub(crate) use boot::boot_db_worker;
+pub use boot::{BootError, BootIdentity, BootedSession, WorkerBootstrap, spawn_db_worker};
 pub use intake::{
     IntakeError, TabWire, announce_tab, await_db_worker_ready, request_custody, sleep,
     tab_wire_factory,

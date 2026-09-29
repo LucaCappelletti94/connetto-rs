@@ -26,13 +26,13 @@
 // these helpers, so unused ones are expected per binary.
 #![allow(dead_code)]
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Transport;
+use connetto_wasm_smoke::build::{self, Once};
 use connetto_wasm_smoke::leader::Membership;
 use connetto_wasm_smoke::locks::HeldLock;
-use connetto_wasm_smoke::workers::{
-    DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL, announce_tab, await_db_worker_ready,
-};
+use connetto_wasm_smoke::workers::demo_schema;
+use connetto_wasm_smoke::workers::{DEMO_QUERY, DEMO_WS_URL, announce_tab, await_db_worker_ready};
 use connetto_wasm_smoke::{BrowserSocket, MessageTransport, leader, locks};
 use diesel::prelude::*;
 use web_sys::BroadcastChannel;
@@ -112,56 +112,27 @@ pub fn glue_url() -> String {
 /// the handshake cannot outrun the worker's end of the channel.
 pub async fn connect_tab(
     client_id: &str,
-    token: String,
-    identity: &str,
 ) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await.expect("announce the tab");
     let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
-    let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("tab connect through the wire channel")
+    ClientBuilder::new(demo_schema(), Once::new(transport))
+        .with_client_id(client_id.to_owned())
+        .connect_driven()
+        .await
+        .expect("tab connect through the wire channel")
 }
 
 /// Connect a client directly to `connetto-server` over a `BrowserSocket`.
-pub async fn connect_server(
-    name: &str,
-    tag: i64,
-    token: String,
-    identity: &str,
-) -> ConnettoConnection<BrowserSocket> {
+pub async fn connect_server(token: String, identity: &str) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig::new(format!("{name}-{tag}"))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect")
+    ClientBuilder::new(demo_schema(), Once::new(transport))
+        .signed_in(build::held(token, identity))
+        .connect_driven()
+        .await
+        .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`, applying every frame in between.
@@ -289,7 +260,7 @@ impl ParityFixture {
         stage("db worker ready");
 
         // The direct client: a plain server session, the parity reference.
-        let mut direct = connect_server("parity-direct", base, token.clone(), user_id).await;
+        let mut direct = connect_server(token.clone(), user_id).await;
         direct
             .subscribe(&format!("{sub_id}-direct"), DEMO_QUERY)
             .await
@@ -304,7 +275,7 @@ impl ParityFixture {
         // protocol the hub's reaper requires.
         let client_id = rosetta_uuid::Uuid::new_v4().to_string();
         let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-        let mut relay = connect_tab(&client_id, token, user_id).await;
+        let mut relay = connect_tab(&client_id).await;
         relay
             .subscribe(&format!("{sub_id}-relay"), DEMO_QUERY)
             .await

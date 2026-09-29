@@ -13,8 +13,13 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{ClientConfig, ConnettoConnection, Replica, ReplicaKey};
+use connetto_client::{
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate,
+    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
+use connetto_core::traits::{ReplicaKeyStore, Transport};
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -40,8 +45,116 @@ struct SchemaName {
     name: String,
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r43").with_login(Some(connetto_client::Grant::new("user:tester")))
+/// A client schema over `ddl`, with `tier` as its device-private tier.
+fn schema(ddl: &str, tier: Option<&str>) -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        ddl,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        tier,
+    ))
+}
+
+/// The replica at exactly `url`, fresh or already there as the test says.
+struct At {
+    url: String,
+    exists: bool,
+}
+
+impl ReplicaPlace for At {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            name,
+            self.url.clone(),
+            self.exists,
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// A key store holding one key for every record.
+struct Holding(ReplicaKey);
+
+impl ReplicaKeyStore for Holding {
+    type Error = ClientError;
+
+    fn load(&self, _name: &str) -> impl Future<Output = Result<Option<ReplicaKey>, ClientError>> {
+        core::future::ready(Ok(Some(self.0.clone())))
+    }
+
+    fn store(
+        &self,
+        _name: &str,
+        _key: &ReplicaKey,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn clear(&self, _name: &str) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn protection(&self) -> Custody {
+        Custody::Ephemeral
+    }
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
+/// The replica at `url` under `key`, created when `fresh`, connected to a fake
+/// server that acknowledges the handshake and nothing else.
+async fn connect_at(
+    schema: SyncSchema,
+    url: &str,
+    key: ReplicaKey,
+    fresh: bool,
+) -> Result<ConnettoConnection<FakeTransport>, ClientError> {
+    ClientBuilder::new(schema, once(FakeTransport::accepting()))
+        .signed_in(
+            HeldCredential::new(connetto_client::Grant::new("user:tester"), "tester")
+                .expect("a string identity serializes"),
+        )
+        .durable(
+            At {
+                url: url.to_owned(),
+                exists: !fresh,
+            },
+            Holding(key),
+        )
+        .with_gate(Gate::off())
+        .connect_driven()
+        .await
+}
+
+/// The replica at `url` under `key`, created when `fresh`, with no transport.
+async fn open_at(
+    schema: SyncSchema,
+    url: &str,
+    key: ReplicaKey,
+    fresh: bool,
+) -> Result<ConnettoConnection<FakeTransport>, ClientError> {
+    ClientBuilder::new(schema, once(FakeTransport::accepting()))
+        .signed_in(
+            HeldCredential::new(connetto_client::Grant::new("user:tester"), "tester")
+                .expect("a string identity serializes"),
+        )
+        .durable(
+            At {
+                url: url.to_owned(),
+                exists: !fresh,
+            },
+            Holding(key),
+        )
+        .with_gate(Gate::off())
+        .open_driven()
+        .await
 }
 
 /// The tier is reached through the replica connection, and the pool gets its
@@ -58,18 +171,9 @@ async fn the_tier_is_attached_to_the_replica_and_frees_with_it() {
     let replica_url = storage.db_url(replica_name);
     let key = ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN]);
     {
-        let replica = Replica::encrypted_file(&replica_url, Some(key))
-            .expect("a resolved key")
-            .with_tier(TIER_DDL);
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &replica,
-            REPLICA_DDL,
-            &config(),
-            None,
-        )
-        .await
-        .expect("connect");
+        let mut conn = connect_at(schema(REPLICA_DDL, Some(TIER_DDL)), &replica_url, key, true)
+            .await
+            .expect("connect");
 
         // The attachment is the mechanism, so say so rather than inferring it.
         let attached: Vec<SchemaName> = diesel::sql_query("PRAGMA database_list")
@@ -124,15 +228,11 @@ async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
     let replica_url = storage.db_url(replica_name);
     let key = ReplicaKey::from_bytes([0x6b; ReplicaKey::LEN]);
     {
-        let replica = Replica::encrypted_file(&replica_url, Some(key.clone()))
-            .expect("a resolved key")
-            .with_tier(TIER_DDL);
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &replica,
-            REPLICA_DDL,
-            &config(),
-            None,
+        let mut conn = connect_at(
+            schema(REPLICA_DDL, Some(TIER_DDL)),
+            &replica_url,
+            key.clone(),
+            true,
         )
         .await
         .expect("connect");
@@ -142,13 +242,14 @@ async fn a_device_private_row_survives_a_reopen_through_the_attachment() {
             .expect("write a device-private row");
     }
 
-    let replica = Replica::encrypted_file(&replica_url, Some(key))
-        .expect("a resolved key")
-        .with_existing_tier();
-    let mut conn =
-        ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
-            .await
-            .expect("reopen");
+    let mut conn = connect_at(
+        schema(REPLICA_DDL, Some(TIER_DDL)),
+        &replica_url,
+        key,
+        false,
+    )
+    .await
+    .expect("reopen");
     let seen: Vec<Option<String>> = drafts::table
         .select(drafts::body)
         .load(conn.conn())
@@ -178,13 +279,13 @@ async fn the_replica_clock_works_in_the_browser() {
     storage.reserve(4).await.expect("room in the pool");
     let key = ReplicaKey::from_bytes([0x29; ReplicaKey::LEN]);
     let replica_url = storage.db_url("r29-clock.sqlite");
-    let replica = Replica::encrypted_file(&replica_url, Some(key)).expect("a resolved key");
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &replica,
-        "CREATE TABLE t (id INTEGER PRIMARY KEY)",
-        &config(),
-        None,
+    let mut conn = open_at(
+        schema("CREATE TABLE t (id INTEGER PRIMARY KEY)", None),
+        &replica_url,
+        key,
+        true,
     )
+    .await
     .expect("open");
 
     let now: Now = diesel::sql_query("SELECT CAST(strftime('%s','now') AS INTEGER) AS secs")

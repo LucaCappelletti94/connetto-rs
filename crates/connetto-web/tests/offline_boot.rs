@@ -13,10 +13,12 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use connetto_client::ExportScope;
+use connetto_client::builder::schema::SyncSchema;
 use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
+use connetto_web::builder::WebClientBuilder;
 use connetto_web::storage::{PendingWipe, ReplicaStorage, mark_wipe_pending, take_pending_wipes};
-use connetto_web::workers::{BlobSource, DbWorkerConfig, boot_db_worker, request_export};
+use connetto_web::workers::{BlobSource, request_export};
 use wasm_bindgen::JsCast;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::DedicatedWorkerGlobalScope;
@@ -30,17 +32,19 @@ const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)"
 /// rather than reaching something unexpected.
 const NOWHERE: &str = "ws://127.0.0.1:9/connetto";
 
-fn config() -> DbWorkerConfig {
-    DbWorkerConfig::new(connetto_core::SchemaVersion::from_source(REPLICA_DDL))
-        .with_ws_url(NOWHERE)
-        .with_replica_db_prefix("r20-offline-boot.sqlite")
-        .with_replica_ddl(REPLICA_DDL)
-        .with_frontend_ddl(TIER_DDL)
-        .with_upstream_sub_id("r20-upstream")
-        .with_upstream_query("SELECT * FROM items")
+fn builder() -> WebClientBuilder {
+    let bundle = connetto_core::schema::SchemaBundle::new(
+        REPLICA_DDL,
+        REPLICA_DDL,
+        REPLICA_DDL,
+        Vec::<(&str, &str)>::new(),
+        Vec::<&str>::new(),
+        Some(TIER_DDL),
+    );
+    WebClientBuilder::new(NOWHERE, SyncSchema::new(bundle))
         .with_hub_meta_name("r20-offline-boot-hub.sqlite")
+        .with_upstream("r20-upstream", "SELECT * FROM items")
         .with_content_namespace("r68-offline-content")
-        .with_auth_db_name("r20-offline-boot-auth.sqlite")
 }
 
 /// The worker comes up with nothing listening, and says so by completing.
@@ -62,7 +66,7 @@ async fn the_worker_starts_with_no_server_reachable() {
     .await
     .expect("mark failing wipe");
     assert!(
-        boot_db_worker::<String>(&config()).await.is_err(),
+        builder().boot::<String>().await.is_err(),
         "invalid content namespace must fail the boot"
     );
     assert_eq!(
@@ -96,7 +100,8 @@ async fn the_worker_starts_with_no_server_reachable() {
 
     // Returns rather than propagating. Before this phase the connect failure
     // came straight back out of here and the worker never existed.
-    let booted = boot_db_worker::<String>(&config())
+    let booted = builder()
+        .boot::<String>()
         .await
         .expect("the worker starts with no server reachable");
     let reopened = BrowserStore::install(&worker, namespace)

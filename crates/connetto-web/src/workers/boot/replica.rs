@@ -3,99 +3,64 @@ use std::rc::Rc;
 use wasm_bindgen::JsCast;
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica, ReplicaStorage as StorageKind,
-    Tier,
+    ClientError, ClientEvent, ConnettoConnection, ContentPlace, Located, ReplicaPlace,
 };
 use connetto_core::custody::{Custody, NoGate};
 use connetto_core::traits::ReplicaKeyStore as _;
 
 use super::super::helpers::sleep_ms;
-use super::super::session::{AccountStoreHandle, acquire_session};
+use super::super::session::{AccountStoreHandle, ResolvedSignIn, resolve_sign_in};
 use super::BootError;
-use super::DbWorkerConfig;
 use crate::BrowserSocket;
+use crate::builder::{CoreBuild, WebConfig};
 
+/// What the boot resolved about its replica, which the services and the
+/// booted session report read.
 pub(crate) struct BootReplicaSpec<Id> {
+    /// The replica's name in the pool, the bare prefix for an anonymous boot.
     pub(crate) replica_db_name: String,
-    pub(crate) replica_url: String,
+    /// The account key the identity is addressed by.
     pub(crate) active_account: Option<String>,
+    /// Whether the replica is durable, which only a signed-in boot is.
     pub(crate) identified: bool,
+    /// Whether the replica was already in the pool.
     pub(crate) existing: bool,
+    /// The identity a provider login established.
     pub(crate) identity: Option<Id>,
+    /// Unix seconds when the local session lapses.
     pub(crate) session_expires_at: Option<u64>,
-    pub(crate) login: Option<Grant>,
-    /// The share keys this boot holds, each the signed grant and the subject
-    /// it names. Empty when the deployment named none, and the replica then
-    /// admits nothing through a key, exactly as the server does for that same
-    /// caller.
-    pub(crate) share_keys: Vec<(String, String)>,
 }
 
-impl<Id: serde::Serialize + core::fmt::Display> BootReplicaSpec<Id> {
-    pub(super) fn from_session(
-        config: &DbWorkerConfig,
-        session: Option<crate::auth::BrowserSession<Id>>,
-        storage: &crate::storage::ReplicaStorage,
-    ) -> Result<Self, BootError> {
-        let replica_db_name = match &session {
-            Some(session) => {
-                connetto_client::replica_db_name(config.replica_db_prefix, &session.user_id)
-                    .map_err(BootError::ReplicaOpen)?
-            }
-            None => config.replica_db_prefix.to_owned(),
-        };
-        let active_account = match &session {
-            Some(session) => Some(
-                connetto_client::encode_identity(&session.user_id)
-                    .map_err(BootError::ReplicaOpen)?,
-            ),
-            None => None,
-        };
-        let existing = storage.exists(&replica_db_name);
-        let replica_url = storage.db_url(&replica_db_name);
-        let identified = session.is_some();
-        let session_expires_at = session.as_ref().map(|s| s.session_expires_at);
-        let login = session.as_ref().map(|s| Grant::new(s.access_token.clone()));
-        let identity = session.map(|s| s.user_id);
-        Ok(Self {
-            replica_db_name,
-            replica_url,
-            active_account,
-            identified,
-            existing,
-            identity,
-            session_expires_at,
-            login,
-            share_keys: config.share_keys.clone(),
-        })
+/// The OPFS pool, the browser's place for a durable replica.
+///
+/// Each replica is named under the application's prefix, and its key record
+/// takes the same name, because the key store is shared by the whole
+/// origin while the prefix separates the applications on it.
+pub(crate) struct OpfsPlace<'a> {
+    pub(crate) storage: &'a crate::storage::ReplicaStorage,
+    pub(crate) prefix: &'static str,
+}
+
+impl ReplicaPlace for OpfsPlace<'_> {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        let db = crate::storage::replica_entry(self.prefix, name);
+        let url = self.storage.db_url(&db);
+        let exists = self.storage.exists(&db);
+        Ok(Located::new(db, url, exists, ContentPlace::InMemory))
     }
 }
 
-/// Combine session acquisition and spec construction into one step.
-pub(super) async fn resolve_replica_spec<Id>(
-    config: &DbWorkerConfig,
-    storage: &crate::storage::ReplicaStorage,
-    key_store: &crate::auth::IdbKeyStore,
-    was_enrolled: bool,
-) -> Result<BootReplicaSpec<Id>, BootError>
-where
-    Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
-{
-    let session = acquire_boot_session::<Id>(config, storage, key_store, was_enrolled).await?;
-    BootReplicaSpec::from_session(config, session, storage)
-}
-
 pub(super) async fn setup_custody(
-    config: &DbWorkerConfig,
+    config: &WebConfig,
     key_store: &Rc<crate::auth::IdbKeyStore>,
 ) -> Result<bool, BootError> {
-    if config.unlock {
+    if config.gate.on() {
         crate::unlock::install_worker_handler()?;
     }
     crate::unlock::init_worker(Rc::clone(key_store), Custody::Unverified(NoGate::Offerable));
     let enrolled_ids = key_store.enrolled().await.map_err(BootError::KeyStore)?;
     let was_enrolled = !enrolled_ids.is_empty();
-    if was_enrolled && !config.unlock {
+    if was_enrolled && !config.gate.on() {
         return Err(BootError::KeyStore(crate::auth::AuthError::Locked {
             detail: "a credential is enrolled but this build did not enable the unlock \
                      protocol, so nothing here can derive the key"
@@ -152,13 +117,18 @@ async fn run_unlock_ceremony(
     Ok(())
 }
 
-async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned>(
-    config: &DbWorkerConfig,
+/// Resolve the sign-in, enrolling the gate after a first login when the
+/// build keeps it on and nothing was enrolled before.
+pub(super) async fn resolve_boot_sign_in<Id>(
+    config: &WebConfig,
     storage: &crate::storage::ReplicaStorage,
     key_store: &crate::auth::IdbKeyStore,
     was_enrolled: bool,
-) -> Result<Option<crate::auth::BrowserSession<Id>>, BootError> {
-    let Some(auth_config) = &config.auth else {
+) -> Result<Option<ResolvedSignIn<Id>>, BootError>
+where
+    Id: serde::Serialize + serde::de::DeserializeOwned + core::fmt::Display,
+{
+    let Some(kind) = config.sign_in.clone() else {
         crate::unlock::set_custody(Custody::Ephemeral);
         return Ok(None);
     };
@@ -166,16 +136,16 @@ async fn acquire_boot_session<Id: serde::Serialize + serde::de::DeserializeOwned
         db_name: config.auth_db_name,
         storage,
     };
-    let session = acquire_session::<Id>(auth_config, &store, config.pick_account)
+    let resolved = resolve_sign_in::<Id>(kind, &store, config.redirect_uri.as_deref())
         .await
         .map_err(BootError::SessionAcquisition)?;
-    // A first run on an unlocking build enrols only after the login resolved an
+    // A first run on a gated build enrols only after the login resolved an
     // account, so the user enrols a profile that exists rather than an empty
     // one.
-    if config.unlock && !was_enrolled {
+    if config.gate.on() && !was_enrolled {
         run_enrol_ceremony(key_store).await?;
     }
-    Ok(Some(session))
+    Ok(Some(resolved))
 }
 
 async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), BootError> {
@@ -213,148 +183,114 @@ async fn run_enrol_ceremony(key_store: &crate::auth::IdbKeyStore) -> Result<(), 
     Ok(())
 }
 
-pub(super) async fn provision_or_load_key(
-    key_store: &crate::auth::IdbKeyStore,
-    replica_db_name: &str,
-    existing: bool,
-) -> Result<Option<connetto_core::ReplicaKey>, BootError> {
-    if existing {
+/// Open the worker's replica through the core build, with no transport, and
+/// return it beside the spec and the content root key.
+///
+/// A signed-in boot opens the durable replica its credential names under the
+/// application's prefix, provisioning the key of a fresh one first, since
+/// only the browser mints keys here. An anonymous boot opens in memory, and
+/// its content root key is minted for this worker and never stored.
+pub(super) async fn open_worker<Id>(
+    core: CoreBuild,
+    config: &WebConfig,
+    resolved: Option<ResolvedSignIn<Id>>,
+    storage: &crate::storage::ReplicaStorage,
+    key_store: &Rc<crate::auth::IdbKeyStore>,
+) -> Result<
+    (
+        BootReplicaSpec<Id>,
+        ConnettoConnection<BrowserSocket>,
+        Option<[u8; 32]>,
+    ),
+    BootError,
+> {
+    let (Some(resolved), Some(prefix)) = (resolved, config.replica_db_prefix) else {
+        let content_root_key = if config.content_namespace.is_some() {
+            Some(crate::auth::mint_content_root_key().map_err(BootError::KeyStore)?)
+        } else {
+            None
+        };
+        let worker = core
+            .with_client_id(rosetta_uuid::Uuid::new_v4().to_string())
+            .open_driven()
+            .map_err(BootError::ReplicaOpen)?;
+        let spec = BootReplicaSpec {
+            replica_db_name: connetto_client::REPLICA_PREFIX.to_owned(),
+            active_account: None,
+            identified: false,
+            existing: false,
+            identity: None,
+            session_expires_at: None,
+        };
+        return Ok((spec, worker, content_root_key));
+    };
+    let place = OpfsPlace { storage, prefix };
+    let located = place
+        .locate(resolved.credential.replica_name())
+        .map_err(BootError::ReplicaOpen)?;
+    let key = if located.exists() {
         key_store
-            .load(replica_db_name)
+            .load(located.record())
             .await
-            .map_err(BootError::KeyStore)
+            .map_err(BootError::KeyStore)?
     } else {
-        crate::auth::provision_replica_key(key_store, replica_db_name)
-            .await
-            .map_err(BootError::KeyStore)
-            .map(Some)
-    }
-}
-
-/// Clear any replica key an earlier anonymous boot stored under the bare prefix.
-///
-/// An anonymous boot provisions no key, so a record left by a boot from before
-/// this decision would sit under the bare prefix with nothing to ever remove it.
-/// The clear is idempotent, so a boot that finds none is unaffected.
-pub(super) async fn clear_anonymous_key(
-    key_store: &crate::auth::IdbKeyStore,
-    replica_db_name: &str,
-) -> Result<(), BootError> {
-    key_store
-        .clear(replica_db_name)
+        Some(
+            crate::auth::provision_replica_key(key_store.as_ref(), located.record())
+                .await
+                .map_err(BootError::KeyStore)?,
+        )
+    };
+    let content_root_key = key.as_ref().map(|key| *key.as_bytes());
+    let worker = core
+        .signed_in(resolved.credential)
+        .durable(
+            place,
+            crate::auth::BuilderKeyStore::new(Rc::clone(key_store)),
+        )
+        .open_driven()
         .await
-        .map_err(BootError::KeyStore)
+        .map_err(BootError::ReplicaOpen)?;
+    let spec = BootReplicaSpec {
+        replica_db_name: located.record().to_owned(),
+        active_account: resolved.account,
+        identified: true,
+        existing: located.exists(),
+        identity: resolved.identity,
+        session_expires_at: resolved.session_expires_at,
+    };
+    tracing::info!(
+        replica = %spec.replica_db_name,
+        resumed = spec.existing,
+        "db worker: replica open"
+    );
+    Ok((spec, worker, content_root_key))
 }
 
-/// Resolve this boot's replica key, provisioning only for an identified boot.
-///
-/// An anonymous boot has no durable file to open, so it provisions no key and
-/// instead clears any record a past anonymous boot left under the bare prefix.
-pub(super) async fn resolve_replica_key<Id>(
-    key_store: &crate::auth::IdbKeyStore,
-    spec: &BootReplicaSpec<Id>,
-) -> Result<Option<connetto_core::ReplicaKey>, BootError> {
-    if spec.identified {
-        provision_or_load_key(key_store, &spec.replica_db_name, spec.existing).await
-    } else {
-        clear_anonymous_key(key_store, &spec.replica_db_name).await?;
-        Ok(None)
-    }
-}
-
-pub(super) fn build_boot_client_config<Id: core::fmt::Display>(
-    config: &DbWorkerConfig,
-    login: Option<Grant>,
-    spec: &BootReplicaSpec<Id>,
-) -> ClientConfig {
-    let mut client_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(login)
-        .with_schema_version(Some(config.schema_version.clone()))
-        .with_sql_functions(config.sql_functions.clone())
-        .with_policy_tables(config.policy_tables.clone());
-    if !config.caller_function.is_empty() {
-        client_config = client_config.with_caller(
-            config.caller_function,
-            spec.identity.as_ref().map(ToString::to_string),
-        );
-    }
-    if !config.subjects_function.is_empty() {
-        // Pairs rather than two lists: the client renders the set from the
-        // grants that are still alive and presents those same grants, so an
-        // expired key cannot linger in a durable replica's own answer.
-        client_config = client_config.with_share_keys::<String>(
-            config.subjects_function,
-            spec.share_keys.iter().cloned().map(|(grant, subject)| {
-                (
-                    Grant::new(grant),
-                    connetto_core::auth::CapabilitySubject::new(subject),
-                )
-            }),
-        );
-    }
-    client_config
-}
-
-pub(super) async fn try_connect_upstream(ws_url: &str) -> Option<BrowserSocket> {
+/// Attach the worker to the server at boot, or leave it offline for the
+/// reconnect loop when no server answers.
+pub(super) async fn try_connect_upstream(
+    worker: &mut ConnettoConnection<BrowserSocket>,
+    ws_url: &str,
+) -> Result<(), BootError> {
     match BrowserSocket::connect(ws_url).await {
-        Ok(transport) => Some(transport),
+        Ok(transport) => worker
+            .attach(transport)
+            .await
+            .map_err(BootError::ReplicaOpen),
         Err(err) => {
             tracing::warn!(
                 error = %err,
                 url = ws_url,
                 "db worker: no server reachable, starting offline"
             );
-            None
+            Ok(())
         }
     }
 }
 
-/// Open the boot replica and return the content root key beside the connection.
-///
-/// For an identified boot the content root key is the replica key. For an
-/// anonymous boot the replica key is `None`, so a fresh content root key is
-/// minted for this worker when a content namespace is configured.
-pub(super) async fn open_boot_replica<Id>(
-    transport: Option<BrowserSocket>,
-    spec: &BootReplicaSpec<Id>,
-    config: &DbWorkerConfig,
-    client_config: &ClientConfig,
-    replica_key: Option<connetto_core::ReplicaKey>,
-) -> Result<(ConnettoConnection<BrowserSocket>, Option<[u8; 32]>), BootError> {
-    let (worker, content_root_key) = if spec.identified {
-        let content_root_key = replica_key.as_ref().map(|key| *key.as_bytes());
-        let replica = Replica::encrypted_file(&spec.replica_url, replica_key)
-            .map_err(BootError::ReplicaOpen)?
-            .with_tier(config.frontend_ddl);
-        let worker =
-            open_replica(transport, &replica, spec.existing, config, client_config).await?;
-        (worker, content_root_key)
-    } else {
-        // An anonymous content store is worker-lifetime memory, so its root key is
-        // minted for this worker and never stored, and only when a content
-        // namespace is configured at all.
-        let content_root_key = if config.content_namespace.is_some() {
-            Some(crate::auth::mint_content_root_key().map_err(BootError::KeyStore)?)
-        } else {
-            None
-        };
-        let replica = Replica::in_memory().with_tier(config.frontend_ddl);
-        let worker = open_replica(transport, &replica, false, config, client_config).await?;
-        (worker, content_root_key)
-    };
-    tracing::info!(
-        replica = %spec.replica_db_name,
-        resumed = spec.existing,
-        durable = spec.identified,
-        connected = worker.is_connected(),
-        "db worker: replica open"
-    );
-    Ok((worker, content_root_key))
-}
-
 pub(super) async fn subscribe_and_boot(
     worker: &mut ConnettoConnection<BrowserSocket>,
-    config: &DbWorkerConfig,
+    config: &WebConfig,
 ) -> Result<(), BootError> {
     // Matches the hello-channel HELLO_TIMEOUT_MS so a silent server is detected
     // as fast as the tab's own wait expires.
@@ -408,98 +344,4 @@ pub(super) async fn subscribe_and_boot(
         }
     }
     Ok(())
-}
-
-/// Open the replica with the device-private database attached beside it.
-async fn open_replica<S: StorageKind>(
-    transport: Option<BrowserSocket>,
-    replica: &Replica<'_, S>,
-    existing: bool,
-    config: &DbWorkerConfig,
-    client_config: &ClientConfig,
-) -> Result<ConnettoConnection<BrowserSocket>, BootError> {
-    if matches!(replica.tier(), Tier::None) {
-        return Err(BootError::NoTierConfigured);
-    }
-    let mut worker = if existing {
-        ConnettoConnection::open_existing(replica, client_config, None)
-            .map_err(BootError::ReplicaOpen)?
-    } else {
-        ConnettoConnection::open(replica, config.replica_ddl, client_config, None)
-            .map_err(BootError::ReplicaOpen)?
-    };
-    if let Some(transport) = transport {
-        worker
-            .attach(transport)
-            .await
-            .map_err(BootError::ReplicaOpen)?;
-    }
-    Ok(worker)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{BootReplicaSpec, resolve_replica_key};
-    use connetto_core::traits::ReplicaKeyStore as _;
-    use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
-
-    wasm_bindgen_test_configure!(run_in_dedicated_worker);
-
-    /// An anonymous spec, whose replica name is the bare prefix a run with no
-    /// identity opens under.
-    fn anonymous_spec(prefix: &str) -> BootReplicaSpec<String> {
-        BootReplicaSpec {
-            replica_db_name: prefix.to_owned(),
-            replica_url: String::new(),
-            active_account: None,
-            identified: false,
-            existing: false,
-            identity: None,
-            session_expires_at: None,
-            login: None,
-            share_keys: Vec::new(),
-        }
-    }
-
-    /// An anonymous boot provisions no key, and clears any record a boot from
-    /// before this decision left under the bare prefix.
-    #[wasm_bindgen_test]
-    async fn an_anonymous_boot_writes_no_key_and_clears_a_leftover() {
-        let key_store = crate::auth::IdbKeyStore::open()
-            .await
-            .expect("open the key store");
-
-        // A leftover record under the bare prefix, as a past anonymous boot wrote.
-        let leftover = "boot-anon-leftover.sqlite";
-        crate::auth::provision_replica_key(&key_store, leftover)
-            .await
-            .expect("seed a leftover key");
-        assert!(
-            key_store.load(leftover).await.expect("load").is_some(),
-            "the leftover record is present before the boot"
-        );
-
-        let resolved = resolve_replica_key(&key_store, &anonymous_spec(leftover))
-            .await
-            .expect("resolve the anonymous key");
-        assert!(resolved.is_none(), "an anonymous boot provisions no key");
-        assert_eq!(
-            key_store.load(leftover).await.expect("load"),
-            None,
-            "and it clears the leftover record under the bare prefix"
-        );
-
-        // With nothing present, an anonymous boot writes no record at all.
-        let fresh = "boot-anon-fresh.sqlite";
-        key_store.clear(fresh).await.expect("start from nothing");
-        let resolved = resolve_replica_key(&key_store, &anonymous_spec(fresh))
-            .await
-            .expect("resolve the anonymous key");
-        assert!(resolved.is_none());
-        assert_eq!(
-            key_store.load(fresh).await.expect("load"),
-            None,
-            "an anonymous boot leaves no key-store record behind"
-        );
-    }
 }

@@ -15,12 +15,11 @@ use std::future::{Future, ready};
 use std::sync::{Arc, Mutex};
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, DataDir, SyncSchema};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionSpec,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
 use tempfile::tempdir;
@@ -129,6 +128,11 @@ impl Transport for Script {
     }
 }
 
+/// The refusal a dialer that is down for its first attempt hands back.
+#[derive(Debug, thiserror::Error)]
+#[error("the server is down")]
+struct FirstDialDown;
+
 fn ack() -> IncomingFrame {
     IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
         connection_id: "script".to_owned(),
@@ -141,8 +145,15 @@ fn ack() -> IncomingFrame {
     }))
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r20-never-synced").with_login(Some(Grant::new("user:tester")))
+fn tier_schema() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ))
 }
 
 /// Wait for the pump to report the named event, so the assertions that follow
@@ -164,16 +175,19 @@ async fn until(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>, sub: 
 #[tokio::test]
 async fn an_empty_first_sync_still_counts_as_having_synced() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("fresh.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
 
     let script = Script::with(vec![ack()]);
-    let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open the replica");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open the replica");
     conn.attach(script.clone())
         .await
         .expect("attach the script");
@@ -217,7 +231,7 @@ async fn an_empty_first_sync_still_counts_as_having_synced() {
     // The event is broadcast from inside the pump's state lock, so taking that
     // lock is the barrier proving the whole iteration finished. Without it the
     // assertions below race the rest of the step.
-    client.with_conn(|_| ()).await;
+    client.with_conn(|_| ()).await.expect("gate not locked");
 
     assert!(
         query.rows().is_empty(),
@@ -238,16 +252,18 @@ async fn an_empty_first_sync_still_counts_as_having_synced() {
 #[tokio::test]
 async fn device_private_rows_do_not_wait_on_a_server() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("local.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key")
-    .with_tier(TIER_DDL);
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
 
-    let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open the replica");
+    let mut conn = ClientBuilder::new(
+        tier_schema(),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open the replica");
     assert!(!conn.has_ever_synced(), "no server was ever reached");
     diesel::insert_into(drafts::table)
         .values((drafts::id.eq(1), drafts::body.eq("typed offline")))
@@ -285,16 +301,18 @@ async fn device_private_rows_do_not_wait_on_a_server() {
 #[tokio::test]
 async fn local_writes_keep_refreshing_with_no_server_and_no_way_to_get_one() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("local-only.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key")
-    .with_tier(TIER_DDL);
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
 
-    let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open the replica");
+    let conn = ClientBuilder::new(
+        tier_schema(),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open the replica");
     // No reconnect driver: nothing can ever attach a transport to this client.
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
@@ -329,7 +347,8 @@ async fn local_writes_keep_refreshing_with_no_server_and_no_way_to_get_one() {
                 .execute(conn.conn())
                 .expect("write a draft");
         })
-        .await;
+        .await
+        .expect("gate not locked");
 
     tokio::time::timeout(core::time::Duration::from_secs(5), query.changed())
         .await
@@ -354,15 +373,18 @@ async fn local_writes_keep_refreshing_with_no_server_and_no_way_to_get_one() {
 #[tokio::test]
 async fn a_query_watched_with_no_server_answers_and_then_subscribes() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("watch-offline.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
 
-    let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open with no server");
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::label.eq("from a previous run")))
         .execute(conn.conn())
@@ -398,36 +420,42 @@ async fn a_query_watched_with_no_server_answers_and_then_subscribes() {
 #[tokio::test]
 async fn a_run_that_starts_before_its_server_ends_up_subscribed() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("late-server.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-
-    let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
     let script = Script::with(vec![ack()]);
     let factory = {
         let script = script.clone();
+        let down = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         move || {
             let script = script.clone();
-            async move { Ok::<_, core::convert::Infallible>(script) }
+            let down = down.clone();
+            async move {
+                if down.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    Err(FirstDialDown)
+                } else {
+                    Ok(script)
+                }
+            }
         }
     };
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
-        factory,
-        |d| tokio::time::sleep(d),
-        ReconnectPolicy::new()
-            .with_initial_backoff(core::time::Duration::from_millis(5))
-            .with_max_backoff(core::time::Duration::from_millis(20))
-            .with_max_attempts(Some(20)),
-    );
+    let (client, pump) = ClientBuilder::new(super::support::bundle(DDL), factory)
+        .with_reconnect(
+            ReconnectPolicy::new()
+                .with_initial_backoff(core::time::Duration::from_millis(5))
+                .with_max_backoff(core::time::Duration::from_millis(20))
+                .with_max_attempts(Some(20)),
+        )
+        .with_sleeper(|d| tokio::time::sleep(d))
+        .signed_in(credential)
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .connect_with_pump()
+        .await
+        .expect("connect with the reconnect driver");
     tokio::spawn(pump);
-    let mut events = client.events();
+    let mut events = client.client().events();
 
     let query = client
+        .client()
         .watch::<_, Item>(items::table.order(items::id))
         .await
         .expect("watching must not need a server");
@@ -457,15 +485,18 @@ async fn a_run_that_starts_before_its_server_ends_up_subscribed() {
 #[tokio::test]
 async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("grace.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
 
-    let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open with no server");
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
 
@@ -484,6 +515,7 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
         client
             .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
             .await
+            .expect("gate not locked")
             .len(),
         2
     );
@@ -496,7 +528,8 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
                 .execute(conn.conn())
                 .expect("write");
         })
-        .await;
+        .await
+        .expect("gate not locked");
     tokio::time::timeout(core::time::Duration::from_secs(5), probe.changed())
         .await
         .expect("the pump completed an iteration")
@@ -506,6 +539,7 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
         client
             .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
             .await
+            .expect("gate not locked")
             .len(),
         2,
         "the dropped handle's subscription outlives it for the grace"
@@ -521,6 +555,7 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
         client
             .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
             .await
+            .expect("gate not locked")
             .len(),
         2,
         "re-watching re-claims rather than declaring a second time"
@@ -534,14 +569,19 @@ async fn a_dropped_watch_keeps_its_subscription_for_the_grace() {
 #[tokio::test]
 async fn a_pin_survives_a_restart_with_no_server() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("pinned.sqlite");
-    let key = connetto_core::test_support::replica_key();
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
-        .expect("a resolved key");
+    let credential = super::support::held("tester");
 
     {
-        let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-            .expect("open with no server");
+        let store = super::support::key_store(&credential).await;
+        let conn = ClientBuilder::new(
+            super::support::bundle(DDL),
+            super::support::NeverDial::<Script>::default(),
+        )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await
+        .expect("open with no server");
         let (client, pump) = ConnettoClient::with_pump(conn);
         tokio::spawn(pump);
         client
@@ -555,10 +595,16 @@ async fn a_pin_survives_a_restart_with_no_server() {
     }
 
     // The process ends. A pin has no handle and no clock, so it is still there.
-    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
-        .expect("a resolved key");
-    let mut conn =
-        ConnettoConnection::<Script>::open_existing(&reopened, &config(), None).expect("reopen");
+    let store = super::support::key_store(&credential).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("reopen");
     assert_eq!(
         conn.pins().expect("pins"),
         vec![("offline-pack".to_owned(), "SELECT * FROM items".to_owned())],
@@ -592,15 +638,18 @@ async fn a_pin_survives_a_restart_with_no_server() {
 #[tokio::test]
 async fn a_subscription_past_its_grace_is_not_re_declared() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("grace-attach.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
 
-    let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open with no server");
 
     let ended = SubscriptionSpec::new("SELECT * FROM items WHERE id = 1");
     let live = SubscriptionSpec::new("SELECT * FROM items WHERE id = 2");
@@ -652,17 +701,22 @@ async fn a_subscription_past_its_grace_is_not_re_declared() {
 #[tokio::test]
 async fn a_watch_the_previous_run_died_holding_starts_its_countdown_at_launch() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("died-holding.sqlite");
-    let key = connetto_core::test_support::replica_key();
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
-        .expect("a resolved key");
+    let credential = super::support::held("tester");
 
     let abandoned = SubscriptionSpec::new("SELECT * FROM items WHERE id = 1");
     let kept = SubscriptionSpec::new("SELECT * FROM items WHERE id = 2");
     let packed = SubscriptionSpec::new("SELECT * FROM items WHERE id = 3");
     {
-        let mut conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-            .expect("open with no server");
+        let store = super::support::key_store(&credential).await;
+        let mut conn = ClientBuilder::new(
+            super::support::bundle(DDL),
+            super::support::NeverDial::<Script>::default(),
+        )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await
+        .expect("open with no server");
         conn.subscribe_spec_with_grace("wire-1", abandoned, core::time::Duration::ZERO)
             .await
             .expect("declare the zero-grace watch");
@@ -675,10 +729,16 @@ async fn a_watch_the_previous_run_died_holding_starts_its_countdown_at_launch() 
         // so none of the three carries a stop moment.
     }
 
-    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
-        .expect("a resolved key");
-    let mut conn =
-        ConnettoConnection::<Script>::open_existing(&reopened, &config(), None).expect("reopen");
+    let store = super::support::key_store(&credential).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("reopen");
     let script = Script::with(vec![ack()]);
     conn.attach(script.clone()).await.expect("attach");
 
@@ -714,14 +774,19 @@ async fn a_watch_the_previous_run_died_holding_starts_its_countdown_at_launch() 
 #[tokio::test]
 async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("re-claim.sqlite");
-    let key = connetto_core::test_support::replica_key();
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
-        .expect("a resolved key");
+    let credential = super::support::held("tester");
 
     {
-        let conn = ConnettoConnection::<Script>::open(&replica, DDL, &config(), None)
-            .expect("open with no server");
+        let store = super::support::key_store(&credential).await;
+        let conn = ClientBuilder::new(
+            super::support::bundle(DDL),
+            super::support::NeverDial::<Script>::default(),
+        )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await
+        .expect("open with no server");
         let (client, pump) = ConnettoClient::with_pump(conn);
         tokio::spawn(pump);
         let watching = client
@@ -733,10 +798,16 @@ async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
         core::mem::forget(watching);
     }
 
-    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
-        .expect("a resolved key");
-    let conn =
-        ConnettoConnection::<Script>::open_existing(&reopened, &config(), None).expect("reopen");
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Script>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("reopen");
     let (client, pump) = ConnettoClient::with_pump(conn);
     tokio::spawn(pump);
     let again = client
@@ -748,6 +819,7 @@ async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
         client
             .with_conn(|conn| conn.declared_subscriptions().expect("declared"))
             .await
+            .expect("gate not locked")
             .into_iter()
             .map(|(sub_id, _)| sub_id)
             .collect::<Vec<_>>(),
@@ -759,6 +831,7 @@ async fn a_re_claim_inside_the_grace_mints_no_second_subscription() {
         client
             .with_conn(|conn| conn.expired_subscriptions().expect("expired"))
             .await
+            .expect("gate not locked")
             .is_empty(),
         "and a re-claimed record is no longer counting down"
     );

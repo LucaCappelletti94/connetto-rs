@@ -13,9 +13,8 @@
 //! pretend when no codec is linked, because in a codec-less SQLite `PRAGMA key`
 //! is an unrecognised pragma that succeeds and encrypts nothing.
 
-use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Grant, Replica, ReplicaKey, cipher,
-};
+use connetto_client::{ClientBuilder, ClientError, DataDir, ReplicaKey, SyncSchema, cipher};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -58,10 +57,6 @@ diesel::table! {
 
 diesel::allow_tables_to_appear_in_same_query!(items, notes);
 
-fn config() -> ClientConfig {
-    ClientConfig::new("e2").with_login(Some(Grant::new("user:token")))
-}
-
 fn key() -> ReplicaKey {
     let mut bytes = [0u8; ReplicaKey::LEN];
     for (index, byte) in bytes.iter_mut().enumerate() {
@@ -97,18 +92,19 @@ fn first_boot_standalone(path: &str, key: Option<&ReplicaKey>, ddl: &str) {
 #[tokio::test]
 async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let encrypted = dir.path().join("encrypted.sqlite");
+    let credential = super::support::held("token");
+    let encrypted = dir.path().join(credential.replica_name());
     let plaintext = dir.path().join("plaintext.sqlite");
 
-    let encrypted_url = url(&encrypted);
     let plaintext_url = url(&plaintext);
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&encrypted_url, Some(key())).expect("key is Some"),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let store = super::support::key_store_with(&credential, key()).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("connect");
     diesel::insert_into(items::table)
@@ -157,18 +153,17 @@ async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not()
 #[tokio::test]
 async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let path = dir.path().join("replica.sqlite");
-    let db = url(&path);
-    let replica = Replica::encrypted_file(&db, Some(key())).expect("key is Some");
+    let credential = super::support::held("token");
 
     let unsynced = {
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &replica,
-            SQLITE_DDL,
-            &config(),
-            None,
+        let store = super::support::key_store_with(&credential, key()).await;
+        let mut conn = ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(FakeTransport::accepting()),
         )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .connect_driven()
         .await
         .expect("first connect");
         diesel::insert_into(items::table)
@@ -186,10 +181,16 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
 
     // A different connection, a different capture session, the same file and the
     // same cached key: this is the cold start an offline reboot performs.
-    let mut conn =
-        ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
-            .await
-            .expect("reopen with the cached key");
+    let store = super::support::key_store_with(&credential, key()).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
+    .await
+    .expect("reopen with the cached key");
     let rows: Vec<Option<String>> = items::table
         .select(items::label)
         .load(conn.conn())
@@ -205,17 +206,19 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
 #[tokio::test]
 async fn a_process_without_the_key_cannot_read_the_replica() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let path = dir.path().join("replica.sqlite");
+    let credential = super::support::held("token");
+    let path = dir.path().join(credential.replica_name());
     let db = url(&path);
 
     {
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &Replica::encrypted_file(&db, Some(key())).expect("key is Some"),
-            SQLITE_DDL,
-            &config(),
-            None,
+        let store = super::support::key_store_with(&credential, key()).await;
+        let mut conn = ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(FakeTransport::accepting()),
         )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .connect_driven()
         .await
         .expect("first connect");
         diesel::insert_into(items::table)
@@ -228,12 +231,14 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     // material at the next login, which is the benign path into this error. It is
     // reported as its own variant rather than as corruption, because the recovery
     // is discard and re-sync.
-    let wrong = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(other_key())).expect("key is Some"),
-        &config(),
-        None,
+    let store = super::support::key_store_with(&credential, other_key()).await;
+    let wrong = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential.clone())
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await;
     match wrong {
         Err(ClientError::ReplicaUndecryptable(_)) => {}
@@ -256,13 +261,14 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
     // connect rebuilds. `force` is set because the pending mutations live inside
     // the file this key will not open, so there is nothing left to guard.
     connetto_client::teardown::purge_replica(&path, &[], true).expect("discard the replica");
-    let mut fresh = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(other_key())).expect("key is Some"),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let store = super::support::key_store_with(&credential, other_key()).await;
+    let mut fresh = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("a discarded replica re-boots under the new key");
     let rows: Vec<Option<String>> = items::table
@@ -278,22 +284,30 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
 #[tokio::test]
 async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let replica_url = url(&dir.path().join("replica.sqlite"));
-    let tier_path = dir.path().join("replica.sqlite-tier");
+    let credential = super::support::held("token");
+    let tier_path = dir
+        .path()
+        .join(format!("{}-tier", credential.replica_name()));
+    let bundle = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        SQLITE_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
 
     // First boot. The tier is created through the replica connection, which is
     // what makes its key salt agree with the replica's, and nothing else does.
     {
-        let replica = Replica::encrypted_file(&replica_url, Some(key()))
-            .expect("key is Some")
-            .with_tier(TIER_DDL);
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &replica,
-            SQLITE_DDL,
-            &config(),
-            None,
+        let store = super::support::key_store_with(&credential, key()).await;
+        let mut conn = ClientBuilder::new(
+            bundle.clone(),
+            super::support::Once::new(FakeTransport::accepting()),
         )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .connect_driven()
         .await
         .expect("connect the encrypted replica");
         assert!(conn.local_tables().contains("notes"));
@@ -314,13 +328,16 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     // Second run: the existing tier file re-attaches with no DDL and no key
     // clause, and its rows come back. This is the resume path, and it works
     // because the first boot made the two salts agree.
-    let replica = Replica::encrypted_file(&replica_url, Some(key()))
-        .expect("key is Some")
-        .with_existing_tier();
-    let mut conn =
-        ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
-            .await
-            .expect("reopen the encrypted replica");
+    let store = super::support::key_store_with(&credential, key()).await;
+    let mut conn = ClientBuilder::new(
+        bundle,
+        super::support::Once::new(FakeTransport::accepting()),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
+    .await
+    .expect("reopen the encrypted replica");
     let rows: Vec<Option<String>> = notes::table
         .select(notes::body)
         .load(conn.conn())
@@ -330,26 +347,33 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
 
 #[tokio::test]
 async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_replica() {
-    let dir = tempfile::tempdir().expect("a temporary directory");
+    let bundle = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        SQLITE_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
 
     // Two ways an app reaches this: a plaintext baked template, which is what a
     // build-time artifact always is, and an encrypted file some other connection
     // created, which carries its own key salt. Neither can attach, and the point
     // is that neither silently leaves the tier in the clear.
     for (name, tier_key) in [("plaintext.sqlite", None), ("foreign.sqlite", Some(key()))] {
-        let replica_url = url(&dir.path().join(format!("replica-for-{name}")));
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let credential = super::support::held("token");
+        let replica_url = url(&dir.path().join(credential.replica_name()));
         let tier = format!("{replica_url}-tier");
         first_boot_standalone(&tier, tier_key.as_ref(), TIER_DDL);
-        let replica = Replica::encrypted_file(&replica_url, Some(key()))
-            .expect("key is Some")
-            .with_existing_tier();
-        let result = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &replica,
-            SQLITE_DDL,
-            &config(),
-            None,
+        let store = super::support::key_store_with(&credential, key()).await;
+        let result = ClientBuilder::new(
+            bundle.clone(),
+            super::support::Once::new(FakeTransport::accepting()),
         )
+        .signed_in(credential)
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .connect_driven()
         .await;
         assert!(
             result.is_err(),

@@ -30,6 +30,7 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use web_sys::{DedicatedWorkerGlobalScope, MessageEvent, Worker};
 
+use connetto_client::AccountChoice;
 use connetto_core::custody::{Custody, NoGate};
 
 use crate::auth::{AT_REST_PRF_INPUT, AuthError, IdbKeyStore};
@@ -39,8 +40,10 @@ use crate::auth::{AT_REST_PRF_INPUT, AuthError, IdbKeyStore};
 /// A bound rather than the user agent's default, which runs to minutes: an
 /// unlock that cannot succeed, because the credential is gone, must fail the
 /// boot in observable time instead of hanging it. Long enough that a user still
-/// has room to find a sensor and be verified.
-const CEREMONY_TIMEOUT_MS: u32 = 60_000;
+/// has room to find a sensor and be verified. The gate's mechanism re-asks the
+/// spawning tab under the same bound, so a tab that never answers cannot hold
+/// a re-check's prompt open forever.
+pub(crate) const CEREMONY_TIMEOUT_MS: u32 = 60_000;
 
 /// What the application registers to answer the worker's account question.
 ///
@@ -136,31 +139,6 @@ pub enum TabAnswer {
     },
     /// Which account the tab chose to sign in as.
     Account(AccountChoice),
-}
-
-/// Who a boot should sign in as, answered by the tab against the accounts the
-/// worker offered.
-///
-/// Three cases rather than an optional account, because "nobody yet" and "the
-/// usual one" are different instructions and collapsing them makes a second
-/// account unreachable: without [`New`](Self::New) the only way to sign one in is
-/// to sign the current one out, which deletes the credential that would have made
-/// it the second account.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccountChoice {
-    /// Sign in as this stored account. It must be one the worker offered, and a
-    /// name that was not is refused rather than answered with a login, because it
-    /// is a caller bug rather than a stale credential.
-    Named(String),
-    /// Take the last-used account, which is what an application with no picker
-    /// gets and what a dismissed picker should fall back to.
-    LastUsed,
-    /// Sign in as somebody new, leaving every stored credential alone.
-    ///
-    /// This is what puts a second account on the device. The boot addresses no
-    /// stored credential, so it goes straight to an interactive login and the new
-    /// credential lands beside the others.
-    New,
 }
 
 /// What a [`TabAnswer`] is, for an error that has to name an answer it did not
@@ -358,10 +336,11 @@ fn decode_choice(data: &JsValue) -> AccountChoice {
         .and_then(|v| v.as_string());
     match choice.as_deref() {
         Some("new") => AccountChoice::New,
+        Some("ask") => AccountChoice::Ask,
         Some("named") => Reflect::get(data, &JsValue::from_str("account"))
             .ok()
             .and_then(|v| v.as_string())
-            .map_or(AccountChoice::LastUsed, AccountChoice::Named),
+            .map_or(AccountChoice::LastUsed, AccountChoice::Account),
         _ => AccountChoice::LastUsed,
     }
 }
@@ -394,6 +373,15 @@ async fn ask_tab(msg: JsValue) -> Result<TabAnswer, AuthError> {
         return Err(err);
     }
     rx.await.map_err(|_| AuthError::Cancelled)
+}
+
+/// Drop the outstanding tab-answer slot without a reply.
+///
+/// A caller that gives up waiting on a tab request (the gate's mechanism on
+/// its bound) calls this so the abandoned request does not stand in the way
+/// of the next one, which would otherwise draw an overlapping-request error.
+pub(crate) fn clear_pending_answer() {
+    PENDING.with(|p| p.borrow_mut().take());
 }
 
 fn set_str(obj: &Object, key: &str, val: &str) {
@@ -861,19 +849,20 @@ fn post_key_to_worker(
 
 /// Post who to sign in as.
 ///
-/// Two fields rather than one nullable account, because three answers have to be
-/// told apart and a null cannot carry the difference between "the usual one" and
-/// "somebody new".
+/// Two fields rather than one nullable account, because the answers have to be
+/// told apart and a null cannot carry the difference between "the usual one"
+/// and "somebody new".
 fn post_account(worker: &Worker, choice: &AccountChoice) -> Result<(), JsValue> {
     let obj = Object::new();
     set_str(&obj, "kind", "account");
     match choice {
-        AccountChoice::Named(account) => {
+        AccountChoice::Account(account) => {
             set_str(&obj, "choice", "named");
             set_str(&obj, "account", account);
         }
         AccountChoice::LastUsed => set_str(&obj, "choice", "last-used"),
         AccountChoice::New => set_str(&obj, "choice", "new"),
+        AccountChoice::Ask => set_str(&obj, "choice", "ask"),
     }
     worker.post_message(&JsValue::from(obj))
 }
@@ -947,15 +936,15 @@ mod tests {
             let seen = Rc::clone(&seen);
             async move {
                 seen.borrow_mut().push(accounts.len());
-                AccountChoice::Named("\"alice\"".to_owned())
+                AccountChoice::Account("\"alice\"".to_owned())
             }
         });
 
-        set_pending_switch(AccountChoice::Named("\"bob\"".to_owned()));
+        set_pending_switch(AccountChoice::Account("\"bob\"".to_owned()));
         let accounts = vec!["\"alice\"".to_owned(), "\"bob\"".to_owned()];
         assert_eq!(
             chosen_account(accounts.clone()).await,
-            AccountChoice::Named("\"bob\"".to_owned()),
+            AccountChoice::Account("\"bob\"".to_owned()),
             "the switch target wins over the chooser"
         );
         assert!(
@@ -965,7 +954,7 @@ mod tests {
 
         assert_eq!(
             chosen_account(accounts.clone()).await,
-            AccountChoice::Named("\"alice\"".to_owned()),
+            AccountChoice::Account("\"alice\"".to_owned()),
             "the target was consumed, so the next boot reaches the chooser"
         );
         assert_eq!(

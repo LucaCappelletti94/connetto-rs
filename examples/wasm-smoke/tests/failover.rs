@@ -13,21 +13,22 @@
 
 mod common;
 
+use connetto_client::dsl::Watchable;
+use connetto_wasm_smoke::build::{self, Once};
+use connetto_wasm_smoke::workers::demo_schema;
 use core::time::Duration;
+use wasm_bindgen::JsCast;
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
-    dsl::Watchable,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, FirstThen, LiveQuery};
 use connetto_core::Transport;
 use connetto_wasm_smoke::workers::{
-    DB_ALIVE_LOCK, DEMO_SQLITE_DDL, DEMO_WS_URL, announce_tab, await_db_worker_ready, sleep,
-    spawn_db_worker, tab_wire_factory,
+    DB_ALIVE_LOCK, DEMO_WS_URL, announce_tab, await_db_worker_ready, sleep, spawn_db_worker,
+    tab_wire_factory,
 };
 use connetto_wasm_smoke::{BrowserSocket, MessageTransport, locks};
 use diesel::prelude::*;
-use wasm_bindgen::JsCast;
+
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::BroadcastChannel;
 
@@ -92,31 +93,15 @@ fn glue_url() -> String {
     format!("{base}.js")
 }
 
-async fn connect_server(
-    name: &str,
-    tag: i64,
-    token: String,
-    identity: &str,
-) -> ConnettoConnection<BrowserSocket> {
+async fn connect_server(token: String, identity: &str) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig::new(format!("{name}-{tag}"))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect")
+    ClientBuilder::new(demo_schema(), Once::new(transport))
+        .signed_in(build::held(token, identity))
+        .connect_driven()
+        .await
+        .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`. The harness timeout bounds
@@ -181,7 +166,7 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     let (token, user_id) = common::mint_session().await;
 
     // A row that exists before anything boots.
-    let mut writer = connect_server("failover-writer", base, token.clone(), &user_id).await;
+    let mut writer = connect_server(token.clone(), &user_id).await;
     let before_id = write_row(&mut writer, 1, &user_id).await;
     stage("writer seeded the first row");
 
@@ -208,27 +193,20 @@ async fn worker_failover_resumes_replica_and_reconnects_the_tab() {
     announce_tab(&wire).await.expect("announce the tab");
     let transport = MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, DB_ALIVE_LOCK)
         .expect("boot wire");
-    let config = ClientConfig::new(client_id.clone())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("tab connect");
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(50))
         .with_max_backoff(Duration::from_millis(500));
-    let (tab, pump) =
-        ConnettoClient::with_reconnect(conn, tab_wire_factory(client_id.clone()), sleep, policy);
+    let (running, pump) = ClientBuilder::new(
+        demo_schema().relay_mirror(),
+        FirstThen::new(transport, tab_wire_factory(client_id.clone())),
+    )
+    .with_client_id(client_id.clone())
+    .with_reconnect(policy)
+    .with_sleeper(sleep)
+    .connect_with_pump()
+    .await
+    .expect("tab connect");
+    let tab = running.client().clone();
     wasm_bindgen_futures::spawn_local(pump);
     let mut events = tab.events();
     let mut live: LiveQuery<Order> = orders::table

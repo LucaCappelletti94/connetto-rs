@@ -1,8 +1,7 @@
 //! Seams for the shared reconnect driver.
 //!
-//! The reconnect loop itself lives in the client pump (see
-//! [`ConnettoClient::with_reconnect`](crate::ConnettoClient::with_reconnect)):
-//! on a transport drop it backs off, asks the [`TransportFactory`] for a
+//! The reconnect loop itself lives in the client pump a builder's running
+//! terminal starts. On a transport drop it backs off, asks the [`TransportFactory`] for a
 //! fresh connection, resumes the session with the highest applied cursor,
 //! and re-declares every live subscription, all without dropping a single
 //! [`LiveQuery`](crate::LiveQuery) or [`LiveValue`](crate::LiveValue)
@@ -53,6 +52,52 @@ where
 
     fn connect(&mut self) -> impl Future<Output = Result<T, E>> + MaybeSend {
         self()
+    }
+}
+
+/// A factory that hands out a transport the caller already opened, then
+/// dials through `then` on every later call.
+///
+/// This is how a connection whose first transport had to exist before the
+/// client did, a browser tab's wire whose content lane is bound at creation
+/// for instance, still reconnects through its ordinary factory.
+pub struct FirstThen<F: TransportFactory> {
+    first: Option<F::Transport>,
+    then: F,
+}
+
+impl<F: TransportFactory> FirstThen<F> {
+    /// Hand out `first` once, then dial through `then`.
+    #[must_use]
+    pub fn new(first: F::Transport, then: F) -> Self {
+        Self {
+            first: Some(first),
+            then,
+        }
+    }
+}
+
+/// One call of a [`FirstThen`]: the held transport or a dial.
+enum FirstOrDial<T, D> {
+    First(T),
+    Dial(D),
+}
+
+impl<F: TransportFactory> TransportFactory for FirstThen<F> {
+    type Transport = F::Transport;
+    type Error = F::Error;
+
+    fn connect(&mut self) -> impl Future<Output = Result<F::Transport, F::Error>> + MaybeSend {
+        let step = match self.first.take() {
+            Some(transport) => FirstOrDial::First(transport),
+            None => FirstOrDial::Dial(self.then.connect()),
+        };
+        async move {
+            match step {
+                FirstOrDial::First(transport) => Ok(transport),
+                FirstOrDial::Dial(dial) => dial.await,
+            }
+        }
     }
 }
 

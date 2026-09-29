@@ -11,7 +11,7 @@
 //! An empty set is what proves no refresh happened: `refresh_changed` returns
 //! before touching the registry when the drain comes back empty.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     ControlMessage, HandshakeAck, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
@@ -30,11 +30,6 @@ diesel::table! {
         /// Free-text status.
         status -> Nullable<Text>,
     }
-}
-
-fn client_config() -> ClientConfig {
-    ClientConfig::new("r45-changed-signal")
-        .with_login(Some(connetto_client::Grant::new("user:changed")))
 }
 
 /// A server that answers the handshake and then advances the resume cursor
@@ -110,13 +105,12 @@ async fn step_to_snapshot_end(conn: &mut ConnettoConnection<LoopbackTransport>) 
 /// filter invites.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cursor_persist_reports_no_changed_table_and_a_write_still_does() {
-    let mut conn = ConnettoConnection::connect(
-        cursor_only_server(),
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &client_config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(cursor_only_server()),
     )
+    .signed_in(super::support::held("changed"))
+    .connect_driven()
     .await
     .expect("connect");
 

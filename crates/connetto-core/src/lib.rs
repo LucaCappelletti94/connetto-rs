@@ -66,7 +66,10 @@ pub use error::CodecError;
 pub use messages::{BulkMessage, ControlMessage};
 pub use percent::{percent_decode, percent_encode};
 pub use replica_key::{ReplicaKey, ReplicaKeyParseError};
-pub use schema::{SchemaVersion, schema_hash};
+pub use schema::{
+    AUDIT_TABLE, CALLER_FUNCTION, SUBJECTS_FUNCTION, SchemaBundle, SchemaVersion, UUID_FUNCTION,
+    WRITE_EXEMPTION_FUNCTION, schema_hash,
+};
 pub use session_id::{SessionId, SessionIdParseError};
 pub use sql::quote_ident;
 pub use traits::{
@@ -74,9 +77,11 @@ pub use traits::{
     IncomingFrame, PendingMutation, RefreshFuture, RefreshTokenStore, ReplicaKeyStore, Store,
     Transport,
 };
+#[cfg(feature = "native-transport")]
+pub use transport::{
+    DialError, NativeStream, WebSocketError, WebSocketTransport, dial, ws_host_is_loopback,
+};
 #[cfg(feature = "loopback")]
 pub use transport::{LoopbackError, LoopbackTransport, loopback};
-#[cfg(feature = "native-transport")]
-pub use transport::{WebSocketError, WebSocketTransport};
 pub use version::PROTOCOL_VERSION;
 pub use write::{VersionColumn, WritableCatalog};

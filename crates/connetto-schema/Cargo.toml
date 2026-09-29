@@ -1,0 +1,28 @@
+[package]
+name = "connetto-schema"
+description = "The schema build step connetto ships: one translation of a deployment's Postgres sources into the bundle the client and its server both version."
+categories = ["database", "encoding"]
+keywords = ["sync", "cdc", "sqlite", "postgres", "schema"]
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-core.workspace = true
+# Tracked on main, the same way the other root crates track it.
+pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+# Applies the translated DDL to a throwaway database so a bad translation fails the build.
+diesel = { workspace = true, features = ["returning_clauses_for_sqlite_3_35"] }
+# View names are read off the translated AST, resolved by the root patch blocks.
+sqlparser = { version = "0.63", default-features = false }
+thiserror.workspace = true
+
+[dev-dependencies]
+connetto-demo-deployment = { path = "../../examples/deployment" }

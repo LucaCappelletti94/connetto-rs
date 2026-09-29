@@ -7,9 +7,7 @@
 //! the measure. A supplanting application sees the same event and the pass
 //! stays silent until it calls `tidy` on its own.
 
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica, ResidualPass,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, ResidualPass, SyncTuning};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, LivePatch, SnapshotBegin, SnapshotEnd,
@@ -155,13 +153,16 @@ where
 /// run and reset the measure, and the uncovered accumulation is gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_automatic_pass_runs_at_the_crossing_and_resets_the_measure() {
-    let config = ClientConfig::new("r60-auto")
-        .with_login(Some(Grant::new("user:r60")))
-        .with_residual_threshold(10);
     let server = accumulating_server(12);
-    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config, None)
-        .await
-        .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
+    )
+    .with_tuning(SyncTuning::default().with_residual_threshold(10))
+    .signed_in(super::support::held("r60"))
+    .connect_driven()
+    .await
+    .expect("connect");
     // A narrow filter: only row 1 is covered, so everything the live stream
     // delivers past it is residual accumulation the pass may reclaim.
     conn.subscribe("w", "SELECT * FROM orders WHERE id = 1")
@@ -191,14 +192,20 @@ async fn the_automatic_pass_runs_at_the_crossing_and_resets_the_measure() {
 /// reclaims, resets, and re-arms.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_manual_application_sees_the_event_and_the_default_pass_stays_silent() {
-    let config = ClientConfig::new("r60-manual")
-        .with_login(Some(Grant::new("user:r60")))
-        .with_residual_threshold(10)
-        .with_residual_pass(ResidualPass::Manual);
     let server = accumulating_server(15);
-    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config, None)
-        .await
-        .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
+    )
+    .with_tuning(
+        SyncTuning::default()
+            .with_residual_threshold(10)
+            .with_residual_pass(ResidualPass::Manual),
+    )
+    .signed_in(super::support::held("r60"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders WHERE id = 1")
         .await
         .expect("subscribe");
@@ -405,14 +412,19 @@ fn staging_test_server() -> LoopbackTransport {
 /// `LivePatch` was processed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn threshold_zero_is_clamped_to_one() {
-    let config = ClientConfig::new("r60-clamp")
-        .with_login(Some(Grant::new("user:r60")))
+    let tuning = SyncTuning::default()
         .with_residual_threshold(0) // clamped to 1 after the fix
         .with_residual_pass(ResidualPass::Manual);
     let server = clamp_test_server();
-    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config, None)
-        .await
-        .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
+    )
+    .with_tuning(tuning)
+    .signed_in(super::support::held("r60"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -444,15 +456,20 @@ async fn threshold_zero_is_clamped_to_one() {
 /// cleared the database write but left the in-memory counter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_apply_leaves_no_phantom_counts() {
-    let config = ClientConfig::new("r60-staging")
-        .with_login(Some(Grant::new("user:r60")))
-        .with_residual_threshold(1)
-        .with_residual_pass(ResidualPass::Manual);
     let server = staging_test_server();
-    let mut conn =
-        ConnettoConnection::connect(server, &Replica::in_memory(), STAGING_DDL, &config, None)
-            .await
-            .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(STAGING_DDL),
+        super::support::Once::new(server),
+    )
+    .with_tuning(
+        SyncTuning::default()
+            .with_residual_threshold(1)
+            .with_residual_pass(ResidualPass::Manual),
+    )
+    .signed_in(super::support::held("r60"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -572,17 +589,14 @@ fn failing_pass_server() -> LoopbackTransport {
 /// count at the crossing whose pass failed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_automatic_pass_emits_nothing_and_retries() {
-    let config = ClientConfig::new("r60-failed-pass")
-        .with_login(Some(Grant::new("user:r60")))
-        .with_residual_threshold(2);
     let server = failing_pass_server();
-    let mut conn = ConnettoConnection::connect(
-        server,
-        &Replica::in_memory(),
-        ABORT_DELETE_DDL,
-        &config,
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(ABORT_DELETE_DDL),
+        super::support::Once::new(server),
     )
+    .with_tuning(SyncTuning::default().with_residual_threshold(2))
+    .signed_in(super::support::held("r60"))
+    .connect_driven()
     .await
     .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders WHERE id = 1")

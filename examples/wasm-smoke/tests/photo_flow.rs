@@ -26,10 +26,10 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     await_db_worker_ready(&[]).await.expect("db worker ready");
     harness::stage("db worker booted");
 
-    let (token, identity) = common::mint_session().await;
+    let (_, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let (content, mut conn) = photo::connect_tab(&client_id, token, &identity).await;
+    let (content, mut conn) = photo::connect_tab(&client_id).await;
     conn.subscribe("photo-flow-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");

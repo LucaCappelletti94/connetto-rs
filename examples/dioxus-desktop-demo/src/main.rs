@@ -7,9 +7,10 @@
 //! redirect and on a phone in a Custom Tab with the app's own redirect (or
 //! silently refreshes if a refresh token is already stored), names the replica from the
 //! resolved identity, opens it with an OS-keyring-held encryption key, and
-//! starts a pump that redials and resumes whenever the link drops. Signing out
-//! calls `forget_device` (credential revoke plus key destroy) and runs setup
-//! again in the same process, so a fresh login begins immediately.
+//! starts a pump that redials and resumes whenever the link drops, all through
+//! one `NativeClientBuilder` chain. Signing out calls the client's
+//! `forget_device` (credential revoke plus key destroy) and runs setup again in
+//! the same process, so a fresh login begins immediately.
 //!
 //! The dev stack is one command from the repository root, which prints the
 //! environment a desktop run needs and the `adb reverse` lines a phone needs.
@@ -28,12 +29,13 @@
 //!   target/debug/connetto-android-proof --serial SERIAL
 //! ```
 //!
-//! The demo reads `CONNETTO_DEMO_SERVER`, the sync host:port (default
-//! `127.0.0.1:7777`), `CONNETTO_DEMO_AUTH_ORIGIN`, the auth server (default
+//! The demo reads `CONNETTO_DEMO_WS`, the sync WebSocket URL (default
+//! `ws://127.0.0.1:7777/`, and `wss://` for any host but loopback),
+//! `CONNETTO_DEMO_AUTH_ORIGIN`, the auth server (default
 //! `http://127.0.0.1:18081`), and `CONNETTO_DEMO_PG`, the conninfo the backend
 //! writer buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
 //! A phone runs with no environment of its own, so a build for one can bake
-//! each in as `CONNETTO_DEMO_BUILD_SERVER`, `CONNETTO_DEMO_BUILD_AUTH_ORIGIN` and
+//! each in as `CONNETTO_DEMO_BUILD_WS`, `CONNETTO_DEMO_BUILD_AUTH_ORIGIN` and
 //! `CONNETTO_DEMO_BUILD_PG`, which the running environment still overrides. The
 //! names differ from the runtime ones so that a shell pointed at a stack never
 //! bakes its addresses into a build by accident.
@@ -48,49 +50,31 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use connetto_client::auth::{
-    KeyringKeyStore, KeyringStore, NativeAuthenticator, provision_replica_key, remembered_account,
-};
-use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
-use connetto_client::replica::{Replica, replica_db_name};
-use connetto_client::teardown::{
-    ForgetError, PurgeError, content_dir, expiry_warning, forget_device,
-};
+use connetto_client::teardown::{ForgetError, PurgeError, expiry_warning};
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, IDENTITY_RECORD,
-    ImportChoices, PolicyTables, SqlFunctions, decode_identity,
+    AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, ImportChoices, KeyringAuth,
+    NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning, decode_identity,
 };
 use connetto_core::messages::FatalErrorReason;
-use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
-use connetto_core::transport::WebSocketTransport;
-use connetto_dioxus::use_live;
+use connetto_dioxus::{use_away_input, use_live};
 use connetto_dioxus_desktop_demo::{
     Order, Photo, mime_from_extension, orders, photo_file_id, photos, short_hex, stage_photo_row,
 };
-use connetto_file_client::{ContentClient, ContentEvent, FileId, FsStore, ReqwestHttp, Resolved};
+use connetto_file_client::{
+    Content as ContentPiece, ContentClient, ContentEvent, ContentHandle, FileId, FsStore,
+    ReqwestHttp, Resolved,
+};
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use rosetta_uuid::Uuid;
-use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 
-include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
+include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 
-/// The translated SQLite DDL, used to seed a replica on first boot.
-const REPLICA_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
-/// The Postgres schema source the connetto-server must be started with
-/// (`CONNETTO_PG_DDL`).
-const SCHEMA_SQL: &str = include_str!("../schema.sql");
-/// The row policies the server must be started with (`CONNETTO_PG_POLICIES`).
-/// The server hashes them beside the schema into the version presented at the
-/// handshake.
-const POLICIES_SQL: &str = include_str!("../policies.sql");
-
-const DEFAULT_SERVER: &str = "127.0.0.1:7777";
+const DEFAULT_WS: &str = "ws://127.0.0.1:7777/";
 const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
 const DEFAULT_PG: &str = "postgres://postgres:postgres@127.0.0.1:55456/postgres";
 const AUTH_PROVIDER: &str = "dev-idp";
-const REPLICA_PREFIX: &str = "connetto-desktop-demo";
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
 /// The login redirect on a phone, whose scheme is the app's bundle identifier
 /// (`Dioxus.toml`), the scheme the bundled redirect activity claims on Android
@@ -115,8 +99,8 @@ extern "Kotlin" {
 /// On a phone, sign in through the platform's in-app browser tab and the app's
 /// own redirect (RFC 8252 section 7.1).
 #[cfg(any(target_os = "android", target_os = "ios"))]
-fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
-    authenticator.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
+fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
+    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
 }
 
 /// The Custom Tab on Android or the authentication session on iOS, and the
@@ -145,27 +129,8 @@ impl connetto_client::AuthorizationSession for TabSession {
 /// On a desktop, sign in through the system browser and a loopback listener
 /// (RFC 8252 section 7.3).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-fn platform_sign_in(authenticator: NativeAuthenticator) -> NativeAuthenticator {
-    authenticator
-}
-
-// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
-// local write omits the id and this registered function mints it.
-#[diesel::declare_sql_function]
-extern "SQL" {
-    /// Client-authored primary key: a 16-byte UUID v4 blob.
-    fn uuidv4() -> diesel::sql_types::Binary;
-}
-
-/// The registrar connetto installs on the replica connection.
-fn uuidv4_functions() -> SqlFunctions {
-    SqlFunctions::new().with(Arc::new(|conn: &mut diesel::SqliteConnection| {
-        uuidv4_utils::register_impl_with_behavior(
-            conn,
-            diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
-            Uuid::new_v4,
-        )
-    }))
+fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
+    auth
 }
 
 fn demo_quantity() -> i64 {
@@ -175,7 +140,7 @@ fn demo_quantity() -> i64 {
     i64::try_from(millis % 9).unwrap_or(0) * 5 + 5
 }
 
-type Ws = WebSocketTransport<TcpStream>;
+type Ws = NativeTransport;
 type Content = Arc<ContentClient<Ws, FsStore, ReqwestHttp>>;
 
 enum DemoCmd {
@@ -185,19 +150,6 @@ enum DemoCmd {
 
 #[derive(Clone)]
 struct Backend(mpsc::UnboundedSender<DemoCmd>);
-
-#[derive(Clone)]
-struct AuthCtx {
-    authenticator: Arc<NativeAuthenticator>,
-    db_path: PathBuf,
-    key_store: Arc<KeyringKeyStore>,
-    key_name: String,
-    token_store: Arc<KeyringStore>,
-    /// The signed-in accounts as the store listed them at startup, since every change restarts.
-    accounts: Vec<String>,
-    session_expires_at: std::time::SystemTime,
-    current_account: String,
-}
 
 /// An endpoint as the running environment sets it, else as the build
 /// environment did, else `default`.
@@ -278,21 +230,20 @@ fn main() {
 }
 
 /// Everything one signed-in session runs on, and dropping it ends the
-/// session. The pump owns the connection and the outbox task holds a client
-/// clone, so both are aborted here.
+/// session. The content outbox holds a client clone, so the client is closed
+/// here, which ends the pump and the outbox with it.
 struct Parts {
+    native: NativeClient<Ws, ContentHandle<Ws>>,
     client: ConnettoClient<Ws>,
     backend: Backend,
-    auth: AuthCtx,
     content: Content,
-    pump: tokio::task::JoinHandle<()>,
-    outbox: tokio::task::JoinHandle<()>,
+    runtime: tokio::runtime::Handle,
 }
 
 impl Drop for Parts {
     fn drop(&mut self) {
-        self.pump.abort();
-        self.outbox.abort();
+        let client = self.client.clone();
+        self.runtime.spawn(async move { client.close().await });
     }
 }
 
@@ -306,14 +257,24 @@ impl PartialEq for SessionParts {
     }
 }
 
-/// Ends the current session and runs setup again, which signs in afresh as
-/// whichever account the marker names.
+/// Ends the current session and runs setup again, signing in as the account
+/// the last request chose.
 #[derive(Clone, Copy)]
-struct Restart(Signal<u64>);
+struct Restart {
+    generation: Signal<u64>,
+    choice: Signal<AccountChoice>,
+}
 
 impl Restart {
-    fn request(mut self) {
-        *self.0.write() += 1;
+    /// Start over as the account last used.
+    fn request(self) {
+        self.request_as(AccountChoice::LastUsed);
+    }
+
+    /// Start over as `choice`.
+    fn request_as(mut self, choice: AccountChoice) {
+        self.choice.set(choice);
+        *self.generation.write() += 1;
     }
 }
 
@@ -329,15 +290,18 @@ enum Stage {
 #[component]
 fn Shell() -> Element {
     let generation = use_signal(|| 0_u64);
+    let choice = use_signal(|| AccountChoice::LastUsed);
+    let restart = Restart { generation, choice };
     let mut stage = use_signal(|| Stage::Starting);
-    use_context_provider(|| Restart(generation));
+    use_context_provider(|| restart);
     let runtime = use_hook(tokio::runtime::Handle::current);
     use_effect(move || {
         let _ = generation();
+        let account = choice.peek().clone();
         stage.set(Stage::Starting);
         let runtime = runtime.clone();
         spawn(async move {
-            let outcome = runtime.spawn(setup()).await;
+            let outcome = runtime.spawn(setup(account)).await;
             stage.set(match outcome {
                 Ok(Ok(parts)) => Stage::Ready(SessionParts(Rc::new(parts))),
                 Ok(Err(err)) => Stage::Failed(
@@ -367,7 +331,7 @@ fn Shell() -> Element {
                     h2 { "connetto demo cannot start" }
                     p { style: "color: #a33;", {detail} }
                     p { "Check that the dev stack is up with CONNETTO_AUTH, CONNETTO_AUTH_BIND, CONNETTO_OIDC_PROVIDERS and the per-provider vars set, and on a phone that adb reverse forwards its ports." }
-                    button { onclick: move |_| Restart(generation).request(), "Try again" }
+                    button { onclick: move |_| restart.request(), "Try again" }
                 }
             }
         }
@@ -383,53 +347,63 @@ fn Shell() -> Element {
 fn Session(parts: SessionParts) -> Element {
     use_context_provider(|| parts.0.client.clone());
     use_context_provider(|| parts.0.backend.clone());
-    use_context_provider(|| parts.0.auth.clone());
     use_context_provider(|| parts.0.content.clone());
+    use_context_provider(|| parts.clone());
     rsx! { App {} }
 }
 
-async fn setup() -> anyhow::Result<Parts> {
+async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
     use anyhow::Context as _;
 
     let server = endpoint(
-        std::env::var("CONNETTO_DEMO_SERVER").ok(),
-        option_env!("CONNETTO_DEMO_BUILD_SERVER"),
-        DEFAULT_SERVER,
+        std::env::var("CONNETTO_DEMO_WS").ok(),
+        option_env!("CONNETTO_DEMO_BUILD_WS"),
+        DEFAULT_WS,
     );
     let pg_url = endpoint(
         std::env::var("CONNETTO_DEMO_PG").ok(),
         option_env!("CONNETTO_DEMO_BUILD_PG"),
         DEFAULT_PG,
     );
+    let auth_origin = endpoint(
+        std::env::var("CONNETTO_DEMO_AUTH_ORIGIN").ok(),
+        option_env!("CONNETTO_DEMO_BUILD_AUTH_ORIGIN"),
+        DEFAULT_AUTH_ORIGIN,
+    );
 
-    let stream = TcpStream::connect(&server)
+    tokio::fs::create_dir_all(data_dir())
         .await
-        .with_context(|| format!("connecting to {server}"))?;
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
-        .await
-        .map_err(|err| anyhow::anyhow!("websocket handshake: {err}"))?;
-
-    let (conn, auth_ctx, root_key) = setup_authenticated(transport).await?;
+        .context("creating the application data directory")?;
 
     // A dropped link redials the same address and resumes, so writes made
     // while offline upload once the server is reachable again.
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
-        move || {
-            let server = server.clone();
-            async move {
-                let stream = TcpStream::connect(&server)
-                    .await
-                    .map_err(|err| err.to_string())?;
-                WebSocketTransport::connect("ws://127.0.0.1/", stream)
-                    .await
-                    .map_err(|err| err.to_string())
-            }
-        },
-        TokioSleeper,
-        ReconnectPolicy::default(),
-    );
-    let pump = tokio::spawn(pump);
+    let (native, pump) =
+        NativeClientBuilder::new(server, SyncSchema::new(connetto_schema_bundle::bundle()))
+            .with_tuning(SyncTuning::default().with_trim_threshold(5))
+            .with_content(ContentPiece::new().with_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            ))
+            .signed_in(platform_sign_in(
+                Auth::new(auth_origin, AUTH_PROVIDER)
+                    .with_account(account)
+                    .keyring(KEYRING_SERVICE),
+            ))
+            .durable(data_dir())
+            .connect_with_pump()
+            .await
+            .map_err(|err| match err {
+                ClientError::Auth(_) => anyhow::anyhow!(
+                    "the server refused the credential; check CONNETTO_AUTH and OIDC settings"
+                ),
+                other => anyhow::anyhow!("opening the encrypted replica: {other}"),
+            })?;
+    tokio::spawn(pump);
+    let client = native.client().clone();
+    let content = match native.content() {
+        Some(ContentHandle::Durable(content)) => Arc::clone(content),
+        _ => anyhow::bail!("a durable build keeps its files beside the replica"),
+    };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<DemoCmd>();
     tokio::spawn(async move {
@@ -474,154 +448,13 @@ async fn setup() -> anyhow::Result<Parts> {
         }
     });
 
-    let store_dir = content_dir(&auth_ctx.db_path);
-    let content = Arc::new(
-        ContentClient::attach(
-            client.clone(),
-            FsStore::new(store_dir),
-            root_key,
-            ReqwestHttp::new(),
-        )
-        .await
-        .map_err(|err| anyhow::anyhow!("attaching content client: {err}"))?
-        .heal_lost(
-            "SELECT content_id FROM photos WHERE content_state = 'lost'",
-            "content_id",
-        )
-        .await
-        .map_err(|err| anyhow::anyhow!("registering the lost-photo query: {err}"))?,
-    );
-    let cc_drive = Arc::clone(&content);
-    let outbox = tokio::spawn(async move { cc_drive.drive_outbox(TokioSleeper).await });
-
     Ok(Parts {
+        native,
         client,
         backend: Backend(tx),
-        auth: auth_ctx,
         content,
-        pump,
-        outbox,
+        runtime: tokio::runtime::Handle::current(),
     })
-}
-
-async fn setup_authenticated(
-    transport: WebSocketTransport<TcpStream>,
-) -> anyhow::Result<(ConnettoConnection<Ws>, AuthCtx, [u8; 32])> {
-    use anyhow::Context as _;
-
-    tokio::fs::create_dir_all(data_dir())
-        .await
-        .context("creating the application data directory")?;
-
-    let token_store = Arc::new(KeyringStore::new(KEYRING_SERVICE));
-    let key_store = Arc::new(KeyringKeyStore::new(KEYRING_SERVICE));
-
-    let account = remembered_account(token_store.as_ref())
-        .await
-        .context("reading the remembered account")?;
-    let authenticator = Arc::new(platform_sign_in(NativeAuthenticator::new(
-        endpoint(
-            std::env::var("CONNETTO_DEMO_AUTH_ORIGIN").ok(),
-            option_env!("CONNETTO_DEMO_BUILD_AUTH_ORIGIN"),
-            DEFAULT_AUTH_ORIGIN,
-        ),
-        AUTH_PROVIDER,
-        Arc::clone(&token_store)
-            as Arc<dyn RefreshTokenStore<Error = connetto_client::ClientError> + Send + Sync>,
-        account,
-    )));
-
-    let session = authenticator
-        .acquire::<String>()
-        .await
-        .map_err(|err| anyhow::anyhow!("acquiring a session: {err}"))?;
-
-    let key_name = replica_db_name(REPLICA_PREFIX, &session.user_id)
-        .map_err(|err| anyhow::anyhow!("naming the replica for this identity: {err}"))?;
-
-    let session_expires_at = session.session_expires_at;
-    let current_account = connetto_client::encode_identity(&session.user_id)
-        .map_err(|err| anyhow::anyhow!("encoding current account key: {err}"))?;
-
-    let db_path = data_dir().join(format!("{key_name}.sqlite"));
-    let db_path_str = db_path
-        .to_str()
-        .context("the application data directory path is not utf8")?
-        .to_owned();
-
-    let existing = db_path.exists();
-
-    let replica_key = if existing {
-        key_store
-            .load(&key_name)
-            .await
-            .map_err(|err| anyhow::anyhow!("reading the replica key from the keyring: {err}"))?
-    } else {
-        Some(
-            provision_replica_key(key_store.as_ref(), &key_name)
-                .await
-                .map_err(|err| anyhow::anyhow!("storing a new replica key: {err}"))?,
-        )
-    };
-
-    // Extract the raw bytes before replica_key is consumed below.
-    let root_key = replica_key.as_ref().map_or([0u8; 32], |k| *k.as_bytes());
-
-    let replica = Replica::encrypted_file(&db_path_str, replica_key)
-        .map_err(|err| anyhow::anyhow!("opening the encrypted replica: {err}"))?;
-
-    let config = ClientConfig::new(key_name.clone())
-        .with_login(Some(Grant::new(session.access_token)))
-        .with_schema_version(Some(connetto_core::SchemaVersion::from_sources([
-            SCHEMA_SQL,
-            POLICIES_SQL,
-        ])))
-        .with_sql_functions(uuidv4_functions())
-        .with_policy_tables(PolicyTables::from_translation(
-            POLICY_TABLES.iter().copied(),
-            POLICY_VIEWS.iter().copied(),
-        ))
-        .with_trim_threshold(5);
-
-    let conn = if existing {
-        ConnettoConnection::connect_existing(transport, &replica, &config, None)
-            .await
-            .map_err(|err| match err {
-                connetto_client::ClientError::Auth(_) => anyhow::anyhow!(
-                    "the server refused the credential; \
-                     check CONNETTO_AUTH and OIDC settings"
-                ),
-                other => anyhow::anyhow!("resuming the encrypted replica: {other}"),
-            })?
-    } else {
-        ConnettoConnection::connect(transport, &replica, REPLICA_SQLITE_DDL, &config, None)
-            .await
-            .map_err(|err| match err {
-                connetto_client::ClientError::Auth(_) => anyhow::anyhow!(
-                    "the server refused the credential; \
-                     check CONNETTO_AUTH and OIDC settings"
-                ),
-                other => anyhow::anyhow!("first boot of the encrypted replica: {other}"),
-            })?
-    };
-
-    let conn = conn.with_token_source(authenticator.token_source());
-    let accounts = token_store
-        .accounts()
-        .await
-        .context("listing the signed-in accounts")?;
-
-    let auth_ctx = AuthCtx {
-        authenticator,
-        db_path,
-        key_store,
-        key_name,
-        accounts,
-        token_store,
-        session_expires_at,
-        current_account,
-    };
-    Ok((conn, auth_ctx, root_key))
 }
 
 async fn replica_footprint(client: &ConnettoClient<Ws>) -> (i64, i64) {
@@ -633,6 +466,7 @@ async fn replica_footprint(client: &ConnettoClient<Ws>) -> (i64, i64) {
             (pages, free)
         })
         .await
+        .unwrap_or((0, 0))
 }
 
 fn status_label(event: &ClientEvent) -> Option<String> {
@@ -688,8 +522,9 @@ enum WipeState {
 #[component]
 fn App() -> Element {
     let client = use_context::<ConnettoClient<Ws>>();
+    use_away_input(&client);
     let backend = use_context::<Backend>();
-    let auth_ctx = use_context::<AuthCtx>();
+    let parts = use_context::<SessionParts>();
 
     let rows = use_live::<_, _, Order>(
         &client,
@@ -722,12 +557,15 @@ fn App() -> Element {
     let mut footprint: Signal<(i64, i64)> = use_signal(|| (0_i64, 0_i64));
     {
         let client = client.clone();
-        let session_expires_at = auth_ctx.session_expires_at;
+        let session_expires_at = parts.0.native.session().map(|session| session.expires_at());
         use_effect(move || {
             let _ = rows.value().read().len();
             let client = client.clone();
             spawn(async move {
-                expiry_warn.set(expiry_text(&client, session_expires_at).await);
+                expiry_warn.set(match session_expires_at {
+                    Some(deadline) => expiry_text(&client, deadline).await,
+                    None => None,
+                });
                 footprint.set(replica_footprint(&client).await);
             });
         });
@@ -814,7 +652,8 @@ fn App() -> Element {
                                         .values(orders::quantity.eq(quantity))
                                         .execute(conn.conn())
                                 })
-                                .await;
+                                .await
+                                .and_then(|insert| insert.map_err(Into::into));
                             if let Err(err) = result {
                                 tracing::error!(error = %err, "local insert failed");
                             }
@@ -869,7 +708,7 @@ async fn expiry_text(
     client: &ConnettoClient<Ws>,
     session_expires_at: std::time::SystemTime,
 ) -> Option<String> {
-    let unsynced = client.with_conn(|c| c.unsynced()).await;
+    let unsynced = client.unsynced().await.unwrap_or_default();
     let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
     let warning = expiry_warning(
         std::time::SystemTime::now(),
@@ -906,23 +745,12 @@ fn grouped_label(counts: &HashMap<i64, i64>) -> String {
 
 /// Sign out of this account, wiping the replica, and start over.
 async fn sign_out(
-    auth: &AuthCtx,
-    client: &ConnettoClient<Ws>,
+    parts: &SessionParts,
     discard_unsynced: bool,
     restart: Restart,
     mut wipe_state: Signal<WipeState>,
 ) {
-    let unsynced = client.with_conn(|c| c.unsynced()).await;
-    match forget_device(
-        &auth.authenticator,
-        &auth.db_path,
-        auth.key_store.as_ref(),
-        &auth.key_name,
-        &unsynced,
-        discard_unsynced,
-    )
-    .await
-    {
+    match parts.0.native.forget_device(discard_unsynced).await {
         Ok(()) => restart.request(),
         Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) if !discard_unsynced => {
             wipe_state.set(WipeState::ConfirmForce {
@@ -936,11 +764,13 @@ async fn sign_out(
 #[component]
 fn SessionPanel(wipe_state: Signal<WipeState>) -> Element {
     let restart = use_context::<Restart>();
-    let client = use_context::<ConnettoClient<Ws>>();
-    let auth_ctx = use_context::<AuthCtx>();
-    let replica_label = auth_ctx.key_name.clone();
-    let (wipe_auth, wipe_client) = (auth_ctx.clone(), client.clone());
-    let (force_auth, force_client) = (auth_ctx, client);
+    let parts = use_context::<SessionParts>();
+    let replica_label = parts
+        .0
+        .native
+        .session()
+        .map_or_else(String::new, |session| session.user_id().to_owned());
+    let (wipe_parts, force_parts) = (parts.clone(), parts);
 
     rsx! {
         div {
@@ -952,14 +782,14 @@ fn SessionPanel(wipe_state: Signal<WipeState>) -> Element {
             }
             p {
                 style: "margin: 0 0 8px 0; font-size: 0.85em; color: #555;",
-                "Replica: {replica_label}"
+                "Signed in as: {replica_label}"
             }
             {match wipe_state.read().clone() {
                 WipeState::Idle => rsx! {
                     button {
                         onclick: move |_| {
-                            let (auth, cl) = (wipe_auth.clone(), wipe_client.clone());
-                            spawn(async move { sign_out(&auth, &cl, false, restart, wipe_state).await });
+                            let parts = wipe_parts.clone();
+                            spawn(async move { sign_out(&parts, false, restart, wipe_state).await });
                         },
                         "Sign out (wipe local replica)"
                     }
@@ -976,8 +806,8 @@ fn SessionPanel(wipe_state: Signal<WipeState>) -> Element {
                             style: "display: flex; gap: 6px;",
                             button {
                                 onclick: move |_| {
-                                    let (auth, cl) = (force_auth.clone(), force_client.clone());
-                                    spawn(async move { sign_out(&auth, &cl, true, restart, wipe_state).await });
+                                    let parts = force_parts.clone();
+                                    spawn(async move { sign_out(&parts, true, restart, wipe_state).await });
                                 },
                                 "Confirm: discard and wipe"
                             }
@@ -1003,16 +833,21 @@ fn SessionPanel(wipe_state: Signal<WipeState>) -> Element {
     }
 }
 
-/// Point the device at another account, or at none so the next start signs in
-/// afresh, and start over. Refused while local writes are unsent.
+/// Start over as another account, or as a new one, refused while local
+/// writes are unsent.
 async fn change_account(
     client: &ConnettoClient<Ws>,
-    token_store: &KeyringStore,
-    account: Option<&str>,
+    choice: AccountChoice,
     restart: Restart,
     mut wipe_state: Signal<WipeState>,
 ) {
-    let unsynced = client.with_conn(|c| c.unsynced()).await;
+    let unsynced = match client.unsynced().await {
+        Ok(unsynced) => unsynced,
+        Err(err) => {
+            wipe_state.set(WipeState::Error(format!("Cannot change account: {err}")));
+            return;
+        }
+    };
     if !unsynced.is_empty() {
         wipe_state.set(WipeState::Error(format!(
             "Cannot change account: {} write(s) not yet synced.",
@@ -1020,27 +855,23 @@ async fn change_account(
         )));
         return;
     }
-    let pointed = match account {
-        Some(key) => token_store.store(IDENTITY_RECORD, key).await,
-        None => token_store.clear(IDENTITY_RECORD).await,
-    };
-    match pointed {
-        Ok(()) => restart.request(),
-        Err(err) => wipe_state.set(WipeState::Error(format!("Cannot change account: {err}"))),
-    }
+    restart.request_as(choice);
 }
 
 #[component]
 fn AccountsPanel(wipe_state: Signal<WipeState>) -> Element {
     let restart = use_context::<Restart>();
     let client = use_context::<ConnettoClient<Ws>>();
-    let auth_ctx = use_context::<AuthCtx>();
+    let parts = use_context::<SessionParts>();
     let mut add_picking: Signal<bool> = use_signal(|| false);
-    let accounts_list = use_signal(|| auth_ctx.accounts.clone());
-    let current_account = auth_ctx.current_account.clone();
-    let token_store = Arc::clone(&auth_ctx.token_store);
+    let session = parts.0.native.session();
+    let accounts_list = use_signal(|| {
+        session
+            .map(|session| session.accounts().to_vec())
+            .unwrap_or_default()
+    });
+    let current_account = session.map_or_else(String::new, |session| session.account().to_owned());
     let add_client = client.clone();
-    let add_store = Arc::clone(&token_store);
 
     let account_items: Vec<(String, String, bool)> = accounts_list
         .read()
@@ -1071,14 +902,13 @@ fn AccountsPanel(wipe_state: Signal<WipeState>) -> Element {
                         }
                     } else {
                         {
-                            let ts = Arc::clone(&token_store);
                             let cl = client.clone();
                             rsx! {
                                 button {
                                     onclick: move |_| {
-                                        let (ts, cl, key) = (Arc::clone(&ts), cl.clone(), acc_key.clone());
+                                        let (cl, key) = (cl.clone(), acc_key.clone());
                                         spawn(async move {
-                                            change_account(&cl, &ts, Some(&key), restart, wipe_state).await;
+                                            change_account(&cl, AccountChoice::Account(key), restart, wipe_state).await;
                                         });
                                     },
                                     "Switch"
@@ -1102,9 +932,9 @@ fn AccountsPanel(wipe_state: Signal<WipeState>) -> Element {
                         style: "display: flex; gap: 6px; flex-wrap: wrap;",
                         button {
                             onclick: move |_| {
-                                let (cl, ts) = (add_client.clone(), Arc::clone(&add_store));
+                                let cl = add_client.clone();
                                 spawn(async move {
-                                    change_account(&cl, &ts, None, restart, wipe_state).await;
+                                    change_account(&cl, AccountChoice::New, restart, wipe_state).await;
                                 });
                             },
                             "Sign in"

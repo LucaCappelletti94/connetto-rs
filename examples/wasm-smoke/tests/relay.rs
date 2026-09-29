@@ -17,11 +17,11 @@
 mod common;
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, LiveQuery};
 use connetto_core::{Transport, loopback};
+use connetto_wasm_smoke::build::{self, Once};
 use connetto_wasm_smoke::workers::DEMO_WS_URL;
+use connetto_wasm_smoke::workers::demo_schema;
 use connetto_wasm_smoke::{BrowserSocket, MessageTransport, RelayHub};
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -66,44 +66,15 @@ struct Note {
     body: String,
 }
 
-/// Base for row ids unique across smoke runs, in the relay test's own band.
-fn unique_base() -> i64 {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "Date::now in milliseconds fits i64 until the year 285428751"
-    )]
-    let millis = js_sys::Date::now() as i64;
-    40_000_000_000 + millis
-}
-
-async fn connect(
-    name: &str,
-    tag: i64,
-    token: String,
-    identity: String,
-) -> ConnettoConnection<BrowserSocket> {
+async fn connect(token: String, identity: String) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig::new(format!("{name}-{tag}"))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(
-            connetto_wasm_smoke::CALLER_FUNCTION,
-            Some(identity.as_str()),
-        )
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        connetto_wasm_smoke::workers::DEMO_TAB_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect")
+    ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
+        .signed_in(build::held(token, &identity))
+        .connect_driven()
+        .await
+        .expect("client connect")
 }
 
 /// Pump `conn` until an event matches `pred`, applying every frame in
@@ -162,7 +133,6 @@ async fn write_row(
 
 #[wasm_bindgen_test]
 async fn relay_serves_generic_snapshots_and_routes_live_patches() {
-    let base = unique_base();
     let (token, identity) = common::mint_session().await;
     // The writer holds its own login of the same user: the hub's upstream
     // connection below presents `token`, and two direct connections under one
@@ -171,12 +141,12 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 
     // A row that exists before the worker connects: it can only reach the
     // tab through the relay's snapshot leg.
-    let mut writer = connect("relay-writer", base, writer_token, identity.clone()).await;
+    let mut writer = connect(writer_token, identity.clone()).await;
     let snapshot_id = write_row(&mut writer, 1, &identity).await;
 
     // The worker-held upstream connection: subscribe and drain to the
     // snapshot end, so its replica holds the current table.
-    let mut worker = connect("relay-worker", base, token.clone(), identity.clone()).await;
+    let mut worker = connect(token.clone(), identity.clone()).await;
     worker
         .subscribe("relay-upstream", QUERY)
         .await
@@ -202,26 +172,12 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
     });
     hub.attach(relay_end);
 
-    let config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(
-            connetto_wasm_smoke::CALLER_FUNCTION,
-            Some(identity.as_str()),
-        )
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let tab = ConnettoConnection::connect(
-        tab_end,
-        &Replica::in_memory(),
-        connetto_wasm_smoke::workers::DEMO_TAB_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("tab connect through relay");
-    let (tab, pump) = ConnettoClient::with_pump(tab);
+    let (running, pump) = ClientBuilder::new(demo_schema().relay_mirror(), Once::new(tab_end))
+        .with_client_id(rosetta_uuid::Uuid::new_v4().to_string())
+        .connect_with_pump()
+        .await
+        .expect("tab connect through relay");
+    let tab = running.client().clone();
     wasm_bindgen_futures::spawn_local(pump);
     let mut orders_live: LiveQuery<Order> = orders::table
         .order(orders::id)
@@ -276,7 +232,6 @@ async fn relay_serves_generic_snapshots_and_routes_live_patches() {
 
 #[wasm_bindgen_test]
 async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
-    let base = unique_base();
     let (token, identity) = common::mint_session().await;
     // The observer's own login of the same user: the hub's upstream holds
     // `token`, and a second direct connection under it would evict the worker
@@ -284,7 +239,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     let (observer_token, _) = common::mint_session().await;
     let stage = |message: &str| web_sys::console::log_1(&message.into());
 
-    let mut worker = connect("port-worker", base, token.clone(), identity.clone()).await;
+    let mut worker = connect(token.clone(), identity.clone()).await;
     worker
         .subscribe("relay-upstream", QUERY)
         .await
@@ -306,23 +261,12 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
     hub.attach(relay_end);
     stage("hub attached");
 
-    let config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(Grant::new(token.clone())))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(
-            connetto_wasm_smoke::CALLER_FUNCTION,
-            Some(identity.as_str()),
-        )
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let mut tab = ConnettoConnection::connect(
-        MessageTransport::<MessagePort>::new(channel.port2()),
-        &Replica::in_memory(),
-        connetto_wasm_smoke::workers::DEMO_TAB_DDL,
-        &config,
-        None,
+    let mut tab = ClientBuilder::new(
+        demo_schema().relay_mirror(),
+        Once::new(MessageTransport::<MessagePort>::new(channel.port2())),
     )
+    .with_client_id(rosetta_uuid::Uuid::new_v4().to_string())
+    .connect_driven()
     .await
     .expect("tab connect through the port");
     stage("tab connected");
@@ -362,7 +306,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
 
     // Round trip proof: an independent observer on the real server sees the
     // row, so it landed in Postgres, not just in a local mirror.
-    let mut observer = connect("port-observer", base, observer_token, identity).await;
+    let mut observer = connect(observer_token, identity).await;
     observer
         .subscribe("observer", QUERY)
         .await

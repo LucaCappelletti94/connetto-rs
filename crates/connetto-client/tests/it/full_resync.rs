@@ -9,7 +9,7 @@
 //! session receives (`FullResyncRequired` then a fresh snapshot), so the test
 //! pins the client contract without an oplog or a retention window.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
@@ -166,14 +166,12 @@ where
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn full_resync_drops_rows_deleted_during_the_outage() {
-    let config = ClientConfig::new("resync").with_login(Some(Grant::new("user:token")));
-    let mut conn = ConnettoConnection::connect(
-        resync_server(),
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config,
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(resync_server()),
     )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await
     .expect("connect");
     conn.subscribe(SUB, QUERY).await.expect("subscribe");

@@ -2,7 +2,7 @@
 
 use core::future::{self, Future};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 
@@ -30,9 +30,12 @@ pub enum MemStoreError {
 ///
 /// Thread-safe via interior `Mutex`. Suitable for tests and for short-lived
 /// in-process pipelines. All stored bytes are lost when the store is dropped.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct MemStore {
-    chunks: Mutex<HashMap<ChunkHash, Vec<u8>>>,
+    /// Held behind an `Arc` so a clone shares the same chunks, since the content
+    /// client clones its store for its local read source, and an in-memory
+    /// clone that copied the map would answer every read empty.
+    chunks: Arc<Mutex<HashMap<ChunkHash, Vec<u8>>>>,
 }
 
 impl MemStore {

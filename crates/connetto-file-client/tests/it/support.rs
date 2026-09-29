@@ -7,11 +7,15 @@ use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
 use connetto_client::live::ConnettoClient;
-use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
+use connetto_client::{
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Gate, Grant, HeldCredential,
+    Located, ReplicaKey, ReplicaPlace, SyncSchema,
+};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, NonFatalError,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{ContentClient, ContentHttp, FsStore, HttpFailure, HttpReply};
@@ -152,18 +156,11 @@ impl Transport for Scripted {
 pub async fn connected_content_bulk_failing(
     root: &std::path::Path,
 ) -> ContentClient<FakeTransport, FsStore, RecordingHttp> {
-    let replica_path = root.join("replica.sqlite");
-    let replica = Replica::encrypted_file(
-        replica_path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = cold::<FakeTransport>(&root.join("replica.sqlite")).await;
     conn.attach(FakeTransport::accepting_but_failing_bulk())
         .await
         .expect("attach the transport");
-    let client = ConnettoClient::start(conn);
+    let client = started(conn);
     ContentClient::attach(
         client,
         FsStore::new(root.join("chunks")),
@@ -257,9 +254,85 @@ impl ContentHttp for RecordingHttp {
     }
 }
 
-/// The client configuration every content test opens with.
-pub fn config() -> ClientConfig {
-    ClientConfig::new("r67-content").with_login(Some(Grant::new("user:tester")))
+/// The replica file at exactly the path a test names, so a reopen finds it.
+pub struct At(pub std::path::PathBuf);
+
+impl ReplicaPlace for At {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            name,
+            self.0.to_str().expect("utf-8 path"),
+            self.0.exists(),
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// A key store answering the suite's fixed replica key for every record.
+pub struct FixedKey;
+
+#[expect(
+    clippy::unused_async_trait_impl,
+    reason = "the trait methods are async and the bodies finish without awaiting"
+)]
+impl connetto_core::traits::ReplicaKeyStore for FixedKey {
+    type Error = ClientError;
+
+    async fn load(&self, _name: &str) -> Result<Option<ReplicaKey>, ClientError> {
+        Ok(Some(connetto_core::test_support::replica_key()))
+    }
+
+    async fn store(&self, _name: &str, _key: &ReplicaKey) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    async fn clear(&self, _name: &str) -> Result<(), ClientError> {
+        Ok(())
+    }
+
+    fn protection(&self) -> connetto_client::Custody {
+        connetto_client::Custody::Ephemeral
+    }
+}
+
+/// The durable replica at `path`, signed in as the suite's tester, with no
+/// transport attached.
+async fn cold<T>(path: &std::path::Path) -> ConnettoConnection<T>
+where
+    T: Transport + Send + 'static,
+    T::Error: core::fmt::Display,
+{
+    ClientBuilder::new(
+        SyncSchema::new(SchemaBundle::new(
+            "",
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )),
+        || async { Err::<T, _>("no server") },
+    )
+    .signed_in(
+        HeldCredential::new(Grant::new("user:tester"), "tester")
+            .expect("a string identity serializes"),
+    )
+    .durable(At(path.to_path_buf()), FixedKey)
+    .with_gate(Gate::off())
+    .open_driven()
+    .await
+    .expect("open with no server")
+}
+
+/// A running client over `conn`, its pump spawned.
+fn started<T>(conn: ConnettoConnection<T>) -> ConnettoClient<T>
+where
+    T: Transport + Send + 'static,
+    T::Error: core::fmt::Display,
+{
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
+    client
 }
 
 /// The root key the encrypting store derives from, fixed so a reopened
@@ -270,15 +343,8 @@ pub const ROOT_KEY: [u8; 32] = [9; 32];
 ///
 /// Nothing is connected, which is the state the offline half of every case
 /// needs.
-pub fn offline_client(path: &std::path::Path) -> ConnettoClient<Scripted> {
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let conn = ConnettoConnection::<Scripted>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
-    ConnettoClient::start(conn)
+pub async fn offline_client(path: &std::path::Path) -> ConnettoClient<Scripted> {
+    started(cold(path).await)
 }
 
 /// Opens a replica at `path` and attaches `transport`, so the client counts as
@@ -287,15 +353,9 @@ pub async fn connected_client(
     path: &std::path::Path,
     transport: Scripted,
 ) -> ConnettoClient<Scripted> {
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let mut conn = ConnettoConnection::<Scripted>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = cold(path).await;
     conn.attach(transport).await.expect("attach the transport");
-    ConnettoClient::start(conn)
+    started(conn)
 }
 
 /// A content client over a filesystem store in `chunks`.
@@ -346,7 +406,7 @@ pub async fn offline_content(
     ConnettoClient<Scripted>,
     ContentClient<Scripted, FsStore, RecordingHttp>,
 ) {
-    let client = offline_client(&dir.join("replica.sqlite"));
+    let client = offline_client(&dir.join("replica.sqlite")).await;
     let content = attach_content(
         client.clone(),
         &dir.join("chunks"),
@@ -365,7 +425,7 @@ pub async fn offline_content(
 pub async fn learn_file_id(bytes: &[u8]) -> FileId {
     let dir = tempfile::tempdir().expect("temp dir");
     let probe = attach_content(
-        offline_client(&dir.path().join("replica.sqlite")),
+        offline_client(&dir.path().join("replica.sqlite")).await,
         &dir.path().join("chunks"),
         RecordingHttp::default(),
     )
@@ -397,7 +457,8 @@ pub async fn insert_row_and_pin_album(
                 .execute(conn.conn())
                 .expect("record the row the pin reads")
         })
-        .await;
+        .await
+        .expect("gate not locked");
     content
         .pin_content("album", "SELECT content_id FROM photos", "content_id")
         .await
@@ -455,25 +516,13 @@ pub async fn connected_connection(
     path: &std::path::Path,
     transport: Scripted,
 ) -> ConnettoConnection<Scripted> {
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let mut conn = ConnettoConnection::<Scripted>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = cold(path).await;
     conn.attach(transport).await.expect("attach the transport");
     conn
 }
 
 /// Opens a replica at `path` and hands back the raw connection with no
 /// transport, the cold state where asking the server is impossible.
-pub fn cold_connection(path: &std::path::Path) -> ConnettoConnection<Scripted> {
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    ConnettoConnection::<Scripted>::open(&replica, DDL, &config(), None)
-        .expect("open with no server")
+pub async fn cold_connection(path: &std::path::Path) -> ConnettoConnection<Scripted> {
+    cold(path).await
 }

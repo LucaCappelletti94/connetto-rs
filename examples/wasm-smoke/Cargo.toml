@@ -51,10 +51,11 @@ web-sys = { version = "0.3", features = [
   "console",
 ] }
 
-# The build script translates schema.sql through pg2sqlite and applies the
-# result to the replica template database shipped into the OPFS test.
+# The schema step: translates the deployment's shared schema and policies plus
+# this demo's local tier into the bundle the app includes and the version it
+# presents at handshake.
 [build-dependencies]
-connetto-demo-deployment = { path = "../deployment", features = ["build"] }
+connetto-schema = { path = "../../crates/connetto-schema" }
 
 [dev-dependencies]
 wasm-bindgen-test = "0.3"

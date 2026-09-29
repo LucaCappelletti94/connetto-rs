@@ -10,7 +10,7 @@
 //! A deterministic fake server completes the handshake advertising a chosen
 //! schema version, so the test controls exactly what the client compares against.
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientError};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
@@ -44,26 +44,21 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
     client_end
 }
 
-fn config(schema_version: Option<SchemaVersion>) -> ClientConfig {
-    ClientConfig::new("schema-detection")
-        .with_login(Some(Grant::new("user:token")))
-        .with_schema_version(schema_version)
-}
-
 #[tokio::test]
 async fn stale_baked_schema_is_rejected_at_handshake() {
-    let server_version = SchemaVersion::from_source("CREATE TABLE orders (id INT, extra INT);");
-    let client_version = SchemaVersion::from_source("CREATE TABLE orders (id INT);");
+    let bundle = super::support::bundle(SQLITE_DDL);
+    let client_version = bundle.version();
+    let server_version = SchemaVersion::from_hash(b"orders-extra");
+    assert_ne!(
+        client_version, server_version,
+        "the two sides must hash different schemas"
+    );
     let transport = fake_server(Some(server_version.clone()));
 
-    let result = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config(Some(client_version.clone())),
-        None,
-    )
-    .await;
+    let result = ClientBuilder::new(bundle, super::support::Once::new(transport))
+        .signed_in(super::support::held("token"))
+        .connect_driven()
+        .await;
 
     match result {
         Err(ClientError::SchemaOutdated { client, server }) => {
@@ -84,18 +79,14 @@ async fn stale_baked_schema_is_rejected_at_handshake() {
 
 #[tokio::test]
 async fn matching_schema_connects() {
-    let version = SchemaVersion::from_source("CREATE TABLE orders (id INT, quantity INT);");
-    let transport = fake_server(Some(version.clone()));
+    let bundle = super::support::bundle(SQLITE_DDL);
+    let version = bundle.version();
+    let transport = fake_server(Some(version));
 
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config(Some(version)),
-        None,
-    )
-    .await;
-
+    let conn = ClientBuilder::new(bundle, super::support::Once::new(transport))
+        .signed_in(super::support::held("token"))
+        .connect_driven()
+        .await;
     assert!(
         conn.is_ok(),
         "a matching schema version proceeds normally: {:?}",
@@ -104,48 +95,16 @@ async fn matching_schema_connects() {
 }
 
 #[tokio::test]
-async fn undeclared_client_rejected_by_versioned_server() {
-    // Detection is server-gated: once the server advertises a version, a client
-    // that declares none (`None`) is stale and must reload, so a build that
-    // forgot to bake its version fails loudly rather than mis-parsing.
-    let server_version = SchemaVersion::from_source("CREATE TABLE orders (id INT);");
-    let transport = fake_server(Some(server_version.clone()));
-
-    let result = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config(None),
-        None,
-    )
-    .await;
-
-    match result {
-        Err(ClientError::SchemaOutdated { client, server }) => {
-            assert_eq!(client, None, "the undeclared client reports no version");
-            assert_eq!(server, server_version, "against the server's real version");
-        }
-        Err(other) => panic!("expected SchemaOutdated, got {other:?}"),
-        Ok(_) => panic!("an undeclared client connected to a versioned server"),
-    }
-}
-
-#[tokio::test]
 async fn empty_server_skips_detection() {
     // A server that advertises no version (`None`) opts out of the contract, so
     // even a versioned client connects. This is the only remaining skip.
+    let bundle = super::support::bundle(SQLITE_DDL);
     let transport = fake_server(None);
 
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config(Some(SchemaVersion::from_source(
-            "CREATE TABLE orders (id INT);",
-        ))),
-        None,
-    )
-    .await;
+    let conn = ClientBuilder::new(bundle, super::support::Once::new(transport))
+        .signed_in(super::support::held("token"))
+        .connect_driven()
+        .await;
 
     assert!(
         conn.is_ok(),

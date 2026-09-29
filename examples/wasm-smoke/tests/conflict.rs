@@ -12,23 +12,20 @@
 //! `MutationConflict` frame, the same approach the resync test uses. The tab
 //! stays attached to the hub throughout, exercising the hub's conflict path.
 //!
-//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
-//! commands. No server or Postgres is needed for this test.
-//! Run this suite with:
+//! No server, Postgres or identity provider is needed. Run this suite with:
 //! `wasm-pack test --headless --chrome examples/wasm-smoke --test conflict`
 
 #![cfg(target_arch = "wasm32")]
 
-mod common;
-
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
-use connetto_wasm_smoke::{RelayHub, uuidv4_functions};
+use connetto_wasm_smoke::RelayHub;
+use connetto_wasm_smoke::build::{Once, raw_schema};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use wasm_bindgen_futures::spawn_local;
@@ -201,13 +198,11 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     // rosetta_uuid::Uuid is Copy; no clone needed.
     spawn_local(fake_upstream(fake_up, seeded_id));
 
-    let worker_config = ClientConfig::new(format!("conflict-worker-{base}"))
-        .with_login(Some(Grant::new(common::mint_token().await)))
-        .with_sql_functions(uuidv4_functions());
-    let mut worker =
-        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
-            .await
-            .expect("worker connect");
+    let mut worker = ClientBuilder::new(raw_schema(DDL), Once::new(worker_up))
+        .with_client_id(format!("conflict-worker-{base}"))
+        .connect_driven()
+        .await
+        .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await
@@ -225,13 +220,11 @@ async fn upstream_conflict_reaches_the_tab_as_a_conflict() {
     // The tab attaches and converges on the seeded row.
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(Grant::new(common::mint_token().await)))
-        .with_sql_functions(uuidv4_functions());
-    let mut tab =
-        ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)
-            .await
-            .expect("tab connect");
+    let mut tab = ClientBuilder::new(raw_schema(DDL), Once::new(tab_end))
+        .with_client_id(rosetta_uuid::Uuid::new_v4().to_string())
+        .connect_driven()
+        .await
+        .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)
         .await
         .expect("tab subscribe");

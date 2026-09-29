@@ -31,8 +31,9 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, ErrorEvent, Event, MessageEvent, Worker};
 
 use crate::locks::{HeldLock, hold_lock};
-use crate::unlock::{AccountChoice, UnlockError};
+use crate::unlock::UnlockError;
 use crate::workers::{BootIdentity, WorkerBootstrap, spawn_db_worker};
+use connetto_client::AccountChoice;
 
 /// Failure of a leader-managed operation.
 #[derive(Debug, thiserror::Error)]
@@ -127,7 +128,7 @@ impl Membership {
     /// [`LeaderError::WorkerSpawn`] if a replacement worker cannot be spawned, or
     /// [`LeaderError::SwitchChannel`] if the request cannot be broadcast to the leader.
     pub fn switch_account(&self, account: &str) -> Result<(), LeaderError> {
-        self.reboot_as(AccountChoice::Named(account.to_owned()))
+        self.reboot_as(AccountChoice::Account(account.to_owned()))
     }
 
     /// Sign in as somebody new, keeping every account already signed in.
@@ -238,9 +239,10 @@ const SWITCH_CHANNEL: &str = "connetto-switch";
 /// sentinel could collide with one.
 fn encode_choice(choice: &AccountChoice) -> String {
     match choice {
-        AccountChoice::Named(account) => format!("named:{account}"),
+        AccountChoice::Account(account) => format!("named:{account}"),
         AccountChoice::LastUsed => "last-used".to_owned(),
         AccountChoice::New => "new".to_owned(),
+        AccountChoice::Ask => "ask".to_owned(),
     }
 }
 
@@ -249,9 +251,10 @@ fn decode_choice(message: &str) -> Option<AccountChoice> {
     match message {
         "last-used" => Some(AccountChoice::LastUsed),
         "new" => Some(AccountChoice::New),
+        "ask" => Some(AccountChoice::Ask),
         other => other
             .strip_prefix("named:")
-            .map(|account| AccountChoice::Named(account.to_owned())),
+            .map(|account| AccountChoice::Account(account.to_owned())),
     }
 }
 

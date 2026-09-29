@@ -27,14 +27,15 @@
 //! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
 //! writes.
 
-use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
 pub use connetto_core::{Custody, NoGate};
 
+use connetto_core::SUBJECTS_FUNCTION;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
-    ControlMessage, FatalErrorReason, Handshake, MutationHeader, MutationPatch, MutationReject,
-    MutationRejectReason, Ping, Subscribe, SubscriptionSpec, Unsubscribe,
+    ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
+    MutationReject, MutationRejectReason, Ping, Subscribe, SubscriptionSpec, TabIdentity,
+    Unsubscribe,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident};
@@ -67,6 +68,8 @@ mod aggregates;
 pub mod archive;
 #[cfg(feature = "native-auth")]
 pub mod auth;
+pub mod away;
+pub mod builder;
 pub mod cipher;
 mod clock;
 pub mod dsl;
@@ -75,6 +78,7 @@ pub mod harden;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
+mod memory_stores;
 pub mod reconnect;
 pub mod replica;
 mod subscriptions;
@@ -89,8 +93,26 @@ pub use archive::{
 #[cfg(feature = "native-auth")]
 pub use auth::{
     AcquiredSession, AuthorizationSession, BrowserOpener, KeyringKeyStore, KeyringStore,
-    MemoryKeyStore, MemoryRefreshStore, NativeAuthenticator, SessionFuture, provision_replica_key,
-    system_browser_opener,
+    NativeAuthenticator, SessionFuture, system_browser_opener,
+};
+pub use away::{
+    Clock, GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment,
+    SystemClock,
+};
+#[cfg(feature = "native-auth")]
+pub use builder::native::NativeSession;
+#[cfg(feature = "native-transport")]
+pub use builder::native::{
+    DataDir, NativeClient, NativeClientBuilder, NativeDurable, NativeSignedIn, NativeTransport,
+};
+pub use builder::sign_in::{AccountChoice, Auth, HeldCredential, WebSignIn};
+#[cfg(feature = "native-auth")]
+pub use builder::sign_in::{Keyring, KeyringAuth, StoredAuth};
+#[cfg(feature = "native-transport")]
+pub use builder::sign_in::{NativeSignIn, NoKeyring};
+pub use builder::{
+    AttachContent, ClientBuilder, ContentPlace, CoreClient, CoreDurable, CorePump, CoreSignedIn,
+    Gate, Located, REPLICA_PREFIX, ReplicaPlace, SyncSchema, SyncTuning,
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
@@ -102,9 +124,12 @@ pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
 };
+pub use memory_stores::{MemoryKeyStore, MemoryRefreshStore};
 #[cfg(feature = "native-transport")]
 pub use reconnect::TokioSleeper;
-pub use reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
+pub use reconnect::{FirstThen, ReconnectPolicy, Sleeper, TransportFactory};
+#[cfg(feature = "native-transport")]
+pub use replica::provision_replica_key;
 pub use replica::{
     Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
     encode_identity, is_reserved_record, replica_db_name,
@@ -219,8 +244,8 @@ pub enum ClientError {
     ///
     /// The map is a build artifact of the same translation that emitted the
     /// DDL, so a disagreement means the two came from different builds, or
-    /// that the application never passed the map
-    /// ([`ClientConfig::with_policy_tables`]). Either way the sync boundaries
+    /// that the schema was bundled without it
+    /// ([`SyncSchema`]). Either way the sync boundaries
     /// would rename the wrong set of names, and the resulting loss is silent:
     /// a patch applied against a policy view reports success and delivers
     /// nothing. Rebuild the client against the current schema.
@@ -243,7 +268,8 @@ pub enum ClientError {
     /// TEXT, value TEXT)` is a keyed table by SQL's standards, so this
     /// requirement is connetto's own and the refusal names the fix.
     ///
-    /// A table listed in [`ClientConfig::with_unrecorded_tables`] that does
+    /// A table listed in
+    /// [`SyncSchema::with_unrecorded_tables`](crate::SyncSchema::with_unrecorded_tables) that does
     /// declare a key is refused here too: the list and the schema then say
     /// opposite things, and the table would sync while the application
     /// believed it did not.
@@ -253,6 +279,23 @@ pub enum ClientError {
         /// change.
         tables: Vec<String>,
     },
+    /// A plain `ws` URL named a host that is not loopback, refused before
+    /// any socket opens.
+    #[error("insecure websocket: {host} is not a loopback host")]
+    InsecureWebSocket {
+        /// The host the URL named.
+        host: String,
+    },
+    /// The content layer failed to build its client.
+    #[error("content error: {0}")]
+    Content(String),
+    /// The gate is locked, so application access is refused. The pump keeps
+    /// applying inbound patches and reconnecting. This is a typed refusal the
+    /// application distinguishes from a transport failure and retries after
+    /// [`ConnettoClient::unlock`](crate::live::ConnettoClient::unlock) or the
+    /// next approved re-check.
+    #[error("locked: the gate is locked and application access is refused")]
+    Locked,
 }
 
 /// Why a sign-in switch was refused.
@@ -300,7 +343,9 @@ type TokenFactory = dyn Fn() -> TokenFuture + Send + Sync;
 /// [`with_token_source`](ConnettoConnection::with_token_source)) calls it on
 /// every resume, so a native client silently refreshes its access token on
 /// reconnect. Debug-opaque and `Clone` like [`SqlFunctions`], so it can live in
-/// a `Send + Sync` connection on every target.
+/// a `Send + Sync` connection on every target, which diesel's `Connection`
+/// requires. A browser factory whose future holds browser handles wraps it
+/// in `send_wrapper::SendWrapper`, which is sound on a target with one thread.
 #[derive(Clone)]
 pub struct AccessTokenSource(Arc<TokenFactory>);
 
@@ -335,8 +380,8 @@ impl std::fmt::Debug for AccessTokenSource {
 /// connection and before any DDL or insert, so a column `DEFAULT` that calls a
 /// registered function fires on the very first write.
 ///
-/// `Send + Sync` on every target, wasm included: [`ConnettoConnection`]
-/// embeds [`ClientConfig`] and implements `diesel::Connection`, whose `Send`
+/// `Send + Sync` on every target, wasm included, because [`ConnettoConnection`]
+/// embeds the client configuration and implements `diesel::Connection`, whose `Send`
 /// supertrait forces the whole connection (so the whole config) to be `Send`
 /// even in the wasm build. `Arc<dyn Fn>` is `Send` only when the `dyn` is
 /// `Send + Sync`, hence both bounds. In practice a registrar closes over
@@ -370,6 +415,13 @@ impl SqlFunctions {
     #[must_use]
     pub fn with(mut self, installer: SqlFunctionInstaller) -> Self {
         self.0.push(installer);
+        self
+    }
+
+    /// Combine this list with `other`, `other`'s installers last.
+    #[must_use]
+    pub fn merged(mut self, other: SqlFunctions) -> Self {
+        self.0.extend(other.0);
         self
     }
 
@@ -426,7 +478,7 @@ impl std::fmt::Debug for SqlFunctions {
 /// Build it from the same translation run that emitted the DDL: the
 /// `(logical, physical)` pairs come from `Pg2Sqlite::translation_manifest`,
 /// and the view names from the throwaway database the build applies the
-/// translation to. Pass it to [`ClientConfig::with_policy_tables`]. Deriving
+/// translation to, which is what [`SyncSchema`] carries. Deriving
 /// it instead from the replica's own schema by looking for the suffix would
 /// bake that suffix into connetto, and a suffix that changed upstream would
 /// leave the client matching nothing, renaming nothing, and going silently
@@ -618,7 +670,7 @@ impl SubjectSource {
 
 /// What the client presents at the handshake.
 #[derive(Debug, Clone)]
-pub struct ClientConfig {
+pub(crate) struct ClientConfig {
     /// Stable client id, echoed for logging and correlation. Never a trust
     /// input on the server.
     client_id: String,
@@ -627,17 +679,13 @@ pub struct ClientConfig {
     /// policy shows such a caller and writes only where a capability says it
     /// may.
     ///
-    /// It is separate from [`capabilities`](Self::capabilities) because only
-    /// this one refreshes: a token source, when set, replaces it on every
-    /// reconnect. On the wire the two are one undifferentiated list.
+    /// It is separate from the share keys' grants because only this one
+    /// refreshes, a token source, when set, replacing it on every reconnect.
+    /// On the wire they are one undifferentiated list.
     login: Option<Grant>,
-    /// Capability grants, for example share keys, presented alongside the
-    /// login. Each is checked on its own, and one that fails changes nothing
-    /// except what the caller can see.
-    capabilities: Vec<Grant>,
     /// The schema version this client build was compiled against, for staleness
     /// detection, or `None` to opt out. When both this and the server's ack
-    /// carry a version and they differ, [`ConnettoConnection::connect`] fails
+    /// carry a version and they differ, the handshake fails
     /// with [`ClientError::SchemaOutdated`] so the app can reload. Either side
     /// being `None` skips the check.
     schema_version: Option<SchemaVersion>,
@@ -703,17 +751,20 @@ pub struct ClientConfig {
     /// land, so reporting anything stronger would claim protection connetto
     /// does not yet provide.
     custody: Custody,
+    /// The grace a watcher may outlive the connection that created it, the
+    /// leeway for a read that started just before the last client dropped.
+    /// Defaults to [`DEFAULT_GRACE`].
+    watch_grace: Duration,
 }
 
 impl ClientConfig {
-    /// Build a config for a client with the given id, no login, no capabilities,
+    /// Build a config for a client with the given id, no login, no share keys,
     /// no schema version, no custom SQL functions, and no split tables.
     #[must_use]
     pub fn new(client_id: impl Into<String>) -> Self {
         Self {
             client_id: client_id.into(),
             login: None,
-            capabilities: Vec::new(),
             schema_version: None,
             sql_functions: SqlFunctions::default(),
             policy_tables: PolicyTables::default(),
@@ -726,6 +777,7 @@ impl ClientConfig {
             residual_threshold: DEFAULT_RESIDUAL_THRESHOLD,
             residual_pass: ResidualPass::default(),
             custody: Custody::Unverified(NoGate::Unsupported),
+            watch_grace: DEFAULT_GRACE,
         }
     }
 
@@ -767,46 +819,28 @@ impl ClientConfig {
     }
 
     /// What the replica's translated policies mean by the caller's subject
-    /// set: the share keys it holds, each as the grant that proves it beside
-    /// the subject it names.
-    ///
-    /// `function` is the SQLite function name the build mapped the subjects
-    /// setting onto. The keys are rendered through their own `Key`, which is
-    /// the deployment's type and carries the separator its translation
-    /// declared, so the replica's local answer and the server's binding cannot
-    /// disagree about which keys are held. Holding none is stated by passing
-    /// none, which leaves the function answering `NULL` and every membership
-    /// over the set admitting nothing.
+    /// set, the share keys it holds, each as the grant that proves it beside
+    /// the subject it names, rendered to subject strings through the
+    /// deployment's `CapabilityKey` separator. Applied on every platform by
+    /// the builders.
     ///
     /// Both halves of a key travel together because they answer different
-    /// ends, and neither is sufficient. The grant is what the handshake
-    /// presents, so the server reads the key into the setting it binds, and
-    /// these grants are presented beside any set through
-    /// [`with_capabilities`](Self::with_capabilities). The subject is what the
-    /// replica compares locally, and a subject whose grant has died is left
-    /// out of the rendering, so a durable replica serves only what the server
-    /// still admits.
+    /// ends. The grant is what the handshake presents, so the server reads the
+    /// key into the setting it binds, and the subject is what the replica
+    /// compares locally. A subject whose grant has died is left out of the
+    /// rendering, so a durable replica serves only what the server still
+    /// admits.
     #[must_use]
-    pub fn with_share_keys<Key: CapabilityKey>(
+    pub(crate) fn with_share_keys_rendered(
         mut self,
-        function: impl Into<String>,
-        keys: impl IntoIterator<Item = (Grant, CapabilitySubject<Key>)>,
+        separator: char,
+        keys: Vec<(Grant, String)>,
     ) -> Self {
         self.subjects = Some(SubjectSource {
-            function: function.into(),
-            separator: Key::SEPARATOR,
-            keys: keys
-                .into_iter()
-                .map(|(grant, subject)| (grant, subject.key().to_string()))
-                .collect(),
+            function: SUBJECTS_FUNCTION.to_owned(),
+            separator,
+            keys,
         });
-        self
-    }
-
-    /// Capability grants presented alongside the login.
-    #[must_use]
-    pub fn with_capabilities(mut self, capabilities: impl IntoIterator<Item = Grant>) -> Self {
-        self.capabilities = capabilities.into_iter().collect();
         self
     }
 
@@ -919,6 +953,14 @@ impl ClientConfig {
     #[must_use]
     pub fn with_custody(mut self, custody: Custody) -> Self {
         self.custody = custody;
+        self
+    }
+
+    /// The watch grace a query outlives its last handle for. The builder and
+    /// the manual path both feed it, keeping the default when they do not.
+    #[must_use]
+    pub fn with_watch_grace(mut self, grace: Duration) -> Self {
+        self.watch_grace = grace;
         self
     }
 }
@@ -1117,6 +1159,21 @@ pub enum ClientEvent {
         /// [`ConnettoConnection::residual_pressure`].
         rows_applied: u64,
     },
+    /// The gate is locked. Application reads, writes, and new watches are
+    /// refused with [`ClientError::Locked`], and live-handle refreshes are
+    /// held. The replica connection and sync keep running.
+    Locked,
+    /// The gate is unlocked. Application access resumes, held live-handle
+    /// refreshes are flushed, and each affected handle wakes once.
+    Unlocked,
+    /// The gate's prompt was dismissed or failed, so the gate stays locked.
+    /// The next return or [`ConnettoClient::unlock`] asks again, which is
+    /// what an application offers a retry through.
+    UnlockDismissed,
+    /// A relay stated who its worker is signed in as, and this tab's mirror
+    /// now answers its policy views as that caller. Every live query over
+    /// the replica refreshes.
+    IdentityStated,
 }
 
 /// A primary-key column value carried on a mutation event.
@@ -1453,14 +1510,12 @@ fn register_subjects(
 /// connetto authors itself: applying server-authoritative patches, rolling a
 /// refused mutation back, evicting uncovered rows, and its own bookkeeping.
 /// The application's writes always see it false, so the policy judges them.
+/// Register [`connetto_core::WRITE_EXEMPTION_FUNCTION`] backed by `flag`.
 ///
-/// A build that translates its schema with policies passes this name to
+/// A build that translates its schema with policies passes the same name to
 /// `Pg2SqliteOptions::with_write_exemption_function`. connetto registers the
 /// function on every replica connection it opens, whether or not the schema
 /// names it.
-pub const WRITE_EXEMPTION_FUNCTION: &str = "connetto_write_exempt";
-
-/// Register [`WRITE_EXEMPTION_FUNCTION`] backed by `flag`.
 ///
 /// Nondeterministic on purpose: its value changes between statements (the
 /// suspension guard flips it), so SQLite must not hoist or cache it the way
@@ -1472,7 +1527,7 @@ fn register_write_exemption(
 ) -> Result<(), ClientError> {
     let flag = Arc::clone(flag);
     db.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
-        WRITE_EXEMPTION_FUNCTION,
+        connetto_core::WRITE_EXEMPTION_FUNCTION,
         SqliteFunctionBehavior::INNOCUOUS,
         move || flag.load(Ordering::Relaxed),
     )
@@ -1687,12 +1742,12 @@ fn check_recorded_tables(
                 "{} in the {where_it_is} database declares no primary key, so SQLite records \
                  nothing for it and writes to it are lost: declare one (a single-row table wants \
                  id INTEGER PRIMARY KEY CHECK (id = 1)), or accept the loss with \
-                 ClientConfig::with_unrecorded_tables",
+                 SyncSchema::with_unrecorded_tables",
                 row.name
             )),
             (true, true) => tables.push(format!(
                 "{} in the {where_it_is} database declares a primary key and is named in \
-                 ClientConfig::with_unrecorded_tables, so the two disagree: drop the name to sync \
+                 SyncSchema::with_unrecorded_tables, so the two disagree: drop the name to sync \
                  it, or drop the key to keep it local",
                 row.name
             )),
@@ -2126,7 +2181,12 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    let mut grants = Vec::with_capacity(1 + config.capabilities.len());
+    let mut grants = Vec::with_capacity(
+        1 + config
+            .subjects
+            .as_ref()
+            .map_or(0, |subjects| subjects.keys.len()),
+    );
     match token_source {
         Some(source) => grants.push(Grant::new(source.token().await?)),
         None => grants.extend(config.login.clone()),
@@ -2137,9 +2197,9 @@ where
     // client with no fresh token still has to present what it has and be told.
     grants.extend(
         config
-            .capabilities
+            .subjects
             .iter()
-            .chain(config.subjects.iter().flat_map(SubjectSource::grants))
+            .flat_map(SubjectSource::grants)
             .filter(|grant| !grant_expiry::has_expired(grant, now))
             .cloned(),
     );
@@ -2324,7 +2384,7 @@ pub struct ConnettoConnection<T: Transport> {
     /// too, harmlessly: an empty capture session never uploads.
     dirty: Arc<AtomicBool>,
     /// True while [`SuspendedCapture`] holds it, read by the registered
-    /// [`WRITE_EXEMPTION_FUNCTION`], so the translated schema's fail-closed
+    /// [`connetto_core::WRITE_EXEMPTION_FUNCTION`], so the translated schema's fail-closed
     /// write guards admit connetto's own writes and nobody else's.
     write_exempt: Arc<AtomicBool>,
     /// Names of tables whose rows changed since the last drain, from the
@@ -2392,55 +2452,6 @@ where
     T: Transport,
     T::Error: core::fmt::Display,
 {
-    /// Connect: open the local replica, hook the capture session, and run the
-    /// handshake.
-    ///
-    /// `replica` says where the replica lives, whether its pages are encrypted,
-    /// and what device-private database sits beside it, as one value, so a
-    /// connection cannot exist without its opener having stated all three and
-    /// cannot pair a durable device-private database with storage that has no
-    /// key. `sqlite_ddl` creates the local schema. Pass `resume` to continue
-    /// from a persisted cursor on reconnect.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a database, cipher, session, transport, or handshake
-    /// failure. [`ClientError::ReplicaUndecryptable`] when an existing replica
-    /// does not open under the key given.
-    pub async fn connect<S: ReplicaStorage>(
-        transport: T,
-        replica: &Replica<'_, S>,
-        sqlite_ddl: &str,
-        config: &ClientConfig,
-        resume: Option<Cursor>,
-    ) -> Result<Self, ClientError> {
-        let mut conn = Self::open_inner(replica, Some(sqlite_ddl), config, resume)?;
-        conn.attach(transport).await?;
-        Ok(conn)
-    }
-
-    /// Connect to a replica that already carries its schema, executing no
-    /// DDL: a previous run's replica on reconnect.
-    ///
-    /// `replica` must describe the replica as it was created. See
-    /// [`connect`](Self::connect) for why it is stated rather than inferred.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a database, cipher, session, transport, or handshake
-    /// failure. [`ClientError::ReplicaUndecryptable`] when the replica does not
-    /// open under the key given.
-    pub async fn connect_existing<S: ReplicaStorage>(
-        transport: T,
-        replica: &Replica<'_, S>,
-        config: &ClientConfig,
-        resume: Option<Cursor>,
-    ) -> Result<Self, ClientError> {
-        let mut conn = Self::open_inner(replica, None, config, resume)?;
-        conn.attach(transport).await?;
-        Ok(conn)
-    }
-
     /// Open the replica with no server, serving local reads at once.
     ///
     /// The connection exists and works before anything is reachable: reads
@@ -2448,16 +2459,17 @@ where
     /// [`attach`](Self::attach) later hands it a transport, which replays
     /// whatever queued up. This is what lets an application start offline.
     ///
-    /// `sqlite_ddl` creates the local schema on a first boot. See
-    /// [`connect`](Self::connect) for why `replica` states all three of where
-    /// it lives, whether it is encrypted, and what sits beside it.
+    /// `sqlite_ddl` creates the local schema on a first boot. `replica` states
+    /// where the replica lives, whether its pages are encrypted, and what
+    /// device-private database sits beside it, as one value, so a connection
+    /// cannot exist without its opener having stated all three.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a database, cipher or session failure.
     /// [`ClientError::ReplicaUndecryptable`] when an existing replica does not
     /// open under the key given.
-    pub fn open<S: ReplicaStorage>(
+    pub(crate) fn open<S: ReplicaStorage>(
         replica: &Replica<'_, S>,
         sqlite_ddl: &str,
         config: &ClientConfig,
@@ -2478,7 +2490,7 @@ where
     /// [`ClientError`] on a database, cipher or session failure.
     /// [`ClientError::ReplicaUndecryptable`] when the replica does not open
     /// under the key given.
-    pub fn open_existing<S: ReplicaStorage>(
+    pub(crate) fn open_existing<S: ReplicaStorage>(
         replica: &Replica<'_, S>,
         config: &ClientConfig,
         resume: Option<Cursor>,
@@ -2634,7 +2646,7 @@ where
 
     /// Attach the device-private database the replica named, if any.
     ///
-    /// Driven from `connect` rather than exposed, because which one is legal
+    /// Driven from `open` rather than exposed, because which one is legal
     /// depends on what the replica keeps at rest and only the replica knows
     /// that. The capture session is bound to `main`, so writes to these tables
     /// are physically incapable of being uploaded, rejected, or rolled back,
@@ -2996,6 +3008,26 @@ where
         &self.config.policy_tables
     }
 
+    /// Who this connection answers its policy views as, which a relay states
+    /// to each tab so the tab's mirror answers them the same way.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the replica's clock cannot be read to decide
+    /// which share keys are still alive.
+    pub fn relay_identity(&mut self) -> Result<TabIdentity, ClientError> {
+        let caller = self
+            .config
+            .caller
+            .as_ref()
+            .map(|(_, identity)| identity.clone());
+        let subjects = match &self.config.subjects {
+            Some(subjects) => subjects.rendered(crate::clock::now_secs(&mut self.db)?),
+            None => None,
+        };
+        Ok(TabIdentity { caller, subjects })
+    }
+
     /// The application's local connection, for ordinary diesel reads and writes.
     /// Writes here are captured for upload on the next [`push`](Self::push).
     pub const fn conn(&mut self) -> &mut SqliteConnection {
@@ -3058,7 +3090,8 @@ where
     /// # Errors
     ///
     /// [`ClientError::Export`] when a table has no declared primary key and
-    /// was not named in [`ClientConfig::with_unrecorded_tables`], since SQLite
+    /// was not named in
+    /// [`SyncSchema::with_unrecorded_tables`](crate::SyncSchema::with_unrecorded_tables), since SQLite
     /// records no changes for one and its rows would be silently absent. A
     /// named one is skipped, which is what the declaration means. Also when
     /// the sink refuses a write.
@@ -3318,6 +3351,12 @@ where
         } else {
             Custody::Ephemeral
         }
+    }
+
+    /// The grace a watcher may outlive this connection, from the config.
+    #[must_use]
+    pub(crate) const fn watch_grace(&self) -> Duration {
+        self.config.watch_grace
     }
 
     /// Update the custody level, for example after a gate is enrolled while the
@@ -3993,6 +4032,29 @@ where
         named
     }
 
+    /// Answer the caller and subjects functions with a relay's worker's
+    /// values, and mark every table changed so each live query re-reads
+    /// through the views they filter.
+    fn adopt_relay_identity(&mut self, identity: TabIdentity) -> Result<(), ClientError> {
+        register_caller(
+            &mut self.db,
+            connetto_core::CALLER_FUNCTION,
+            identity
+                .caller
+                .unwrap_or_else(|| connetto_core::auth::absent_marker().to_owned()),
+        )?;
+        register_subjects(&mut self.db, SUBJECTS_FUNCTION, identity.subjects)?;
+        let tables: Vec<String> = sqlite_catalog::table
+            .select(sqlite_catalog::name)
+            .filter(sqlite_catalog::kind.eq_any(["table", "view"]))
+            .load(&mut self.db)?;
+        self.changed
+            .lock()
+            .expect("the changed-tables lock")
+            .extend(tables);
+        Ok(())
+    }
+
     /// [`take_changed`](Self::take_changed) without the hidden-table filter,
     /// for the live-query refresh: a query narrowed through a membership
     /// still has to re-run when the membership moves (R27).
@@ -4027,6 +4089,23 @@ where
             .close()
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))
+    }
+
+    /// A server throttle, deferring the pending write it names.
+    fn rate_limited(&mut self, limited: connetto_core::messages::RateLimited) -> ClientEvent {
+        // A mutation is correlated by its sequence, and one still pending waits for its resend.
+        let throttled_write = limited
+            .related_to
+            .as_deref()
+            .and_then(|related| related.parse::<u64>().ok())
+            .is_some_and(|seq| self.pending.contains_key(&seq));
+        if throttled_write {
+            self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
+        }
+        ClientEvent::RateLimited {
+            related_to: limited.related_to,
+            retry_after_ms: limited.retry_after_ms,
+        }
     }
 
     fn handle_control(&mut self, msg: ControlMessage) -> Result<ClientEvent, ClientError> {
@@ -4106,26 +4185,26 @@ where
                 related_to: err.related_to,
                 detail: err.detail,
             }),
-            ControlMessage::RateLimited(limited) => {
-                // A mutation is correlated by its sequence, and one still pending waits for its resend.
-                let throttled_write = limited
-                    .related_to
-                    .as_deref()
-                    .and_then(|related| related.parse::<u64>().ok())
-                    .is_some_and(|seq| self.pending.contains_key(&seq));
-                if throttled_write {
-                    self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
-                }
-                Ok(ClientEvent::RateLimited {
-                    related_to: limited.related_to,
-                    retry_after_ms: limited.retry_after_ms,
-                })
-            }
+            ControlMessage::RateLimited(limited) => Ok(self.rate_limited(limited)),
             // A relay saying whether IT can reach the server. For a tab that is
             // the answer that matters, because a tab whose own link is fine
             // still cannot sync while the relay cannot, so it rides the same
             // event as this connection's own state.
             ControlMessage::SyncStatus(status) => Ok(ClientEvent::SyncStatus(status)),
+            // A relay stating the worker's gate state. For a tab that is the
+            // answer its application acts on, so it rides the same event as
+            // the client's own gate.
+            ControlMessage::GateState(state) => Ok(match state {
+                GateState::Locked => ClientEvent::Locked,
+                GateState::Unlocked => ClientEvent::Unlocked,
+                GateState::UnlockDismissed => ClientEvent::UnlockDismissed,
+            }),
+            // A relay stating who its worker is. The tab's mirror runs the
+            // worker's translated schema, whose views filter on both values.
+            ControlMessage::TabIdentity(identity) => {
+                self.adopt_relay_identity(identity)?;
+                Ok(ClientEvent::IdentityStated)
+            }
             // The server says why it is closing. Surfaced rather than treated
             // as a violation: the server behaved exactly as the protocol says.
             ControlMessage::FatalError(fatal) => Ok(ClientEvent::ServerClosed {
@@ -4813,17 +4892,16 @@ impl<T: Transport> ConnectionSealed for ConnettoConnection<T> {}
 /// `ConnettoConnection` is a diesel `Connection` over the managed local SQLite,
 /// so applications run ordinary diesel queries on `&mut conn`. Execution
 /// delegates to the captured connection `db`, so local writes are recorded and
-/// auto-submitted by the driver. `establish` is unsupported: build the
-/// connection with [`ConnettoConnection::connect`], which owns the transport and
-/// handshake. diesel's query methods never call `establish`.
+/// auto-submitted by the driver. `establish` is unsupported, since a client
+/// builder owns the transport and handshake, and diesel's query methods never
+/// call `establish`.
 impl<T: Transport + Send> Connection for ConnettoConnection<T> {
     type Backend = Sqlite;
     type TransactionManager = AnsiTransactionManager;
 
     fn establish(_database_url: &str) -> ConnectionResult<Self> {
         Err(ConnectionError::BadConnection(
-            "ConnettoConnection is built with ConnettoConnection::connect, not establish"
-                .to_owned(),
+            "ConnettoConnection is built with a client builder, not establish".to_owned(),
         ))
     }
 

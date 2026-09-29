@@ -15,24 +15,21 @@
 //! the same approach the native test uses. The tab stays attached to the hub
 //! throughout, exercising the hub's resync fan-out.
 //!
-//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
-//! commands. No server or Postgres is needed for this test.
-//! Run this suite with:
+//! No server, Postgres or identity provider is needed. Run this suite with:
 //! `wasm-pack test --headless --chrome examples/wasm-smoke --test resync`
 
 #![cfg(target_arch = "wasm32")]
 
-mod common;
-
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
-use connetto_wasm_smoke::{RelayHub, uuidv4_functions};
+use connetto_wasm_smoke::RelayHub;
+use connetto_wasm_smoke::build::{Once, raw_schema};
 use connetto_web::relay::HubReconnect;
 use diesel::prelude::*;
 use futures_channel::oneshot;
@@ -225,13 +222,11 @@ async fn full_resync_is_relay_transparent() {
     let (trigger_tx, trigger_rx) = oneshot::channel();
     spawn_local(fake_upstream(fake_up, trigger_rx, doomed_id, survivor_id));
 
-    let worker_config = ClientConfig::new(format!("resync-worker-{base}"))
-        .with_login(Some(Grant::new(common::mint_token().await)))
-        .with_sql_functions(uuidv4_functions());
-    let mut worker =
-        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
-            .await
-            .expect("worker connect");
+    let mut worker = ClientBuilder::new(raw_schema(DDL), Once::new(worker_up))
+        .with_client_id(format!("resync-worker-{base}"))
+        .connect_driven()
+        .await
+        .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await
@@ -259,13 +254,11 @@ async fn full_resync_is_relay_transparent() {
     // The tab attaches to the hub and subscribes: its mirror seeds both rows.
     let (tab_end, relay_end) = loopback();
     hub.attach(relay_end);
-    let tab_config = ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(Grant::new(common::mint_token().await)))
-        .with_sql_functions(uuidv4_functions());
-    let mut tab =
-        ConnettoConnection::connect(tab_end, &Replica::in_memory(), DDL, &tab_config, None)
-            .await
-            .expect("tab connect");
+    let mut tab = ClientBuilder::new(raw_schema(DDL), Once::new(tab_end))
+        .with_client_id(rosetta_uuid::Uuid::new_v4().to_string())
+        .connect_driven()
+        .await
+        .expect("tab connect");
     tab.subscribe("tab-orders", QUERY)
         .await
         .expect("tab subscribe");

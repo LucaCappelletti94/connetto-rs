@@ -19,9 +19,15 @@
 //! is the canonical byte source, hashed so the name is fixed-length, filesystem
 //! safe, and does not spell the user id out in a directory listing.
 
+#[cfg(feature = "native-transport")]
+use crate::ClientError;
 use crate::cipher::ReplicaKey;
+#[cfg(feature = "native-transport")]
+use connetto_core::traits::ReplicaKeyStore;
 use sha2::{Digest, Sha256};
 use std::borrow::Cow;
+#[cfg(feature = "native-transport")]
+use zeroize::Zeroize;
 
 mod sealed {
     /// Closes [`ReplicaStorage`](super::ReplicaStorage) so the two cases below
@@ -115,7 +121,7 @@ fn tier_url(replica: &str) -> String {
 ///
 /// A durable replica with its pages in the clear was a third case until phase
 /// E5, and it went because the key is minted on the device
-/// ([`provision_replica_key`](crate::auth::provision_replica_key)). A deployment
+/// ([`provision_replica_key`]). A deployment
 /// with no authentication at all therefore still has a key: it names the
 /// key-store record after the bare replica prefix, the same way the browser's
 /// `device_key` names one after a literal to protect the store it has to read
@@ -195,7 +201,7 @@ impl<'a> Replica<'a, Encrypted> {
     /// key it was written under, and it is the only place that refusal lives, so
     /// the browser worker and a native application get the same behaviour.
     /// `None` is what
-    /// [`ReplicaKeyStore::load`](connetto_core::traits::ReplicaKeyStore::load)
+    /// [`ReplicaKeyStore::load`]
     /// returns for a
     /// replica whose key-store record is gone while the file survived, and its
     /// recoveries are restoring the key, or an explicit data wipe followed by a
@@ -203,13 +209,13 @@ impl<'a> Replica<'a, Encrypted> {
     /// error rather than choosing for the application.
     ///
     /// Note the asymmetry with
-    /// [`provision_replica_key`](crate::auth::provision_replica_key), which cannot
+    /// [`provision_replica_key`], which cannot
     /// return `None` because it mints: a replica being created always has a key,
     /// and only one already on disk can be missing its own.
     ///
     /// # Errors
     ///
-    /// [`ClientError::ReplicaKeyMissing`](crate::ClientError::ReplicaKeyMissing)
+    /// [`ClientError::ReplicaKeyMissing`]
     /// when `resolved` is `None`.
     pub fn encrypted_file(
         path: &'a str,
@@ -283,6 +289,62 @@ impl<'a, S: ReplicaStorage> Replica<'a, S> {
     }
 }
 
+/// The effective key for the replica `name`, minting one when this device has
+/// none cached.
+///
+/// Provision-once in one function. A key already cached on this device always
+/// wins and is never overwritten, so a second login cannot silently re-key a
+/// replica and strand its contents. Only when nothing is cached is a fresh key
+/// minted, and it is written through before it is returned.
+///
+/// The key is minted here, on the device, from the same platform RNG that mints
+/// the PKCE verifier and the CSRF state. No key material crosses the wire and
+/// the server never holds any. The scope is one key per replica per device, cached locally, usable with no credential and no
+/// network.
+///
+/// It stays once per target rather than moving to `connetto-core` beside the
+/// trait, because minting needs an entropy source and `ReplicaKey` deliberately
+/// carries none, which is what keeps the browser build free of one.
+///
+/// **Call this only for a replica that does not exist yet.** For one already on
+/// disk, read the cache with [`ReplicaKeyStore::load`] and hand the result to
+/// [`Replica::encrypted_file`](crate::Replica::encrypted_file). Minting for an
+/// existing replica would return a key that decrypts nothing, and it would fill
+/// the record that restoring a backed-up key still could, where the refusal
+/// ([`ClientError::ReplicaKeyMissing`])
+/// leaves both the ciphertext and that recovery intact.
+///
+/// # Errors
+///
+/// [`ClientError::Auth`] if the store cannot be read or written, or if the
+/// platform RNG fails.
+#[cfg(feature = "native-transport")]
+pub async fn provision_replica_key<S: ReplicaKeyStore<Error = ClientError>>(
+    store: &S,
+    name: &str,
+) -> Result<ReplicaKey, ClientError> {
+    if let Some(cached) = store.load(name).await? {
+        return Ok(cached);
+    }
+    let minted = mint_replica_key()?;
+    store.store(name, &minted).await?;
+    Ok(minted)
+}
+
+/// A fresh key from the platform RNG.
+///
+/// The staging array is key material until it is wiped, and a plain fill would
+/// be elidable where `zeroize` is not.
+#[cfg(feature = "native-transport")]
+fn mint_replica_key() -> Result<ReplicaKey, ClientError> {
+    let mut bytes = [0u8; ReplicaKey::LEN];
+    getrandom::fill(&mut bytes)
+        .map_err(|err| ClientError::Auth(format!("replica key mint: {err}")))?;
+    let key = ReplicaKey::from_bytes(bytes);
+    bytes.zeroize();
+    Ok(key)
+}
+
 /// The hashed identity component of a replica name, in hex characters. 128
 /// bits of SHA-256, which is far past any collision concern for the handful of
 /// identities one device ever holds.
@@ -300,7 +362,7 @@ const DIGEST_HEX_LEN: usize = 32;
 ///
 /// # Errors
 ///
-/// [`ClientError::Session`](crate::ClientError::Session) when the id's
+/// [`ClientError::Session`] when the id's
 /// `Serialize` impl fails, which for an id type is a programming error rather
 /// than a runtime condition.
 pub fn replica_db_name<Id>(prefix: &str, user_id: &Id) -> Result<String, crate::ClientError>
@@ -373,7 +435,7 @@ pub fn is_reserved_record(name: &str) -> bool {
 ///
 /// # Errors
 ///
-/// [`ClientError::Session`](crate::ClientError::Session) when the id's
+/// [`ClientError::Session`] when the id's
 /// `Serialize` impl fails, which for an id type is a programming error rather
 /// than a runtime condition.
 pub fn encode_identity<Id>(user_id: &Id) -> Result<String, crate::ClientError>
@@ -391,7 +453,7 @@ where
 ///
 /// # Errors
 ///
-/// [`ClientError::Session`](crate::ClientError::Session) when the record does not decode as this
+/// [`ClientError::Session`] when the record does not decode as this
 /// deployment's id type, which means the record was written by a build whose
 /// id type differed. The recovery is a fresh login, which rewrites it.
 pub fn decode_identity<Id>(record: &str) -> Result<Id, crate::ClientError>

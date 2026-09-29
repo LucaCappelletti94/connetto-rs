@@ -5,9 +5,10 @@
 
 use core::time::Duration;
 
-use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+use connetto_client::{ClientBuilder, FirstThen, SyncSchema};
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{ControlMessage, FatalErrorReason, Handshake};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_web::{MessageTransport, RelayHub};
@@ -19,18 +20,33 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
+/// The client schema over [`DDL`].
+fn schema() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
 /// A hub over a silent upstream, and the tab end of a real message channel
 /// attached to it.
 async fn hub_with_tab() -> (RelayHub, MessageTransport<MessagePort>) {
-    let worker = ConnettoConnection::connect(
-        FakeTransport::accepting_but_silent(),
-        &Replica::in_memory(),
-        DDL,
-        &ClientConfig::new("tab-refusal-worker"),
-        None,
-    )
-    .await
-    .expect("worker connect");
+    let worker = ClientBuilder::new(schema(), once(FakeTransport::accepting_but_silent()))
+        .with_client_id("tab-refusal-worker")
+        .connect_driven()
+        .await
+        .expect("worker connect");
     let (hub, pump, _notices) = RelayHub::new(worker, ":memory:").expect("hub meta");
     spawn_local(async move {
         pump.await.expect("hub pump");
@@ -81,14 +97,10 @@ async fn a_refused_tab_is_told_why() {
 async fn a_tab_with_any_client_id_connects() {
     for client_id in ["tab-1790236972826", "6f1c9d2e-8a4b-4c5d-9e6f-0a1b2c3d4e5f"] {
         let (_hub, tab) = hub_with_tab().await;
-        let connected = ConnettoConnection::connect(
-            tab,
-            &Replica::in_memory(),
-            DDL,
-            &ClientConfig::new(client_id),
-            None,
-        )
-        .await;
+        let connected = ClientBuilder::new(schema(), once(tab))
+            .with_client_id(client_id)
+            .connect_driven()
+            .await;
         assert!(
             connected.is_ok(),
             "{client_id} was refused: {:?}",

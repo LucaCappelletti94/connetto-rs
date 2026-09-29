@@ -27,10 +27,10 @@ async fn a_second_viewer_cannot_resolve_another_users_photo() {
     await_db_worker_ready(&[]).await.expect("db worker ready");
     harness::stage("db worker booted");
 
-    let (token, identity) = common::mint_session().await;
+    let (_, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let (content, mut conn) = photo::connect_tab(&client_id, token, &identity).await;
+    let (content, mut conn) = photo::connect_tab(&client_id).await;
     conn.subscribe("photo-visibility-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");
@@ -76,13 +76,7 @@ async fn a_second_viewer_cannot_resolve_another_users_photo() {
     harness::stage("owner fetched");
 
     let (viewer_token, viewer_identity) = common::mint_session_as("viewer").await;
-    let viewer_conn = harness::connect_server(
-        "photo-visibility-viewer",
-        harness::unique_base(),
-        viewer_token,
-        &viewer_identity,
-    )
-    .await;
+    let viewer_conn = harness::connect_server(viewer_token, &viewer_identity).await;
     let (viewer_client, viewer_pump) = ConnettoClient::with_pump(viewer_conn);
     let (viewer_done_tx, viewer_done) = oneshot::channel::<()>();
     spawn_local(async move {

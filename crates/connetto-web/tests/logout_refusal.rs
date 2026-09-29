@@ -23,15 +23,19 @@ use core::future::ready;
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+use connetto_client::{
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate,
+    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::{FakeTransport, replica_key};
+use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::{BulkMessage, ControlMessage, IncomingFrame, Transport};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 use connetto_web::RelayHub;
 use connetto_web::auth::{
-    AuthError, LogoutOutcome, PendingWork, WorkerAuthConfig, forget_retired_content,
-    request_logout, request_unsynced,
+    AuthError, LogoutOutcome, PendingWork, forget_retired_content, request_logout, request_unsynced,
 };
 use connetto_web::relay::HubReconnect;
 use connetto_web::storage::{PendingWipe, ReplicaStorage, take_pending_wipes};
@@ -60,17 +64,69 @@ diesel::table! {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new(rosetta_uuid::Uuid::new_v4().to_string())
-        .with_login(Some(connetto_client::Grant::new("user:tester")))
+/// The client schema over [`SQLITE_DDL`].
+fn schema() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        SQLITE_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
 }
 
-/// An auth base that would fail loudly if anything tried to use it. The refusal
-/// path must not reach the network, and a forced logout with no stored credential
-/// returns before it would.
-fn unused_auth() -> WorkerAuthConfig {
-    WorkerAuthConfig::new("http://127.0.0.1:1", "unused", "http://127.0.0.1:1/unused")
+/// The replica at exactly `url`, fresh or already there as the test says.
+struct At {
+    url: String,
+    exists: bool,
 }
+
+impl ReplicaPlace for At {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            name,
+            self.url.clone(),
+            self.exists,
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// A key store holding one key for every record.
+struct Holding(ReplicaKey);
+
+impl ReplicaKeyStore for Holding {
+    type Error = ClientError;
+
+    fn load(&self, _name: &str) -> impl Future<Output = Result<Option<ReplicaKey>, ClientError>> {
+        core::future::ready(Ok(Some(self.0.clone())))
+    }
+
+    fn store(
+        &self,
+        _name: &str,
+        _key: &ReplicaKey,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn clear(&self, _name: &str) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn protection(&self) -> Custody {
+        Custody::Ephemeral
+    }
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
 struct CountingTransport {
     inner: FakeTransport,
     ticket_requests: Rc<Cell<u32>>,
@@ -150,13 +206,17 @@ async fn stranded_worker(
     Vec<u64>,
 ) {
     let url = storage.db_url(REPLICA);
-    let mut worker = ConnettoConnection::connect(
-        CountingTransport::new(ticket_requests, ticket_sent),
-        &Replica::encrypted_file(&url, Some(replica_key())).expect("a resolved key"),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let mut worker = ClientBuilder::new(
+        schema(),
+        once(CountingTransport::new(ticket_requests, ticket_sent)),
     )
+    .signed_in(
+        HeldCredential::new(connetto_client::Grant::new("user:tester"), "tester")
+            .expect("a string identity serializes"),
+    )
+    .durable(At { url, exists: false }, Holding(replica_key()))
+    .with_gate(Gate::off())
+    .connect_driven()
     .await
     .expect("connect over an upstream that never acknowledges");
     diesel::insert_into(items::table)
@@ -197,7 +257,10 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     let hub = start_content_hub(worker, content, &ticket_requests, &ticket_sent);
     serve_logout_requests(
         LogoutConfig {
-            auth: unused_auth(),
+            auth_base_url: "http://127.0.0.1:1".to_owned(),
+            login_base_url: None,
+            provider: "unused".to_owned(),
+            redirect_uri: "http://127.0.0.1:1/unused".to_owned(),
             auth_db_name: AUTH_DB.to_owned(),
             replica_db_name: REPLICA.to_owned(),
             content_namespace: Some("content-wipe-namespace".to_owned()),

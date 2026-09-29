@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica, Watchable,
+    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, SyncSchema, Watchable,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
@@ -203,22 +204,24 @@ async fn spawn_server(
 /// tier holding `notes`.
 async fn connect_with_tier(
     addr: std::net::SocketAddr,
-    client_id: &str,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")));
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory().with_tier(NOTES_DDL),
+    let bundle = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
         SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect")
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(NOTES_DDL),
+    ));
+    ClientBuilder::new(bundle, super::support::Once::new(transport))
+        .signed_in(super::support::held("token"))
+        .connect_driven()
+        .await
+        .expect("client connect")
 }
 
 /// Pump the broadcast stream until an event matches `pred`, failing fast on
@@ -248,7 +251,7 @@ async fn wait_broadcast_strict(
 async fn local_write_is_outside_the_capture_session() {
     let fixture = Fixture::acquire().await;
     let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
-    let mut client = connect_with_tier(addr, "tier-capture").await;
+    let mut client = connect_with_tier(addr).await;
     assert_eq!(
         client.local_tables(),
         &std::collections::HashSet::from(["notes".to_owned()]),
@@ -290,8 +293,9 @@ async fn local_write_is_outside_the_capture_session() {
 async fn local_row_watch_registers_no_subscription_and_refreshes() {
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
-    let conn = connect_with_tier(addr, "tier-rows").await;
-    let client = ConnettoClient::start(conn);
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let mut live: connetto_client::LiveQuery<Note> = notes::table
@@ -310,6 +314,7 @@ async fn local_row_watch_registers_no_subscription_and_refreshes() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("insert note");
     live.changed().await.expect("local refresh");
     assert_eq!(live.rows().len(), 1);
@@ -334,8 +339,9 @@ async fn local_row_watch_registers_no_subscription_and_refreshes() {
 async fn local_aggregate_recomputes_locally() {
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
-    let conn = connect_with_tier(addr, "tier-agg").await;
-    let client = ConnettoClient::start(conn);
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     // A filtered count, so the rendered query carries a bind that the local
@@ -359,6 +365,7 @@ async fn local_aggregate_recomputes_locally() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("insert notes");
     count.changed().await.expect("local recompute");
     assert_eq!(count.value(), Some(2), "the aggregate re-executed locally");
@@ -389,8 +396,9 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     // json_quote and no subscription reaches the server.
     let fixture = Fixture::acquire().await;
     let (_manager, seen, addr, server) = spawn_server(&fixture, 1).await;
-    let conn = connect_with_tier(addr, "tier-custom-agg").await;
-    let client = ConnettoClient::start(conn);
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let mut joined = notes::table
@@ -418,6 +426,7 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("insert notes");
     joined.changed().await.expect("local recompute");
     assert_eq!(
@@ -435,6 +444,7 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("insert third note");
     joined.changed().await.expect("second local recompute");
     assert_eq!(
@@ -449,6 +459,7 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
     client
         .with_conn(|conn| diesel::delete(notes::table).execute(conn.conn()))
         .await
+        .expect("gate not locked")
         .expect("delete all notes");
     joined.changed().await.expect("empty recompute");
     assert_eq!(
@@ -474,8 +485,9 @@ async fn local_custom_aggregate_decodes_via_extension_seam() {
 async fn mixed_tier_aggregate_is_refused_at_registration() {
     let fixture = Fixture::acquire().await;
     let (_manager, _seen, addr, server) = spawn_server(&fixture, 1).await;
-    let conn = connect_with_tier(addr, "tier-mixed-agg").await;
-    let client = ConnettoClient::start(conn);
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
 
     let Err(err) = orders::table
         .inner_join(notes::table.on(notes::id.eq(orders::id)))
@@ -498,8 +510,9 @@ async fn mixed_tier_aggregate_is_refused_at_registration() {
 async fn mixed_row_query_subscribes_synced_tables_whole() {
     let fixture = Fixture::acquire().await;
     let (manager, seen, addr, server) = spawn_server(&fixture, 1).await;
-    let conn = connect_with_tier(addr, "tier-mixed-rows").await;
-    let client = ConnettoClient::start(conn);
+    let conn = connect_with_tier(addr).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     client
@@ -509,6 +522,7 @@ async fn mixed_row_query_subscribes_synced_tables_whole() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("seed note");
 
     // A join across the tier boundary: served locally, backed by a
@@ -560,6 +574,7 @@ async fn mixed_row_query_subscribes_synced_tables_whole() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("edit note");
     loop {
         if joined.rows() == vec![(1_i64, "edited".to_owned())] {
@@ -578,6 +593,7 @@ async fn mixed_row_query_subscribes_synced_tables_whole() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("seed withheld note");
     source
         .execute_sql(&format!(

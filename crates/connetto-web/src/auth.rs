@@ -19,7 +19,9 @@ use std::rc::Rc;
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_client::ClientError;
 use connetto_core::ReplicaKey;
+use connetto_core::custody::Custody;
 use connetto_core::percent::percent_encode;
 use connetto_core::traits::ReplicaKeyStore;
 use diesel::connection::SimpleConnection;
@@ -118,56 +120,6 @@ pub const AT_REST_KEK_LABEL: &[u8] = b"connetto kek v1";
 
 fn js_error(context: &str, value: &JsValue) -> AuthError {
     AuthError::Request(format!("{context}: {value:?}"))
-}
-
-/// Worker-side confidential-client configuration for the browser flow.
-#[derive(Debug, Clone)]
-pub struct WorkerAuthConfig {
-    /// The origin the worker's `fetch` calls to `{base}/auth/token`,
-    /// `{base}/auth/refresh` and `{base}/auth/logout` go to. Those calls carry the
-    /// refresh cookie, so this is either the app's own origin with the auth
-    /// endpoints behind its proxy, or the auth origin itself with the app's
-    /// origin listed in the server's `CONNETTO_AUTH_CORS_ORIGINS`.
-    auth_base_url: String,
-    /// The origin the login navigation goes to, when it is not
-    /// [`auth_base_url`](Self::auth_base_url).
-    login_base_url: Option<String>,
-    /// The provider name to log in with.
-    provider: String,
-    /// The app page the login redirect returns to, which posts the code back to
-    /// the worker with [`deliver_login_code`].
-    redirect_uri: String,
-}
-
-impl WorkerAuthConfig {
-    /// Builds with the given auth origin, provider name, and callback URI.
-    #[must_use]
-    pub fn new(
-        auth_base_url: impl Into<String>,
-        provider: impl Into<String>,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        Self {
-            auth_base_url: auth_base_url.into(),
-            login_base_url: None,
-            provider: provider.into(),
-            redirect_uri: redirect_uri.into(),
-        }
-    }
-
-    /// The origin the login navigation goes to, when it is not the auth origin.
-    ///
-    /// A login is a navigation the browser follows, so it needs no CORS, only an
-    /// origin that serves the auth router. `None` means the auth origin. It
-    /// differs when the app proxies its `fetch` calls through its own origin with
-    /// a proxy that does not forward navigations, as a dev server's does, which
-    /// keeps the refresh cookie same-site without the server allowing a
-    /// credentialed cross-origin caller.
-    #[must_use]
-    pub fn with_login_base_url(mut self, login_base_url: Option<String>) -> Self {
-        self.login_base_url = login_base_url;
-        self
-    }
 }
 
 /// The accounts this browser profile has signed into and which of them it last
@@ -614,6 +566,16 @@ impl IdbKeyStore {
             .collect()
     }
 
+    /// Drop the derived key-encryption key held in memory.
+    ///
+    /// A gate that locks the protected secret calls this while a credential
+    /// is enrolled. With the derived key gone and a credential recorded,
+    /// reads and writes return [`AuthError::Locked`] until the next approval
+    /// re-derives the key.
+    pub(crate) fn drop_derived(&self) {
+        self.derived.replace(None);
+    }
+
     /// Derive the key-encryption key for this handle from `hkdf` without
     /// touching storage. Subsequent reads and writes use the derived key.
     ///
@@ -933,6 +895,14 @@ impl IdbKeyStore {
 impl ReplicaKeyStore for IdbKeyStore {
     type Error = AuthError;
 
+    /// The protection the items this store writes carry, from the worker's
+    /// custody. The boot learns what the platform offers (`Offerable`), the
+    /// unlock or enrol settles it (`Verified`, `Declined`), and an absent
+    /// PRF demotes it to `Unsupported`.
+    fn protection(&self) -> Custody {
+        crate::unlock::custody()
+    }
+
     /// Load the replica key for `name`, or `None` if no key has been saved.
     ///
     /// Uses the derived key-encryption key when one is held in memory (enrolled
@@ -1105,6 +1075,49 @@ impl ReplicaKeyStore for IdbKeyStore {
     }
 }
 
+/// The worker's key store behind the error type the core builder's durable
+/// step expects.
+///
+/// The store itself errors with [`AuthError`], and the builder takes a store
+/// that errors with [`ClientError`], so this wraps it and maps each failure
+/// to the one the boot reports.
+pub(crate) struct BuilderKeyStore(Rc<IdbKeyStore>);
+
+impl BuilderKeyStore {
+    /// Wrap the worker's key store.
+    pub(crate) fn new(store: Rc<IdbKeyStore>) -> Self {
+        Self(store)
+    }
+}
+
+impl ReplicaKeyStore for BuilderKeyStore {
+    type Error = ClientError;
+
+    fn protection(&self) -> Custody {
+        self.0.protection()
+    }
+
+    async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
+        self.0.load(name).await.map_err(|err| store_error(&err))
+    }
+
+    async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
+        self.0
+            .store(name, key)
+            .await
+            .map_err(|err| store_error(&err))
+    }
+
+    async fn clear(&self, name: &str) -> Result<(), ClientError> {
+        self.0.clear(name).await.map_err(|err| store_error(&err))
+    }
+}
+
+/// Map a key store failure to the client error that carries it.
+fn store_error(err: &AuthError) -> ClientError {
+    ClientError::Session(format!("key store: {err}"))
+}
+
 /// The effective key for the replica `name`, minting one when this device has
 /// none cached.
 ///
@@ -1254,22 +1267,36 @@ pub struct PendingLogin {
 /// passing one at each call, so no two call sites can disagree about which
 /// credential this is.
 pub struct BrowserAuthenticator {
-    config: WorkerAuthConfig,
+    /// The origin the token and refresh endpoints live under.
+    auth_base_url: String,
+    /// The origin the login navigation goes to, when it differs from the auth origin.
+    login_base_url: Option<String>,
+    /// The provider name the login names.
+    provider: String,
+    /// The app page the login redirect returns to.
+    redirect_uri: String,
     account: Option<String>,
 }
 
 impl BrowserAuthenticator {
-    /// Build over the worker auth configuration and the account whose stored
-    /// credential to try.
+    /// Build over the provider sign-in `auth`, the page the login returns to,
+    /// and the account whose stored credential to try.
     ///
     /// `None` means there is nothing to try, which is a first run and any boot
-    /// where no account was chosen and none was ever remembered. It is not a
-    /// placeholder for an unknown account: the token is what reveals the account,
-    /// so a run with no account skips the silent attempt entirely rather than
-    /// addressing a literal.
+    /// where no account was chosen and none was ever remembered.
     #[must_use]
-    pub fn new(config: WorkerAuthConfig, account: Option<String>) -> Self {
-        Self { config, account }
+    pub fn new(
+        auth: &connetto_client::Auth,
+        redirect_uri: impl Into<String>,
+        account: Option<String>,
+    ) -> Self {
+        Self {
+            auth_base_url: auth.origin().to_owned(),
+            login_base_url: auth.login_origin().map(str::to_owned),
+            provider: auth.provider().to_owned(),
+            redirect_uri: redirect_uri.into(),
+            account,
+        }
     }
 
     /// Try a silent refresh from the cookie the browser holds for the account,
@@ -1317,12 +1344,9 @@ impl BrowserAuthenticator {
         let state = random_token();
         let login_url = format!(
             "{}/auth/login?provider={}&redirect_uri={}&code_challenge={}&state={}",
-            self.config
-                .login_base_url
-                .as_ref()
-                .unwrap_or(&self.config.auth_base_url),
-            percent_encode(&self.config.provider),
-            percent_encode(&self.config.redirect_uri),
+            self.login_base_url.as_ref().unwrap_or(&self.auth_base_url),
+            percent_encode(&self.provider),
+            percent_encode(&self.redirect_uri),
             percent_encode(&challenge),
             percent_encode(&state),
         );
@@ -1404,7 +1428,7 @@ impl BrowserAuthenticator {
         let user_id: serde_json::Value = serde_json::from_str(account)
             .map_err(|err| AuthError::Store(format!("account key: {err}")))?;
         let body = serde_json::json!({ "user_id": user_id }).to_string();
-        let revoked = post_json(&format!("{}/auth/logout", self.config.auth_base_url), &body).await;
+        let revoked = post_json(&format!("{}/auth/logout", self.auth_base_url), &body).await;
         store.forget(account)?;
         revoked.map(drop)
     }
@@ -1414,11 +1438,7 @@ impl BrowserAuthenticator {
         user_id: &Id,
     ) -> Result<TokenResponse<Id>, AuthError> {
         let body = serde_json::json!({ "user_id": user_id }).to_string();
-        let text = post_json(
-            &format!("{}/auth/refresh", self.config.auth_base_url),
-            &body,
-        )
-        .await?;
+        let text = post_json(&format!("{}/auth/refresh", self.auth_base_url), &body).await?;
         serde_json::from_str(&text).map_err(|_| AuthError::Decode)
     }
 
@@ -1428,7 +1448,7 @@ impl BrowserAuthenticator {
         verifier: &str,
     ) -> Result<TokenResponse<Id>, AuthError> {
         let body = serde_json::json!({ "code": code, "code_verifier": verifier }).to_string();
-        let text = post_json(&format!("{}/auth/token", self.config.auth_base_url), &body).await?;
+        let text = post_json(&format!("{}/auth/token", self.auth_base_url), &body).await?;
         serde_json::from_str(&text).map_err(|_| AuthError::Decode)
     }
 }
@@ -1660,7 +1680,7 @@ fn random_token() -> String {
 /// selects the cookie contract on the server, and `include` so the browser
 /// attaches the `HttpOnly` refresh cookie and accepts the `Set-Cookie` a login
 /// response returns.
-async fn post_json(url: &str, body: &str) -> Result<String, AuthError> {
+pub(crate) async fn post_json(url: &str, body: &str) -> Result<String, AuthError> {
     let options = RequestInit::new();
     options.set_method("POST");
     options.set_body(&JsValue::from_str(body));

@@ -76,11 +76,11 @@ futures-channel = "0.3"
 serde_json = "1"
 connetto-file-client = { path = "../../crates/connetto-file-client" }
 
-# The build script translates schema.sql and frontend.sql through pg2sqlite and
-# bakes a template per tier, so the app ships every tier's schema pre-applied
-# and never executes DDL at startup. Same pipeline as the dioxus demo.
+# The schema step: translates the deployment's shared schema and policies plus
+# this demo's local tier into the bundle the app includes and the version it
+# presents at handshake.
 [build-dependencies]
-connetto-demo-deployment = { path = "../deployment", features = ["build"] }
+connetto-schema = { path = "../../crates/connetto-schema" }
 
 [workspace]
 

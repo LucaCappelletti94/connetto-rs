@@ -2,8 +2,8 @@
 //!
 //! connetto opens every replica connection itself, so it owns the point where
 //! a schema's key-generating function must be registered. [`SqlFunctions`] is
-//! that seam: [`ConnettoConnection::connect`] runs `SqlFunctions::install` on
-//! the fresh connection before any DDL or insert. This test drives `install`
+//! that seam, and every connection a builder opens runs `SqlFunctions::install`
+//! on the fresh connection before any DDL or insert. This test drives `install`
 //! the same way, then proves a column `DEFAULT` that calls the registered
 //! function fires per row (the nondeterministic registrar, so SQLite never
 //! folds the DEFAULT to a constant).

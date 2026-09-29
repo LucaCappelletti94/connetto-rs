@@ -18,19 +18,15 @@
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
+    Auth, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, FirstThen, LiveQuery,
 };
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::{
-    AccountStore, Acquired, BrowserAuthenticator, LOGIN_CHANNEL, LoginMessage, WorkerAuthConfig,
-    deliver_login_code,
+    AccountStore, Acquired, BrowserAuthenticator, LOGIN_CHANNEL, LoginMessage, deliver_login_code,
 };
 use connetto_web::storage::ReplicaStorage;
 use connetto_web::{MessageTransport, TabContent, TabResolved, locks, workers};
-use connetto_yew_web_demo::{
-    AUTH_BASE, CALLER_FUNCTION, DEMO_TAB_DDL, auth_landing, demo_policy_tables,
-    demo_schema_version, uuidv4_functions,
-};
+use connetto_yew_web_demo::{AUTH_BASE, auth_landing, demo_schema};
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use js_sys::{Array, Uint8Array};
@@ -195,10 +191,8 @@ async fn mint_session() -> (String, String) {
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db = format!("yew-photo-mint-{n}.sqlite");
     let store = AccountStore::open(&storage.db_url(&db)).expect("account index");
-    let auth = BrowserAuthenticator::new(
-        WorkerAuthConfig::new(AUTH_BASE, AUTH_PROVIDER, auth_landing()),
-        None,
-    );
+    let auth =
+        BrowserAuthenticator::new(&Auth::new(AUTH_BASE, AUTH_PROVIDER), auth_landing(), None);
     let pending = match auth.acquire::<String>(&store).await.expect("acquire") {
         Acquired::NeedLogin(p) => p,
         Acquired::Access(_) => panic!("fresh index cannot refresh silently"),
@@ -286,10 +280,10 @@ async fn fetch_bytes(url: &str) -> Vec<u8> {
     Uint8Array::new(&buf).to_vec()
 }
 
+/// A tab of the booted worker. The worker states who it is signed in as, so
+/// the tab's mirror answers its policy views as the worker's replica does.
 async fn connect_tab(
     client_id: &str,
-    token: String,
-    identity: &str,
 ) -> (
     TabContent<BroadcastChannel>,
     ConnettoConnection<MessageTransport<BroadcastChannel>>,
@@ -298,20 +292,12 @@ async fn connect_tab(
     workers::announce_tab(&wire).await.expect("announce tab");
     let mut transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("transport");
     let content = TabContent::new(&mut transport);
-    let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(demo_schema_version()))
-        .with_sql_functions(uuidv4_functions())
-        .with_policy_tables(demo_policy_tables())
-        .with_caller(CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(connetto_yew_web_demo::SUBJECTS_FUNCTION, []);
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_TAB_DDL,
-        &config,
-        None,
+    let conn = ClientBuilder::new(
+        demo_schema().relay_mirror(),
+        FirstThen::new(transport, workers::tab_wire_factory(client_id.to_owned())),
     )
+    .with_client_id(client_id)
+    .connect_driven()
     .await
     .expect("tab connect");
     (content, conn)
@@ -330,10 +316,10 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
         .expect("db worker ready");
     stage("yew align worker booted");
 
-    let (token, identity) = mint_session().await;
+    let (_, identity) = mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let (_content, mut conn) = connect_tab(&client_id, token, &identity).await;
+    let (_content, mut conn) = connect_tab(&client_id).await;
     conn.subscribe("align-orders", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -372,6 +358,7 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("order insert");
     client.replay_pending().await.expect("replay pending");
     stage("order written");
@@ -406,10 +393,10 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
         .expect("db worker ready");
     stage("yew photo worker booted");
 
-    let (token, identity) = mint_session().await;
+    let (_, identity) = mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let (content, mut conn) = connect_tab(&client_id, token, &identity).await;
+    let (content, mut conn) = connect_tab(&client_id).await;
     conn.subscribe("photo-test-photos", "SELECT * FROM photos")
         .await
         .expect("subscribe");

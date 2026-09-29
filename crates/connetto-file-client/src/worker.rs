@@ -1208,6 +1208,27 @@ mod tests {
 
     use super::{FileId, next_after};
 
+    /// An anonymous connection over `ddl`, opened offline the way a build with
+    /// no server yet opens it.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    fn offline(
+        ddl: &str,
+    ) -> connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport> {
+        connetto_client::ClientBuilder::new(
+            connetto_client::SyncSchema::new(connetto_core::schema::SchemaBundle::new(
+                "",
+                "",
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )),
+            || async { Err::<connetto_core::test_support::FakeTransport, _>("offline") },
+        )
+        .open_driven()
+        .expect("the replica opens offline")
+    }
+
     fn file(byte: u8) -> FileId {
         FileId::from_bytes([byte; 32])
     }
@@ -1247,19 +1268,11 @@ mod tests {
     #[tokio::test]
     async fn a_relisted_chunk_survives_the_sweep() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("relisted"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1293,20 +1306,14 @@ mod tests {
     #[tokio::test]
     async fn a_heal_query_queues_only_files_this_device_can_send() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{EncryptingStore, MimeClass, process_file};
         use diesel::connection::SimpleConnection;
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
+        let mut connection = offline(
             "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB, content_state TEXT)",
-            &ClientConfig::new("heal"),
-            None,
-        )
-        .expect("the replica opens offline");
+        );
         let archive = super::ContentArchive::new(store.clone(), [1; 32]).with_heal_lost(
             "SELECT content_id FROM photos WHERE content_state = 'lost'",
             "content_id",
@@ -1390,17 +1397,9 @@ mod tests {
     #[test]
     fn an_unreadable_heal_entry_is_dropped_without_a_loss_record() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
 
         let dir = tempfile::tempdir().expect("a temporary directory");
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("heal-lost"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive =
             super::ContentArchive::new(crate::store::FsStore::new(dir.path().join("c")), [1; 32]);
         archive.install(&mut connection).expect("content tables");
@@ -1426,19 +1425,11 @@ mod tests {
     #[tokio::test]
     async fn an_uploaded_file_no_pin_covers_is_released() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("evict"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1481,19 +1472,11 @@ mod tests {
     #[tokio::test]
     async fn an_interrupted_import_leaves_no_chunks_behind() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("sweep"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1534,19 +1517,11 @@ mod tests {
     #[tokio::test]
     async fn a_replaced_manifest_restarts_the_scan() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("replace"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1611,19 +1586,11 @@ mod tests {
     #[tokio::test]
     async fn an_ambiguous_confirmation_read_keeps_the_entry() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("ambiguous"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
 
         let classifications = std::sync::Arc::new(AtomicUsize::new(0));
         let unavailable = super::ContentArchive::new(
@@ -1720,19 +1687,11 @@ mod tests {
     #[tokio::test]
     async fn a_chunk_restored_mid_scan_keeps_the_entry() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("restore"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1797,19 +1756,11 @@ mod tests {
     #[tokio::test]
     async fn a_cursor_from_another_file_does_not_skip_chunks() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("cursor"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1863,19 +1814,11 @@ mod tests {
     #[tokio::test]
     async fn the_unsent_total_counts_each_chunk_once() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("total"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
         assert_eq!(
@@ -1910,19 +1853,11 @@ mod tests {
     #[tokio::test]
     async fn a_resumed_scan_retires_a_file_whose_last_chunk_is_gone() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("scan"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -1980,18 +1915,10 @@ mod tests {
     #[tokio::test]
     async fn a_missing_manifest_is_a_loss_on_the_walk_and_the_scan() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("missing-manifest"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store, [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2040,19 +1967,11 @@ mod tests {
     #[tokio::test]
     async fn finish_upload_confirms_the_loss_before_retiring() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("confirm-loss"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2175,8 +2094,6 @@ mod tests {
     #[tokio::test]
     async fn finish_upload_reads_only_the_reported_chunk() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{EncryptingStore, MimeClass, process_file};
         use core::sync::atomic::Ordering;
 
@@ -2186,13 +2103,7 @@ mod tests {
             inner: crate::store::FsStore::new(dir.path().join("chunks")),
             reads: reads.clone(),
         };
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("targeted-loss"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2245,21 +2156,13 @@ mod tests {
     #[tokio::test]
     async fn finish_upload_keeps_a_file_whose_manifest_was_replaced() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{
             ChunkHash, ChunkMeta, ChunkStore, EncryptingStore, Manifest, MimeClass, process_file,
         };
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("replaced-manifest"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2339,19 +2242,11 @@ mod tests {
     #[tokio::test]
     async fn a_permanent_refusal_stays_in_the_outbox() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("refuse-stays"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2405,16 +2300,8 @@ mod tests {
     #[tokio::test]
     async fn a_refused_entry_is_skipped_while_an_unmarked_entry_is_sendable() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
 
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("sendable"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
         let archive = super::ContentArchive::new(store, [1; 32]);
@@ -2444,16 +2331,8 @@ mod tests {
     #[tokio::test]
     async fn retry_refused_clears_the_mark_and_the_entry_becomes_sendable() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
 
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("retry-refused"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
         let archive = super::ContentArchive::new(store, [1; 32]);
@@ -2485,16 +2364,8 @@ mod tests {
     #[tokio::test]
     async fn a_heal_entry_whose_file_is_then_authored_here_becomes_authored() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
 
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("heal-then-author"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
         let archive = super::ContentArchive::new(store, [1; 32]);
@@ -2521,19 +2392,11 @@ mod tests {
     #[tokio::test]
     async fn the_integrity_walk_retires_a_refused_entry_with_missing_bytes() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
         use connetto_file_core::{ChunkStore, EncryptingStore, MimeClass, process_file};
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("retire-refused"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store.clone(), [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2577,18 +2440,10 @@ mod tests {
     #[tokio::test]
     async fn sendable_files_excludes_refused_while_pending_files_counts_both() {
         use crate::db;
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
 
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("sendable-count"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let archive = super::ContentArchive::new(store, [1; 32]);
         archive.install(&mut connection).expect("content tables");
 
@@ -2631,25 +2486,15 @@ mod tests {
     }
 
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
-    fn staged_fixture(
-        name: &str,
-    ) -> (
+    fn staged_fixture() -> (
         tempfile::TempDir,
         super::ContentArchive<crate::store::FsStore>,
         connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport>,
     ) {
-        use connetto_client::{ClientConfig, ConnettoConnection, Replica};
-        use connetto_core::test_support::FakeTransport;
-
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = crate::store::FsStore::new(dir.path().join("chunks"));
-        let mut connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)",
-            &ClientConfig::new(name),
-            None,
-        )
-        .expect("the replica opens offline");
+        let mut connection =
+            offline("CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)");
         let archive = super::ContentArchive::new(store, [1; 32]);
         archive.install(&mut connection).expect("content tables");
         (dir, archive, connection)
@@ -2664,7 +2509,7 @@ mod tests {
         use connetto_file_core::MimeClass;
         use diesel::RunQueryDsl;
 
-        let (_dir, archive, mut connection) = staged_fixture("stage-commit");
+        let (_dir, archive, mut connection) = staged_fixture();
         let bytes = vec![7u8; 1024];
         let manifest = archive
             .chunk_file(&bytes[..], MimeClass::Jpeg)
@@ -2710,7 +2555,7 @@ mod tests {
         use connetto_file_core::MimeClass;
         use diesel::RunQueryDsl;
 
-        let (_dir, archive, mut connection) = staged_fixture("stage-mismatch");
+        let (_dir, archive, mut connection) = staged_fixture();
         let bytes = vec![8u8; 1024];
         let manifest = archive
             .chunk_file(&bytes[..], MimeClass::Jpeg)
@@ -2760,7 +2605,7 @@ mod tests {
         use crate::resolve::Resolved;
         use connetto_file_core::MimeClass;
 
-        let (_dir, archive, mut connection) = staged_fixture("stage-resolve");
+        let (_dir, archive, mut connection) = staged_fixture();
         let bytes = vec![5u8; 2048];
         let manifest = archive
             .chunk_file(&bytes[..], MimeClass::Jpeg)
@@ -2794,7 +2639,7 @@ mod tests {
         use crate::resolve::Resolved;
         use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 
-        let (dir, archive, mut connection) = staged_fixture("stage-unavailable");
+        let (dir, archive, mut connection) = staged_fixture();
         let (answer, _) = archive
             .resolve_connection(
                 &mut connection,

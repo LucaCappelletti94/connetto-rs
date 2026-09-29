@@ -8,12 +8,7 @@
 // rest reads as dead to that binary.
 #![allow(dead_code)]
 
-use connetto_wasm_smoke::workers::{
-    DB_NAME, DEMO_FRONTEND_DDL, DEMO_QUERY, DEMO_SQLITE_DDL, DEMO_WS_URL,
-};
-use connetto_web::auth::{
-    AccountStore, Acquired, BrowserAuthenticator, LoginMessage, WorkerAuthConfig,
-};
+use connetto_web::auth::{AccountStore, Acquired, BrowserAuthenticator, LoginMessage};
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use wasm_bindgen::JsCast;
@@ -26,26 +21,30 @@ pub const PROVIDER: &str = "dev-idp";
 /// These suites' account index, kept apart from every other suite's.
 pub const ACCOUNT_DB: &str = "e42-accounts.sqlite";
 
-pub fn auth_config() -> WorkerAuthConfig {
-    // The stack serves the navigation and the fetch calls on one origin.
-    WorkerAuthConfig::new(AUTH_BASE, PROVIDER, connetto_wasm_smoke::auth_landing())
+/// The stack's provider sign-in, which serves the navigation and the fetch
+/// calls on one origin.
+pub fn auth_config() -> connetto_client::Auth {
+    connetto_client::Auth::new(AUTH_BASE, PROVIDER)
 }
 
-pub fn worker_config(auth: Option<WorkerAuthConfig>) -> connetto_web::workers::DbWorkerConfig {
-    connetto_web::workers::DbWorkerConfig::new(connetto_wasm_smoke::demo_schema_version())
-        .with_ws_url(DEMO_WS_URL)
-        .with_replica_db_prefix(DB_NAME)
-        .with_replica_ddl(DEMO_SQLITE_DDL)
-        .with_frontend_ddl(DEMO_FRONTEND_DDL)
-        .with_upstream_sub_id("e42-upstream")
-        .with_upstream_query(DEMO_QUERY)
+/// The logged-in worker these suites boot, gate off, under their own
+/// prefix, hub and account index.
+pub fn worker_builder() -> connetto_web::builder::WebDurable {
+    use connetto_wasm_smoke::workers::{DB_NAME, DEMO_QUERY, DEMO_WS_URL, demo_schema};
+    connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+        .with_upstream("e42-upstream", DEMO_QUERY)
         .with_hub_meta_name("e42-hub-meta.sqlite")
         .with_content_namespace("e42-content")
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller_function(connetto_wasm_smoke::CALLER_FUNCTION)
-        .with_auth(auth)
+        .signed_in(auth_config())
+        .with_redirect_uri(connetto_wasm_smoke::auth_landing())
         .with_auth_db_name(ACCOUNT_DB)
+        .durable(DB_NAME)
+        .with_gate(connetto_client::Gate::off())
+}
+
+/// An authenticator over the stack's sign-in that tries `account`.
+pub fn authenticator(account: Option<String>) -> BrowserAuthenticator {
+    BrowserAuthenticator::new(&auth_config(), connetto_wasm_smoke::auth_landing(), account)
 }
 
 async fn fetch_str(url: &str) -> Response {
@@ -202,7 +201,7 @@ pub async fn mint_session_as(username: &str) -> (String, String) {
     let unique = NEXT_MINT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let db_name = format!("common-mint-{unique}.sqlite");
     let store = AccountStore::open(&storage.db_url(&db_name)).expect("open account index");
-    let authenticator = BrowserAuthenticator::new(auth_config(), None);
+    let authenticator = authenticator(None);
     let pending = match authenticator
         .acquire::<String>(&store)
         .await

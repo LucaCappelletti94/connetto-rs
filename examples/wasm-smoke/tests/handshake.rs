@@ -8,43 +8,28 @@
 //! own handshake, and the hub propagates it to every tab.
 //!
 //! The worker's upstream is a fake server over a loopback that answers the
-//! handshake with a distinctive schema version, so no real server or Postgres
-//! is needed.
-//!
-//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
-//! commands. No server or Postgres is needed; only the identity provider and
-//! login server are required to mint the session tokens the clients carry.
-//! Run this suite with:
+//! handshake with the worker's own bundle version, so no real server, Postgres
+//! or identity provider is needed. Run this suite with:
 //! `wasm-pack test --headless --chrome examples/wasm-smoke --test handshake`
 
 #![cfg(target_arch = "wasm32")]
 
-mod common;
-
-use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
+use connetto_client::ClientBuilder;
 use connetto_core::messages::{ControlMessage, Handshake, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, PROTOCOL_VERSION, SchemaVersion, loopback};
 use connetto_wasm_smoke::RelayHub;
+use connetto_wasm_smoke::build::{Once, raw_schema};
 use wasm_bindgen_futures::spawn_local;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY NOT NULL, quantity INTEGER) STRICT;";
-/// A distinctive upstream schema version the relay must not overwrite.
-const SCHEMA_HASH: &[u8] = &[0xde, 0xad, 0xbe, 0xef];
 
-/// Ids unique across smoke runs, in this test's own band.
-fn unique_base() -> i64 {
-    #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
-    let millis = js_sys::Date::now() as i64;
-    94_000_000_000 + millis
-}
-
-/// A fake upstream that answers the worker handshake with a distinctive schema
-/// version, then drains.
-async fn schema_upstream(mut server: LoopbackTransport) {
+/// A fake upstream that answers the worker handshake with `version`, then
+/// drains.
+async fn schema_upstream(mut server: LoopbackTransport, version: SchemaVersion) {
     let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await else {
         return;
     };
@@ -54,7 +39,7 @@ async fn schema_upstream(mut server: LoopbackTransport) {
             session_token: "upstream".to_owned(),
             resume_token: String::new(),
             current_cursor: Cursor::new(Vec::new()),
-            schema_version: Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())),
+            schema_version: Some(version),
             initial_credits: 64,
             last_applied_seq: None,
         }))
@@ -65,20 +50,15 @@ async fn schema_upstream(mut server: LoopbackTransport) {
 
 #[wasm_bindgen_test]
 async fn tab_handshake_ack_carries_the_upstream_schema_version() {
-    let base = unique_base();
-    let upstream_version = SchemaVersion::from_hash(SCHEMA_HASH.to_vec());
+    let upstream_version = raw_schema(DDL).version();
 
     let (worker_up, fake_up) = loopback();
-    spawn_local(schema_upstream(fake_up));
+    spawn_local(schema_upstream(fake_up, upstream_version.clone()));
 
-    let worker_config = ClientConfig::new(format!("handshake-worker-{base}"))
-        .with_login(Some(Grant::new(common::mint_token().await)))
-        .with_schema_version(Some(SchemaVersion::from_hash(SCHEMA_HASH.to_vec())))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions());
-    let worker =
-        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
-            .await
-            .expect("worker connect");
+    let worker = ClientBuilder::new(raw_schema(DDL), Once::new(worker_up))
+        .connect_driven()
+        .await
+        .expect("worker connect");
     assert_eq!(
         worker.schema_version(),
         Some(&upstream_version),

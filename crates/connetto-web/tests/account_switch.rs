@@ -25,9 +25,12 @@
 
 use connetto_client::cipher::{UnlockError, unlock};
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey, replica_db_name,
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate,
+    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema, replica_db_name,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
+use connetto_core::traits::{ReplicaKeyStore, Transport};
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -63,8 +66,91 @@ diesel::table! {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("e4").with_login(Some(connetto_client::Grant::new("user:tester")))
+/// The client schema over [`SQLITE_DDL`].
+fn schema() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        SQLITE_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
+}
+
+/// The replica at exactly `url`, fresh or already there as the test says.
+struct At {
+    url: String,
+    exists: bool,
+}
+
+impl ReplicaPlace for At {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            name,
+            self.url.clone(),
+            self.exists,
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// A key store holding one key for every record.
+struct Holding(ReplicaKey);
+
+impl ReplicaKeyStore for Holding {
+    type Error = ClientError;
+
+    fn load(&self, _name: &str) -> impl Future<Output = Result<Option<ReplicaKey>, ClientError>> {
+        core::future::ready(Ok(Some(self.0.clone())))
+    }
+
+    fn store(
+        &self,
+        _name: &str,
+        _key: &ReplicaKey,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn clear(&self, _name: &str) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn protection(&self) -> Custody {
+        Custody::Ephemeral
+    }
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
+/// The replica at `url` under `key`, created when `fresh`, over a fake server
+/// that acknowledges the handshake and nothing else.
+async fn open_at(
+    url: &str,
+    key: ReplicaKey,
+    fresh: bool,
+) -> Result<ConnettoConnection<FakeTransport>, ClientError> {
+    ClientBuilder::new(schema(), once(FakeTransport::accepting()))
+        .signed_in(
+            HeldCredential::new(connetto_client::Grant::new("user:tester"), "tester")
+                .expect("a string identity serializes"),
+        )
+        .durable(
+            At {
+                url: url.to_owned(),
+                exists: !fresh,
+            },
+            Holding(key),
+        )
+        .with_gate(Gate::off())
+        .connect_driven()
+        .await
 }
 
 fn key_from_byte(byte: u8) -> ReplicaKey {
@@ -88,15 +174,7 @@ fn open_tier(
 /// and nothing else. Returns the pending sequence numbers, captured before the
 /// connection drops, which it must: one connection per database.
 async fn first_boot_with_a_queued_row(url: &str, key: ReplicaKey) -> Vec<u64> {
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(url, Some(key)).expect("a resolved key"),
-        SQLITE_DDL,
-        &config(),
-        None,
-    )
-    .await
-    .expect("first connect");
+    let mut conn = open_at(url, key, true).await.expect("first connect");
     assert!(
         conn.unsynced().is_empty(),
         "no unsynced work on a fresh replica"
@@ -147,15 +225,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // The switch. Bob's boot derives a different name, so it first-boots an empty
     // replica rather than resuming onto Alice's rows or her pending mutations.
     {
-        let mut conn = ConnettoConnection::connect(
-            FakeTransport::accepting(),
-            &Replica::encrypted_file(&bob_url, Some(bob_key)).expect("a resolved key"),
-            SQLITE_DDL,
-            &config(),
-            None,
-        )
-        .await
-        .expect("connect bob");
+        let mut conn = open_at(&bob_url, bob_key, true).await.expect("connect bob");
         let seen: Vec<Option<String>> = items::table
             .select(items::label)
             .load(conn.conn())
@@ -178,13 +248,7 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
     // The two files are mutually opaque. Naming the other identity's replica
     // while holding this identity's key does not read it, so a switch cannot
     // degrade into a cross-identity resume even if the file selection were wrong.
-    let crossed = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&bob_url, Some(alice_key.clone())).expect("a resolved key"),
-        &config(),
-        None,
-    )
-    .await;
+    let crossed = open_at(&bob_url, alice_key.clone(), false).await;
     match crossed {
         Err(ClientError::ReplicaUndecryptable(_)) => {}
         Err(other) => panic!("expected ReplicaUndecryptable, got {other:?}"),
@@ -193,14 +257,9 @@ async fn an_account_switch_opens_a_distinct_opaque_replica_and_deletes_nothing()
 
     // Switching back resumes the replica that was left alone, with its rows and
     // its queued mutation, so no snapshot leg is needed.
-    let mut conn = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&alice_url, Some(alice_key)).expect("a resolved key"),
-        &config(),
-        None,
-    )
-    .await
-    .expect("switch back to alice");
+    let mut conn = open_at(&alice_url, alice_key, false)
+        .await
+        .expect("switch back to alice");
     let seen: Vec<Option<String>> = items::table
         .select(items::label)
         .load(conn.conn())

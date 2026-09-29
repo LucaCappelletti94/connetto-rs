@@ -8,6 +8,14 @@ mod aggregate_relay;
 mod apply_behaviour;
 
 mod authentication_client;
+#[cfg(feature = "native-auth")]
+mod builder_harness;
+
+mod builder_lifecycle;
+
+mod builder_schema;
+
+mod core_builder;
 
 mod changed_signal;
 
@@ -16,6 +24,9 @@ mod coverage_resync;
 mod encrypted_replica;
 
 mod full_resync;
+
+#[cfg(feature = "native-auth")]
+mod gate_recheck;
 
 mod grouped_live;
 
@@ -58,11 +69,13 @@ mod rls_name_mapping;
 mod rls_sync_path;
 
 mod schema_detection;
+mod schema_handshake;
 
 #[cfg(feature = "native-auth")]
 mod secret_stores;
 
 mod sql_functions;
+mod support;
 
 #[cfg(feature = "native-auth")]
 mod teardown;

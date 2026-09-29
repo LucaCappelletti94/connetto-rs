@@ -22,11 +22,7 @@ pub const DEMO_POLICIES_SQL: &str = connetto_demo_deployment::POLICIES_SQL;
 
 // The logical-to-physical table map and view list the build's translation
 // produced, as `POLICY_TABLES` and `POLICY_VIEWS`.
-include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
-
-pub const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
-
-pub const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
+include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 
 pub use connetto_demo_deployment::{AUTH_BASE, auth_landing};
 
@@ -91,51 +87,124 @@ pub async fn fetch_share_key() -> Result<(String, String), String> {
     Ok((grant, subject))
 }
 
-/// The tables `schema.sql` plus `policies.sql` split, for
-/// `ClientConfig::with_policy_tables`.
-#[must_use]
-pub fn demo_policy_tables() -> connetto_client::PolicyTables {
-    connetto_client::PolicyTables::from_translation(
-        POLICY_TABLES.iter().copied(),
-        POLICY_VIEWS.iter().copied(),
-    )
-}
+/// The builder pieces the browser suites share.
+pub mod build {
+    use connetto_client::{
+        ClientError, ContentPlace, Grant, HeldCredential, Located, MemoryKeyStore, ReplicaKey,
+        ReplicaPlace, SyncSchema, TransportFactory,
+    };
+    use connetto_core::SchemaBundle;
+    use connetto_core::traits::{ReplicaKeyStore as _, Transport};
 
-/// The schema version this build was compiled against, for staleness detection.
-/// Every client that reaches the real demo server (directly or through the
-/// relay) presents this so its handshake is not rejected as stale.
-#[must_use]
-pub fn demo_schema_version() -> connetto_core::SchemaVersion {
-    connetto_demo_deployment::schema_version()
-}
+    use crate::BrowserSocket;
 
-// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
-// client write omits the id and this registered function mints it. connetto
-// installs the registrar on every connection it opens (the DB worker replica,
-// the local tier, and each tab mirror) through the `sql_functions` config. The
-// impl is `rosetta_uuid::Uuid::new_v4`, the same strongly typed key the
-// `orders` schema uses on SQLite and Postgres.
-#[diesel::declare_sql_function]
-extern "SQL" {
-    /// Client-authored primary key: a 16-byte UUID v4, stored as a BLOB.
-    fn uuidv4() -> diesel::sql_types::Binary;
-}
+    /// A schema over one raw DDL, no policies, no local tier, for a suite
+    /// whose tables are its own rather than the deployment's.
+    #[must_use]
+    pub fn raw_schema(ddl: &str) -> SyncSchema {
+        SyncSchema::new(SchemaBundle::new(
+            "",
+            "",
+            ddl,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        ))
+    }
 
-/// The registrar connetto installs on every connection it opens for the smoke
-/// topology. Nondeterministic, so SQLite calls `uuidv4()` per row instead of
-/// folding the DEFAULT to a constant, and `INNOCUOUS` because the replica runs
-/// with trusted schema off and a column DEFAULT is a schema object.
-#[must_use]
-pub fn uuidv4_functions() -> connetto_client::SqlFunctions {
-    connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
-        |conn: &mut diesel::SqliteConnection| {
-            uuidv4_utils::register_impl_with_behavior(
-                conn,
-                diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
-                rosetta_uuid::Uuid::new_v4,
-            )
-        },
-    ))
+    /// A credential for the session a suite minted, `token` standing for
+    /// `user_id`.
+    ///
+    /// # Panics
+    ///
+    /// When the identity cannot be serialized, which a string always can.
+    #[must_use]
+    pub fn held(token: String, user_id: &str) -> HeldCredential {
+        HeldCredential::new(Grant::new(token), user_id).expect("a string identity serializes")
+    }
+
+    /// A replica file in the sahpool pool under a name the suite picks,
+    /// fresh or already there as the suite says, since the suite alone
+    /// knows which boot it is running.
+    pub struct SuitePlace {
+        url: String,
+        exists: bool,
+    }
+
+    impl SuitePlace {
+        /// The pool file `db`, already there when `exists`.
+        #[must_use]
+        pub fn new(db: &str, exists: bool) -> Self {
+            Self {
+                url: connetto_client::cipher::cipher_url(db, "opfs-sahpool"),
+                exists,
+            }
+        }
+    }
+
+    impl ReplicaPlace for SuitePlace {
+        fn locate(&self, name: &str) -> Result<Located, ClientError> {
+            Ok(Located::new(
+                name,
+                self.url.clone(),
+                self.exists,
+                ContentPlace::InMemory,
+            ))
+        }
+    }
+
+    /// A key store holding `key` under the name `credential` gives its
+    /// replica, since the browser has no platform RNG to mint one.
+    ///
+    /// # Panics
+    ///
+    /// Never, the in-memory store cannot fail.
+    pub async fn keys_for(credential: &HeldCredential, key: ReplicaKey) -> MemoryKeyStore {
+        let store = MemoryKeyStore::default();
+        store
+            .store(credential.replica_name(), &key)
+            .await
+            .expect("the in-memory store never fails");
+        store
+    }
+
+    /// Dial the browser stack's sync endpoint, once per call.
+    pub fn server() -> impl FnMut() -> core::pin::Pin<
+        Box<dyn core::future::Future<Output = Result<BrowserSocket, crate::BrowserSocketError>>>,
+    > {
+        || Box::pin(BrowserSocket::connect(crate::workers::DEMO_WS_URL))
+    }
+
+    /// The refusal a one-shot dialer answers once its transport is spent.
+    #[derive(Debug)]
+    pub struct Spent;
+
+    impl core::fmt::Display for Spent {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.write_str("the one-shot dialer has no second transport")
+        }
+    }
+
+    /// A dialer that hands out one transport the suite already holds, the
+    /// worker's end of a loopback pair for instance.
+    pub struct Once<T>(Option<T>);
+
+    impl<T> Once<T> {
+        /// A dialer handing out `transport` once.
+        #[must_use]
+        pub fn new(transport: T) -> Self {
+            Self(Some(transport))
+        }
+    }
+
+    impl<T: Transport + 'static> TransportFactory for Once<T> {
+        type Transport = T;
+        type Error = Spent;
+
+        fn connect(&mut self) -> impl core::future::Future<Output = Result<T, Spent>> {
+            core::future::ready(self.0.take().ok_or(Spent))
+        }
+    }
 }
 
 /// Resolve the co-located `db-worker.js` bootstrap script beside the
@@ -153,17 +222,21 @@ pub mod leader {
     /// Join the topology, spawning `db-worker.js` from beside `glue_url`.
     #[must_use]
     pub fn join(leader_lock: &str, glue_url: &str) -> Membership {
-        connetto_web::leader::join(
-            leader_lock,
-            glue_url,
-            connetto_web::workers::WorkerBootstrap::Script(super::worker_url(glue_url)),
-        )
+        connetto_web::leader::join(leader_lock, glue_url, bootstrap(glue_url))
+    }
+
+    /// How the election's winner spawns the smoke worker, `db-worker.js`
+    /// beside `glue_url`.
+    #[must_use]
+    pub fn bootstrap(glue_url: &str) -> connetto_web::workers::WorkerBootstrap {
+        connetto_web::workers::WorkerBootstrap::Script(super::worker_url(glue_url))
     }
 }
 
 /// DB worker glue, demo schema constants, and the baked local tier template
 /// for the smoke topology.
 pub mod workers {
+    use crate::connetto_schema_bundle;
     use wasm_bindgen::JsValue;
     use wasm_bindgen::prelude::wasm_bindgen;
     use web_sys::Worker;
@@ -189,23 +262,6 @@ pub mod workers {
 
     pub use connetto_demo_deployment::DEMO_WS_URL;
 
-    /// The synced replica schema, translated from `schema.sql` and
-    /// `policies.sql` by build.rs. Hand-copying it here is what used to keep
-    /// the browser suite off the translator's real output, which for a
-    /// policy-bearing table is a backing table, a view and triggers rather
-    /// than one plain table.
-    pub const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
-    /// The local tier schema: `notes` is device-private and never synced.
-    pub const DEMO_FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
-    /// The mirror schema for tab clients: both tiers live in the tab's main
-    /// schema, because every relayed patch (snapshot, upstream, and local
-    /// fan-out alike) applies to main. The hub, not the tab, keeps the tiers
-    /// apart.
-    pub const DEMO_TAB_DDL: &str = concat!(
-        include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql")),
-        "\n",
-        include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql")),
-    );
     /// The upstream subscription the DB worker registers.
     pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
     /// The extra upstream subscription the photo flow needs.
@@ -217,13 +273,14 @@ pub mod workers {
     /// OPFS file for unlock-protocol tests, separate from DB_NAME so the two
     /// suites do not share a replica when running in the same browser session.
     pub const UNLOCK_DB_NAME: &str = "connetto-unlock-relay.sqlite";
+    /// OPFS file for the gate-protocol tests, separate from the other
+    /// suites' replicas for the same reason.
+    pub const GATE_DB_NAME: &str = "connetto-gate-relay.sqlite";
 
-    fn dev_auth() -> connetto_web::auth::WorkerAuthConfig {
-        connetto_web::auth::WorkerAuthConfig::new(
-            crate::AUTH_BASE,
-            "dev-idp",
-            crate::auth_landing(),
-        )
+    /// The demo schema this build was compiled against.
+    #[must_use]
+    pub fn demo_schema() -> connetto_client::SyncSchema {
+        connetto_client::SyncSchema::new(connetto_schema_bundle::bundle())
     }
 
     /// Spawn the dedicated DB worker from the co-located `db-worker.js`.
@@ -251,25 +308,18 @@ pub mod workers {
         // `Id` names the user id the server mints. The server requires a session
         // from the dev identity provider, so the worker authenticates before
         // connecting and names the replica after the acquired identity.
-        connetto_web::workers::boot_db_worker::<String>(
-            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
-                .with_ws_url(DEMO_WS_URL)
-                .with_replica_db_prefix(DB_NAME)
-                .with_replica_ddl(DEMO_SQLITE_DDL)
-                .with_frontend_ddl(DEMO_FRONTEND_DDL)
-                .with_upstream_sub_id("db-upstream")
-                .with_upstream_query(DEMO_QUERY)
-                .with_hub_meta_name("connetto-hub-meta.sqlite")
-                .with_sql_functions(crate::uuidv4_functions())
-                .with_policy_tables(crate::demo_policy_tables())
-                .with_caller_function(crate::CALLER_FUNCTION)
-                .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(dev_auth()))
-                .with_auth_db_name("connetto-auth.sqlite"),
-        )
-        .await
-        .map(drop)
-        .map_err(JsValue::from)
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_upstream("db-upstream", DEMO_QUERY)
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-auth.sqlite")
+            .durable(DB_NAME)
+            .with_gate(connetto_client::Gate::off())
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
     }
 
     /// DB worker entry point for the photo flow test binary.
@@ -280,31 +330,24 @@ pub mod workers {
     #[wasm_bindgen]
     pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
-        connetto_web::workers::boot_db_worker::<String>(
-            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
-                .with_ws_url(DEMO_WS_URL)
-                .with_replica_db_prefix(DB_NAME)
-                .with_replica_ddl(DEMO_SQLITE_DDL)
-                .with_frontend_ddl(DEMO_FRONTEND_DDL)
-                .with_upstream_sub_id("db-upstream")
-                .with_upstream_query(DEMO_QUERY)
-                .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-                .with_hub_meta_name("connetto-hub-meta.sqlite")
-                .with_content_namespace("connetto-photo-content")
-                .with_content_heal_lost(
-                    "SELECT content_id FROM photos WHERE content_state = 'lost'",
-                    "content_id",
-                )
-                .with_sql_functions(crate::uuidv4_functions())
-                .with_policy_tables(crate::demo_policy_tables())
-                .with_caller_function(crate::CALLER_FUNCTION)
-                .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(dev_auth()))
-                .with_auth_db_name("connetto-auth.sqlite"),
-        )
-        .await
-        .map(drop)
-        .map_err(JsValue::from)
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_upstream("db-upstream", DEMO_QUERY)
+            .with_upstream("db-photos-upstream", PHOTO_QUERY)
+            .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-auth.sqlite")
+            .durable(DB_NAME)
+            .with_gate(connetto_client::Gate::off())
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
     }
 
     /// DB worker entry point for the share-key test binary: the same photo
@@ -323,33 +366,29 @@ pub mod workers {
         let (grant, subject) = crate::fetch_share_key()
             .await
             .map_err(|err| JsValue::from_str(&format!("fetching the demo share key: {err}")))?;
-        let share_keys = [(grant, subject)];
-        connetto_web::workers::boot_db_worker::<String>(
-            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
-                .with_ws_url(DEMO_WS_URL)
-                .with_replica_db_prefix(DB_NAME)
-                .with_replica_ddl(DEMO_SQLITE_DDL)
-                .with_frontend_ddl(DEMO_FRONTEND_DDL)
-                .with_upstream_sub_id("db-upstream")
-                .with_upstream_query(DEMO_QUERY)
-                .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-                .with_hub_meta_name("connetto-hub-meta.sqlite")
-                .with_content_namespace("connetto-photo-content")
-                .with_content_heal_lost(
-                    "SELECT content_id FROM photos WHERE content_state = 'lost'",
-                    "content_id",
-                )
-                .with_sql_functions(crate::uuidv4_functions())
-                .with_policy_tables(crate::demo_policy_tables())
-                .with_caller_function(crate::CALLER_FUNCTION)
-                .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_share_keys(share_keys)
-                .with_auth(Some(dev_auth()))
-                .with_auth_db_name("connetto-auth.sqlite"),
-        )
-        .await
-        .map(drop)
-        .map_err(JsValue::from)
+        let share_keys = [(
+            connetto_client::Grant::new(grant),
+            connetto_core::CapabilitySubject::<String>::new(subject),
+        )];
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_upstream("db-upstream", DEMO_QUERY)
+            .with_upstream("db-photos-upstream", PHOTO_QUERY)
+            .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
+            .with_share_keys(share_keys)
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-auth.sqlite")
+            .durable(DB_NAME)
+            .with_gate(connetto_client::Gate::off())
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
     }
 
     /// DB worker entry point for the offline photo flow test binary.
@@ -360,36 +399,30 @@ pub mod workers {
     #[wasm_bindgen]
     pub async fn db_worker_photo_offline_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
-        connetto_web::workers::boot_db_worker::<String>(
-            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
-                .with_ws_url(DEMO_WS_URL)
-                .with_replica_db_prefix(DB_NAME)
-                .with_replica_ddl(DEMO_SQLITE_DDL)
-                .with_frontend_ddl(DEMO_FRONTEND_DDL)
-                .with_upstream_sub_id("db-upstream")
-                .with_upstream_query(DEMO_QUERY)
-                .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-                .with_hub_meta_name("connetto-hub-meta.sqlite")
-                .with_content_namespace("connetto-photo-content")
-                .with_content_heal_lost(
-                    "SELECT content_id FROM photos WHERE content_state = 'lost'",
-                    "content_id",
-                )
-                .with_sql_functions(crate::uuidv4_functions())
-                .with_policy_tables(crate::demo_policy_tables())
-                .with_caller_function(crate::CALLER_FUNCTION)
-                .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(dev_auth()))
-                .with_auth_db_name("connetto-auth.sqlite")
-                .with_connect_gate(PHOTO_CONNECT_CHANNEL),
-        )
-        .await
-        .map(drop)
-        .map_err(JsValue::from)
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-hub-meta.sqlite")
+            .with_upstream("db-upstream", DEMO_QUERY)
+            .with_upstream("db-photos-upstream", PHOTO_QUERY)
+            .with_content_namespace("connetto-photo-content")
+            .with_content_heal_lost(
+                "SELECT content_id FROM photos WHERE content_state = 'lost'",
+                "content_id",
+            )
+            .with_connect_gate(PHOTO_CONNECT_CHANNEL)
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-auth.sqlite")
+            .durable(DB_NAME)
+            .with_gate(connetto_client::Gate::off())
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
     }
 
     /// DB worker entry point for the unlock-protocol test binary. Same as
-    /// `db_worker_boot` except the passkey unlock protocol is enabled.
+    /// `db_worker_boot` except the gate is on, which arms the passkey
+    /// unlock protocol.
     ///
     /// # Errors
     ///
@@ -397,25 +430,74 @@ pub mod workers {
     #[wasm_bindgen]
     pub async fn db_worker_unlock_boot() -> Result<(), JsValue> {
         connetto_web::logging::init_console();
-        connetto_web::workers::boot_db_worker::<String>(
-            &connetto_web::workers::DbWorkerConfig::new(crate::demo_schema_version())
-                .with_ws_url(DEMO_WS_URL)
-                .with_replica_db_prefix(UNLOCK_DB_NAME)
-                .with_replica_ddl(DEMO_SQLITE_DDL)
-                .with_frontend_ddl(DEMO_FRONTEND_DDL)
-                .with_upstream_sub_id("db-unlock-upstream")
-                .with_upstream_query(DEMO_QUERY)
-                .with_hub_meta_name("connetto-unlock-hub-meta.sqlite")
-                .with_sql_functions(crate::uuidv4_functions())
-                .with_policy_tables(crate::demo_policy_tables())
-                .with_caller_function(crate::CALLER_FUNCTION)
-                .with_subjects_function(crate::SUBJECTS_FUNCTION)
-                .with_auth(Some(dev_auth()))
-                .with_auth_db_name("connetto-unlock-auth.sqlite")
-                .with_unlock(true),
-        )
-        .await
-        .map(drop)
-        .map_err(JsValue::from)
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-unlock-hub-meta.sqlite")
+            .with_upstream("db-unlock-upstream", DEMO_QUERY)
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-unlock-auth.sqlite")
+            .durable(UNLOCK_DB_NAME)
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
+    }
+
+    /// DB worker entry point for the away-and-return gate test binary. The
+    /// unlock boot with the away-and-return gate set to re-check on return,
+    /// the boot installing it on the hub's gate controller.
+    ///
+    /// `grace_ms` is the away grace in milliseconds. `None` re-checks once
+    /// per launch and `Some(0)` re-checks on every return.
+    ///
+    /// # Errors
+    ///
+    /// A string describing the VFS, acquisition, or subscribe failure.
+    #[wasm_bindgen]
+    pub async fn db_worker_gate_boot(grace_ms: Option<f64>) -> Result<(), JsValue> {
+        connetto_web::logging::init_console();
+        let recheck = grace_ms.map(|ms| {
+            // The demo passes whole non-negative milliseconds.
+            debug_assert!(
+                ms >= 0.0 && ms.fract() == 0.0,
+                "the away grace must be whole milliseconds"
+            );
+            std::time::Duration::from_millis(ms as u64)
+        });
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-gate-hub-meta.sqlite")
+            .with_upstream("db-gate-upstream", DEMO_QUERY)
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-gate-auth.sqlite")
+            .durable(GATE_DB_NAME)
+            .with_gate(connetto_client::Gate::default().with_recheck(recheck))
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
+    }
+
+    /// DB worker entry point for the gate suite's default case, the gate
+    /// boot with no gate setting, so the builder's own default decides.
+    ///
+    /// # Errors
+    ///
+    /// A string describing the VFS, unlock, upstream connect, or subscribe
+    /// failure.
+    #[wasm_bindgen]
+    pub async fn db_worker_default_gate_boot() -> Result<(), JsValue> {
+        connetto_web::logging::init_console();
+        connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
+            .with_hub_meta_name("connetto-gate-hub-meta.sqlite")
+            .with_upstream("db-gate-upstream", DEMO_QUERY)
+            .signed_in(connetto_client::Auth::new(crate::AUTH_BASE, "dev-idp"))
+            .with_redirect_uri(crate::auth_landing())
+            .with_auth_db_name("connetto-gate-auth.sqlite")
+            .durable(GATE_DB_NAME)
+            .boot::<String>()
+            .await
+            .map(drop)
+            .map_err(JsValue::from)
     }
 }

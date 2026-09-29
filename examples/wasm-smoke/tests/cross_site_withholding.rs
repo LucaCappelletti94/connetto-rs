@@ -16,7 +16,7 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_web::auth::{AccountStore, Acquired, BrowserAuthenticator, WorkerAuthConfig};
+use connetto_web::auth::{AccountStore, Acquired, BrowserAuthenticator};
 use connetto_web::storage::ReplicaStorage;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -37,9 +37,14 @@ fn cross_base() -> String {
 const PROVIDER: &str = "dev-idp";
 const CROSS_DB: &str = "r90-cross-site.sqlite";
 
-fn cross_config() -> WorkerAuthConfig {
+/// An authenticator over the cross-site host that tries `account`.
+fn cross_authenticator(account: Option<String>) -> BrowserAuthenticator {
     let base = cross_base();
-    WorkerAuthConfig::new(&base, PROVIDER, format!("{base}/dev/landing"))
+    BrowserAuthenticator::new(
+        &connetto_client::Auth::new(&base, PROVIDER),
+        format!("{base}/dev/landing"),
+        account,
+    )
 }
 
 /// Walk the login as `subject` and return the code and state, over the
@@ -90,7 +95,7 @@ async fn a_cross_site_page_never_carries_the_refresh_cookie() {
     storage.delete_db(CROSS_DB).expect("clear an earlier index");
     let store = AccountStore::open(&storage.db_url(CROSS_DB)).expect("open the account index");
 
-    let authenticator = BrowserAuthenticator::new(cross_config(), None);
+    let authenticator = cross_authenticator(None);
     let pending = match authenticator
         .acquire::<String>(&store)
         .await
@@ -108,7 +113,7 @@ async fn a_cross_site_page_never_carries_the_refresh_cookie() {
 
     // Same account, same marked contract, same browser: the only difference is
     // that the request is cross-site to its cookies, and that is enough.
-    match BrowserAuthenticator::new(cross_config(), Some(account))
+    match cross_authenticator(Some(account))
         .acquire::<String>(&store)
         .await
         .expect("a withheld cookie is a fall-through, not an error")

@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
-use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, Gate, Grant, HeldCredential, SyncSchema};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::transport::LoopbackTransport;
 use connetto_file_client::{ContentClient, FsStore, ReqwestHttp, Resolved};
 use connetto_file_core::{FileId, MimeClass};
@@ -109,7 +110,7 @@ async fn a_photo_written_offline_arrives_and_a_second_device_fetches_it() {
     // Device A: replica opened with no transport, so the entry and its bytes
     // are written while the gate is closed.
     let replica_dir = tempdir().expect("temp dir");
-    let (a, gate) = offline_device_a(replica_dir.path(), &server);
+    let (a, gate) = offline_device_a(replica_dir.path(), &server).await;
     let a_content = attach_device_a_content(a, chunk_dir.path()).await;
     let file_id = stage_offline_photo(&a_content).await;
 
@@ -158,7 +159,7 @@ async fn a_device_holding_a_lost_photo_uploads_it_again() {
     let (_, signer, files) = start_file_server(&fixture, chunk_dir.path()).await;
     let server = Arc::new(spawn_sync_server(&fixture, signer).await);
     let replica_dir = tempdir().expect("temp dir");
-    let (a, gate) = offline_device_a(replica_dir.path(), &server);
+    let (a, gate) = offline_device_a(replica_dir.path(), &server).await;
     let a_content = attach_device_a_content(a.clone(), chunk_dir.path())
         .await
         .heal_lost(
@@ -352,32 +353,16 @@ async fn assert_device_b_fetches_photo(
 /// produce a transport until the test opens it, so the device is offline in
 /// exactly the way a device with no network is, and the reconnect is the
 /// production reconnect path rather than a hand-placed attach.
-fn offline_device_a(
+async fn offline_device_a(
     replica_root: &std::path::Path,
     server: &Arc<Server>,
 ) -> (ConnettoClient<LoopbackTransport>, Arc<AtomicBool>) {
-    let path = replica_root.join("a.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let conn = ConnettoConnection::<LoopbackTransport>::open(
-        &replica,
-        SQLITE_DDL,
-        &config("device-a", "user:alice#writer"),
-        None,
-    )
-    .expect("open device A with no server");
-    assert!(
-        !conn.is_connected(),
-        "device A is offline, which is the premise of the whole case"
-    );
     let gate = Arc::new(AtomicBool::new(false));
     let factory_gate = Arc::clone(&gate);
     let factory_server = Arc::clone(server);
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
+    let client = device(
+        &replica_root.join("a.sqlite"),
+        "user:alice#writer",
         move || {
             let gate = Arc::clone(&factory_gate);
             let server = Arc::clone(&factory_server);
@@ -389,10 +374,16 @@ fn offline_device_a(
                 }
             }
         },
-        TokioSleeper,
-        ReconnectPolicy::default(),
+    )
+    .await;
+    let connected = client
+        .with_conn(|conn| conn.is_connected())
+        .await
+        .expect("the gate is off");
+    assert!(
+        !connected,
+        "device A is offline, which is the premise of the whole case"
     );
-    tokio::spawn(pump);
     (client, gate)
 }
 
@@ -401,22 +392,58 @@ async fn connect_device_b(
     replica_root: &std::path::Path,
     server: &Arc<Server>,
 ) -> ConnettoClient<LoopbackTransport> {
-    let path = replica_root.join("b.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let conn = ConnettoConnection::connect(
-        server.attach(),
-        &replica,
-        SQLITE_DDL,
-        &config("device-b", "user:alice#reader"),
-        None,
+    let server = Arc::clone(server);
+    device(
+        &replica_root.join("b.sqlite"),
+        "user:alice#reader",
+        move || {
+            let server = Arc::clone(&server);
+            async move { Ok(server.attach()) }
+        },
     )
     .await
-    .expect("connect device B");
-    ConnettoClient::start(conn)
+}
+
+/// One device of alice's at `path`, presenting `grant` and dialing through
+/// `dial`, redialing under the default policy while the dial fails.
+///
+/// The grant differs per device on purpose, because a session handle is durable and a
+/// second connection presenting the same grant supersedes the first, so two
+/// devices of one user are two grants.
+async fn device<F, Fut>(
+    path: &std::path::Path,
+    grant: &str,
+    dial: F,
+) -> ConnettoClient<LoopbackTransport>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<LoopbackTransport, &'static str>> + Send + 'static,
+{
+    let credential =
+        HeldCredential::new(Grant::new(grant), "alice").expect("a string identity serializes");
+    let (running, pump) = ClientBuilder::new(
+        SyncSchema::new(SchemaBundle::new(
+            PG_DDL,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )),
+        dial,
+    )
+    .with_reconnect(ReconnectPolicy::default())
+    .signed_in(credential)
+    .durable(
+        super::support::At(path.to_path_buf()),
+        super::support::FixedKey,
+    )
+    .with_gate(Gate::off())
+    .connect_with_pump()
+    .await
+    .expect("open the device");
+    tokio::spawn(pump);
+    running.client().clone()
 }
 
 /// Installs the file server's own schema, the application's table, the two
@@ -482,15 +509,6 @@ async fn start_file_server(
         let _ = axum::serve(listener, router).await;
     });
     (base_url, signer, serving)
-}
-
-/// The client configuration one device opens with.
-///
-/// The grant differs per device on purpose: a session handle is durable and a
-/// second connection presenting the same grant supersedes the first, so two
-/// devices of one user are two grants.
-fn config(client_id: &str, grant: &str) -> ClientConfig {
-    ClientConfig::new(client_id).with_login(Some(Grant::new(grant)))
 }
 
 /// A harness server with the file server's signer wired into its session loop.
@@ -587,7 +605,8 @@ async fn wait_for_replica_state(
                 )
                 .expect("read the replica")
             })
-            .await;
+            .await
+            .expect("gate not locked");
         if let Some(state) = state.into_iter().next().flatten() {
             return Some(state);
         }

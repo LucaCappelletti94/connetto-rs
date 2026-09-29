@@ -214,6 +214,34 @@ pub fn tier_db_name(replica: &str) -> String {
     format!("{replica}-tier")
 }
 
+/// The pool entry and key record of `credential_name`'s replica under an
+/// application's `prefix`.
+///
+/// The credential names the replica for its identity, and the prefix keeps
+/// two applications, or two test suites, on one origin apart, since the pool
+/// and the key store are both shared by the whole origin.
+#[must_use]
+pub fn replica_entry(prefix: &str, credential_name: &str) -> String {
+    format!("{prefix}-{credential_name}")
+}
+
+/// The pool entry and key record the replica of `user_id` takes under an
+/// application's `prefix`, the name a signed-in boot opens.
+///
+/// # Errors
+///
+/// [`connetto_client::ClientError::Session`] when the identity cannot be
+/// serialized.
+pub fn replica_name<Id: serde::Serialize + ?Sized>(
+    prefix: &str,
+    user_id: &Id,
+) -> Result<String, connetto_client::ClientError> {
+    Ok(replica_entry(
+        prefix,
+        &connetto_client::replica_db_name(connetto_client::REPLICA_PREFIX, user_id)?,
+    ))
+}
+
 /// Data teardown that destroys the replica's key, then deletes the replica, its
 /// device-private tier, and its content namespace.
 ///
@@ -223,7 +251,7 @@ pub fn tier_db_name(replica: &str) -> String {
 /// entry nothing can open, so the two are one primitive.
 ///
 /// `name` is both the pool entry and the key-store record, which is the value
-/// `connetto_client::replica_db_name` produced for this identity. Only that entry
+/// [`replica_name`] produced for this identity. Only that entry
 /// and that record are touched, so a second identity signed in on the same device
 /// keeps its replica and its key.
 ///

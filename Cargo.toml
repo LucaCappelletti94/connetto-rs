@@ -2,8 +2,8 @@
 resolver = "3"
 members = [
   "crates/connetto-core",
+  "crates/connetto-schema",
   "crates/connetto-server",
-  "crates/connetto-client",
   "crates/connetto-dioxus",
   "crates/connetto-yew",
   "crates/connetto-test-harness",
@@ -28,10 +28,10 @@ homepage = "https://github.com/LucaCappelletti94/connetto-rs"
 
 [workspace.dependencies]
 connetto-core = { path = "crates/connetto-core", version = "0.0.0" }
+connetto-schema = { path = "crates/connetto-schema", version = "0.0.0" }
 
 # subql: the CDC subscription runtime the materializer drives. Pinned to a rev
 # on main. `8ad31be` carries the whole row-visibility composition R5b consumes:
-# `RowPolicy` answering from the changed row, `OpenFgaPolicy` terminating it
 # against a server, and one shared `Shapes` index behind both. It also carries
 # the three answers connetto found the composition could not reach: the
 # difference whose tuple key states both sides, the table the database leaves

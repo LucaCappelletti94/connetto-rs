@@ -58,7 +58,8 @@ async fn a_staged_file_commits_its_manifest_with_its_row() {
                 .load(conn.conn())
                 .expect("read the photo rows")
         })
-        .await;
+        .await
+        .expect("gate not locked");
     assert_eq!(
         rows,
         vec![file_id.as_bytes().to_vec()],
@@ -130,7 +131,8 @@ async fn an_entry_row_never_outlives_its_manifest() {
                 .get_result(conn.conn())
                 .expect("count the photo rows")
         })
-        .await;
+        .await
+        .expect("gate not locked");
     assert_eq!(rows, 0, "the row rolled back with the transaction");
     assert_eq!(
         content.flush_outbox().await.expect("walk the outbox"),

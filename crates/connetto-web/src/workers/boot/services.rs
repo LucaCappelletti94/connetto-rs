@@ -2,7 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use connetto_client::ConnettoConnection;
-use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
+use connetto_client::reconnect::{Sleeper, TransportFactory};
 use connetto_core::messages::SubscriptionSpec;
 use connetto_file_client::{BrowserStore, ContentArchive};
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -13,8 +13,8 @@ use web_sys::{BroadcastChannel, MessageEvent};
 
 use super::super::helpers::content_store_namespace;
 use super::BootError;
-use super::DbWorkerConfig;
 use super::replica::BootReplicaSpec;
+use crate::builder::WebConfig;
 use crate::relay::HubReconnect;
 use crate::{BrowserSocket, HubNotice, RelayHub, locks};
 
@@ -54,7 +54,7 @@ fn install_connect_gate(name: &'static str) -> Result<Rc<ConnectGate>, BootError
 /// Returns the storage handle, the key store, and whether a credential was
 /// already enrolled.
 pub(super) async fn prepare_boot_storage(
-    config: &DbWorkerConfig,
+    config: &WebConfig,
 ) -> Result<
     (
         crate::storage::ReplicaStorage,
@@ -140,11 +140,11 @@ pub(super) async fn hold_alive_lock() {
 }
 
 pub(super) async fn start_boot_services<Id>(
-    config: &DbWorkerConfig,
+    config: &WebConfig,
     spec: &BootReplicaSpec<Id>,
     worker: ConnettoConnection<BrowserSocket>,
     content_root_key: Option<[u8; 32]>,
-) -> Result<Option<bool>, BootError> {
+) -> Result<(RelayHub, Option<bool>), BootError> {
     let ws_url = config.ws_url;
     let connect_gate = match config.connect_gate {
         Some(name) => Some(install_connect_gate(name)?),
@@ -163,7 +163,7 @@ pub(super) async fn start_boot_services<Id>(
             }
         },
         sleeper: super::super::intake::sleep,
-        policy: ReconnectPolicy::default(),
+        policy: config.policy.clone(),
         upstream: config
             .upstream_subscriptions()
             .map(|(sub_id, query)| (sub_id.to_owned(), SubscriptionSpec::new(query)))
@@ -191,12 +191,12 @@ pub(super) async fn start_boot_services<Id>(
         content_wipe_namespace,
         spec.active_account.as_deref(),
     )?;
-    super::super::intake::install_hello_intake(hub)?;
-    Ok(content_persistent)
+    super::super::intake::install_hello_intake(hub.clone())?;
+    Ok((hub, content_persistent))
 }
 
 async fn setup_content_store(
-    config: &DbWorkerConfig,
+    config: &WebConfig,
     identified: bool,
     replica_db_name: &str,
     content_root_key: Option<[u8; 32]>,
@@ -269,16 +269,25 @@ fn install_dead_tab_reaper(hub: RelayHub, mut notices: UnboundedReceiver<HubNoti
 }
 
 fn install_tab_services(
-    config: &DbWorkerConfig,
+    config: &WebConfig,
     hub: &RelayHub,
     replica_db_name: &str,
     content_wipe_namespace: Option<String>,
     active_account: Option<&str>,
 ) -> Result<(), BootError> {
-    if let Some(auth_config) = &config.auth {
+    if let Some(connetto_client::builder::sign_in::SignInKind::Provider {
+        origin,
+        login_origin,
+        provider,
+        ..
+    }) = &config.sign_in
+    {
         super::super::logout::serve_logout_requests(
             super::super::logout::LogoutConfig {
-                auth: auth_config.clone(),
+                auth_base_url: origin.clone(),
+                login_base_url: login_origin.clone(),
+                provider: provider.clone(),
+                redirect_uri: config.redirect_uri.clone().unwrap_or_default(),
                 auth_db_name: config.auth_db_name.to_owned(),
                 replica_db_name: replica_db_name.to_owned(),
                 content_namespace: content_wipe_namespace,

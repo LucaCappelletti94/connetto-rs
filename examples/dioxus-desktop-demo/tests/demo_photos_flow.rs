@@ -21,10 +21,13 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use connetto_client::live::ConnettoClient;
-use connetto_client::reconnect::{ReconnectPolicy, TokioSleeper};
+use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientConfig, ConnettoConnection, ExportScope, Grant, ImportChoices, Replica,
+    ClientBuilder, DataDir, ExportScope, Gate, Grant, HeldCredential, ImportChoices,
+    MemoryKeyStore, SyncSchema,
 };
+use connetto_core::schema::SchemaBundle;
+use connetto_core::traits::ReplicaKeyStore as _;
 use connetto_core::transport::LoopbackTransport;
 use connetto_dioxus_desktop_demo::{photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
@@ -101,7 +104,7 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 
     // Device A opens offline; the gate controls when its reconnect factory
     // starts returning a real transport.
-    let (a, gate) = offline_device(replica_dir.path(), "device-a", &server, &ddl);
+    let (a, gate) = offline_device(replica_dir.path(), "device-a", &server, &ddl).await;
     let mut a_client_events = a.events();
     let a_content = attach_content(a, chunk_dir.path(), "a").await;
 
@@ -219,20 +222,10 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 
     // Import the archive, captured while content was still unsent, on device C
     // under a distinct key, proving re-encryption of the unsent bytes.
-    let c_replica_path = replica_dir.path().join("device-c.sqlite");
-    let c_replica = Replica::encrypted_file(
-        c_replica_path.to_str().expect("utf-8"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("device C replica");
-    let c_conn = ConnettoConnection::<LoopbackTransport>::open(
-        &c_replica,
-        &ddl,
-        &client_config("device-c"),
-        None,
-    )
-    .expect("open device C");
-    let c_client = ConnettoClient::start(c_conn);
+    let c_client = device(replica_dir.path(), "device-c", &ddl, || async {
+        Err::<LoopbackTransport, _>("device C stays offline")
+    })
+    .await;
     let c_content = ContentClient::attach(
         c_client,
         FsStore::new(chunk_dir.path().join("device-c")),
@@ -373,44 +366,68 @@ async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
     .await
 }
 
-fn offline_device(
+/// A device named `name` in its own directory under `root`, dialing through
+/// `dial` and redialing under the default policy while it cannot reach the
+/// server.
+async fn device<F, Fut>(
+    root: &std::path::Path,
+    name: &str,
+    ddl: &str,
+    dial: F,
+) -> ConnettoClient<LoopbackTransport>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<LoopbackTransport, &'static str>> + Send + 'static,
+{
+    // One user on several devices, each device its own session and its own
+    // directory, so an archive from one restores on another.
+    let credential = HeldCredential::new(Grant::new(format!("user:alice#{name}")), "alice")
+        .expect("a string identity serializes");
+    let dir = root.join(name);
+    std::fs::create_dir_all(&dir).expect("the device directory");
+    let keys = MemoryKeyStore::default();
+    keys.store(
+        credential.replica_name(),
+        &connetto_core::test_support::replica_key(),
+    )
+    .await
+    .expect("the in-memory store never fails");
+    let (running, pump) = ClientBuilder::new(schema(ddl), dial)
+        .with_reconnect(ReconnectPolicy::default())
+        .signed_in(credential)
+        .durable(DataDir::new(dir), keys)
+        .with_gate(Gate::off())
+        .connect_with_pump()
+        .await
+        .expect("open the device");
+    tokio::spawn(pump);
+    running.client().clone()
+}
+
+async fn offline_device(
     root: &std::path::Path,
     name: &str,
     server: &Arc<Server>,
     ddl: &str,
 ) -> (ConnettoClient<LoopbackTransport>, Arc<AtomicBool>) {
-    let path = root.join(format!("{name}.sqlite"));
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("open device replica");
-    let conn =
-        ConnettoConnection::<LoopbackTransport>::open(&replica, ddl, &client_config(name), None)
-            .expect("open offline connection");
     let gate = Arc::new(AtomicBool::new(false));
     let factory_gate = Arc::clone(&gate);
     let factory_server = Arc::clone(server);
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
-        move || {
-            let gate = Arc::clone(&factory_gate);
-            let server = Arc::clone(&factory_server);
-            async move {
-                let open = gate.load(Ordering::Relaxed);
-                eprintln!("[diag] factory called gate={open}");
-                if open {
-                    eprintln!("[diag] factory returning Ok(transport)");
-                    Ok(server.attach())
-                } else {
-                    Err("gate not open yet")
-                }
+    let client = device(root, name, ddl, move || {
+        let gate = Arc::clone(&factory_gate);
+        let server = Arc::clone(&factory_server);
+        async move {
+            let open = gate.load(Ordering::Relaxed);
+            eprintln!("[diag] factory called gate={open}");
+            if open {
+                eprintln!("[diag] factory returning Ok(transport)");
+                Ok(server.attach())
+            } else {
+                Err("gate not open yet")
             }
-        },
-        TokioSleeper,
-        ReconnectPolicy::default(),
-    );
-    tokio::spawn(pump);
+        }
+    })
+    .await;
     (client, gate)
 }
 
@@ -424,17 +441,12 @@ async fn connect_device(
     ConnettoClient<LoopbackTransport>,
     ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
 ) {
-    let path = root.join(format!("{name}.sqlite"));
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("open device replica");
-    let conn =
-        ConnettoConnection::connect(server.attach(), &replica, ddl, &client_config(name), None)
-            .await
-            .expect("connect device");
-    let client = ConnettoClient::start(conn);
+    let server = Arc::clone(server);
+    let client = device(root, name, ddl, move || {
+        let server = Arc::clone(&server);
+        async move { Ok(server.attach()) }
+    })
+    .await;
     let content = attach_content(client.clone(), chunk_root, name).await;
     (client, content)
 }
@@ -500,7 +512,8 @@ async fn wait_for_replica_state(
                 )
                 .expect("read replica state")
             })
-            .await;
+            .await
+            .expect("gate not locked");
         if let Some(s) = state.into_iter().next().flatten() {
             return Some(s);
         }
@@ -512,8 +525,16 @@ async fn wait_for_replica_state(
     }
 }
 
-fn client_config(name: &str) -> ClientConfig {
-    ClientConfig::new(name).with_login(Some(Grant::new(format!("user:{name}"))))
+/// The client schema over the test's translated DDL.
+fn schema(ddl: &str) -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        SCHEMA_SQL,
+        "",
+        ddl,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
 }
 
 /// Splits DDL that contains no dollar-quoted bodies on semicolons.

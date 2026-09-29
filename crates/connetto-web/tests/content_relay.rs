@@ -8,7 +8,7 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, FirstThen, Grant, HeldCredential, SyncSchema};
 use connetto_core::Cursor;
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
@@ -16,6 +16,7 @@ use connetto_core::messages::{
     HandshakeAck, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
     NonFatalError,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{FileId, FileIdHasher, MimeClass};
@@ -158,8 +159,23 @@ impl Transport for Upstream {
     }
 }
 
-fn hub_config() -> ClientConfig {
-    ClientConfig::new("r69c-content-relay").with_login(Some(Grant::new("user:r69c")))
+/// The client schema over [`DDL`].
+fn schema() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
 }
 
 /// A content-aware hub on a live fake upstream plus the tab transport on
@@ -180,15 +196,14 @@ async fn relay_tab(
     let mutations = Rc::new(Cell::new(0u32));
     let upstream = Upstream::live(Rc::clone(&mutations), tickets.clone());
     let answers = upstream.answers();
-    let worker = ConnettoConnection::<Upstream>::connect(
-        upstream,
-        &Replica::in_memory(),
-        DDL,
-        &hub_config(),
-        None,
-    )
-    .await
-    .expect("connect relay replica");
+    let worker = ClientBuilder::new(schema(), once(upstream))
+        .signed_in(
+            HeldCredential::new(Grant::new("user:r69c"), "r69c")
+                .expect("a string identity serializes"),
+        )
+        .connect_driven()
+        .await
+        .expect("connect relay replica");
     let scope = js_sys::global()
         .dyn_into::<DedicatedWorkerGlobalScope>()
         .expect("dedicated worker");

@@ -16,9 +16,9 @@
 
 use std::sync::Arc;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, DataDir};
 use connetto_core::messages::{ControlMessage, HandshakeAck};
-use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::traits::{HandshakeAuthority, IncomingFrame, ReplicaKeyStore, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
 use connetto_server::{
     LoopbackTransport, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
@@ -263,10 +263,6 @@ where
     rows.first().map_or(0, |row| row.n)
 }
 
-fn config(client_id: &str) -> ClientConfig {
-    ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")))
-}
-
 /// Insert one local order row through the connection.
 fn insert_local<T>(conn: &mut ConnettoConnection<T>, id: i64)
 where
@@ -292,13 +288,12 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
 
     // Push into the black hole: both frames leave successfully and nothing
     // ever processes them.
-    let mut conn = ConnettoConnection::connect(
-        black_hole(),
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config("replay"),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(black_hole()),
     )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await
     .expect("connect");
     insert_local(&mut conn, 60);
@@ -374,13 +369,12 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
         // Dropping both ends here loses the acknowledgement forever.
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config("dedupe"),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(client_end),
     )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await
     .expect("connect");
     insert_local(&mut conn, 61);
@@ -428,23 +422,24 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
 async fn restart_replays_persisted_pending() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
-    let replica = tempfile::NamedTempFile::new().expect("replica file");
-    let replica_path = replica.path().to_str().expect("utf8 path").to_owned();
+    let dir = tempfile::tempdir().expect("replica directory");
+    let credential = super::support::held("token");
+    let record = credential.replica_name().to_owned();
+    let keys = super::support::SharedKeys::default();
+    keys.store(&record, &connetto_core::test_support::replica_key())
+        .await
+        .expect("the shared store never fails");
     let manager = writable_manager(&fixture);
 
     // First process: push into the black hole, then die outright.
     {
-        let mut conn = ConnettoConnection::connect(
-            black_hole(),
-            &Replica::encrypted_file(
-                &replica_path,
-                Some(connetto_core::test_support::replica_key()),
-            )
-            .expect("key provided"),
-            SQLITE_DDL,
-            &config("restart"),
-            None,
+        let mut conn = ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(black_hole()),
         )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
+        .connect_driven()
         .await
         .expect("first connect");
         insert_local(&mut conn, 62);
@@ -453,16 +448,13 @@ async fn restart_replays_persisted_pending() {
 
     // Second process: reopening the replica loads the persisted pending
     // record, and the connect-time reconcile replays it.
-    let mut conn = ConnettoConnection::connect_existing(
-        open_session(&manager),
-        &Replica::encrypted_file(
-            &replica_path,
-            Some(connetto_core::test_support::replica_key()),
-        )
-        .expect("key provided"),
-        &config("restart"),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(open_session(&manager)),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), keys)
+    .connect_driven()
     .await
     .expect("second connect");
     loop {

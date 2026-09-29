@@ -1,6 +1,8 @@
 //! Local data export contract tests.
 
-use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, PolicyTables, Replica};
+use connetto_client::{ClientBuilder, DataDir, ExportScope, SyncSchema};
+use connetto_core::schema::SchemaBundle;
+use connetto_core::test_support::FakeTransport;
 use diesel::prelude::*;
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use std::io::{Cursor, Read};
@@ -47,28 +49,34 @@ diesel::table! {
     }
 }
 
-#[test]
+#[tokio::test]
 #[expect(
     clippy::too_many_lines,
     reason = "the test walks its scenario in order and a split would hide the sequence"
 )]
-fn archive_carries_manifest_and_compressed_patchset_entries() {
+async fn archive_carries_manifest_and_compressed_patchset_entries() {
     let dir = tempfile::tempdir().expect("temporary directory");
-    let replica_path = dir.path().join("replica.sqlite");
-    let replica_path_str = replica_path.to_str().expect("utf-8 path").to_owned();
-    let tier_path = dir.path().join("replica.sqlite-tier");
-    let replica = Replica::encrypted_file(
-        &replica_path_str,
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("replica key")
-    .with_tier(TIER_DDL);
-    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
-        &replica,
+    let credential = super::support::held("test");
+    let name = credential.replica_name().to_owned();
+    let replica_path = dir.path().join(&name);
+    let tier_path = dir.path().join(format!("{name}-tier"));
+    let store = super::support::key_store(&credential).await;
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
         SYNCED_DDL,
-        &ClientConfig::new("export-test".to_owned()),
-        None,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("open replica");
 
     diesel::insert_into(items::table)
@@ -205,13 +213,19 @@ fn archive_carries_manifest_and_compressed_patchset_entries() {
 
 #[test]
 fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
-    let replica = Replica::in_memory().with_tier(TIER_DDL);
-    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
-        &replica,
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
         SYNCED_DDL,
-        &ClientConfig::new("scope-test".to_owned()),
-        None,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open replica");
 
     diesel::insert_into(items::table)
@@ -275,13 +289,11 @@ fn everything_scope_carries_both_tiers_unsynced_omits_synced_replica() {
 /// an unkeyed table no longer opens at all.
 #[test]
 fn table_without_primary_key_is_refused_by_name() {
-    let replica = Replica::in_memory();
-    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
-        &replica,
-        "CREATE TABLE keyed (id INTEGER PRIMARY KEY);",
-        &ClientConfig::new("nopk-test".to_owned()),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle("CREATE TABLE keyed (id INTEGER PRIMARY KEY);"),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open replica");
     diesel::connection::SimpleConnection::batch_execute(
         &mut conn,
@@ -302,20 +314,24 @@ fn table_without_primary_key_is_refused_by_name() {
 fn policy_split_table_rows_travel_in_the_synced_patchset() {
     let ddl = "
 CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL, payload BLOB NOT NULL) STRICT;
-CREATE VIEW orders AS SELECT id, owner_id, payload FROM orders_rls WHERE owner_id = connetto_user();
+CREATE VIEW orders AS SELECT id, owner_id, payload FROM orders_rls WHERE owner_id = current_app_user();
 CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
 ";
-    let config = ClientConfig::new("export-rls".to_owned())
-        .with_sql_functions(connetto_client::SqlFunctions::default())
-        .with_policy_tables(PolicyTables::from_translation(
-            [("orders", "orders_rls")],
-            ["orders"],
-        ))
-        .with_caller("connetto_user", Some("alice".to_owned()));
-    let replica = Replica::in_memory();
-    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
-        &replica, ddl, &config, None,
+    let credential = super::support::held("alice");
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        ddl,
+        vec![("orders", "orders_rls")],
+        vec!["orders"],
+        None::<&str>,
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .signed_in(credential)
+    .open_driven()
     .expect("open split replica");
 
     diesel::insert_into(orders_rls::table)
@@ -375,13 +391,19 @@ CREATE INDEX orders_rls_owner_idx ON orders_rls(owner_id);
 #[test]
 fn a_file_sink_and_a_buffer_sink_write_the_same_archive() {
     let dir = tempfile::tempdir().expect("temporary directory");
-    let replica = Replica::in_memory().with_tier(TIER_DDL);
-    let mut conn = ConnettoConnection::<connetto_core::test_support::FakeTransport>::open(
-        &replica,
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
         SYNCED_DDL,
-        &ClientConfig::new("file-sink".to_owned()),
-        None,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open replica");
     diesel::insert_into(items::table)
         .values((

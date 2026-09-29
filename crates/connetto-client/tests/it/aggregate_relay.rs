@@ -10,7 +10,7 @@
 //! hand-crafted frame over a loopback, so a decode regression cannot hide
 //! behind the server's construction.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent};
 use connetto_core::Cursor;
 use connetto_core::messages::{AggregateUpdate, ControlMessage, HandshakeAck};
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -47,10 +47,6 @@ fn aggregate_pusher(update: AggregateUpdate) -> LoopbackTransport {
     client_end
 }
 
-fn config(client_id: &str) -> ClientConfig {
-    ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")))
-}
-
 // The decoded event mirrors the wire AggregateUpdate field for field, so a
 // relay can rebuild a faithful frame, including a grouped delta the direct
 // server never emits today.
@@ -63,19 +59,22 @@ async fn aggregate_update_decodes_group_key_and_delta_flag() {
         result_json: Some("{\"count\":3}".to_owned()),
         is_full_result: false,
     });
-    let mut conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config("t"),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await
     .expect("connect");
 
-    // Connecting states the connection's own state first, ahead of anything the
-    // server sends, so an application always knows whether what follows is
-    // current.
+    // The build opens the replica offline before it attaches the transport, so
+    // the connection states Offline and then Connected ahead of anything the
+    // server sends.
+    assert_eq!(
+        conn.pump_one().await.expect("pump"),
+        ClientEvent::SyncStatus(connetto_client::SyncStatus::Offline)
+    );
     assert_eq!(
         conn.pump_one().await.expect("pump"),
         ClientEvent::SyncStatus(connetto_client::SyncStatus::Connected)
@@ -104,16 +103,19 @@ async fn aggregate_removal_decodes_as_none() {
         result_json: None,
         is_full_result: false,
     });
-    let mut conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config("t2"),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await
     .expect("connect");
 
+    assert_eq!(
+        conn.pump_one().await.expect("pump"),
+        ClientEvent::SyncStatus(connetto_client::SyncStatus::Offline)
+    );
     assert_eq!(
         conn.pump_one().await.expect("pump"),
         ClientEvent::SyncStatus(connetto_client::SyncStatus::Connected)

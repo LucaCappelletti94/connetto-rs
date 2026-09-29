@@ -7,12 +7,14 @@
 
 use std::collections::VecDeque;
 use std::future::{Future, ready};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use connetto_client::{
-    AccessTokenSource, ClientConfig, ClientError, ClientEvent, ConnettoClient, ConnettoConnection,
-    Encrypted, Grant, ReconnectPolicy, Replica, ReplicaKey, TokioSleeper, replica_db_name,
+    AccessTokenSource, ClientBuilder, ClientError, ClientEvent, DataDir, Grant, HeldCredential,
+    ReconnectPolicy, ReplicaKey,
 };
 use connetto_core::Cursor;
 use connetto_core::auth::CapabilitySubject;
@@ -21,7 +23,6 @@ use connetto_core::test_support::{FakeTransport, FakeTransportError};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{AuthConfig, TokenAuthority};
 use diesel::prelude::*;
-
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
 diesel::table! {
@@ -34,22 +35,17 @@ diesel::table! {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("phase6").with_login(Some(Grant::new("user:token")))
-}
-
 #[tokio::test]
 async fn handshake_with_refused_grant_still_succeeds() {
     // A refused grant changes nothing on the wire: the run simply continues
     // unidentified and connect returns Ok.
     let transport = FakeTransport::accepting();
-    let result = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let result = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await;
     assert!(
         result.is_ok(),
@@ -71,13 +67,12 @@ async fn a_handshake_refusal_surfaces_its_reason() {
             detail: "second handshake".to_owned(),
         },
     ] {
-        let result = ConnettoConnection::connect(
-            FakeTransport::refusing(reason.clone()),
-            &Replica::in_memory(),
-            SQLITE_DDL,
-            &config(),
-            None,
+        let result = ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(FakeTransport::refusing(reason.clone())),
         )
+        .signed_in(super::support::held("token"))
+        .connect_driven()
         .await;
         match result {
             Err(ClientError::Refused { reason: got }) => assert_eq!(got, reason),
@@ -87,17 +82,26 @@ async fn a_handshake_refusal_surfaces_its_reason() {
     }
 }
 
-/// First-boot `replica`, write `label`, and leave the captured mutation queued,
-/// since the fake server acknowledges the handshake and nothing else. Returns the
-/// pending sequence numbers, captured before the connection drops.
-async fn first_boot_with_a_queued_row(replica: &Replica<'_, Encrypted>, label: &str) -> Vec<u64> {
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        replica,
-        SQLITE_DDL,
-        &config(),
-        None,
+/// First-boot onto `cred`'s durable replica, write `label`, and leave the
+/// captured mutation queued, since the fake server acknowledges the handshake
+/// and nothing else. Returns the pending sequence numbers, captured before the
+/// connection drops.
+async fn first_boot_with_a_queued_row(
+    dir: &Path,
+    cred: &HeldCredential,
+    key: &ReplicaKey,
+    label: &str,
+) -> Vec<u64> {
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(cred.clone())
+    .durable(
+        DataDir::new(dir.to_path_buf()),
+        super::support::key_store_with(cred, key.clone()).await,
+    )
+    .connect_driven()
     .await
     .expect("first connect");
     assert!(
@@ -132,44 +136,44 @@ async fn first_boot_with_a_queued_row(replica: &Replica<'_, Encrypted>, label: &
 #[tokio::test]
 async fn each_identity_opens_its_own_replica() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let prefix = dir
-        .path()
-        .join("replica")
-        .to_str()
-        .expect("utf8")
-        .to_owned();
+    let data_dir = || DataDir::new(dir.path().to_path_buf());
 
     // The replica an identity owns is named from the id itself, so two
     // identities on one device never name the same file.
-    let alice = replica_db_name(&prefix, "alice").expect("derive alice");
-    let bob = replica_db_name(&prefix, "bob").expect("derive bob");
-    assert_ne!(alice, bob, "distinct identities select distinct replicas");
+    let alice = super::support::held("alice");
+    let bob = super::support::held("bob");
+    assert_ne!(
+        alice.replica_name(),
+        bob.replica_name(),
+        "distinct identities select distinct replicas"
+    );
     assert_eq!(
-        alice,
-        replica_db_name(&prefix, "alice").expect("derive alice again"),
+        alice.replica_name(),
+        super::support::held("alice").replica_name(),
         "one identity always returns to the same replica",
     );
 
     let alice_key = ReplicaKey::from_bytes([0x11; ReplicaKey::LEN]);
     let bob_key = ReplicaKey::from_bytes([0x22; ReplicaKey::LEN]);
-    let alice_replica =
-        Replica::encrypted_file(&alice, Some(alice_key.clone())).expect("key provided");
-    let bob_replica = Replica::encrypted_file(&bob, Some(bob_key)).expect("key provided");
 
     // Alice syncs a row into her replica and leaves a mutation queued, since the
     // fake server acknowledges the handshake and nothing else.
-    let alice_unsynced = first_boot_with_a_queued_row(&alice_replica, "alice-row").await;
+    let alice_unsynced =
+        first_boot_with_a_queued_row(dir.path(), &alice, &alice_key, "alice-row").await;
 
     // Bob authenticates on the same device. His boot derives a different file,
     // so he starts on an empty replica and can neither read Alice's rows nor
     // inherit her pending mutations.
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &bob_replica,
-        SQLITE_DDL,
-        &config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(bob.clone())
+    .durable(
+        data_dir(),
+        super::support::key_store_with(&bob, bob_key.clone()).await,
+    )
+    .connect_driven()
     .await
     .expect("connect bob");
     let seen: Vec<Option<String>> = items::table
@@ -186,19 +190,24 @@ async fn each_identity_opens_its_own_replica() {
     // Neither replica was deleted by the switch: a returning identity resumes
     // rather than re-syncing, which is why a wipe has to be explicit.
     assert!(
-        std::path::Path::new(&alice).exists() && std::path::Path::new(&bob).exists(),
+        dir.path().join(alice.replica_name()).exists()
+            && dir.path().join(bob.replica_name()).exists(),
         "a switch deletes nothing"
     );
 
     // The files are mutually opaque. Naming the other identity's replica while
     // holding this identity's key does not read it, so a switch cannot degrade
     // into a cross-identity resume even if the file selection were wrong.
-    let crossed = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&bob, Some(alice_key.clone())).expect("key provided"),
-        &config(),
-        None,
+    let crossed = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(bob.clone())
+    .durable(
+        data_dir(),
+        super::support::key_store_with(&bob, alice_key.clone()).await,
+    )
+    .connect_driven()
     .await;
     match crossed {
         Err(ClientError::ReplicaUndecryptable(_)) => {}
@@ -209,12 +218,16 @@ async fn each_identity_opens_its_own_replica() {
     // Alice's own replica is untouched by the switch and resumes with her data
     // and her queued mutation, which is the fast return the per-replica key
     // exists to make possible.
-    let mut conn = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &alice_replica,
-        &config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(alice.clone())
+    .durable(
+        data_dir(),
+        super::support::key_store_with(&alice, alice_key.clone()).await,
+    )
+    .connect_driven()
     .await
     .expect("reconnect alice");
     let seen: Vec<Option<String>> = items::table
@@ -233,21 +246,23 @@ async fn each_identity_opens_its_own_replica() {
 async fn reconnect_routes_rejected_credential_to_relogin() {
     // The live session drops, and the token source returns an Auth error:
     // the driver must stop retrying and signal re-login.
-    let initial = FakeTransport::accepting();
-    let conn =
-        ConnettoConnection::connect(initial, &Replica::in_memory(), SQLITE_DDL, &config(), None)
-            .await
-            .expect("initial connect")
-            .with_token_source(AccessTokenSource::new(|| async {
-                Err(ClientError::Auth("credential no longer valid".to_owned()))
-            }));
+    let credential =
+        super::support::held("token").with_token_source(AccessTokenSource::new(|| async {
+            Err(ClientError::Auth("credential no longer valid".to_owned()))
+        }));
     let factory = || async { Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(5))
         .with_max_attempts(Some(5));
-    let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
-    let mut events = client.events();
+    let (client, pump) = ClientBuilder::new(super::support::bundle(SQLITE_DDL), factory)
+        .with_reconnect(policy)
+        .with_sleeper(|d| tokio::time::sleep(d))
+        .signed_in(credential)
+        .connect_with_pump()
+        .await
+        .expect("initial connect");
+    let mut events = client.client().events();
     tokio::spawn(pump);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -274,23 +289,37 @@ async fn reconnect_routes_rejected_credential_to_relogin() {
 /// from a sign-out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mid_session_close_surfaces_its_reason_then_routes_to_relogin() {
-    let initial = FakeTransport::accepting_then_closing(FatalErrorReason::SessionRevoked);
-    let conn =
-        ConnettoConnection::connect(initial, &Replica::in_memory(), SQLITE_DDL, &config(), None)
-            .await
-            .expect("initial connect")
-            .with_token_source(AccessTokenSource::new(|| async {
-                Err(ClientError::Auth("credential no longer valid".to_owned()))
-            }));
+    let revoked_once = Arc::new(AtomicBool::new(false));
+    let factory = move || {
+        let revoked_once = Arc::clone(&revoked_once);
+        async move {
+            if revoked_once.swap(true, Ordering::Relaxed) {
+                Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting())
+            } else {
+                Ok(FakeTransport::accepting_then_closing(
+                    FatalErrorReason::SessionRevoked,
+                ))
+            }
+        }
+    };
+    let credential =
+        super::support::held("token").with_token_source(AccessTokenSource::new(|| async {
+            Err(ClientError::Auth("credential no longer valid".to_owned()))
+        }));
     // A revoked session causes the token source to fail on the next reconnect,
     // routing to re-login rather than an endless retry.
-    let factory = || async { Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(5))
         .with_max_attempts(Some(5));
-    let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
-    let mut events = client.events();
+    let (client, pump) = ClientBuilder::new(super::support::bundle(SQLITE_DDL), factory)
+        .with_reconnect(policy)
+        .with_sleeper(|d| tokio::time::sleep(d))
+        .signed_in(credential)
+        .connect_with_pump()
+        .await
+        .expect("initial connect");
+    let mut events = client.client().events();
     tokio::spawn(pump);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -322,23 +351,25 @@ async fn reconnect_retries_a_transient_refresh_fault() {
     // from /auth/refresh would. The driver must keep retrying and eventually
     // exhaust its attempts, never routing a transient fault to interactive
     // re-login.
-    let initial = FakeTransport::accepting();
-    let conn =
-        ConnettoConnection::connect(initial, &Replica::in_memory(), SQLITE_DDL, &config(), None)
-            .await
-            .expect("initial connect")
-            .with_token_source(AccessTokenSource::new(|| async {
-                Err(ClientError::Transport(
-                    "refresh endpoint returned 503".to_owned(),
-                ))
-            }));
+    let credential =
+        super::support::held("token").with_token_source(AccessTokenSource::new(|| async {
+            Err(ClientError::Transport(
+                "refresh endpoint returned 503".to_owned(),
+            ))
+        }));
     let factory = || async { Ok::<FakeTransport, FakeTransportError>(FakeTransport::accepting()) };
     let policy = ReconnectPolicy::new()
         .with_initial_backoff(Duration::from_millis(1))
         .with_max_backoff(Duration::from_millis(5))
         .with_max_attempts(Some(3));
-    let (client, pump) = ConnettoClient::with_reconnect(conn, factory, TokioSleeper, policy);
-    let mut events = client.events();
+    let (client, pump) = ClientBuilder::new(super::support::bundle(SQLITE_DDL), factory)
+        .with_reconnect(policy)
+        .with_sleeper(|d| tokio::time::sleep(d))
+        .signed_in(credential)
+        .connect_with_pump()
+        .await
+        .expect("initial connect");
+    let mut events = client.client().events();
     tokio::spawn(pump);
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -446,14 +477,23 @@ async fn an_expired_share_key_is_not_presented_and_a_live_one_is() {
         .expect("mint the live key");
 
     let transport = GrantRecorder::default();
-    let config = config().with_capabilities(vec![Grant::new(dead), Grant::new(alive.clone())]);
-    let _conn = ConnettoConnection::connect(
-        transport.clone(),
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config,
-        None,
+    let keys = vec![
+        (
+            Grant::new(dead),
+            CapabilitySubject::<String>::new("share:expired"),
+        ),
+        (
+            Grant::new(alive.clone()),
+            CapabilitySubject::<String>::new("share:live"),
+        ),
+    ];
+    let _conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport.clone()),
     )
+    .with_share_keys(keys)
+    .signed_in(super::support::held("token"))
+    .connect_driven()
     .await
     .expect("connect");
 

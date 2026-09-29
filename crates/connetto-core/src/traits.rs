@@ -16,6 +16,7 @@ use crate::{
     ReplicaKey, SessionId,
     auth::Subject,
     cursor::Cursor,
+    custody::Custody,
     messages::{BulkMessage, ContentVerb, ControlMessage, Grant},
 };
 
@@ -209,6 +210,15 @@ pub trait RefreshTokenStore {
     ///
     /// [`Self::Error`] if the backing store cannot be read.
     fn accounts(&self) -> RefreshFuture<'_, Vec<String>, Self::Error>;
+
+    /// The protection the items this store writes carry.
+    ///
+    /// The build folds this with its own level and the client reports the
+    /// weaker of the two, per R94 decision 13. A store does not answer for
+    /// the application's gate. Only the item itself can state what protects
+    /// it, so a platform gate that does not reach these items reports
+    /// `Unverified`.
+    fn protection(&self) -> Custody;
 }
 
 /// Where a device caches the per-replica encryption keys it minted.
@@ -265,6 +275,15 @@ pub trait ReplicaKeyStore {
         &self,
         name: &str,
     ) -> impl core::future::Future<Output = Result<(), Self::Error>> + MaybeSend;
+
+    /// The protection the items this store writes carry.
+    ///
+    /// The build folds this with its own level and the client reports the
+    /// weaker of the two, per R94 decision 13. A store does not answer for
+    /// the application's gate. Only the item itself can state what protects
+    /// it, so a platform gate that does not reach these items reports
+    /// `Unverified`.
+    fn protection(&self) -> Custody;
 }
 
 /// Mints the signed address a content ticket carries.

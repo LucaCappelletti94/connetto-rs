@@ -7,7 +7,7 @@
 //! [`wipe_replica`]: delete the replica and destroy its key, which crypto-shreds
 //! it so any ciphertext a forensic recovery turns up is inert. The application
 //! composes the two behind its own prompt, or runs both under one guard with
-//! [`forget_device`].
+//! [`NativeClient::forget_device`](crate::NativeClient::forget_device).
 //!
 //! Keeping both the credential and the data is not a logout at all, it is a lock
 //! or an app close, and connetto does nothing durable there.
@@ -230,6 +230,13 @@ pub enum ForgetError {
     /// session stays live until it expires on its own.
     #[error("logged out locally but the session was not revoked: {0}")]
     NotRevoked(String),
+    /// The build kept no replica on this device, so there is nothing to forget.
+    #[error("the build kept no replica on this device")]
+    NoReplica,
+    /// The client could not read the writes the server has not acknowledged,
+    /// so nothing was destroyed.
+    #[error("reading the unsynced writes: {0}")]
+    Client(#[from] crate::ClientError),
 }
 
 /// Both destructive axes under one guard: revoke and clear the credential, then
@@ -251,7 +258,7 @@ pub enum ForgetError {
 /// [`ForgetError::Purge`] if the guard refuses or the wipe fails, or
 /// [`ForgetError::NotRevoked`] if the wipe succeeded but the revoke did not.
 #[cfg(feature = "native-auth")]
-pub async fn forget_device<S>(
+pub(crate) async fn forget_device<S>(
     authenticator: &crate::auth::NativeAuthenticator,
     db_path: &std::path::Path,
     key_store: &S,
