@@ -80,6 +80,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y keyutils dbus gnome-keyring
 
+      # --all-features turns on connetto-dioxus's desktop feature.
+      - name: Install desktop dependencies
+        if: matrix.name == 'rest'
+        uses: ./.github/actions/install-desktop-deps
+
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
 
