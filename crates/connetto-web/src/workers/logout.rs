@@ -26,7 +26,7 @@ pub struct LogoutConfig {
 
 /// Serve [`crate::auth::LOGOUT_CHANNEL`] for this worker's life.
 ///
-/// [`super::boot_db_worker`] calls this itself; call directly when assembling a worker by hand.
+/// A [`crate::builder::WebClientBuilder`] boot calls this itself. Call it directly when assembling a worker by hand.
 ///
 /// # Errors
 ///

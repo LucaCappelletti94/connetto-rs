@@ -477,7 +477,7 @@ async fn poll_for_export_reply(
 
 /// Serve [`super::EXPORT_CHANNEL`] for this worker's life.
 ///
-/// [`super::boot_db_worker`] calls this itself; call directly when assembling a worker by hand.
+/// A [`crate::builder::WebClientBuilder`] boot calls this itself. Call it directly when assembling a worker by hand.
 ///
 /// # Errors
 ///
@@ -568,7 +568,7 @@ where
 
 /// Serve [`super::IMPORT_CHANNEL`] for this worker's life.
 ///
-/// [`super::boot_db_worker`] calls this itself; call directly when assembling a worker by hand.
+/// A [`crate::builder::WebClientBuilder`] boot calls this itself. Call it directly when assembling a worker by hand.
 ///
 /// # Errors
 ///

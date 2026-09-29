@@ -13,7 +13,7 @@
 //! `MessagePort` and a named `BroadcastChannel`, [`locks`] provides Web Locks
 //! liveness for dead-tab reaping and leader election, [`storage`] owns the
 //! worker's durable databases and the data-wipe seam that removes one,
-//! [`workers`] holds the DB worker orchestration ([`workers::boot_db_worker`])
+//! [`workers`] holds the DB worker orchestration behind the builder's boot
 //! and the page-side glue, and [`leader`] runs the multi-page election that
 //! decides which page owns the DB worker. [`gate`] installs the
 //! away-and-return gate on the worker's relay hub and applies the relayed
