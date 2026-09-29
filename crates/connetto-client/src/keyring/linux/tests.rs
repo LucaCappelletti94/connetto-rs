@@ -342,6 +342,8 @@ fn only_keyutils_is_lost_at_reboot() {
 enum Answer {
     /// The service creates or unlocks at once and hands back no prompt.
     Immediate,
+    /// The service drops the connection after showing the prompt, as a crashed daemon does.
+    Hangup,
     Never,
     Dismiss,
     Complete,
@@ -484,7 +486,12 @@ struct Prompt(FakeSecretService);
 
 #[zbus::interface(name = "org.freedesktop.Secret.Prompt")]
 impl Prompt {
-    async fn prompt(&self, window_id: &str, #[zbus(signal_emitter)] emitter: SignalEmitter<'_>) {
+    async fn prompt(
+        &self,
+        window_id: &str,
+        #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
+        #[zbus(connection)] connection: &zbus::Connection,
+    ) {
         self.0.record("Prompt");
         assert!(
             window_id.is_empty(),
@@ -493,6 +500,13 @@ impl Prompt {
         let answer = self.0.state.lock().expect("fake state").answer;
         match answer {
             Answer::Immediate | Answer::Never => {}
+            Answer::Hangup => {
+                let connection = connection.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    let _ = connection.close().await;
+                });
+            }
             Answer::Dismiss => {
                 Self::completed(&emitter, true, Value::from(""))
                     .await
@@ -940,37 +954,80 @@ async fn a_sandbox_with_no_data_directory_refuses_before_asking_the_portal() {
 }
 
 /// One side of the session-bus run, driven by the environment. Run alone it does nothing.
+/// One side of a session-bus run, chosen by the environment. Run alone it does nothing.
 #[tokio::test]
-#[ignore = "a phase the session-bus sandbox test runs in a child process"]
-async fn sandbox_session_phase() {
-    if std::env::var_os("CONNETTO_R71_SANDBOX_PHASE").is_none() {
+#[ignore = "a phase the session-bus tests run in a child process"]
+async fn session_bus_phase() {
+    let Ok(phase) = std::env::var("CONNETTO_R71_SESSION_PHASE") else {
         return;
+    };
+    match phase.as_str() {
+        "open" => {
+            let sandbox = super::sandbox::Sandbox::open()
+                .await
+                .expect("open through the session bus");
+            sandbox
+                .write("tokens", "\"alice\"", "alice-refresh")
+                .await
+                .expect("write");
+        }
+        "named-sandbox" => {
+            let store = super::Store::named(super::LinuxStore::SandboxKeyring);
+            assert_eq!(
+                store.backend().await.expect("opens"),
+                Backend::SandboxKeyring
+            );
+            store
+                .write("tokens", "\"alice\"", "alice-refresh")
+                .await
+                .expect("write");
+            assert_eq!(
+                store
+                    .read("tokens", "\"alice\"")
+                    .await
+                    .expect("read")
+                    .as_deref(),
+                Some("alice-refresh")
+            );
+            store.clear("tokens", "\"alice\"").await.expect("clear");
+            assert!(
+                store
+                    .read("tokens", "\"alice\"")
+                    .await
+                    .expect("read")
+                    .is_none()
+            );
+        }
+        "detected-sandbox" => {
+            let opened = detect(&environment(true, None, None), None)
+                .await
+                .expect("a sandbox opens through the portal");
+            assert!(matches!(opened, Opened::Sandbox(_)));
+        }
+        "no-secret-service" => {
+            let store = super::Store::named(super::LinuxStore::SecretService);
+            let err = store.backend().await.expect_err("no session bus refuses");
+            assert!(
+                matches!(err, ClientError::SecretStore(SecretStoreError::NoStore { probed }) if probed == "the Secret Service"),
+                "got {err}"
+            );
+        }
+        other => panic!("unknown phase {other}"),
     }
-    let sandbox = super::sandbox::Sandbox::open()
-        .await
-        .expect("open through the session bus");
-    sandbox
-        .write("tokens", "\"alice\"", "alice-refresh")
-        .await
-        .expect("write");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn the_sandbox_opens_through_the_session_bus_at_libsecrets_path() {
-    let bus = PrivateBus::start();
-    let _portal = bus.serve_portal(Some(PORTAL_SECRET.to_vec())).await;
-    let data = tempfile::tempdir().expect("data home");
-    std::fs::create_dir_all(data.path().join("keyrings")).expect("keyrings directory");
+/// Runs `phase` in a child process whose session bus and data home are the given ones.
+async fn run_session_phase(phase: &'static str, bus_address: &str, data_home: &Path) {
     let exe = std::env::current_exe().expect("the test binary");
-    let (address, data_home) = (bus.address.clone(), data.path().to_owned());
+    let (address, data_home) = (bus_address.to_owned(), data_home.to_owned());
     let status = tokio::task::spawn_blocking(move || {
         std::process::Command::new(exe)
             .args([
-                "keyring::linux::tests::sandbox_session_phase",
+                "keyring::linux::tests::session_bus_phase",
                 "--exact",
                 "--ignored",
             ])
-            .env("CONNETTO_R71_SANDBOX_PHASE", "1")
+            .env("CONNETTO_R71_SESSION_PHASE", phase)
             .env("DBUS_SESSION_BUS_ADDRESS", address)
             .env("XDG_DATA_HOME", data_home)
             .status()
@@ -978,7 +1035,21 @@ async fn the_sandbox_opens_through_the_session_bus_at_libsecrets_path() {
     .await
     .expect("join")
     .expect("spawn the phase");
-    assert!(status.success(), "the child phase failed");
+    assert!(status.success(), "the {phase} phase failed");
+}
+
+fn data_home() -> tempfile::TempDir {
+    let data = tempfile::tempdir().expect("data home");
+    std::fs::create_dir_all(data.path().join("keyrings")).expect("keyrings directory");
+    data
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sandbox_opens_through_the_session_bus_at_libsecrets_path() {
+    let bus = PrivateBus::start();
+    let _portal = bus.serve_portal(Some(PORTAL_SECRET.to_vec())).await;
+    let data = data_home();
+    run_session_phase("open", &bus.address, data.path()).await;
 
     let path = data.path().join("keyrings").join("default.keyring");
     let keyring = super::sandbox::Sandbox::load(&path, oo7::Secret::from(PORTAL_SECRET.to_vec()))
@@ -992,6 +1063,33 @@ async fn the_sandbox_opens_through_the_session_bus_at_libsecrets_path() {
             .as_deref(),
         Some("alice-refresh")
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_sandbox_store_keeps_secrets_through_the_store() {
+    let bus = PrivateBus::start();
+    let _portal = bus.serve_portal(Some(PORTAL_SECRET.to_vec())).await;
+    let data = data_home();
+    run_session_phase("named-sandbox", &bus.address, data.path()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn detection_inside_a_sandbox_opens_the_portal_keyring() {
+    let bus = PrivateBus::start();
+    let _portal = bus.serve_portal(Some(PORTAL_SECRET.to_vec())).await;
+    let data = data_home();
+    run_session_phase("detected-sandbox", &bus.address, data.path()).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_secret_service_with_no_session_bus_refuses_naming_it() {
+    let data = data_home();
+    run_session_phase(
+        "no-secret-service",
+        "unix:path=/nonexistent/connetto-r71-bus",
+        data.path(),
+    )
+    .await;
 }
 
 #[test]
@@ -1032,5 +1130,254 @@ async fn a_secret_service_that_answers_with_errors_refuses() {
     assert!(
         matches!(&err, ClientError::SecretStore(SecretStoreError::Backend(message)) if message.starts_with("the Secret Service")),
         "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn a_service_that_hangs_up_mid_prompt_is_refused_as_dismissed() {
+    let (fake, bus) = FakeSecretService::start(Answer::Hangup).await;
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        ensure_default(&bus, Duration::from_secs(5)),
+    )
+    .await
+    .expect("a hang-up ends the wait rather than the bound")
+    .expect_err("refused");
+    assert!(
+        matches!(err, ClientError::SecretStore(SecretStoreError::Dismissed)),
+        "got {err}"
+    );
+    assert!(
+        !fake.calls().contains(&"Dismiss".to_owned()),
+        "nothing is left to dismiss"
+    );
+}
+
+#[tokio::test]
+async fn a_sandbox_item_that_is_not_connettos_base64_text_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("default.keyring");
+    let secret = || oo7::Secret::from(PORTAL_SECRET.to_vec());
+    let raw = oo7::file::UnlockedKeyring::load(&path, secret())
+        .await
+        .expect("open");
+    for (name, text) in [("garbled", "not base64!"), ("binary", "/w==")] {
+        raw.create_item(
+            "tokens",
+            &super::attributes("tokens", name),
+            oo7::Secret::text(text),
+            true,
+        )
+        .await
+        .expect("plant a value connetto never writes");
+    }
+    drop(raw);
+    let sandbox = super::sandbox::Sandbox::load(&path, secret())
+        .await
+        .expect("reopen");
+    for name in ["garbled", "binary"] {
+        let err = sandbox.read("tokens", name).await.expect_err("refused");
+        assert!(
+            matches!(err, ClientError::SecretStore(SecretStoreError::Encoding)),
+            "{name}: got {err}"
+        );
+    }
+}
+
+fn key_file_store(dir: &Path, key: &[u8; 32]) -> super::LinuxStore {
+    let path = dir.join(format!("wrap-{}.key", key[0]));
+    std::fs::write(&path, key).expect("key file");
+    super::LinuxStore::KeyFile(super::KeyFile::new(path, dir.join("state")))
+}
+
+#[tokio::test]
+async fn a_record_that_is_not_text_refuses_as_badly_encoded() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = super::Store::named(key_file_store(dir.path(), &CURRENT));
+    sealed(&dir.path().join("state").join(SEALED_DIR), &CURRENT, None)
+        .write("tokens", "alice", &[0xff, 0xfe])
+        .expect("plant bytes connetto never writes");
+    let err = store.read("tokens", "alice").await.expect_err("refused");
+    assert!(
+        matches!(err, ClientError::SecretStore(SecretStoreError::Encoding)),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_directory_where_a_record_belongs_refuses_reads_and_clears() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = sealed(dir.path(), &CURRENT, None);
+    std::fs::create_dir(dir.path().join(stem("keys", "alice")))
+        .expect("a directory in the record's place");
+    let err = store.read("keys", "alice").expect_err("read refuses");
+    assert!(
+        err.to_string().contains("reading a sealed record"),
+        "got {err}"
+    );
+    let err = store.clear("keys", "alice").expect_err("clear refuses");
+    assert!(
+        err.to_string().contains("removing a sealed record"),
+        "got {err}"
+    );
+}
+
+#[test]
+fn a_record_left_under_the_previous_key_after_opening_is_resealed_when_read() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let rotating = sealed(dir.path(), &CURRENT, Some(&PREVIOUS));
+    sealed(dir.path(), &PREVIOUS, None)
+        .write("keys", "late", b"late-secret")
+        .expect("another process writes under the previous key");
+    assert_eq!(
+        rotating
+            .read("keys", "late")
+            .expect("read")
+            .as_deref()
+            .map(Vec::as_slice),
+        Some(&b"late-secret"[..])
+    );
+    assert_eq!(
+        sealed(dir.path(), &CURRENT, None)
+            .read("keys", "late")
+            .expect("opens under the current key alone")
+            .as_deref()
+            .map(Vec::as_slice),
+        Some(&b"late-secret"[..])
+    );
+}
+
+#[test]
+fn opening_skips_names_it_does_not_own_and_records_under_neither_key() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let stranger = dir
+        .path()
+        .join(std::ffi::OsStr::from_bytes(b"not-utf8-\xff"));
+    std::fs::write(&stranger, b"left alone").expect("a file with a non-UTF-8 name");
+    sealed(dir.path(), &[5; 32], None)
+        .write("keys", "foreign", b"foreign-secret")
+        .expect("a record under a third key");
+    let foreign = dir.path().join(stem("keys", "foreign"));
+    let before = std::fs::read(&foreign).expect("read");
+
+    let rotating = sealed(dir.path(), &CURRENT, Some(&PREVIOUS));
+    assert!(!rotating.previous_key_needed());
+    assert_eq!(
+        std::fs::read(&foreign).expect("read"),
+        before,
+        "a record under neither key is untouched"
+    );
+    assert!(
+        stranger.exists(),
+        "a name that is not connetto's is left alone"
+    );
+    let err = rotating.read("keys", "foreign").expect_err("refused");
+    assert!(is_unsealable(&err), "got {err}");
+}
+
+#[tokio::test]
+async fn a_named_credential_opens_the_sealed_store_and_bad_state_directories_refuse() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let credentials = dir.path().join("credentials");
+    std::fs::create_dir_all(&credentials).expect("credentials");
+    std::fs::write(credentials.join(super::CREDENTIAL), CURRENT).expect("credential");
+    let state = dir.path().join("state");
+    let opened = super::open_named(
+        &super::LinuxStore::SystemdCredential,
+        &environment(false, Some(&credentials), Some(&state)),
+    )
+    .await
+    .expect("the named credential opens");
+    assert!(matches!(
+        opened,
+        Opened::Sealed {
+            credential: true,
+            ..
+        }
+    ));
+
+    let file = dir.path().join("a-file");
+    std::fs::write(&file, b"").expect("a regular file");
+    let under_file = file.join("state");
+    let err = super::open_named(
+        &super::LinuxStore::SystemdCredential,
+        &environment(false, Some(&credentials), Some(&under_file)),
+    )
+    .await
+    .err()
+    .expect("a state directory under a file refuses");
+    assert!(err.to_string().contains("a-file"), "got {err}");
+    let key = dir.path().join("wrap.key");
+    std::fs::write(&key, CURRENT).expect("key");
+    let err = super::open_named(
+        &super::LinuxStore::KeyFile(super::KeyFile::new(&key, &under_file)),
+        &environment(false, None, None),
+    )
+    .await
+    .err()
+    .expect("a key file's state directory under a file refuses");
+    assert!(err.to_string().contains("a-file"), "got {err}");
+    let err = super::open_named(
+        &super::LinuxStore::KeyFile(super::KeyFile::new(dir.path().join("missing.key"), &state)),
+        &environment(false, None, None),
+    )
+    .await
+    .err()
+    .expect("a missing key file refuses");
+    assert!(
+        err.to_string().contains("reading the wrap key"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn store_failures_reach_the_refresh_and_key_stores_as_errors() {
+    use connetto_core::traits::{RefreshTokenStore as _, ReplicaKeyStore as _};
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (first, second) = (
+        key_file_store(dir.path(), &CURRENT),
+        key_file_store(dir.path(), &PREVIOUS),
+    );
+    let tokens = crate::KeyringStore::with_linux_store("svc", first.clone());
+    tokens
+        .store("\"alice\"", "alice-refresh")
+        .await
+        .expect("store");
+    crate::KeyringKeyStore::with_linux_store("keys", first)
+        .store(
+            "replica",
+            &crate::ReplicaKey::from_bytes([1; crate::ReplicaKey::LEN]),
+        )
+        .await
+        .expect("store a key");
+
+    let rekeyed = crate::KeyringStore::with_linux_store("svc", second.clone());
+    assert!(
+        rekeyed.accounts().await.is_err(),
+        "an index under another key refuses to list"
+    );
+    assert!(
+        rekeyed.store("\"bob\"", "bob-refresh").await.is_err(),
+        "and to add an account"
+    );
+    assert!(rekeyed.clear("\"alice\"").await.is_err(), "and to drop one");
+    let err = crate::KeyringKeyStore::with_linux_store("keys", second)
+        .load("replica")
+        .await
+        .expect_err("a key under another wrap key refuses");
+    assert!(is_unsealable(&err), "got {err}");
+
+    let records = dir.path().join("state").join(SEALED_DIR);
+    let carol = records.join(stem("svc", "\"carol\""));
+    std::fs::create_dir(&carol).expect("a directory in carol's place");
+    std::fs::write(carol.join("occupant"), b"").expect("non-empty");
+    assert!(
+        tokens.store("\"carol\"", "carol-refresh").await.is_err(),
+        "an unwritable record refuses"
+    );
+    assert!(
+        tokens.clear("\"carol\"").await.is_err(),
+        "an unremovable record refuses"
     );
 }

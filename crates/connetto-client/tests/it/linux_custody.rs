@@ -20,8 +20,10 @@ use diesel::prelude::*;
 const PHASE: &str = "CONNETTO_R71_PHASE";
 const DIR: &str = "CONNETTO_R71_DIR";
 const KEY_FILE: &str = "CONNETTO_R71_KEY_FILE";
-/// Set by `scripts/r71-secret-service-tests.sh` once a private bus with an unlocked keyring is up.
+/// Set by `scripts/linux-secret-store-tests.sh secret-service` once a private bus with an unlocked keyring is up.
 const PRIVATE_BUS: &str = "CONNETTO_R71_PRIVATE_BUS";
+/// Names the Secret Service explicitly instead of detecting it.
+const NAMED_SECRET_SERVICE: &str = "CONNETTO_R71_NAMED_SECRET_SERVICE";
 const SERVICE: &str = "connetto-r71-custody";
 const ACCOUNT: &str = "\"alice\"";
 const TOKEN: &str = "alice-refresh";
@@ -48,6 +50,10 @@ fn stores() -> (KeyringStore, KeyringKeyStore) {
                 KeyringKeyStore::with_linux_store(SERVICE, store),
             )
         }
+        None if std::env::var_os(NAMED_SECRET_SERVICE).is_some() => (
+            KeyringStore::with_linux_store(SERVICE, LinuxStore::SecretService),
+            KeyringKeyStore::with_linux_store(SERVICE, LinuxStore::SecretService),
+        ),
         None => (KeyringStore::new(SERVICE), KeyringKeyStore::new(SERVICE)),
     }
 }
@@ -298,21 +304,20 @@ fn a_fresh_process_reads_what_another_wrote_under_a_named_key_file() {
 }
 
 /// Needs a private session bus with an unlocked `gnome-keyring-daemon`, which
-/// `scripts/r71-secret-service-tests.sh` sets up.
+/// `scripts/linux-secret-store-tests.sh secret-service` sets up.
 #[test]
-#[ignore = "needs the private Secret Service bus scripts/r71-secret-service-tests.sh starts"]
+#[ignore = "needs the private Secret Service bus scripts/linux-secret-store-tests.sh secret-service starts"]
 fn a_fresh_process_reads_what_another_wrote_under_the_secret_service() {
     assert!(
         std::env::var_os(PRIVATE_BUS).is_some(),
-        "run under scripts/r71-secret-service-tests.sh, never against a desktop's own keyring"
+        "run under scripts/linux-secret-store-tests.sh, never against a desktop's own keyring"
     );
-    let dir = tempfile::tempdir().expect("tempdir");
-    for phase in ["write", "read"] {
-        run_phase(phase, dir.path(), &[]);
-    }
-    run_phase("stored-as-text", dir.path(), &[]);
-    for phase in ["wipe", "empty"] {
-        run_phase(phase, dir.path(), &[]);
+    let named: [(&str, OsString); 1] = [(NAMED_SECRET_SERVICE, "1".into())];
+    for env in [&[][..], &named[..]] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for phase in ["write", "read", "stored-as-text", "wipe", "empty"] {
+            run_phase(phase, dir.path(), env);
+        }
     }
 }
 
