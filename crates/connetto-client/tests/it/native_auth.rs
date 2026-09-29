@@ -15,11 +15,15 @@
 use std::sync::Arc;
 
 use connetto_client::{
-    AcquiredSession, AuthorizationSession, BrowserOpener, ClientError, Grant, MemoryKeyStore,
-    MemoryRefreshStore, NativeAuthenticator, SessionFuture, encode_identity, provision_replica_key,
+    AccountChoice, AccountChooser, AcquiredSession, Auth, AuthorizationSession, BrowserOpener,
+    ClientError, Custody, Gate, Grant, MemoryKeyStore, MemoryRefreshStore, NativeAuthenticator,
+    NativeClientBuilder, SessionFuture, StoredAuth, encode_identity, provision_replica_key,
     replica_db_name,
 };
-use connetto_core::traits::{GrantRefused, HandshakeAuthority, RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::test_support::FakeTransport;
+use connetto_core::traits::{
+    GrantRefused, HandshakeAuthority, RefreshFuture, RefreshTokenStore, ReplicaKeyStore,
+};
 use connetto_server::{
     AuthConfig, AuthService, GenericOidcProvider, IdentityResolver, InMemoryAuthStore,
     ProviderRegistry, RedirectPolicy, RequestGuard, ResolveFuture, TokenAuthority, VerifiedClaims,
@@ -901,5 +905,275 @@ async fn a_restarted_process_without_a_redirect_starts_over() {
         store.accounts().await.expect("accounts"),
         vec![encode_identity(&login.user_id).expect("encode account")],
         "the new login's account is the only record listed"
+    );
+}
+
+/// A refresh store whose records every clone shares, so a test reads what a
+/// build stored after handing the build its own clone.
+#[derive(Clone, Default)]
+struct SharedRefreshStore(Arc<MemoryRefreshStore>);
+
+impl RefreshTokenStore for SharedRefreshStore {
+    type Error = ClientError;
+
+    fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, ClientError> {
+        self.0.load(account)
+    }
+
+    fn store<'a>(&'a self, account: &'a str, token: &'a str) -> RefreshFuture<'a, (), ClientError> {
+        self.0.store(account, token)
+    }
+
+    fn clear<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, (), ClientError> {
+        self.0.clear(account)
+    }
+
+    fn accounts(&self) -> RefreshFuture<'_, Vec<String>, ClientError> {
+        self.0.accounts()
+    }
+
+    fn protection(&self) -> Custody {
+        self.0.protection()
+    }
+}
+
+const BUILDER_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT);";
+
+/// A native builder whose dialer never reaches a sync server, so the client
+/// it builds opens offline once the sign-in resolved.
+fn offline_builder() -> NativeClientBuilder<FakeTransport> {
+    NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(BUILDER_DDL))
+        .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+}
+
+/// A provider sign-in over `store` choosing `choice`.
+fn provider(
+    base: &str,
+    store: &SharedRefreshStore,
+    choice: AccountChoice,
+) -> StoredAuth<SharedRefreshStore> {
+    Auth::new(base, MOCK_OAUTH_PROVIDER)
+        .with_account(choice)
+        .refresh_store(store.clone())
+}
+
+/// A browser opener that fails the test, for a sign-in that must not log in
+/// interactively.
+fn no_browser() -> BrowserOpener {
+    Arc::new(|_url: &str| panic!("the sign-in opened a browser"))
+}
+
+/// Sign in as `subject` through a fresh login and return the account the
+/// store holds it under.
+async fn builder_login(base: &str, store: &SharedRefreshStore, subject: &str) -> String {
+    let client = offline_builder()
+        .signed_in(
+            provider(base, store, AccountChoice::New).with_browser_opener(fake_browser(subject)),
+        )
+        .connect()
+        .await
+        .expect("the provider build signs in");
+    let account = client
+        .session()
+        .expect("a provider build reports its session")
+        .account()
+        .to_owned();
+    client.close().await;
+    account
+}
+
+/// A provider sign-in through the builder logs in, keeps its replica on the
+/// device, and reports the session it acquired. Forgetting the device then
+/// revokes that session at the server, clears the refresh token and deletes
+/// the replica.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provider_build_reports_its_session_and_forgets_its_device() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _idp) = spawn_auth_server().await;
+    let store = SharedRefreshStore::default();
+    let dir = tempfile::tempdir().expect("a temporary directory");
+
+    let client = offline_builder()
+        .signed_in(
+            provider(&base, &store, AccountChoice::New)
+                .with_browser_opener(fake_browser("builder-user")),
+        )
+        .durable(dir.path(), super::support::SharedKeys::default())
+        .with_gate(Gate::off())
+        .connect()
+        .await
+        .expect("the provider build signs in and opens offline");
+
+    let session = client
+        .session()
+        .expect("a provider build reports its session");
+    let account = session.account().to_owned();
+    assert_eq!(
+        account,
+        encode_identity(session.user_id()).expect("encode account"),
+        "the session's account is its encoded user id"
+    );
+    assert_eq!(
+        session.accounts(),
+        std::slice::from_ref(&account),
+        "the store lists the account"
+    );
+    assert!(
+        session.expires_at() > std::time::SystemTime::now(),
+        "the session expires in the future"
+    );
+    let issued = store
+        .load(&account)
+        .await
+        .expect("load")
+        .expect("the login stored its refresh token");
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("list")
+            .next()
+            .is_some(),
+        "the durable build wrote its replica"
+    );
+
+    client
+        .forget_device(true)
+        .await
+        .expect("the device is forgotten and the session revoked");
+    assert_eq!(
+        store.load(&account).await.expect("load"),
+        None,
+        "the refresh token is cleared"
+    );
+    assert!(
+        std::fs::read_dir(dir.path())
+            .expect("list")
+            .next()
+            .is_none(),
+        "the replica is gone"
+    );
+    let replay: SharedRefresh = Arc::new(MemoryRefreshStore::default());
+    replay.store(&account, &issued).await.expect("store");
+    let refused = NativeAuthenticator::new(base, MOCK_OAUTH_PROVIDER, replay, Some(account))
+        .with_browser_opener(no_browser())
+        .refresh_access::<String>()
+        .await;
+    assert!(
+        refused.is_err(),
+        "the server refuses the revoked refresh token"
+    );
+}
+
+/// The default account choice signs back in as the account this device used
+/// last, silently, through the refresh token the first build stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_last_used_build_signs_back_in_without_a_browser() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _idp) = spawn_auth_server().await;
+    let store = SharedRefreshStore::default();
+    let account = builder_login(&base, &store, "returning-user").await;
+
+    let client = offline_builder()
+        .signed_in(
+            Auth::new(&base, MOCK_OAUTH_PROVIDER)
+                .refresh_store(store.clone())
+                .with_browser_opener(no_browser()),
+        )
+        .connect()
+        .await
+        .expect("the silent sign-in");
+    assert_eq!(
+        client.session().expect("a session").account(),
+        account,
+        "the same account signs back in"
+    );
+}
+
+/// With two accounts stored, an `Ask` build signs in as the one the
+/// platform's chooser picks from the stored list, without a browser.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_ask_build_signs_in_as_the_account_the_chooser_picks() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let (base, _service, _idp) =
+        spawn_auth_server_with_service(vec![APP_REDIRECT.to_owned()]).await;
+    let store = SharedRefreshStore::default();
+    let first = builder_login(&base, &store, "first-user").await;
+
+    let client = offline_builder()
+        .signed_in(
+            provider(&base, &store, AccountChoice::New)
+                .with_browser_opener(no_browser())
+                .with_claimed_redirect(APP_REDIRECT, Arc::new(ScriptedSession::new("second-user"))),
+        )
+        .connect()
+        .await
+        .expect("the claimed-redirect sign-in");
+    let second = client.session().expect("a session").account().to_owned();
+    client.close().await;
+    assert_ne!(first, second, "two distinct accounts are stored");
+
+    let offered = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let chooser: AccountChooser = {
+        let offered = Arc::clone(&offered);
+        let pick = first.clone();
+        Arc::new(move |accounts: Vec<String>| {
+            *offered.lock().expect("offered") = accounts;
+            let pick = pick.clone();
+            Box::pin(async move { AccountChoice::Account(pick) })
+        })
+    };
+    let client = offline_builder()
+        .signed_in(
+            provider(&base, &store, AccountChoice::Ask)
+                .with_browser_opener(no_browser())
+                .with_account_chooser(chooser),
+        )
+        .connect()
+        .await
+        .expect("the chosen account signs in silently");
+    let mut listed = offered.lock().expect("offered").clone();
+    listed.sort();
+    let mut stored = vec![first.clone(), second];
+    stored.sort();
+    assert_eq!(
+        listed, stored,
+        "the chooser is offered every stored account"
+    );
+    assert_eq!(
+        client.session().expect("a session").account(),
+        first,
+        "the build signs in as the chosen account"
+    );
+}
+
+/// An `Ask` build with no chooser, or whose chooser answers `Ask`, is refused
+/// before any login starts.
+#[tokio::test]
+async fn an_ask_build_without_an_answer_is_refused() {
+    let store = SharedRefreshStore::default();
+    let refused = offline_builder()
+        .signed_in(
+            provider("http://127.0.0.1:1", &store, AccountChoice::Ask)
+                .with_browser_opener(no_browser()),
+        )
+        .connect()
+        .await;
+    assert!(
+        matches!(refused, Err(ClientError::Auth(_))),
+        "an Ask with no chooser is refused"
+    );
+
+    let evasive: AccountChooser =
+        Arc::new(|_accounts: Vec<String>| Box::pin(async { AccountChoice::Ask }));
+    let refused = offline_builder()
+        .signed_in(
+            provider("http://127.0.0.1:1", &store, AccountChoice::Ask)
+                .with_browser_opener(no_browser())
+                .with_account_chooser(evasive),
+        )
+        .connect()
+        .await;
+    assert!(
+        matches!(refused, Err(ClientError::Auth(_))),
+        "a chooser answering Ask is refused"
     );
 }

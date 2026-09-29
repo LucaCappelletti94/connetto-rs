@@ -330,6 +330,46 @@ async fn a_return_beyond_the_grace_locks_and_refuses() {
         matches!(client.unpin("pin").await, Err(ClientError::Locked)),
         "unpins are refused while locked"
     );
+    assert!(
+        matches!(
+            client.watch::<_, i32>(items::table.select(items::id)).await,
+            Err(ClientError::Locked)
+        ),
+        "watches are refused while locked"
+    );
+    assert!(
+        matches!(
+            client.watch_value::<_, i64>(items::table.count()).await,
+            Err(ClientError::Locked)
+        ),
+        "value watches are refused while locked"
+    );
+    assert!(
+        matches!(
+            client
+                .watch_groups::<_, Option<String>, i64>(
+                    items::table
+                        .group_by(items::label)
+                        .select((items::label, diesel::dsl::count_star())),
+                )
+                .await,
+            Err(ClientError::Locked)
+        ),
+        "group watches are refused while locked"
+    );
+    assert!(
+        matches!(
+            client
+                .watch_rows::<_, (i32,)>(items::table.select((items::id,)))
+                .await,
+            Err(ClientError::Locked)
+        ),
+        "row watches are refused while locked"
+    );
+    assert!(
+        matches!(client.unsynced().await, Err(ClientError::Locked)),
+        "the unsynced list is refused while locked"
+    );
 }
 
 /// A zero grace re-checks on every return, however brief.

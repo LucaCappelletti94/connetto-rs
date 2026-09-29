@@ -8,12 +8,12 @@
 use std::time::Duration;
 
 use connetto_client::{
-    ClientBuilder, ClientEvent, Grant, LiveQuery, ReconnectPolicy, SyncSchema, SyncStatus,
-    SyncTuning, TransportFactory,
+    ClientBuilder, ClientEvent, FirstThen, Grant, LiveQuery, ReconnectPolicy, SyncSchema,
+    SyncStatus, SyncTuning, TransportFactory,
 };
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    SubscriptionPriority,
+    SubscriptionPriority, TabIdentity,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
@@ -84,6 +84,19 @@ fn payload(id: i64) -> Vec<u8> {
     zstd::encode_all(patchset.build().as_slice(), 3).expect("compress payload")
 }
 
+/// The ack every scripted server here answers the handshake with.
+fn ack() -> ControlMessage {
+    ControlMessage::HandshakeAck(HandshakeAck {
+        connection_id: "core".to_owned(),
+        session_token: "core".to_owned(),
+        resume_token: "core".to_owned(),
+        current_cursor: Cursor::new(Vec::new()),
+        schema_version: None,
+        initial_credits: 64,
+        last_applied_seq: None,
+    })
+}
+
 /// A server that answers the handshake, answers each subscription with a
 /// one-row snapshot, and echoes the keepalives.
 fn snapshot_server() -> LoopbackTransport {
@@ -93,18 +106,7 @@ fn snapshot_server() -> LoopbackTransport {
         else {
             return;
         };
-        server
-            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                connection_id: "core".to_owned(),
-                session_token: "core".to_owned(),
-                resume_token: "core".to_owned(),
-                current_cursor: Cursor::new(Vec::new()),
-                schema_version: None,
-                initial_credits: 64,
-                last_applied_seq: None,
-            }))
-            .await
-            .expect("ack the handshake");
+        server.send_control(ack()).await.expect("ack the handshake");
         while let Ok(Some(frame)) = server.recv().await {
             match frame {
                 IncomingFrame::Control(ControlMessage::Subscribe(sub)) => {
@@ -224,18 +226,7 @@ async fn signed_in_stage_presents_the_held_credentials_grant() {
             return None;
         };
         let grant = handshake.grants.into_iter().next();
-        server
-            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
-                connection_id: "core".to_owned(),
-                session_token: "core".to_owned(),
-                resume_token: "core".to_owned(),
-                current_cursor: Cursor::new(Vec::new()),
-                schema_version: None,
-                initial_credits: 64,
-                last_applied_seq: None,
-            }))
-            .await
-            .expect("ack the handshake");
+        server.send_control(ack()).await.expect("ack the handshake");
         grant
     });
     let builder = ClientBuilder::new(
@@ -639,4 +630,107 @@ fn an_anonymous_build_answers_the_caller_and_subjects_functions_as_nobody() {
     .get_result(conn.conn())
     .expect("the subjects function is registered");
     assert_eq!(subjects, None, "a caller holding no key answers NULL");
+}
+
+/// A relay hub's upstream: it answers the handshake, then states the
+/// worker's identity the way the hub does for every tab it serves.
+fn identity_server(identity: TabIdentity) -> LoopbackTransport {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        server.send_control(ack()).await.expect("ack the handshake");
+        server
+            .send_control(ControlMessage::TabIdentity(identity))
+            .await
+            .expect("state the identity");
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+    client_end
+}
+
+/// A tab adopts the identity its worker states, so the tab's caller function
+/// answers the worker's signed-in user instead of nobody.
+#[tokio::test]
+async fn a_tab_adopts_the_identity_its_worker_states() {
+    let mut worker = ClientBuilder::new(
+        bundle(),
+        OneShot {
+            transport: Some(snapshot_server()),
+        },
+    )
+    .signed_in(
+        connetto_client::HeldCredential::new(Grant::new("user:alice"), &"alice".to_owned())
+            .expect("a held credential"),
+    )
+    .connect_driven()
+    .await
+    .expect("the worker connects");
+    let identity = worker
+        .relay_identity()
+        .expect("the worker states its identity");
+
+    let mut tab = ClientBuilder::new(
+        bundle(),
+        OneShot {
+            transport: Some(identity_server(identity)),
+        },
+    )
+    .connect_driven()
+    .await
+    .expect("the tab connects");
+    let before: String = diesel::select(current_app_user())
+        .get_result(tab.conn())
+        .expect("read the caller");
+    assert_eq!(
+        before,
+        connetto_core::auth::absent_marker(),
+        "an anonymous tab answers nobody"
+    );
+    loop {
+        match tab.pump_one().await.expect("pump") {
+            ClientEvent::IdentityStated => break,
+            ClientEvent::Closed => panic!("closed before the identity arrived"),
+            _ => {}
+        }
+    }
+    let caller: String = diesel::select(current_app_user())
+        .get_result(tab.conn())
+        .expect("read the caller");
+    assert_eq!(caller, "alice", "the tab answers the worker's user");
+}
+
+/// A build handed a transport it already opened speaks over that one first,
+/// then reconnects through the factory once that transport dies.
+#[tokio::test]
+async fn a_first_then_build_reconnects_through_its_factory() {
+    let dials = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let factory = {
+        let dials = std::sync::Arc::clone(&dials);
+        move || {
+            dials.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            std::future::ready(Ok::<_, DialRefused>(snapshot_server()))
+        }
+    };
+    let (client, pump) = ClientBuilder::new(bundle(), FirstThen::new(closing_server(), factory))
+        .with_sleeper(|d| tokio::time::sleep(d))
+        .connect_with_pump()
+        .await
+        .expect("connect over the opened transport");
+    assert_eq!(
+        dials.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "the first connect speaks over the opened transport"
+    );
+    tokio::spawn(pump);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while dials.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the reconnect dials through the factory");
+    client.close().await;
 }
