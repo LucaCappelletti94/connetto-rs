@@ -167,7 +167,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R90~~ | The browser's refresh token into an `HttpOnly` cookie |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
 | any | R92 | Synced tables without local references, with SQLite's own enforcement for the tier. Needs nothing |
-| any | R93 | The file replica for bots. Needs R91's template, R71's headless custody being built |
+| any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52, R74 and R95 wait on it |
 | blocked | R95 | Share keys added and removed on a running client. Blocked on R94 |
 | any | R96 | One server builder for programs that embed the server. Minted undesigned, so it starts with its design |
@@ -5065,7 +5065,7 @@ X6 is closed with a per-timer rule recorded, and the code matches the rule every
 
 **Blocked on** R94 (decided with the maintainer 2026-09-28). This phase adds a third secret beside the two stores R94 decision 15 injects by setter, an application-requested certificate lifetime, and an enrolment run after sign-in inside the connection sequence R94 step 3 moves into `connect()`. R94 decisions 11 and 15 make `ClientConfig` and `ConnettoConnection::connect` internal, so the device key's store, its protection report under R94 decision 13, the lifetime setting and the enrolment are built once, on the builders. R96 does not gate it, because the server half (the CA keypair checked at startup and the lifetime ceiling) is server settings types with R37 setters, which R96's builder gathers.
 
-Two edges weighed 2026-09-12 with the maintainer and left unblocking. R71: on Linux the device key rides the kernel session keyring beside the replica key and both die at reboot, so a rebooted Linux device has already lost its replica and the device key's loss adds no failure of its own. R71 fixes both keys at once and this phase states the caveat rather than waiting. R72: certificate validity is the one wall-clock check a peer cannot correct against a server, so step 4 below states the clock rule itself and R72's later inventory cites it. Rejected: R71 gating the whole peer programme on a Linux custody decision whose every candidate has a named cost, and R72 preceding with an inventory that touches only built code.
+Two edges weighed 2026-09-12 with the maintainer and left unblocking. R71: on Linux the device key shares the replica key's custody, which R71 made survive a reboot, so the device key uses R71's stores and needs nothing of its own. R72: certificate validity is the one wall-clock check a peer cannot correct against a server, so step 4 below states the clock rule itself and R72's later inventory cites it. Rejected: R71 gating the whole peer programme on a Linux custody decision whose every candidate has a named cost, and R72 preceding with an inventory that touches only built code.
 
 ### Purpose
 
@@ -5079,11 +5079,11 @@ Nothing today lets two devices authenticate each other offline: clients hold onl
 4. Lifetime is application-requested under a server ceiling, refused if over, the R4 `capability_ttl` pattern, with renewal auto-run on any connectivity past half-life. Lifetime IS the offline revocation lag, stated in the docs rather than hidden. **The clock rule (2026-09-12):** validity is checked against the wall clock with a stated skew tolerance, and a device whose clock puts every certificate outside its window fails closed on every peer link and surfaces one typed event naming the cause, so an expedition device whose clock drifted for weeks off-grid is told why it sees no peers rather than seeing none silently. R72 absorbs this as the one wall-clock rule when it inventories the tree.
 5. Server-side enrolment revocation (a reported-lost device), the surface R78's courier refusals and the ban machinery consult.
 6. No offline enrolment and no sub-issuance, recorded as refusals with their reasoning.
-7. The lost-key path, on every platform (2026-09-12): a device whose custody record is gone, by reboot on Linux until R71 lands, by a cleared keychain anywhere, enrols again with a fresh key exactly as a first enrolment, and the dangling enrolment expires at its lifetime under the revocation-lag semantic of step 4. Provisional rows peers hold under the old key are adjudicated or retracted by the server's frontier like any other author's, since the device cannot sign for a key it no longer holds. Stated in chapter 19 with the Linux caveat named.
+7. The lost-key path, on every platform (2026-09-12): a device whose custody record is gone, by a cleared keychain or a removed store, enrols again with a fresh key exactly as a first enrolment, and the dangling enrolment expires at its lifetime under the revocation-lag semantic of step 4. Provisional rows peers hold under the old key are adjudicated or retracted by the server's frontier like any other author's, since the device cannot sign for a key it no longer holds. Stated in chapter 19.
 
 ### Done when
 
-A device enrols while online, holds key and certificates across process restarts behind the existing gate (across reboots on Linux only once R71 lands, stated, and then proven by a fresh process reopening the device key from R71's durable stores), renews past half-life, is refused a lifetime over the ceiling, a revoked enrolment stops verifying, a device with a cleared custody record enrols again under a fresh key, and a device whose clock puts every certificate outside its window refuses every peer and says why, all proven by tests including one browser-independent native run.
+A device enrols while online, holds key and certificates across process restarts behind the existing gate (across reboots on Linux too, proven by a fresh process reopening the device key from R71's durable stores), renews past half-life, is refused a lifetime over the ceiling, a revoked enrolment stops verifying, a device with a cleared custody record enrols again under a fresh key, and a device whose clock puts every certificate outside its window refuses every peer and says why, all proven by tests including one browser-independent native run.
 
 ---
 
