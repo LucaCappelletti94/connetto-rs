@@ -364,18 +364,12 @@ pub(crate) fn custody_of(claims: &[Custody], build: Custody) -> Custody {
         return Custody::Ephemeral;
     }
     match build {
-        Custody::Ephemeral => Custody::Ephemeral,
-        Custody::Verified => {
-            if claims
-                .iter()
-                .any(|claim| matches!(claim, Custody::Unverified(_)))
-            {
-                build
-            } else {
-                Custody::Verified
-            }
-        }
-        Custody::Unverified(_) => build,
+        Custody::Verified => claims
+            .iter()
+            .copied()
+            .find(|claim| matches!(claim, Custody::Unverified(_)))
+            .unwrap_or(Custody::Verified),
+        Custody::Ephemeral | Custody::Unverified(_) => build,
     }
 }
 
@@ -1390,5 +1384,40 @@ impl<T: Transport> AttachContent<T> for () {
         _place: ContentPlace,
     ) -> impl Future<Output = Result<(), ClientError>> + MaybeSend {
         async { Ok(()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use connetto_core::custody::{Custody, NoGate};
+
+    use super::custody_of;
+
+    #[test]
+    fn a_verified_build_reports_the_weakest_store_claim() {
+        let unverified = Custody::Unverified(NoGate::Offerable);
+        assert_eq!(
+            custody_of(&[Custody::Verified, unverified], Custody::Verified),
+            unverified
+        );
+        assert_eq!(
+            custody_of(&[unverified, Custody::Ephemeral], Custody::Verified),
+            Custody::Ephemeral
+        );
+        assert_eq!(
+            custody_of(&[Custody::Verified], Custody::Verified),
+            Custody::Verified
+        );
+    }
+
+    #[test]
+    fn an_unverified_build_keeps_its_own_reason_over_a_store_claim() {
+        let build = Custody::Unverified(NoGate::Unsupported);
+        assert_eq!(
+            custody_of(&[Custody::Unverified(NoGate::Offerable)], build),
+            build
+        );
+        assert_eq!(custody_of(&[Custody::Verified], build), build);
+        assert_eq!(custody_of(&[Custody::Ephemeral], build), Custody::Ephemeral);
     }
 }
