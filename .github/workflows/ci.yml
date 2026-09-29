@@ -728,6 +728,21 @@ jobs:
         if: matrix.name == 'client'
         run: scripts/linux-secret-store-tests.sh container
 
+      # R71 proofs 4, 5 and 12: GNOME Keyring's and KDE Wallet's real dialogs
+      # answered on a virtual display, and a real Flatpak through the Secret portal.
+      - name: Run desktop custody proofs
+        if: matrix.name == 'client'
+        env:
+          DESKTOP_PROOF_OUT: ${{ runner.temp }}/desktop-proofs
+        run: scripts/linux-secret-store-tests.sh desktop
+
+      - uses: actions/upload-artifact@v7
+        if: always() && matrix.name == 'client'
+        with:
+          name: desktop-custody-proofs
+          path: ${{ runner.temp }}/desktop-proofs
+          if-no-files-found: ignore
+
       - name: Prune target cache
         if: always()
         run: |

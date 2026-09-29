@@ -4,10 +4,20 @@
 #   secret-service  a private session bus with an unlocked gnome-keyring-daemon
 #   systemd         transient system services, through passwordless sudo
 #   container       Docker under its default seccomp profile
+#   desktop         GNOME Keyring's and KDE Wallet's real dialogs and a real
+#                   Flatpak, in Docker, screenshots under DESKTOP_PROOF_OUT
 set -euo pipefail
 
 profile="${CARGO_TEST_PROFILE:-release}"
 nextest=(cargo +stable nextest run --cargo-profile "$profile" --all-features -p connetto-client --run-ignored ignored-only)
+
+# The secret_store_probe example, built under the profile, printed as a path.
+build_probe() {
+  cargo +stable build --profile "$profile" --all-features -p connetto-client --example secret_store_probe >&2
+  local target
+  target="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
+  echo "$target/$profile/examples/secret_store_probe"
+}
 
 case "${1:-}" in
   secret-service)
@@ -23,13 +33,22 @@ case "${1:-}" in
     exec keyctl session - "${nextest[@]}" -E 'test(=linux_custody::a_second_transient_service_reads_what_the_first_wrote)'
     ;;
   container)
-    cargo +stable build --profile "$profile" --all-features -p connetto-client --example secret_store_probe
-    target="$(cargo metadata --format-version 1 --no-deps | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])')"
-    CONNETTO_R71_PROBE="$target/$profile/examples/secret_store_probe" \
+    probe="$(build_probe)"
+    CONNETTO_R71_PROBE="$probe" \
       exec "${nextest[@]}" -E 'test(=linux_custody::a_restarted_container_reads_its_keys_back_through_a_mounted_key_file)'
     ;;
+  desktop)
+    probe="$(build_probe)"
+    out="${DESKTOP_PROOF_OUT:-$(mktemp -d)}"
+    here="$(cd "$(dirname "$0")" && pwd)/desktop-proofs"
+    for proof in gnome kde flatpak; do
+      echo "== $proof"
+      "$here/$proof/run.sh" "$probe" "$out/$proof"
+    done
+    echo "screenshots and logs in $out"
+    ;;
   *)
-    echo "usage: $0 secret-service|systemd|container" >&2
+    echo "usage: $0 secret-service|systemd|container|desktop" >&2
     exit 2
     ;;
 esac

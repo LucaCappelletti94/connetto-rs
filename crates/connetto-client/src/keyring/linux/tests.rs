@@ -1381,3 +1381,76 @@ async fn store_failures_reach_the_refresh_and_key_stores_as_errors() {
         "an unremovable record refuses"
     );
 }
+
+#[tokio::test]
+async fn two_stores_on_one_sandbox_keyring_both_write_and_see_each_other() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("default.keyring");
+    let secret = || oo7::Secret::from(PORTAL_SECRET.to_vec());
+    let tokens = super::sandbox::Sandbox::load(&path, secret())
+        .await
+        .expect("open for tokens");
+    let keys = super::sandbox::Sandbox::load(&path, secret())
+        .await
+        .expect("open for keys");
+    keys.write("keys", "replica", "replica-key")
+        .await
+        .expect("the key store writes first");
+    tokens
+        .write("tokens", "\"alice\"", "alice-refresh")
+        .await
+        .expect("the token store writes after the file changed under it");
+    assert_eq!(
+        keys.read("tokens", "\"alice\"")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("alice-refresh")
+    );
+    assert_eq!(
+        tokens
+            .read("keys", "replica")
+            .await
+            .expect("read")
+            .as_deref(),
+        Some("replica-key")
+    );
+    tokens
+        .clear("keys", "replica")
+        .await
+        .expect("clear through the other store");
+    assert!(keys.read("keys", "replica").await.expect("read").is_none());
+}
+
+#[tokio::test]
+async fn a_sandbox_keyring_corrupted_after_opening_refuses_every_operation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("default.keyring");
+    let sandbox = super::sandbox::Sandbox::load(&path, oo7::Secret::from(PORTAL_SECRET.to_vec()))
+        .await
+        .expect("open");
+    sandbox
+        .write("tokens", "alice", "alice-refresh")
+        .await
+        .expect("write");
+    std::fs::write(&path, b"not a keyring").expect("another program overwrites the file");
+    let refused = |err: ClientError| err.to_string().contains("the sandbox keyring");
+    assert!(refused(
+        sandbox
+            .read("tokens", "alice")
+            .await
+            .expect_err("read refuses")
+    ));
+    assert!(refused(
+        sandbox
+            .write("tokens", "bob", "bob-refresh")
+            .await
+            .expect_err("write refuses")
+    ));
+    assert!(refused(
+        sandbox
+            .clear("tokens", "alice")
+            .await
+            .expect_err("clear refuses")
+    ));
+}
