@@ -71,6 +71,10 @@ pub mod roster;
 pub mod stack;
 pub mod standby;
 
+mod native;
+use native::NativeCluster;
+pub use native::{POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
+
 pub use roster::{RosterAuth, WITHHELD_ID};
 
 /// The value type carried in an uploaded changeset: SQLite text keys and blob
@@ -475,12 +479,16 @@ impl MockOauth {
         }
     }
 
-    /// Start one provider and return the host-reachable issuer URL.
+    /// Start one provider and return the host-reachable issuer URL, or the
+    /// running provider [`stack::ISSUER_VAR`] names.
     ///
     /// # Panics
     ///
     /// Panics when the Docker daemon is unreachable, when the container host address cannot be resolved, or when the mapped port is unavailable, all of which are test setup failures.
     pub async fn start() -> Self {
+        if let Ok(issuer) = std::env::var(stack::ISSUER_VAR) {
+            return Self::running(issuer);
+        }
         sweep_abandoned_containers();
         let request = GenericImage::new(MOCK_OAUTH_IMAGE, MOCK_OAUTH_TAG)
             .with_exposed_port(MOCK_OAUTH_PORT.tcp())
@@ -773,9 +781,8 @@ static COUNTER_SCOPE: RwLock<()> = RwLock::const_new(());
 pub struct Fixture {
     admin_url: String,
     admin: Pool<AsyncPgConnection>,
-    /// Held to keep the database alive, and the target of [`Self::shell`].
-    /// Absent on a fixture over a running cluster.
-    postgres: Option<ContainerAsync<GenericImage>>,
+    /// Held to keep the database alive.
+    postgres: Cluster,
     /// The admin conninfo on the mapped spare port, present on a restorable fixture only.
     spare_url: Option<String>,
     /// Started on the first ask, because most tests never ask and an unused
@@ -783,6 +790,16 @@ pub struct Fixture {
     fga: OnceCell<Authorization>,
     _shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
     _exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
+}
+
+/// What keeps a fixture's Postgres alive.
+enum Cluster {
+    /// A container, the target of [`Fixture::shell`].
+    Container(Box<ContainerAsync<GenericImage>>),
+    /// A cluster started as plain processes, see [`native::POSTGRES_BIN_VAR`].
+    Native { _guard: NativeCluster },
+    /// A cluster something else started and keeps running.
+    Running,
 }
 
 /// The authorization service one fixture owns, and where it listens.
@@ -795,6 +812,11 @@ struct Authorization {
 
 impl Fixture {
     /// Start this test's own `Postgres` and create the watermark table.
+    ///
+    /// The cluster is a container, or where [`native::POSTGRES_BIN_VAR`] and
+    /// [`native::POSTGRES_TEMPLATE_VAR`] are set a copy of the template
+    /// started as the fixture's own. The authorization service is the running
+    /// one [`stack::OPENFGA_URL_VAR`] names when it is set.
     ///
     /// # Panics
     ///
@@ -826,21 +848,19 @@ impl Fixture {
     /// Panics when the cluster does not answer or watermark provisioning fails, both setup failures.
     pub async fn on_cluster(admin_url: &str, fga_url: &str) -> Self {
         let scope = COUNTER_SCOPE.read().await;
-        let admin = pool_when_ready(admin_url).await;
-        provision_watermark(&admin).await;
-        exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
-        Self {
-            admin_url: admin_url.to_owned(),
-            admin,
-            postgres: None,
-            spare_url: None,
-            fga: OnceCell::new_with(Some(Authorization {
-                _container: None,
-                url: fga_url.to_owned(),
-            })),
-            _shared_counter_scope: Some(scope),
-            _exclusive_counter_scope: None,
-        }
+        let fga = OnceCell::new_with(Some(Authorization {
+            _container: None,
+            url: fga_url.to_owned(),
+        }));
+        Self::provisioned(
+            admin_url.to_owned(),
+            Cluster::Running,
+            None,
+            fga,
+            Some(scope),
+            None,
+        )
+        .await
     }
 
     async fn acquire_with(
@@ -856,6 +876,13 @@ impl Fixture {
                 .with_env_filter(tracing_subscriber::EnvFilter::new(directives))
                 .with_writer(std::io::stderr)
                 .try_init();
+        }
+        if let Some(programs) = native::NativePrograms::from_lookup(|name| std::env::var_os(name)) {
+            assert!(
+                !restorable,
+                "a restorable fixture needs the container's spare cluster and shell"
+            );
+            return Self::on_native(&programs, shared_counter_scope, exclusive_counter_scope).await;
         }
         sweep_abandoned_containers();
         let mut image = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
@@ -887,15 +914,54 @@ impl Fixture {
             None
         };
         let admin_url = format!("postgres://postgres:postgres@{host}:{port}/postgres");
+        Self::provisioned(
+            admin_url,
+            Cluster::Container(Box::new(postgres)),
+            spare_url,
+            OnceCell::new(),
+            shared_counter_scope,
+            exclusive_counter_scope,
+        )
+        .await
+    }
+
+    /// A fixture on a cluster of its own copied from `programs`' template.
+    pub(crate) async fn on_native(
+        programs: &native::NativePrograms,
+        shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
+        exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
+    ) -> Self {
+        let cluster = NativeCluster::start(&programs.bin, &programs.template).await;
+        Self::provisioned(
+            cluster.admin_url(),
+            Cluster::Native { _guard: cluster },
+            None,
+            OnceCell::new(),
+            shared_counter_scope,
+            exclusive_counter_scope,
+        )
+        .await
+    }
+
+    /// This fixture once its cluster at `admin_url` answers, with the
+    /// watermark and epoch tables created.
+    async fn provisioned(
+        admin_url: String,
+        postgres: Cluster,
+        spare_url: Option<String>,
+        fga: OnceCell<Authorization>,
+        shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
+        exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
+    ) -> Self {
         let admin = pool_when_ready(&admin_url).await;
         provision_watermark(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
         Self {
             admin_url,
             admin,
-            postgres: Some(postgres),
+            postgres,
             spare_url,
-            fga: OnceCell::new(),
+            fga,
             _shared_counter_scope: shared_counter_scope,
             _exclusive_counter_scope: exclusive_counter_scope,
         }
@@ -910,10 +976,10 @@ impl Fixture {
     /// exec cannot start, or when the script exits nonzero, printing the
     /// script's standard error.
     pub async fn shell(&self, script: &str) -> String {
-        let mut run = self
-            .postgres
-            .as_ref()
-            .expect("a shell needs the fixture's own container")
+        let Cluster::Container(postgres) = &self.postgres else {
+            panic!("a shell needs the fixture's own container");
+        };
+        let mut run = postgres
             .exec(
                 ExecCommand::new(["gosu", "postgres", "bash", "-euo", "pipefail", "-c", script])
                     .with_cmd_ready_condition(CmdWaitFor::exit()),
@@ -1087,6 +1153,12 @@ impl Fixture {
     async fn authorization(&self) -> &Authorization {
         self.fga
             .get_or_init(|| async {
+                if let Ok(url) = std::env::var(stack::OPENFGA_URL_VAR) {
+                    return Authorization {
+                        _container: None,
+                        url,
+                    };
+                }
                 let request = GenericImage::new(FGA_IMAGE, FGA_TAG)
                     .with_exposed_port(FGA_GRPC_PORT.tcp())
                     .with_exposed_port(FGA_HTTP_PORT.tcp())

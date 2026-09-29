@@ -1,0 +1,6 @@
+connetto-core --all-features
+connetto-auth-session
+connetto-file-core
+connetto-file-client
+connetto-client --features native-auth
+connetto-dioxus

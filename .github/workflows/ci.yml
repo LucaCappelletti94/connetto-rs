@@ -578,12 +578,9 @@ jobs:
           rm dx-aarch64-apple-darwin.tar.gz
           dx --version
 
-      # libpq links the server and the harness, and the proof reads the
-      # simulator's pages through ios_webkit_debug_proxy.
-      - name: Install libpq and ios_webkit_debug_proxy
-        run: |
-          brew install libpq ios-webkit-debug-proxy
-          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> "${GITHUB_ENV}"
+      # The proof reads the simulator's pages through ios_webkit_debug_proxy.
+      - name: Install ios_webkit_debug_proxy
+        run: brew install ios-webkit-debug-proxy
 
       # One release tree, whose dependencies the server and the harness share.
       - name: Build the server and the proof
@@ -637,6 +634,73 @@ jobs:
         with:
           path: examples/dioxus-desktop-demo/target
           key: ${{ steps.cache-3.outputs.cache-primary-key }}
+
+  ios-crate-tests:
+    # The client crates' own tests, run inside an iOS simulator. The runner
+    # cannot run Docker, so each fixture starts a copy of the workflow's
+    # template cluster, beside the workflow's OpenFGA and mock identity
+    # provider. It keeps no target cache, which would not fit beside
+    # main's others under the repository's 10 GB.
+    name: iOS simulator crate tests
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore cargo downloads
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Install stable toolchain with the simulator target
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add aarch64-apple-ios-sim --toolchain stable
+
+      # The crates the iOS demo links, with the features it uses.
+      - name: Build the crates' tests for the simulator
+        run: |
+          while read -r -a crate; do
+            cargo +stable test --no-run --target aarch64-apple-ios-sim -p "${crate[@]}"
+          done < .github/ios-crates.txt
+
+      - uses: ./.github/actions/start-native-services
+
+      - name: Boot a simulator
+        run: |
+          udid=$(xcrun simctl list devices available --json \
+            | jq -r '[.devices[][] | select(.name == "iPhone 17 Pro")][0].udid')
+          xcrun simctl boot "$udid"
+          xcrun simctl bootstatus "$udid" -b
+          echo "SIMULATOR_UDID=$udid" >> "${GITHUB_ENV}"
+
+      # simctl passes the variables prefixed SIMCTL_CHILD_ into the simulator.
+      - name: Run the crates' tests in the simulator
+        env:
+          CARGO_TARGET_AARCH64_APPLE_IOS_SIM_RUNNER: xcrun simctl spawn ${{ env.SIMULATOR_UDID }}
+          SIMCTL_CHILD_CONNETTO_POSTGRES_BIN: ${{ env.CONNETTO_POSTGRES_BIN }}
+          SIMCTL_CHILD_CONNETTO_POSTGRES_TEMPLATE: ${{ env.CONNETTO_POSTGRES_TEMPLATE }}
+          SIMCTL_CHILD_CONNETTO_STACK_OPENFGA_URL: ${{ env.CONNETTO_STACK_OPENFGA_URL }}
+          SIMCTL_CHILD_CONNETTO_STACK_ISSUER: ${{ env.CONNETTO_STACK_ISSUER }}
+          SIMCTL_CHILD_RUST_BACKTRACE: "1"
+        run: |
+          status=0
+          while read -r -a crate; do
+            cargo +stable test --no-fail-fast --target aarch64-apple-ios-sim -p "${crate[@]}" || status=1
+          done < .github/ios-crates.txt
+          exit "$status"
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: ios-crate-test-services
+          path: ${{ runner.temp }}/native-services/logs
+          retention-days: 7
 
   rust-tests:
     name: Rust tests ${{ matrix.name }}

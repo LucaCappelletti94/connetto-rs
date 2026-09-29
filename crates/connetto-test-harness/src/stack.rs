@@ -5,6 +5,7 @@ use std::fs;
 use std::net::TcpListener as StdTcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, anyhow};
@@ -41,15 +42,21 @@ pub struct TempDir {
 }
 
 impl TempDir {
-    /// Create a directory under the system temp dir named after `label`.
+    /// Create a directory under the system temp dir named after `label`,
+    /// distinct from every other this process creates.
     ///
     /// # Errors
     ///
-    /// When the directory cannot be created.
+    /// When the directory cannot be created or already exists.
     pub async fn create(label: &str) -> Result<Self> {
-        let path =
-            std::env::temp_dir().join(format!("{label}-{}-{}", std::process::id(), now_millis()));
-        tokio::fs::create_dir_all(&path)
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "{label}-{}-{}-{}",
+            std::process::id(),
+            now_millis(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        tokio::fs::create_dir(&path)
             .await
             .with_context(|| format!("creating {}", path.display()))?;
         Ok(Self { path })
@@ -337,9 +344,11 @@ pub const TLS_KEY_VAR: &str = "CONNETTO_STACK_TLS_KEY";
 /// The variables naming services a stack uses in place of the containers it
 /// would start, all three together. See [`RunningServices`].
 pub const POSTGRES_URL_VAR: &str = "CONNETTO_STACK_POSTGRES_URL";
-/// See [`POSTGRES_URL_VAR`].
+/// See [`POSTGRES_URL_VAR`]. A fixture also uses it alone, see
+/// [`Fixture::acquire`](crate::Fixture::acquire).
 pub const OPENFGA_URL_VAR: &str = "CONNETTO_STACK_OPENFGA_URL";
-/// See [`POSTGRES_URL_VAR`].
+/// See [`POSTGRES_URL_VAR`]. A provider also uses it alone, see
+/// [`MockOauth::start`](crate::MockOauth::start).
 pub const ISSUER_VAR: &str = "CONNETTO_STACK_ISSUER";
 
 /// Services something else started for a stack, where Docker cannot run.
@@ -580,7 +589,7 @@ pub fn now_millis() -> u128 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ISSUER_VAR, OPENFGA_URL_VAR, POSTGRES_URL_VAR, RunningServices};
+    use super::{ISSUER_VAR, OPENFGA_URL_VAR, POSTGRES_URL_VAR, RunningServices, TempDir};
 
     fn lookup(set: &[&str]) -> impl Fn(&str) -> Option<String> {
         let set: Vec<String> = set.iter().map(|name| (*name).to_owned()).collect();
@@ -600,6 +609,17 @@ mod tests {
         assert_eq!(services.postgres, format!("{POSTGRES_URL_VAR}-value"));
         assert_eq!(services.openfga, format!("{OPENFGA_URL_VAR}-value"));
         assert_eq!(services.issuer, format!("{ISSUER_VAR}-value"));
+    }
+
+    /// Fixtures made in one instant each start a cluster in a directory of
+    /// their own, so two directories made back to back must differ.
+    #[tokio::test]
+    async fn directories_made_in_one_instant_are_distinct() {
+        for _ in 0..100 {
+            let first = TempDir::create("temp-dir-test").await.unwrap();
+            let second = TempDir::create("temp-dir-test").await.unwrap();
+            assert_ne!(first.path, second.path);
+        }
     }
 
     #[test]

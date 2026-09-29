@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Starts Postgres, OpenFGA and the mock identity provider as plain processes
 # under DIR, for a macOS arm64 machine that cannot run Docker, and names them
-# in the CONNETTO_STACK_* variables connetto-demo-stack reads. The variables
-# go to GITHUB_ENV when it is set and to standard output otherwise. Every PID
-# is written to DIR/pids.
+# in the CONNETTO_STACK_* variables connetto-demo-stack reads. For test
+# fixtures that start clusters of their own it also names the directory of
+# pg_ctl in CONNETTO_POSTGRES_BIN and a stopped template cluster to copy in
+# CONNETTO_POSTGRES_TEMPLATE, made here since initdb cannot run inside the
+# iOS simulator. The variables go to GITHUB_ENV when it is set and to
+# standard output otherwise. Every PID is written to DIR/pids.
 #
 #   start.sh DIR
 #
@@ -47,6 +50,7 @@ curl -fsSL --retry 3 "$base/$pg.tar.gz.sha256" \
   | fetch_checked "$base/$pg.tar.gz"
 tar xzf "$pg.tar.gz"
 "$pg/bin/initdb" -D pgdata -U postgres --auth=trust > logs/initdb.log
+"$pg/bin/initdb" -D template -U postgres --auth=trust --no-sync > logs/initdb-template.log
 "$pg/bin/pg_ctl" -D pgdata -l logs/postgres.log -w \
   -o "-c wal_level=logical -c fsync=off -c port=$pg_port -c listen_addresses=127.0.0.1" \
   start > /dev/null
@@ -99,6 +103,8 @@ variables=(
   "CONNETTO_STACK_POSTGRES_URL=postgres://postgres:postgres@127.0.0.1:$pg_port/postgres"
   "CONNETTO_STACK_OPENFGA_URL=http://127.0.0.1:$fga_grpc_port"
   "CONNETTO_STACK_ISSUER=http://127.0.0.1:$oauth_port/default"
+  "CONNETTO_POSTGRES_BIN=$PWD/$pg/bin"
+  "CONNETTO_POSTGRES_TEMPLATE=$PWD/template"
 )
 if [ -n "${GITHUB_ENV:-}" ]; then
   printf '%s\n' "${variables[@]}" >> "$GITHUB_ENV"
