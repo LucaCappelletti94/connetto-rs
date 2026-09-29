@@ -137,3 +137,64 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use diesel::sql_types::Text;
+    use diesel_async::RunQueryDsl as _;
+
+    use super::NativeCluster;
+    use crate::pool_when_ready;
+    use crate::stack::TempDir;
+
+    /// The newest server programs of the Debian and Ubuntu layout, which the
+    /// CI runners ship.
+    fn postgres_bin() -> PathBuf {
+        std::fs::read_dir("/usr/lib/postgresql")
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path().join("bin"))
+            .filter(|bin| bin.join("pg_ctl").exists())
+            .max()
+            .expect("no /usr/lib/postgresql/*/bin/pg_ctl, install the PostgreSQL server")
+    }
+
+    #[tokio::test]
+    async fn a_cluster_copied_from_a_template_serves_logical_replication_until_dropped() {
+        let bin = postgres_bin();
+        let dir = TempDir::create("native-cluster-test").await.unwrap();
+        let template = dir.path.join("template");
+        let initdb = std::process::Command::new(bin.join("initdb"))
+            .arg("-D")
+            .arg(&template)
+            .args(["-U", "postgres", "--auth=trust", "--no-sync"])
+            .output()
+            .unwrap();
+        assert!(
+            initdb.status.success(),
+            "{}",
+            String::from_utf8_lossy(&initdb.stderr)
+        );
+
+        let cluster = NativeCluster::start(&bin, &template).await;
+        let port = cluster.port;
+        let pool = pool_when_ready(&cluster.admin_url()).await;
+        let wal_level: String =
+            diesel::select(diesel::dsl::sql::<Text>("current_setting('wal_level')"))
+                .get_result(&mut pool.get().await.unwrap())
+                .await
+                .unwrap();
+        assert_eq!(wal_level, "logical");
+        assert!(
+            template.join("postmaster.pid").metadata().is_err(),
+            "the server ran on the template itself"
+        );
+
+        drop(pool);
+        drop(cluster);
+        assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
+    }
+}
