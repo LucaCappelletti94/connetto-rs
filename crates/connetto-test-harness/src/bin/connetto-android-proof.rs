@@ -386,6 +386,10 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
 
 struct Device {
     serial: String,
+    /// The `adb` program, a stand-in under test.
+    program: PathBuf,
+    /// How long a device that dropped offline gets to come back.
+    recover_within: Duration,
     /// The browser targets [`Device::login_tab`] returned. A finished login's
     /// tab can stay listed on the authorize URL while it closes, so a later
     /// login must never pick it again.
@@ -394,8 +398,14 @@ struct Device {
 
 impl Device {
     fn new(serial: String) -> Self {
+        Self::with_adb(serial, PathBuf::from("adb"), Duration::from_secs(30))
+    }
+
+    fn with_adb(serial: String, program: PathBuf, recover_within: Duration) -> Self {
         Self {
             serial,
+            program,
+            recover_within,
             spent_tabs: std::sync::Mutex::default(),
         }
     }
@@ -423,23 +433,67 @@ impl Device {
         }
     }
 
+    /// Runs `adb -s SERIAL args`, and once more after reconnecting when the
+    /// device had dropped offline, which an emulator's transport does under load.
     async fn adb(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new("adb")
-            .arg("-s")
-            .arg(&self.serial)
-            .args(args)
-            .output()
-            .await
-            .context("starting adb")?;
+        let output = self.run(args).await?;
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !stderr.contains("device offline") {
+            bail!(
+                "adb {} exited with {}: {stderr}",
+                args.join(" "),
+                output.status
+            );
+        }
+        eprintln!("{} dropped offline, reconnecting", self.serial);
+        self.reconnect().await?;
+        let output = self.run(args).await?;
         if !output.status.success() {
             bail!(
-                "adb {} exited with {}: {}",
+                "adb {} exited with {} after a reconnect: {}",
                 args.join(" "),
                 output.status,
                 String::from_utf8_lossy(&output.stderr)
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    async fn run(&self, args: &[&str]) -> Result<std::process::Output> {
+        Command::new(&self.program)
+            .arg("-s")
+            .arg(&self.serial)
+            .args(args)
+            .output()
+            .await
+            .context("starting adb")
+    }
+
+    /// Resets offline transports and waits, up to the bound, for the device to answer.
+    async fn reconnect(&self) -> Result<()> {
+        // A failed reset still leaves the state poll below to decide.
+        let _ = Command::new(&self.program)
+            .args(["reconnect", "offline"])
+            .output()
+            .await;
+        let deadline = Instant::now() + self.recover_within;
+        loop {
+            let state = self.run(&["get-state"]).await?;
+            if String::from_utf8_lossy(&state.stdout).trim() == "device" {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "{} stayed offline for {:?} after a reconnect",
+                    self.serial,
+                    self.recover_within
+                );
+            }
+            sleep(Duration::from_millis(200)).await;
+        }
     }
 
     async fn rust_target(&self) -> Result<String> {
@@ -497,7 +551,7 @@ impl Device {
     async fn drop_sync_link(&self, reverse: &[(u16, u16)]) -> Result<()> {
         restart_adb_server().await?;
         if self.serial.contains(':') {
-            let status = Command::new("adb")
+            let status = Command::new(&self.program)
                 .args(["connect", &self.serial])
                 .status()
                 .await
@@ -539,7 +593,7 @@ impl Device {
     }
 
     async fn screenshot(&self, dir: &Path, name: &str) -> Result<()> {
-        let output = Command::new("adb")
+        let output = Command::new(&self.program)
             .args(["-s", &self.serial, "exec-out", "screencap", "-p"])
             .output()
             .await
@@ -583,7 +637,11 @@ impl Device {
                 self.spent_tabs.lock().expect("spent tabs").push(id);
                 return PageSession::devtools(&ws).await;
             }
-            self.tap_interstitial().await?;
+            // uiautomator's dump is killed now and then while the system is busy, and the
+            // next round retries it until the deadline.
+            if let Err(err) = self.tap_interstitial().await {
+                eprintln!("looking for the browser's first-run screens: {err:#}");
+            }
             if Instant::now() >= deadline {
                 bail!("no browser tab opened {prefix}");
             }
@@ -658,5 +716,88 @@ fn parse_bounds(text: &str) -> Option<(i32, i32, i32, i32)> {
     match numbers.as_slice() {
         [left, top, right, bottom] => Some((*left, *top, *right, *bottom)),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
+
+    use super::Device;
+
+    /// A stand-in `adb` that runs `body` with `$state` naming a scratch directory.
+    fn fake_adb(dir: &Path, body: &str) -> PathBuf {
+        let path = dir.join("adb");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nstate={}\necho \"$*\" >>\"$state/calls\"\n{body}\n",
+                dir.display()
+            ),
+        )
+        .expect("write the fake adb");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        path
+    }
+
+    fn calls(dir: &Path) -> String {
+        std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn a_device_that_drops_offline_once_is_reconnected_and_the_command_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adb = fake_adb(
+            dir.path(),
+            r#"case "$*" in
+  "reconnect offline") exit 0 ;;
+  *get-state*) echo device; exit 0 ;;
+esac
+if [ ! -e "$state/dropped" ]; then touch "$state/dropped"; echo "adb: device offline" >&2; exit 1; fi
+echo ok"#,
+        );
+        let device = Device::with_adb("emulator-5554".to_owned(), adb, Duration::from_secs(5));
+        let out = device
+            .adb(&["shell", "true"])
+            .await
+            .expect("the retry succeeds");
+        assert_eq!(out, "ok\n");
+        let calls = calls(dir.path());
+        assert!(calls.contains("reconnect offline"), "{calls}");
+        assert_eq!(calls.matches("shell true").count(), 2, "{calls}");
+    }
+
+    #[tokio::test]
+    async fn a_device_that_stays_offline_fails_within_the_bound() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adb = fake_adb(
+            dir.path(),
+            r#"case "$*" in
+  "reconnect offline") exit 0 ;;
+  *get-state*) echo offline; exit 0 ;;
+esac
+echo "adb: device offline" >&2; exit 1"#,
+        );
+        let device = Device::with_adb("emulator-5554".to_owned(), adb, Duration::from_millis(600));
+        let started = std::time::Instant::now();
+        let err = device
+            .adb(&["shell", "true"])
+            .await
+            .expect_err("still offline");
+        assert!(started.elapsed() < Duration::from_secs(5), "bounded wait");
+        assert!(format!("{err:#}").contains("offline"), "{err:#}");
+    }
+
+    #[tokio::test]
+    async fn any_other_adb_failure_is_not_retried() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adb = fake_adb(dir.path(), r#"echo "error: closed" >&2; exit 1"#);
+        let device = Device::with_adb("emulator-5554".to_owned(), adb, Duration::from_secs(5));
+        device.adb(&["shell", "true"]).await.expect_err("fails");
+        let calls = calls(dir.path());
+        assert!(!calls.contains("reconnect"), "{calls}");
+        assert_eq!(calls.matches("shell true").count(), 1, "{calls}");
     }
 }

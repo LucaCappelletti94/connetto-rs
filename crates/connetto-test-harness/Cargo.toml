@@ -112,6 +112,8 @@ parking_lot = "0.12"
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.
 sqlite-diff-rs = { version = "0.15", default-features = false }
+# A stand-in adb for the Android proof's offline-recovery tests.
+tempfile = "3"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Joining a fresh anonymous session keyring in-process, replacing the external
