@@ -877,34 +877,12 @@ impl Fixture {
                 .with_writer(std::io::stderr)
                 .try_init();
         }
-        let programs = (
-            std::env::var_os(native::POSTGRES_BIN_VAR),
-            std::env::var_os(native::POSTGRES_TEMPLATE_VAR),
-        );
-        if programs.0.is_some() || programs.1.is_some() {
-            let (Some(bin), Some(template)) = programs else {
-                panic!(
-                    "{} and {} go together",
-                    native::POSTGRES_BIN_VAR,
-                    native::POSTGRES_TEMPLATE_VAR
-                );
-            };
+        if let Some(programs) = native::NativePrograms::from_lookup(|name| std::env::var_os(name)) {
             assert!(
                 !restorable,
                 "a restorable fixture needs the container's spare cluster and shell"
             );
-            let cluster =
-                NativeCluster::start(std::path::Path::new(&bin), std::path::Path::new(&template))
-                    .await;
-            return Self::provisioned(
-                cluster.admin_url(),
-                Cluster::Native { _guard: cluster },
-                None,
-                OnceCell::new(),
-                shared_counter_scope,
-                exclusive_counter_scope,
-            )
-            .await;
+            return Self::on_native(&programs, shared_counter_scope, exclusive_counter_scope).await;
         }
         sweep_abandoned_containers();
         let mut image = GenericImage::new(POSTGRES_IMAGE, POSTGRES_TAG)
@@ -940,6 +918,24 @@ impl Fixture {
             admin_url,
             Cluster::Container(Box::new(postgres)),
             spare_url,
+            OnceCell::new(),
+            shared_counter_scope,
+            exclusive_counter_scope,
+        )
+        .await
+    }
+
+    /// A fixture on a cluster of its own copied from `programs`' template.
+    pub(crate) async fn on_native(
+        programs: &native::NativePrograms,
+        shared_counter_scope: Option<RwLockReadGuard<'static, ()>>,
+        exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
+    ) -> Self {
+        let cluster = NativeCluster::start(&programs.bin, &programs.template).await;
+        Self::provisioned(
+            cluster.admin_url(),
+            Cluster::Native { _guard: cluster },
+            None,
             OnceCell::new(),
             shared_counter_scope,
             exclusive_counter_scope,

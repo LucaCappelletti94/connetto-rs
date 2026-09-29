@@ -1,6 +1,7 @@
 //! Postgres clusters started as plain processes, for machines that cannot run
 //! Docker, such as a macOS runner driving an iOS simulator.
 
+use std::ffi::OsString;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -24,6 +25,31 @@ pub const POSTGRES_TEMPLATE_VAR: &str = "CONNETTO_POSTGRES_TEMPLATE";
 /// Starts on a fresh port each, since another process can take a free port
 /// between choosing it and the server binding it.
 const ATTEMPTS: u32 = 3;
+
+/// The programs and template [`POSTGRES_BIN_VAR`] and
+/// [`POSTGRES_TEMPLATE_VAR`] name.
+pub(crate) struct NativePrograms {
+    pub(crate) bin: PathBuf,
+    pub(crate) template: PathBuf,
+}
+
+impl NativePrograms {
+    /// The programs `var` names, or `None` when it names neither.
+    ///
+    /// # Panics
+    ///
+    /// When `var` names one of the two without the other.
+    pub(crate) fn from_lookup(var: impl Fn(&str) -> Option<OsString>) -> Option<Self> {
+        match (var(POSTGRES_BIN_VAR), var(POSTGRES_TEMPLATE_VAR)) {
+            (Some(bin), Some(template)) => Some(Self {
+                bin: bin.into(),
+                template: template.into(),
+            }),
+            (None, None) => None,
+            _ => panic!("{POSTGRES_BIN_VAR} and {POSTGRES_TEMPLATE_VAR} go together"),
+        }
+    }
+}
 
 /// A cluster in a directory of its own, stopped on drop before the directory
 /// goes.
@@ -140,14 +166,17 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsString;
     use std::path::PathBuf;
 
+    use diesel::QueryDsl as _;
     use diesel::sql_types::Text;
     use diesel_async::RunQueryDsl as _;
 
-    use super::NativeCluster;
-    use crate::pool_when_ready;
+    use super::{NativePrograms, POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
+    use crate::Fixture;
     use crate::stack::TempDir;
+    use crate::watermark::_connetto_mutations;
 
     /// The newest server programs of the Debian and Ubuntu layout, which the
     /// CI runners ship.
@@ -162,8 +191,42 @@ mod tests {
             .expect("no /usr/lib/postgresql/*/bin/pg_ctl, install the PostgreSQL server")
     }
 
+    fn lookup(set: &[&str]) -> impl Fn(&str) -> Option<OsString> {
+        let set: Vec<String> = set.iter().map(|name| (*name).to_owned()).collect();
+        move |name| {
+            set.iter()
+                .any(|set| set == name)
+                .then(|| format!("/{name}").into())
+        }
+    }
+
+    #[test]
+    fn both_variables_name_the_programs_and_neither_leaves_the_containers() {
+        let programs =
+            NativePrograms::from_lookup(lookup(&[POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR]))
+                .expect("both are set");
+        assert_eq!(programs.bin, PathBuf::from(format!("/{POSTGRES_BIN_VAR}")));
+        assert_eq!(
+            programs.template,
+            PathBuf::from(format!("/{POSTGRES_TEMPLATE_VAR}"))
+        );
+        assert!(NativePrograms::from_lookup(lookup(&[])).is_none());
+    }
+
+    #[test]
+    #[should_panic(expected = "go together")]
+    fn the_programs_without_a_template_are_refused() {
+        NativePrograms::from_lookup(lookup(&[POSTGRES_BIN_VAR]));
+    }
+
+    #[test]
+    #[should_panic(expected = "go together")]
+    fn a_template_without_the_programs_is_refused() {
+        NativePrograms::from_lookup(lookup(&[POSTGRES_TEMPLATE_VAR]));
+    }
+
     #[tokio::test]
-    async fn a_cluster_copied_from_a_template_serves_logical_replication_until_dropped() {
+    async fn a_native_fixture_is_provisioned_on_a_copy_and_stopped_on_drop() {
         let bin = postgres_bin();
         let dir = TempDir::create("native-cluster-test").await.unwrap();
         let template = dir.path.join("template");
@@ -178,23 +241,38 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&initdb.stderr)
         );
+        let programs = NativePrograms {
+            bin,
+            template: template.clone(),
+        };
 
-        let cluster = NativeCluster::start(&bin, &template).await;
-        let port = cluster.port;
-        let pool = pool_when_ready(&cluster.admin_url()).await;
+        let fixture = Fixture::on_native(&programs, None, None).await;
+        let port: u16 = fixture
+            .admin_url()
+            .rsplit_once(':')
+            .and_then(|(_, rest)| rest.split_once('/'))
+            .and_then(|(port, _)| port.parse().ok())
+            .expect("the admin URL names a port");
+        let mut conn = fixture.admin.get().await.unwrap();
         let wal_level: String =
             diesel::select(diesel::dsl::sql::<Text>("current_setting('wal_level')"))
-                .get_result(&mut pool.get().await.unwrap())
+                .get_result(&mut conn)
                 .await
                 .unwrap();
         assert_eq!(wal_level, "logical");
+        let pending: i64 = _connetto_mutations::table
+            .count()
+            .get_result(&mut conn)
+            .await
+            .expect("the watermark table was provisioned");
+        assert_eq!(pending, 0);
         assert!(
             template.join("postmaster.pid").metadata().is_err(),
             "the server ran on the template itself"
         );
 
-        drop(pool);
-        drop(cluster);
+        drop(conn);
+        drop(fixture);
         assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
     }
 }
