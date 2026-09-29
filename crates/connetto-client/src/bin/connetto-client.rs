@@ -19,13 +19,17 @@
 //!   the client declares no version and a versioned server rejects it.
 //! - `CONNETTO_SUB_ID`: subscription id (default `default`).
 //! - `CONNETTO_QUERY`: the row subscription `SELECT` (required).
+//! - `CONNETTO_KEY_STORE`: `keyutils` keeps the replica keys in the kernel
+//!   session keyring on Linux, which a reboot empties. Unset means the detected
+//!   durable store.
 //! - `CONNETTO_WRITE`: optional SQL run on the managed local connection after
 //!   subscribing, one statement per line. Each line is run and pushed to the
 //!   server as a separate mutation, in order. The server applies them to
 //!   Postgres.
 //!
 //! Connects, subscribes, and pumps inbound frames, printing each client event
-//! until the server closes the connection. When `CONNETTO_WRITE` is set, the
+//! until the server closes the connection or a SIGINT or SIGTERM arrives, either
+//! of which ends the process normally. When `CONNETTO_WRITE` is set, the
 //! client applies those writes locally and pushes them right after subscribing,
 //! then observes its own rows echoed back over CDC.
 
@@ -45,6 +49,34 @@ const KEYRING_SERVICE: &str = "connetto-client";
 #[tokio::main]
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
+    // Armed before any work, so a SIGTERM at any point ends the process by returning from main.
+    let terminated = terminate_signal()?;
+    tokio::select! {
+        result = run() => result,
+        () = terminated => {
+            tracing::info!("terminated");
+            Ok(())
+        }
+    }
+}
+
+/// Resolves on the first SIGINT, or on unix the first SIGTERM.
+fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+    #[cfg(unix)]
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .context("installing the SIGTERM handler")?;
+    Ok(async move {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = terminate.recv() => {}
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    })
+}
+
+async fn run() -> Result<()> {
     let server = var_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
     let db_path = std::env::var("CONNETTO_DB").context("set CONNETTO_DB to a file path")?;
     let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
@@ -93,7 +125,7 @@ async fn main() -> Result<()> {
     // identity to name a record after. A replica already on disk reads the cache
     // and never mints: a fresh key for an existing file decrypts nothing, and
     // writing one would fill the record that restoring a backup still could.
-    let keys = KeyringKeyStore::new(KEYRING_SERVICE);
+    let keys = key_store()?;
     let resolved = if std::path::Path::new(&db_path).exists() {
         keys.load(&db_path)
             .await
@@ -150,5 +182,55 @@ async fn main() -> Result<()> {
             }
             event => tracing::info!(event = ?event, "client event"),
         }
+    }
+}
+
+/// The replica-key store `CONNETTO_KEY_STORE` names, or the detected one.
+fn key_store() -> anyhow::Result<KeyringKeyStore> {
+    key_store_named(std::env::var("CONNETTO_KEY_STORE").ok().as_deref())
+}
+
+fn key_store_named(name: Option<&str>) -> anyhow::Result<KeyringKeyStore> {
+    match name {
+        None => Ok(KeyringKeyStore::new(KEYRING_SERVICE)),
+        #[cfg(target_os = "linux")]
+        Some("keyutils") => Ok(KeyringKeyStore::with_linux_store(
+            KEYRING_SERVICE,
+            connetto_client::LinuxStore::Keyutils,
+        )),
+        Some(other) => Err(anyhow!(
+            "CONNETTO_KEY_STORE={other} names no store this platform has"
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::key_store_named;
+
+    #[test]
+    fn an_unknown_store_name_is_refused_naming_it() {
+        let err = key_store_named(Some("secret-service"))
+            .err()
+            .expect("refused");
+        assert!(
+            err.to_string()
+                .contains("CONNETTO_KEY_STORE=secret-service"),
+            "got {err}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn keyutils_and_detection_are_the_two_choices() {
+        let keyutils = key_store_named(Some("keyutils")).expect("keyutils");
+        assert_eq!(
+            keyutils.backend().await.expect("opens"),
+            connetto_client::Backend::Keyutils
+        );
+        assert!(
+            key_store_named(None).is_ok(),
+            "unset means the detected store"
+        );
     }
 }

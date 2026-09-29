@@ -46,7 +46,7 @@ use subql::{ClockHandle, EventKind, PgChangeEvent, PgCommit, PgCommitPosition, P
 use crate::fence::Unseen;
 
 /// Default retention age: 72 hours (`06-reconnect.md` line 69).
-const DEFAULT_MAX_AGE: Duration = Duration::from_secs(72 * 60 * 60);
+const DEFAULT_MAX_AGE: Duration = Duration::from_hours(72);
 /// Default retention count: one million entries (`06-reconnect.md` line 69).
 const DEFAULT_MAX_ENTRIES: usize = 1_000_000;
 

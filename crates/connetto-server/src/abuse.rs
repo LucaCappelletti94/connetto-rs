@@ -22,7 +22,7 @@ use connetto_core::SessionId;
 use crate::throttle::Limit;
 
 /// One day, the window every per-person default uses.
-const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+const DAY: Duration = Duration::from_hours(24);
 
 /// One act of naming something precise and being told no.
 ///

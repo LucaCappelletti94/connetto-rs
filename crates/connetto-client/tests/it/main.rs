@@ -25,6 +25,9 @@ mod key_requirement;
 
 mod live_dispatch;
 
+#[cfg(all(feature = "native-auth", target_os = "linux"))]
+mod linux_custody;
+
 mod local_export;
 
 mod local_import;

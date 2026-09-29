@@ -20,7 +20,7 @@ exclude = ["examples/dioxus-desktop-demo", "examples/webauthn-unlock"]
 [workspace.package]
 version = "0.0.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.92"
 authors = ["Luca Cappelletti <cappelletti.luca94@gmail.com>"]
 license = "MIT"
 repository = "https://github.com/LucaCappelletti94/connetto-rs"

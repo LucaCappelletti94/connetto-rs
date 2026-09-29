@@ -142,7 +142,7 @@ const STARTED_LABEL: &str = "io.connetto.harness.started";
 /// How old a labelled container must be before the sweep removes it. Longer
 /// than any test by a wide margin, because a sibling test process owns
 /// containers this process must not touch.
-const STALE_AFTER: Duration = Duration::from_secs(2 * 60 * 60);
+const STALE_AFTER: Duration = Duration::from_hours(2);
 
 /// How long a container has to pass its health probe.
 ///

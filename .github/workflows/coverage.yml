@@ -73,10 +73,10 @@ jobs:
             --profile minimal \
             --component llvm-tools-preview
 
-      - name: Install keyring helper
+      - name: Install keyring helpers
         run: |
           sudo apt-get update
-          sudo apt-get install -y keyutils
+          sudo apt-get install -y keyutils dbus gnome-keyring
 
       - uses: taiki-e/install-action@cargo-llvm-cov
       - uses: taiki-e/install-action@nextest
@@ -102,6 +102,12 @@ jobs:
             --all-features \
             --test-threads 4 \
             ${{ matrix.packages }}
+          # The desktop Secret Service path, whose child processes inherit the
+          # profile environment. The systemd and container groups run with a
+          # clean environment, so ci.yml runs them uninstrumented.
+          if [ "${{ matrix.name }}" = client ]; then
+            CARGO_TEST_PROFILE=testfast scripts/linux-secret-store-tests.sh secret-service
+          fi
           cargo +stable llvm-cov report \
             --profile testfast \
             --codecov \

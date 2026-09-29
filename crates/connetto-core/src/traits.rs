@@ -148,17 +148,24 @@ pub trait Store {
     async fn set_session_token(&mut self, token: String) -> Result<(), Self::Error>;
 }
 
+/// What every [`RefreshTokenStore`] method resolves to.
+///
+/// Boxed so that `dyn RefreshTokenStore` stays usable, which the native
+/// authenticator holds.
+pub type RefreshFuture<'a, T, E> =
+    core::pin::Pin<Box<dyn Future<Output = Result<T, E>> + Send + 'a>>;
+
 /// Where a device persists its rotating refresh token between runs.
 ///
-/// Both targets implement this: an OS keyring natively, an encrypted `SQLite`
-/// database in the browser. Neither needs to await, so this stays synchronous
-/// while [`ReplicaKeyStore`] does not.
+/// It awaits because the Linux desktop store is the Secret Service, reached only
+/// over D-Bus, and a caller on a runtime worker must not hold that worker for a
+/// round trip or for an unlock dialog (R71 decision 15).
 ///
 /// Every accessor names the account whose token it addresses. The store itself is
-/// therefore not scoped to anybody, which is what the browser bootstrap
-/// requires: the refresh token is what reveals the account, so something has to
-/// be readable before any account is known, and a store constructed for an
-/// account would have nobody to construct it for.
+/// therefore not scoped to anybody, which is what a bootstrap requires: the
+/// refresh token is what reveals the account, so something has to be readable
+/// before any account is known, and a store constructed for an account would
+/// have nobody to construct it for.
 pub trait RefreshTokenStore {
     /// Store-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
@@ -168,21 +175,21 @@ pub trait RefreshTokenStore {
     /// # Errors
     ///
     /// [`Self::Error`] if the backing store cannot be read.
-    fn load(&self, account: &str) -> Result<Option<String>, Self::Error>;
+    fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, Self::Error>;
 
     /// Persist `token` for `account`, replacing any prior one.
     ///
     /// # Errors
     ///
     /// [`Self::Error`] if the backing store cannot be written.
-    fn store(&self, account: &str, token: &str) -> Result<(), Self::Error>;
+    fn store<'a>(&'a self, account: &'a str, token: &'a str) -> RefreshFuture<'a, (), Self::Error>;
 
     /// Remove the token stored for `account`, if any.
     ///
     /// # Errors
     ///
     /// [`Self::Error`] if the backing store cannot be cleared.
-    fn clear(&self, account: &str) -> Result<(), Self::Error>;
+    fn clear<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, (), Self::Error>;
 
     /// Every account this store holds a token for, in unspecified order.
     ///
@@ -191,13 +198,9 @@ pub trait RefreshTokenStore {
     /// account key can collide with one, because an account key is a serialized
     /// id and a reserved name is not valid JSON.
     ///
-    /// The two targets answer differently because only one of them can. The
-    /// browser reads the rows the tokens themselves live in, so its answer
-    /// cannot disagree with what is stored. `keyring` 3.6.3 exposes no
-    /// enumeration on any of its backends, so the native store maintains an
-    /// index record and answers from that, which an out-of-band keychain edit
-    /// can leave stale. A stale entry costs an interactive login, never a wrong
-    /// identity.
+    /// No OS keyring backend enumerates, so the native store maintains an index
+    /// record and answers from that, which an out-of-band keychain edit can leave
+    /// stale. A stale entry costs an interactive login, never a wrong identity.
     ///
     /// Order carries no meaning, so a caller wanting the boot default reads the
     /// last-used marker rather than taking the first entry.
@@ -205,7 +208,7 @@ pub trait RefreshTokenStore {
     /// # Errors
     ///
     /// [`Self::Error`] if the backing store cannot be read.
-    fn accounts(&self) -> Result<Vec<String>, Self::Error>;
+    fn accounts(&self) -> RefreshFuture<'_, Vec<String>, Self::Error>;
 }
 
 /// Where a device caches the per-replica encryption keys it minted.
