@@ -107,7 +107,7 @@ pub use builder::native::{
 };
 pub use builder::sign_in::{AccountChoice, Auth, HeldCredential, WebSignIn};
 #[cfg(feature = "native-auth")]
-pub use builder::sign_in::{Keyring, KeyringAuth, StoredAuth};
+pub use builder::sign_in::{AccountChooser, Keyring, KeyringAuth, StoredAuth};
 #[cfg(feature = "native-transport")]
 pub use builder::sign_in::{NativeSignIn, NoKeyring};
 pub use builder::{
