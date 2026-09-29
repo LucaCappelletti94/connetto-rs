@@ -578,12 +578,9 @@ jobs:
           rm dx-aarch64-apple-darwin.tar.gz
           dx --version
 
-      # libpq links the server and the harness, and the proof reads the
-      # simulator's pages through ios_webkit_debug_proxy.
-      - name: Install libpq and ios_webkit_debug_proxy
-        run: |
-          brew install libpq ios-webkit-debug-proxy
-          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> "${GITHUB_ENV}"
+      # The proof reads the simulator's pages through ios_webkit_debug_proxy.
+      - name: Install ios_webkit_debug_proxy
+        run: brew install ios-webkit-debug-proxy
 
       # One release tree, whose dependencies the server and the harness share.
       - name: Build the server and the proof
@@ -664,11 +661,6 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-apple-ios-sim --toolchain stable
-
-      - name: Install libpq
-        run: |
-          brew install libpq
-          echo "PQ_LIB_DIR=$(brew --prefix libpq)/lib" >> "${GITHUB_ENV}"
 
       # The crates the iOS demo links, with the features it uses.
       - name: Build the crates' tests for the simulator
