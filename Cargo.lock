@@ -1032,6 +1032,7 @@ dependencies = [
  "sqlite-diff-rs",
  "sqlparser",
  "subql",
+ "tempfile",
  "testcontainers",
  "thiserror 2.0.20",
  "tokio",
