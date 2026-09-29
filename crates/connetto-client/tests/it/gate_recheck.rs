@@ -7,7 +7,7 @@
 //! prompt and without a real sleep.
 
 use connetto_client::{
-    ClientBuilder, ClientError, ClientEvent, Clock, ConnettoClient, DataDir, GateAskFuture,
+    ClientBuilder, ClientError, ClientEvent, Clock, ConnettoClient, DataDir, Gate, GateAskFuture,
     GateAskOutcome, GateMechanism, Moment,
 };
 use connetto_core::messages::{BulkMessage, ControlMessage, GateState, HandshakeAck, LivePatch};
@@ -812,5 +812,49 @@ async fn a_gated_launch_refuses_with_conn_until_approval() {
     assert!(
         client.with_conn(|_| ()).await.is_ok(),
         "after approval, access resumes"
+    );
+}
+
+/// The gate a durable build carries reaches the client with its grace: a
+/// return within the grace keeps the gate open, a return beyond it locks.
+#[tokio::test]
+async fn a_built_gate_rechecks_a_return_beyond_its_grace() {
+    let dir = tempdir().expect("temp dir");
+    let script = Script::with(vec![ack()]);
+    let credential = super::support::held("tester");
+    let key_store = super::support::key_store(&credential).await;
+    let mechanism = FakeMechanism::new();
+    let (running, pump) = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(script.clone()),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+    .with_gate(Gate::default().with_recheck(Some(Duration::from_secs(60))))
+    .with_gate_mechanism(mechanism.clone())
+    .connect_with_pump()
+    .await
+    .expect("the gated build connects");
+    tokio::spawn(pump);
+    let client = running.client().clone();
+    let mut events = client.events();
+    unlock_gate(&client, &mut events, &mechanism).await;
+
+    let clock = FakeClock::new();
+    client.away(Moment::now(&clock)).await;
+    clock.set(Duration::from_secs(30), Duration::from_secs(30));
+    client.back(Moment::now(&clock)).await;
+    assert!(
+        client.with_conn(|_| ()).await.is_ok(),
+        "a return within the build's grace keeps the gate open"
+    );
+
+    client.away(Moment::now(&clock)).await;
+    clock.set(Duration::from_secs(100), Duration::from_secs(100));
+    client.back(Moment::now(&clock)).await;
+    assert_eq!(
+        next_gate_event(&mut events).await,
+        ClientEvent::Locked,
+        "a return beyond the build's grace locks"
     );
 }

@@ -12,8 +12,8 @@ use connetto_client::{
     SyncStatus, SyncTuning, TransportFactory,
 };
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, Pong, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    SubscriptionPriority, TabIdentity,
+    BulkMessage, ControlMessage, HandshakeAck, Pong, RateLimited, SnapshotBegin, SnapshotEnd,
+    SnapshotPatch, SubscriptionPriority, TabIdentity,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaBundle, loopback};
@@ -733,4 +733,102 @@ async fn a_first_then_build_reconnects_through_its_factory() {
     .await
     .expect("the reconnect dials through the factory");
     client.close().await;
+}
+
+/// How long the deferring server below asks a throttled write to wait.
+const DEFERRAL: Duration = Duration::from_millis(250);
+
+/// A server that answers the handshake, reports a limit on a subscription
+/// that is no write of the client's, then defers every write it is sent.
+fn deferring_server() -> LoopbackTransport {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        server.send_control(ack()).await.expect("ack the handshake");
+        server
+            .send_control(ControlMessage::RateLimited(RateLimited {
+                related_to: Some("some-subscription".to_owned()),
+                retry_after_ms: 5_000,
+            }))
+            .await
+            .expect("limit a subscription");
+        while let Ok(Some(frame)) = server.recv().await {
+            if let IncomingFrame::Control(ControlMessage::MutationHeader(header)) = frame {
+                server
+                    .send_control(ControlMessage::RateLimited(RateLimited {
+                        related_to: Some(header.client_seq.to_string()),
+                        retry_after_ms: u64::try_from(DEFERRAL.as_millis()).expect("fits"),
+                    }))
+                    .await
+                    .expect("defer the write");
+            }
+        }
+    });
+    client_end
+}
+
+/// The next `RateLimited` the connection reports, as its correlation and wait.
+async fn next_rate_limit<T>(
+    conn: &mut connetto_client::ConnettoConnection<T>,
+) -> (Option<String>, u64)
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::RateLimited {
+                related_to,
+                retry_after_ms,
+            } => return (related_to, retry_after_ms),
+            ClientEvent::Closed => panic!("closed before the server limited anything"),
+            _ => {}
+        }
+    }
+}
+
+/// A limit on something other than a pending write arms no resend, and a
+/// deferred write arms one that waits exactly as long as the server asked.
+#[tokio::test]
+async fn a_deferred_write_waits_as_long_as_the_server_asked() {
+    let mut conn = ClientBuilder::new(
+        bundle(),
+        OneShot {
+            transport: Some(deferring_server()),
+        },
+    )
+    .connect_driven()
+    .await
+    .expect("connect driven");
+
+    let (related_to, _) = next_rate_limit(&mut conn).await;
+    assert_eq!(related_to.as_deref(), Some("some-subscription"));
+    assert!(
+        conn.resend_timer().is_none(),
+        "a limit on no pending write arms no resend"
+    );
+
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(9), orders::label.eq("deferred")))
+        .execute(conn.conn())
+        .expect("local insert");
+    let seq = conn.push().await.expect("push").expect("mutation sent");
+    let (related_to, retry_after_ms) = next_rate_limit(&mut conn).await;
+    assert_eq!(
+        related_to,
+        Some(seq.to_string()),
+        "the deferral names the write"
+    );
+    assert_eq!(
+        retry_after_ms,
+        u64::try_from(DEFERRAL.as_millis()).expect("fits")
+    );
+    assert_eq!(
+        conn.resend_timer().map(|timer| timer.wait()),
+        Some(DEFERRAL),
+        "the resend waits the server's named wait"
+    );
 }
