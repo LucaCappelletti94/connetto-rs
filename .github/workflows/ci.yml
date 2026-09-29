@@ -18,6 +18,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+# Caches are saved only from main, which restores exact keys only, so a
+# tree saved after a Cargo.lock change holds none of the artifacts the
+# older lock left behind. Pull requests also restore the nearest older key.
 jobs:
   format:
     name: Format ${{ matrix.name }}
@@ -56,8 +59,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable rustfmt
         run: |
@@ -120,8 +122,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable clippy
         run: |
@@ -211,8 +212,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-nightly-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-nightly-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-nightly-{0}-', runner.os) || '' }}
 
       - name: Install nightly clippy
         run: |
@@ -301,8 +301,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable rustdoc
         run: rustup toolchain install stable --profile minimal
@@ -387,8 +386,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
@@ -450,8 +448,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the Android target
         run: |
@@ -501,8 +498,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the iOS targets
         run: |
@@ -548,8 +544,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore native build output
         id: cache-2
@@ -557,8 +552,7 @@ jobs:
         with:
           path: target
           key: t-ios-simulator-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            t-ios-simulator-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-{0}-', runner.os) || '' }}
 
       - name: Restore the demo's build output
         id: cache-3
@@ -566,8 +560,7 @@ jobs:
         with:
           path: examples/dioxus-desktop-demo/target
           key: t-ios-simulator-demo-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
-          restore-keys: |
-            t-ios-simulator-demo-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-demo-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the simulator target
         run: |
@@ -687,8 +680,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore rust test output
         id: cache-2
@@ -696,8 +688,7 @@ jobs:
         with:
           path: target
           key: t-rust-tests-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            t-rust-tests-${{ matrix.name }}-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-rust-tests-{0}-{1}-', matrix.name, runner.os) || '' }}
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
@@ -781,8 +772,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore native build output
         id: cache-2
@@ -790,8 +780,7 @@ jobs:
         with:
           path: target
           key: t-browser-native-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            t-browser-native-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || '' }}
 
       - name: Install stable browser toolchain
         run: rustup toolchain install stable --profile minimal
@@ -886,8 +875,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       # The wasm tree in target-wasm is the one graph a shard still builds.
       - name: Restore wasm build output
@@ -896,8 +884,7 @@ jobs:
         with:
           path: target-wasm
           key: t-browser-wasm-lines-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            t-browser-wasm-lines-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || '' }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -972,21 +959,21 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       # The dx bundle beside the Rust artifacts holds several copies of the
       # debug library, and Gradle rebuilds it in seconds from that library.
+      # The cache matches paths without descending into them, so it lists the
+      # target's children for the exclusion to apply.
       - name: Restore the demo's build output
         id: cache-2
         uses: actions/cache/restore@v6
         with:
           path: |
-            examples/dioxus-desktop-demo/target
+            examples/dioxus-desktop-demo/target/*
             !examples/dioxus-desktop-demo/target/dx
-          key: t-android-emulator-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
-          restore-keys: |
-            t-android-emulator-${{ runner.os }}-
+          key: t-android-emulator-lines-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-lines-{0}-', runner.os) || '' }}
 
       - uses: actions/download-artifact@v8
         with:
@@ -1026,9 +1013,12 @@ jobs:
           echo "${ANDROID_HOME}/platform-tools" >> "${GITHUB_PATH}"
 
       # The same command the proof runs without --apk, built before the
-      # emulator boots so the emulator's time goes to the proof.
+      # emulator boots so the emulator's time goes to the proof. Line tables
+      # keep a panic's file and line and halve the APK and the cached tree.
       - name: Build the demo's APK
         working-directory: examples/dioxus-desktop-demo
+        env:
+          CARGO_PROFILE_ANDROID_DEV_DEBUG: line-tables-only
         run: |
           dx build \
             --android \
@@ -1089,7 +1079,7 @@ jobs:
         uses: actions/cache/save@v6
         with:
           path: |
-            examples/dioxus-desktop-demo/target
+            examples/dioxus-desktop-demo/target/*
             !examples/dioxus-desktop-demo/target/dx
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
@@ -1109,8 +1099,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable browser toolchain
         run: rustup toolchain install stable --profile minimal
@@ -1160,8 +1149,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore passkey build output
         id: cache-2
@@ -1169,8 +1157,7 @@ jobs:
         with:
           path: examples/webauthn-unlock/target
           key: t-passkey-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            t-passkey-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-passkey-{0}-', runner.os) || '' }}
 
       - name: Install stable browser toolchain
         run: rustup toolchain install stable --profile minimal

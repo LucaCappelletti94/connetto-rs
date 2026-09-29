@@ -17,6 +17,9 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
 
+# Caches are saved only from main, which restores exact keys only, so a
+# tree saved after a Cargo.lock change holds none of the artifacts the
+# older lock left behind. Pull requests also restore the nearest older key.
 jobs:
   sonar:
     name: SonarQube scan
@@ -43,8 +46,7 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            dl-${{ runner.os }}-
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Install stable clippy
         run: |
