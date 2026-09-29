@@ -389,7 +389,7 @@
       <text x="315" y="46" text-anchor="middle" font-size="9" fill="#555">local (never-syncing) tier attached, inherits the replica key</text>
       <text x="315" y="61" text-anchor="middle" font-size="8.5" fill="#C62828">R21: one page codec on both targets</text>
       <text x="315" y="76" text-anchor="middle" font-size="8.5" fill="#555">unlock gate built in the browser. Native gates R51 and R52 wait on the client builder R94, R53 blocked on hardware</text>
-      <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">Linux keyring custody across a reboot: R71</text>
+      <text x="315" y="91" text-anchor="middle" font-size="8.5" fill="#555">Linux custody survives a reboot: Secret Service, sandbox keyring, sealed files (R71)</text>
     </g>
 
     <!-- Schema pipeline (build time) -->

@@ -35,7 +35,7 @@ The plan in `plans/master-implementation-plan.md` tracks 98 phases, 74 done and 
 | Remaining | Phases |
 |---|---|
 | Native unlock gates | R51 to R53 |
-| One page codec, synced tables without local references, Linux key custody across a reboot | R21, R92, R71 |
+| One page codec, synced tables without local references, the desktop proofs of Linux key custody | R21, R92, R71 |
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline | R70, R72 |
 | Demo gaps | R57 |
