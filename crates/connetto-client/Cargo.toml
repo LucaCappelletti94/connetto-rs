@@ -201,10 +201,12 @@ open = { version = "5.4", optional = true }
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 webbrowser = { version = "1.2", optional = true }
 
-# Android: the Keystore-backed store of the same family. The NDK ships no
-# OpenSSL headers, so SQLCipher builds its own from source here.
+# Android: the Keystore-backed store of the same family.
 [target.'cfg(target_os = "android")'.dependencies]
 android-native-keyring-store = { version = "1.0.0", optional = true }
+
+# The NDK and MSVC ship no OpenSSL, so SQLCipher builds its own from source.
+[target.'cfg(any(target_os = "android", target_os = "windows"))'.dependencies]
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }

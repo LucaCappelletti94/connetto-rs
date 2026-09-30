@@ -56,6 +56,15 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Git Bash's own Perl writes POSIX paths, which OpenSSL's MSVC build rejects.
+      - name: Point openssl-src at a Windows Perl
+        shell: pwsh
+        run: |
+          $perl = Get-Command perl -All | Where-Object { $_.Source -notlike '*\Git\*' } | Select-Object -First 1
+          if (-not $perl) { throw 'no Windows Perl on PATH' }
+          "OPENSSL_SRC_PERL=$($perl.Source)" >> $env:GITHUB_ENV
+          & $perl.Source -e 'print "$^V $^O\n"'
+
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
 
@@ -100,6 +109,16 @@ jobs:
         working-directory: ${{ matrix.cwd }}
     steps:
       - uses: actions/checkout@v7
+
+      # Git Bash's own Perl writes POSIX paths, which OpenSSL's MSVC build rejects.
+      - name: Point openssl-src at a Windows Perl
+        shell: pwsh
+        working-directory: .
+        run: |
+          $perl = Get-Command perl -All | Where-Object { $_.Source -notlike '*\Git\*' } | Select-Object -First 1
+          if (-not $perl) { throw 'no Windows Perl on PATH' }
+          "OPENSSL_SRC_PERL=$($perl.Source)" >> $env:GITHUB_ENV
+          & $perl.Source -e 'print "$^V $^O\n"'
 
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal --component clippy
