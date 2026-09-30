@@ -37,7 +37,7 @@ use crate::replica::encode_identity;
 use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
-use crate::{ClientError, ConnettoClient, ConnettoConnection, Custody};
+use crate::{ClientError, ConnettoClient, Custody};
 
 /// The platform transport, a WebSocket over a plain loopback socket or a
 /// TLS stream the platform's trust store verified.
@@ -229,39 +229,6 @@ where
     }
 }
 
-impl<T> NativeClientBuilder<T, ()>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: Display,
-{
-    /// Connect anonymous and in memory, returning the connected, unstarted
-    /// connection for a caller that drives it frame by frame.
-    ///
-    /// The driver API is the frame-by-frame surface, one `pump_one` per
-    /// frame with the subscription declared in between. A build that names
-    /// content cannot use this terminal, because the content handle attaches
-    /// to a running client and there is none here.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a dial, database, or handshake failure, including a
-    /// first dial that fails, since nothing here retries it.
-    pub async fn connect_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        ClientBuilder { base: self.base }.connect_driven().await
-    }
-
-    /// Open in memory with no transport, returning the unstarted, offline
-    /// connection for a caller that attaches one by hand later.
-    /// [`connect_driven`](Self::connect_driven) without the dial.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a database or cipher failure.
-    pub fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        ClientBuilder { base: self.base }.open_driven()
-    }
-}
-
 /// The signed-in stage, with a credential named and the replica still in
 /// process.
 ///
@@ -331,40 +298,6 @@ where
             credential: resolved.credential.clone(),
         };
         Ok((core, resolved))
-    }
-}
-
-impl<T, K> NativeSignedIn<T, (), K>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: Display,
-    K: StorageMarker,
-{
-    /// Connect signed in, in memory, returning the connected, unstarted
-    /// connection for a caller that drives it frame by frame.
-    ///
-    /// The driver API is the frame-by-frame surface, one `pump_one` per
-    /// frame with the subscription declared in between. A build that names
-    /// content cannot use this terminal, because the content handle attaches
-    /// to a running client and there is none here.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a sign-in, dial, database, or handshake failure,
-    /// including a first dial that fails.
-    pub async fn connect_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        self.into_core().await?.0.connect_driven().await
-    }
-
-    /// Open signed in, in memory, with no transport, returning the unstarted,
-    /// offline connection for a caller that attaches one by hand later.
-    /// [`connect_driven`](Self::connect_driven) without the dial.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a sign-in, database, or cipher failure.
-    pub async fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        self.into_core().await?.0.open_driven()
     }
 }
 
@@ -628,41 +561,6 @@ where
             mechanism: self.mechanism,
         };
         Ok((core, resolved, key_store))
-    }
-}
-
-impl<T, K, KS> NativeDurable<T, (), K, KS>
-where
-    T: Transport + MaybeSend + 'static,
-    T::Error: Display,
-    K: StorageMarker,
-    KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
-{
-    /// Connect with the durable replica, returning the connected, unstarted
-    /// connection for a caller that drives it frame by frame.
-    ///
-    /// The driver API is the frame-by-frame surface, one `pump_one` per
-    /// frame with the subscription declared in between. A build that names
-    /// content cannot use this terminal, because the content handle attaches
-    /// to a running client and there is none here.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a sign-in, key, dial, database, or handshake
-    /// failure, including a first dial that fails.
-    pub async fn connect_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        self.into_core().await?.0.connect_driven().await
-    }
-
-    /// Open the durable replica with no transport, returning the unstarted
-    /// connection for a caller that attaches one by hand later.
-    /// [`connect_driven`](Self::connect_driven) without the dial.
-    ///
-    /// # Errors
-    ///
-    /// [`ClientError`] on a sign-in, key, database, or cipher failure.
-    pub async fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        self.into_core().await?.0.open_driven().await
     }
 }
 
