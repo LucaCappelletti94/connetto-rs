@@ -382,7 +382,7 @@ impl GateController {
         let Some(grace) = state.recheck else {
             return false;
         };
-        if pending.away_duration(at) > grace {
+        if grace.is_zero() || pending.away_duration(at) > grace {
             self.start_prompt(&mut state, &mechanism);
             true
         } else {

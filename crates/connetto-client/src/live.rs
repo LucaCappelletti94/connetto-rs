@@ -793,6 +793,9 @@ struct State<T: Transport> {
     values: Vec<ValueEntry>,
     computed: Vec<ComputedEntry>,
     wire: Vec<WireSub>,
+    /// Aggregate pushes a locked gate held, as the wire sub and whether the
+    /// frame was scalar, fanned out once the gate opens.
+    held: Vec<(String, bool)>,
 }
 
 /// The pump's exit signal. The flag and the wake form a double-check, so a
@@ -1369,6 +1372,7 @@ where
                 values: Vec::new(),
                 computed: Vec::new(),
                 wire,
+                held: Vec::new(),
             }),
             wake: Arc::clone(&wake),
             reaper: Arc::new(Reaper {
@@ -1626,7 +1630,8 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the insert or the watch registration fails.
+    /// [`ClientError::Locked`] while the gate is locked, and [`ClientError`]
+    /// when the insert or the watch registration fails.
     pub async fn insert_watched_with_grace<V, R, K>(
         &self,
         values: V,
@@ -1691,7 +1696,8 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the insert or the pin fails.
+    /// [`ClientError::Locked`] while the gate is locked, and [`ClientError`]
+    /// when the insert or the pin fails.
     pub async fn insert_pinned<V, R, K>(&self, name: &str, values: V) -> Result<R, ClientError>
     where
         V: Insertable<R::Table>,
@@ -1704,6 +1710,9 @@ where
             for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let row: R = diesel::insert_into(<R as HasTable>::table())
             .values(values)
             .get_result(state.conn.conn())
@@ -1730,7 +1739,9 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the update or the watch registration fails.
+    /// [`ClientError::Locked`] while the gate is locked, before anything is
+    /// written, and [`ClientError`] when the update or the watch registration
+    /// fails.
     pub async fn update_watched<Tgt, C, R, K>(
         &self,
         target: Tgt,
@@ -1751,6 +1762,9 @@ where
         >: AsQuery + for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let row: R = diesel::update(target)
             .set(changeset)
             .get_result(state.conn.conn())
@@ -2773,6 +2787,15 @@ async fn pump<T, F, S>(
             &mut ask_outcome,
         )
         .await;
+        // A resolved prompt is applied under the state lock, and an unresolved
+        // one goes back whatever the step ended in, so a recovery or an exit
+        // never strands the gate mid-prompt. Approval resumes access and held
+        // refreshes, and a dismissal stays locked for the next return or
+        // unlock call.
+        shared.gate.apply_outcome(&mut ask, ask_outcome);
+        if let Some(ask) = ask {
+            shared.gate.restore_ask(ask);
+        }
         match route_step_result(&mut state, &shared, stepped, reconnect.is_some()) {
             PumpFlow::Proceed => {}
             PumpFlow::Recover => {
@@ -2789,14 +2812,6 @@ async fn pump<T, F, S>(
             }
         }
 
-        // A resolved prompt is applied under the state lock. Approval resumes
-        // access and held refreshes, and a dismissal stays locked for the next
-        // return or unlock call.
-        shared.gate.apply_outcome(&mut ask, ask_outcome);
-        if let Some(ask) = ask {
-            shared.gate.restore_ask(ask);
-        }
-
         // The first cursor is the moment "empty" stops meaning "never
         // fetched", so it is recorded here rather than beside the refresh
         // below, which an empty first sync gives nothing to do.
@@ -2806,8 +2821,8 @@ async fn pump<T, F, S>(
 
         // Refresh live queries whose tables changed, from server patches and
         // local writes alike, while the gate is open. A lock holds the
-        // refreshes, and the changed tables accumulate until the first open
-        // refresh drains them, waking each affected handle once.
+        // refreshes and the aggregate pushes, which accumulate until the first
+        // open refresh drains them, waking each affected handle once.
         if !shared.gate.is_locked() {
             refresh_changed(&mut state, &shared.events);
         }
@@ -2951,7 +2966,17 @@ where
             }
         }
         Ok(Some(event)) => {
-            route_aggregate(&mut *state, shared.as_ref(), &event);
+            if let ClientEvent::Aggregate {
+                sub_id, group_key, ..
+            } = &event
+            {
+                let push = (sub_id.clone(), group_key.is_none());
+                if !shared.gate.is_locked() {
+                    route_aggregate(state, &shared.events, &push.0, push.1);
+                } else if !state.held.contains(&push) {
+                    state.held.push(push);
+                }
+            }
             if !apply_relayed_gate(&shared.gate, &event) {
                 let _ = shared.events.send(event);
             }
@@ -3045,8 +3070,12 @@ where
     stepped
 }
 
-/// Re-run every live query whose tables were touched since the last step.
+/// Fan out the aggregate pushes a lock held, then re-run every live query
+/// whose tables were touched since the last step.
 fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sender<ClientEvent>) {
+    for (sub_id, scalar) in core::mem::take(&mut state.held) {
+        route_aggregate(state, events, &sub_id, scalar);
+    }
     let changed = state.conn.take_changed_unfiltered();
     if changed.is_empty() {
         return;
@@ -3058,6 +3087,7 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
         values: _,
         computed: _,
         wire: _,
+        held: _,
     } = state;
     for entry in registry.iter_mut() {
         if entry.tables.is_disjoint(&changed) {
@@ -3082,32 +3112,31 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
 /// departure, or a whole-answer demotion) feeds the keyed handles from the
 /// full rested group set, so all three shapes take one path and a demotion
 /// never surfaces (R84, decision 4).
-fn route_aggregate<T>(state: &mut State<T>, shared: &Shared<T>, event: &ClientEvent)
-where
+fn route_aggregate<T>(
+    state: &mut State<T>,
+    events: &broadcast::Sender<ClientEvent>,
+    sub_id: &str,
+    scalar: bool,
+) where
     T: Transport,
 {
-    let ClientEvent::Aggregate {
-        sub_id, group_key, ..
-    } = event
-    else {
-        return;
-    };
     let State {
         conn,
         registry: _,
         values,
         computed,
         wire,
+        held: _,
     } = state;
     let Some(target) = wire.iter().find(|w| w.wire_id == *sub_id) else {
         return;
     };
-    if group_key.is_none() && values.iter().any(|e| e.wire_id == *sub_id) {
+    if scalar && values.iter().any(|e| e.wire_id == *sub_id) {
         let rested = match conn.rested_scalar(target.spec.query.as_str(), &target.spec.binds) {
             Ok(rested) => rested,
             Err(err) => {
-                let _ = shared.events.send(ClientEvent::NonFatal {
-                    related_to: Some(sub_id.clone()),
+                let _ = events.send(ClientEvent::NonFatal {
+                    related_to: Some(sub_id.to_owned()),
                     detail: format!("reading rested aggregate failed: {err}"),
                 });
                 return;
@@ -3121,7 +3150,7 @@ where
         // own decoder and typed value, not just the first.
         for entry in values.iter_mut().filter(|e| e.wire_id == *sub_id) {
             if let Err(err) = (entry.apply)(json.as_deref(), as_of) {
-                let _ = shared.events.send(ClientEvent::NonFatal {
+                let _ = events.send(ClientEvent::NonFatal {
                     related_to: Some(entry.sub_id.clone()),
                     detail: format!("live value update failed: {err}"),
                 });
@@ -3134,8 +3163,8 @@ where
     let rested = match conn.rested_groups(target.spec.query.as_str(), &target.spec.binds) {
         Ok(rested) => rested,
         Err(err) => {
-            let _ = shared.events.send(ClientEvent::NonFatal {
-                related_to: Some(sub_id.clone()),
+            let _ = events.send(ClientEvent::NonFatal {
+                related_to: Some(sub_id.to_owned()),
                 detail: format!("reading rested computed rows failed: {err}"),
             });
             return;
@@ -3145,7 +3174,7 @@ where
     // decoders and typed map.
     for entry in computed.iter_mut().filter(|e| e.wire_id == *sub_id) {
         if let Err(err) = (entry.apply)(&rested) {
-            let _ = shared.events.send(ClientEvent::NonFatal {
+            let _ = events.send(ClientEvent::NonFatal {
                 related_to: Some(entry.sub_id.clone()),
                 detail: format!("live groups update failed: {err}"),
             });

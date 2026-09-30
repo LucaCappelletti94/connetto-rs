@@ -10,7 +10,9 @@ use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, Clock, ConnettoClient, DataDir, Gate, GateAskFuture,
     GateAskOutcome, GateMechanism, Moment,
 };
-use connetto_core::messages::{BulkMessage, ControlMessage, GateState, HandshakeAck, LivePatch};
+use connetto_core::messages::{
+    AggregateUpdate, BulkMessage, ControlMessage, GateState, HandshakeAck, LivePatch,
+};
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -39,13 +41,32 @@ diesel::table! {
 #[derive(Clone, Default)]
 struct Script {
     frames: Arc<Mutex<VecDeque<IncomingFrame>>>,
+    hung_up: Arc<std::sync::atomic::AtomicBool>,
+    subscribed: Arc<Mutex<Vec<String>>>,
 }
 
 impl Script {
     fn with(frames: Vec<IncomingFrame>) -> Self {
         Self {
             frames: Arc::new(Mutex::new(frames.into())),
+            hung_up: Arc::default(),
+            subscribed: Arc::default(),
         }
+    }
+
+    /// The wire id of the last subscription the client declared.
+    fn last_subscribed(&self) -> String {
+        self.subscribed
+            .lock()
+            .expect("script lock")
+            .last()
+            .cloned()
+            .expect("the client subscribed")
+    }
+
+    /// End the connection once the queued frames are delivered.
+    fn hang_up(&self) {
+        self.hung_up.store(true, Ordering::Relaxed);
     }
 
     /// Push a frame onto the queue for the pump to receive.
@@ -59,8 +80,14 @@ impl Transport for Script {
 
     fn send_control(
         &mut self,
-        _message: ControlMessage,
+        message: ControlMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
+        if let ControlMessage::Subscribe(subscribe) = message {
+            self.subscribed
+                .lock()
+                .expect("script lock")
+                .push(subscribe.sub_id);
+        }
         ready(Ok(()))
     }
 
@@ -73,10 +100,14 @@ impl Transport for Script {
 
     fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
         let frames = Arc::clone(&self.frames);
+        let hung_up = Arc::clone(&self.hung_up);
         async move {
             loop {
                 if let Some(frame) = frames.lock().expect("script lock").pop_front() {
                     return Ok(Some(frame));
+                }
+                if hung_up.load(Ordering::Relaxed) {
+                    return Ok(None);
                 }
                 tokio::task::yield_now().await;
             }
@@ -562,7 +593,7 @@ async fn a_relayed_gate_state_locks_a_mechanismless_tab() {
 }
 
 /// A row of the `items` table.
-#[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
+#[derive(Queryable, Selectable, Identifiable, Debug, PartialEq, Clone)]
 #[diesel(table_name = items)]
 #[diesel(check_for_backend(diesel::sqlite::Sqlite))]
 struct Item {
@@ -857,4 +888,193 @@ async fn a_built_gate_rechecks_a_return_beyond_its_grace() {
         ClientEvent::Locked,
         "a return beyond the build's grace locks"
     );
+}
+
+/// A zero grace re-checks a return even when the clocks read no time away.
+#[tokio::test]
+async fn a_zero_grace_rechecks_a_return_that_measures_no_time_away() {
+    let (client, _script) = client().await;
+    let mechanism = FakeMechanism::new();
+    let mut events = client.events();
+    client
+        .enable_gate(Some(Duration::ZERO), Arc::new(mechanism.clone()))
+        .await;
+    unlock_gate(&client, &mut events, &mechanism).await;
+
+    let clock = FakeClock::new();
+    client.away(Moment::now(&clock)).await;
+    client.back(Moment::now(&clock)).await;
+    assert_eq!(
+        next_gate_event(&mut events).await,
+        ClientEvent::Locked,
+        "a zero grace re-checks a return of no measurable length"
+    );
+}
+
+/// A locked gate refuses a pinned insert and a watched update before either
+/// writes anything.
+#[tokio::test]
+async fn a_locked_gate_refuses_pinned_inserts_and_watched_updates_before_writing() {
+    let (client, _script) = client().await;
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(items::table)
+                .values((items::id.eq(1), items::label.eq("kept")))
+                .execute(conn.conn())
+                .expect("seed the row")
+        })
+        .await
+        .expect("no gate yet");
+    let mechanism = FakeMechanism::new();
+    let mut events = client.events();
+    client.enable_gate(None, Arc::new(mechanism.clone())).await;
+
+    assert!(
+        matches!(
+            client
+                .insert_pinned::<_, Item, i32>("pin", items::label.eq("new"))
+                .await,
+            Err(ClientError::Locked)
+        ),
+        "a pinned insert is refused while locked"
+    );
+    assert!(
+        matches!(
+            client
+                .update_watched::<_, _, Item, i32>(items::table.find(1), items::label.eq("changed"))
+                .await,
+            Err(ClientError::Locked)
+        ),
+        "a watched update is refused while locked"
+    );
+
+    unlock_gate(&client, &mut events, &mechanism).await;
+    let rows: Vec<Item> = client
+        .with_conn(|conn| {
+            items::table
+                .order(items::id)
+                .load(conn.conn())
+                .expect("read the table")
+        })
+        .await
+        .expect("the gate is open");
+    assert_eq!(
+        rows,
+        vec![Item {
+            id: 1,
+            label: Some("kept".to_owned())
+        }],
+        "nothing was written while locked"
+    );
+}
+
+/// A prompt pending when the connection drops survives the reconnect
+/// attempts, so approving it afterwards still unlocks the gate.
+#[tokio::test]
+async fn a_prompt_pending_across_a_dropped_connection_still_unlocks() {
+    let (client, script) = client().await;
+    let mechanism = FakeMechanism::new();
+    let mut events = client.events();
+    client.enable_gate(None, Arc::new(mechanism.clone())).await;
+    client.unlock().await;
+    assert_eq!(next_gate_event(&mut events).await, ClientEvent::Locked);
+    assert_eq!(mechanism.asks(), 1, "the unlock asked the mechanism");
+
+    script.hang_up();
+    loop {
+        if let ClientEvent::Reconnecting { .. } = events
+            .recv()
+            .await
+            .expect("the pump keeps producing events")
+        {
+            break;
+        }
+    }
+    mechanism.resolve(GateAskOutcome::Approved);
+    assert_eq!(
+        next_gate_event(&mut events).await,
+        ClientEvent::Unlocked,
+        "the approval given while reconnecting unlocks"
+    );
+}
+
+/// The scalar aggregate push a server sends.
+fn scalar_push(sub_id: &str, value: &str) -> IncomingFrame {
+    IncomingFrame::Control(ControlMessage::AggregateUpdate(AggregateUpdate {
+        sub_id: sub_id.to_owned(),
+        group_key: None,
+        group_values_json: None,
+        result_json: Some(value.to_owned()),
+        is_full_result: true,
+    }))
+}
+
+/// Wait for the aggregate push for `sub` to reach the event stream.
+async fn until_aggregate(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>, sub: &str) {
+    loop {
+        match events
+            .recv()
+            .await
+            .expect("the pump keeps producing events")
+        {
+            ClientEvent::Aggregate { sub_id, .. } if sub_id == sub => return,
+            _ => {}
+        }
+    }
+}
+
+/// A value handle whose aggregate moved while locked keeps its old value and
+/// wakes with the new one only after the unlock.
+#[tokio::test]
+async fn a_locked_value_handle_keeps_its_value_until_the_unlock() {
+    let (client, script) = client().await;
+    let mechanism = FakeMechanism::new();
+    let mut events = client.events();
+    client
+        .enable_gate(Some(Duration::from_secs(60)), Arc::new(mechanism.clone()))
+        .await;
+    unlock_gate(&client, &mut events, &mechanism).await;
+
+    let mut count = client
+        .watch_value::<_, i64>(items::table.count())
+        .await
+        .expect("watch the count");
+    let wire = script.last_subscribed();
+    script.say(scalar_push(&wire, "1"));
+    tokio::time::timeout(Duration::from_secs(5), count.changed())
+        .await
+        .expect("the push wakes the handle in time")
+        .expect("the client is alive");
+    assert_eq!(count.value(), Some(1));
+
+    let clock = FakeClock::new();
+    client.away(Moment::now(&clock)).await;
+    clock.set(Duration::from_secs(70), Duration::from_secs(70));
+    client.back(Moment::now(&clock)).await;
+    assert_eq!(next_gate_event(&mut events).await, ClientEvent::Locked);
+    mechanism.resolve(GateAskOutcome::Dismissed);
+    assert_eq!(
+        next_gate_event(&mut events).await,
+        ClientEvent::UnlockDismissed
+    );
+
+    script.say(scalar_push(&wire, "2"));
+    until_aggregate(&mut events, &wire).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(500), count.changed())
+            .await
+            .is_err(),
+        "the held push does not wake the handle while locked"
+    );
+    assert_eq!(count.value(), Some(1), "the handle keeps its old value");
+
+    client.back(Moment::now(&clock)).await;
+    assert_eq!(next_gate_event(&mut events).await, ClientEvent::Locked);
+    mechanism.resolve(GateAskOutcome::Approved);
+    assert_eq!(next_gate_event(&mut events).await, ClientEvent::Unlocked);
+    tokio::time::timeout(Duration::from_secs(5), count.changed())
+        .await
+        .expect("the unlock wakes the held push in time")
+        .expect("the client is alive");
+    assert_eq!(count.value(), Some(2));
 }
