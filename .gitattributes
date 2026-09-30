@@ -1,0 +1,2 @@
+# Git Bash on Windows cannot run a CRLF shell script, and tests compare checked-out files byte for byte.
+* text=auto eol=lf

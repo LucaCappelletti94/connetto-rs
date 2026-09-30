@@ -1,0 +1,108 @@
+# Throwaway: measures plans/windows-ci.md's unverified points on a hosted Windows runner.
+name: Windows rehearsal
+
+"on":
+  push:
+    branches:
+      - ci/windows-rehearsal
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  runner-facts:
+    name: Windows runner facts
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - name: Report session, browser, WebView2, Credential Manager and Hello
+        shell: powershell
+        run: |
+          "USER: $env:USERNAME"
+          $identity = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+          "ADMIN: " + $identity.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+          "USER INTERACTIVE: " + [Environment]::UserInteractive
+          "SESSION ID: " + (Get-Process -Id $PID).SessionId
+          "EXPLORER SESSIONS: " + ((Get-Process explorer -ErrorAction SilentlyContinue | ForEach-Object { $_.SessionId }) -join ',')
+          query user 2>&1 | Out-String
+          $webview = Get-ItemProperty 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}' -ErrorAction SilentlyContinue
+          "WEBVIEW2: " + $webview.pv
+          "HTTP PROGID: " + (Get-ItemProperty 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice' -ErrorAction SilentlyContinue).ProgId
+          cmdkey /generic:connetto-ci-probe /user:probe /pass:secret
+          cmdkey /list:connetto-ci-probe
+          cmdkey /delete:connetto-ci-probe
+          Add-Type -AssemblyName System.Runtime.WindowsRuntime
+          $null = [Windows.Security.Credentials.KeyCredentialManager, Windows.Security.Credentials, ContentType = WindowsRuntime]
+          $asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1' } | Select-Object -First 1
+          $task = $asTask.MakeGenericMethod([bool]).Invoke($null, @([Windows.Security.Credentials.KeyCredentialManager]::IsSupportedAsync()))
+          $null = $task.Wait(60000)
+          "HELLO SUPPORTED: " + $task.Result
+          $before = Get-Process | ForEach-Object { $_.Id }
+          Start-Process 'http://127.0.0.1:9/connetto-ci-probe'
+          Start-Sleep -Seconds 15
+          Get-Process | Where-Object { $before -notcontains $_.Id } | ForEach-Object { "OPENED: $($_.ProcessName) session $($_.SessionId)" }
+
+  crate-tests:
+    name: Windows crate tests
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Build the crates' tests
+        run: |
+          while read -r -a crate; do
+            cargo +stable test --no-run -p "${crate[@]}"
+          done < .github/ios-crates.txt
+
+      - uses: ./.github/actions/start-native-services
+
+      - name: Run the crates' tests
+        run: |
+          status=0
+          while read -r -a crate; do
+            cargo +stable test --no-fail-fast -p "${crate[@]}" || status=1
+          done < .github/ios-crates.txt
+          exit "$status"
+
+      - uses: actions/upload-artifact@v7
+        if: failure()
+        with:
+          name: windows-crate-test-services
+          path: ${{ runner.temp }}/native-services/logs
+          retention-days: 7
+
+  lint:
+    name: Windows lint ${{ matrix.name }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: root
+            cwd: .
+          - name: dioxus-desktop-demo
+            cwd: examples/dioxus-desktop-demo
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ matrix.cwd }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      - name: Clippy
+        run: cargo +stable clippy --all-targets --all-features -- -D warnings
