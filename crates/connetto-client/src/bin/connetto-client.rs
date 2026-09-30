@@ -121,7 +121,7 @@ async fn connect(
 }
 
 /// Run and push each `CONNETTO_WRITE` statement in order, stopping at the
-/// first one the replica or the server refuses.
+/// first one the replica refuses or a push that fails to send.
 async fn run_writes(client: &mut ConnettoConnection<NativeTransport>) -> Result<()> {
     let Ok(writes) = std::env::var("CONNETTO_WRITE") else {
         return Ok(());

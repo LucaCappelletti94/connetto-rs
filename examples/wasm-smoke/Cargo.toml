@@ -15,7 +15,7 @@ crate-type = ["cdylib", "rlib"]
 connetto-demo-deployment = { path = "../deployment" }
 # The browser platform crate: transports, locks, leader election, the relay
 # hub, and the DB worker orchestration. This crate is its thin consumer,
-# supplying the demo schema and the baked template through DbWorkerConfig.
+# booting the demo schema through its WebClientBuilder.
 connetto-web = { path = "../../crates/connetto-web" }
 connetto-client = { path = "../../crates/connetto-client", default-features = false }
 connetto-core = { path = "../../crates/connetto-core", features = ["loopback"] }

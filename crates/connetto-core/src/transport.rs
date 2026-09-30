@@ -5,6 +5,7 @@
 //! * [`LoopbackTransport`]: an in-memory pair connected by channels, for
 //!   single-process wiring, fast tests, and the browser relay's tab side. It
 //!   rides only the sync primitives, so it compiles on wasm (feature
+//!   `loopback`).
 //! * [`WebSocketTransport`]: the native `tokio-tungstenite` transport per
 //!   `docs/architecture/09-wasm.md` (feature `native-transport`). The browser
 //!   client provides its own `web-sys` backed transport instead. A native

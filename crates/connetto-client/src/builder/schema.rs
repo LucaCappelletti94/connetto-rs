@@ -115,7 +115,7 @@ impl SyncSchema {
         &self.sql_functions
     }
 
-    /// The device-only tables, lowercased.
+    /// The device-only tables, as given.
     #[must_use]
     pub fn unrecorded_tables(&self) -> &HashSet<String> {
         &self.unrecorded

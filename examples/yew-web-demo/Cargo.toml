@@ -14,10 +14,10 @@ crate-type = ["cdylib", "rlib"]
 # The deployment every browser demo here runs against, documents and all.
 connetto-demo-deployment = { path = "../deployment" }
 # The browser platform: transports, leader election, locks, the relay hub,
-# and the DB worker orchestration. The demo supplies its schema and baked
-# template through DbWorkerConfig.
+# and the DB worker orchestration, booted and attached through its
+# WebClientBuilder.
 connetto-web = { path = "../../crates/connetto-web" }
-# The client types the window drives (connection, client, config, events).
+# The client types the window drives (builder pieces, client, events).
 # Default features off: this is a wasm build with a browser transport.
 connetto-client = { path = "../../crates/connetto-client", default-features = false }
 connetto-core = { path = "../../crates/connetto-core" }

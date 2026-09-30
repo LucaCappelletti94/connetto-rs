@@ -76,9 +76,6 @@ pub enum BootError {
     /// The replica could not be opened or its session-derived name could not be encoded.
     #[error("replica open: {0}")]
     ReplicaOpen(connetto_client::ClientError),
-    /// No device-private database was configured alongside the replica.
-    #[error("no device-private database configured")]
-    NoTierConfigured,
     /// The upstream subscription or boot-handshake ping failed.
     #[error("upstream subscription: {0}")]
     Subscribe(connetto_client::ClientError),

@@ -5,8 +5,9 @@ use core::time::Duration;
 /// Whether a durable build locks the protected secret on away, and how a
 /// return is re-checked.
 ///
-/// The default is on with no re-check, so a build locks on the first away
-/// and re-checks once when it returns, then never again. `with_recheck`
+/// The default is on with no re-check, so a build with a mechanism starts
+/// locked, asks once on the first return or unlock, and never re-checks
+/// after. `with_recheck`
 /// tightens the return side, `None` re-checking once per launch and
 /// `Some(DURATION)` re-checking a return whose time away exceeded the
 /// bound.
