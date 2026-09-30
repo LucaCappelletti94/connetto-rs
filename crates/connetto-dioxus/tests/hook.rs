@@ -9,11 +9,8 @@
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
-use connetto_client::{ClientConfig, ConnettoClient, ConnettoConnection, Grant, Replica};
-use connetto_core::{
-    Cursor, HandshakeAuthority,
-    test_support::{TestGrantChecker, replica_key},
-};
+use connetto_client::{ConnettoClient, Grant, HeldCredential, NativeClientBuilder, SyncSchema};
+use connetto_core::{Cursor, HandshakeAuthority, test_support::TestGrantChecker};
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
     ConnettoReadSetup, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
@@ -29,7 +26,7 @@ use subql::reexec::{
     AsyncConnector, ReadQuery, RowPage, ScalarRowError, Snapshot as ConnectorRead,
 };
 use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 
 fn test_verifier() -> Arc<dyn HandshakeAuthority> {
     Arc::new(TestGrantChecker)
@@ -37,6 +34,18 @@ fn test_verifier() -> Arc<dyn HandshakeAuthority> {
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
 const SQLITE_DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, quantity INTEGER);";
+
+/// The client schema over [`SQLITE_DDL`].
+fn schema() -> SyncSchema {
+    SyncSchema::new(connetto_core::schema::SchemaBundle::new(
+        "",
+        "",
+        SQLITE_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        None::<&str>,
+    ))
+}
 
 diesel::table! {
     /// Test table for orders in the fixture.
@@ -216,7 +225,7 @@ impl AsyncConnector for SeedRows {
     }
 }
 
-type Ws = WebSocketTransport<TcpStream>;
+type Ws = connetto_client::NativeTransport;
 
 /// The component reads the shared client from here: `VirtualDom` components
 /// take no test-local captures, and props require `PartialEq`. A clearable
@@ -322,21 +331,16 @@ async fn use_live_renders_and_follows_cdc() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+    let client = NativeClientBuilder::new(format!("ws://{addr}/"), schema())
+        .signed_in(
+            HeldCredential::new(Grant::new("user:dioxus-test"), "dioxus-test")
+                .expect("a string identity serializes"),
+        )
+        .connect()
         .await
-        .expect("ws connect");
-    let config = ClientConfig::new("dioxus-test").with_login(Some(Grant::new("user:dioxus-test")));
-    let replica = Replica::encrypted_file(&db_path, Some(replica_key())).expect("replica key");
-    let conn = ConnettoConnection::connect(transport, &replica, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
-    let client = ConnettoClient::start(conn);
+        .expect("client connect")
+        .client()
+        .clone();
     *CLIENT.lock().expect("client slot poisoned") = Some(client.clone());
 
     let mut vdom = VirtualDom::new(app);
@@ -406,22 +410,16 @@ async fn use_live_fn_follows_a_boxed_row_query() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let stream = TcpStream::connect(addr).await.expect("connect");
-    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+    let client = NativeClientBuilder::new(format!("ws://{addr}/"), schema())
+        .signed_in(
+            HeldCredential::new(Grant::new("user:dioxus-fn-test"), "dioxus-fn-test")
+                .expect("a string identity serializes"),
+        )
+        .connect()
         .await
-        .expect("ws connect");
-    let config =
-        ClientConfig::new("dioxus-fn-test").with_login(Some(Grant::new("user:dioxus-fn-test")));
-    let replica = Replica::encrypted_file(&db_path, Some(replica_key())).expect("replica key");
-    let conn = ConnettoConnection::connect(transport, &replica, SQLITE_DDL, &config, None)
-        .await
-        .expect("client connect");
-    let client = ConnettoClient::start(conn);
+        .expect("client connect")
+        .client()
+        .clone();
     *CLIENT_FN.lock().expect("client slot poisoned") = Some(client.clone());
 
     let mut vdom = VirtualDom::new(app_fn);

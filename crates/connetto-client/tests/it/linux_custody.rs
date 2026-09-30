@@ -10,9 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use connetto_client::{
-    ClientConfig, ConnettoConnection, Grant, KeyFile, KeyringKeyStore, KeyringStore, LinuxStore,
-    Replica, provision_replica_key, teardown,
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Gate, Grant, HeldCredential,
+    KeyFile, KeyringKeyStore, KeyringStore, LinuxStore, Located, ReplicaPlace, SyncSchema,
+    provision_replica_key, teardown,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use connetto_core::traits::{RefreshTokenStore as _, ReplicaKeyStore as _};
 use diesel::prelude::*;
@@ -65,8 +67,55 @@ fn replica_url(dir: &Path) -> String {
         .to_owned()
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r71").with_login(Some(Grant::new("user:token")))
+/// The replica at exactly `url`, its key recorded as `replica`, where the
+/// custody phases look for it.
+struct At {
+    url: String,
+    exists: bool,
+}
+
+impl ReplicaPlace for At {
+    fn locate(&self, _name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            "replica",
+            self.url.clone(),
+            self.exists,
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// The replica at `url` beside its device-local tier, created when `fresh`,
+/// with its key read from this phase's key store.
+async fn open(url: &str, fresh: bool) -> ConnettoConnection<FakeTransport> {
+    let transport = FakeTransport::accepting();
+    let mut once = Some(transport);
+    ClientBuilder::new(
+        SyncSchema::new(SchemaBundle::new(
+            "",
+            "",
+            "",
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )),
+        move || core::future::ready(once.take().ok_or("spent")),
+    )
+    .signed_in(
+        HeldCredential::new(Grant::new("user:token"), "token")
+            .expect("a string identity serializes"),
+    )
+    .durable(
+        At {
+            url: url.to_owned(),
+            exists: !fresh,
+        },
+        stores().1,
+    )
+    .with_gate(Gate::off())
+    .connect_driven()
+    .await
+    .expect("the replica opens")
 }
 
 /// One phase of a multi-process run, chosen by the environment. Run alone it does nothing.
@@ -101,17 +150,11 @@ async fn custody_phase() {
 }
 
 async fn write_phase(tokens: &KeyringStore, keys: &KeyringKeyStore, url: &str) {
-    let key = provision_replica_key(keys, "replica")
+    provision_replica_key(keys, "replica")
         .await
         .expect("provision");
     tokens.store(ACCOUNT, TOKEN).await.expect("store the token");
-    let replica = Replica::encrypted_file(url, Some(key))
-        .expect("key")
-        .with_tier(TIER_DDL);
-    let mut conn =
-        ConnettoConnection::connect(FakeTransport::accepting(), &replica, "", &config(), None)
-            .await
-            .expect("first boot");
+    let mut conn = open(url, true).await;
     diesel::insert_into(notes::table)
         .values((notes::id.eq(1), notes::body.eq(NOTE)))
         .execute(conn.conn())
@@ -121,8 +164,7 @@ async fn write_phase(tokens: &KeyringStore, keys: &KeyringKeyStore, url: &str) {
 async fn read_phase(tokens: &KeyringStore, keys: &KeyringKeyStore, url: &str) {
     let backend = tokens.backend().await.expect("the store opens");
     assert!(backend.survives_reboot(), "{backend:?}");
-    let key = keys
-        .load("replica")
+    keys.load("replica")
         .await
         .expect("load")
         .expect("the key survived, so nothing is re-minted");
@@ -131,13 +173,7 @@ async fn read_phase(tokens: &KeyringStore, keys: &KeyringKeyStore, url: &str) {
         Some(TOKEN)
     );
     assert_eq!(tokens.accounts().await.expect("accounts"), [ACCOUNT]);
-    let replica = Replica::encrypted_file(url, Some(key))
-        .expect("key")
-        .with_existing_tier();
-    let mut conn =
-        ConnettoConnection::connect_existing(FakeTransport::accepting(), &replica, &config(), None)
-            .await
-            .expect("the replica reopens");
+    let mut conn = open(url, false).await;
     let rows: Vec<Option<String>> = notes::table
         .select(notes::body)
         .load(conn.conn())

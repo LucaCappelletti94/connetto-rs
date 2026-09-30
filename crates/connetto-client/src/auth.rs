@@ -13,7 +13,7 @@
 //! so a reconnect silently refreshes with no user interaction.
 
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
@@ -21,12 +21,13 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use connetto_core::ReplicaKey;
 use connetto_core::percent::{percent_decode, percent_encode};
 use connetto_core::traits::{RefreshFuture, RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::{Custody, NoGate};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 use crate::keyring::Keyring;
 use crate::replica::PENDING_LOGIN_RECORD;
@@ -167,54 +168,11 @@ impl RefreshTokenStore for KeyringStore {
     fn accounts(&self) -> RefreshFuture<'_, Vec<String>, ClientError> {
         Box::pin(self.index())
     }
-}
 
-/// An in-memory refresh-token store, for tests and ephemeral sessions.
-#[derive(Default)]
-pub struct MemoryRefreshStore {
-    inner: Mutex<std::collections::HashMap<String, String>>,
-}
-
-impl RefreshTokenStore for MemoryRefreshStore {
-    type Error = ClientError;
-
-    fn load<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, Option<String>, ClientError> {
-        let token = self
-            .inner
-            .lock()
-            .expect("refresh store lock")
-            .get(account)
-            .cloned();
-        Box::pin(std::future::ready(Ok(token)))
-    }
-
-    fn store<'a>(&'a self, account: &'a str, token: &'a str) -> RefreshFuture<'a, (), ClientError> {
-        self.inner
-            .lock()
-            .expect("refresh store lock")
-            .insert(account.to_owned(), token.to_owned());
-        Box::pin(std::future::ready(Ok(())))
-    }
-
-    fn clear<'a>(&'a self, account: &'a str) -> RefreshFuture<'a, (), ClientError> {
-        self.inner
-            .lock()
-            .expect("refresh store lock")
-            .remove(account);
-        Box::pin(std::future::ready(Ok(())))
-    }
-
-    /// Enumerated from the map itself, so it cannot disagree with what is stored.
-    fn accounts(&self) -> RefreshFuture<'_, Vec<String>, ClientError> {
-        let accounts = self
-            .inner
-            .lock()
-            .expect("refresh store lock")
-            .keys()
-            .filter(|name| !crate::is_reserved_record(name))
-            .cloned()
-            .collect();
-        Box::pin(std::future::ready(Ok(accounts)))
+    /// No user-verified gate reaches the stored items until R51 and R52
+    /// land one, so nothing can be offered yet (R23, decision 5).
+    fn protection(&self) -> Custody {
+        Custody::Unverified(NoGate::Unsupported)
     }
 }
 
@@ -237,61 +195,6 @@ where
     S: RefreshTokenStore<Error = ClientError> + ?Sized,
 {
     store.load(IDENTITY_RECORD).await
-}
-
-/// The effective key for the replica `name`, minting one when this device has
-/// none cached.
-///
-/// Provision-once in one function: a key already cached on this device always
-/// wins and is never overwritten, so a second login cannot silently re-key a
-/// replica and strand its contents. Only when nothing is cached is a fresh key
-/// minted, and it is written through before it is returned.
-///
-/// The key is minted here, on the device, from the same platform RNG that mints
-/// the PKCE verifier and the CSRF state. No key material crosses the wire and
-/// the server never holds any. The scope the plan locked is unchanged: one key
-/// per replica per device, cached locally, usable with no credential and no
-/// network.
-///
-/// It stays once per target rather than moving to `connetto-core` beside the
-/// trait, because minting needs an entropy source and `ReplicaKey` deliberately
-/// carries none, which is what keeps the browser build free of one.
-///
-/// **Call this only for a replica that does not exist yet.** For one already on
-/// disk, read the cache with [`ReplicaKeyStore::load`] and hand the result to
-/// [`Replica::encrypted_file`](crate::Replica::encrypted_file). Minting for an
-/// existing replica would return a key that decrypts nothing, and it would fill
-/// the record that restoring a backed-up key still could, where the refusal
-/// ([`ClientError::ReplicaKeyMissing`])
-/// leaves both the ciphertext and that recovery intact.
-///
-/// # Errors
-///
-/// [`ClientError::Auth`] if the store cannot be read or written, or if the
-/// platform RNG fails.
-pub async fn provision_replica_key<S: ReplicaKeyStore<Error = ClientError>>(
-    store: &S,
-    name: &str,
-) -> Result<ReplicaKey, ClientError> {
-    if let Some(cached) = store.load(name).await? {
-        return Ok(cached);
-    }
-    let minted = mint_replica_key()?;
-    store.store(name, &minted).await?;
-    Ok(minted)
-}
-
-/// A fresh key from the platform RNG.
-///
-/// The staging array is key material until it is wiped, and a plain fill would
-/// be elidable where `zeroize` is not.
-fn mint_replica_key() -> Result<ReplicaKey, ClientError> {
-    let mut bytes = [0u8; ReplicaKey::LEN];
-    getrandom::fill(&mut bytes)
-        .map_err(|err| ClientError::Auth(format!("replica key mint: {err}")))?;
-    let key = ReplicaKey::from_bytes(bytes);
-    bytes.zeroize();
-    Ok(key)
 }
 
 /// OS secure storage for the per-replica encryption keys, using the same
@@ -360,41 +263,11 @@ impl ReplicaKeyStore for KeyringKeyStore {
     async fn clear(&self, name: &str) -> Result<(), ClientError> {
         self.keyring.clear(name).await
     }
-}
 
-/// An in-memory replica-key store, for tests and ephemeral sessions.
-#[derive(Default)]
-pub struct MemoryKeyStore {
-    inner: Mutex<std::collections::HashMap<String, ReplicaKey>>,
-}
-
-#[expect(
-    clippy::unused_async_trait_impl,
-    reason = "the trait method is async and this body finishes without awaiting"
-)]
-impl ReplicaKeyStore for MemoryKeyStore {
-    type Error = ClientError;
-
-    async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
-        Ok(self
-            .inner
-            .lock()
-            .expect("key store lock")
-            .get(name)
-            .cloned())
-    }
-
-    async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
-        self.inner
-            .lock()
-            .expect("key store lock")
-            .insert(name.to_owned(), key.clone());
-        Ok(())
-    }
-
-    async fn clear(&self, name: &str) -> Result<(), ClientError> {
-        self.inner.lock().expect("key store lock").remove(name);
-        Ok(())
+    /// No user-verified gate reaches the stored items until R51 and R52
+    /// land one, so nothing can be offered yet (R23, decision 5).
+    fn protection(&self) -> Custody {
+        Custody::Unverified(NoGate::Unsupported)
     }
 }
 
@@ -434,7 +307,7 @@ struct TokenResponse<Id> {
 ///
 /// No key material rides this: the replica's encryption key is minted on the
 /// device. Derive the replica name from
-/// [`user_id`](Self::user_id) and pass it to [`provision_replica_key`] for a
+/// [`user_id`](Self::user_id) and pass it to [`provision_replica_key`](crate::replica::provision_replica_key) for a
 /// fresh replica, or to [`ReplicaKeyStore::load`] for one already on disk.
 #[derive(Debug, Clone)]
 pub struct AcquiredSession<Id> {
@@ -505,6 +378,7 @@ struct PendingLogin {
 /// it, so the token source and logout address the account signed in now.
 pub struct NativeAuthenticator {
     server_base: String,
+    login_base: Option<String>,
     provider: String,
     store: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>,
     account: std::sync::Mutex<Option<String>>,
@@ -533,6 +407,7 @@ impl NativeAuthenticator {
     ) -> Self {
         Self {
             server_base: server_base.into(),
+            login_base: None,
             provider: provider.into(),
             store,
             account: std::sync::Mutex::new(account),
@@ -546,6 +421,15 @@ impl NativeAuthenticator {
     #[must_use]
     pub fn with_browser_opener(mut self, opener: BrowserOpener) -> Self {
         self.opener = opener;
+        self
+    }
+
+    /// The origin the login page navigates to, when it differs from the
+    /// origin the token endpoints live under. The token fetches keep
+    /// `server_base`, and only the navigation uses this.
+    #[must_use]
+    pub fn with_login_base(mut self, base: Option<String>) -> Self {
+        self.login_base = base;
         self
     }
 
@@ -659,7 +543,7 @@ impl NativeAuthenticator {
         let login_url = |redirect_uri: &str| {
             format!(
                 "{}/auth/login?provider={}&redirect_uri={}&code_challenge={}&state={}",
-                self.server_base,
+                self.login_base.as_deref().unwrap_or(&self.server_base),
                 percent_encode(&self.provider),
                 percent_encode(redirect_uri),
                 percent_encode(&challenge),
@@ -806,7 +690,7 @@ impl NativeAuthenticator {
     /// its key survive, which is what lets a returning user resume from their
     /// persisted cursor instead of re-syncing. For the other half see
     /// [`wipe_replica`](crate::teardown::wipe_replica), and for both under one
-    /// guard see [`forget_device`](crate::teardown::forget_device).
+    /// guard see [`NativeClient::forget_device`](crate::NativeClient::forget_device).
     ///
     /// The revoke is awaited, and **the local clear happens either way**. A
     /// device with no connectivity must still be able to log out, so a failed
@@ -957,9 +841,9 @@ fn code_and_state(query: &str, what: &str) -> Result<(String, String), ClientErr
 mod tests {
     use connetto_core::ReplicaKey;
 
-    use super::{
-        KeyringStore, MemoryKeyStore, indexed_with, indexed_without, provision_replica_key,
-    };
+    use super::{KeyringStore, indexed_with, indexed_without};
+    use crate::MemoryKeyStore;
+    use crate::replica::provision_replica_key;
     use connetto_core::traits::{RefreshTokenStore as _, ReplicaKeyStore as _};
 
     fn names(values: &[&str]) -> Vec<String> {

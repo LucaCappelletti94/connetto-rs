@@ -36,8 +36,8 @@ use std::{
 };
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Custody, ExportScope, NoGate,
-    PolicyTables, Replica,
+    AccountChoice, Auth, ClientEvent, ConnettoClient, Custody, ExportScope, NoGate, SyncSchema,
+    SyncTuning,
     teardown::{ExpiryWarning, expiry_warning},
 };
 use connetto_core::messages::FatalErrorReason;
@@ -45,9 +45,10 @@ use connetto_dioxus::use_live;
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::{
     MessageTransport, TabContent, TabResolved,
-    auth::{LogoutOutcome, WorkerAuthConfig, deliver_login_code, request_logout, request_unsynced},
-    leader, locks,
-    unlock::{AccountChoice, serve_account_choice},
+    auth::{LogoutOutcome, deliver_login_code, request_logout, request_unsynced},
+    builder::{AttachedTab, TabTopology, WebClientBuilder},
+    leader,
+    unlock::serve_account_choice,
     workers,
 };
 use diesel::prelude::*;
@@ -56,7 +57,7 @@ use wasm_bindgen::{JsCast, JsValue, closure::Closure};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{BroadcastChannel, MessageEvent};
 
-include!(concat!(env!("OUT_DIR"), "/replica-tables.rs"));
+include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = MessageTransport<BroadcastChannel>;
@@ -67,26 +68,10 @@ const DEMO_WS_URL: &str = match option_env!("CONNETTO_DEMO_WS") {
     Some(url) => url,
     None => "ws://127.0.0.1:7777/",
 };
-/// The synced replica schema (worker first boot, policy-split by build.rs from schema.sql +
-/// policies.sql). The tab mirror uses a simpler non-split DDL below.
-const DEMO_SQLITE_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
-/// The tab mirror schema: simple tables in the tab's main schema. The hub does not use
-/// policy views on the tab side; the server's CDC already filters rows to the user's identity.
-const DEMO_TAB_DDL: &str = "CREATE TABLE orders (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, owner_id TEXT NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0)) STRICT; \
-     CREATE TABLE order_lines (order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), line_no INTEGER NOT NULL, owner_id TEXT NOT NULL, quantity INTEGER NOT NULL CHECK (quantity >= 0), PRIMARY KEY (order_id, line_no)) STRICT; \
-     CREATE TABLE photos (id BLOB PRIMARY KEY DEFAULT (uuidv4()) CHECK (length(id) = 16) NOT NULL, order_id BLOB NOT NULL REFERENCES orders(id) CHECK (length(order_id) = 16), owner_id TEXT NOT NULL, content_id BLOB NOT NULL, content_state TEXT) STRICT; \
-     CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;";
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 /// The extra upstream subscription for photos.
 const PHOTO_QUERY: &str = "SELECT * FROM photos";
-/// SQLite function name a translated policy calls for the caller identity.
-const CALLER_FUNCTION: &str = connetto_demo_deployment::CALLER_FUNCTION;
-
-/// The replica's local name for the share keys the caller holds, which the
-/// membership arm of `photos_p` searches. A boot holding no key answers NULL,
-/// so that arm admits nothing.
-const SUBJECTS_FUNCTION: &str = connetto_demo_deployment::SUBJECTS_FUNCTION;
 /// The OPFS file holding the worker's durable synced replica (base name; the
 /// worker appends the identity hash so each account gets its own encrypted file).
 const DB_NAME: &str = "connetto-relay.sqlite";
@@ -94,8 +79,6 @@ const DB_NAME: &str = "connetto-relay.sqlite";
 const AUTH_DB_NAME: &str = "connetto-auth.sqlite";
 /// The shared leader lock every window of this app races.
 const LEADER_LOCK: &str = "connetto-demo-leader";
-/// The local tier schema, translated from `frontend.sql` by build.rs.
-const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
 /// BroadcastChannel on which the worker publishes the authenticated user id
 /// once it has acquired a session.
 const DEMO_UID_CHANNEL: &str = "connetto-demo-uid";
@@ -168,34 +151,6 @@ struct Photo {
     content_state: Option<String>,
 }
 
-// The synced key generator: `orders.id` bakes to `DEFAULT (uuidv4())`, so a
-// tab write omits the id and this registered function mints it. The impl is
-// `rosetta_uuid::Uuid::new_v4`, the same strongly typed key the `orders`
-// schema uses on SQLite and Postgres. Declared as nondeterministic so SQLite
-// calls it per row instead of folding the DEFAULT to a constant.
-// Declared with the built-in Binary type so diesel generates
-// register_nondeterministic_impl for SQLite. rosetta_uuid::Uuid implements
-// ToSql<Binary, Sqlite>, so the closure still returns the right value.
-#[diesel::declare_sql_function]
-extern "SQL" {
-    fn uuidv4() -> diesel::sql_types::Binary;
-}
-
-/// The registrar connetto installs on every connection it opens for this app.
-/// `INNOCUOUS` because the replica runs with trusted schema off and a column
-/// DEFAULT is a schema object.
-fn uuidv4_functions() -> connetto_client::SqlFunctions {
-    connetto_client::SqlFunctions::new().with(std::sync::Arc::new(
-        |conn: &mut diesel::SqliteConnection| {
-            uuidv4_utils::register_impl_with_behavior(
-                conn,
-                diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
-                rosetta_uuid::Uuid::new_v4,
-            )
-        },
-    ))
-}
-
 /// A device-unique integer id for a local-only `notes` row. `notes` stays on
 /// integer keys (device-private, never synced), so the client authors the id.
 /// The millisecond clock plus a random low tag keeps two windows of one device
@@ -247,6 +202,7 @@ async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
             (pages, free)
         })
         .await
+        .unwrap_or((0, 0))
 }
 
 // --- Auth helpers ------------------------------------------------------------
@@ -402,15 +358,35 @@ async fn worker_provider() -> String {
         .unwrap_or_else(|| AUTH_PROVIDER.to_owned())
 }
 
+/// The one build the worker boots from and every window attaches through.
+fn demo_builder() -> WebClientBuilder {
+    WebClientBuilder::new(
+        DEMO_WS_URL,
+        SyncSchema::new(connetto_schema_bundle::bundle()),
+    )
+    .with_tuning(SyncTuning::default().with_trim_threshold(5))
+    .with_reconnect(
+        connetto_client::reconnect::ReconnectPolicy::new()
+            .with_initial_backoff(Duration::from_millis(100))
+            .with_max_backoff(Duration::from_secs(2)),
+    )
+    .with_upstream("db-upstream", DEMO_QUERY)
+    .with_upstream("db-photos-upstream", PHOTO_QUERY)
+    .with_content_namespace("connetto-photo-content")
+    .with_content_heal_lost(
+        "SELECT content_id FROM photos WHERE content_state = 'lost'",
+        "content_id",
+    )
+}
+
 /// Boot the connetto DB tier in the worker context.
 ///
-/// Calls [`workers::boot_db_worker`] with the auth config aimed at
-/// [`AUTH_ORIGIN`]. Once the session is acquired, `boot_db_worker` returns
-/// the identity, account key, and session deadline, which are all broadcast on
-/// [`DEMO_UID_CHANNEL`] so the page can display which account is live, filter
-/// switch-account buttons, and warn before an offline session lapses. The
-/// broadcast happens after `boot_db_worker` returns, so it arrives after the
-/// worker has posted "ready" and the Dashboard is already visible.
+/// Signs in against [`AUTH_ORIGIN`]. Once the session is acquired, the boot
+/// returns the identity, account key, and session deadline, which are all
+/// broadcast on [`DEMO_UID_CHANNEL`] so the page can display which account is
+/// live, filter switch-account buttons, and warn before an offline session
+/// lapses. The broadcast happens after the boot returns, so it arrives after
+/// the worker has posted "ready" and the Dashboard is already visible.
 ///
 /// # Errors
 ///
@@ -418,39 +394,13 @@ async fn worker_provider() -> String {
 /// failure.
 async fn run_db_worker() -> Result<(), JsValue> {
     let origin = worker_origin();
-    let auth = Some(WorkerAuthConfig::new(
-        AUTH_ORIGIN,
-        worker_provider().await,
-        format!("{origin}{AUTH_CALLBACK_PATH}"),
-    ));
-    let booted = workers::boot_db_worker::<String>(
-        &workers::DbWorkerConfig::new(connetto_demo_deployment::schema_version())
-            .with_ws_url(DEMO_WS_URL)
-            .with_replica_db_prefix(DB_NAME)
-            .with_replica_ddl(DEMO_SQLITE_DDL)
-            .with_frontend_ddl(FRONTEND_DDL)
-            .with_upstream_sub_id("db-upstream")
-            .with_upstream_query(DEMO_QUERY)
-            .with_extra_upstream("db-photos-upstream", PHOTO_QUERY)
-            .with_hub_meta_name("connetto-hub-meta.sqlite")
-            .with_content_namespace("connetto-photo-content")
-            .with_content_heal_lost(
-                "SELECT content_id FROM photos WHERE content_state = 'lost'",
-                "content_id",
-            )
-            .with_sql_functions(uuidv4_functions())
-            .with_policy_tables(PolicyTables::from_translation(
-                POLICY_TABLES.iter().copied(),
-                POLICY_VIEWS.iter().copied(),
-            ))
-            .with_caller_function(CALLER_FUNCTION)
-            .with_subjects_function(SUBJECTS_FUNCTION)
-            .with_auth(auth)
-            .with_auth_db_name(AUTH_DB_NAME)
-            .with_unlock(true)
-            .with_pick_account(true),
-    )
-    .await?;
+    let booted = demo_builder()
+        .signed_in(Auth::new(AUTH_ORIGIN, worker_provider().await).with_account(AccountChoice::Ask))
+        .with_redirect_uri(format!("{origin}{AUTH_CALLBACK_PATH}"))
+        .with_auth_db_name(AUTH_DB_NAME)
+        .durable(DB_NAME)
+        .boot::<String>()
+        .await?;
     // Post all three session fields in one JS object so the page can show the
     // live account, warn before expiry, and populate switch-account buttons.
     if let Ok(ch) = BroadcastChannel::new(DEMO_UID_CHANNEL) {
@@ -506,66 +456,33 @@ struct Boot {
     /// Shared rather than owned, because the gate ceremony is awaited and the
     /// handle has to outlive the borrow that reaches it.
     membership: Rc<leader::Membership>,
-    _tab_lock: locks::HeldLock,
+    _tab: AttachedTab,
 }
 
-/// Join the topology and connect this window's tab client.
+/// Join the topology and attach this window's tab client.
 ///
-/// The sequence mirrors what the browser test suite pins: join the leader
-/// election (the winner spawns the worker), wait for the worker to answer,
-/// hold the tab liveness lock BEFORE connecting, connect over a boot wire, and
-/// wrap the connection in the reconnecting client so a worker swap recovers.
+/// The winner of the leader election spawns the worker from the dx glue,
+/// which auto-initializes on import and runs `main`, so no separate bootstrap
+/// is needed.
 async fn boot_window() -> Result<Boot, JsValue> {
     let glue = glue_url();
-    let client_id = rosetta_uuid::Uuid::new_v4().to_string();
-
-    // The DB worker is the wasm-bindgen glue itself: dx auto-initializes it on
-    // import and `main` boots the tier, so no separate bootstrap is needed.
-    let membership = leader::join(LEADER_LOCK, &glue, workers::WorkerBootstrap::Glue);
-    // A leader knows the boot it spawned, so it hears that boot's failure at once, and a
-    // follower waits for the announcement or for the deadline.
-    let boot = membership
-        .boot_identity()
-        .map_or_else(Vec::new, |id| vec![id]);
-    workers::await_db_worker_ready(&boot).await?;
-
-    let tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let wire = format!("connetto-wire-{client_id}-boot");
-    workers::announce_tab(&wire).await?;
-    let mut transport =
-        MessageTransport::<BroadcastChannel>::with_peer_liveness(&wire, workers::DB_ALIVE_LOCK)
-            .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    let content = Rc::new(TabContent::new(&mut transport));
-    let config = ClientConfig::new(client_id.clone())
-        .with_schema_version(Some(connetto_demo_deployment::schema_version()))
-        .with_sql_functions(uuidv4_functions())
-        // No with_policy_tables: the tab mirror uses the simple non-split DDL and the
-        // server's CDC already filters rows to the authenticated user's identity.
-        .with_trim_threshold(5);
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_TAB_DDL,
-        &config,
-        None,
-    )
-    .await
-    .map_err(|err| JsValue::from_str(&err.to_string()))?;
-    let policy = connetto_client::reconnect::ReconnectPolicy::new()
-        .with_initial_backoff(Duration::from_millis(100))
-        .with_max_backoff(Duration::from_secs(2));
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
-        workers::tab_wire_factory(client_id),
-        workers::sleep,
-        policy,
-    );
-    spawn_local(pump);
+    let tab = demo_builder()
+        .attach(TabTopology {
+            leader_lock: LEADER_LOCK,
+            glue_url: &glue,
+            bootstrap: workers::WorkerBootstrap::Glue,
+        })
+        .await
+        .map_err(|err| JsValue::from_str(&err.to_string()))?;
+    let content = tab
+        .content
+        .clone()
+        .ok_or_else(|| JsValue::from_str("the demo build keeps files"))?;
     Ok(Boot {
-        client,
+        client: tab.client.clone(),
         content,
-        membership: Rc::new(membership),
-        _tab_lock: tab_lock,
+        membership: Rc::clone(&tab.membership),
+        _tab: tab,
     })
 }
 
@@ -1102,7 +1019,7 @@ fn AuthBanner() -> Element {
                                 key: "{acc_label}",
                                 onclick: move |_| {
                                     account_answer
-                                        .set(Some(AccountChoice::Named(acc_key.clone())))
+                                        .set(Some(AccountChoice::Account(acc_key.clone())))
                                 },
                                 "Sign in as {acc_label}"
                             }
@@ -1414,7 +1331,8 @@ fn Dashboard() -> Element {
                                             ))
                                             .execute(conn.conn())
                                     })
-                                    .await;
+                                    .await
+                                    .and_then(|insert| insert.map_err(Into::into));
                                 if let Err(err) = result {
                                     tracing::error!(error = %err, "order insert failed");
                                 }
@@ -1434,7 +1352,8 @@ fn Dashboard() -> Element {
                                             )
                                             .execute(conn.conn())
                                         })
-                                        .await;
+                                        .await
+                                        .and_then(|insert| insert.map_err(Into::into));
                                     if let Err(err) = result {
                                         tracing::error!(error = %err, "order remove failed");
                                     }
@@ -1585,7 +1504,8 @@ fn Dashboard() -> Element {
                                             .values((notes::id.eq(id), notes::body.eq(body)))
                                             .execute(conn.conn())
                                     })
-                                    .await;
+                                    .await
+                                    .and_then(|insert| insert.map_err(Into::into));
                                 match result {
                                     Ok(_) => note_text.set(String::new()),
                                     Err(err) => {

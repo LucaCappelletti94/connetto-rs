@@ -26,6 +26,11 @@ use dioxus_core::{spawn, use_hook};
 use dioxus_hooks::use_signal;
 use dioxus_signals::{ReadSignal, WritableExt};
 
+#[cfg(feature = "desktop")]
+mod away;
+#[cfg(feature = "desktop")]
+pub use away::use_away_input;
+
 /// A live query bound to a component: the snapshot signal and an error slot.
 ///
 /// Reading [`value`](Self::value) inside a component subscribes that

@@ -14,9 +14,8 @@
 
 use std::time::Duration;
 
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoConnection, FullResyncReason, Grant, Replica,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, FullResyncReason, Grant};
+use connetto_core::auth::CapabilitySubject;
 use connetto_core::traits::Transport;
 use connetto_server::LoopbackTransport;
 use connetto_test_harness::Fixture;
@@ -87,10 +86,14 @@ async fn connect_as(
     transport: LoopbackTransport,
     person: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
-    let config = ClientConfig::new(person).with_login(Some(Grant::new(format!("user:{person}"))));
-    ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
-        .await
-        .expect("connect")
+    ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
+    )
+    .signed_in(super::support::held(person))
+    .connect_driven()
+    .await
+    .expect("connect")
 }
 
 /// Every row the replica holds, by id.
@@ -110,17 +113,17 @@ where
 /// identity, which is what a share link produces.
 async fn connect_with_key(
     transport: LoopbackTransport,
-    client_id: &str,
     key: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
-    let config = ClientConfig::new(client_id).with_capabilities([Grant::new(key.to_owned())]);
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        PAPERS_SQLITE_DDL,
-        &config,
-        None,
+    ClientBuilder::new(
+        super::support::bundle(PAPERS_SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .with_share_keys([(
+        Grant::new(key.to_owned()),
+        CapabilitySubject::<String>::new(key.to_owned()),
+    )])
+    .connect_driven()
     .await
     .expect("connect")
 }
@@ -130,14 +133,12 @@ async fn connect_owner(
     transport: LoopbackTransport,
     person: &str,
 ) -> ConnettoConnection<LoopbackTransport> {
-    let config = ClientConfig::new(person).with_login(Some(Grant::new(format!("user:{person}"))));
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        PAPERS_SQLITE_DDL,
-        &config,
-        None,
+    ClientBuilder::new(
+        super::support::bundle(PAPERS_SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(super::support::held(person))
+    .connect_driven()
     .await
     .expect("connect")
 }
@@ -320,7 +321,7 @@ async fn three_bearers(
     ConnettoConnection<LoopbackTransport>,
     ConnettoConnection<LoopbackTransport>,
 ) {
-    let mut bearer_a = connect_with_key(server.attach(), "bearer-a", SHARE_KEY_A).await;
+    let mut bearer_a = connect_with_key(server.attach(), SHARE_KEY_A).await;
     bearer_a
         .subscribe(PAPERS_SUB, PAPERS_QUERY)
         .await
@@ -332,7 +333,7 @@ async fn three_bearers(
         "the key grants exactly the paper its share row names"
     );
 
-    let mut bearer_b = connect_with_key(server.attach(), "bearer-b", SHARE_KEY_B).await;
+    let mut bearer_b = connect_with_key(server.attach(), SHARE_KEY_B).await;
     bearer_b
         .subscribe(PAPERS_SUB, PAPERS_QUERY)
         .await

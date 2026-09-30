@@ -19,17 +19,13 @@
 //! The worker's upstream is a fake server over a loopback, so no real server or
 //! Postgres is needed.
 //!
-//! **Needs the auth stack.** See `authenticated_boot.rs` for the auth stack
-//! commands. No server or Postgres is needed for this test.
-//! Run this suite with:
+//! No server, Postgres or identity provider is needed. Run this suite with:
 //! `wasm-pack test --headless --chrome examples/wasm-smoke --test credits`
 
 #![cfg(target_arch = "wasm32")]
 
-mod common;
-
 use connetto_client::reconnect::ReconnectPolicy;
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, HandshakeAck, LivePatch, NonFatalError,
     Ping, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
@@ -37,7 +33,8 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, PROTOCOL_VERSION, loopback};
-use connetto_wasm_smoke::{RelayHub, uuidv4_functions};
+use connetto_wasm_smoke::RelayHub;
+use connetto_wasm_smoke::build::{Once, raw_schema};
 use connetto_web::relay::HubReconnect;
 use futures_channel::oneshot;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -195,7 +192,6 @@ async fn recv(tab: &mut LoopbackTransport) -> IncomingFrame {
 #[wasm_bindgen_test]
 async fn hub_enforces_the_per_tab_credit_window() {
     let base = unique_base();
-    let worker_token = common::mint_token().await;
 
     // The worker's upstream is a fake server we drive frame by frame. It seeds
     // one row up front, so the worker replica is non-empty before the hub runs.
@@ -203,13 +199,11 @@ async fn hub_enforces_the_per_tab_credit_window() {
     let (trigger_tx, trigger_rx) = oneshot::channel();
     spawn_local(fake_upstream(fake_up, trigger_rx));
 
-    let worker_config = ClientConfig::new(format!("credits-worker-{base}"))
-        .with_login(Some(Grant::new(worker_token)))
-        .with_sql_functions(uuidv4_functions());
-    let mut worker =
-        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
-            .await
-            .expect("worker connect");
+    let mut worker = ClientBuilder::new(raw_schema(DDL), Once::new(worker_up))
+        .with_client_id(format!("credits-worker-{base}"))
+        .connect_driven()
+        .await
+        .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await
@@ -269,9 +263,13 @@ async fn hub_enforces_the_per_tab_credit_window() {
             IncomingFrame::Control(ControlMessage::SnapshotBegin(_)) => {}
             IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_)) => snapshot_patches += 1,
             IncomingFrame::Control(ControlMessage::SnapshotEnd(_)) => break,
-            // The hub states its reach to every tab, and it is not a bulk frame
-            // so it spends no credit.
-            IncomingFrame::Control(ControlMessage::SyncStatus(_)) => {}
+            // The hub states its reach, its identity and its gate to every
+            // tab, none of them bulk frames, so they spend no credit.
+            IncomingFrame::Control(
+                ControlMessage::SyncStatus(_)
+                | ControlMessage::TabIdentity(_)
+                | ControlMessage::GateState(_),
+            ) => {}
             other => panic!("unexpected frame during the snapshot: {other:?}"),
         }
     }
@@ -339,12 +337,16 @@ async fn hub_enforces_the_per_tab_credit_window() {
 
 /// A short name for a frame, so an ordering failure reads as a sequence.
 ///
-/// `SyncStatus` is dropped rather than named: the hub states its reach to every
-/// tab whenever it changes, on no schedule of this test's, and it spends no
-/// credit.
+/// The hub's statements of its reach, its identity and its gate are dropped
+/// rather than named, since the hub sends them on no schedule of this test's
+/// and they spend no credit.
 fn label(frame: &IncomingFrame) -> Option<String> {
     match frame {
-        IncomingFrame::Control(ControlMessage::SyncStatus(_)) => None,
+        IncomingFrame::Control(
+            ControlMessage::SyncStatus(_)
+            | ControlMessage::TabIdentity(_)
+            | ControlMessage::GateState(_),
+        ) => None,
         IncomingFrame::Control(ControlMessage::SnapshotBegin(begin)) => {
             Some(format!("SnapshotBegin {}", begin.sub_id))
         }
@@ -398,19 +400,16 @@ async fn drain_to_barrier(tab: &mut LoopbackTransport, nonce: u64) -> Vec<String
 #[wasm_bindgen_test]
 async fn a_tabs_snapshot_end_waits_for_its_rows() {
     let base = unique_base();
-    let worker_token = common::mint_token().await;
 
     let (worker_up, fake_up) = loopback();
     let (trigger_tx, trigger_rx) = oneshot::channel();
     spawn_local(fake_upstream(fake_up, trigger_rx));
 
-    let worker_config = ClientConfig::new(format!("order-worker-{base}"))
-        .with_login(Some(Grant::new(worker_token)))
-        .with_sql_functions(uuidv4_functions());
-    let mut worker =
-        ConnettoConnection::connect(worker_up, &Replica::in_memory(), DDL, &worker_config, None)
-            .await
-            .expect("worker connect");
+    let mut worker = ClientBuilder::new(raw_schema(DDL), Once::new(worker_up))
+        .with_client_id(format!("order-worker-{base}"))
+        .connect_driven()
+        .await
+        .expect("worker connect");
     worker
         .subscribe(UPSTREAM_SUB, QUERY)
         .await
@@ -471,7 +470,11 @@ async fn a_tabs_snapshot_end_waits_for_its_rows() {
         match recv(&mut tab).await {
             IncomingFrame::Bulk(BulkMessage::LivePatch(_)) => delivered += 1,
             IncomingFrame::Control(ControlMessage::NonFatalError(_)) => break,
-            IncomingFrame::Control(ControlMessage::SyncStatus(_)) => {}
+            IncomingFrame::Control(
+                ControlMessage::SyncStatus(_)
+                | ControlMessage::TabIdentity(_)
+                | ControlMessage::GateState(_),
+            ) => {}
             other => panic!("unexpected frame before the credit barrier: {other:?}"),
         }
     }

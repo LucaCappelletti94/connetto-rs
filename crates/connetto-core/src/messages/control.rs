@@ -47,6 +47,40 @@ pub enum PauseCause {
     DatabaseUnreachable,
 }
 
+/// The worker's gate state, which a relay states to a tab so the tab can
+/// refuse application access while the gate is locked.
+///
+/// A relay states the current value right after each tab's handshake and
+/// pushes every change to the tabs that have finished theirs, the way
+/// [`SyncStatus`] carries the relay's connection state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GateState {
+    /// The gate is locked. Application reads, writes, and new watches are
+    /// refused, and live-handle refreshes are held.
+    Locked,
+    /// The gate is unlocked, and application access has resumed.
+    Unlocked,
+    /// The gate's prompt was dismissed or failed and the gate stays locked.
+    UnlockDismissed,
+}
+
+/// Who a relay's worker is signed in as, which a relay states to a tab so the
+/// tab's mirror answers its policy views as the worker's replica does.
+///
+/// A tab holds no credential, the worker having signed in, while the tab's
+/// mirror runs the same translated schema, whose views filter on the caller
+/// and the subjects the caller holds. The relay states both right after each
+/// tab's handshake. Neither is secret on the origin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TabIdentity {
+    /// The caller value the worker's replica answers, `None` when nobody is
+    /// signed in.
+    pub caller: Option<String>,
+    /// The packed subject set the worker's replica answers, `None` when the
+    /// worker holds no live share key.
+    pub subjects: Option<String>,
+}
+
 use super::{
     aggregate::AggregateUpdate,
     content::{ContentTicketGrant, ContentTicketRequest},
@@ -121,6 +155,14 @@ pub enum ControlMessage {
     /// tab knows whether what it is showing is current. Never sent by a real
     /// server, which cannot say this to a client it is not reaching.
     SyncStatus(SyncStatus),
+    /// A relay tells a tab the worker's gate state, so a tab can refuse
+    /// application access while the gate is locked. Never sent by a real
+    /// server, which has no gate of this kind.
+    GateState(GateState),
+    /// A relay tells a tab who its worker is signed in as. Never sent by a
+    /// real server, which answers the caller's identity through the rows it
+    /// serves.
+    TabIdentity(TabIdentity),
     /// Session-terminating error.
     FatalError(FatalError),
     /// Server reports that live delivery is temporarily paused.

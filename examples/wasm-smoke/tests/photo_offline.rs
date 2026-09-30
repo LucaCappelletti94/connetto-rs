@@ -6,19 +6,18 @@ mod common;
 mod harness;
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
 use connetto_file_core::{FileId, MimeClass};
-use connetto_wasm_smoke::workers::{
-    DEMO_TAB_DDL, PHOTO_CONNECT_CHANNEL, announce_tab, await_db_worker_ready,
-};
-use connetto_wasm_smoke::{CALLER_FUNCTION, MessageTransport, locks};
+use connetto_wasm_smoke::build::Once;
+use connetto_wasm_smoke::workers::demo_schema;
+use connetto_wasm_smoke::workers::{PHOTO_CONNECT_CHANNEL, announce_tab, await_db_worker_ready};
+use connetto_wasm_smoke::{MessageTransport, locks};
 use connetto_web::{TabContent, TabResolved};
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use js_sys::{Array, Uint8Array};
 use wasm_bindgen::JsCast;
+
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, Response};
@@ -127,8 +126,6 @@ fn open_photo_connect_gate() {
 }
 async fn connect_tab(
     client_id: &str,
-    token: String,
-    identity: &str,
 ) -> (
     TabContent<BroadcastChannel>,
     ConnettoConnection<MessageTransport<BroadcastChannel>>,
@@ -139,22 +136,11 @@ async fn connect_tab(
     harness::stage("tab announced");
     let mut transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let content = TabContent::new(&mut transport);
-    let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_TAB_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("tab connect through the wire channel");
+    let conn = ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
+        .with_client_id(client_id.to_owned())
+        .connect_driven()
+        .await
+        .expect("tab connect through the wire channel");
     harness::stage("tab connected");
     (content, conn)
 }
@@ -180,7 +166,7 @@ async fn an_offline_photo_replays_on_connect_and_flips_available() {
     let (token, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let (content, mut conn) = connect_tab(&client_id, token.clone(), &identity).await;
+    let (content, mut conn) = connect_tab(&client_id).await;
     conn.subscribe("photo-offline-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");
@@ -275,13 +261,7 @@ async fn an_offline_photo_replays_on_connect_and_flips_available() {
     ));
     harness::stage("photo present offline");
 
-    let mut server = harness::connect_server(
-        "photo-offline-server",
-        harness::unique_base(),
-        token,
-        &identity,
-    )
-    .await;
+    let mut server = harness::connect_server(token, &identity).await;
     server
         .subscribe("photo-offline-server-photos", "SELECT * FROM photos")
         .await

@@ -16,7 +16,7 @@
 //! stale ones behind, and deleting the whole table removes the stale ones and
 //! the sibling's with them.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
@@ -127,10 +127,6 @@ async fn wait_subscribe(server: &mut LoopbackTransport) {
     }
 }
 
-fn client_config() -> ClientConfig {
-    ClientConfig::new("coverage").with_login(Some(connetto_client::Grant::new("user:coverage")))
-}
-
 /// Pump until the next snapshot completes.
 async fn pump_to_snapshot_end<T>(conn: &mut ConnettoConnection<T>)
 where
@@ -207,13 +203,12 @@ fn resync_wipe_server() -> LoopbackTransport {
 /// snapshot restores only A's rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn resync_of_one_subscription_keeps_the_siblings_rows() {
-    let mut conn = ConnettoConnection::connect(
-        resync_wipe_server(),
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &client_config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(resync_wipe_server()),
     )
+    .signed_in(super::support::held("coverage"))
+    .connect_driven()
     .await
     .expect("connect");
 

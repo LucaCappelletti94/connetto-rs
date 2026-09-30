@@ -34,7 +34,6 @@ const LANDING_PATH: &str = "/dev/landing";
 const SHARE_PATH: &str = "/dev/share";
 /// Where a suite posts hex file ids whose stored chunks the stack deletes before restarting the server, so the boot reconcile marks those files lost.
 const LOSE_CONTENT_PATH: &str = "/dev/lose-content";
-const CALLER_FUNCTION: &str = "current_app_user";
 const BROWSER_PROVIDER: &str = "dev-idp";
 
 const DEPLOYMENT: Deployment = Deployment {
@@ -369,7 +368,6 @@ async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<S
     envs.extend(
         [
             ("CONNETTO_CONTENT_SWEEP_SECS", "1".to_owned()),
-            ("CONNETTO_CALLER_FUNCTION", CALLER_FUNCTION.to_owned()),
             ("CONNETTO_SLOT_LAG_SECS", "0".to_owned()),
             ("CONNETTO_TEST_PROVIDER", BROWSER_PROVIDER.to_owned()),
             (

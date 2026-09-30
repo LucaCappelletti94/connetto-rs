@@ -45,7 +45,7 @@ async fn resolve_answers_a_signed_url_when_nothing_local_holds_the_bytes() {
 #[tokio::test]
 async fn resolve_answers_unavailable_when_offline_and_nothing_local() {
     let dir = tempdir().expect("temp dir");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content =
         attach_content(client, &dir.path().join("chunks"), RecordingHttp::default()).await;
 
@@ -169,7 +169,7 @@ async fn a_pin_names_the_files_its_query_returns() {
 #[tokio::test]
 async fn a_pin_whose_column_is_not_returned_is_refused() {
     let dir = tempdir().expect("temp dir");
-    let client = offline_client(&dir.path().join("replica.sqlite"));
+    let client = offline_client(&dir.path().join("replica.sqlite")).await;
     let content =
         attach_content(client, &dir.path().join("chunks"), RecordingHttp::default()).await;
 
@@ -367,7 +367,7 @@ async fn a_started_resolve_on_a_cold_connection_answers_unavailable() {
     use connetto_file_client::{ContentArchive, FsStore, ResolveStart};
 
     let dir = tempdir().expect("temp dir");
-    let mut conn = cold_connection(&dir.path().join("replica.sqlite"));
+    let mut conn = cold_connection(&dir.path().join("replica.sqlite")).await;
     let archive = ContentArchive::new(FsStore::new(dir.path().join("chunks")), ROOT_KEY);
     archive
         .install(&mut conn)

@@ -11,7 +11,7 @@
 
 mod common;
 
-use common::{ACCOUNT_DB, auth_config, play_the_tab, worker_config};
+use common::{ACCOUNT_DB, play_the_tab, worker_builder};
 use connetto_web::auth::AccountStore;
 use connetto_web::storage::ReplicaStorage;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -42,7 +42,8 @@ async fn a_marker_that_cannot_refresh_is_replaced_by_a_fresh_login() {
 
     // The startup meets that marker and logs in through the tab.
     let logins_served = play_the_tab();
-    connetto_web::workers::boot_db_worker::<String>(&worker_config(Some(auth_config())))
+    worker_builder()
+        .boot::<String>()
         .await
         .expect("the startup recovers from a marker with no cookie");
     assert_eq!(

@@ -8,7 +8,8 @@
 //! `CREATE TABLE prefs (name TEXT, value TEXT)` is a keyed table by SQLite's
 //! rules, so nothing warned the developer and the write was never uploaded.
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey};
+use connetto_client::{ClientBuilder, ClientError, DataDir, ReplicaKey, SyncSchema};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -20,10 +21,6 @@ const MIXED_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)
 
 /// One keyed table, so a test can create its own tables afterwards.
 const KEYED_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
-
-fn config() -> ClientConfig {
-    ClientConfig::new("r62")
-}
 
 fn key() -> ReplicaKey {
     ReplicaKey::from_bytes([0x62; ReplicaKey::LEN])
@@ -53,12 +50,11 @@ fn refused<T>(result: Result<T, ClientError>) -> Vec<String> {
 /// silent one before this phase.
 #[tokio::test]
 async fn a_write_to_an_accepted_table_is_captured_by_nothing() {
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        MIXED_DDL,
-        &config().with_unrecorded_tables(["prefs"]),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(MIXED_DDL).with_unrecorded_tables(["prefs"]),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open the replica");
 
     conn.batch_execute("INSERT INTO prefs (name, value) VALUES ('theme', 'dark')")
@@ -82,12 +78,13 @@ async fn a_write_to_an_accepted_table_is_captured_by_nothing() {
 /// which table and what to write.
 #[test]
 fn a_rowid_only_table_is_refused_at_open() {
-    let tables = refused(ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        MIXED_DDL,
-        &config(),
-        None,
-    ));
+    let tables = refused(
+        ClientBuilder::new(
+            super::support::bundle(MIXED_DDL),
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .open_driven(),
+    );
     assert_eq!(tables.len(), 1, "only the unkeyed table: {tables:?}");
     let refusal = &tables[0];
     assert!(refusal.contains("prefs"), "names the table: {refusal}");
@@ -98,12 +95,13 @@ fn a_rowid_only_table_is_refused_at_open() {
 /// too. This is the case a developer is most likely to think is covered.
 #[test]
 fn a_unique_constraint_without_a_primary_key_is_refused() {
-    let tables = refused(ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        "CREATE TABLE pairs (a TEXT, b TEXT, UNIQUE(a, b))",
-        &config(),
-        None,
-    ));
+    let tables = refused(
+        ClientBuilder::new(
+            super::support::bundle("CREATE TABLE pairs (a TEXT, b TEXT, UNIQUE(a, b))"),
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .open_driven(),
+    );
     assert!(
         tables.iter().any(|refusal| refusal.contains("pairs")),
         "names the table: {tables:?}"
@@ -115,12 +113,11 @@ fn a_unique_constraint_without_a_primary_key_is_refused() {
 /// restart, which is where the loss would otherwise be unbounded.
 #[tokio::test]
 async fn a_table_created_after_open_is_caught_at_the_next_write() {
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        KEYED_DDL,
-        &config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(KEYED_DDL),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open the replica");
     conn.batch_execute("CREATE TABLE later (body TEXT)")
         .expect("the application creates its own table");
@@ -140,13 +137,14 @@ async fn a_table_created_after_open_is_caught_at_the_next_write() {
 /// that was ever analysed writable.
 #[tokio::test]
 async fn sqlites_own_statistics_table_is_not_the_applications() {
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT); \
-         CREATE INDEX items_label ON items (label)",
-        &config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(
+            "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT); \
+             CREATE INDEX items_label ON items (label)",
+        ),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open the replica");
     conn.batch_execute("INSERT INTO items (id, label) VALUES (1, 'kept'); ANALYZE")
         .expect("analyse the replica");
@@ -174,12 +172,25 @@ async fn sqlites_own_statistics_table_is_not_the_applications() {
 #[tokio::test]
 async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
     let dir = tempdir().expect("temp dir");
-    let replica_path = dir.path().join("replica.db");
-    let replica = Replica::encrypted_file(replica_path.to_str().expect("utf-8"), Some(key()))
-        .expect("replica")
-        .with_tier("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)");
-    let mut conn = ConnettoConnection::<FakeTransport>::open(&replica, KEYED_DDL, &config(), None)
-        .expect("open the replica");
+    let credential = super::support::held("test");
+    let store = super::support::key_store_with(&credential, key()).await;
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        KEYED_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)"),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<FakeTransport>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open the replica");
     conn.batch_execute("CREATE TABLE connetto_local.scratch (body TEXT)")
         .expect("the application creates a device-private table");
 
@@ -197,12 +208,21 @@ async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
 /// table through a session diff and an unkeyed one delivers nothing.
 #[test]
 fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
-    let tables = refused(ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory().with_tier("CREATE TABLE scratch (body TEXT)"),
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
         KEYED_DDL,
-        &config(),
-        None,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some("CREATE TABLE scratch (body TEXT)"),
     ));
+    let tables = refused(
+        ClientBuilder::new(
+            schema,
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .open_driven(),
+    );
     assert!(
         tables.iter().any(|refusal| refusal.contains("scratch")),
         "names the tier table: {tables:?}"
@@ -211,32 +231,46 @@ fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
 
 /// And when it attaches one a previous run created, which is every run after
 /// the first.
-#[test]
-fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
+#[tokio::test]
+async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
     let dir = tempdir().expect("temp dir");
-    let replica_path = dir.path().join("replica.db");
-    let path = replica_path.to_str().expect("utf-8");
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        KEYED_DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some("CREATE TABLE scratch (body TEXT)"),
+    ));
+    let accepted = schema.clone().with_unrecorded_tables(["scratch"]);
     // The tier is created with the table accepted, which is the only way one
     // gets written at all, and then reopened without the acceptance.
+    let first = super::support::held("test");
+    let store = super::support::key_store_with(&first, key()).await;
     drop(
-        ConnettoConnection::<FakeTransport>::open(
-            &Replica::encrypted_file(path, Some(key()))
-                .expect("replica")
-                .with_tier("CREATE TABLE scratch (body TEXT)"),
-            KEYED_DDL,
-            &config().with_unrecorded_tables(["scratch"]),
-            None,
+        ClientBuilder::new(
+            accepted,
+            super::support::NeverDial::<FakeTransport>::default(),
         )
+        .signed_in(first)
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await
         .expect("the accepted tier opens"),
     );
 
-    let tables = refused(ConnettoConnection::<FakeTransport>::open_existing(
-        &Replica::encrypted_file(path, Some(key()))
-            .expect("replica")
-            .with_existing_tier(),
-        &config(),
-        None,
-    ));
+    let second = super::support::held("test");
+    let store = super::support::key_store_with(&second, key()).await;
+    let tables = refused(
+        ClientBuilder::new(
+            schema,
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .signed_in(second)
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await,
+    );
     assert!(
         tables.iter().any(|refusal| refusal.contains("scratch")),
         "names the tier table: {tables:?}"
@@ -248,12 +282,13 @@ fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
 /// table would sync while the application believed it did not.
 #[test]
 fn an_accepted_table_that_declares_a_key_is_refused() {
-    let tables = refused(ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        KEYED_DDL,
-        &config().with_unrecorded_tables(["items"]),
-        None,
-    ));
+    let tables = refused(
+        ClientBuilder::new(
+            super::support::bundle(KEYED_DDL).with_unrecorded_tables(["items"]),
+            super::support::NeverDial::<FakeTransport>::default(),
+        )
+        .open_driven(),
+    );
     assert_eq!(tables.len(), 1, "one refusal: {tables:?}");
     let refusal = &tables[0];
     assert!(refusal.contains("items"), "names the table: {refusal}");
@@ -267,12 +302,11 @@ fn an_accepted_table_that_declares_a_key_is_refused() {
 /// meant to name is still refused, which is loud.
 #[test]
 fn an_acceptance_that_matches_nothing_is_harmless() {
-    ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        KEYED_DDL,
-        &config().with_unrecorded_tables(["prefrences"]),
-        None,
+    ClientBuilder::new(
+        super::support::bundle(KEYED_DDL).with_unrecorded_tables(["prefrences"]),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("a typo changes nothing about a keyed schema");
 }
 
@@ -281,12 +315,11 @@ fn an_acceptance_that_matches_nothing_is_harmless() {
 /// unaccepted table is `local_export.rs`.
 #[test]
 fn the_export_skips_an_accepted_table() {
-    let mut conn = ConnettoConnection::<FakeTransport>::open(
-        &Replica::in_memory(),
-        MIXED_DDL,
-        &config().with_unrecorded_tables(["prefs"]),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(MIXED_DDL).with_unrecorded_tables(["prefs"]),
+        super::support::NeverDial::<FakeTransport>::default(),
     )
+    .open_driven()
     .expect("open the replica");
     conn.batch_execute("INSERT INTO prefs (name, value) VALUES ('theme', 'dark')")
         .expect("write an accepted row");

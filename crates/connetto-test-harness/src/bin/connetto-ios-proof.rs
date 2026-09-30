@@ -21,8 +21,9 @@
 //! maintainer's tailnet is `CONNETTO_STACK_PUBLIC_HOST` with TLS. The demo and
 //! its login page are read and driven through the `WebKit` remote inspector,
 //! reached with `ios_webkit_debug_proxy`, which must be on `PATH`. The app
-//! dials the sync server through a relay the driver owns, and stopping the
-//! relay is the offline step. Evidence lands under
+//! dials the sync server through a relay the driver owns, over `wss` with the
+//! stack's certificate on a device, and stopping the relay is the offline
+//! step. Evidence lands under
 //! `target/ios-proof/<udid>-<millis>/`, screenshots and the app log on a
 //! simulator and the demo's page text on a device, where `devicectl` takes
 //! no screenshots.
@@ -38,7 +39,7 @@ use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
 use connetto_test_harness::ios_signing;
 use connetto_test_harness::relay::Relay;
-use connetto_test_harness::stack::{now_millis, repo_path};
+use connetto_test_harness::stack::{TLS_CERT_VAR, TLS_KEY_VAR, now_millis, repo_path};
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
@@ -81,6 +82,9 @@ async fn main() -> Result<()> {
 /// What `connetto-demo-stack` tells its command.
 struct Stack {
     server: String,
+    /// The certificate and key a TLS relay in front of the sync server
+    /// serves, which the stack names when it is on the network.
+    tls: Option<(PathBuf, PathBuf)>,
     auth_origin: String,
     pg_url: String,
     issuer: String,
@@ -94,6 +98,10 @@ impl Stack {
         };
         Ok(Self {
             server: var("CONNETTO_DEMO_SERVER")?,
+            tls: std::env::var(TLS_CERT_VAR)
+                .ok()
+                .zip(std::env::var(TLS_KEY_VAR).ok())
+                .map(|(cert, key)| (PathBuf::from(cert), PathBuf::from(key))),
             auth_origin: var("CONNETTO_DEMO_AUTH_ORIGIN")?,
             pg_url: var("CONNETTO_DEMO_PG")?,
             issuer: var("CONNETTO_DEMO_ISSUER")?,
@@ -119,14 +127,25 @@ async fn prove(
         Some(app) => app,
         None => target.build(evidence).await?,
     };
-    // A device dials the relay across the network, a simulator on the Mac's
-    // loopback.
-    let (listen, host) = match target {
-        Target::Simulator { .. } => ("127.0.0.1:0", "127.0.0.1"),
-        Target::Device { .. } => ("0.0.0.0:0", stack.host()?),
+    // A simulator dials the relay on the Mac's loopback in plain `ws`. A
+    // device dials it across the network, where the client accepts only
+    // `wss`, so the relay terminates TLS with the stack's certificate.
+    let (mut relay, sync_url) = match target {
+        Target::Simulator { .. } => {
+            let relay = Relay::start("127.0.0.1:0", &stack.server).await?;
+            let url = format!("ws://127.0.0.1:{}/", relay.address().port());
+            (relay, url)
+        }
+        Target::Device { .. } => {
+            let (cert, key) = stack
+                .tls
+                .as_ref()
+                .context("a device run needs the stack's TLS certificate")?;
+            let relay = Relay::start_tls("0.0.0.0:0", &stack.server, cert, key).await?;
+            let url = format!("wss://{}:{}/", stack.host()?, relay.address().port());
+            (relay, url)
+        }
     };
-    let mut relay = Relay::start(listen, &stack.server).await?;
-    let server = format!("{host}:{}", relay.address().port());
 
     step("install");
     target.install(&app).await?;
@@ -135,7 +154,7 @@ async fn prove(
     step("sign in");
     target
         .launch(&[
-            ("CONNETTO_DEMO_SERVER", &server),
+            ("CONNETTO_DEMO_WS", &sync_url),
             ("CONNETTO_DEMO_AUTH_ORIGIN", &stack.auth_origin),
             ("CONNETTO_DEMO_PG", &stack.pg_url),
         ])

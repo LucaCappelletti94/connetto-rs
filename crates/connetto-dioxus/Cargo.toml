@@ -24,6 +24,15 @@ dioxus-signals = "0.7.9"
 # (`QueryFragment`, `LoadQuery`, `Sqlite`, `SqliteConnection`), so the adapter
 # names diesel directly. It is already in the graph through connetto-client.
 diesel.workspace = true
+# The desktop away/return feeder (R94 step 5) reads tao's lifecycle events,
+# so it pulls dioxus-desktop. Optional, keeping the wasm build clean.
+dioxus-desktop = { version = "0.7.9", optional = true }
+
+[features]
+# Feeds the client's away input from tao's Suspended and Resumed events on
+# iOS and Android and from window focus on the desktop (R94 decision 9). Off
+# by default, so the wasm build never pulls the native webview stack.
+desktop = ["dep:dioxus-desktop"]
 
 [dev-dependencies]
 # The hook integration test drives a real native client (ConnettoClient::start

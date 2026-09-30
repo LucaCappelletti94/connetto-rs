@@ -73,18 +73,12 @@ const RESTORE_INTO_FRESH: &str = "rm -rf /tmp/fresh && \
 /// The dump restored over the cluster it came from.
 const RESTORE_INTO_SAME: &str = "pg_restore --clean --if-exists -d postgres /tmp/db.dump";
 
-/// The replica schema, idempotent because the client binary replays it on
-/// every open and this client opens its replica twice.
-const REOPENABLE_SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS orders \
-    (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
-
 /// The application launching on its replica.
 fn launch(ws: &str, db: &Path, token: &str) -> ChildGuard {
     spawn_client_env(
         ws,
         db,
         "restore-client",
-        REOPENABLE_SQLITE_DDL,
         PG_DDL,
         NO_POLICIES,
         "orders",

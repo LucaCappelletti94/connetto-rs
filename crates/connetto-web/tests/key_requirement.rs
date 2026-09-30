@@ -10,8 +10,13 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Replica, ReplicaKey};
+use connetto_client::{
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate,
+    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
+use connetto_core::traits::{ReplicaKeyStore, Transport};
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use diesel::connection::SimpleConnection;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -21,8 +26,91 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 const REPLICA_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const UNKEYED_TIER_DDL: &str = "CREATE TABLE scratch (body TEXT)";
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r62")
+/// A client schema over `ddl`, with `tier` as its device-private tier.
+fn schema(ddl: &str, tier: Option<&str>) -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        ddl,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        tier,
+    ))
+}
+
+/// The replica at exactly `url`, fresh or already there as the test says.
+struct At {
+    url: String,
+    exists: bool,
+}
+
+impl ReplicaPlace for At {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            name,
+            self.url.clone(),
+            self.exists,
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// A key store holding one key for every record.
+struct Holding(ReplicaKey);
+
+impl ReplicaKeyStore for Holding {
+    type Error = ClientError;
+
+    fn load(&self, _name: &str) -> impl Future<Output = Result<Option<ReplicaKey>, ClientError>> {
+        core::future::ready(Ok(Some(self.0.clone())))
+    }
+
+    fn store(
+        &self,
+        _name: &str,
+        _key: &ReplicaKey,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn clear(&self, _name: &str) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn protection(&self) -> Custody {
+        Custody::Ephemeral
+    }
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
+/// The replica at `url` under `key`, created when `fresh`, with no transport.
+async fn open_at(
+    schema: SyncSchema,
+    url: &str,
+    key: ReplicaKey,
+    fresh: bool,
+) -> Result<ConnettoConnection<FakeTransport>, ClientError> {
+    ClientBuilder::new(schema, once(FakeTransport::accepting()))
+        .signed_in(
+            HeldCredential::new(connetto_client::Grant::new("user:test"), "test")
+                .expect("a string identity serializes"),
+        )
+        .durable(
+            At {
+                url: url.to_owned(),
+                exists: !fresh,
+            },
+            Holding(key),
+        )
+        .with_gate(Gate::off())
+        .open_driven()
+        .await
 }
 
 fn key() -> ReplicaKey {
@@ -56,12 +144,18 @@ async fn a_rowid_only_table_is_refused_in_the_worker() {
     fresh(&storage, name).await;
     let url = storage.db_url(name);
 
-    let tables = refused(ConnettoConnection::<FakeTransport>::open(
-        &Replica::encrypted_file(&url, Some(key())).expect("a resolved key"),
-        "CREATE TABLE items (id INTEGER PRIMARY KEY); CREATE TABLE prefs (name TEXT, value TEXT)",
-        &config(),
-        None,
-    ));
+    let tables = refused(
+        open_at(
+            schema(
+                "CREATE TABLE items (id INTEGER PRIMARY KEY); CREATE TABLE prefs (name TEXT, value TEXT)",
+                None,
+            ),
+            &url,
+            key(),
+            true,
+        )
+        .await,
+    );
     assert_eq!(tables.len(), 1, "one refusal: {tables:?}");
     assert!(
         tables[0].contains("prefs"),
@@ -80,14 +174,15 @@ async fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
     let tier = fresh(&storage, name).await;
     let url = storage.db_url(name);
 
-    let tables = refused(ConnettoConnection::<FakeTransport>::open(
-        &Replica::encrypted_file(&url, Some(key()))
-            .expect("a resolved key")
-            .with_tier(UNKEYED_TIER_DDL),
-        REPLICA_DDL,
-        &config(),
-        None,
-    ));
+    let tables = refused(
+        open_at(
+            schema(REPLICA_DDL, Some(UNKEYED_TIER_DDL)),
+            &url,
+            key(),
+            true,
+        )
+        .await,
+    );
     assert!(
         tables.iter().any(|refusal| refusal.contains("scratch")),
         "names the tier table: {tables:?}"
@@ -115,23 +210,24 @@ async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
     // Written once with the table accepted, which is the only way such a tier
     // gets created at all, then reopened without the acceptance.
     drop(
-        ConnettoConnection::<FakeTransport>::open(
-            &Replica::encrypted_file(&url, Some(key()))
-                .expect("a resolved key")
-                .with_tier(UNKEYED_TIER_DDL),
-            REPLICA_DDL,
-            &config().with_unrecorded_tables(["scratch"]),
-            None,
+        open_at(
+            schema(REPLICA_DDL, Some(UNKEYED_TIER_DDL)).with_unrecorded_tables(["scratch"]),
+            &url,
+            key(),
+            true,
         )
+        .await
         .expect("the accepted tier opens"),
     );
-    let tables = refused(ConnettoConnection::<FakeTransport>::open_existing(
-        &Replica::encrypted_file(&url, Some(key()))
-            .expect("a resolved key")
-            .with_existing_tier(),
-        &config(),
-        None,
-    ));
+    let tables = refused(
+        open_at(
+            schema(REPLICA_DDL, Some(UNKEYED_TIER_DDL)),
+            &url,
+            key(),
+            false,
+        )
+        .await,
+    );
     assert!(
         tables.iter().any(|refusal| refusal.contains("scratch")),
         "names the tier table: {tables:?}"
@@ -152,14 +248,13 @@ async fn an_accepted_tier_table_records_nothing_and_a_later_one_is_caught() {
     let url = storage.db_url(name);
 
     {
-        let mut conn = ConnettoConnection::<FakeTransport>::open(
-            &Replica::encrypted_file(&url, Some(key()))
-                .expect("a resolved key")
-                .with_tier(UNKEYED_TIER_DDL),
-            REPLICA_DDL,
-            &config().with_unrecorded_tables(["scratch"]),
-            None,
+        let mut conn = open_at(
+            schema(REPLICA_DDL, Some(UNKEYED_TIER_DDL)).with_unrecorded_tables(["scratch"]),
+            &url,
+            key(),
+            true,
         )
+        .await
         .expect("the accepted tier opens");
         conn.batch_execute("INSERT INTO scratch (body) VALUES ('kept locally')")
             .expect("write an accepted row");

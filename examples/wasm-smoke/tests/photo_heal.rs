@@ -70,10 +70,10 @@ async fn a_pinned_photo_stays_local_and_heals_the_lost_server_copy() {
     await_db_worker_ready(&[]).await.expect("db worker ready");
     harness::stage("db worker booted");
 
-    let (token, identity) = common::mint_session().await;
+    let (_, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let (content, mut conn) = photo::connect_tab(&client_id, token, &identity).await;
+    let (content, mut conn) = photo::connect_tab(&client_id).await;
     conn.subscribe("photo-heal-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");
@@ -140,13 +140,7 @@ async fn a_pinned_photo_stays_local_and_heals_the_lost_server_copy() {
     harness::stage("pinned photo healed");
 
     let (other_token, other_identity) = common::mint_session().await;
-    let other = harness::connect_server(
-        "photo-heal-other",
-        harness::unique_base(),
-        other_token,
-        &other_identity,
-    )
-    .await;
+    let other = harness::connect_server(other_token, &other_identity).await;
     let (other_client, other_pump) = ConnettoClient::with_pump(other);
     let (other_done_tx, other_done) = oneshot::channel::<()>();
     spawn_local(async move {

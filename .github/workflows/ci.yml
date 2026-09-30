@@ -134,21 +134,11 @@ jobs:
         if: matrix.target != ''
         run: rustup target add wasm32-unknown-unknown --toolchain stable
 
+      # The root legs pass --all-features, which turns on connetto-dioxus's
+      # desktop feature and its webview stack.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            lld
+        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
+        uses: ./.github/actions/install-desktop-deps
 
       - name: Run clippy
         working-directory: ${{ matrix.cwd }}
@@ -224,21 +214,11 @@ jobs:
         if: matrix.target != ''
         run: rustup target add wasm32-unknown-unknown --toolchain nightly
 
+      # The root legs pass --all-features, which turns on connetto-dioxus's
+      # desktop feature and its webview stack.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            lld
+        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
+        uses: ./.github/actions/install-desktop-deps
 
       - name: Run nightly clippy
         working-directory: ${{ matrix.cwd }}
@@ -310,21 +290,11 @@ jobs:
         if: matrix.target != ''
         run: rustup target add wasm32-unknown-unknown --toolchain stable
 
+      # The root legs pass --all-features, which turns on connetto-dioxus's
+      # desktop feature and its webview stack.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            lld
+        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
+        uses: ./.github/actions/install-desktop-deps
 
       - name: Check docs
         working-directory: ${{ matrix.cwd }}
@@ -395,21 +365,11 @@ jobs:
         if: matrix.target != ''
         run: rustup target add wasm32-unknown-unknown --toolchain stable
 
+      # The root legs pass --all-features, which turns on connetto-dioxus's
+      # desktop feature and its webview stack.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libxdo-dev \
-            libssl-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            lld
+        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
+        uses: ./.github/actions/install-desktop-deps
 
       - name: Check workspace
         working-directory: ${{ matrix.cwd }}
@@ -725,6 +685,7 @@ jobs:
           - name: rest
             packages: >-
               -p connetto-core
+              -p connetto-schema
               -p connetto-test-harness
               -p connetto-dioxus
               -p connetto-yew
@@ -763,6 +724,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y keyutils dbus gnome-keyring
+
+      # --all-features turns on connetto-dioxus's desktop feature.
+      - name: Install desktop dependencies
+        if: matrix.name == 'rest'
+        uses: ./.github/actions/install-desktop-deps
 
       - uses: taiki-e/install-action@nextest
 

@@ -12,11 +12,12 @@ mod common;
 mod harness;
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
-};
-use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab, await_db_worker_ready};
-use connetto_wasm_smoke::{CALLER_FUNCTION, MessageTransport, locks};
+use connetto_wasm_smoke::build::{self, Once};
+use connetto_wasm_smoke::workers::demo_schema;
+
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
+use connetto_wasm_smoke::workers::{announce_tab, await_db_worker_ready};
+use connetto_wasm_smoke::{MessageTransport, locks};
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use js_sys::Array;
@@ -72,44 +73,18 @@ fn spawn_share_worker(glue_url: &str) -> web_sys::Worker {
     worker
 }
 
-/// A tab, holding the key the worker booted with or holding none.
-///
-/// The tab reads its own replica, so it registers what it holds. A tab given
-/// only the identity is shown nothing of the key's rows, whatever the worker
-/// holds, which is the second half of this suite.
-async fn connect_tab(
-    client_id: &str,
-    token: String,
-    identity: &str,
-    key: Option<(&str, &str)>,
-) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
+/// A tab of the worker booted with the key. The worker states who it is and
+/// the keys it holds to the tab, so the tab's mirror answers its views as the
+/// worker's replica does.
+async fn connect_tab(client_id: &str) -> ConnettoConnection<MessageTransport<BroadcastChannel>> {
     let wire = format!("connetto-wire-{client_id}");
     announce_tab(&wire).await.expect("announce the tab");
     let transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
-    let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(
-            connetto_wasm_smoke::SUBJECTS_FUNCTION,
-            key.map(|(grant, subject)| {
-                (
-                    Grant::new(grant.to_owned()),
-                    connetto_core::auth::CapabilitySubject::new(subject.to_owned()),
-                )
-            }),
-        );
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_TAB_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("tab connect through the wire channel")
+    ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
+        .with_client_id(client_id)
+        .connect_driven()
+        .await
+        .expect("tab connect through the wire channel")
 }
 
 /// A caller holding only a share key sees the row that key owns, and the same
@@ -124,17 +99,17 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
     harness::relay_worker_breadcrumbs();
     common::play_the_tab();
 
-    let (grant, subject, shared) = connetto_wasm_smoke::fetch_share()
+    let (_grant, subject, shared) = connetto_wasm_smoke::fetch_share()
         .await
         .expect("the browser stack serves the share key it minted");
 
     let worker = spawn_share_worker(&harness::glue_url());
     await_db_worker_ready(&[]).await.expect("db worker ready");
 
-    let (token, identity) = common::mint_session().await;
+    let (_, identity) = common::mint_session().await;
     let client_id = rosetta_uuid::Uuid::new_v4().to_string();
     let _tab_lock = locks::hold_lock(&locks::tab_lock_name(&client_id)).await;
-    let mut conn = connect_tab(&client_id, token, &identity, Some((&grant, &subject))).await;
+    let mut conn = connect_tab(&client_id).await;
     conn.subscribe("photo-share-photos", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");
@@ -175,13 +150,15 @@ async fn a_key_holder_sees_the_row_its_key_owns() {
     drop(client);
     let _ = pump_done.await;
 
-    // The same identity, the same worker, no key: the row goes away. This is
-    // what makes the assertion above about the key rather than about the row
+    // A signed-in client holding no key does not see the row. This is what
+    // makes the assertion above about the key rather than about the row
     // existing at all.
-    let bare_id = rosetta_uuid::Uuid::new_v4().to_string();
-    let _bare_lock = locks::hold_lock(&locks::tab_lock_name(&bare_id)).await;
     let (bare_token, bare_identity) = common::mint_session().await;
-    let mut bare = connect_tab(&bare_id, bare_token, &bare_identity, None).await;
+    let mut bare = ClientBuilder::new(demo_schema(), build::server())
+        .signed_in(build::held(bare_token, &bare_identity))
+        .connect_driven()
+        .await
+        .expect("a keyless client connects");
     bare.subscribe("photo-share-bare", "SELECT * FROM photos")
         .await
         .expect("photo subscribe");

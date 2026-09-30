@@ -26,8 +26,7 @@ use connetto_client::{encode_identity, replica_db_name};
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::AUTH_BASE;
 use connetto_web::auth::{
-    AccountStore, Acquired, BrowserAuthenticator, IdbKeyStore, WorkerAuthConfig,
-    provision_replica_key,
+    AccountStore, Acquired, BrowserAuthenticator, IdbKeyStore, provision_replica_key,
 };
 use connetto_web::storage::ReplicaStorage;
 use wasm_bindgen::JsCast;
@@ -110,13 +109,19 @@ async fn walk_the_login(login_url: &str, subject: &str) -> (String, String) {
     (code, state)
 }
 
-fn config() -> WorkerAuthConfig {
-    config_for(PROVIDER)
+/// An authenticator against the stack's provider that tries `account`.
+fn stack_authenticator(account: Option<String>) -> BrowserAuthenticator {
+    authenticator_for(PROVIDER, account)
 }
 
-fn config_for(provider: &str) -> WorkerAuthConfig {
-    // The stack serves connetto's navigation and fetch endpoints on one origin.
-    WorkerAuthConfig::new(AUTH_BASE, provider, connetto_wasm_smoke::auth_landing())
+/// An authenticator against `provider` that tries `account`. The stack serves
+/// connetto's navigation and fetch endpoints on one origin.
+fn authenticator_for(provider: &str, account: Option<String>) -> BrowserAuthenticator {
+    BrowserAuthenticator::new(
+        &connetto_client::Auth::new(AUTH_BASE, provider),
+        connetto_wasm_smoke::auth_landing(),
+        account,
+    )
 }
 
 /// Log in for real against `provider` and return the session it resolved.
@@ -130,7 +135,7 @@ async fn login_as(
     account: Option<String>,
     store: &AccountStore,
 ) -> connetto_web::auth::BrowserSession<String> {
-    let authenticator = BrowserAuthenticator::new(config_for(PROVIDER), account);
+    let authenticator = authenticator_for(PROVIDER, account);
     let pending = match authenticator
         .acquire::<String>(store)
         .await
@@ -166,7 +171,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
 
     let store = AccountStore::open(&storage.db_url(ACCOUNT_DB)).expect("open the account index");
     // Nothing is stored, so pass None: this is a first run.
-    let first_auth = BrowserAuthenticator::new(config(), None);
+    let first_auth = stack_authenticator(None);
 
     let pending = match first_auth.acquire::<String>(&store).await.expect("acquire") {
         Acquired::NeedLogin(pending) => pending,
@@ -216,7 +221,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // A cold start or a leader failover refreshes silently through the cookie:
     // no interactive login, the same identity. The authenticator for this knows
     // which account to try.
-    let authenticator = BrowserAuthenticator::new(config(), Some(account.clone()));
+    let authenticator = stack_authenticator(Some(account.clone()));
     let refreshed = match authenticator
         .acquire::<String>(&store)
         .await
@@ -271,7 +276,7 @@ async fn a_browser_login_and_logout_round_trip_against_a_real_stack() {
     // ask for an interactive login again. That the server-side session is dead
     // too, rather than merely un-carried, is pinned natively in
     // `authn_flow::marked_logout_revokes_and_clears_only_that_cookie`.
-    match BrowserAuthenticator::new(config(), Some(account.clone()))
+    match stack_authenticator(Some(account.clone()))
         .acquire::<String>(&store)
         .await
         .expect("acquire after logout")
@@ -313,7 +318,7 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
     let store = AccountStore::open(&storage.db_url(STALE_DB)).expect("open the account index");
 
     // One real account, signed in for real, so its cookie genuinely refreshes.
-    let pending = match BrowserAuthenticator::new(config(), None)
+    let pending = match stack_authenticator(None)
         .acquire::<String>(&store)
         .await
         .expect("acquire")
@@ -322,7 +327,7 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
         Acquired::Access(_) => panic!("an empty index cannot refresh"),
     };
     let (code, state) = walk_the_login(&pending.login_url, "present-user").await;
-    let session = BrowserAuthenticator::new(config(), None)
+    let session = stack_authenticator(None)
         .complete::<String>(&pending, &code, &state, &store)
         .await
         .expect("complete the login");
@@ -343,7 +348,7 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
         .expect("read the marker")
         .expect("a marker is set");
     assert_eq!(boot, departed, "the boot reads the departed account");
-    match BrowserAuthenticator::new(config(), Some(boot))
+    match stack_authenticator(Some(boot))
         .acquire::<String>(&store)
         .await
         .expect("an absent account is not an error")
@@ -358,7 +363,7 @@ async fn a_marker_whose_credential_is_gone_never_signs_the_other_account_in() {
     // The live account was never presented, and its cookie is exactly as alive as
     // it was: presenting it would have refreshed it, so this succeeding on a
     // second pass is what a fallback implementation would have done first.
-    match BrowserAuthenticator::new(config(), Some(present.clone()))
+    match stack_authenticator(Some(present.clone()))
         .acquire::<String>(&store)
         .await
         .expect("address the present account directly")
@@ -434,7 +439,7 @@ async fn two_real_logins_leave_two_accounts_signed_in_at_once() {
     // login and without becoming the other person. This is what a switch does once
     // the worker has been replaced, and it is the per-account cookie doing it:
     // adding the second person left the first one's cookie usable.
-    let switched = match BrowserAuthenticator::new(config(), Some(first_account.clone()))
+    let switched = match stack_authenticator(Some(first_account.clone()))
         .acquire::<String>(&store)
         .await
         .expect("acquire against the first account")

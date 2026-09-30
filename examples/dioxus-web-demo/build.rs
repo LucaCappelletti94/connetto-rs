@@ -1,9 +1,13 @@
 //! Build-time schema pipeline for this demo.
 //!
-//! The shared deployment crate translates its own documents and this demo's
-//! local tier, so a demo says which local tier it has and nothing else.
+//! The demo shares the deployment's synced schema and policies and adds its
+//! own local tier, so it runs the shared schema step over those three.
 
 fn main() {
-    let out_dir = std::path::PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
-    connetto_demo_deployment::build_support::emit(Some("frontend.sql"), &out_dir);
+    connetto_schema::emit::<String>(
+        std::path::Path::new("../deployment/schema.sql"),
+        std::path::Path::new("../deployment/policies.sql"),
+        Some(std::path::Path::new("frontend.sql")),
+    )
+    .expect("translate the demo's schema");
 }

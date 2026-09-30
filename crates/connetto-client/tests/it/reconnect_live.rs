@@ -15,8 +15,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery,
-    ReconnectPolicy, Replica, TokioSleeper,
+    ClientBuilder, ClientEvent, ConnettoClient, DataDir, LiveQuery, ReconnectPolicy,
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
@@ -197,12 +196,6 @@ async fn drive_withheld(source: &mut PgSqliteEmuSource, manager: &Manager) {
     .await;
 }
 
-/// The file-backed replica, opened under the test key.
-fn file_replica(path: &str) -> Replica<'_, connetto_client::Encrypted> {
-    Replica::encrypted_file(path, Some(connetto_core::test_support::replica_key()))
-        .expect("key provided")
-}
-
 /// The latest serve task, so a test can kill the live session.
 type ServeSlot = Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>;
 
@@ -271,12 +264,6 @@ async fn fence(client: &ConnettoClient<LoopbackTransport>, nonce: u64) {
     }
 }
 
-/// The client identity every test in this file presents, differing only by the
-/// client id it labels its connection with.
-fn config(client_id: &str) -> ClientConfig {
-    ClientConfig::new(client_id).with_login(Some(Grant::new("user:token")))
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let fixture = Fixture::acquire().await;
@@ -295,30 +282,29 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let slot: ServeSlot = Arc::new(Mutex::new(None));
     let offline = Arc::new(AtomicBool::new(false));
 
-    let transport = open_session(&manager, &slot).await;
-    let config = config("reconnect-live");
-    let conn =
-        ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
-            .await
-            .expect("client connect");
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
+    let (client, pump) = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
         session_factory(
             Arc::clone(&manager),
             Arc::clone(&slot),
             Arc::clone(&offline),
         ),
-        TokioSleeper,
-        fast_policy(),
-    );
+    )
+    .with_reconnect(fast_policy())
+    .with_sleeper(|d| tokio::time::sleep(d))
+    .signed_in(super::support::held("token"))
+    .connect_with_pump()
+    .await
+    .expect("client connect");
     tokio::spawn(pump);
+    let client = client.client();
     let mut events = client.events();
 
     let mut live: LiveQuery<Order> = client
         .watch(orders::table.order(orders::id))
         .await
         .expect("live query");
-    fence(&client, 1).await;
+    fence(client, 1).await;
 
     // A row synced BEFORE the drop pins the client's resume cursor.
     drive(
@@ -352,7 +338,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     // Drive the withheld row: whole-table subscription, no predicate, so
     // it would arrive if the policy allowed it.
     drive_withheld(&mut source, &manager).await;
-    fence(&client, 2).await;
+    fence(client, 2).await;
     assert!(
         !live.rows().iter().any(|row| row.id == WITHHELD_ID),
         "the withheld row must not arrive via the change path"
@@ -411,23 +397,22 @@ async fn offline_write_reflushes_after_resume() {
     let slot: ServeSlot = Arc::new(Mutex::new(None));
     let offline = Arc::new(AtomicBool::new(false));
 
-    let transport = open_session(&manager, &slot).await;
-    let config = config("reconnect-write");
-    let conn =
-        ConnettoConnection::connect(transport, &Replica::in_memory(), SQLITE_DDL, &config, None)
-            .await
-            .expect("client connect");
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
+    let (client, pump) = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
         session_factory(
             Arc::clone(&manager),
             Arc::clone(&slot),
             Arc::clone(&offline),
         ),
-        TokioSleeper,
-        fast_policy(),
-    );
+    )
+    .with_reconnect(fast_policy())
+    .with_sleeper(|d| tokio::time::sleep(d))
+    .signed_in(super::support::held("token"))
+    .connect_with_pump()
+    .await
+    .expect("client connect");
     tokio::spawn(pump);
+    let client = client.client();
     let mut events = client.events();
 
     // Cut the transport, then write locally: the capture session records
@@ -446,7 +431,8 @@ async fn offline_write_reflushes_after_resume() {
                 .execute(conn.conn())
                 .expect("offline insert")
         })
-        .await;
+        .await
+        .expect("gate not locked");
     offline.store(false, Ordering::Relaxed);
 
     // After the resume the forced flush re-uploads the captured write, and
@@ -473,7 +459,8 @@ async fn offline_write_reflushes_after_resume() {
                 .execute(conn.conn())
                 .expect("withheld insert")
         })
-        .await;
+        .await
+        .expect("gate not locked");
 
     // Wait for the policy to refuse the withheld write.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -531,27 +518,22 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
         SessionConfig::default().with_write_retry_budget(Duration::from_millis(200)),
     );
     let slot: ServeSlot = Arc::new(Mutex::new(None));
-    let transport = open_session(&manager, &slot).await;
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        SQLITE_DDL,
-        &config("deferred-write"),
-        None,
-    )
-    .await
-    .expect("client connect");
-    let (client, pump) = ConnettoClient::with_reconnect(
-        conn,
+    let (client, pump) = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
         session_factory(
             Arc::clone(&manager),
             Arc::clone(&slot),
             Arc::new(AtomicBool::new(false)),
         ),
-        TokioSleeper,
-        fast_policy(),
-    );
+    )
+    .with_reconnect(fast_policy())
+    .with_sleeper(|d| tokio::time::sleep(d))
+    .signed_in(super::support::held("token"))
+    .connect_with_pump()
+    .await
+    .expect("client connect");
     tokio::spawn(pump);
+    let client = client.client();
     let mut events = client.events();
 
     let outage = writes.get_owned().await.expect("hold the only connection");
@@ -565,7 +547,8 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
                 .execute(conn.conn())
                 .expect("local insert")
         })
-        .await;
+        .await
+        .expect("gate not locked");
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     await_event(
         &mut events,
@@ -582,7 +565,8 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
                 .get_result::<i64>(conn.conn())
                 .expect("read the replica")
         })
-        .await;
+        .await
+        .expect("gate not locked");
     assert_eq!(kept, 1, "the deferred write stays on the replica");
 
     drop(outage);
@@ -618,12 +602,8 @@ async fn await_event(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let fixture = Fixture::acquire().await;
-    let replica_file = tempfile::NamedTempFile::new().expect("replica file");
-    let replica_path = replica_file
-        .path()
-        .to_str()
-        .expect("utf8 temp path")
-        .to_owned();
+    let dir = tempfile::tempdir().expect("data dir");
+    let credential = super::support::held("token");
 
     let materializer = Materializer::new(PG_DDL).expect("build materializer");
     let manager = SessionManager::new(
@@ -642,14 +622,14 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     // First run: a file-backed replica, one live query, one synced row. The
     // applied cursor lands in the replica's meta table transactionally.
     let transport = open_session(&manager, &slot).await;
-    let first = config("restart-first");
-    let conn = ConnettoConnection::connect(
-        transport,
-        &file_replica(&replica_path),
-        SQLITE_DDL,
-        &first,
-        None,
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential.clone())
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("first connect");
     let (client, pump) = ConnettoClient::with_pump(conn);
@@ -688,13 +668,14 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     // persisted cursor makes the new subscription catch up from the oplog,
     // never re-snapshot.
     let transport = open_session(&manager, &slot).await;
-    let second = config("restart-second");
-    let conn = ConnettoConnection::connect_existing(
-        transport,
-        &file_replica(&replica_path),
-        &second,
-        None,
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("second connect");
     let (client, pump) = ConnettoClient::with_pump(conn);

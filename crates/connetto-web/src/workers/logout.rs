@@ -6,8 +6,14 @@ use web_sys::{BroadcastChannel, MessageEvent};
 /// Configuration bundle for the logout request handler.
 #[derive(Clone)]
 pub struct LogoutConfig {
-    /// Authentication service configuration.
-    pub auth: crate::auth::WorkerAuthConfig,
+    /// The origin the token and refresh endpoints live under.
+    pub auth_base_url: String,
+    /// The origin the login navigation goes to, when it differs from the auth origin.
+    pub login_base_url: Option<String>,
+    /// The provider name the login names.
+    pub provider: String,
+    /// The app page the login redirect returns to.
+    pub redirect_uri: String,
     /// Name of the authentication database.
     pub auth_db_name: String,
     /// Name of the replica database.
@@ -20,7 +26,7 @@ pub struct LogoutConfig {
 
 /// Serve [`crate::auth::LOGOUT_CHANNEL`] for this worker's life.
 ///
-/// [`super::boot_db_worker`] calls this itself; call directly when assembling a worker by hand.
+/// A [`crate::builder::WebClientBuilder`] boot calls this itself. Call it directly when assembling a worker by hand.
 ///
 /// # Errors
 ///
@@ -236,7 +242,10 @@ async fn serve_logout(
         return reply;
     }
     match logout_locally(
-        &config.auth,
+        &config.auth_base_url,
+        config.login_base_url.as_deref(),
+        &config.provider,
+        &config.redirect_uri,
         &config.auth_db_name,
         config.account.as_deref(),
     )
@@ -256,7 +265,10 @@ async fn serve_logout(
 /// No key store is involved: the credential this revokes is the `HttpOnly`
 /// cookie the browser carries, and the index beside it is plain.
 async fn logout_locally(
-    auth: &crate::auth::WorkerAuthConfig,
+    auth_base_url: &str,
+    login_base_url: Option<&str>,
+    provider: &str,
+    redirect_uri: &str,
     auth_db_name: &str,
     account: Option<&str>,
 ) -> Result<(), crate::auth::AuthError> {
@@ -266,7 +278,9 @@ async fn logout_locally(
         storage: &storage,
     };
     let store = crate::workers::session::open_account_store(&handle)?;
-    crate::auth::BrowserAuthenticator::new(auth.clone(), account.map(ToOwned::to_owned))
+    let auth = connetto_client::Auth::new(auth_base_url, provider)
+        .with_login_origin(login_base_url.map(str::to_owned));
+    crate::auth::BrowserAuthenticator::new(&auth, redirect_uri, account.map(ToOwned::to_owned))
         .logout(&store)
         .await
 }

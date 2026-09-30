@@ -10,7 +10,7 @@
 
 mod common;
 
-use common::{ACCOUNT_DB, auth_config, play_the_tab, worker_config};
+use common::{ACCOUNT_DB, play_the_tab, worker_builder};
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{AccountStore, LogoutOutcome, request_logout, request_unsynced};
 use connetto_web::storage::{ReplicaStorage, take_pending_wipes};
@@ -28,7 +28,8 @@ async fn a_tab_queries_the_count_then_logs_out_keeping_and_then_deleting() {
         .expect("clear an earlier account index");
 
     let logins_served = play_the_tab();
-    connetto_web::workers::boot_db_worker::<String>(&worker_config(Some(auth_config())))
+    worker_builder()
+        .boot::<String>()
         .await
         .expect("boot with logins on");
     assert_eq!(logins_served.get(), 1, "the boot logged in through the tab");

@@ -14,10 +14,10 @@ crate-type = ["cdylib", "rlib"]
 # The deployment every browser demo here runs against, documents and all.
 connetto-demo-deployment = { path = "../deployment" }
 # The browser platform: transports, leader election, locks, the relay hub,
-# and the DB worker orchestration. The demo supplies its schema and baked
-# template through DbWorkerConfig.
+# and the DB worker orchestration, booted and attached through its
+# WebClientBuilder.
 connetto-web = { path = "../../crates/connetto-web" }
-# The client types the window drives (connection, client, config, events).
+# The client types the window drives (builder pieces, client, events).
 # Default features off: this is a wasm build with a browser transport.
 connetto-client = { path = "../../crates/connetto-client", default-features = false }
 connetto-core = { path = "../../crates/connetto-core" }
@@ -72,11 +72,11 @@ serde_json = "1"
 js-sys = "0.3"
 connetto-file-client = { path = "../../crates/connetto-file-client" }
 
-# The build script translates schema.sql and frontend.sql through pg2sqlite and
-# bakes a template per tier, so the app ships every tier's schema pre-applied
-# and never executes DDL at startup. Same pipeline as the smoke crate.
+# The schema step: translates the deployment's shared schema and policies plus
+# this demo's local tier into the bundle the app includes and the version it
+# presents at handshake.
 [build-dependencies]
-connetto-demo-deployment = { path = "../deployment", features = ["build"] }
+connetto-schema = { path = "../../crates/connetto-schema" }
 
 [workspace]
 

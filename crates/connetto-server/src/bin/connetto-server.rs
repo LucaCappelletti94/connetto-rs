@@ -111,7 +111,7 @@ use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
-use connetto_core::{SchemaVersion, SessionId};
+use connetto_core::{CALLER_FUNCTION, SUBJECTS_FUNCTION, SessionId};
 #[cfg(feature = "content")]
 use connetto_file_server::{
     self as files, DbPool, DefaultFileSchema, TicketSigner, TicketVerifier,
@@ -937,29 +937,22 @@ async fn prepare_change_log(
     ))
 }
 /// The deployment's caller pairing for reverse translation (R27): the SQLite
-/// function `CONNETTO_CALLER_FUNCTION` names, paired against the identity
-/// setting. Empty means unset, and without it a subscription naming the
-/// caller's local function is refused at registration.
-///
-/// `CONNETTO_SUBJECTS_FUNCTION` names the second one, paired against the
-/// setting the caller's share keys are bound to. It declares the delimiter
-/// those keys are joined with, so a membership test over the set reverse
-/// translates as one, rather than as a comparison against the joined text
-/// that matches nobody. Empty leaves a deployment with no share keys exactly
-/// as it was.
-fn caller_mapping() -> Option<CallerMappings> {
-    let function = var_or("CONNETTO_CALLER_FUNCTION", "");
-    if function.is_empty() {
-        return None;
+/// functions the deployment names, paired against the settings the server
+/// binds them to. A subscription that names the caller's local function
+/// reverse translates against these, and a membership test over the caller's
+/// share keys reverse translates against the second as a set, not as a
+/// comparison against the joined text that matches nobody.
+fn caller_mapping() -> CallerMappings {
+    CallerMappings {
+        identity: SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, CALLER_FUNCTION),
+        subjects: Some(
+            SessionVariableMapping::current_setting(
+                <String as CapabilityKey>::SETTING,
+                SUBJECTS_FUNCTION,
+            )
+            .holding_set(<String as CapabilityKey>::SEPARATOR),
+        ),
     }
-    let subjects = var_or("CONNETTO_SUBJECTS_FUNCTION", "");
-    Some(CallerMappings {
-        identity: SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, function),
-        subjects: (!subjects.is_empty()).then(|| {
-            SessionVariableMapping::current_setting(<String as CapabilityKey>::SETTING, subjects)
-                .holding_set(<String as CapabilityKey>::SEPARATOR)
-        }),
-    })
 }
 
 /// The concrete manager this binary serves.
@@ -1145,7 +1138,7 @@ async fn main() -> Result<()> {
         &pg_ddl,
         writable_catalog(),
         Some(translator),
-        caller_mapping(),
+        Some(caller_mapping()),
         engine_connector,
     )
     .map_err(|err| anyhow!("building materializer: {err}"))?;
@@ -1162,10 +1155,11 @@ async fn main() -> Result<()> {
         oplog,
         write,
         Arc::clone(&guard),
-        SessionConfig::new().with_schema_version(Some(SchemaVersion::from_sources([
-            pg_ddl.as_str(),
-            pg_policies.as_str(),
-        ]))),
+        SessionConfig::new().with_schema_version(Some(
+            connetto_schema::translate::<String>(&pg_ddl, &pg_policies)
+                .map_err(|err| anyhow!("translating the replica schema: {err}"))?
+                .version(),
+        )),
         Some(upkeep),
         signer,
     );

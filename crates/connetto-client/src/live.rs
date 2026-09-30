@@ -48,8 +48,8 @@ use sqlparser::parser::Parser;
 use subql::backend::Value as SqliteValue;
 use tokio::sync::{Mutex, Notify, broadcast, watch};
 
+use crate::away::{GateAskFuture, GateAskOutcome, GateController, GateMechanism, GateSink, Moment};
 use crate::reconnect::{NoReconnect, NoSleep, ReconnectPolicy, Sleeper, TransportFactory};
-use crate::subscriptions::DEFAULT_GRACE;
 use crate::{ClientError, ClientEvent, ConnettoConnection, ResendTimer};
 
 /// Render a typed diesel query to its SQLite SQL (with `?` placeholders) and
@@ -793,6 +793,17 @@ struct State<T: Transport> {
     values: Vec<ValueEntry>,
     computed: Vec<ComputedEntry>,
     wire: Vec<WireSub>,
+    /// Aggregate pushes a locked gate held, as the wire sub and whether the
+    /// frame was scalar, fanned out once the gate opens.
+    held: Vec<(String, bool)>,
+}
+
+/// The pump's exit signal. The flag and the wake form a double-check, so a
+/// waiter that registers after the pump fired the wake still sees the flag
+/// and returns, and a waiter that registered first is woken by the fire.
+struct PumpDone {
+    done: AtomicBool,
+    wake: Notify,
 }
 
 /// Everything the client handles and the pump task share.
@@ -809,6 +820,19 @@ struct Shared<T: Transport> {
     /// where queries refresh, so it holds for a first sync that delivers no
     /// rows and therefore refreshes nothing.
     ever_synced: Arc<AtomicBool>,
+    /// The gate's re-check state machine, whose sink emits its transitions
+    /// into the event stream. Outside [`State`] so the pump can drive the
+    /// prompt without holding the state lock.
+    gate: GateController,
+    /// Raised by [`ConnettoClient::close`], read by the pump at the top of
+    /// its loop to end without a redial.
+    close_requested: Arc<AtomicBool>,
+    /// The pump's exit signal, the double-check half of
+    /// [`ConnettoClient::close`].
+    pump_done: PumpDone,
+    /// The watch grace every watcher defaults to, cached from the config at
+    /// build so the default site and the pump share one value.
+    grace: Duration,
 }
 
 impl<T: Transport> Shared<T> {
@@ -1191,6 +1215,25 @@ impl Drop for ClientToken {
     }
 }
 
+/// The gate's sink into the client's own event stream.
+struct ClientGateSink {
+    events: broadcast::Sender<ClientEvent>,
+}
+
+impl GateSink for ClientGateSink {
+    fn locked(&self) {
+        let _ = self.events.send(ClientEvent::Locked);
+    }
+
+    fn unlocked(&self) {
+        let _ = self.events.send(ClientEvent::Unlocked);
+    }
+
+    fn unlock_dismissed(&self) {
+        let _ = self.events.send(ClientEvent::UnlockDismissed);
+    }
+}
+
 /// A shared, background-driven connetto client.
 ///
 /// Wraps a [`ConnettoConnection`] and owns its pump: applications create live
@@ -1219,20 +1262,6 @@ where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
 {
-    /// Take ownership of a connected [`ConnettoConnection`] and start the
-    /// background pump that drives it on the ambient tokio runtime.
-    ///
-    /// Native convenience over [`with_pump`](Self::with_pump), gated on the
-    /// `native-transport` feature that carries the tokio runtime. Wasm builds
-    /// leave the feature off and drive the pump future with `spawn_local`.
-    #[cfg(feature = "native-transport")]
-    #[must_use]
-    pub fn start(conn: ConnettoConnection<T>) -> Self {
-        let (client, pump) = Self::with_pump(conn);
-        tokio::spawn(pump);
-        client
-    }
-
     /// Take ownership of a connected [`ConnettoConnection`] and return the
     /// client together with its pump future, which the caller must drive to
     /// completion (`tokio::spawn` on native, `spawn_local` on wasm).
@@ -1258,7 +1287,7 @@ where
     /// transport died is NOT replayed (acceptance has no reply, so a resend
     /// could double-apply). Writes captured but never sent re-flush after
     /// the resume.
-    pub fn with_reconnect<F, S>(
+    pub(crate) fn with_reconnect<F, S>(
         conn: ConnettoConnection<T>,
         factory: F,
         sleeper: S,
@@ -1276,6 +1305,26 @@ where
                 policy,
             }),
         )
+    }
+
+    /// End the pump and close the transport while the clones stay alive.
+    ///
+    /// The pump exits as the last clone's drop would end it. The transport
+    /// closes with the proper close handshake, no reconnect is attempted,
+    /// [`ClientEvent::Closed`] goes to every subscriber, and the exit is
+    /// signalled back here. Clones that stay alive keep
+    /// their handles, whose reads fall back to the offline half of the
+    /// contract.
+    pub async fn close(&self) {
+        self.shared.close_requested.store(true, Ordering::Release);
+        self.shared.wake.notify_one();
+        loop {
+            let notified = self.shared.pump_done.wake.notified();
+            if self.shared.pump_done.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
     }
 
     /// Shared constructor body behind the two pump flavors.
@@ -1311,6 +1360,10 @@ where
                 refs: 0,
             })
             .collect();
+        let grace = conn.watch_grace();
+        let gate = GateController::new(Arc::new(ClientGateSink {
+            events: events.clone(),
+        }));
         let shared = Arc::new(Shared {
             ever_synced,
             state: Mutex::new(State {
@@ -1319,6 +1372,7 @@ where
                 values: Vec::new(),
                 computed: Vec::new(),
                 wire,
+                held: Vec::new(),
             }),
             wake: Arc::clone(&wake),
             reaper: Arc::new(Reaper {
@@ -1328,10 +1382,28 @@ where
             events,
             next_live: AtomicU64::new(1),
             next_wire: AtomicU64::new(next_wire),
+            gate,
+            close_requested: Arc::new(AtomicBool::new(false)),
+            pump_done: PumpDone {
+                done: AtomicBool::new(false),
+                wake: Notify::new(),
+            },
+            grace,
         });
         let token = Arc::new(ClientToken { wake });
         let driver = pump(Arc::clone(&shared), Arc::downgrade(&token), reconnect);
         (Self { shared, token }, driver)
+    }
+
+    /// Refuse the work while the gate is locked. The gate is read under the
+    /// state lock, so a refusal is decided under the same lock the pump
+    /// gates. Called at the top of a watch entry, before its setup.
+    async fn refuse_if_locked(&self) -> Result<(), ClientError> {
+        let _state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        Ok(())
     }
 
     /// Run a typed diesel query and keep its result fresh.
@@ -1412,7 +1484,7 @@ where
         Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
         R: Clone + PartialEq + Send + Sync + 'static,
     {
-        self.watch_fn_with_grace(build, DEFAULT_GRACE).await
+        self.watch_fn_with_grace(build, self.shared.grace).await
     }
 
     /// Run a diesel query and keep its result fresh, choosing how long the
@@ -1459,6 +1531,9 @@ where
         Q: for<'query> LoadQuery<'query, SqliteConnection, R>,
         R: Clone + PartialEq + Send + Sync + 'static,
     {
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let (sql, binds) = render_query(&build())?;
         let parsed = parse_subscription(&sql)?;
         if parsed.shape == QueryShape::Aggregate {
@@ -1555,7 +1630,8 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the insert or the watch registration fails.
+    /// [`ClientError::Locked`] while the gate is locked, and [`ClientError`]
+    /// when the insert or the watch registration fails.
     pub async fn insert_watched_with_grace<V, R, K>(
         &self,
         values: V,
@@ -1572,6 +1648,9 @@ where
             for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let row: R = diesel::insert_into(<R as HasTable>::table())
             .values(values)
             .get_result(state.conn.conn())
@@ -1604,7 +1683,8 @@ where
         InsertStatement<R::Table, <V as Insertable<R::Table>>::Values>:
             for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
-        self.insert_watched_with_grace(values, DEFAULT_GRACE).await
+        self.insert_watched_with_grace(values, self.shared.grace)
+            .await
     }
 
     /// Insert `values` and pin the inserted row under `name`, the durable form
@@ -1616,7 +1696,8 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the insert or the pin fails.
+    /// [`ClientError::Locked`] while the gate is locked, and [`ClientError`]
+    /// when the insert or the pin fails.
     pub async fn insert_pinned<V, R, K>(&self, name: &str, values: V) -> Result<R, ClientError>
     where
         V: Insertable<R::Table>,
@@ -1629,6 +1710,9 @@ where
             for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let row: R = diesel::insert_into(<R as HasTable>::table())
             .values(values)
             .get_result(state.conn.conn())
@@ -1641,7 +1725,7 @@ where
             &mut state,
             &self.shared.next_wire,
             spec.clone(),
-            DEFAULT_GRACE,
+            self.shared.grace,
         )
         .await?;
         state.conn.pin_subscription(name, &wire_id, &spec)?;
@@ -1655,7 +1739,9 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when the update or the watch registration fails.
+    /// [`ClientError::Locked`] while the gate is locked, before anything is
+    /// written, and [`ClientError`] when the update or the watch registration
+    /// fails.
     pub async fn update_watched<Tgt, C, R, K>(
         &self,
         target: Tgt,
@@ -1676,6 +1762,9 @@ where
         >: AsQuery + for<'q> LoadQuery<'q, SqliteConnection, R>,
     {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let row: R = diesel::update(target)
             .set(changeset)
             .get_result(state.conn.conn())
@@ -1685,7 +1774,7 @@ where
             .register_watch(
                 &mut state,
                 move || <R as HasTable>::table().find(key.clone()),
-                DEFAULT_GRACE,
+                self.shared.grace,
             )
             .await?;
         Ok((row, live))
@@ -1792,6 +1881,7 @@ where
         Q: QueryFragment<Sqlite>,
         V: Clone + PartialEq + Send + Sync + 'static,
     {
+        self.refuse_if_locked().await?;
         let (sql, binds) = render_query(&query)?;
         let parsed = parse_subscription(&sql)?;
         require_scalar_shape(shape, &parsed)?;
@@ -1997,6 +2087,7 @@ where
         K: Eq + core::hash::Hash + Clone + PartialEq + Send + Sync + 'static,
         V: Clone + PartialEq + Send + Sync + 'static,
     {
+        self.refuse_if_locked().await?;
         let (sql, binds) = render_query(&query)?;
         let parsed = parse_subscription(&sql)?;
         require_grouped_shape(shape, &parsed)?;
@@ -2115,6 +2206,7 @@ where
         Q: QueryFragment<Sqlite>,
         R: DeserializeOwned + Clone + PartialEq + Send + Sync + 'static,
     {
+        self.refuse_if_locked().await?;
         let (sql, binds) = render_query(&query)?;
         let parsed = parse_subscription(&sql)?;
         match parsed.shape {
@@ -2213,20 +2305,94 @@ where
         })
     }
 
+    /// The sequence numbers of the local writes the server has not confirmed,
+    /// the ones the pump has not queued yet among them.
+    ///
+    /// The writes committed since the pump's last flush are queued first, so
+    /// a guard reading this right after a write sees it. Non-empty means a
+    /// teardown would lose data.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the
+    /// [`ClientError`] queueing the writes surfaces.
+    pub async fn unsynced(&self) -> Result<Vec<u64>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
+        state.conn.flush().await?;
+        Ok(state.conn.unsynced())
+    }
+
     /// Run a closure against the shared connection: one-off diesel reads and
     /// captured writes. Local writes committed here are auto-submitted by the
     /// pump's next flush, and any live query reading the written tables
     /// refreshes.
-    pub async fn with_conn<F, O>(&self, f: F) -> O
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Locked`] while the gate is locked, and the closure does not
+    /// run. Otherwise whatever the closure's connection work surfaces.
+    pub async fn with_conn<F, O>(&self, f: F) -> Result<O, ClientError>
     where
         F: FnOnce(&mut ConnettoConnection<T>) -> O,
     {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let out = f(&mut state.conn);
         drop(state);
         // A write may have landed: let the pump flush and refresh promptly.
         self.shared.wake.notify_one();
-        out
+        Ok(out)
+    }
+
+    /// Turn on the away/return re-check.
+    ///
+    /// From now on a return re-asks the mechanism when the time away exceeds
+    /// the grace, and a gated launch starts locked. `recheck` is the grace:
+    /// `None` re-checks once per launch (never on a return), `Some(zero)`
+    /// re-checks every return, and `Some(d)` re-checks a return whose time
+    /// away exceeds `d`.
+    pub async fn enable_gate(&self, recheck: Option<Duration>, mechanism: Arc<dyn GateMechanism>) {
+        let _state = self.shared.lock_interrupting().await;
+        self.shared.gate.enable(recheck, mechanism);
+    }
+
+    /// The application went away at `at`.
+    ///
+    /// Only a gated, open client keeps the moment, and only when a grace is
+    /// set. Anonymous and gate-less clients ignore it, a locked client's
+    /// pending prompt stays pending, and no grace means once per launch.
+    pub async fn away(&self, at: Moment) {
+        let _state = self.shared.lock_interrupting().await;
+        self.shared.gate.away(at);
+    }
+
+    /// The application came back at `at`.
+    ///
+    /// A locked client re-asks the mechanism when no prompt is pending. A
+    /// gated, open client clears the pending moment and re-checks when the
+    /// time away exceeds the grace, or on every return with a zero grace.
+    pub async fn back(&self, at: Moment) {
+        let _state = self.shared.lock_interrupting().await;
+        // Let the pump pick up a started prompt promptly.
+        if self.shared.gate.back(at) {
+            self.shared.wake.notify_one();
+        }
+    }
+
+    /// The application asks the gate to unlock, a retry after a dismissed
+    /// prompt. Asks the mechanism when the gate is locked and no prompt is
+    /// pending, and does nothing when the gate is open or a prompt is pending.
+    pub async fn unlock(&self) {
+        let _state = self.shared.lock_interrupting().await;
+        // Let the pump pick up a started prompt promptly.
+        if self.shared.gate.unlock() {
+            self.shared.wake.notify_one();
+        }
     }
 
     /// Replays every unacknowledged mutation on the current transport.
@@ -2253,15 +2419,19 @@ where
     ///
     /// # Errors
     ///
+    /// [`ClientError::Locked`] while the gate is locked.
     /// [`ClientError::Session`] when the replica rejects the record.
     pub async fn pin(&self, name: &str, query: &str) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         let spec = SubscriptionSpec::new(query);
         let wire_id = attach_wire(
             &mut state,
             &self.shared.next_wire,
             spec.clone(),
-            DEFAULT_GRACE,
+            self.shared.grace,
         )
         .await?;
         state.conn.pin_subscription(name, &wire_id, &spec)
@@ -2273,9 +2443,13 @@ where
     ///
     /// # Errors
     ///
+    /// [`ClientError::Locked`] while the gate is locked.
     /// [`ClientError::Session`] when the replica rejects the write.
     pub async fn unpin(&self, name: &str) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
+        if self.shared.gate.is_locked() {
+            return Err(ClientError::Locked);
+        }
         state.conn.unpin_subscription(name)
     }
 
@@ -2548,8 +2722,14 @@ async fn pump<T, F, S>(
     let mut resend = None;
     loop {
         if alive.upgrade().is_none() {
-            let mut state = shared.state.lock().await;
-            let _ = state.conn.close().await;
+            pump_exit(&shared).await;
+            return;
+        }
+
+        // A close was asked for, so end as the last clone's drop would, with
+        // no redial, while the other clones keep their handles.
+        if shared.close_requested.load(Ordering::Acquire) {
+            pump_exit(&shared).await;
             return;
         }
 
@@ -2557,18 +2737,18 @@ async fn pump<T, F, S>(
         // the state lock, so watch and with_conn callers are only blocked
         // during the brief resume itself, never during backoff sleeps.
         if needs_recovery {
-            let outcome = match reconnect.as_mut() {
-                Some(driver) => recover(&shared, driver).await,
-                None => Recovery::Exhausted,
-            };
-            match outcome {
-                Recovery::Live => needs_recovery = false,
-                Recovery::ReauthRequired => {
-                    let _ = shared.events.send(ClientEvent::AuthenticationRequired);
-                    return;
-                }
-                Recovery::Exhausted => {
-                    let _ = shared.events.send(ClientEvent::Closed);
+            match drive_recovery(&shared, &mut reconnect).await {
+                Recovered::Live => needs_recovery = false,
+                // The top of the loop ends the pump through the close path.
+                Recovered::Closing => continue,
+                Recovered::Ended(event) => {
+                    // Recovery gave up, so the writes made meanwhile are
+                    // queued for the next run before the pump ends.
+                    if let Err(err) = shared.state.lock().await.conn.flush().await {
+                        tracing::warn!(error = %err, "queueing the last writes at exit failed");
+                    }
+                    let _ = shared.events.send(event);
+                    pump_finished(&shared);
                     return;
                 }
             }
@@ -2576,79 +2756,57 @@ async fn pump<T, F, S>(
 
         let mut state = shared.state.lock().await;
 
-        // 1. Unsubscribes queued by dropped handles. A send failure only
-        //    marks the transport for recovery: the server-side subscription
-        //    dies with the session either way, and the entry is already out
-        //    of the registry, so nothing re-declares it.
-        if let Err(err) = drain_dropped(&mut state, &shared.reaper).await {
-            if is_disconnect(&err) {
-                needs_recovery = true;
-            } else {
-                return;
-            }
-        }
-        if needs_recovery {
-            continue;
-        }
-
-        // 2. No socket and a driver to find one: go and find it. With no
-        //    driver there is nothing to recover to, so the pump falls through
-        //    and step 4 parks it until local work wakes it, which is what
-        //    keeps device-private queries refreshing with no server at all.
-        if reconnect.is_some() && !state.conn.is_connected() {
-            needs_recovery = true;
-            continue;
-        }
-
-        // 3. Auto-submit local writes committed since the last step.
-        if let Err(err) = state.conn.flush().await {
-            if is_disconnect(&err) {
+        match drain_and_flush(&mut state, &shared, reconnect.is_some()).await {
+            PumpFlow::Proceed => {}
+            PumpFlow::Recover => {
                 needs_recovery = true;
                 continue;
             }
-            return;
+            PumpFlow::Exit => return,
         }
 
-        // 4. One cancellable pump step. A wake interrupts the idle wait so
-        //    lock waiters (watch, with_conn, drops) get in promptly, and the
-        //    armed resend of deferred writes interrupts it when it is due.
-        //    With no driver there is no sleeper, so deferred writes wait for
-        //    the next attach.
+        // One cancellable pump step. A wake interrupts the idle wait so lock
+        // waiters (watch, with_conn, drops) get in promptly, and the armed
+        // resend of deferred writes interrupts it when it is due. With no
+        // driver there is no sleeper, so deferred writes wait for the next
+        // attach.
         let armed = state.conn.resend_timer();
         if armed != resend.as_ref().map(|(timer, _)| *timer) {
             resend = armed
                 .zip(reconnect.as_mut())
                 .map(|(timer, driver)| (timer, Box::pin(driver.sleeper.sleep(timer.wait()))));
         }
-        match step_or_resend(&mut state.conn, &shared.wake, &mut resend).await {
-            // A deliberate server close: tell the app why, then take the same
-            // path a dropped transport takes. The socket is gone either way.
-            Ok(Some(event @ ClientEvent::ServerClosed { .. })) => {
-                let _ = shared.events.send(event);
-                if reconnect.is_some() {
-                    needs_recovery = true;
-                    continue;
-                }
-                let _ = shared.events.send(ClientEvent::Closed);
-                return;
+        // Drive the gate's prompt, if one is pending, alongside the frame wait.
+        let mut ask = shared.gate.take_ask();
+        let mut ask_outcome = None;
+        let stepped = step_or_resend(
+            &mut state.conn,
+            &shared.wake,
+            &mut resend,
+            &mut ask,
+            &mut ask_outcome,
+        )
+        .await;
+        // A resolved prompt is applied under the state lock, and an unresolved
+        // one goes back whatever the step ended in, so a recovery or an exit
+        // never strands the gate mid-prompt. Approval resumes access and held
+        // refreshes, and a dismissal stays locked for the next return or
+        // unlock call.
+        shared.gate.apply_outcome(&mut ask, ask_outcome);
+        if let Some(ask) = ask {
+            shared.gate.restore_ask(ask);
+        }
+        match route_step_result(&mut state, &shared, stepped, reconnect.is_some()) {
+            PumpFlow::Proceed => {}
+            PumpFlow::Recover => {
+                needs_recovery = true;
+                continue;
             }
-            Ok(Some(ClientEvent::Closed)) => {
-                if reconnect.is_some() {
-                    needs_recovery = true;
-                    continue;
-                }
-                let _ = shared.events.send(ClientEvent::Closed);
-                return;
-            }
-            Ok(Some(event)) => {
-                route_aggregate(&mut state, shared.as_ref(), &event);
-                let _ = shared.events.send(event);
-            }
-            Ok(None) => {}
-            Err(err) => {
-                if is_disconnect(&err) {
-                    needs_recovery = true;
-                    continue;
+            PumpFlow::Exit => {
+                // The server ended the session with no driver to resume it, so
+                // the writes made meanwhile are queued for the next run.
+                if let Err(err) = state.conn.flush().await {
+                    tracing::warn!(error = %err, "queueing the last writes at exit failed");
                 }
                 return;
             }
@@ -2661,21 +2819,220 @@ async fn pump<T, F, S>(
             shared.ever_synced.store(true, Ordering::Relaxed);
         }
 
-        // 5. Refresh live queries whose tables changed, from server patches
-        //    and local writes alike.
-        refresh_changed(&mut state, &shared.events);
+        // Refresh live queries whose tables changed, from server patches and
+        // local writes alike, while the gate is open. A lock holds the
+        // refreshes and the aggregate pushes, which accumulate until the first
+        // open refresh drains them, waking each affected handle once.
+        if !shared.gate.is_locked() {
+            refresh_changed(&mut state, &shared.events);
+        }
     }
 }
 
-/// One cancellable pump step that also ends when the armed resend is due, and
-/// then sends the deferred writes again.
+/// The pump's per-iteration control flow.
+enum PumpFlow {
+    /// Proceed to the next step.
+    Proceed,
+    /// The transport is gone. Recover at the top of the next iteration.
+    Recover,
+    /// The pump has ended.
+    Exit,
+}
+
+/// Queue the last writes, close the transport, announce `Closed`, and end
+/// the pump, as the last clone's drop would.
+async fn pump_exit<T>(shared: &Arc<Shared<T>>)
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    let mut state = shared.state.lock().await;
+    // A write made just before the close is queued before the socket goes.
+    if let Err(err) = state.conn.flush().await {
+        tracing::warn!(error = %err, "queueing the last writes at close failed");
+    }
+    let _ = state.conn.close().await;
+    drop(state);
+    let _ = shared.events.send(ClientEvent::Closed);
+    pump_finished(shared);
+}
+
+/// How a recovery ended, as the pump acts on it.
+enum Recovered {
+    /// The transport is live again.
+    Live,
+    /// A close was asked for while the pump waited to redial.
+    Closing,
+    /// Recovery cannot proceed, and this terminal event says why.
+    Ended(ClientEvent),
+}
+
+/// Recover a lost transport, outside the state lock.
+async fn drive_recovery<T, F, S>(
+    shared: &Arc<Shared<T>>,
+    reconnect: &mut Option<ReconnectDriver<F, S>>,
+) -> Recovered
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+    F: TransportFactory<Transport = T> + MaybeSend + 'static,
+    S: Sleeper + MaybeSend + 'static,
+{
+    let outcome = match reconnect.as_mut() {
+        Some(driver) => recover(shared, driver).await,
+        None => Recovery::Exhausted,
+    };
+    match outcome {
+        Recovery::Live => Recovered::Live,
+        Recovery::Closing => Recovered::Closing,
+        Recovery::ReauthRequired => Recovered::Ended(ClientEvent::AuthenticationRequired),
+        Recovery::Exhausted => Recovered::Ended(ClientEvent::Closed),
+    }
+}
+
+/// Unsubscribe dropped handles, seek a missing socket, and auto-submit local
+/// writes, before the pump step.
+async fn drain_and_flush<T>(
+    state: &mut State<T>,
+    shared: &Arc<Shared<T>>,
+    has_driver: bool,
+) -> PumpFlow
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    // Unsubscribes queued by dropped handles. A send failure only marks the
+    // transport for recovery, because the server-side subscription dies with
+    // the session either way, and the entry is already out of the registry, so
+    // nothing re-declares it.
+    if let Err(err) = drain_dropped(&mut *state, &shared.reaper).await {
+        if is_disconnect(&err) {
+            return PumpFlow::Recover;
+        }
+        pump_finished(shared);
+        return PumpFlow::Exit;
+    }
+    // Auto-submit local writes committed since the last step. With no socket
+    // this only queues them durably, which must not wait for a server.
+    if let Err(err) = state.conn.flush().await {
+        if is_disconnect(&err) {
+            return PumpFlow::Recover;
+        }
+        pump_finished(shared);
+        return PumpFlow::Exit;
+    }
+    // No socket and a driver to find one, so go and find it. With no driver
+    // there is nothing to recover to, so the pump falls through and parks,
+    // which keeps device-private queries refreshing with no server at all.
+    if has_driver && !state.conn.is_connected() {
+        return PumpFlow::Recover;
+    }
+    PumpFlow::Proceed
+}
+
+/// Route one pump step's result. A deliberate close tells the app why and
+/// takes the recovery path, a plain close does the same, an aggregate is
+/// routed and forwarded, and a lost transport marks recovery.
+fn route_step_result<T>(
+    state: &mut State<T>,
+    shared: &Arc<Shared<T>>,
+    stepped: Result<Option<ClientEvent>, ClientError>,
+    has_driver: bool,
+) -> PumpFlow
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: core::fmt::Display,
+{
+    match stepped {
+        // A deliberate server close tells the app why, then takes the same
+        // path a dropped transport takes. The socket is gone either way.
+        Ok(Some(event @ ClientEvent::ServerClosed { .. })) => {
+            let _ = shared.events.send(event);
+            if has_driver {
+                PumpFlow::Recover
+            } else {
+                let _ = shared.events.send(ClientEvent::Closed);
+                pump_finished(shared);
+                PumpFlow::Exit
+            }
+        }
+        Ok(Some(ClientEvent::Closed)) => {
+            if has_driver {
+                PumpFlow::Recover
+            } else {
+                let _ = shared.events.send(ClientEvent::Closed);
+                pump_finished(shared);
+                PumpFlow::Exit
+            }
+        }
+        Ok(Some(event)) => {
+            if let ClientEvent::Aggregate {
+                sub_id, group_key, ..
+            } = &event
+            {
+                let push = (sub_id.clone(), group_key.is_none());
+                if !shared.gate.is_locked() {
+                    route_aggregate(state, &shared.events, &push.0, push.1);
+                } else if !state.held.contains(&push) {
+                    state.held.push(push);
+                }
+            }
+            if !apply_relayed_gate(&shared.gate, &event) {
+                let _ = shared.events.send(event);
+            }
+            PumpFlow::Proceed
+        }
+        Ok(None) => PumpFlow::Proceed,
+        Err(err) => {
+            if is_disconnect(&err) {
+                PumpFlow::Recover
+            } else {
+                pump_finished(shared);
+                PumpFlow::Exit
+            }
+        }
+    }
+}
+
+/// Apply a gate state a relay stated, when this client has no mechanism of
+/// its own, and say whether it did. The controller emits the change itself,
+/// so the frame's own event is not sent a second time.
+fn apply_relayed_gate(gate: &GateController, event: &ClientEvent) -> bool {
+    if gate.is_armed() {
+        return false;
+    }
+    match event {
+        ClientEvent::Locked => {
+            gate.set_locked(true);
+            true
+        }
+        ClientEvent::Unlocked => {
+            gate.set_locked(false);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// The pump's single exit step, which signals a waiting
+/// [`ConnettoClient::close`] that the pump has ended.
+fn pump_finished<T: Transport>(shared: &Shared<T>) {
+    shared.pump_done.done.store(true, Ordering::Release);
+    shared.pump_done.wake.notify_waiters();
+}
+
+/// One cancellable pump step that also ends when the armed resend is due or
+/// the gate's prompt resolves, and then sends the deferred writes again.
 ///
 /// A due resend means the cancel won, so the step took no frame and an error
-/// from the resend loses none.
+/// from the resend loses none. A resolved prompt is captured in `ask_outcome`
+/// for the caller to apply under the state lock.
 async fn step_or_resend<T, F>(
     conn: &mut ConnettoConnection<T>,
     wake: &Notify,
     resend: &mut Option<(ResendTimer, core::pin::Pin<Box<F>>)>,
+    ask: &mut Option<GateAskFuture>,
+    ask_outcome: &mut Option<GateAskOutcome>,
 ) -> Result<Option<ClientEvent>, ClientError>
 where
     T: Transport,
@@ -2684,13 +3041,24 @@ where
 {
     let due = AtomicBool::new(false);
     let cancel = async {
-        match resend.as_mut() {
-            Some((_, sleep)) => tokio::select! {
+        match (resend.as_mut(), ask.as_mut()) {
+            (Some((_, sleep)), Some(ask_f)) => tokio::select! {
+                biased;
+                () = wake.notified() => {}
+                () = sleep.as_mut() => due.store(true, Ordering::Relaxed),
+                outcome = ask_f => *ask_outcome = Some(outcome),
+            },
+            (Some((_, sleep)), None) => tokio::select! {
                 biased;
                 () = wake.notified() => {}
                 () = sleep.as_mut() => due.store(true, Ordering::Relaxed),
             },
-            None => wake.notified().await,
+            (None, Some(ask_f)) => tokio::select! {
+                biased;
+                () = wake.notified() => {}
+                outcome = ask_f => *ask_outcome = Some(outcome),
+            },
+            (None, None) => wake.notified().await,
         }
     };
     let stepped = conn.pump_one_or(cancel).await;
@@ -2702,8 +3070,12 @@ where
     stepped
 }
 
-/// Re-run every live query whose tables were touched since the last step.
+/// Fan out the aggregate pushes a lock held, then re-run every live query
+/// whose tables were touched since the last step.
 fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sender<ClientEvent>) {
+    for (sub_id, scalar) in core::mem::take(&mut state.held) {
+        route_aggregate(state, events, &sub_id, scalar);
+    }
     let changed = state.conn.take_changed_unfiltered();
     if changed.is_empty() {
         return;
@@ -2715,6 +3087,7 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
         values: _,
         computed: _,
         wire: _,
+        held: _,
     } = state;
     for entry in registry.iter_mut() {
         if entry.tables.is_disjoint(&changed) {
@@ -2739,32 +3112,31 @@ fn refresh_changed<T: Transport>(state: &mut State<T>, events: &broadcast::Sende
 /// departure, or a whole-answer demotion) feeds the keyed handles from the
 /// full rested group set, so all three shapes take one path and a demotion
 /// never surfaces (R84, decision 4).
-fn route_aggregate<T>(state: &mut State<T>, shared: &Shared<T>, event: &ClientEvent)
-where
+fn route_aggregate<T>(
+    state: &mut State<T>,
+    events: &broadcast::Sender<ClientEvent>,
+    sub_id: &str,
+    scalar: bool,
+) where
     T: Transport,
 {
-    let ClientEvent::Aggregate {
-        sub_id, group_key, ..
-    } = event
-    else {
-        return;
-    };
     let State {
         conn,
         registry: _,
         values,
         computed,
         wire,
+        held: _,
     } = state;
     let Some(target) = wire.iter().find(|w| w.wire_id == *sub_id) else {
         return;
     };
-    if group_key.is_none() && values.iter().any(|e| e.wire_id == *sub_id) {
+    if scalar && values.iter().any(|e| e.wire_id == *sub_id) {
         let rested = match conn.rested_scalar(target.spec.query.as_str(), &target.spec.binds) {
             Ok(rested) => rested,
             Err(err) => {
-                let _ = shared.events.send(ClientEvent::NonFatal {
-                    related_to: Some(sub_id.clone()),
+                let _ = events.send(ClientEvent::NonFatal {
+                    related_to: Some(sub_id.to_owned()),
                     detail: format!("reading rested aggregate failed: {err}"),
                 });
                 return;
@@ -2778,7 +3150,7 @@ where
         // own decoder and typed value, not just the first.
         for entry in values.iter_mut().filter(|e| e.wire_id == *sub_id) {
             if let Err(err) = (entry.apply)(json.as_deref(), as_of) {
-                let _ = shared.events.send(ClientEvent::NonFatal {
+                let _ = events.send(ClientEvent::NonFatal {
                     related_to: Some(entry.sub_id.clone()),
                     detail: format!("live value update failed: {err}"),
                 });
@@ -2791,8 +3163,8 @@ where
     let rested = match conn.rested_groups(target.spec.query.as_str(), &target.spec.binds) {
         Ok(rested) => rested,
         Err(err) => {
-            let _ = shared.events.send(ClientEvent::NonFatal {
-                related_to: Some(sub_id.clone()),
+            let _ = events.send(ClientEvent::NonFatal {
+                related_to: Some(sub_id.to_owned()),
                 detail: format!("reading rested computed rows failed: {err}"),
             });
             return;
@@ -2802,7 +3174,7 @@ where
     // decoders and typed map.
     for entry in computed.iter_mut().filter(|e| e.wire_id == *sub_id) {
         if let Err(err) = (entry.apply)(&rested) {
-            let _ = shared.events.send(ClientEvent::NonFatal {
+            let _ = events.send(ClientEvent::NonFatal {
                 related_to: Some(entry.sub_id.clone()),
                 detail: format!("live groups update failed: {err}"),
             });
@@ -2821,6 +3193,71 @@ enum Recovery {
     /// never signals this: a grant it refuses leaves the connection open and
     /// says nothing, so the client learns it from its own token source.
     ReauthRequired,
+    /// A close was asked for during a backoff.
+    Closing,
+}
+
+/// How a backoff wait ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Offline {
+    /// The backoff ran out, so the next dial is due.
+    Due,
+    /// A close was asked for.
+    Closing,
+}
+
+/// Wait out one reconnect backoff while serving what needs no server.
+///
+/// A local write wakes the wait, is queued durably, and refreshes the live
+/// queries its tables feed unless the gate holds refreshes, and a pending
+/// gate prompt is driven and applied, so an offline client stays usable
+/// between dials. A close ends the wait at once.
+async fn serve_offline<T, F>(shared: &Shared<T>, sleep: F) -> Offline
+where
+    T: Transport,
+    F: Future<Output = ()>,
+{
+    let mut sleep = core::pin::pin!(sleep);
+    loop {
+        if shared.close_requested.load(Ordering::Acquire) {
+            return Offline::Closing;
+        }
+        let mut ask = shared.gate.take_ask();
+        let mut outcome = None;
+        let due = if let Some(ask_f) = ask.as_mut() {
+            tokio::select! {
+                biased;
+                () = shared.wake.notified() => false,
+                resolved = ask_f => {
+                    outcome = Some(resolved);
+                    false
+                }
+                () = sleep.as_mut() => true,
+            }
+        } else {
+            tokio::select! {
+                biased;
+                () = shared.wake.notified() => false,
+                () = sleep.as_mut() => true,
+            }
+        };
+        shared.gate.apply_outcome(&mut ask, outcome);
+        if let Some(ask) = ask {
+            shared.gate.restore_ask(ask);
+        }
+        let mut state = shared.state.lock().await;
+        // A write made offline is queued durably now, not at the next attach.
+        if let Err(err) = state.conn.flush().await {
+            tracing::warn!(error = %err, "queueing an offline write failed");
+        }
+        if !shared.gate.is_locked() {
+            refresh_changed(&mut state, &shared.events);
+        }
+        drop(state);
+        if due {
+            return Offline::Due;
+        }
+    }
 }
 
 /// Run the reconnect sequence to completion: backoff, fresh transport,
@@ -2844,7 +3281,9 @@ where
         let _ = shared.events.send(ClientEvent::Reconnecting {
             attempt: episode.attempt(),
         });
-        driver.sleeper.sleep(wait).await;
+        if serve_offline(shared, driver.sleeper.sleep(wait)).await == Offline::Closing {
+            return Recovery::Closing;
+        }
 
         let Ok(transport) = driver.factory.connect().await else {
             continue;

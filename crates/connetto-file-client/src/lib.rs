@@ -4,6 +4,8 @@ mod archive;
 #[cfg(all(target_family = "wasm", target_os = "unknown"))]
 mod browser_store;
 mod client;
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+mod content;
 mod db;
 mod error;
 pub mod http;
@@ -20,6 +22,8 @@ pub use browser_store::{BrowserStore, BrowserStoreError};
 
 pub use client::{ContentClient, ContentEvent};
 pub use connetto_file_core::{ChunkHash, FileId, FileIdHasher, MimeClass};
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub use content::{Content, ContentHandle};
 pub use error::{AttemptOutcome, ContentError, StageCommitError};
 pub use import::ContentImportPlan;
 pub use resolve::{BoxedSource, ChunkStoreSource, LocalContentSource, Resolved, SourceFuture};

@@ -18,13 +18,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use connetto_client::{
-    ClientConfig, ClientError, ClientEvent, ConnettoConnection, Grant, Replica, SyncStatus,
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, SyncStatus,
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck, SubscriptionSpec};
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
-use tempfile::tempdir;
+use tempfile::{TempDir, tempdir};
 
 const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
@@ -109,8 +109,19 @@ impl Transport for Recorder {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r20-offline").with_login(Some(Grant::new("user:tester")))
+/// A replica in its own directory, opened offline under the suite's identity.
+async fn open_offline(dir: &TempDir) -> ConnettoConnection<Recorder> {
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
+    ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<Recorder>::default(),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
+    .expect("open with no server")
 }
 
 fn labels(conn: &mut ConnettoConnection<Recorder>) -> Vec<Option<String>> {
@@ -125,15 +136,7 @@ fn labels(conn: &mut ConnettoConnection<Recorder>) -> Vec<Option<String>> {
 #[tokio::test]
 async fn a_connection_opens_and_serves_reads_with_no_server() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("offline.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
     assert!(
         !conn.is_connected(),
         "nothing was attached, so nothing is connected"
@@ -168,14 +171,7 @@ async fn a_connection_opens_and_serves_reads_with_no_server() {
 #[tokio::test]
 async fn no_waiting_write_is_evicted_however_many_queue() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("queue.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
 
     let mut queued = Vec::new();
     for id in 0..300 {
@@ -192,14 +188,7 @@ async fn no_waiting_write_is_evicted_however_many_queue() {
 #[tokio::test]
 async fn a_write_the_handshake_watermark_retires_is_reported_applied() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("retired.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
     let mut queued = Vec::new();
     for id in 0..2 {
         diesel::insert_into(items::table)
@@ -242,15 +231,7 @@ async fn a_write_the_handshake_watermark_retires_is_reported_applied() {
 #[tokio::test]
 async fn attaching_a_transport_later_replays_what_was_queued() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("later.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
     diesel::insert_into(items::table)
         .values((items::id.eq(1), items::label.eq("queued")))
         .execute(conn.conn())
@@ -294,15 +275,7 @@ async fn attaching_a_transport_later_replays_what_was_queued() {
 #[tokio::test]
 async fn a_first_run_with_no_data_and_no_server_reports_empty_and_never_synced() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("fresh.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
     assert!(
         labels(&mut conn).is_empty(),
         "nothing has ever been fetched"
@@ -322,15 +295,7 @@ async fn a_first_run_with_no_data_and_no_server_reports_empty_and_never_synced()
 #[tokio::test]
 async fn the_connection_reports_going_offline_and_coming_back() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("status.sqlite");
-    let replica = Replica::encrypted_file(
-        path.to_str().expect("utf-8 path"),
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("a resolved key");
-
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
 
     // The state it came up in, stated rather than left to be guessed.
     assert_eq!(
@@ -378,14 +343,9 @@ async fn the_connection_reports_going_offline_and_coming_back() {
 #[tokio::test]
 async fn a_subscription_declared_alone_reaches_the_first_server() {
     let dir = tempdir().expect("temp dir");
-    let path = dir.path().join("declared.sqlite");
-    let key = connetto_core::test_support::replica_key();
-    let replica = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key.clone()))
-        .expect("a resolved key");
 
     // No server, and a query is declared anyway.
-    let mut conn = ConnettoConnection::<Recorder>::open(&replica, DDL, &config(), None)
-        .expect("open with no server");
+    let mut conn = open_offline(&dir).await;
     conn.subscribe_spec("wire-1", SubscriptionSpec::new("SELECT * FROM items"))
         .await
         .expect("declaring a subscription does not need a server");
@@ -400,10 +360,7 @@ async fn a_subscription_declared_alone_reaches_the_first_server() {
 
     // The process ends and starts again, still with no server. The declaration
     // is read back off disk, not remembered.
-    let reopened = Replica::encrypted_file(path.to_str().expect("utf-8 path"), Some(key))
-        .expect("a resolved key");
-    let mut conn = ConnettoConnection::<Recorder>::open_existing(&reopened, &config(), None)
-        .expect("reopen with no server");
+    let mut conn = open_offline(&dir).await;
     assert_eq!(
         conn.declared_subscriptions()
             .expect("read the declared set"),

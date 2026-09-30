@@ -13,11 +13,11 @@
 mod common;
 
 use connetto_client::dsl::Watchable;
-use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
-};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, LiveQuery};
 use connetto_wasm_smoke::BrowserSocket;
+use connetto_wasm_smoke::build::{self, Once};
 use connetto_wasm_smoke::workers::DEMO_WS_URL;
+use connetto_wasm_smoke::workers::demo_schema;
 use diesel::prelude::*;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
@@ -40,39 +40,15 @@ struct Order {
     quantity: i64,
 }
 
-/// A row id unique enough across smoke runs, above every other band in use.
-fn unique_id() -> i64 {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "Date::now in milliseconds fits i64 until the year 285428751"
-    )]
-    let millis = js_sys::Date::now() as i64;
-    30_000_000_000 + millis
-}
-
-async fn connect(name: &str, token: String, identity: String) -> ConnettoConnection<BrowserSocket> {
+async fn connect(token: String, identity: String) -> ConnettoConnection<BrowserSocket> {
     let transport = BrowserSocket::connect(DEMO_WS_URL)
         .await
         .expect("connect to connetto-server");
-    let config = ClientConfig::new(format!("{name}-{}", unique_id()))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(
-            connetto_wasm_smoke::CALLER_FUNCTION,
-            Some(identity.as_str()),
-        )
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        connetto_wasm_smoke::workers::DEMO_SQLITE_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("client connect")
+    ClientBuilder::new(demo_schema(), Once::new(transport))
+        .signed_in(build::held(token, &identity))
+        .connect_driven()
+        .await
+        .expect("client connect")
 }
 
 #[wasm_bindgen_test]
@@ -80,7 +56,7 @@ async fn page_live_query_reloads_on_another_clients_write() {
     let (token, identity) = common::mint_session().await;
     // The observing client runs in a dedicated worker, same as the data tier.
     let (observer, pump) =
-        ConnettoClient::with_pump(connect("page-observer", token.clone(), identity.clone()).await);
+        ConnettoClient::with_pump(connect(token.clone(), identity.clone()).await);
     wasm_bindgen_futures::spawn_local(pump);
     let mut live: LiveQuery<Order> = orders::table
         .order(orders::id)
@@ -95,7 +71,7 @@ async fn page_live_query_reloads_on_another_clients_write() {
     // superseding the observer's. Same fixed user, so it owns what it writes
     // and the observer, that user too, is allowed to see it.
     let (writer_token, _) = common::mint_session().await;
-    let mut writer = connect("page-writer", writer_token, identity.clone()).await;
+    let mut writer = connect(writer_token, identity.clone()).await;
     let before: std::collections::HashSet<rosetta_uuid::Uuid> = orders::table
         .select(orders::id)
         .load::<rosetta_uuid::Uuid>(writer.conn())

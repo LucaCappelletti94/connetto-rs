@@ -14,19 +14,19 @@
 mod common;
 
 use connetto_client::{
-    ClientConfig, ConnettoClient, ConnettoConnection, Grant, Replica, ReplicaKey,
-    cipher::cipher_url, dsl::Watchable,
+    ClientBuilder, ConnettoClient, ConnettoConnection, Gate, HeldCredential, ReplicaKey,
+    dsl::Watchable,
 };
 use connetto_wasm_smoke::BrowserSocket;
-use connetto_wasm_smoke::workers::DEMO_WS_URL;
+use connetto_wasm_smoke::build;
+use connetto_wasm_smoke::workers::demo_schema;
+
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-/// The replica schema, translated from `schema.sql` by build.rs.
-const REPLICA_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
 const DB_NAME: &str = "opfs-smoke.sqlite";
 
 /// A fixed key for this suite. What is under test here is OPFS persistence, not
@@ -52,34 +52,21 @@ struct Order {
     quantity: i64,
 }
 
-/// A row id unique enough across smoke runs, above every other band in use.
-fn unique_id() -> i64 {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "Date::now in milliseconds fits i64 until the year 285428751"
-    )]
-    let millis = js_sys::Date::now() as i64;
-    20_000_000_000 + millis
-}
-
-/// The replica URL: the codec shim over the installed sahpool VFS, because the
-/// browser codec intercepts as a VFS layer and a bare name would leave it out.
-fn replica_url() -> String {
-    cipher_url(DB_NAME, "opfs-sahpool")
-}
-
-/// Open the replica, applying `ddl` on a first boot and nothing on a reopen.
-async fn connect(config: &ClientConfig, ddl: Option<&str>) -> ConnettoConnection<BrowserSocket> {
-    let transport = BrowserSocket::connect(DEMO_WS_URL)
+/// Open the replica, creating it on a first boot and reopening it after.
+async fn connect(
+    credential: &HeldCredential,
+    first_boot: bool,
+) -> ConnettoConnection<BrowserSocket> {
+    ClientBuilder::new(demo_schema(), build::server())
+        .signed_in(credential.clone())
+        .durable(
+            build::SuitePlace::new(DB_NAME, !first_boot),
+            build::keys_for(credential, replica_key()).await,
+        )
+        .with_gate(Gate::off())
+        .connect_driven()
         .await
-        .expect("connect to connetto-server");
-    let url = replica_url();
-    let replica = Replica::encrypted_file(&url, Some(replica_key())).expect("create replica");
-    match ddl {
-        Some(ddl) => ConnettoConnection::connect(transport, &replica, ddl, config, None).await,
-        None => ConnettoConnection::connect_existing(transport, &replica, config, None).await,
-    }
-    .expect("client connect")
+        .expect("client connect")
 }
 
 #[wasm_bindgen_test]
@@ -95,14 +82,8 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
     .expect("install sahpool vfs");
 
     let (token, user_id) = common::mint_session().await;
-    let config = ClientConfig::new(format!("wasm-opfs-{}", unique_id()))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let conn = connect(&config, Some(REPLICA_DDL)).await;
+    let credential = build::held(token, &user_id);
+    let conn = connect(&credential, true).await;
 
     // The pump under spawn_local: the wasm driving mode for the same client
     // machinery the native demo runs under tokio.
@@ -146,6 +127,7 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
             )
         })
         .await
+        .expect("gate not locked")
         .expect("local insert");
     live.changed().await.expect("live refresh");
     let rows = live.rows();
@@ -161,7 +143,7 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
     // Reopen the same OPFS file on a fresh connection: the write persisted in the
     // browser's origin private file system and still decrypts under the cached
     // key, visible before any subscription runs.
-    let mut conn = connect(&config, None).await;
+    let mut conn = connect(&credential, false).await;
     let persisted: Vec<Order> = orders::table
         .order(orders::id)
         .select(Order::as_select())

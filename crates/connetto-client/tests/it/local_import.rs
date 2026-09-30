@@ -11,9 +11,10 @@
 //! than the replica holds, and a table this build does not have.
 
 use connetto_client::{
-    ArchiveAttachment, ClientConfig, ClientError, ConnettoConnection, ExportScope, ImportChoices,
-    Keep, Replica,
+    ArchiveAttachment, ClientBuilder, ClientError, ConnettoConnection, DataDir, ExportScope,
+    ImportChoices, Keep, SyncSchema,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -67,26 +68,26 @@ struct Device {
     _dir: tempfile::TempDir,
 }
 
-fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
+async fn device(synced_ddl: &str, tier_ddl: &str, account: &str) -> Device {
     let dir = tempfile::tempdir().expect("temporary directory");
-    let replica_path = dir
-        .path()
-        .join("replica.sqlite")
-        .to_str()
-        .expect("utf-8 path")
-        .to_owned();
-    let replica = Replica::encrypted_file(
-        &replica_path,
-        Some(connetto_core::test_support::replica_key()),
-    )
-    .expect("replica key")
-    .with_tier(tier_ddl);
-    let conn = ConnettoConnection::<FakeTransport>::open(
-        &replica,
+    let credential = super::support::held(account);
+    let store = super::support::key_store(&credential).await;
+    let bundle = SchemaBundle::new(
+        "",
+        "",
         synced_ddl,
-        &ClientConfig::new("import-test".to_owned()).with_caller("current_app_user", Some(account)),
-        None,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(tier_ddl),
+    );
+    let conn = ClientBuilder::new(
+        SyncSchema::new(bundle),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("open replica");
     Device { conn, _dir: dir }
 }
@@ -121,7 +122,7 @@ fn queued(conn: &mut ConnettoConnection<FakeTransport>) -> Vec<PendingRow> {
 /// been in.
 #[tokio::test]
 async fn a_restored_replica_holds_the_device_only_rows_and_the_unsent_writes() {
-    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
     // The device-only tier is outside the capture session, so seeding it
     // queues nothing: those rows travel as rows.
     source
@@ -153,7 +154,7 @@ async fn a_restored_replica_holds_the_device_only_rows_and_the_unsent_writes() {
         .expect("export");
 
     // The replacement device: same build, same account, nothing on it.
-    let mut fresh = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut fresh = device(SYNCED_DDL, TIER_DDL, "alice").await;
     let plan = fresh
         .conn
         .import_local_data(std::io::Cursor::new(&archive))
@@ -223,7 +224,7 @@ async fn a_restored_replica_holds_the_device_only_rows_and_the_unsent_writes() {
 async fn an_archive_on_disk_restores_the_same_replica_a_buffer_does() {
     let dir = tempfile::tempdir().expect("temporary directory");
     let path = dir.path().join("device.zip");
-    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
     source
         .conn
         .conn()
@@ -242,7 +243,7 @@ async fn an_archive_on_disk_restores_the_same_replica_a_buffer_does() {
         )
         .expect("export to the file");
 
-    let mut fresh = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut fresh = device(SYNCED_DDL, TIER_DDL, "alice").await;
     let plan = fresh
         .conn
         .import_local_data(std::fs::File::open(&path).expect("open the archive file"))
@@ -283,7 +284,7 @@ async fn an_archive_on_disk_restores_the_same_replica_a_buffer_does() {
 /// is written, and the answer given is the one honoured.
 #[tokio::test]
 async fn a_clashing_row_is_reported_with_both_versions_and_the_answer_is_honoured() {
-    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
     source
         .conn
         .conn()
@@ -294,7 +295,7 @@ async fn a_clashing_row_is_reported_with_both_versions_and_the_answer_is_honoure
         .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
 
-    let mut mine = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut mine = device(SYNCED_DDL, TIER_DDL, "alice").await;
     mine.conn
         .conn()
         .batch_execute("INSERT INTO drafts (id, body) VALUES (7, 'my version')")
@@ -350,12 +351,12 @@ async fn a_clashing_row_is_reported_with_both_versions_and_the_answer_is_honoure
 /// An archive made under another schema is refused, and the message says so.
 #[tokio::test]
 async fn a_mismatched_schema_is_refused_by_name() {
-    let mut source = device(WIDER_SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(WIDER_SYNCED_DDL, TIER_DDL, "alice").await;
     let archive = source
         .conn
         .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export");
-    let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut target = device(SYNCED_DDL, TIER_DDL, "alice").await;
     match target
         .conn
         .import_local_data(std::io::Cursor::new(&archive))
@@ -372,12 +373,12 @@ async fn a_mismatched_schema_is_refused_by_name() {
 /// its writer's own owner value, so it could never be saved here anyway.
 #[tokio::test]
 async fn another_accounts_archive_is_refused_by_name() {
-    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
     let archive = source
         .conn
         .export_local_data(ExportScope::Everything, Vec::new())
         .expect("export");
-    let mut target = device(SYNCED_DDL, TIER_DDL, "bob");
+    let mut target = device(SYNCED_DDL, TIER_DDL, "bob").await;
     match target
         .conn
         .import_local_data(std::io::Cursor::new(&archive))
@@ -396,7 +397,7 @@ async fn another_accounts_archive_is_refused_by_name() {
 /// export of this build can reach it.
 #[tokio::test]
 async fn a_tier_with_an_extra_table_is_refused() {
-    let mut source = device(SYNCED_DDL, WIDER_TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, WIDER_TIER_DDL, "alice").await;
     source
         .conn
         .conn()
@@ -406,7 +407,7 @@ async fn a_tier_with_an_extra_table_is_refused() {
         .conn
         .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
-    let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut target = device(SYNCED_DDL, TIER_DDL, "alice").await;
     match target
         .conn
         .import_local_data(std::io::Cursor::new(&archive))
@@ -425,7 +426,7 @@ async fn a_tier_with_an_extra_table_is_refused() {
 /// proven in the crate's own tests.
 #[tokio::test]
 async fn a_full_queue_travels_whole() {
-    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
     for id in 0..8 {
         write_offline(
             &mut source,
@@ -437,7 +438,7 @@ async fn a_full_queue_travels_whole() {
         .conn
         .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
-    let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut target = device(SYNCED_DDL, TIER_DDL, "alice").await;
     let plan = target
         .conn
         .import_local_data(std::io::Cursor::new(&archive))
@@ -459,7 +460,7 @@ async fn a_full_queue_travels_whole() {
 /// upsert.
 #[tokio::test]
 async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
-    let mut source = device(SYNCED_DDL, KEPT_TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, KEPT_TIER_DDL, "alice").await;
     source
         .conn
         .conn()
@@ -470,7 +471,7 @@ async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
         .export_local_data(ExportScope::Unsynced, Vec::new())
         .expect("export");
 
-    let mut target = device(SYNCED_DDL, KEPT_TIER_DDL, "alice");
+    let mut target = device(SYNCED_DDL, KEPT_TIER_DDL, "alice").await;
     target
         .conn
         .conn()
@@ -504,7 +505,7 @@ async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
 
 #[tokio::test]
 async fn attachments_round_trip_and_bookkeeping_failure_rolls_back_the_import() {
-    let mut source = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut source = device(SYNCED_DDL, TIER_DDL, "alice").await;
     write_offline(
         &mut source,
         "INSERT INTO items (id, label) VALUES (17, 'with attachment')",
@@ -523,7 +524,7 @@ async fn attachments_round_trip_and_bookkeeping_failure_rolls_back_the_import() 
         .expect("attachment body");
     let archive = export.finish().expect("finish");
 
-    let mut target = device(SYNCED_DDL, TIER_DDL, "alice");
+    let mut target = device(SYNCED_DDL, TIER_DDL, "alice").await;
     let mut plan = target
         .conn
         .import_local_data(std::io::Cursor::new(&archive))

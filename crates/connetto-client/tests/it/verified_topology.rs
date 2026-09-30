@@ -16,7 +16,7 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use connetto_client::{ClientConfig, ClientError, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientError, DataDir, Grant, HeldCredential, SyncSchema};
 use connetto_core::transport::WebSocketTransport;
 use sha2::{Digest as _, Sha256};
 use std::process::{Child, Command, Stdio};
@@ -107,11 +107,12 @@ async fn maybe_spawn_server() -> Option<ServerGuard> {
     Some(ServerGuard(child))
 }
 
-/// The upstream schema version, hashed from the very files the server was
-/// started with, the schema and the policies both. A client that presents no
-/// version is refused rather than waved through, which is right: not knowing
-/// its schema is not evidence of being current.
-fn schema_version() -> connetto_core::SchemaVersion {
+/// The upstream bundle, derived the way the server derives its schema, from
+/// the very files the server was started with, the schema and the policies
+/// both. A client whose version is not the upstream's is refused rather than
+/// waved through, which is right, since not knowing its schema is not
+/// evidence of being current.
+fn upstream_bundle() -> connetto_core::schema::SchemaBundle {
     fn source(var: &str, fallback: &str) -> String {
         let path = std::env::var(var).unwrap_or_else(|_| fallback.to_owned());
         std::fs::read_to_string(&path)
@@ -132,7 +133,8 @@ fn schema_version() -> connetto_core::SchemaVersion {
             "/../../examples/deployment/policies.sql"
         ),
     );
-    connetto_core::SchemaVersion::from_sources([ddl.as_str(), policies.as_str()])
+    connetto_schema::translate::<String>(&ddl, &policies)
+        .unwrap_or_else(|err| panic!("translating the upstream schema: {err}"))
 }
 
 /// A high-entropy value for the PKCE verifier and the CSRF state, both of which
@@ -266,21 +268,19 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
     let transport = WebSocketTransport::connect(&url, tcp)
         .await
         .expect("websocket upgrade");
-    let replica = tempfile::NamedTempFile::new().expect("a temp replica");
-    let path = replica.path().to_string_lossy().into_owned();
-    // No subscription, so nothing past the handshake is under test. A local DDL that
-    // does not mirror the upstream is fine when no snapshot is ever requested.
-    let config = ClientConfig::new(format!("verified-topology-{}", random_token()))
-        .with_login(Some(Grant::new(token.to_owned())))
-        .with_schema_version(Some(schema_version()));
-    ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        "CREATE TABLE probe (id INTEGER PRIMARY KEY)",
-        &config,
-        None,
+    let data_dir = tempfile::tempdir().expect("a temp data dir");
+    // No subscription, so nothing past the handshake is under test, and the
+    // replica takes the upstream bundle the server answers with.
+    let credential = HeldCredential::new(Grant::new(token.to_owned()), token)
+        .expect("a held credential serializes its id");
+    let key_store = super::support::key_store(&credential).await;
+    ClientBuilder::new(
+        SyncSchema::new(upstream_bundle()),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(data_dir.path().to_path_buf()), key_store)
+    .connect_driven()
     .await
     .map(|conn| {
         conn.session_handle()

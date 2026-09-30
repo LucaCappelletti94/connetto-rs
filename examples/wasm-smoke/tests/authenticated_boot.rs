@@ -23,14 +23,15 @@
 
 mod common;
 
-use common::{ACCOUNT_DB, auth_config, play_the_tab, walk_the_login, worker_config};
-use connetto_client::{encode_identity, replica_db_name};
+use common::{ACCOUNT_DB, play_the_tab, walk_the_login, worker_builder};
+use connetto_client::encode_identity;
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_wasm_smoke::workers::DB_NAME;
 use connetto_web::auth::{
-    AccountStore, Acquired, BrowserAuthenticator, IdbKeyStore, PendingWork, provision_replica_key,
-    remembered_account, remembered_identity,
+    AccountStore, Acquired, IdbKeyStore, PendingWork, provision_replica_key, remembered_account,
+    remembered_identity,
 };
+use connetto_web::storage::replica_name;
 use connetto_web::storage::{
     PendingWipe, ReplicaStorage, mark_wipe_pending, take_pending_wipes, tier_db_name,
 };
@@ -57,7 +58,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     let user_id = {
         let store =
             AccountStore::open(&storage.db_url(ACCOUNT_DB)).expect("open the account index");
-        let authenticator = BrowserAuthenticator::new(auth_config(), None);
+        let authenticator = common::authenticator(None);
         let pending = match authenticator
             .acquire::<String>(&store)
             .await
@@ -73,7 +74,7 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
             .expect("complete the first login")
             .user_id
     };
-    let replica_name = replica_db_name(DB_NAME, &user_id).expect("a replica name");
+    let replica_name = replica_name(DB_NAME, &user_id).expect("a replica name");
     storage
         .delete_db(ACCOUNT_DB)
         .expect("discard the first login's account record");
@@ -101,10 +102,10 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
     // account, opens it encrypted, opens the private tables under the same key,
     // connects to the sync server, and subscribes.
     let logins_served = play_the_tab();
-    let booted_as =
-        connetto_web::workers::boot_db_worker::<String>(&worker_config(Some(auth_config())))
-            .await
-            .expect("the logged-in startup completes");
+    let booted_as = worker_builder()
+        .boot::<String>()
+        .await
+        .expect("the logged-in startup completes");
 
     // The startup reports the identity it acquired, which is the same account the
     // first login named. An application needs this to say who is signed in without
@@ -184,7 +185,8 @@ async fn the_logged_in_startup_runs_and_carries_out_a_pending_delete() {
         "the account marker holds the encoded id"
     );
     assert_eq!(
-        replica_db_name(DB_NAME, &remembered.expect("remembered")).expect("derive"),
+        connetto_web::storage::replica_name(DB_NAME, &remembered.expect("remembered"))
+            .expect("derive"),
         replica_name,
         "and the remembered account names the very replica the startup opened"
     );

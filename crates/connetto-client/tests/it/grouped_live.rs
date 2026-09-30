@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_client::{
-    ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, Replica, Watchable,
+    ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant, Watchable,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
@@ -83,26 +83,27 @@ async fn spawn_server(
     (addr, server)
 }
 
-/// Connect a client over a real WebSocket against a file replica at `db_path`.
+/// Connect a client over a real WebSocket against the durable replica the
+/// credential names inside `dir`.
 async fn connect(
     addr: std::net::SocketAddr,
     client_id: &str,
-    db_path: &str,
+    dir: &std::path::Path,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(format!("user:token#{client_id}"))));
-    ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    let credential =
+        super::support::held_grant(Grant::new(format!("user:token#{client_id}")), "token");
+    let store = super::support::key_store(&credential).await;
+    ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect")
 }
@@ -162,13 +163,10 @@ async fn a_grouped_watch_maintains_one_entry_per_group() {
     let manager = manager(&fixture);
     let (addr, server) = spawn_server(Arc::clone(&manager)).await;
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect(addr, "grouped", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = connect(addr, "grouped", dir.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let mut groups = orders::table
@@ -255,15 +253,11 @@ async fn a_restart_reads_the_last_synced_map_from_the_resting_table() {
     let manager = manager(&fixture);
     let (addr, server) = spawn_server(Arc::clone(&manager)).await;
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let dir = tempfile::tempdir().expect("temp dir");
 
     // First run: watch, see the seeded map, and let the pump rest it. Driven
     // through `with_pump` so the reopen waits for a fully closed connection.
-    let conn = connect(addr, "resting", &db_path).await;
+    let conn = connect(addr, "resting", dir.path()).await;
     let (client, pump) = ConnettoClient::with_pump(conn);
     let pump = tokio::spawn(pump);
     let mut groups = client
@@ -283,13 +277,16 @@ async fn a_restart_reads_the_last_synced_map_from_the_resting_table() {
     server.abort();
 
     // Restart offline against the same file, before any server is reachable.
-    let replica =
-        Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided");
-    let config = ClientConfig::new("resting").with_login(Some(Grant::new("user:token#resting")));
-    let conn = ConnettoConnection::<WebSocketTransport<TcpStream>>::open(
-        &replica, SQLITE_DDL, &config, None,
+    let credential = super::support::held_grant(Grant::new("user:token#resting"), "token");
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("reopen offline");
     assert!(!conn.is_connected(), "the restart reaches no server");
     let (client, pump) = ConnettoClient::with_pump(conn);
@@ -337,12 +334,8 @@ async fn a_row_shaped_watch_replaces_the_answer_whole() {
     let manager = manager(&fixture);
     let (addr, server) = spawn_server(Arc::clone(&manager)).await;
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect(addr, "rows", &db_path).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let conn = connect(addr, "rows", dir.path()).await;
     let (client, pump) = ConnettoClient::with_pump(conn);
     let pump = tokio::spawn(pump);
 
@@ -398,13 +391,16 @@ async fn a_row_shaped_watch_replaces_the_answer_whole() {
     server.abort();
 
     // Restart offline against the same file: the last synced answer rests.
-    let replica =
-        Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided");
-    let config = ClientConfig::new("rows").with_login(Some(Grant::new("user:token#rows")));
-    let conn = ConnettoConnection::<WebSocketTransport<TcpStream>>::open(
-        &replica, SQLITE_DDL, &config, None,
+    let credential = super::support::held_grant(Grant::new("user:token#rows"), "token");
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("reopen offline");
     assert!(!conn.is_connected(), "the restart reaches no server");
     let (client, pump) = ConnettoClient::with_pump(conn);

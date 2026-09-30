@@ -37,7 +37,7 @@ async fn row_live_query_is_relay_transparent() {
     // Seed a row BEFORE the fixture brings up the worker and both clients, so
     // it can only reach either client through the snapshot leg. The DEFAULT
     // mints the id, which the writer reads back for the convergence assertion.
-    let mut writer = connect_server("parity-writer", base, writer_token, &user_id).await;
+    let mut writer = connect_server(writer_token, &user_id).await;
     let snapshot_id = write_row(&mut writer, 1, &user_id).await;
     stage("writer seeded the snapshot row");
 
@@ -75,7 +75,7 @@ async fn aggregate_is_relay_transparent() {
     let (token, user_id) = mint_session().await;
     let (writer_token, _) = mint_session().await;
 
-    let mut writer = connect_server("parity-agg-writer", base, writer_token, &user_id).await;
+    let mut writer = connect_server(writer_token, &user_id).await;
     let mut fixture = ParityFixture::setup(base, "parity-agg", token, &user_id).await;
 
     // Both clients subscribe to the same global aggregate.

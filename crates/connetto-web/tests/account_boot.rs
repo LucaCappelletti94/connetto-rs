@@ -14,8 +14,7 @@
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
 use connetto_web::auth::{
-    AccountStore, Acquired, BrowserAuthenticator, WorkerAuthConfig, remembered_account,
-    remembered_identity,
+    AccountStore, Acquired, BrowserAuthenticator, remembered_account, remembered_identity,
 };
 use connetto_web::storage::ReplicaStorage;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
@@ -29,11 +28,11 @@ const ACCOUNT_DB: &str = "r42-account-boot.sqlite";
 /// Unreachable on purpose. Nothing here may perform a request, so a test that
 /// accidentally does fails on the connection rather than passing for the wrong
 /// reason.
-fn config() -> WorkerAuthConfig {
-    WorkerAuthConfig::new(
-        "http://127.0.0.1:1",
-        "nobody",
+fn authenticator(account: Option<String>) -> BrowserAuthenticator {
+    BrowserAuthenticator::new(
+        &connetto_client::Auth::new("http://127.0.0.1:1", "nobody"),
         "http://127.0.0.1:1/callback",
+        account,
     )
 }
 
@@ -131,7 +130,7 @@ async fn a_marker_whose_account_is_gone_asks_for_a_login_and_adopts_nobody() {
     );
 
     let boot = remembered_account(&store).expect("read the marker");
-    let acquired = BrowserAuthenticator::new(config(), boot)
+    let acquired = authenticator(boot)
         .acquire::<String>(&store)
         .await
         .expect("an absent account is not an error");
@@ -160,7 +159,7 @@ async fn a_first_run_names_no_account_and_asks_for_a_login() {
         "and nothing is indexed, so a picker has nothing to offer"
     );
 
-    let acquired = BrowserAuthenticator::new(config(), None)
+    let acquired = authenticator(None)
         .acquire::<String>(&store)
         .await
         .expect("an empty index is not an error");
@@ -176,13 +175,13 @@ async fn a_first_run_names_no_account_and_asks_for_a_login() {
 #[wasm_bindgen_test]
 async fn the_login_goes_to_the_login_origin_while_the_calls_stay_on_the_proxy() {
     let store = fresh_store().await;
-    let config = WorkerAuthConfig::new(
-        "http://127.0.0.1:1",
-        "nobody",
+    let authenticator = BrowserAuthenticator::new(
+        &connetto_client::Auth::new("http://127.0.0.1:1", "nobody")
+            .with_login_origin(Some("http://127.0.0.1:2".to_owned())),
         "http://127.0.0.1:1/callback",
-    )
-    .with_login_base_url(Some("http://127.0.0.1:2".to_owned()));
-    let Acquired::NeedLogin(pending) = BrowserAuthenticator::new(config, None)
+        None,
+    );
+    let Acquired::NeedLogin(pending) = authenticator
         .acquire::<String>(&store)
         .await
         .expect("an empty index is not an error")
@@ -206,7 +205,7 @@ async fn an_account_this_build_cannot_decode_asks_for_a_login() {
     let store = fresh_store().await;
     store.remember("42").expect("an integer-id build's account");
 
-    match BrowserAuthenticator::new(config(), Some("42".to_owned()))
+    match authenticator(Some("42".to_owned()))
         .acquire::<String>(&store)
         .await
     {

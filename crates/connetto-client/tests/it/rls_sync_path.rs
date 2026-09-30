@@ -17,15 +17,14 @@
 //! not, since "applied nothing" and "applied everything" are otherwise
 //! indistinguishable.
 
-use connetto_client::{
-    ClientConfig, ClientError, ClientEvent, ConnettoConnection, PolicyTables, Replica,
-};
+use connetto_client::{ClientBuilder, ClientError, ClientEvent, ConnettoConnection, SyncSchema};
 use connetto_core::Cursor;
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, MutationPatch,
     SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
@@ -113,11 +112,6 @@ CREATE POLICY orders_insert ON orders
 /// identity that opened it, so this value is fixed for its whole life.
 const ALICE: &str = "alice";
 
-/// The replica's local name for `current_setting('app.user_id')`. The
-/// generated view and the three `INSTEAD OF` triggers all call it, and
-/// connetto registers it from [`ClientConfig::with_caller`].
-const CALLER_FUNCTION: &str = "current_app_user";
-
 diesel::table! {
     /// The logical table, which the translation turned into a policy view.
     orders (id) {
@@ -160,17 +154,17 @@ fn options() -> Pg2SqliteOptions {
     Pg2SqliteOptions::default()
         .with_session_variable(SessionVariableMapping::current_setting(
             "app.user_id",
-            CALLER_FUNCTION,
+            connetto_core::CALLER_FUNCTION,
         ))
         .with_rls_audit_table_name("rls_audit".to_string())
         // The download boundary: connetto holds this function true while it
         // applies server-authoritative data, so the fail-closed write guards
         // admit rows the caller may see but not write.
-        .with_write_exemption_function(connetto_client::WRITE_EXEMPTION_FUNCTION)
+        .with_write_exemption_function(connetto_core::WRITE_EXEMPTION_FUNCTION)
 }
 
-/// Emits the SQLite DDL and policy table map for `pg_ddl`.
-fn translation_for(pg_ddl: &str) -> (String, PolicyTables) {
+/// Emits the SQLite DDL, policy table pairs and policy views for `pg_ddl`.
+fn translation_for(pg_ddl: &str) -> (String, Vec<(String, String)>, Vec<String>) {
     let statements = Pg2Sqlite::default()
         .sql(pg_ddl)
         .expect("parse the Postgres document")
@@ -204,11 +198,24 @@ fn translation_for(pg_ddl: &str) -> (String, PolicyTables) {
         .load::<String>(&mut probe)
         .expect("list the views the translation created");
 
-    (ddl, PolicyTables::from_translation(pairs, views))
+    (ddl, pairs, views)
 }
 
-fn translation() -> (String, PolicyTables) {
-    translation_for(PG_DDL)
+fn translation() -> SyncSchema {
+    schema_for(PG_DDL)
+}
+
+/// The schema the sync path tests build, translated from `pg_ddl`.
+fn schema_for(pg_ddl: &str) -> SyncSchema {
+    let (ddl, pairs, views) = translation_for(pg_ddl);
+    SyncSchema::new(SchemaBundle::new(
+        pg_ddl,
+        "",
+        ddl,
+        pairs,
+        views,
+        None::<&str>,
+    ))
 }
 
 diesel::table! {
@@ -221,13 +228,6 @@ diesel::table! {
         /// The object name.
         name -> diesel::sql_types::Text,
     }
-}
-
-fn client_config(tables: PolicyTables) -> ClientConfig {
-    ClientConfig::new("r40-rls-sync")
-        .with_login(Some(connetto_client::Grant::new("user:alice")))
-        .with_caller(CALLER_FUNCTION, Some(ALICE))
-        .with_policy_tables(tables)
 }
 
 fn orders_wire_table() -> SimpleTable {
@@ -341,7 +341,7 @@ fn uploaded_tables(patch: &MutationPatch) -> Vec<String> {
 /// apply did not simply bypass the split.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_server_row_lands_and_the_view_still_filters() {
-    let (ddl, tables) = translation();
+    let schema = translation();
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -350,15 +350,11 @@ async fn a_server_row_lands_and_the_view_still_filters() {
         while let Ok(Some(_)) = server.recv().await {}
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
     conn.subscribe("sub", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -404,7 +400,7 @@ async fn a_server_row_lands_and_the_view_still_filters() {
 /// A readable server row is not rejudged under the local INSERT policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_shared_row_is_not_rejudged_as_a_local_insert() {
-    let (ddl, tables) = translation_for(SHARED_READ_DDL);
+    let schema = schema_for(SHARED_READ_DDL);
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -413,15 +409,11 @@ async fn authoritative_shared_row_is_not_rejudged_as_a_local_insert() {
         while let Ok(Some(_)) = server.recv().await {}
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
     conn.subscribe("sub", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -443,22 +435,18 @@ async fn authoritative_shared_row_is_not_rejudged_as_a_local_insert() {
 /// Local writes remain subject to the INSERT policy.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn local_insert_still_obeys_the_owner_check() {
-    let (ddl, tables) = translation_for(SHARED_READ_DDL);
+    let schema = schema_for(SHARED_READ_DDL);
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
         while let Ok(Some(_)) = server.recv().await {}
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
 
     let error = diesel::insert_into(orders::table)
         .values((
@@ -484,7 +472,7 @@ async fn local_insert_still_obeys_the_owner_check() {
 /// A nested ownership predicate has the same authoritative apply contract.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_local_insert() {
-    let (ddl, tables) = translation_for(NESTED_OWNERSHIP_DDL);
+    let schema = schema_for(NESTED_OWNERSHIP_DDL);
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -493,15 +481,11 @@ async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_loca
         while let Ok(Some(_)) = server.recv().await {}
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
     conn.subscribe("sub", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -528,7 +512,7 @@ async fn authoritative_row_allowed_by_nested_ownership_is_not_rejudged_as_a_loca
 /// no live query over this table would ever refresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_changed_table_is_reported_under_its_logical_name() {
-    let (ddl, tables) = translation();
+    let schema = translation();
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -537,15 +521,11 @@ async fn the_changed_table_is_reported_under_its_logical_name() {
         while let Ok(Some(_)) = server.recv().await {}
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
     conn.subscribe("sub", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -574,7 +554,7 @@ async fn the_changed_table_is_reported_under_its_logical_name() {
 /// the server's write target apply to a Postgres table that does not exist.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_local_write_travels_up_under_its_logical_name() {
-    let (ddl, tables) = translation();
+    let schema = translation();
     let (mut server, client_end) = loopback();
     let uploaded = tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -589,15 +569,11 @@ async fn a_local_write_travels_up_under_its_logical_name() {
         }
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
 
     diesel::insert_into(orders::table)
         .values((
@@ -634,7 +610,7 @@ async fn a_local_write_travels_up_under_its_logical_name() {
 /// hidden row where nothing later removes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resync_clears_hidden_rows_and_spares_a_sibling() {
-    let (ddl, tables) = translation();
+    let schema = translation();
     let (mut server, client_end) = loopback();
     tokio::spawn(async move {
         ack_handshake(&mut server).await;
@@ -655,15 +631,11 @@ async fn a_resync_clears_hidden_rows_and_spares_a_sibling() {
         while let Ok(Some(_)) = server.recv().await {}
     });
 
-    let mut conn = ConnettoConnection::connect(
-        client_end,
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(tables),
-        None,
-    )
-    .await
-    .expect("connect");
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(client_end))
+        .signed_in(super::support::held("alice"))
+        .connect_driven()
+        .await
+        .expect("connect");
     conn.subscribe("sub-a", "SELECT * FROM orders WHERE quantity > 10")
         .await
         .expect("subscribe a");
@@ -705,13 +677,20 @@ async fn a_resync_clears_hidden_rows_and_spares_a_sibling() {
 /// would restore exactly the silent loss this phase removes.
 #[test]
 fn an_unaccounted_policy_view_refuses_to_open() {
-    let (ddl, _) = translation();
-    let refused = ConnettoConnection::<LoopbackTransport>::open(
-        &Replica::in_memory(),
-        &ddl,
-        &client_config(PolicyTables::new()),
-        None,
+    let (ddl, _, _) = translation_for(PG_DDL);
+    let refused = ClientBuilder::new(
+        SyncSchema::new(SchemaBundle::new(
+            PG_DDL,
+            "",
+            ddl,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
+    .signed_in(super::support::held("alice"))
+    .open_driven()
     .err()
     .expect("opening must be refused");
     let ClientError::PolicyTablesStale { unmapped } = refused else {
@@ -751,15 +730,19 @@ fn dead_grant() -> connetto_client::Grant {
 fn a_dead_grants_subject_is_left_out_of_the_set() {
     use diesel::RunQueryDsl;
 
-    let (ddl, tables) = translation();
+    let schema = translation();
     let held = [
         (live_grant(), CapabilitySubject::<String>::new("key:alive")),
         (dead_grant(), CapabilitySubject::<String>::new("key:dead")),
     ];
-    let config = client_config(tables).with_share_keys("current_app_subjects", held);
-    let mut connection =
-        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
-            .expect("the replica opens");
+    let mut connection = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .with_share_keys(held)
+    .signed_in(super::support::held("alice"))
+    .open_driven()
+    .expect("the replica opens");
     let answered: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
         "current_app_subjects()",
     ))
@@ -782,15 +765,19 @@ fn a_dead_grants_subject_is_left_out_of_the_set() {
 fn the_replica_answers_the_packed_subject_set() {
     use diesel::RunQueryDsl;
 
-    let (ddl, tables) = translation();
+    let schema = translation();
     let held = [
         (live_grant(), CapabilitySubject::<String>::new("key:a")),
         (live_grant(), CapabilitySubject::<String>::new("key:b")),
     ];
-    let config = client_config(tables).with_share_keys("current_app_subjects", held);
-    let mut connection =
-        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
-            .expect("the replica opens");
+    let mut connection = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .with_share_keys(held)
+    .signed_in(super::support::held("alice"))
+    .open_driven()
+    .expect("the replica opens");
     let answered: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
         "current_app_subjects()",
     ))
@@ -809,11 +796,15 @@ fn the_replica_answers_the_packed_subject_set() {
 fn a_caller_holding_no_key_answers_null() {
     use diesel::RunQueryDsl;
 
-    let (ddl, tables) = translation();
-    let config = client_config(tables).with_share_keys::<String>("current_app_subjects", []);
-    let mut connection =
-        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
-            .expect("the replica opens");
+    let schema = translation();
+    let mut connection = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .with_share_keys::<String>([])
+    .signed_in(super::support::held("alice"))
+    .open_driven()
+    .expect("the replica opens");
     let answered: Option<String> = diesel::select(diesel::dsl::sql::<
         diesel::sql_types::Nullable<diesel::sql_types::Text>,
     >("current_app_subjects()"))
@@ -849,7 +840,7 @@ fn the_replica_joins_on_the_deployments_own_separator() {
         const SEPARATOR: char = '|';
     }
 
-    let (ddl, tables) = translation();
+    let schema = translation();
     let held: [(connetto_client::Grant, CapabilitySubject<PipeKey>); 2] = [
         (
             live_grant(),
@@ -860,10 +851,14 @@ fn the_replica_joins_on_the_deployments_own_separator() {
             CapabilitySubject::new(PipeKey("key:b".to_owned())),
         ),
     ];
-    let config = client_config(tables).with_share_keys("current_app_subjects", held);
-    let mut connection =
-        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), &ddl, &config, None)
-            .expect("the replica opens");
+    let mut connection = ClientBuilder::new(
+        schema,
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .with_share_keys(held)
+    .signed_in(super::support::held("alice"))
+    .open_driven()
+    .expect("the replica opens");
     let answered: String = diesel::select(diesel::dsl::sql::<diesel::sql_types::Text>(
         "current_app_subjects()",
     ))

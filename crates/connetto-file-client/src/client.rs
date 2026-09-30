@@ -154,7 +154,7 @@ where
                 conn.batch_execute(db::CONTENT_DDL)?;
                 db::add_outbox_columns(conn.conn())
             })
-            .await?;
+            .await??;
         let (events, _) = broadcast::channel(EVENT_CAPACITY);
         let local = ChunkStoreSource::new(EncryptingStore::new(store.clone(), &root_key));
         Ok(Self {
@@ -185,14 +185,14 @@ where
         sink: W,
     ) -> Result<W, ContentError> {
         let _writing = self.content_writes.lock().await;
-        let manifests = self.client.with_conn(outbox_manifests).await?;
+        let manifests = self.client.with_conn(outbox_manifests).await??;
         let declaration = crate::archive::declare_content(&manifests)?;
         let export = self
             .client
             .with_conn(|conn| {
                 conn.export_local_data_with_attachments(scope, &declaration.attachments, sink)
             })
-            .await?;
+            .await??;
         write_content_entries(&self.store, &self.root_key, &declaration, export).await
     }
 
@@ -207,7 +207,7 @@ where
     ) -> Result<ContentImportPlan<R>, ContentError> {
         self.client
             .with_conn(|connection| prepare_content_import(connection, source))
-            .await
+            .await?
     }
 
     /// Restores content under this device key.
@@ -225,7 +225,7 @@ where
         let outcome = self
             .client
             .with_conn(|connection| apply_content_import(connection, plan, choices))
-            .await?;
+            .await??;
         // The import is committed; a failed replay is left to the outbox driver.
         let _ = self.client.replay_pending().await;
         self.outbox_wake.notify_one();
@@ -259,7 +259,7 @@ where
         if !self
             .client
             .with_conn(move |conn| crate::retain::answers_column(conn.conn(), &probe, &column))
-            .await
+            .await?
         {
             return Err(ContentError::HealColumnMissing {
                 query: query.to_owned(),
@@ -284,7 +284,7 @@ where
         let queued = self
             .client
             .with_conn(move |conn| crate::retain::queue_lost(conn.conn(), &queries))
-            .await?;
+            .await??;
         for file_id in &queued {
             let _ = self
                 .events
@@ -355,7 +355,7 @@ where
                 )
                 .map(|((), out)| out)
             })
-            .await?;
+            .await??;
         Ok((file_id, out))
     }
 
@@ -375,7 +375,7 @@ where
         let waiting = self
             .client
             .with_conn(|conn| db::outbox(conn.conn()))
-            .await?;
+            .await??;
         let mut lost = Vec::new();
         for file_id in waiting {
             let Some(unreadable) = self.unreadable_chunks(file_id).await? else {
@@ -383,7 +383,7 @@ where
             };
             self.client
                 .with_conn(|conn| retire(conn.conn(), file_id))
-                .await?;
+                .await??;
             lost.push(file_id);
             let _ = self.events.send(ContentEvent::BytesLost {
                 file_id,
@@ -399,7 +399,9 @@ where
     ///
     /// [`ContentError::Replica`] when the record cannot be read.
     pub async fn retired_content(&self) -> Result<Vec<FileId>, ContentError> {
-        self.client.with_conn(|conn| db::retired(conn.conn())).await
+        self.client
+            .with_conn(|conn| db::retired(conn.conn()))
+            .await?
     }
 
     /// Every refused outbox entry with its permanent refusal detail.
@@ -410,7 +412,7 @@ where
     pub async fn refused_content(&self) -> Result<Vec<(FileId, String)>, ContentError> {
         self.client
             .with_conn(|conn| db::refusals(conn.conn()))
-            .await
+            .await?
     }
 
     /// Clears the refusal mark on one outbox entry so the next walk attempts it.
@@ -421,7 +423,7 @@ where
     pub async fn retry_refused(&self, file_id: FileId) -> Result<(), ContentError> {
         self.client
             .with_conn(move |conn| db::clear_refusal(conn.conn(), file_id))
-            .await
+            .await?
             .map_err(ContentError::from)?;
         self.outbox_wake.notify_one();
         Ok(())
@@ -443,7 +445,7 @@ where
                     Ok::<(), diesel::result::Error>(())
                 })
             })
-            .await
+            .await?
             .map_err(Into::into)
     }
 
@@ -456,7 +458,7 @@ where
         let manifest = self
             .client
             .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-            .await?;
+            .await??;
         let Some(manifest) = manifest else {
             return Ok(Some(0));
         };
@@ -478,14 +480,14 @@ where
         let waiting = self
             .client
             .with_conn(|conn| db::sendable(conn.conn()))
-            .await?;
+            .await??;
         let mut sent = 0;
         for file_id in waiting {
             match self.upload_one(file_id).await {
                 Ok(()) => {
                     self.client
                         .with_conn(|conn| db::dequeue(conn.conn(), file_id))
-                        .await?;
+                        .await??;
                     sent += 1;
                     let _ = self.events.send(ContentEvent::Uploaded { file_id });
                 }
@@ -500,7 +502,7 @@ where
                         let detail = err.to_string();
                         self.client
                             .with_conn(move |conn| db::refuse(conn.conn(), file_id, &detail))
-                            .await?;
+                            .await??;
                         let _ = self.events.send(ContentEvent::UploadRefused {
                             file_id,
                             detail: err.to_string(),
@@ -513,10 +515,10 @@ where
                             let heal = self
                                 .client
                                 .with_conn(move |conn| db::is_heal(conn.conn(), file_id))
-                                .await?;
+                                .await??;
                             self.client
                                 .with_conn(move |conn| retire(conn.conn(), file_id))
-                                .await?;
+                                .await??;
                             if !heal {
                                 let _ = self.events.send(ContentEvent::BytesLost {
                                     file_id,
@@ -542,7 +544,7 @@ where
         let manifest = self
             .client
             .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-            .await?
+            .await??
             .ok_or(ContentError::NoManifest { file_id })?;
         let declared_len: u64 = manifest.chunks().iter().map(|chunk| chunk.len).sum();
         let url =
@@ -567,7 +569,7 @@ where
         if let Some(answer) = self.local_answer(file_id).await? {
             return Ok(answer);
         }
-        if !self.client.with_conn(|conn| conn.is_connected()).await {
+        if !self.client.with_conn(|conn| conn.is_connected()).await? {
             return Ok(Resolved::Unavailable);
         }
         let url = ticket::request(&self.client, file_id, ContentVerb::Read).await?;
@@ -584,14 +586,14 @@ where
         let Some(manifest) = self
             .client
             .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-            .await?
+            .await??
         else {
             return Ok(None);
         };
         if self
             .client
             .with_conn(|conn| db::is_unsent(conn.conn(), file_id))
-            .await?
+            .await??
         {
             return Ok(Some(
                 self.local_bytes(&manifest)
@@ -674,7 +676,7 @@ where
                 )
                 .map(|_| ())
             })
-            .await
+            .await?
     }
 
     /// Ends the pin under `name`. Unknown names are a no-op.
@@ -692,7 +694,7 @@ where
                 )
                 .map(|_| ())
             })
-            .await
+            .await?
             .map_err(ContentError::Replica)
     }
 
@@ -704,7 +706,7 @@ where
     pub async fn content_pins(&self) -> Result<Vec<(String, String, String)>, ContentError> {
         self.client
             .with_conn(|conn| db::pins(conn.conn()))
-            .await
+            .await?
             .map_err(ContentError::Replica)
     }
 
@@ -716,7 +718,7 @@ where
     pub async fn pinned(&self) -> Result<HashSet<FileId>, ContentError> {
         self.client
             .with_conn(|conn| crate::retain::pinned_ids(conn.conn()))
-            .await
+            .await?
     }
 
     /// Fetches every pinned file this device does not hold, returning the ones
@@ -738,7 +740,7 @@ where
         let mut arrived = Vec::new();
         for file_id in self.pinned().await? {
             if self.already_local(file_id).await?
-                || !self.client.with_conn(|conn| conn.is_connected()).await
+                || !self.client.with_conn(|conn| conn.is_connected()).await?
             {
                 continue;
             }
@@ -754,7 +756,7 @@ where
         let Some(manifest) = self
             .client
             .with_conn(|conn| db::load_manifest(conn.conn(), file_id))
-            .await?
+            .await??
         else {
             return Ok(false);
         };
@@ -784,7 +786,7 @@ where
                     |_| Ok::<(), diesel::result::Error>(()),
                 )
             })
-            .await
+            .await?
             .map_err(ContentError::Replica)
             .map(|_| ())
     }
@@ -803,8 +805,8 @@ where
     ///
     /// Returned as a future rather than spawned, the same shape
     /// [`ConnettoClient::with_pump`] uses, so the caller decides which
-    /// executor drives it. It ends when the client's event stream ends, which
-    /// is when the last client clone drops.
+    /// executor drives it. It ends when the client's pump ends, on
+    /// [`ConnettoClient::close`] or when the last client clone drops.
     ///
     /// A reconnect is not the only thing that unblocks a walk, and treating it
     /// as the only one leaves offline content pending forever. The ordinary
@@ -833,7 +835,9 @@ where
                 .client
                 .with_conn(|conn| db::sendable(conn.conn()))
                 .await
-                .is_ok_and(|waiting| !waiting.is_empty());
+                .ok()
+                .and_then(Result::ok)
+                .is_some_and(|waiting| !waiting.is_empty());
             if queued {
                 attempt = attempt.saturating_add(1);
                 sleeper.sleep(policy.backoff(attempt)).await;
@@ -855,8 +859,10 @@ where
                             | ClientEvent::SnapshotEnd { .. }
                             | ClientEvent::FullResync { .. },
                         ) if !self.heal_queries.is_empty() => break,
+                        Ok(ClientEvent::Closed) | Err(broadcast::error::RecvError::Closed) => {
+                            return;
+                        }
                         Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => return,
                     }
                 }
             }
@@ -911,7 +917,7 @@ where
                 // write.
                 .map(|(counted, ())| counted)
             })
-            .await?;
+            .await??;
         self.delete_unreferenced(&referenced).await?;
         Ok(evicted)
     }
@@ -946,7 +952,8 @@ mod tests {
     use std::sync::Arc;
 
     use connetto_client::live::ConnettoClient;
-    use connetto_client::{ClientConfig, ConnettoConnection, Replica};
+    use connetto_client::{ClientBuilder, ConnettoConnection, SyncSchema};
+    use connetto_core::schema::SchemaBundle;
     use connetto_core::test_support::FakeTransport;
     use connetto_file_core::{EncryptingStore, MimeClass, process_file};
 
@@ -954,6 +961,24 @@ mod tests {
     use crate::db;
     use crate::http::ReqwestHttp;
     use crate::store::FsStore;
+
+    /// An anonymous connection over `ddl`, opened offline the way a build with
+    /// no server yet opens it.
+    fn offline(ddl: &str) -> ConnettoConnection<FakeTransport> {
+        ClientBuilder::new(
+            SyncSchema::new(SchemaBundle::new(
+                "",
+                "",
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )),
+            || async { Err::<FakeTransport, _>("offline") },
+        )
+        .open_driven()
+        .expect("the replica opens offline")
+    }
 
     /// Clearing a refusal wakes a parked driver: the driver parks with only a
     /// refused entry, the application clears it, and the driver wakes and
@@ -967,13 +992,7 @@ mod tests {
     async fn clearing_a_refusal_wakes_the_parked_driver() {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let store = FsStore::new(dir.path().join("chunks"));
-        let connection = ConnettoConnection::<FakeTransport>::open(
-            &Replica::in_memory(),
-            "CREATE TABLE photos (id INTEGER PRIMARY KEY)",
-            &ClientConfig::new("wake-on-retry"),
-            None,
-        )
-        .expect("the replica opens offline");
+        let connection = offline("CREATE TABLE photos (id INTEGER PRIMARY KEY)");
         let (client, pump) = ConnettoClient::with_pump(connection);
         tokio::spawn(pump);
         let content = Arc::new(
@@ -994,11 +1013,13 @@ mod tests {
                 db::enqueue(conn.conn(), file_id)
             })
             .await
+            .expect("gate not locked")
             .expect("stage the file");
         content
             .client
             .with_conn(move |conn| db::refuse(conn.conn(), file_id, "over the ceiling"))
             .await
+            .expect("gate not locked")
             .expect("refuse the file");
 
         let mut events = content.events();

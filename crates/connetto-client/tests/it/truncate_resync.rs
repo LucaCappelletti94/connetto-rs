@@ -11,7 +11,7 @@
 //! A deterministic fake server hand-feeds the frame sequence, so the client
 //! contract is pinned with no Postgres, no oplog and no retention window.
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck,
@@ -180,11 +180,14 @@ where
 
 /// Connect over `server`, declare both overlapping subscriptions, and drain both snapshots.
 async fn connected(server: LoopbackTransport) -> ConnettoConnection<LoopbackTransport> {
-    let config = ClientConfig::new("truncate").with_login(Some(Grant::new("user:token")));
-    let mut conn =
-        ConnettoConnection::connect(server, &Replica::in_memory(), SQLITE_DDL, &config, None)
-            .await
-            .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(server),
+    )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe(SUB_LOW, QUERY_LOW).await.expect("subscribe");
     conn.subscribe(SUB_HIGH, QUERY_HIGH)
         .await
@@ -430,11 +433,14 @@ async fn over(
     subscriptions: &[(&str, &str)],
     seeds: usize,
 ) -> ConnettoConnection<LoopbackTransport> {
-    let config = ClientConfig::new("membership").with_login(Some(Grant::new("user:token")));
-    let mut conn =
-        ConnettoConnection::connect(server, &Replica::in_memory(), SQLITE_DDL, &config, None)
-            .await
-            .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(server),
+    )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
+    .await
+    .expect("connect");
     for (sub, query) in subscriptions {
         conn.subscribe(sub, query).await.expect("subscribe");
     }

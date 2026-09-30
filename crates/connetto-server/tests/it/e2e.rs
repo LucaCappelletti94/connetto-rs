@@ -44,12 +44,8 @@ use serde_json::json;
 
 pub(super) const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
-const SQLITE_DDL: &str =
-    "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 pub(super) const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 const OWNED_PG_DDL: &str = "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
-const OWNED_SQLITE_DDL: &str =
-    "CREATE TABLE owned (id INTEGER PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_QUERY: &str = "SELECT * FROM owned";
 /// The policy document the `owned` fixture's server derives its model from.
 ///
@@ -514,15 +510,14 @@ pub(super) fn spawn_server_cfg(
 pub(super) fn spawn_client(
     ws: &str,
     db_path: &Path,
-    client_id: &str,
+    user: &str,
     token: &str,
     write: Option<&str>,
 ) -> ChildGuard {
     spawn_client_env(
         ws,
         db_path,
-        client_id,
-        SQLITE_DDL,
+        user,
         PG_DDL,
         NO_POLICIES,
         "orders",
@@ -539,8 +534,7 @@ pub(super) fn spawn_client(
 pub(super) fn spawn_client_env(
     ws: &str,
     db_path: &Path,
-    client_id: &str,
-    sqlite_ddl: &str,
+    user: &str,
     schema_sql: &str,
     policies_sql: &str,
     sub_id: &str,
@@ -553,14 +547,13 @@ pub(super) fn spawn_client_env(
         .env("CONNETTO_SERVER", ws)
         .env("CONNETTO_KEY_STORE", "keyutils")
         .env("CONNETTO_DB", db_path)
-        .env("CONNETTO_SQLITE_DDL", sqlite_ddl)
-        // The client hashes the SAME canonical source the server does, so the
-        // handshake schema versions match. Distinct from the SQLite replica DDL.
+        // The client translates the SAME sources the server does, so the
+        // replica and the handshake schema versions match.
         .env("CONNETTO_SCHEMA_SQL", schema_sql)
         // Beside it, because the server hashes both into the version it
         // advertises: a policy decides what the replica's own views admit.
         .env("CONNETTO_POLICIES_SQL", policies_sql)
-        .env("CONNETTO_CLIENT_ID", client_id)
+        .env("CONNETTO_USER", user)
         .env("CONNETTO_TOKEN", token)
         .env("CONNETTO_SUB_ID", sub_id)
         .env("CONNETTO_QUERY", query)
@@ -1043,21 +1036,19 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     let mut dir = ReplicaDir::new();
     let db = dir.replica("alice.db");
 
-    // Alice pushes three ordered mutations on one session: an owned insert
-    // (allowed), a foreign insert with a literal owner that does not match
-    // app.user_id (refused by the policy's implicit WITH CHECK), and a second
-    // owned insert. The session applies frames in order, so once the third row
-    // lands the foreign one has already been processed and refused.
+    // Alice writes two owned rows and then a foreign one, whose literal owner
+    // does not match her id. Her replica runs the translated policy, so the
+    // foreign insert is refused on the device and never sent, and the client
+    // stops there once the server has answered the two writes before it.
     let writes = format!(
         "INSERT INTO owned VALUES (1, '{alice_id}', 'mine')\n\
-         INSERT INTO owned VALUES (2, 'bob', 'theirs')\n\
-         INSERT INTO owned VALUES (3, '{alice_id}', 'also mine')"
+         INSERT INTO owned VALUES (3, '{alice_id}', 'also mine')\n\
+         INSERT INTO owned VALUES (2, 'bob', 'theirs')"
     );
     let _alice = spawn_client_env(
         &ws,
         &db,
-        "alice",
-        OWNED_SQLITE_DDL,
+        &alice_id,
         OWNED_PG_DDL,
         OWNED_POLICIES,
         "owned",
@@ -1066,8 +1057,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         Some(writes.as_str()),
     );
 
-    // The sentinel third row landing proves the foreign write ahead of it was
-    // already handled.
+    // The second owned row landing proves the writes ahead of the refusal
+    // were delivered.
     assert_eq!(
         wait_for_pg_count(
             &admin,
@@ -1080,7 +1071,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         "alice's owned sentinel write did not land under RLS"
     );
 
-    // Postgres holds only alice's rows. Bob's foreign row was refused.
+    // Postgres holds only alice's rows. Bob's foreign row never left the device.
     assert_eq!(
         pg_owned_rows(&admin).await,
         vec![(1, alice_id.clone()), (3, alice_id.clone())],

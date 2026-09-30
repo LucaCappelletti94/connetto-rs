@@ -19,12 +19,13 @@
 )]
 
 use std::collections::{HashMap, VecDeque};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use connetto_client::{
-    AffectedRow, ClientConfig, ClientEvent, ConnettoClient, ConnettoConnection, Grant, KeyValue,
-    LiveQuery, Replica, Watchable,
+    AffectedRow, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant,
+    KeyValue, LiveQuery, Watchable,
 };
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
@@ -606,24 +607,20 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     });
 
     // Client: connect over the socket with a file-backed local replica.
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
-    let mut client = ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect");
 
@@ -780,24 +777,20 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
-    let mut client = ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect");
 
@@ -942,24 +935,20 @@ async fn connection_is_a_diesel_connection() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
-    let mut client = ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect");
 
@@ -1064,24 +1053,20 @@ async fn rejected_write_rolls_back_locally() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
-    let mut client = ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect");
 
@@ -1200,24 +1185,20 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new("client-a").with_login(Some(Grant::new("user:token")));
-    let mut client = ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect");
 
@@ -1310,31 +1291,31 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     server.await.expect("join server");
 }
 
-/// Connect one client over the socket with a fresh file-backed replica. The
-/// caller owns `db_path` (its backing temp file must outlive the connection).
+/// Connect one client over the socket with a fresh file-backed replica in `dir`,
+/// which the caller owns for the connection's life.
 async fn connect_client(
     addr: std::net::SocketAddr,
     client_id: &str,
-    db_path: &str,
+    dir: &Path,
 ) -> ConnettoConnection<WebSocketTransport<TcpStream>> {
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new(client_id.to_owned())
-        // One user, one session per client. TestGrantChecker reads the part
-        // between "user:" and "#" as the identity, so these stay the same caller
-        // while holding distinct durable handles, which is what two devices of
-        // one person look like. Sharing a handle would supersede the older.
-        .with_login(Some(Grant::new(format!("user:token#{client_id}"))));
-    ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        SQLITE_DDL,
-        &config,
-        None,
+    // One user, one session per client. TestGrantChecker reads the part
+    // between "user:" and "#" as the identity, so these stay the same caller
+    // while holding distinct durable handles, which is what two devices of
+    // one person look like. Sharing a handle would supersede the older.
+    let credential =
+        super::support::held_grant(Grant::new(format!("user:token#{client_id}")), "token");
+    let store = super::support::key_store(&credential).await;
+    ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect")
 }
@@ -1380,18 +1361,10 @@ async fn conflicting_write_converges_to_server_after_rollback() {
         }
     });
 
-    let db_a = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db a");
-    let db_b = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db b");
-    let path_a = db_a.path().to_str().expect("utf8 path").to_owned();
-    let path_b = db_b.path().to_str().expect("utf8 path").to_owned();
-    let mut client_a = connect_client(addr, "client-a", &path_a).await;
-    let mut client_b = connect_client(addr, "client-b", &path_b).await;
+    let db_a = tempfile::tempdir().expect("temp dir a");
+    let db_b = tempfile::tempdir().expect("temp dir b");
+    let mut client_a = connect_client(addr, "client-a", db_a.path()).await;
+    let mut client_b = connect_client(addr, "client-b", db_b.path()).await;
 
     // Both clients sync the seed row (status "seed").
     client_a
@@ -1692,12 +1665,8 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     // Subscribe to the scalar aggregate; the server bootstraps its value.
     client
@@ -1782,12 +1751,8 @@ async fn unsupported_subscription_is_rejected_without_closing() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe(
@@ -1937,12 +1902,8 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("count", "SELECT COUNT(*) FROM orders")
@@ -2124,12 +2085,8 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("count", "SELECT COUNT(*) FROM orders")
@@ -2216,12 +2173,8 @@ async fn an_aggregates_first_frame_is_its_full_result() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("count", "SELECT COUNT(*) FROM orders")
@@ -2276,12 +2229,8 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("total", "SELECT COUNT(*) FROM orders")
@@ -2338,12 +2287,8 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("count", "SELECT COUNT(*) FROM orders")
@@ -2410,12 +2355,8 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("orders-live", QUERY)
@@ -2537,12 +2478,8 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client
         .subscribe("count", "SELECT COUNT(*) FROM orders")
@@ -2641,13 +2578,10 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     // An ordinary typed diesel query, no SQL strings in sight: the postfix
@@ -2737,7 +2671,10 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     // R15: dropping the zero-grace watch ended the subscription, so the pass
     // evicted the two rows no other subscription covered. That the third insert
     // never arrived is asserted above by the absence of any patch.
-    let replica_rows = client.with_conn(|conn| orders(conn.conn()).len()).await;
+    let replica_rows = client
+        .with_conn(|conn| orders(conn.conn()).len())
+        .await
+        .expect("gate not locked");
     assert_eq!(
         replica_rows, 0,
         "ending the watch evicted its uncovered rows"
@@ -2789,13 +2726,10 @@ async fn live_value_tracks_a_server_aggregate() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     // The shape guards: an aggregate query is refused by watch, a row query by
@@ -2923,13 +2857,10 @@ async fn live_value_decodes_a_temporal_aggregate() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-ts", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-ts", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     // MAX(seen) is Nullable<Timestamp>, so the typed live() infers a
@@ -3007,13 +2938,10 @@ async fn identical_row_watches_share_one_subscription() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let build = || {
@@ -3132,7 +3060,10 @@ async fn identical_row_watches_share_one_subscription() {
     );
     // R15: the last sharer dropped, ending the zero-grace subscription, so the
     // pass evicted the three rows no other subscription still covered.
-    let replica_rows = client.with_conn(|conn| orders(conn.conn()).len()).await;
+    let replica_rows = client
+        .with_conn(|conn| orders(conn.conn()).len())
+        .await
+        .expect("gate not locked");
     assert_eq!(replica_rows, 0, "ending the shared watch evicted its rows");
 
     drop(client);
@@ -3168,13 +3099,10 @@ async fn distinct_row_queries_do_not_collapse() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let mut live_a: LiveQuery<Order> = orders::table
@@ -3256,13 +3184,10 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let mut count_a = orders::table.count().live(&client).await.expect("live a");
@@ -3403,29 +3328,26 @@ async fn watch_fn_drives_a_boxed_row_query() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
     // The replica needs the gadgets schema, so connect with that DDL rather than
     // the orders-shaped connect_client helper.
     let stream = TcpStream::connect(addr).await.expect("connect");
     let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
         .await
         .expect("ws connect");
-    let config = ClientConfig::new("client-gadgets").with_login(Some(Grant::new("user:token")));
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided"),
-        GADGETS_SQLITE_DDL,
-        &config,
-        None,
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(GADGETS_SQLITE_DDL),
+        super::support::Once::new(transport),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("client connect");
-    let client = ConnettoClient::start(conn);
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     // A boxed whole-table query ordered by label. The same value handed to
@@ -3519,13 +3441,10 @@ async fn watch_fn_shares_a_subscription_with_watch() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
     let mut events = client.events();
 
     let mut live_a: LiveQuery<Order> = orders::table
@@ -3599,13 +3518,10 @@ async fn watch_fn_rejects_an_aggregate_query() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let conn = connect_client(addr, "client-a", &db_path).await;
-    let client = ConnettoClient::start(conn);
+    let db = tempfile::tempdir().expect("temp dir");
+    let conn = connect_client(addr, "client-a", db.path()).await;
+    let (client, pump) = ConnettoClient::with_pump(conn);
+    tokio::spawn(pump);
 
     let result = client
         .watch_fn::<_, _, i64>(|| orders::table.count().into_boxed())
@@ -3693,12 +3609,8 @@ async fn a_change_committed_during_the_snapshot_reaches_the_replica() {
     let (manager, addr, server) =
         gated_server(&fixture, &entered, &release, vec![order(1, 1.0, 3, "seed")]).await;
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client.subscribe("orders", QUERY).await.expect("subscribe");
     entered.notified().await;
@@ -3751,12 +3663,8 @@ async fn the_snapshot_overlap_converges_on_the_later_value() {
     )
     .await;
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client.subscribe("orders", QUERY).await.expect("subscribe");
     entered.notified().await;
@@ -3829,12 +3737,8 @@ async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "r44", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "r44", db.path()).await;
 
     // Two subscriptions over one table. Row 7 will leave the first and stay in
     // the second, which is the whole point.
@@ -3933,12 +3837,8 @@ async fn a_row_that_leaves_its_only_subscription_is_removed() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "r44-solo", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "r44-solo", db.path()).await;
 
     client
         .subscribe("busy", "SELECT * FROM orders WHERE quantity > 4")
@@ -4037,12 +3937,8 @@ async fn no_resume_position_is_persisted_for_rows_that_never_arrived() {
         serve_manager.serve(transport).await.expect("session ok");
     });
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let db = tempfile::tempdir().expect("temp dir");
+    let mut client = connect_client(addr, "client-a", db.path()).await;
 
     client.subscribe("orders", QUERY).await.expect("subscribe");
     let seen = pump_for(&mut client, Duration::from_secs(2)).await;
@@ -4199,11 +4095,7 @@ async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
 
     // The first run. The client snapshots at "before" and takes a live patch,
     // so it leaves holding a real resume position rather than an empty one.
@@ -4218,7 +4110,7 @@ async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
         let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
         let _ = serve.serve(transport).await;
     });
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let mut client = connect_client(addr, "client-a", db.path()).await;
     client.subscribe("orders", QUERY).await.expect("subscribe");
     pump_until(&mut client, |e| {
         matches!(e, ClientEvent::SnapshotEnd { .. })
@@ -4261,7 +4153,7 @@ async fn a_restart_resyncs_a_client_it_cannot_prove_current() {
         let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
         let _ = serve.serve(transport).await;
     });
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let mut client = connect_client(addr, "client-a", db.path()).await;
     client.subscribe("orders", QUERY).await.expect("subscribe");
     let seen = pump_for(&mut client, Duration::from_secs(2)).await;
 
@@ -4306,11 +4198,7 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
         .expect("provision the oplog table");
     let oplog = || PgOplog::new(fixture.admin().clone(), table, OplogConfig::default());
 
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
+    let db = tempfile::tempdir().expect("temp dir");
 
     let first = status_manager(&fixture, "before", oplog());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -4321,7 +4209,7 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
         let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
         let _ = serve.serve(transport).await;
     });
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let mut client = connect_client(addr, "client-a", db.path()).await;
     client.subscribe("orders", QUERY).await.expect("subscribe");
     pump_until(&mut client, |e| {
         matches!(e, ClientEvent::SnapshotEnd { .. })
@@ -4371,7 +4259,7 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
     // the case the catchup path has to get right.
     let withheld_sql2 = format!("UPDATE orders SET status = 'withheld2' WHERE id = {WITHHELD_ID}");
     drive_insert(&mut source, &second, &withheld_sql2).await;
-    let mut client = connect_client(addr, "client-a", &db_path).await;
+    let mut client = connect_client(addr, "client-a", db.path()).await;
     client.subscribe("orders", QUERY).await.expect("subscribe");
     let seen = pump_for(&mut client, Duration::from_secs(2)).await;
 
@@ -4446,20 +4334,12 @@ async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
 
     // A file replica, since surviving a restart against the same file is the
     // whole property.
-    let db = tempfile::Builder::new()
-        .suffix(".sqlite")
-        .tempfile()
-        .expect("temp db");
-    let db_path = db.path().to_str().expect("utf8 path").to_owned();
-    let replica =
-        Replica::encrypted_file(&db_path, Some(connetto_core::test_support::replica_key()))
-            .expect("key provided");
-    let config = ClientConfig::new("resting").with_login(Some(Grant::new("user:token#resting")));
+    let db = tempfile::tempdir().expect("temp dir");
 
     // First run: connect, watch the count, see the bootstrap, and let the
     // pump rest it. Driven through `with_pump` so the reopen waits for a fully
     // closed connection rather than racing a detached pump.
-    let conn = connect_client(addr, "resting", &db_path).await;
+    let conn = connect_client(addr, "resting", db.path()).await;
     let (client, pump) = ConnettoClient::with_pump(conn);
     let pump = tokio::spawn(pump);
     let mut count = orders::table.count().live(&client).await.expect("live");
@@ -4478,9 +4358,16 @@ async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
     server.abort();
 
     // Restart offline against the same file, before any server is reachable.
-    let conn = ConnettoConnection::<WebSocketTransport<TcpStream>>::open(
-        &replica, SQLITE_DDL, &config, None,
+    let credential = super::support::held_grant(Grant::new("user:token#resting"), "token");
+    let store = super::support::key_store(&credential).await;
+    let conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::NeverDial::<WebSocketTransport<TcpStream>>::default(),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .open_driven()
+    .await
     .expect("reopen offline");
     assert!(!conn.is_connected(), "the restart reaches no server");
     let (client, pump) = ConnettoClient::with_pump(conn);

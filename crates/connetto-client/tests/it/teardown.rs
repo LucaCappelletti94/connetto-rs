@@ -12,18 +12,17 @@
 //! and its unsynced work intact, which is what makes a fast return possible.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use connetto_client::teardown::{
-    ForgetError, PurgeError, content_dir, forget_device, purge_replica, wipe_replica,
+    ForgetError, PurgeError, content_dir, purge_replica, wipe_replica,
 };
 use connetto_client::{
-    ClientConfig, ClientError, ConnettoConnection, Grant, MemoryKeyStore, MemoryRefreshStore,
-    NativeAuthenticator, Replica, ReplicaKey, encode_identity, provision_replica_key,
-    replica_db_name,
+    ClientBuilder, ClientError, DataDir, Gate, NativeClientBuilder, ReplicaKey, SyncSchema,
+    provision_replica_key,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
-use connetto_core::traits::{RefreshTokenStore, ReplicaKeyStore};
+use connetto_core::traits::ReplicaKeyStore;
 use diesel::prelude::*;
 
 /// A string written into the replica, so a leftover-plaintext assertion has
@@ -44,10 +43,6 @@ diesel::table! {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("e3").with_login(Some(Grant::new("user:token")))
-}
-
 /// The utf-8 form of a temporary path, with the same expectation spelled once.
 fn url(path: &Path) -> String {
     path.to_str().expect("a utf-8 temporary path").to_owned()
@@ -59,22 +54,19 @@ fn url(path: &Path) -> String {
 /// pending sequence numbers captured before the connection dropped.
 async fn seed_replica(
     dir: &Path,
-    keys: &MemoryKeyStore,
+    keys: &super::support::SharedKeys,
     user_id: &str,
 ) -> (PathBuf, String, Vec<u64>) {
-    let record = replica_db_name("replica", user_id).expect("a replica name");
+    let credential = super::support::held(user_id);
+    let record = credential.replica_name().to_owned();
     let path = dir.join(&record);
-    let db = url(&path);
-    let key = provision_replica_key(keys, &record)
-        .await
-        .expect("mint a key for a fresh replica");
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.to_path_buf()), keys.clone())
+    .connect_driven()
     .await
     .expect("first connect");
     diesel::insert_into(items::table)
@@ -92,14 +84,21 @@ async fn seed_replica(
 
 /// Read the rows of an existing encrypted replica through a fresh connection,
 /// which is the only honest way to claim it is still readable.
-async fn read_back(path: &Path, key: ReplicaKey) -> Result<Vec<Option<String>>, ClientError> {
-    let db = url(path);
-    let mut conn = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
-        &config(),
-        None,
+async fn read_back(
+    path: &Path,
+    user_id: &str,
+    key: ReplicaKey,
+) -> Result<Vec<Option<String>>, ClientError> {
+    let credential = super::support::held(user_id);
+    let store = super::support::key_store_with(&credential, key).await;
+    let dir = path.parent().expect("the replica lives in a directory");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.to_path_buf()), store)
+    .connect_driven()
     .await?;
     items::table
         .select(items::label)
@@ -114,7 +113,7 @@ async fn read_back(path: &Path, key: ReplicaKey) -> Result<Vec<Option<String>>, 
 async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
+    let keys = super::support::SharedKeys::default();
 
     let (alice_path, alice_record, alice_unsynced) = seed_replica(dir.path(), &keys, "alice").await;
     let (bob_path, bob_record, _) = seed_replica(dir.path(), &keys, "bob").await;
@@ -151,7 +150,7 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
         .expect("load")
         .expect("the other identity keeps its key");
     assert_eq!(
-        read_back(&bob_path, bob_key)
+        read_back(&bob_path, "bob", bob_key)
             .await
             .expect("bob still opens"),
         vec![Some(MARKER.to_owned())],
@@ -164,24 +163,27 @@ async fn a_wipe_shreds_one_identitys_replica_and_leaves_the_others_readable() {
 /// key-store record name, and the pending sequence numbers.
 async fn seed_replica_with_tier(
     dir: &Path,
-    keys: &MemoryKeyStore,
+    keys: &super::support::SharedKeys,
     user_id: &str,
 ) -> (PathBuf, String, Vec<u64>) {
-    let record = replica_db_name("replica", user_id).expect("a replica name");
+    let credential = super::support::held(user_id);
+    let record = credential.replica_name().to_owned();
     let path = dir.join(&record);
-    let db = url(&path);
-    let key = provision_replica_key(keys, &record)
-        .await
-        .expect("mint a key for a fresh replica");
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(key))
-            .expect("key is provided")
-            .with_tier(TIER_DDL),
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
         SQLITE_DDL,
-        &config(),
-        None,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(TIER_DDL),
+    ));
+    let mut conn = ClientBuilder::new(
+        schema,
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.to_path_buf()), keys.clone())
+    .connect_driven()
     .await
     .expect("first connect");
     diesel::insert_into(items::table)
@@ -199,7 +201,7 @@ async fn seed_replica_with_tier(
 async fn a_wipe_removes_the_tier_and_content_directory_beside_the_replica() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
+    let keys = super::support::SharedKeys::default();
 
     let (path, record, unsynced) = seed_replica_with_tier(dir.path(), &keys, "alice").await;
     let tier = PathBuf::from(format!("{}-tier", url(&path)));
@@ -231,7 +233,7 @@ async fn a_wipe_removes_the_tier_and_content_directory_beside_the_replica() {
 async fn a_purge_removes_the_content_directory_but_keeps_the_key() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
+    let keys = super::support::SharedKeys::default();
 
     let (path, record, unsynced) = seed_replica_with_tier(dir.path(), &keys, "alice").await;
     let content = content_dir(&path);
@@ -287,7 +289,7 @@ async fn the_session_guard_leaves_the_persistent_keyring_as_it_found_it() {
 async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
+    let keys = super::support::SharedKeys::default();
     let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
 
     match wipe_replica(&path, &keys, &record, &unsynced, false).await {
@@ -305,7 +307,7 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
         .expect("load")
         .expect("the blocked wipe keeps the key");
     assert_eq!(
-        read_back(&path, key)
+        read_back(&path, "alice", key)
             .await
             .expect("the replica still opens"),
         vec![Some(MARKER.to_owned())],
@@ -321,8 +323,8 @@ async fn a_wipe_refuses_to_drop_unsynced_writes_and_destroys_nothing() {
 async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
-    let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
+    let keys = super::support::SharedKeys::default();
+    let (_path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
 
     // Credential teardown touches neither the file nor the key store, so this is
     // the state a keep-mode logout leaves behind.
@@ -332,13 +334,15 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
         .expect("load")
         .expect("the key survives a credential-only logout");
 
-    let db = url(&path);
-    let mut conn = ConnettoConnection::connect_existing(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
-        &config(),
-        None,
+    let credential = super::support::held("alice");
+    let store = super::support::key_store_with(&credential, key).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("reopen from the cached key after re-authentication");
     let rows: Vec<Option<String>> = items::table
@@ -365,7 +369,7 @@ async fn keeping_the_data_leaves_the_replica_openable_from_its_cached_key() {
 async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
+    let keys = super::support::SharedKeys::default();
     let (path, record, _) = seed_replica(dir.path(), &keys, "alice").await;
 
     // The key store is cleared without the file, which is what a partial wipe or
@@ -374,7 +378,7 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
     let reminted = provision_replica_key(&keys, &record)
         .await
         .expect("a later boot mints again");
-    match read_back(&path, reminted).await {
+    match read_back(&path, "alice", reminted).await {
         Err(ClientError::ReplicaUndecryptable(_)) => {}
         Err(other) => panic!("expected ReplicaUndecryptable, got {other:?}"),
         Ok(_) => panic!("a re-minted key must not open the old ciphertext"),
@@ -391,14 +395,15 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
         .await
         .expect("load")
         .expect("the minted key");
-    let db = url(&path);
-    let mut conn = ConnettoConnection::connect(
-        FakeTransport::accepting(),
-        &Replica::encrypted_file(&db, Some(key)).expect("key is provided"),
-        SQLITE_DDL,
-        &config(),
-        None,
+    let credential = super::support::held("alice");
+    let store = super::support::key_store_with(&credential, key).await;
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(FakeTransport::accepting()),
     )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .connect_driven()
     .await
     .expect("rebuild after the purge");
     let rows: Vec<Option<String>> = items::table
@@ -408,42 +413,91 @@ async fn an_undecryptable_replica_recovers_through_a_forced_purge() {
     assert!(rows.is_empty(), "the rebuilt replica starts empty");
 }
 
-/// `forget_device` runs both destructive axes, and its guard is checked before the
-/// credential is destroyed: once the refresh token is gone the queued writes can
-/// never be uploaded, so a guard that ran afterwards would be protecting nothing.
+/// A durable client forgets its device only past the unsynced guard, which it
+/// reads itself before anything is destroyed, since once the credential is
+/// gone the queued writes can never be uploaded. Past the guard the replica,
+/// its key record and its content are gone.
 #[tokio::test]
-async fn forget_device_checks_the_guard_before_it_touches_the_credential() {
-    let _keyring = connetto_test_harness::isolated_session_keyring();
+async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
     let dir = tempfile::tempdir().expect("a temporary directory");
-    let keys = MemoryKeyStore::default();
-    let (path, record, unsynced) = seed_replica(dir.path(), &keys, "alice").await;
-
-    let refresh: Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync> =
-        Arc::new(MemoryRefreshStore::default());
-    let alice_account = encode_identity("alice").expect("encode alice account");
-    refresh
-        .store(&alice_account, "session-id.secret")
+    let keys = super::support::SharedKeys::default();
+    let credential = super::support::held("alice");
+    let record = credential.replica_name().to_owned();
+    let path = dir.path().join(&record);
+    keys.store(&record, &connetto_core::test_support::replica_key())
         .await
-        .expect("seed a credential");
-    // Port 1 is reserved and nothing listens there. The revoke can therefore
-    // never land, which is deliberate: the guard must refuse before the request
-    // is even attempted, so an unreachable server proves the ordering.
-    let authenticator = NativeAuthenticator::new(
-        "http://127.0.0.1:1",
-        "permissive",
-        Arc::clone(&refresh),
-        Some(alice_account.clone()),
-    );
+        .expect("seed the key");
+    let client = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+        .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+        .signed_in(credential)
+        .durable(dir.path(), keys.clone())
+        .with_gate(Gate::off())
+        .connect()
+        .await
+        .expect("the durable client opens offline");
+    client
+        .client()
+        .with_conn(|conn| {
+            diesel::insert_into(items::table)
+                .values((items::id.eq(7), items::label.eq(MARKER)))
+                .execute(conn.conn())
+                .expect("write the canary");
+        })
+        .await
+        .expect("the gate is off");
 
-    match forget_device(&authenticator, &path, &keys, &record, &unsynced, false).await {
-        Err(ForgetError::Purge(PurgeError::Unsynced(blocked))) => assert_eq!(blocked, unsynced),
-        Err(other) => panic!("expected a blocked purge, got {other:?}"),
+    let queued = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let unsynced = client
+                .client()
+                .with_conn(|conn| conn.unsynced())
+                .await
+                .expect("the gate is off");
+            if !unsynced.is_empty() {
+                break unsynced;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the offline write is queued");
+    match client.forget_device(false).await {
+        Err(ForgetError::Purge(PurgeError::Unsynced(blocked))) => assert_eq!(blocked, queued),
+        Err(other) => panic!("expected a blocked forget, got {other:?}"),
         Ok(()) => panic!("forget_device must not silently drop queued writes"),
     }
-    assert_eq!(
-        refresh.load(&alice_account).await.expect("load").as_deref(),
-        Some("session-id.secret"),
-        "the credential is intact, so the queued writes can still be uploaded"
+    assert!(path.exists(), "the refused forget leaves the replica");
+    assert!(
+        keys.load(&record).await.expect("load").is_some(),
+        "and its key"
     );
-    assert!(path.exists(), "and the replica is intact too");
+
+    client
+        .forget_device(true)
+        .await
+        .expect("a forced forget wipes the device");
+    assert!(!path.exists(), "the replica is gone");
+    assert!(!content_dir(&path).exists(), "and its content");
+    assert!(
+        keys.load(&record).await.expect("load").is_none(),
+        "and its key record"
+    );
+}
+
+/// A build that kept nothing on the device has nothing to forget.
+#[tokio::test]
+async fn an_in_memory_client_has_no_device_to_forget() {
+    let client = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+        .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+        .signed_in(super::support::held("alice"))
+        .connect()
+        .await
+        .expect("the in-memory client opens offline");
+    assert!(
+        matches!(
+            client.forget_device(true).await,
+            Err(ForgetError::NoReplica)
+        ),
+        "an in-memory build refuses to forget"
+    );
 }

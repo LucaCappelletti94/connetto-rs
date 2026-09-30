@@ -7,12 +7,13 @@
 
 use std::collections::HashMap;
 
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, SyncSchema, SyncTuning};
 use connetto_core::Cursor;
 use connetto_core::messages::{
     BulkMessage, ControlMessage, HandshakeAck, LivePatch, MutationApplied, SnapshotBegin,
     SnapshotEnd, SnapshotPatch, SubscriptionPriority, SubscriptionSpec,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
 use diesel::prelude::*;
@@ -145,10 +146,6 @@ fn snapshot_server(snaps: Snapshots) -> LoopbackTransport {
     client_end
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r15").with_login(Some(Grant::new("user:r15")))
-}
-
 async fn pump_to_snapshot_end<T>(conn: &mut ConnettoConnection<T>)
 where
     T: Transport,
@@ -179,9 +176,13 @@ where
 /// shrink-capable auto-vacuum mode, so the trimming pass can reclaim pages.
 #[tokio::test]
 async fn auto_vacuum_is_incremental_on_a_created_replica() {
-    let mut conn =
-        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), DDL, &config(), None)
-            .expect("open a fresh replica");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .signed_in(super::support::held("r15"))
+    .open_driven()
+    .expect("open a fresh replica");
     assert_eq!(
         conn.conn().auto_vacuum(None).expect("read auto_vacuum"),
         AutoVacuumMode::Incremental,
@@ -200,9 +201,14 @@ async fn rotation_drops_rows_outside_the_new_bound() {
         ),
         ("a2", vec![(1, "x".into()), (2, "x".into())], 2),
     ]);
-    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config(), None)
-        .await
-        .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
+    )
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
+    .await
+    .expect("connect");
 
     conn.subscribe("a", "SELECT * FROM orders WHERE id <= 3")
         .await
@@ -237,9 +243,14 @@ async fn a_pin_keeps_its_rows_until_unpin() {
         ),
         ("k", vec![(3, "x".into())], 2),
     ]);
-    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config(), None)
-        .await
-        .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
+    )
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
+    .await
+    .expect("connect");
 
     conn.subscribe("a", "SELECT * FROM orders WHERE id <= 3")
         .await
@@ -297,10 +308,14 @@ async fn a_pending_write_survives_until_it_is_acknowledged() {
         }
     });
 
-    let mut conn =
-        ConnettoConnection::connect(client_end, &Replica::in_memory(), DDL, &config(), None)
-            .await
-            .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(client_end),
+    )
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
+    .await
+    .expect("connect");
     // A subscription that keeps `orders` in scope but covers none of its rows.
     conn.subscribe("a", "SELECT * FROM orders WHERE id = 999")
         .await
@@ -346,13 +361,13 @@ async fn trimming_returns_pages_after_a_bulk_eviction() {
     let big = "x".repeat(400);
     let seed: Vec<(i64, String)> = (1..=800).map(|id| (id, big.clone())).collect();
     let server = snapshot_server(vec![("seed", seed, 1), ("keep", Vec::new(), 2)]);
-    let mut conn = ConnettoConnection::connect(
-        server,
-        &Replica::in_memory(),
-        DDL,
-        &config().with_trim_threshold(0),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
     )
+    .with_tuning(SyncTuning::default().with_trim_threshold(0))
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
     .await
     .expect("connect");
 
@@ -387,13 +402,13 @@ async fn tidy_trims_the_freelist_without_an_eviction() {
     let big = "x".repeat(400);
     let seed: Vec<(i64, String)> = (1..=800).map(|id| (id, big.clone())).collect();
     let server = snapshot_server(vec![("all", seed, 1)]);
-    let mut conn = ConnettoConnection::connect(
-        server,
-        &Replica::in_memory(),
-        DDL,
-        &config().with_trim_threshold(0),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
     )
+    .with_tuning(SyncTuning::default().with_trim_threshold(0))
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
     .await
     .expect("connect");
 
@@ -427,9 +442,13 @@ async fn tidy_trims_the_freelist_without_an_eviction() {
 /// connected pass would remove is left in place until connectivity returns.
 #[tokio::test]
 async fn no_eviction_runs_while_the_transport_is_down() {
-    let mut conn =
-        ConnettoConnection::<LoopbackTransport>::open(&Replica::in_memory(), DDL, &config(), None)
-            .expect("open offline");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .signed_in(super::support::held("r15"))
+    .open_driven()
+    .expect("open offline");
     assert!(!conn.is_connected(), "opened with no transport");
 
     // Recorded offline: it keeps `orders` in scope but covers none of the rows.
@@ -464,12 +483,13 @@ async fn no_eviction_runs_while_the_transport_is_down() {
 /// Only the eviction half waits for connectivity.
 #[tokio::test]
 async fn tidy_trims_while_the_transport_is_down() {
-    let mut conn = ConnettoConnection::<LoopbackTransport>::open(
-        &Replica::in_memory(),
-        DDL,
-        &config().with_trim_threshold(0),
-        None,
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<LoopbackTransport>::default(),
     )
+    .with_tuning(SyncTuning::default().with_trim_threshold(0))
+    .signed_in(super::support::held("r15"))
+    .open_driven()
     .expect("open offline");
     assert!(!conn.is_connected(), "opened with no transport");
 
@@ -507,8 +527,17 @@ async fn a_local_tier_row_survives_eviction_of_synced_rows() {
         ("seed", vec![(1, "x".into()), (2, "x".into())], 1),
         ("keep", Vec::new(), 2),
     ]);
-    let replica = Replica::in_memory().with_tier(LOCAL_DDL);
-    let mut conn = ConnettoConnection::connect(server, &replica, DDL, &config(), None)
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        DDL,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        Some(LOCAL_DDL),
+    ));
+    let mut conn = ClientBuilder::new(schema, super::support::Once::new(server))
+        .signed_in(super::support::held("r15"))
+        .connect_driven()
         .await
         .expect("connect");
 
@@ -590,10 +619,14 @@ async fn a_filterless_subscription_holds_the_whole_table_and_tidy_removes_nothin
         }
     });
 
-    let mut conn =
-        ConnettoConnection::connect(client_end, &Replica::in_memory(), DDL, &config(), None)
-            .await
-            .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(client_end),
+    )
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders")
         .await
         .expect("subscribe whole table");
@@ -651,9 +684,14 @@ async fn a_raw_unsubscribe_reclaims_what_its_subscription_synced() {
         vec![(1, "x".into()), (2, "x".into()), (3, "x".into())],
         1,
     )]);
-    let mut conn = ConnettoConnection::connect(server, &Replica::in_memory(), DDL, &config(), None)
-        .await
-        .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(server),
+    )
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders")
         .await
         .expect("subscribe");
@@ -696,10 +734,14 @@ async fn an_offline_unsubscribe_defers_eviction_to_the_next_connected_attach() {
             }
         }
     });
-    let mut conn =
-        ConnettoConnection::connect(client_end, &Replica::in_memory(), DDL, &config(), None)
-            .await
-            .expect("connect");
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(client_end),
+    )
+    .signed_in(super::support::held("r15"))
+    .connect_driven()
+    .await
+    .expect("connect");
     conn.subscribe("w", "SELECT * FROM orders")
         .await
         .expect("subscribe");

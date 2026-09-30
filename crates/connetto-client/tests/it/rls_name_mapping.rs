@@ -72,7 +72,7 @@ fn options() -> Pg2SqliteOptions {
         // The download boundary: the apply below holds this function true
         // while it lands server-authoritative rows, exactly as connetto's
         // own apply does through its suspension guard.
-        .with_write_exemption_function(connetto_client::WRITE_EXEMPTION_FUNCTION)
+        .with_write_exemption_function(connetto_core::WRITE_EXEMPTION_FUNCTION)
 }
 
 /// Translate `ddl` and execute every emitted statement on a fresh in-memory
@@ -85,7 +85,7 @@ fn build_db(ddl: &str, user: &'static str) -> (SqliteConnection, Arc<AtomicBool>
     let exempt = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&exempt);
     conn.register_noarg_sql_function::<diesel::sql_types::Bool, _, _>(
-        connetto_client::WRITE_EXEMPTION_FUNCTION,
+        connetto_core::WRITE_EXEMPTION_FUNCTION,
         SqliteFunctionBehavior::INNOCUOUS,
         move || flag.load(Ordering::Relaxed),
     )

@@ -234,6 +234,9 @@ pub enum TabStageError<E: Display> {
     /// its own; nothing needs unwinding.
     #[error("the staged row failed: {0}")]
     Row(E),
+    /// The sync client refused the operation.
+    #[error("the sync client refused the stage: {0}")]
+    Client(#[from] connetto_client::ClientError),
 }
 
 /// One answer to a `Resolve`, with the bytes a `Local` answer carries.
@@ -316,7 +319,8 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
     /// # Errors
     ///
     /// [`TabStageError::Read`] when the blob cannot be hashed,
-    /// [`TabStageError::Post`] when the lane refuses the announcement, and
+    /// [`TabStageError::Post`] when the lane refuses the announcement,
+    /// [`TabStageError::Client`] when the sync client refuses access, and
     /// whatever `row` returns as [`TabStageError::Row`].
     pub async fn stage<T, F, O, E>(
         &self,
@@ -358,6 +362,7 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
         client
             .with_conn(|conn| row(conn.conn(), file_id))
             .await
+            .map_err(TabStageError::Client)?
             .map(|outcome| (file_id, outcome))
             .map_err(TabStageError::Row)
     }

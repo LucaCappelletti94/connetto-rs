@@ -1007,16 +1007,19 @@ dependencies = [
  "base64 0.22.1",
  "chacha20poly1305",
  "connetto-core",
+ "connetto-schema",
  "diesel",
  "diesel-sqlite-session",
  "futures-util",
  "getrandom 0.3.4",
+ "js-sys",
  "keyring-core",
  "libsqlite3-sys",
  "linux-keyutils-keyring-store",
  "oo7",
  "open",
  "reqwest 0.12.28",
+ "rustix",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -1027,6 +1030,8 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+ "uuid",
+ "web-sys",
  "webbrowser",
  "windows-native-keyring-store",
  "zbus",
@@ -1042,24 +1047,19 @@ dependencies = [
  "diesel",
  "futures-util",
  "rmp-serde",
+ "rustls",
+ "rustls-platform-verifier",
  "serde",
  "serde_bytes",
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
+ "tokio-rustls",
  "tokio-tungstenite",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zeroize",
-]
-
-[[package]]
-name = "connetto-demo-deployment"
-version = "0.0.0"
-dependencies = [
- "connetto-core",
- "diesel",
- "pg2sqlite",
 ]
 
 [[package]]
@@ -1070,6 +1070,7 @@ dependencies = [
  "connetto-core",
  "diesel",
  "dioxus-core",
+ "dioxus-desktop",
  "dioxus-hooks",
  "dioxus-signals",
 ]
@@ -1085,10 +1086,10 @@ dependencies = [
  "connetto-auth-session",
  "connetto-client",
  "connetto-core",
- "connetto-demo-deployment",
  "connetto-dioxus",
  "connetto-file-client",
  "connetto-file-server",
+ "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
  "diesel",
@@ -1163,6 +1164,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-schema"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "diesel",
+ "pg2sqlite",
+ "sqlparser",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "connetto-server"
 version = "0.0.0"
 dependencies = [
@@ -1173,6 +1185,7 @@ dependencies = [
  "chrono",
  "connetto-core",
  "connetto-file-server",
+ "connetto-schema",
  "diesel",
  "diesel-async",
  "futures-util",
@@ -7015,6 +7028,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustls-platform-verifier"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "19787cda76408ec5404443dc8b31795c87cd8fec49762dc75fa727740d34acc1"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+ "jni 0.21.1",
+ "log",
+ "once_cell",
+ "rustls",
+ "rustls-native-certs",
+ "rustls-platform-verifier-android",
+ "rustls-webpki",
+ "security-framework",
+ "security-framework-sys",
+ "webpki-root-certs 0.26.11",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "rustls-platform-verifier-android"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f87165f0995f63a9fbeea62b64d10b4d9d8e78ec6d7d51fb2125fda7bb36788f"
+
+[[package]]
 name = "rustls-webpki"
 version = "0.103.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -9064,6 +9104,24 @@ dependencies = [
  "pkg-config",
  "soup3-sys",
  "system-deps",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "0.26.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c7f0ef91146ebfb530314f5f1d24528d7f0767efbfd31dce919275413e393e"
+dependencies = [
+ "webpki-root-certs 1.0.9",
+]
+
+[[package]]
+name = "webpki-root-certs"
+version = "1.0.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b96554aa2acc8ccdb7e1c9a58a7a68dd5d13bccc69cd124cb09406db612a1c9b"
+dependencies = [
+ "rustls-pki-types",
 ]
 
 [[package]]

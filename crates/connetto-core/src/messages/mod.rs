@@ -19,7 +19,7 @@ pub mod subscription;
 pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
-pub use control::{ControlMessage, PauseCause, SyncStatus};
+pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
 pub use error::{
     CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, FatalError, FatalErrorReason,
     NonFatalError, RateLimited, SUBSCRIPTION_REFUSED,

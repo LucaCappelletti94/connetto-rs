@@ -8,8 +8,13 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::{ClientConfig, ConnettoConnection, ExportScope, Replica, ReplicaKey};
+use connetto_client::{
+    ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, ExportScope, FirstThen,
+    Gate, HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+};
+use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
+use connetto_core::traits::{ReplicaKeyStore, Transport};
 use connetto_web::storage::{ReplicaStorage, tier_db_name};
 use connetto_web::workers::{
     BlobSink, BlobSource, DB_ALIVE_LOCK, request_export, serve_export_requests,
@@ -49,8 +54,93 @@ diesel::table! {
     }
 }
 
-fn config() -> ClientConfig {
-    ClientConfig::new("r26-export").with_login(Some(connetto_client::Grant::new("user:tester")))
+/// A client schema over `ddl`, with `tier` as its device-private tier.
+fn schema(ddl: &str, tier: Option<&str>) -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        ddl,
+        Vec::<(String, String)>::new(),
+        Vec::<String>::new(),
+        tier,
+    ))
+}
+
+/// The replica at exactly `url`, fresh or already there as the test says.
+struct At {
+    url: String,
+    exists: bool,
+}
+
+impl ReplicaPlace for At {
+    fn locate(&self, name: &str) -> Result<Located, ClientError> {
+        Ok(Located::new(
+            name,
+            self.url.clone(),
+            self.exists,
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// A key store holding one key for every record.
+struct Holding(ReplicaKey);
+
+impl ReplicaKeyStore for Holding {
+    type Error = ClientError;
+
+    fn load(&self, _name: &str) -> impl Future<Output = Result<Option<ReplicaKey>, ClientError>> {
+        core::future::ready(Ok(Some(self.0.clone())))
+    }
+
+    fn store(
+        &self,
+        _name: &str,
+        _key: &ReplicaKey,
+    ) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn clear(&self, _name: &str) -> impl Future<Output = Result<(), ClientError>> {
+        core::future::ready(Ok(()))
+    }
+
+    fn protection(&self) -> Custody {
+        Custody::Ephemeral
+    }
+}
+
+/// A dialer handing out `transport` once and nothing after.
+fn once<T: Transport + 'static>(
+    transport: T,
+) -> FirstThen<impl FnMut() -> core::future::Ready<Result<T, &'static str>>> {
+    FirstThen::new(transport, || core::future::ready(Err("spent")))
+}
+
+/// The replica at `url` under `key`, created when `fresh`, connected over
+/// `transport`.
+async fn connect_at(
+    schema: SyncSchema,
+    transport: FakeTransport,
+    url: &str,
+    key: ReplicaKey,
+    fresh: bool,
+) -> Result<ConnettoConnection<FakeTransport>, ClientError> {
+    ClientBuilder::new(schema, once(transport))
+        .signed_in(
+            HeldCredential::new(connetto_client::Grant::new("user:tester"), "tester")
+                .expect("a string identity serializes"),
+        )
+        .durable(
+            At {
+                url: url.to_owned(),
+                exists: !fresh,
+            },
+            Holding(key),
+        )
+        .with_gate(Gate::off())
+        .connect_driven()
+        .await
 }
 
 /// The archive a tab receives carries both tiers as patchsets. Applying each
@@ -66,19 +156,13 @@ async fn a_tab_receives_both_tiers_as_patchsets() {
     storage.delete_db(&tier).expect("clear an earlier tier");
     storage.reserve(4).await.expect("room in the pool");
     let replica_url = storage.db_url(REPLICA);
-    let replica = Replica::encrypted_file(
-        &replica_url,
-        Some(ReplicaKey::from_bytes([0x26; ReplicaKey::LEN])),
-    )
-    .expect("a resolved key")
-    .with_tier(TIER_DDL);
-    let mut worker = ConnettoConnection::connect(
+    let mut worker = connect_at(
+        schema(REPLICA_DDL, Some(TIER_DDL)),
         // accepting_but_silent avoids a close after the scripted frames run out.
         FakeTransport::accepting_but_silent(),
-        &replica,
-        REPLICA_DDL,
-        &config(),
-        None,
+        &replica_url,
+        ReplicaKey::from_bytes([0x26; ReplicaKey::LEN]),
+        true,
     )
     .await
     .expect("connect");
@@ -187,15 +271,12 @@ async fn blob_sink_to_blob_source_round_trip() {
     storage.delete_db(&tier).expect("clear earlier tier");
     storage.reserve(2).await.expect("room in the pool");
     let url = storage.db_url(replica);
-    let rep = Replica::encrypted_file(&url, Some(ReplicaKey::from_bytes([0x27; ReplicaKey::LEN])))
-        .expect("a resolved key")
-        .with_tier(TIER_DDL);
-    let mut conn = ConnettoConnection::connect(
+    let mut conn = connect_at(
+        schema(REPLICA_DDL, Some(TIER_DDL)),
         FakeTransport::accepting_but_silent(),
-        &rep,
-        REPLICA_DDL,
-        &ClientConfig::new("r26-sink-rt"),
-        None,
+        &url,
+        ReplicaKey::from_bytes([0x27; ReplicaKey::LEN]),
+        true,
     )
     .await
     .expect("connect");

@@ -2,16 +2,17 @@
 
 #![cfg(target_arch = "wasm32")]
 
-use connetto_client::{
-    ClientConfig, ConnettoClient, ConnettoConnection, Grant, LiveQuery, Replica,
-};
+use connetto_client::{ClientBuilder, ConnettoClient, ConnettoConnection, LiveQuery};
 use connetto_file_core::{FileId, MimeClass};
-use connetto_wasm_smoke::workers::{DEMO_TAB_DDL, announce_tab};
-use connetto_wasm_smoke::{CALLER_FUNCTION, MessageTransport};
+use connetto_wasm_smoke::MessageTransport;
+use connetto_wasm_smoke::build::Once;
+use connetto_wasm_smoke::workers::announce_tab;
+use connetto_wasm_smoke::workers::demo_schema;
 use connetto_web::TabContent;
 use diesel::prelude::*;
 use js_sys::{Array, Uint8Array};
 use wasm_bindgen::JsCast;
+
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{BroadcastChannel, DedicatedWorkerGlobalScope, Response};
 
@@ -111,8 +112,6 @@ pub fn spawn_photo_worker(glue_url: &str) -> web_sys::Worker {
 
 pub async fn connect_tab(
     client_id: &str,
-    token: String,
-    identity: &str,
 ) -> (
     TabContent<BroadcastChannel>,
     ConnettoConnection<MessageTransport<BroadcastChannel>>,
@@ -121,22 +120,11 @@ pub async fn connect_tab(
     announce_tab(&wire).await.expect("announce the tab");
     let mut transport = MessageTransport::<BroadcastChannel>::new(&wire).expect("wire channel");
     let content = TabContent::new(&mut transport);
-    let config = ClientConfig::new(client_id.to_owned())
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(CALLER_FUNCTION, Some(identity))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let conn = ConnettoConnection::connect(
-        transport,
-        &Replica::in_memory(),
-        DEMO_TAB_DDL,
-        &config,
-        None,
-    )
-    .await
-    .expect("tab connect through the wire channel");
+    let conn = ClientBuilder::new(demo_schema().relay_mirror(), Once::new(transport))
+        .with_client_id(client_id.to_owned())
+        .connect_driven()
+        .await
+        .expect("tab connect through the wire channel");
     (content, conn)
 }
 

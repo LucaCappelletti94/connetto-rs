@@ -2,21 +2,23 @@
 //!
 //! Configuration comes from the environment:
 //!
-//! - `CONNETTO_SERVER`: server WebSocket URL (default `ws://127.0.0.1:8080/`).
-//! - `CONNETTO_DB`: local SQLite file path (required, not `:memory:`, since the
-//!   capture and apply connections share the file). The replica is encrypted at
-//!   rest under a key kept in the OS keyring, one entry per path.
-//! - `CONNETTO_SQLITE_DDL` or `CONNETTO_SQLITE_DDL_FILE`: local schema DDL.
-//! - `CONNETTO_CLIENT_ID`: identity presented at handshake (default `anonymous`).
+//! - `CONNETTO_SERVER`: server WebSocket URL (default `ws://127.0.0.1:8080/`),
+//!   `wss://` anywhere and plain `ws://` only to a loopback host.
+//! - `CONNETTO_SCHEMA_SQL` or `CONNETTO_SCHEMA_SQL_FILE`: the Postgres schema
+//!   the server serves (required). The client translates it, with
+//!   `CONNETTO_POLICIES_SQL` or `CONNETTO_POLICIES_SQL_FILE` beside it (default
+//!   none), into its replica schema, so the replica and the handshake's schema
+//!   version are the ones the server derives from the same sources.
 //! - `CONNETTO_TOKEN`: the login grant (default none, so no identity).
-//! - `CONNETTO_KEYS`: share-key grants, comma separated (default none). Each is
-//!   checked on its own, so an expired one costs the caller only what that key
-//!   opened.
-//! - `CONNETTO_SCHEMA_SQL` or `CONNETTO_SCHEMA_SQL_FILE`: the shared canonical
-//!   schema source this build is compiled against, hashed into the handshake
-//!   schema version for staleness detection. It must be the SAME source the
-//!   server hashes (`CONNETTO_PG_DDL`), not the local SQLite DDL. Unset means
-//!   the client declares no version and a versioned server rejects it.
+//! - `CONNETTO_USER`: the user id `CONNETTO_TOKEN` stands for, which the
+//!   replica's policy views compare against (required with a token).
+//! - `CONNETTO_DB`: the replica file of a signed-in client (required with a
+//!   token). The replica is encrypted at rest under a key kept in the OS
+//!   keyring, one entry per path. A client with no token keeps its replica in
+//!   memory.
+//! - `CONNETTO_KEYS`: share keys, comma separated, each written as its grant,
+//!   `=`, and the subject it renders as (default none). Each is checked on its
+//!   own, so an expired one costs the caller only what that key opened.
 //! - `CONNETTO_SUB_ID`: subscription id (default `default`).
 //! - `CONNETTO_QUERY`: the row subscription `SELECT` (required).
 //! - `CONNETTO_KEY_STORE`: `keyutils` keeps the replica keys in the kernel
@@ -24,27 +26,138 @@
 //!   durable store.
 //! - `CONNETTO_WRITE`: optional SQL run on the managed local connection after
 //!   subscribing, one statement per line. Each line is run and pushed to the
-//!   server as a separate mutation, in order. The server applies them to
-//!   Postgres.
+//!   server as a separate mutation, in order, and the server applies them to
+//!   Postgres. The first statement the replica's own policy refuses ends the
+//!   run with an error, once the server has answered every write before it.
 //!
 //! Connects, subscribes, and pumps inbound frames, printing each client event
 //! until the server closes the connection or a SIGINT or SIGTERM arrives, either
 //! of which ends the process normally. When `CONNETTO_WRITE` is set, the
-//! client applies those writes locally and pushes them right after subscribing,
-//! then observes its own rows echoed back over CDC.
+//! client applies those writes locally and pushes them over the established
+//! session right after subscribing, then observes its own rows echoed back
+//! over CDC.
+
+use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
-use connetto_client::auth::{KeyringKeyStore, provision_replica_key};
-use connetto_client::{ClientConfig, ClientEvent, ConnettoConnection, Grant, Replica};
+use connetto_client::auth::KeyringKeyStore;
+use connetto_client::{
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, ContentPlace, Gate, Grant,
+    HeldCredential, Located, NativeTransport, ReplicaPlace, SyncSchema,
+};
+use connetto_core::auth::CapabilitySubject;
 use connetto_core::env::{read_ddl, var_or};
-use connetto_core::traits::ReplicaKeyStore;
-use connetto_core::transport::WebSocketTransport;
 use diesel::connection::SimpleConnection;
-use tokio::net::TcpStream;
 
 /// Keyring service holding this binary's replica keys, one entry per
 /// `CONNETTO_DB` path.
 const KEYRING_SERVICE: &str = "connetto-client";
+
+/// The replica file at exactly `CONNETTO_DB`, its key recorded under the
+/// same path, since the operator chose the file rather than the identity.
+struct DbPath(PathBuf);
+
+impl ReplicaPlace for DbPath {
+    fn locate(&self, _name: &str) -> Result<Located, ClientError> {
+        let url = self
+            .0
+            .to_str()
+            .ok_or_else(|| ClientError::Session("CONNETTO_DB is not valid UTF-8".to_owned()))?;
+        Ok(Located::new(
+            url,
+            url,
+            self.0.exists(),
+            ContentPlace::InMemory,
+        ))
+    }
+}
+
+/// The share keys `CONNETTO_KEYS` names.
+fn share_keys() -> Result<Vec<(Grant, CapabilitySubject<String>)>> {
+    std::env::var("CONNETTO_KEYS")
+        .ok()
+        .iter()
+        .flat_map(|keys| keys.split(','))
+        .filter(|key| !key.is_empty())
+        .map(|key| {
+            let (grant, subject) = key
+                .split_once('=')
+                .ok_or_else(|| anyhow!("a CONNETTO_KEYS entry is grant=subject, got {key}"))?;
+            Ok((
+                Grant::new(grant.to_owned()),
+                CapabilitySubject::new(subject.to_owned()),
+            ))
+        })
+        .collect()
+}
+
+/// Connect as the environment says, returning the connected, unstarted
+/// connection this binary drives frame by frame.
+async fn connect(
+    schema: SyncSchema,
+    server: String,
+) -> Result<ConnettoConnection<NativeTransport>> {
+    let dial = move || {
+        let url = server.clone();
+        async move { connetto_core::dial(&url).await }
+    };
+    let builder = ClientBuilder::new(schema, dial).with_share_keys(share_keys()?);
+    let connected = match std::env::var("CONNETTO_TOKEN").ok() {
+        None => builder.connect_driven().await,
+        Some(token) => {
+            let user = std::env::var("CONNETTO_USER")
+                .context("set CONNETTO_USER to the user id CONNETTO_TOKEN stands for")?;
+            let db_path = std::env::var("CONNETTO_DB")
+                .context("set CONNETTO_DB to the replica file of a signed-in client")?;
+            builder
+                .signed_in(HeldCredential::new(Grant::new(token), &user)?)
+                .durable(DbPath(PathBuf::from(db_path)), key_store()?)
+                .with_gate(Gate::off())
+                .connect_driven()
+                .await
+        }
+    };
+    connected.map_err(|err| anyhow!("connecting sync client: {err}"))
+}
+
+/// Run and push each `CONNETTO_WRITE` statement in order, stopping at the
+/// first one the replica refuses or a push that fails to send.
+async fn run_writes(client: &mut ConnettoConnection<NativeTransport>) -> Result<()> {
+    let Ok(writes) = std::env::var("CONNETTO_WRITE") else {
+        return Ok(());
+    };
+    for stmt in writes
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+    {
+        client
+            .conn()
+            .batch_execute(stmt)
+            .map_err(|err| anyhow!("running CONNETTO_WRITE: {err}"))?;
+        let seq = client
+            .push()
+            .await
+            .map_err(|err| anyhow!("pushing local write: {err}"))?;
+        tracing::info!(client_seq = ?seq, "pushed a local write");
+    }
+    Ok(())
+}
+
+/// Before an early exit, wait until the server has answered every write
+/// already pushed, then close the connection with its handshake, so a
+/// refusal further down the script loses none of the writes ahead of it.
+async fn settle(client: &mut ConnettoConnection<NativeTransport>) {
+    while !client.unsynced().is_empty() {
+        match client.pump_one().await {
+            Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. }) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
+    if let Err(err) = client.close().await {
+        tracing::warn!(error = %err, "closing after an early exit");
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -78,92 +191,23 @@ fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
 
 async fn run() -> Result<()> {
     let server = var_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
-    let db_path = std::env::var("CONNETTO_DB").context("set CONNETTO_DB to a file path")?;
-    let sqlite_ddl = read_ddl("CONNETTO_SQLITE_DDL")?;
     let sub_id = var_or("CONNETTO_SUB_ID", "default");
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
-    // Declared only when a shared canonical source is provided, matching the
-    // server's version. Absent, the client declares nothing and a versioned
-    // server rejects it. The policy source belongs in the hash beside the
-    // schema, because a policy decides which view a logical name resolves to
-    // on the replica, and a deployment with no policies states none.
-    let schema_version = read_ddl("CONNETTO_SCHEMA_SQL").ok().map(|schema| {
-        let policies = read_ddl("CONNETTO_POLICIES_SQL").unwrap_or_default();
-        connetto_core::SchemaVersion::from_sources([schema.as_str(), policies.as_str()])
-    });
-    let client_id = var_or("CONNETTO_CLIENT_ID", "anonymous");
-    let config = ClientConfig::new(client_id)
-        // CONNETTO_TOKEN carries the caller's identity grant. Unset means no
-        // identity: the server accepts an anonymous caller.
-        .with_login(std::env::var("CONNETTO_TOKEN").ok().map(Grant::new))
-        .with_capabilities(
-            std::env::var("CONNETTO_KEYS")
-                .ok()
-                .iter()
-                .flat_map(|keys| keys.split(','))
-                .filter(|key| !key.is_empty())
-                .map(Grant::new)
-                .collect::<Vec<_>>(),
-        )
-        .with_schema_version(schema_version);
+    let schema_sql = read_ddl("CONNETTO_SCHEMA_SQL").context("set CONNETTO_SCHEMA_SQL")?;
+    let policies_sql = read_ddl("CONNETTO_POLICIES_SQL").unwrap_or_default();
+    let bundle = connetto_schema::translate::<String>(&schema_sql, &policies_sql)
+        .map_err(|err| anyhow!("translating CONNETTO_SCHEMA_SQL: {err}"))?;
 
-    // The ws URL's authority is also the TCP target.
-    let authority = server
-        .strip_prefix("ws://")
-        .unwrap_or(&server)
-        .split('/')
-        .next()
-        .unwrap_or(&server);
-    let tcp = TcpStream::connect(authority)
-        .await
-        .with_context(|| format!("connecting to {authority}"))?;
-    let transport = WebSocketTransport::connect(&server, tcp)
-        .await
-        .map_err(|err| anyhow!("websocket handshake to {server}: {err}"))?;
-
-    // Provision-once, addressed by the replica path since this binary has no
-    // identity to name a record after. A replica already on disk reads the cache
-    // and never mints: a fresh key for an existing file decrypts nothing, and
-    // writing one would fill the record that restoring a backup still could.
-    let keys = key_store()?;
-    let resolved = if std::path::Path::new(&db_path).exists() {
-        keys.load(&db_path)
-            .await
-            .with_context(|| format!("reading the replica key for {db_path}"))?
-    } else {
-        Some(
-            provision_replica_key(&keys, &db_path)
-                .await
-                .with_context(|| format!("minting the replica key for {db_path}"))?,
-        )
-    };
-    let replica = Replica::encrypted_file(&db_path, resolved)?;
-
-    let mut client = ConnettoConnection::connect(transport, &replica, &sqlite_ddl, &config, None)
-        .await
-        .map_err(|err| anyhow!("connecting sync client: {err}"))?;
+    let mut client = connect(SyncSchema::new(bundle), server).await?;
     tracing::info!(connection = ?client.connection_id(), "connected");
     client
         .subscribe(&sub_id, &query)
         .await
         .map_err(|err| anyhow!("subscribing: {err}"))?;
 
-    if let Ok(writes) = std::env::var("CONNETTO_WRITE") {
-        for stmt in writes
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-        {
-            client
-                .conn()
-                .batch_execute(stmt)
-                .map_err(|err| anyhow!("running CONNETTO_WRITE: {err}"))?;
-            let seq = client
-                .push()
-                .await
-                .map_err(|err| anyhow!("pushing local write: {err}"))?;
-            tracing::info!(client_seq = ?seq, "pushed a local write");
-        }
+    if let Err(err) = run_writes(&mut client).await {
+        settle(&mut client).await;
+        return Err(err);
     }
 
     loop {

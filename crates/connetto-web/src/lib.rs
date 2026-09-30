@@ -13,18 +13,22 @@
 //! `MessagePort` and a named `BroadcastChannel`, [`locks`] provides Web Locks
 //! liveness for dead-tab reaping and leader election, [`storage`] owns the
 //! worker's durable databases and the data-wipe seam that removes one,
-//! [`workers`] holds the DB worker orchestration ([`workers::boot_db_worker`])
+//! [`workers`] holds the DB worker orchestration behind the builder's boot
 //! and the page-side glue, and [`leader`] runs the multi-page election that
-//! decides which page owns the DB worker. The demo schema and server URL are the
-//! consumer's: [`workers::boot_db_worker`] takes them as a
-//! [`workers::DbWorkerConfig`], so this crate bakes nothing application
-//! specific.
+//! decides which page owns the DB worker. [`gate`] installs the
+//! away-and-return gate on the worker's relay hub and applies the relayed
+//! state on a tab's client, and [`visibility`] carries the tabs'
+//! visibility to the worker's away input. The demo schema and server URL are the
+//! consumer's, which the [`builder::WebClientBuilder`] takes, so this crate
+//! bakes nothing application specific.
 
 pub mod auth;
 pub mod broadcast;
+pub mod builder;
 pub mod content;
 pub mod content_wire;
 pub mod frames;
+pub mod gate;
 pub mod leader;
 pub mod locks;
 pub mod logging;
@@ -32,12 +36,13 @@ pub mod port;
 pub mod relay;
 pub mod storage;
 pub mod unlock;
+pub mod visibility;
 pub mod workers;
 
 pub use auth::{
     AT_REST_KEK_LABEL, AT_REST_PRF_INPUT, AccountStore, Acquired, AuthError, BrowserAuthenticator,
-    BrowserSession, LOCKED_MESSAGE, LOGIN_CHANNEL, LoginMessage, PendingLogin, WorkerAuthConfig,
-    await_login_code, deliver_login_code, remembered_account, remembered_identity,
+    BrowserSession, LOCKED_MESSAGE, LOGIN_CHANNEL, LoginMessage, PendingLogin, await_login_code,
+    deliver_login_code, remembered_account, remembered_identity,
 };
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,

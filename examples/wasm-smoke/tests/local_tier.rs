@@ -7,30 +7,27 @@
 //! sahpool file, the attach-create dbconfig, and `json_quote` in the wasm SQLite
 //! build (the local aggregate probe rides it).
 //!
-//! The tier is named on the replica with `.with_tier` (first boot) or
-//! `.with_existing_tier` (reopen), which is the only way to create a
-//! durable tier that decrypts under the replica's derived key.
-//!
+//! The tier comes from the schema's local tier, created with the replica on
+//! a first boot and reopened with it after, decrypting under the replica's
+//! key.
 
 #![cfg(target_arch = "wasm32")]
 
 mod common;
 
 use connetto_client::{
-    ClientConfig, ConnettoClient, ConnettoConnection, Grant, Replica, ReplicaKey,
-    cipher::cipher_url, dsl::Watchable,
+    ClientBuilder, ConnettoClient, ConnettoConnection, Gate, HeldCredential, ReplicaKey,
+    dsl::Watchable,
 };
 use connetto_wasm_smoke::BrowserSocket;
-use connetto_wasm_smoke::workers::DEMO_WS_URL;
+use connetto_wasm_smoke::build;
+use connetto_wasm_smoke::workers::demo_schema;
 use diesel::prelude::*;
 use futures_channel::oneshot;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
-/// The two tier schemas, translated from their source documents by build.rs.
-const REPLICA_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/replica-ddl.sql"));
-const FRONTEND_DDL: &str = include_str!(concat!(env!("OUT_DIR"), "/frontend-ddl.sql"));
 const DB_NAME: &str = "tier-smoke.sqlite";
 
 /// A fixed key for this suite. One device, one key: the tier inherits it through
@@ -64,32 +61,25 @@ fn unique_id() -> i64 {
     50_000_000_000 + millis
 }
 
-/// Connect to the shared replica file with the local tier named on the replica.
+/// Connect to the shared replica file, the local tier beside it.
 ///
-/// A first boot applies both schemas: the replica's through `connect` and the
-/// tier's through `.with_tier`, which creates a durable tier that decrypts
-/// under the replica's key. A reopen uses `.with_existing_tier`, which refuses
-/// to create the tier file if it is missing, so a failed persist fails loudly.
-async fn connect(config: &ClientConfig, first_boot: bool) -> ConnettoConnection<BrowserSocket> {
-    let transport = BrowserSocket::connect(DEMO_WS_URL)
+/// A first boot creates both files and applies both schemas, the tier
+/// decrypting under the replica's key. A reopen refuses to create the tier
+/// file if it is missing, so a failed persist fails loudly.
+async fn connect(
+    credential: &HeldCredential,
+    first_boot: bool,
+) -> ConnettoConnection<BrowserSocket> {
+    ClientBuilder::new(demo_schema(), build::server())
+        .signed_in(credential.clone())
+        .durable(
+            build::SuitePlace::new(DB_NAME, !first_boot),
+            build::keys_for(credential, replica_key()).await,
+        )
+        .with_gate(Gate::off())
+        .connect_driven()
         .await
-        .expect("connect to connetto-server");
-    let url = cipher_url(DB_NAME, "opfs-sahpool");
-    if first_boot {
-        let replica = Replica::encrypted_file(&url, Some(replica_key()))
-            .expect("create replica")
-            .with_tier(FRONTEND_DDL);
-        ConnettoConnection::connect(transport, &replica, REPLICA_DDL, config, None)
-            .await
-            .expect("client connect")
-    } else {
-        let replica = Replica::encrypted_file(&url, Some(replica_key()))
-            .expect("create replica")
-            .with_existing_tier();
-        ConnettoConnection::connect_existing(transport, &replica, config, None)
-            .await
-            .expect("client connect")
-    }
+        .expect("client connect")
 }
 
 #[wasm_bindgen_test]
@@ -105,14 +95,8 @@ async fn local_tier_placement_dispatch_and_persistence() {
     .expect("install sahpool vfs");
 
     let (token, user_id) = common::mint_session().await;
-    let config = ClientConfig::new(format!("wasm-tier-{}", unique_id()))
-        .with_login(Some(Grant::new(token)))
-        .with_schema_version(Some(connetto_wasm_smoke::demo_schema_version()))
-        .with_sql_functions(connetto_wasm_smoke::uuidv4_functions())
-        .with_policy_tables(connetto_wasm_smoke::demo_policy_tables())
-        .with_caller(connetto_wasm_smoke::CALLER_FUNCTION, Some(&user_id))
-        .with_share_keys::<String>(connetto_wasm_smoke::SUBJECTS_FUNCTION, []);
-    let mut conn = connect(&config, true).await;
+    let credential = build::held(token, &user_id);
+    let mut conn = connect(&credential, true).await;
     assert!(
         conn.local_tables().contains("notes"),
         "the tier lookup sees the attached notes table"
@@ -164,6 +148,7 @@ async fn local_tier_placement_dispatch_and_persistence() {
                 .execute(conn.conn())
         })
         .await
+        .expect("gate not locked")
         .expect("insert second note");
     live.changed().await.expect("local row refresh");
     assert_eq!(live.rows().len(), 2, "the row handle refreshed locally");
@@ -178,7 +163,7 @@ async fn local_tier_placement_dispatch_and_persistence() {
     // The notes persisted in their own OPFS file: a fresh connection re-attaches
     // it with attach-create disabled, so this also proves the tier file really
     // exists and decrypts under the replica's key.
-    let mut conn = connect(&config, false).await;
+    let mut conn = connect(&credential, false).await;
     let persisted: Vec<Note> = notes::table
         .filter(notes::id.ge(id))
         .order(notes::id)
