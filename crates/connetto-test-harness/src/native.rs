@@ -178,17 +178,24 @@ mod tests {
     use crate::stack::TempDir;
     use crate::watermark::_connetto_mutations;
 
-    /// The newest server programs of the Debian and Ubuntu layout, which the
-    /// CI runners ship.
+    /// The directory of the `pg_ctl` on `PATH`, else the newest server
+    /// programs of the Debian and Ubuntu layout, which the CI runners ship.
     fn postgres_bin() -> PathBuf {
-        std::fs::read_dir("/usr/lib/postgresql")
-            .into_iter()
-            .flatten()
-            .flatten()
-            .map(|entry| entry.path().join("bin"))
-            .filter(|bin| bin.join("pg_ctl").exists())
-            .max()
-            .expect("no /usr/lib/postgresql/*/bin/pg_ctl, install the PostgreSQL server")
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        std::env::split_paths(&path)
+            .find(|dir| dir.join("pg_ctl").is_file())
+            .or_else(|| {
+                std::fs::read_dir("/usr/lib/postgresql")
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .map(|entry| entry.path().join("bin"))
+                    .filter(|bin| bin.join("pg_ctl").exists())
+                    .max()
+            })
+            .expect(
+                "no pg_ctl on PATH or in /usr/lib/postgresql/*/bin, install the PostgreSQL server",
+            )
     }
 
     fn lookup(set: &[&str]) -> impl Fn(&str) -> Option<OsString> {
