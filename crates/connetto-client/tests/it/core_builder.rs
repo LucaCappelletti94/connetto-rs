@@ -605,6 +605,87 @@ async fn a_durable_build_takes_freshness_from_the_file_and_never_rekeys() {
     );
 }
 
+/// A key store whose platform lost every key, as Android does when the screen
+/// lock is removed: it says so once, then holds what the build stores.
+#[cfg(feature = "native-transport")]
+#[derive(Clone)]
+struct LostKeys {
+    lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    inner: RecordingKeyStore,
+}
+
+#[cfg(feature = "native-transport")]
+impl connetto_core::traits::ReplicaKeyStore for LostKeys {
+    type Error = connetto_client::ClientError;
+
+    async fn load(&self, name: &str) -> Result<Option<connetto_core::ReplicaKey>, Self::Error> {
+        if self.lost.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            self.inner.clear(name).await?;
+            return Err(connetto_client::ClientError::ReplicaKeyLost);
+        }
+        self.inner.load(name).await
+    }
+
+    async fn store(&self, name: &str, key: &connetto_core::ReplicaKey) -> Result<(), Self::Error> {
+        self.inner.store(name, key).await
+    }
+
+    async fn clear(&self, name: &str) -> Result<(), Self::Error> {
+        self.inner.clear(name).await
+    }
+
+    fn protection(&self) -> connetto_client::Custody {
+        self.inner.protection()
+    }
+}
+
+/// A replica whose key the platform lost can never be opened again, so the
+/// build wipes it and starts a fresh one under a new key, and the server
+/// resyncs it, rather than refusing the way a key missing for no known reason
+/// is refused.
+#[cfg(feature = "native-transport")]
+#[tokio::test]
+async fn a_replica_whose_key_the_platform_lost_is_wiped_and_started_fresh() {
+    let dir = tempfile::tempdir().expect("a data directory");
+    let store = RecordingKeyStore::new();
+    let credential =
+        connetto_client::HeldCredential::new(Grant::new("user:lost"), &"lost".to_owned())
+            .expect("a held credential");
+    let name = credential.replica_name().to_owned();
+    let open = |keys: LostKeys| {
+        ClientBuilder::new(bundle(), OneShot { transport: None })
+            .signed_in(credential.clone())
+            .durable(connetto_client::DataDir::new(dir.path()), keys)
+            .open_driven()
+    };
+    let intact = LostKeys {
+        lost: std::sync::Arc::default(),
+        inner: store.clone(),
+    };
+    let mut first = open(intact)
+        .await
+        .expect("the first run creates the replica");
+    diesel::insert_into(orders::table)
+        .values((orders::id.eq(7), orders::label.eq("before")))
+        .execute(first.conn())
+        .expect("a row the lost key encrypted");
+    drop(first);
+    let old_key = store.key(&name).expect("the first run stored a key");
+
+    let lost = LostKeys {
+        lost: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        inner: store.clone(),
+    };
+    let mut fresh = open(lost).await.expect("a lost key starts a fresh replica");
+    let rows: i64 = orders::table
+        .count()
+        .get_result(fresh.conn())
+        .expect("count the fresh replica");
+    assert_eq!(rows, 0, "the old rows went with the replica");
+    let new_key = store.key(&name).expect("the fresh replica stored a key");
+    assert_ne!(new_key, old_key, "the fresh replica has its own key");
+}
+
 /// A translated schema calls the caller and subjects functions from its views
 /// whether or not anyone signed in or holds a key, so a build registers both
 /// and each answers as nobody does.

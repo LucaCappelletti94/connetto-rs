@@ -2361,6 +2361,16 @@ where
         self.shared.gate.enable(recheck, mechanism);
     }
 
+    /// Turn on the re-check open, for a launch whose prompt was approved.
+    pub(crate) async fn enable_verified_gate(
+        &self,
+        recheck: Option<Duration>,
+        mechanism: Arc<dyn GateMechanism>,
+    ) {
+        let _state = self.shared.lock_interrupting().await;
+        self.shared.gate.enable_verified(recheck, mechanism);
+    }
+
     /// The application went away at `at`.
     ///
     /// Only a gated, open client keeps the moment, and only when a grace is

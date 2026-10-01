@@ -144,9 +144,9 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R25~~ | Device-to-device sync, a design, from which R74 to R80 derive |
 | done | ~~R30~~ | Grouped aggregates revisited, a design, from which R82 to R85 derive |
 | done | ~~R88~~ | The mobile build of a demo, Android on this workstation, iOS through the Mac |
-| blocked | R51 | Native Apple gate. Blocked on R94's gate setting, with two upstream keychain changes patched in until released, R88's iOS leg being done |
-| blocked | R52 | Native Android gate. Blocked on R94's gate setting, with one upstream keystore change patched in until released, R88's Android leg being done |
-| blocked | R53 | Windows gate. Blocked on hardware |
+| done | ~~R51~~ | Native Apple gate, two upstream keychain changes patched in until released |
+| done | ~~R52~~ | Native Android gate, one upstream keystore change patched in until released |
+| any | R53 | Windows gate. W2 measured deterministic on a lent laptop, so a native gate exists, and it follows R51 and R52 |
 | blocked | R21 | One page codec. Blocked on the maintainers agreeing to the shared cipher source crates in `rusqlite/rusqlite` discussion #1908, without which it would run on permanent forks |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
@@ -208,8 +208,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R50 the policy answers a write it never asks | **DONE** (2026-08-18) | nothing | no, discharged |
 | R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
 | R23 user-verified unlock (browser gate, custody, chapter 14) | **DONE** (2026-08-20) | nothing. Nine decisions recorded in the R23 section. Natives and Windows split to R51, R52, R53 | no |
-| R51 native Apple gate | NOT STARTED, probe I5 measured 2026-09-25 | R94, whose `Gate` setting carries the default and the re-check, and the shared-authentication changes requested of `apple-native-keyring-store` (#26) and `security-framework` (#263, #264) on 2026-09-25, taken through pinned patches until released. Split out of R23 (2026-08-19), mechanism measured on macOS and on the iPhone and iPad | no |
-| R52 native Android gate | NOT STARTED, device probe measured 2026-09-26 | R94, whose `Gate` setting carries the default and the re-check, and the unlock-once store option requested of `android-native-keyring-store` under #16 on 2026-09-26, taken through a pinned patch until released. Split out of R23 (2026-08-19), mechanism measured on the Galaxy M52 | no |
+| R51 native Apple gate | **DONE** (2026-10-01) | nothing. The shared-authentication changes requested of `apple-native-keyring-store` (#26) and `security-framework` (#263, #264) are taken through pinned patches until released. Nine decisions shared with R52 in the R51 section | no |
+| R52 native Android gate | **DONE** (2026-09-30) | nothing. The unlock-once store option requested of `android-native-keyring-store` under #16 is taken through a pinned patch until released. Nine decisions shared with R51 in the R51 section | no |
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
@@ -219,7 +219,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R94 one client builder per platform | STARTED 2026-09-28, minted and designed 2026-09-25 while planning R51, open points settled 2026-09-28, every construction site on the builders 2026-09-29, proof 1 passed 2026-09-29 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | R94. One decision and one open question in the section | no |
 | R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, undesigned | nothing, its design comes first | no |
-| R53 Windows gate | BLOCKED on hardware | a reliable Windows machine, then the probe's Windows leg. W2 decides whether a native gate exists there | no |
+| R53 Windows gate | NOT STARTED, W2 measured 2026-09-30 | nothing. W2 found the `KeyCredentialManager` signature deterministic, so a native gate exists. The build waits on `connetto-client` building on Windows and on the testcontainers watchdog compiling there | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
 | R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
@@ -2613,7 +2613,7 @@ Established by direct search across `examples/*/src`, not by reading summaries. 
 
 | Capability | desktop | dioxus web | yew web |
 | --- | --- | --- | --- |
-| Passkey gate, `with_unlock` | not applicable, R51 and R52 not started | **absent** | **absent** |
+| Passkey gate, `with_unlock` | not applicable, the native gate is the platform's own prompt (R51, R52) | **absent** | **absent** |
 | Custody level shown, `request_custody` | **absent** | **absent** | **absent** |
 | Account picker, `with_pick_account` and `serve_account_choice` | **absent** | **absent** | **absent** |
 | Account switch, `switch_account` | **absent** | **absent** | **absent** |
@@ -2705,9 +2705,9 @@ Found while gating `R62` by mirroring `ci.yml` job for job instead of running th
 
 ## R51: native Apple gate for stored secrets
 
-**Status.** NOT STARTED. Split out of R23 on 2026-08-19 so each surface lands alone.
+**Status.** **DONE (2026-10-01)**, built together with R52 and proven on the iPhone 15 Pro Max, the simulator and macOS. Split out of R23 on 2026-08-19 so each surface lands alone.
 
-**Blocked on R94 for its wiring only**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). Its probe, decisions and upstream requests are not blocked and are done, and the two upstream changes below are patched in until released. R88's iOS leg is the signed provisioned `.app` this phase's gated item lives in.
+**Blocked on nothing.** R94's `Gate` setting carries the gate's default and the re-check grace, and the two upstream changes below are patched in until released.
 
 Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `ReplicaKeyStore` implementations) through `apple-native-keyring-store`'s `protected::Store` (measured at 1.0.1 on macOS, 1.0.2 in the lockfile and on iOS) with `AccessPolicy::RequireUserPresence`, measured equivalent to biometry-any combined with device passcode on all three points including surviving a fingerprint-set change (probe N1 to N3, macOS). The policy needs nothing upstream, but the crate passes no authentication context to the keychain, which one unlock per launch needs, per the decision below. The gated item exists only in a provisioned signed `.app` (AMFI kills a bare signed CLI at exec, rc 137, because the data protection keychain needs the `keychain-access-groups` entitlement), so the implementation detects the store-time refusal and downgrades custody honestly, packaging-cannot as a flavour of platform-cannot.
 
@@ -2727,20 +2727,37 @@ Gate the two keychain items behind the R41 seam (`RefreshTokenStore` and `Replic
 ### Steps
 
 1. ~~Verify the iOS native leg first (probe I5 on the iPhone): the access-control flags and their prompting are not guaranteed to match between macOS and iOS, and Face ID may change the fallback behaviour.~~ **Done 2026-09-25**, results above.
-2. Patch `apple-native-keyring-store` and `security-framework` to the fork branches in the root and demo workspaces, each pinned by `rev` to the head of its open pull request (the `security-framework` branch carries exactly #263 and #264 on upstream `main`, none of the fork's other open pull requests), and check both builds on the macOS CI job.
-3. Wire the gated store behind the seam, report through R23's custody surface, extend chapter 14.
+2. ~~Patch `apple-native-keyring-store` and `security-framework` to the fork branches.~~ **Done 2026-09-30**, pinned to `0cbad3f4` and `6ac1b8a3` in the root and demo workspaces.
+3. ~~Wire the gated store behind the seam, report through R23's custody surface, extend chapter 14.~~ **Done 2026-09-30**, with R52, through the decisions below.
+4. ~~The macOS proof at the Mac.~~ **Done 2026-10-01**, below.
+
+### Decisions shared with R52 (2026-09-30)
+
+Decisions 1 to 3 were taken with the maintainer, 4 to 9 follow from recorded decisions and were stated to him.
+
+1. **`Custody::Verified` is amended, not joined by a new level.** It means a key the platform releases only after verifying the user, so a copy of the storage alone opens nothing. The browser's passkey-derived key and a gated keychain or Keystore item both report it, since an application reads custody to decide whether to warn or offer the gate and both answer that the same way.
+2. **R51 gates macOS too.** macOS moves from the login keychain to the protected store with shared authentication, and the desktop demo ships as a provisioned `.app` carrying `keychain-access-groups`, built by `connetto-macos-app`.
+3. **R52 pins one integration revision** of `android-native-keyring-store` (`bcb27e8f`), carrying #28, the unlock-once option, the `-16` refusal and #27's lost-key report on upstream `main`.
+4. **Only the two secrets are gated**, refresh tokens and replica keys. The reserved records (the account index, the last-used identity, the pending login) stay readable before any prompt, since the account choice reads them first and none is secret.
+5. **One prompt per launch.** The first gated read raises it, Apple's sheet through the shared `LAContext` or Android's `BiometricPrompt` over the store's `CryptoObject`. A launch whose sign-in only created secrets has verified nothing, so the connect asks once and waits on the answer before it returns, and nothing the application starts meets the lock at launch. That ask first resets the platform context, because iOS lets the context that created an item read it back without a sheet (measured on the iPhone, 2026-09-30), which would have let a first sign-in open unverified.
+6. **A dismissal at launch fails the connect**, as R94's table says: a dismissed first read with `SecretStoreError::PromptDismissed`, a dismissed launch ask with `ClientError::Locked`.
+7. **A device that cannot hold a gated item keeps the secrets ungated and says so.** No passcode or no secure lock screen reports `Unverified(Offerable)`, a missing entitlement or a platform with no mechanism `Unverified(Unsupported)`, and macOS then falls back to the login keychain.
+8. **Gate off is the application's opt-out**, reporting `Unverified(Offerable)`. It applies to secrets as they are written, since both platforms fix an item's protection at creation.
+9. **Items written before a gate existed are not migrated** (pre-alpha, no deployments). Development devices reinstall.
+
+Two platform behaviours found by the device runs shape the prompt code. Samsung shows no `BiometricPrompt` asked while another window has focus, so the Kotlin prompt waits for the app's window focus. iOS drops an `ASWebAuthenticationSession` started while a Face ID sheet is in front, so the login session waits for the app to become active. A replica whose Android store key was lost (the screen lock removed) returns `ClientError::ReplicaKeyLost`, which the build answers with R23's wipe-and-resync. The keyring's state table is the second table of chapter 14's "The gate's states".
 
 ### Proof
 
-The probe app remains the platform evidence for prompting behaviour, since provisioning is not available to `cargo test`. connetto's wiring is proven by the store refusing ungated reads where gated, plus custody tests.
+**Passed on the iPhone 15 Pro Max on 2026-09-30** (`connetto-ios-proof --device`, evidence `target/ios-proof/00008130-000C718E2140001C-1790798566965` on the Mac): Face ID at the launch, sync, an offline write and its upload, then 36 s in Settings, the gate locked, Face ID once more on return, and a backend write reached the page after the approval. A cancelled sheet at launch refused the start with "the unlock prompt was dismissed", decision 6 on a device. **Passed on macOS 26.6.2 on 2026-10-01**, by the maintainer at the Mac: the `.app` that `connetto-macos-app` builds and signs, run against the dev stack, asked Touch ID once after the browser login, and again on return after more than 35 s in another app, and each approval opened the gate. The simulator run passes the iOS steps without a sheet, since the simulator never enforces the gate. Unit tests cover the keyring's state table (`keyring::gate`), the launch ask and the re-check (`tests/it/gate_recheck.rs`), and the lost-key wipe (`core_builder.rs`).
 
 ---
 
 ## R52: native Android gate for stored secrets
 
-**Status.** NOT STARTED, device probe measured on the Galaxy M52 2026-09-26. Split out of R23 on 2026-08-19.
+**Status.** **DONE (2026-09-30)**, built with R51 under the decisions recorded in R51's section. Split out of R23 on 2026-08-19.
 
-**Blocked on R94 for its wiring only**, whose `Gate` setting carries the gate's default and the re-check grace this phase implements (decided 2026-09-25). Its probe, its decision and its upstream request are done, and the upstream change below is patched in until released. R88's Android leg is the installed app this phase's gated store and `BiometricPrompt` live in.
+**Blocked on nothing.** The upstream change below is patched in until released.
 
 Gate the two stores behind the R41 seam through `android-native-keyring-store` (1.0.0 in the lockfile, installed by `install_keyring_store` in `crates/connetto-client/src/auth.rs`), which creates its one Keystore key per store with `set_user_authentication_required(false)` (`src/by_store/vault.rs:276`) and offers no option. A WebView app has no WebAuthn at all (probe A5, measured on the physical device), so this native path is the only gate a Dioxus Android application can have.
 
@@ -2762,20 +2779,22 @@ Gate the two stores behind the R41 seam through `android-native-keyring-store` (
 ### Steps
 
 1. ~~Probe the Keystore on the Galaxy M52.~~ **Done 2026-09-26**, results above.
-2. Patch `android-native-keyring-store` to the fork branch in the root and demo workspaces through `[patch.crates-io]`, pinned by `rev` to the head of its pull request, and check the Android build.
-3. Wire the gated store behind the seam with the unlock prompt in `connetto-auth-session`, report through R23's custody surface, treat a deleted store key as R23's wipe-and-resync, and extend chapter 14.
+2. ~~Patch `android-native-keyring-store` to the fork branch.~~ **Done 2026-09-30**, pinned to the integration revision `bcb27e8f` (R51 decision 3).
+3. ~~Wire the gated store behind the seam with the unlock prompt in `connetto-auth-session`, report custody, treat a deleted store key as wipe-and-resync, extend chapter 14.~~ **Done 2026-09-30.**
 
 ### Proof
 
-On the physical device, per the probe's A4 rule that the emulator on hand is not evidence for this platform. connetto's wiring is proven by a locked store refusing reads and writes, plus custody tests.
+On the physical device, per the probe's A4 rule. **Passed on the Galaxy M52 on 2026-09-30** (`connetto-android-proof` over wireless adb, evidence `target/android-proof/adb-RFCRB0AQSEB-xHzSDu._adb-tls-connect._tcp-1790799525177`), approved by a person: the prompt at sign-in, sync, an offline write and its upload, the prompt again on return after 35 s on the home screen, and the prompt once more after the process was killed and relaunched, with custody reading "released only after user verification" and nothing else prompting. The emulator run (API 35, PIN typed by the driver) passes the same steps. Unit tests as in R51.
 
 ---
 
 ## R53: Windows gate for stored secrets
 
-**Status.** BLOCKED on hardware. Split out of R23 on 2026-08-19: no reliable Windows machine exists at this time.
+**Status.** NOT STARTED, W2 measured 2026-09-30. Split out of R23 on 2026-08-19.
 
-First step is the probe's Windows leg (`webauth-spike/native/windows`, questions W1 to W3). W2 is decisive: whether a `KeyCredentialManager` key signs the same challenge byte-identically across invocations and across a reboot. Deterministic means a native gate can be seeded from the signature exactly as the browser extension's output seeds one. Not deterministic puts native Windows with the unsupported surfaces, which chapter 14 and the custody reason already name pending this measurement (R23 does that). W1 (`UserConsentVerifier`) is recorded as insufficient by construction: a consent check our own code performs is worth nothing against an attacker holding the files, and it is noted only so nobody later mistakes it for protection.
+**W2 is deterministic.** On a lent Windows 11 laptop with Windows Hello, a `KeyCredentialManager` key signed the same challenge to the same 256 bytes six times, twice in each of two runs and twice after a reboot. So a native gate exists: a wrapping key derived from one signature seals the secrets in the stock Windows credential store, the way the browser's extension output seeds one. W1 returned `verified=true` and stays worth nothing as a gate. The build waits on `connetto-client` building on Windows (vendored OpenSSL) and on the testcontainers watchdog compiling there.
+
+The probe's Windows leg (`webauth-spike/native/windows`, questions W1 to W3). W2 is decisive: whether a `KeyCredentialManager` key signs the same challenge byte-identically across invocations and across a reboot. Deterministic means a native gate can be seeded from the signature exactly as the browser extension's output seeds one. Not deterministic puts native Windows with the unsupported surfaces, which chapter 14 and the custody reason already name pending this measurement (R23 does that). W1 (`UserConsentVerifier`) is recorded as insufficient by construction: a consent check our own code performs is worth nothing against an attacker holding the files, and it is noted only so nobody later mistakes it for protection.
 
 ---
 

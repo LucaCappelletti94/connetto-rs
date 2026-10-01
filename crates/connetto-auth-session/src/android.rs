@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use manganis::android::with_activity;
 use manganis::jni::JNIEnv;
-use manganis::jni::objects::{JClass, JObject, JString, JValue};
+use manganis::jni::objects::{GlobalRef, JClass, JObject, JString, JValue};
 use tokio::time::{Instant, sleep};
 
 use crate::AuthSessionError;
@@ -18,7 +18,16 @@ extern "Kotlin" {
 }
 
 const PLUGIN_CLASS: &str = "dev.connetto.authsession.AuthSessionPlugin";
+const UNLOCK_CLASS: &str = "dev.connetto.authsession.UnlockPromptPlugin";
 const POLL: Duration = Duration::from_millis(250);
+
+/// The prompt's outcome codes, `UnlockPromptPlugin`'s constants.
+const PENDING: i32 = 0;
+const APPROVED: i32 = 1;
+const CANCELED: i32 = 3;
+/// A prompt the system cancels this soon after showing it, as it does to an
+/// app launched while the phone settles, is shown again once.
+const EARLY_CANCEL: Duration = Duration::from_secs(1);
 
 pub(crate) async fn authorize(url: &str, timeout: Duration) -> Result<String, AuthSessionError> {
     let plugin = construct()?;
@@ -49,12 +58,65 @@ pub(crate) fn delivered() -> Result<Option<String>, AuthSessionError> {
     jni_call(|env, _| take_redirect(env, plugin.as_obj()))
 }
 
+pub(crate) fn device_secure() -> Result<bool, AuthSessionError> {
+    let plugin = construct_class(UNLOCK_CLASS)?;
+    jni_call(|env, _| {
+        env.call_method(plugin.as_obj(), "deviceSecure", "()Z", &[])?
+            .z()
+    })
+}
+
+pub(crate) fn approve_unlock(
+    cipher: &JObject<'_>,
+    title: &str,
+    timeout: Duration,
+) -> Result<bool, AuthSessionError> {
+    let plugin = construct_class(UNLOCK_CLASS)?;
+    let mut retried = false;
+    loop {
+        let shown = std::time::Instant::now();
+        jni_call(|env, _| {
+            let title = env.new_string(title)?;
+            env.call_method(
+                plugin.as_obj(),
+                "begin",
+                "(Ljavax/crypto/Cipher;Ljava/lang/String;)V",
+                &[JValue::Object(cipher), JValue::Object(&title)],
+            )?;
+            Ok(())
+        })?;
+        let outcome = loop {
+            let outcome = jni_call(|env, _| {
+                env.call_method(plugin.as_obj(), "takeOutcome", "()I", &[])?
+                    .i()
+            })?;
+            if outcome != PENDING {
+                break outcome;
+            }
+            if shown.elapsed() >= timeout {
+                return Err(AuthSessionError::TimedOut(timeout));
+            }
+            std::thread::sleep(POLL);
+        };
+        if outcome == CANCELED && !retried && shown.elapsed() < EARLY_CANCEL {
+            retried = true;
+            continue;
+        }
+        return Ok(outcome == APPROVED);
+    }
+}
+
 fn construct() -> Result<AuthSessionPlugin, AuthSessionError> {
+    construct_class(PLUGIN_CLASS).map(AuthSessionPlugin::from_global_ref)
+}
+
+/// An instance of the bundled class `name`, built on the Activity.
+fn construct_class(name: &str) -> Result<GlobalRef, AuthSessionError> {
     jni_call(|env, activity| {
         let loader = env
             .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
             .l()?;
-        let name = env.new_string(PLUGIN_CLASS)?;
+        let name = env.new_string(name)?;
         let class = env
             .call_method(
                 &loader,
@@ -68,9 +130,7 @@ fn construct() -> Result<AuthSessionPlugin, AuthSessionError> {
             "(Landroid/app/Activity;)V",
             &[JValue::Object(activity)],
         )?;
-        Ok(AuthSessionPlugin::from_global_ref(
-            env.new_global_ref(instance)?,
-        ))
+        env.new_global_ref(instance)
     })
 }
 

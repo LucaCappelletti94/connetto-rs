@@ -72,8 +72,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "android-native-keyring-store"
 version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48c6349ddff23194f8fdce2ea8849380f5a4868c1648965b70e801e104cba9b3"
+source = "git+https://github.com/LucaCappelletti94/android-native-keyring-store?rev=bcb27e8f6def5ed78dc75103562df63cad78f017#bcb27e8f6def5ed78dc75103562df63cad78f017"
 dependencies = [
  "base64 0.22.1",
  "jni 0.21.1",
@@ -105,8 +104,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 [[package]]
 name = "apple-native-keyring-store"
 version = "1.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b350bfd03649e07aa05c0a81b3e15934374e585c98204a57e20b9d49f49bb9a"
+source = "git+https://github.com/LucaCappelletti94/apple-native-keyring-store?rev=0cbad3f4f8a67491455a838e842476c9b5be07a4#0cbad3f4f8a67491455a838e842476c9b5be07a4"
 dependencies = [
  "keyring-core",
  "log",
@@ -1012,6 +1010,7 @@ dependencies = [
  "diesel-sqlite-session",
  "futures-util",
  "getrandom 0.3.4",
+ "jni 0.21.1",
  "js-sys",
  "keyring-core",
  "libsqlite3-sys",
@@ -1020,6 +1019,7 @@ dependencies = [
  "open",
  "reqwest 0.12.28",
  "rustix",
+ "security-framework",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2274,7 +2274,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -2570,7 +2570,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -4848,7 +4848,7 @@ dependencies = [
  "openssl-sys",
  "schannel",
  "security-framework",
- "security-framework-sys",
+ "security-framework-sys 2.17.0",
  "tempfile",
 ]
 
@@ -5172,6 +5172,16 @@ dependencies = [
  "block2",
  "objc2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-local-authentication"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
+dependencies = [
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]
@@ -6341,7 +6351,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -6986,7 +6996,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7043,9 +7053,9 @@ dependencies = [
  "rustls-platform-verifier-android",
  "rustls-webpki",
  "security-framework",
- "security-framework-sys",
+ "security-framework-sys 2.17.0",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -7148,15 +7158,17 @@ dependencies = [
 
 [[package]]
 name = "security-framework"
-version = "3.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
+version = "3.7.1"
+source = "git+https://github.com/LucaCappelletti94/rust-security-framework?rev=6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9#6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9"
 dependencies = [
  "bitflags 2.13.2",
  "core-foundation",
  "core-foundation-sys",
  "libc",
- "security-framework-sys",
+ "objc2",
+ "objc2-foundation",
+ "objc2-local-authentication",
+ "security-framework-sys 2.17.1",
 ]
 
 [[package]]
@@ -7164,6 +7176,15 @@ name = "security-framework-sys"
 version = "2.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
+dependencies = [
+ "core-foundation-sys",
+ "libc",
+]
+
+[[package]]
+name = "security-framework-sys"
+version = "2.17.1"
+source = "git+https://github.com/LucaCappelletti94/rust-security-framework?rev=6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9#6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9"
 dependencies = [
  "core-foundation-sys",
  "libc",
@@ -7617,7 +7638,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -7785,7 +7806,7 @@ dependencies = [
  "cfg-if",
  "libc",
  "psm",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -8066,10 +8087,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8708,7 +8729,7 @@ checksum = "f2f6fb2847f6742cd76af783a2a2c49e9375d0a111c7bef6f71cd9e738c72d6e"
 dependencies = [
  "memoffset",
  "tempfile",
- "windows-sys 0.61.2",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
@@ -9210,7 +9231,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

@@ -128,6 +128,16 @@ anyhow = "1"
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
 sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
 sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+# R51, until both are released: the keychain store's shared authentication
+# (apple-native-keyring-store #26) on security-framework's typed
+# authentication context (#263 and #264, on upstream main). Pinned by rev,
+# since this is key custody code.
+apple-native-keyring-store = { git = "https://github.com/LucaCappelletti94/apple-native-keyring-store", rev = "0cbad3f4f8a67491455a838e842476c9b5be07a4" }
+security-framework = { git = "https://github.com/LucaCappelletti94/rust-security-framework", rev = "6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9" }
+# R52, until released: user authentication on named stores (#28), a store the
+# app unlocks once per approval, the Android 13 expiry refusal, and a lost
+# Keystore key reported instead of replaced (#27), integrated on upstream main.
+android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "bcb27e8f6def5ed78dc75103562df63cad78f017" }
 
 # diesel-sqlite-session takes diesel from git, which [patch.crates-io] does not reach.
 [patch."https://github.com/diesel-rs/diesel"]

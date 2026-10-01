@@ -35,7 +35,7 @@ dioxus-desktop = { version = "0.7.9", optional = true }
 desktop = ["dep:dioxus-desktop"]
 
 [dev-dependencies]
-# The hook integration test drives a real native client (ConnettoClient::start
+# The hook integration test drives a real native client (a builder-built client
 # over a WebSocket), so the test build needs the native transport. A dev
 # dependency keeps it out of the normal graph, so wasm consumers of the adapter
 # never inherit the native runtime.

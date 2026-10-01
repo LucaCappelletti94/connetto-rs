@@ -18,10 +18,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use connetto_core::Custody;
 use connetto_core::ReplicaKey;
 use connetto_core::percent::{percent_decode, percent_encode};
 use connetto_core::traits::{RefreshFuture, RefreshTokenStore, ReplicaKeyStore};
-use connetto_core::{Custody, NoGate};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
@@ -169,10 +169,10 @@ impl RefreshTokenStore for KeyringStore {
         Box::pin(self.index())
     }
 
-    /// No user-verified gate reaches the stored items until R51 and R52
-    /// land one, so nothing can be offered yet (R23, decision 5).
+    /// `Verified` where the platform keyring holds the secrets behind its user
+    /// verification (Apple), otherwise stored with none, for the stated reason.
     fn protection(&self) -> Custody {
-        Custody::Unverified(NoGate::Unsupported)
+        self.keyring.protection()
     }
 }
 
@@ -239,9 +239,11 @@ impl ReplicaKeyStore for KeyringKeyStore {
     type Error = ClientError;
 
     async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
-        self.keyring
-            .read(name)
-            .await?
+        let stored = self.keyring.read(name).await?;
+        if self.keyring.take_lost() {
+            return Err(ClientError::ReplicaKeyLost);
+        }
+        stored
             // The keyring hands back an owned hex string, which is key
             // material until it is wiped, hence the `Zeroizing` wrapper.
             .map(|hex| {
@@ -264,10 +266,10 @@ impl ReplicaKeyStore for KeyringKeyStore {
         self.keyring.clear(name).await
     }
 
-    /// No user-verified gate reaches the stored items until R51 and R52
-    /// land one, so nothing can be offered yet (R23, decision 5).
+    /// `Verified` where the platform keyring holds the secrets behind its user
+    /// verification (Apple), otherwise stored with none, for the stated reason.
     fn protection(&self) -> Custody {
-        Custody::Unverified(NoGate::Unsupported)
+        self.keyring.protection()
     }
 }
 
@@ -841,10 +843,14 @@ fn code_and_state(query: &str, what: &str) -> Result<(String, String), ClientErr
 mod tests {
     use connetto_core::ReplicaKey;
 
-    use super::{KeyringStore, indexed_with, indexed_without};
+    #[cfg(target_os = "linux")]
+    use super::KeyringStore;
+    use super::{indexed_with, indexed_without};
     use crate::MemoryKeyStore;
     use crate::replica::provision_replica_key;
-    use connetto_core::traits::{RefreshTokenStore as _, ReplicaKeyStore as _};
+    #[cfg(target_os = "linux")]
+    use connetto_core::traits::RefreshTokenStore as _;
+    use connetto_core::traits::ReplicaKeyStore as _;
 
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_owned()).collect()

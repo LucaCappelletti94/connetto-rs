@@ -2,3 +2,9 @@
 # The Android applicationId and the iOS bundle identifier. It is also the
 # scheme of the login redirect a phone receives, so it stays lowercase.
 identifier = "dev.connetto.dioxusdemo"
+
+# The gate on the stored secrets (R51, R52). iOS offers Face ID only with the
+# usage description this writes, and Android needs `USE_BIOMETRIC` for the
+# unlock prompt.
+[permissions]
+biometrics = { description = "Unlock your synced data" }

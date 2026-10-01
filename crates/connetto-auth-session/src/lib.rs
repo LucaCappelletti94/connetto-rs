@@ -12,6 +12,10 @@
 //! receives. On iOS it is an ephemeral `ASWebAuthenticationSession`, which
 //! catches any URI whose scheme is the lowercased bundle identifier. Other
 //! platforms answer [`AuthSessionError::Unsupported`].
+//!
+//! On Android it also hosts the prompt a Keystore-gated store unlocks through
+//! ([`device_secure`], [`approve_unlock`]), since the store is pure JNI and
+//! cannot receive the prompt's callback itself.
 
 use std::time::Duration;
 
@@ -77,4 +81,33 @@ pub fn delivered() -> Result<Option<String>, AuthSessionError> {
     return android::delivered();
     #[cfg(not(target_os = "android"))]
     Ok(None)
+}
+
+/// Whether the device has a secure lock screen, which a key held behind the
+/// user's verification needs.
+///
+/// # Errors
+///
+/// [`AuthSessionError::Bridge`] when the platform bridge cannot be reached.
+#[cfg(target_os = "android")]
+pub fn device_secure() -> Result<bool, AuthSessionError> {
+    android::device_secure()
+}
+
+/// Show the biometric or device-credential prompt titled `title` over
+/// `cipher`, a `javax.crypto.Cipher` a Keystore-gated store handed out, and
+/// answer whether the user approved it. Blocks the calling thread until the
+/// prompt closes, at most `timeout`, so it runs off the app's event loop.
+///
+/// # Errors
+///
+/// [`AuthSessionError::Bridge`] when the prompt cannot be shown, and
+/// [`AuthSessionError::TimedOut`] when nobody answers within the bound.
+#[cfg(target_os = "android")]
+pub fn approve_unlock(
+    cipher: &manganis::jni::objects::JObject<'_>,
+    title: &str,
+    timeout: Duration,
+) -> Result<bool, AuthSessionError> {
+    android::approve_unlock(cipher, title, timeout)
 }

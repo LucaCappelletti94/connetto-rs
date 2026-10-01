@@ -8,8 +8,15 @@
 //! ```text
 //! cargo build -p connetto-test-harness --bin connetto-android-proof
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
-//!   target/debug/connetto-android-proof [--serial SERIAL] [--apk PATH]
+//!   target/debug/connetto-android-proof [--serial SERIAL] [--apk PATH] [--unlock-pin PIN]
 //! ```
+//!
+//! The demo keeps its secrets behind the Keystore gate (R52), so each launch
+//! shows the platform's unlock prompt once, and a return after more than the
+//! demo's re-check grace shows it again. With `--unlock-pin` the driver types
+//! that PIN into the prompt, which suits an emulator whose throwaway PIN the
+//! run may know. Without it a person approves each prompt on the phone, by
+//! fingerprint or PIN, while the driver waits and says so.
 //!
 //! Without `--apk` it builds the APK with `dx` for the device's ABI. The demo
 //! and the device's browser are read and driven over the `DevTools` protocol,
@@ -54,7 +61,11 @@ const STAY_ON: &str = "stay_on_while_plugged_in";
 #[tokio::main]
 async fn main() -> Result<()> {
     let stack = Stack::from_env()?;
-    let (serial, apk) = cli_arguments()?;
+    let Arguments {
+        serial,
+        apk,
+        unlock_pin,
+    } = cli_arguments()?;
     let device = Device::pick(serial).await?;
     let evidence = repo_path(&["target", "android-proof"])?.join(format!(
         "{}-{}",
@@ -72,7 +83,10 @@ async fn main() -> Result<()> {
     // The proof keeps the screen on, and a phone left on the cable must not stay lit after it.
     let stay_on = device.stay_on().await?;
     device.set_browser_role_holder(BROWSER).await?;
-    let outcome = prove(&device, apk, &stack, &evidence).await;
+    let unlock = Unlock {
+        pin: unlock_pin.as_deref(),
+    };
+    let outcome = prove(&device, apk, &stack, &evidence, unlock).await;
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
     tokio::fs::write(evidence.join("logcat.txt"), log)
         .await
@@ -148,17 +162,19 @@ async fn prove(
     apk: Option<PathBuf>,
     stack: &Stack,
     evidence: &Path,
+    unlock: Unlock<'_>,
 ) -> Result<()> {
-    device
-        .adb(&["shell", "svc", "power", "stayon", "usb"])
-        .await?;
-    device
-        .adb(&["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
-        .await?;
     let apk = match apk {
         Some(apk) => apk,
         None => build_apk(&device.rust_target().await?).await?,
     };
+    // A paused charge ends a `usb` stay-on, and a sleeping screen locks the phone.
+    device
+        .adb(&["shell", "svc", "power", "stayon", "true"])
+        .await?;
+    device
+        .adb(&["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
+        .await?;
     step("install");
     device
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
@@ -176,9 +192,15 @@ async fn prove(
     device.screenshot(evidence, "login-page").await?;
     submit_login(&mut tab).await?;
     drop(tab);
+    unlock.approve(device, evidence, "launch-unlock").await?;
     let mut app = device.app().await?;
     app.wait_for_text("status: connected", Duration::from_secs(90))
         .await?;
+    app.wait_for_text(
+        "custody: released only after user verification",
+        Duration::from_secs(10),
+    )
+    .await?;
     device.screenshot(evidence, "signed-in").await?;
 
     step("sync a backend write");
@@ -222,8 +244,10 @@ async fn prove(
     .await?;
     wait_for_count(&stack.pg_url, offline + 1).await?;
     device.screenshot(evidence, "uploaded").await?;
+    recheck_after_time_away(device, evidence, unlock).await?;
+    let mut app = device.app().await?;
     sign_out(device, &mut app, evidence).await?;
-    sign_in_across_a_killed_process(device, &stack.issuer, evidence).await?;
+    sign_in_across_a_killed_process(device, &stack.issuer, evidence, unlock).await?;
     step("proof complete");
     Ok(())
 }
@@ -253,6 +277,7 @@ async fn sign_in_across_a_killed_process(
     device: &Device,
     issuer: &str,
     evidence: &Path,
+    unlock: Unlock<'_>,
 ) -> Result<()> {
     step("sign in across a killed process");
     let mut tab = device.login_tab(issuer).await?;
@@ -274,6 +299,7 @@ async fn sign_in_across_a_killed_process(
     }
     submit_login(&mut tab).await?;
     drop(tab);
+    unlock.approve(device, evidence, "restart-unlock").await?;
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut app = loop {
         match device.app().await {
@@ -287,6 +313,69 @@ async fn sign_in_across_a_killed_process(
     app.wait_for_text("status: connected", Duration::from_secs(90))
         .await?;
     device.screenshot(evidence, "resumed").await
+}
+
+/// The demo's re-check grace, `RECHECK_AFTER` in its source.
+const RECHECK_AFTER: Duration = Duration::from_secs(30);
+
+/// Leave the app for longer than its re-check grace and come back: the gate
+/// locks, asks once, and the approval unlocks it with the session kept.
+async fn recheck_after_time_away(
+    device: &Device,
+    evidence: &Path,
+    unlock: Unlock<'_>,
+) -> Result<()> {
+    step("re-check after time away");
+    device
+        .adb(&["shell", "input", "keyevent", "KEYCODE_HOME"])
+        .await?;
+    sleep(RECHECK_AFTER + Duration::from_secs(5)).await;
+    device.launch().await?;
+    unlock.approve(device, evidence, "recheck-unlock").await?;
+    let mut app = device.app().await?;
+    app.wait_for_text("gate: open", Duration::from_secs(30))
+        .await?;
+    device.screenshot(evidence, "unlocked").await
+}
+
+/// Who answers the platform's unlock prompt.
+#[derive(Clone, Copy)]
+struct Unlock<'a> {
+    /// The PIN the driver types, for an emulator whose PIN the run knows.
+    pin: Option<&'a str>,
+}
+
+impl Unlock<'_> {
+    /// Wait for the unlock prompt, answer it, and wait for it to close.
+    async fn approve(self, device: &Device, evidence: &Path, name: &str) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !device.unlock_prompt_shown().await? {
+            if Instant::now() >= deadline {
+                bail!("the unlock prompt never showed");
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        device.screenshot(evidence, name).await?;
+        match self.pin {
+            Some(pin) => {
+                // The credential pad needs a moment to take focus.
+                sleep(Duration::from_secs(1)).await;
+                device.adb(&["shell", "input", "text", pin]).await?;
+                device
+                    .adb(&["shell", "input", "keyevent", "KEYCODE_ENTER"])
+                    .await?;
+            }
+            None => eprintln!("approve the unlock prompt on the phone"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while device.unlock_prompt_shown().await? {
+            if Instant::now() >= deadline {
+                bail!("the unlock prompt was never answered");
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        Ok(())
+    }
 }
 
 /// Type the dev user into the identity provider's form and submit it. Trusted
@@ -318,19 +407,27 @@ fn step(name: &str) {
 }
 
 /// `--serial` and `--apk`, both optional.
-fn cli_arguments() -> Result<(Option<String>, Option<PathBuf>)> {
-    let mut serial = None;
-    let mut apk = None;
+/// What the command line names.
+#[derive(Default)]
+struct Arguments {
+    serial: Option<String>,
+    apk: Option<PathBuf>,
+    unlock_pin: Option<String>,
+}
+
+fn cli_arguments() -> Result<Arguments> {
+    let mut arguments = Arguments::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let value = args.next().ok_or_else(|| anyhow!("{arg} needs a value"))?;
         match arg.as_str() {
-            "--serial" => serial = Some(value),
-            "--apk" => apk = Some(PathBuf::from(value)),
+            "--serial" => arguments.serial = Some(value),
+            "--apk" => arguments.apk = Some(PathBuf::from(value)),
+            "--unlock-pin" => arguments.unlock_pin = Some(value),
             other => bail!("unknown argument {other}"),
         }
     }
-    Ok((serial, apk))
+    Ok(arguments)
 }
 
 /// Comma-separated `device:host` port pairs.
@@ -590,6 +687,22 @@ impl Device {
         ])
         .await
         .map(drop)
+    }
+
+    /// Whether the platform's biometric or credential prompt holds the
+    /// screen, which System UI draws in a window of its own.
+    async fn unlock_prompt_shown(&self) -> Result<bool> {
+        let windows = self.adb(&["shell", "dumpsys", "window", "windows"]).await?;
+        // AOSP's System UI titles the window `BiometricPrompt`, and Samsung
+        // draws it from its own biometrics package. Samsung's keyguard toast
+        // window stays listed at all times, so a looser match never clears.
+        Ok(windows
+            .lines()
+            .filter(|line| line.contains("Window{"))
+            .any(|line| {
+                line.contains("BiometricPrompt")
+                    || line.contains("com.samsung.android.biometrics.app.setting")
+            }))
     }
 
     async fn screenshot(&self, dir: &Path, name: &str) -> Result<()> {

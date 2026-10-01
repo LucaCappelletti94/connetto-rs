@@ -116,6 +116,8 @@ pub use builder::{
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
+#[cfg(all(feature = "native-auth", target_os = "android"))]
+pub use keyring::KeystorePrompt;
 #[cfg(feature = "native-auth")]
 pub use keyring::SecretStoreError;
 #[cfg(all(feature = "native-auth", target_os = "linux"))]
@@ -239,6 +241,12 @@ pub enum ClientError {
     /// or with an explicit data wipe.
     #[error("no replica key was provisioned or cached, so the replica cannot be opened encrypted")]
     ReplicaKeyMissing,
+    /// The platform destroyed every key it held behind the user's
+    /// verification, as Android does when the screen lock is removed. A
+    /// durable build answers it by wiping the replica and starting a fresh one
+    /// the server resyncs, since nothing can open the old one again.
+    #[error("the platform lost the replica key, so the replica can never be opened again")]
+    ReplicaKeyLost,
     /// The replica's schema and the policy-table map disagree about which
     /// tables the row-level-security translation split.
     ///

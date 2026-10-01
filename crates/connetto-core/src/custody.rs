@@ -16,9 +16,10 @@
 /// there is worse than reporting nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Custody {
-    /// Derived at unlock from a credential the user verified themselves with,
-    /// and held only in memory. Nothing stored on the device opens the replica,
-    /// so a copy of the stored data alone is inert.
+    /// Released only after the user verified themselves: derived at unlock
+    /// from a passkey in the browser, or held by the platform's keychain or
+    /// Keystore behind a biometric or device-credential check on a native
+    /// device. A copy of the stored data alone opens nothing.
     Verified,
     /// Held on the device with no user verification, for the stated reason. This
     /// defends a copy of the storage that leaves the device and it crypto-shreds
@@ -65,7 +66,7 @@ impl Custody {
 impl core::fmt::Display for Custody {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match *self {
-            Self::Verified => f.write_str("derived from a user-verified credential"),
+            Self::Verified => f.write_str("released only after user verification"),
             Self::Unverified(NoGate::Unsupported) => {
                 f.write_str("stored without user verification, unsupported on this platform")
             }
