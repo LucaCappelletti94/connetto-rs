@@ -22,7 +22,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans |
 | Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
 | Clients | Native Diesel connection, browser client on a worker over OPFS, Dioxus and Yew hooks |
-| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock, a device-private tier, retention, several accounts |
+| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier, retention, several accounts |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
@@ -30,11 +30,10 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 98 phases, 75 done and 23 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 99 phases, 78 done and 21 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
-| Native unlock gates | R51 to R53 |
 | One page codec, synced tables without local references | R21, R92 |
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline | R70, R72 |
@@ -42,6 +41,7 @@ The plan in `plans/master-implementation-plan.md` tracks 98 phases, 75 done and 
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
 | One client builder per platform, share keys on a running client, one server builder | R94 to R96 |
+| The desktop login tab | R97 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
 

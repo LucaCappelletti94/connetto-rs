@@ -146,7 +146,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R88~~ | The mobile build of a demo, Android on this workstation, iOS through the Mac |
 | done | ~~R51~~ | Native Apple gate, two upstream keychain changes patched in until released |
 | done | ~~R52~~ | Native Android gate, one upstream keystore change patched in until released |
-| built | R53 | Windows gate through a Windows Hello PRF store, proven on a lent laptop and awaiting commit |
+| done | ~~R53~~ | Windows gate through a Windows Hello PRF store, one upstream store patched in until released |
 | blocked | R21 | One page codec. Blocked on the maintainers agreeing to the shared cipher source crates in `rusqlite/rusqlite` discussion #1908, without which it would run on permanent forks |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
@@ -170,7 +170,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52, R74 and R95 wait on it |
 | blocked | R95 | Share keys added and removed on a running client. Blocked on R94 |
 | any | R96 | One server builder for programs that embed the server. Minted undesigned, so it starts with its design |
-| any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, three design points open |
+| any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
@@ -220,8 +220,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R94 one client builder per platform | STARTED 2026-09-28, minted and designed 2026-09-25 while planning R51, open points settled 2026-09-28, every construction site on the builders 2026-09-29, proof 1 passed 2026-09-29 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | R94. One decision and one open question in the section | no |
 | R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, undesigned | nothing, its design comes first | no |
-| R97 the desktop login tab | NOT STARTED, minted 2026-10-02 from the R53 Windows proof | nothing, its three open design points come first | no |
-| R53 Windows gate | **BUILT** (2026-10-02), not yet committed | nothing. `HelloStore` is taken from the upstream branch at `01d7620` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
+| R97 the desktop login tab | NOT STARTED, minted and designed 2026-10-02 from the R53 Windows proof | nothing | no |
+| R53 Windows gate | **DONE** (2026-10-02) | nothing. `HelloStore` is taken from the upstream branch at `01d7620` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
 | R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
@@ -407,6 +407,8 @@ graph TD
   U9[upstream android-native-keyring-store:<br/>one approval opens the store until locked] -.->|patched until released| R52
   R94 --> R95[R95 share keys on a running client]
   R94 --> R74
+  U10[upstream windows-native-keyring-store:<br/>a Windows Hello PRF named store] -.->|patched until released| R53
+  R53 --> R97[R97 the desktop login tab]
   R96[R96 one server builder]
   R26 --> R56[R56 local data import]
   R54[R54 every demo carries every feature] --> R57[R57 demo gaps from the export audit]
@@ -2792,7 +2794,7 @@ On the physical device, per the probe's A4 rule. **Passed on the Galaxy M52 on 2
 
 ## R53: Windows gate for stored secrets
 
-**Status.** Built and proven on 2026-10-02, not yet committed. Split out of R23 on 2026-08-19.
+**Status.** DONE (2026-10-02). Split out of R23 on 2026-08-19.
 
 **Mechanism.** `windows-native-keyring-store`'s `HelloStore`, built upstream for this phase and pinned to `01d7620665ed0e118cd4a1a6e74a14be2eed07ad` until a release carries it, seals each secret with AES-256-GCM under a key derived from a Windows Hello passkey's PRF output through native WebAuthn API 9, with the Hello authenticator selected by enumeration. One approval enrolls, one approval unlocks each later launch, and entry deletion and an explicit `discard` need none. `UserConsentVerifier` stays unused, since a consent check our own code performs is worth nothing against an attacker holding the files.
 
@@ -2809,7 +2811,7 @@ On the physical device, per the probe's A4 rule. **Passed on the Galaxy M52 on 2
 
 **Status.** NOT STARTED, minted 2026-10-02 from the R53 Windows proof.
 
-A desktop sign-in leaves its browser tab open on the loopback page, and the app behind it. A page can close itself only if script opened it or its history holds one entry, and the identity provider's form adds history. Decided with the maintainer on 2026-10-02: macOS signs in through `ASWebAuthenticationSession`, which closes itself as it does on iOS, and Windows and Linux keep the system browser and bring the app's window back to the front after the login. Open before building: how the macOS session is built and anchored for a `dx` bundle, which layer brings the window forward and whether Windows lets a background process do it, and what the loopback page says. The working record is `plans/design-r97-desktop-login-tab.md`.
+A desktop sign-in leaves its browser tab open on the loopback page, and the app behind it. A page can close itself only if script opened it or its history holds one entry, and the identity provider's form adds history. Decided with the maintainer on 2026-10-02: macOS signs in through `ASWebAuthenticationSession`, which closes itself as it does on iOS, and Windows and Linux keep the system browser and bring the app's window back to the front after the login. Settled the same day: `connetto-auth-session` extends its Swift plugin to macOS and the demo's macOS sign-in uses the claimed redirect iOS uses, the Dioxus app calls its window's `set_focus` once setup completes with no new connetto API, and the loopback page calls `window.close()` and otherwise tells the user to return to the app. To measure while building: a `dx` macOS bundle embedding the plugin, and the refocus on Windows and Linux. The working record is `plans/design-r97-desktop-login-tab.md`.
 ---
 
 ## R26: local data export
