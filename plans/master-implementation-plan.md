@@ -5095,7 +5095,7 @@ X6 is closed with a per-timer rule recorded, and the code matches the rule every
 
 ## R74: device identity, enrolment, and certificates
 
-**Status.** NOT STARTED. First of the seven peer-sync phases R25's design derived on 2026-08-22 at the maintainer's instruction. R25's section and chapter 19 are normative wherever these seven are silent.
+**Status.** NOT STARTED, designed in detail with the maintainer on 2026-10-01 and 2026-10-02 (the decisions and design below). First of the seven peer-sync phases R25's design derived on 2026-08-22 at the maintainer's instruction. R25's section and chapter 19 are normative wherever these seven are silent.
 
 **Blocked on** R94 (decided with the maintainer 2026-09-28). This phase adds a third secret beside the two stores R94 decision 15 injects by setter, an application-requested certificate lifetime, and an enrolment run after sign-in inside the connection sequence R94 step 3 moves into `connect()`. R94 decisions 11 and 15 make `ClientConfig` and `ConnettoConnection::connect` internal, so the device key's store, its protection report under R94 decision 13, the lifetime setting and the enrolment are built once, on the builders. R96 does not gate it, because the server half (the CA keypair checked at startup and the lifetime ceiling) is server settings types with R37 setters, which R96's builder gathers.
 
@@ -5103,21 +5103,104 @@ Two edges weighed 2026-09-12 with the maintainer and left unblocking. R71: on Li
 
 ### Purpose
 
-Nothing today lets two devices authenticate each other offline: clients hold only server-signed credentials. This phase gives a device a durable identity the server vouches for: an Ed25519 keypair whose private key lives beside R41's stores on the same custody backend behind the R23 gate, as its own record type rather than inside `ReplicaKeyStore`, and an X.509 certificate the deployment's CA signs binding the public key to the account.
+Nothing today lets two devices authenticate each other offline, since clients hold only server-signed credentials. This phase gives a native device a durable identity the server vouches for, a P-256 key created inside the device's security chip and an X.509 certificate the deployment's issuer signs binding that key to the account, plus the signed lost-device notices peers carry to one another.
+
+### Decisions, taken with the maintainer on 2026-10-01 and 2026-10-02
+
+Each was asked with primary references for every option, and the rejected options are recorded beside the chosen one.
+
+1. **Lost-device notices travel between peers, and expiry bounds the rest.** The deployment signs notices that devices hand to one another when they meet, so a peer rejects a reported device once any notice reaches it. A group no notice reaches trusts the certificate until it expires. Expiry alone was rejected, since it leaves a reported device trusted by peers that already know of the report.
+2. **The root key stays offline, and a replaceable issuer lives on the server.** The online issuer signs certificates and notices, and the offline root signs issuers. One online signing key was rejected, since its compromise compromises the trust anchor of every offline peer.
+3. **The application is built with the expected deployment root.** A device checks the chain it receives against the root or roots it was built with, and never adopts a root it is handed (RFC 7030 section 4.1.1 contrasts the two). Trusting the root received at first enrolment was rejected, since a compromised first connection can replace it.
+4. **The server ceiling defaults to 30 days, a certificate lasts 24 hours unless the application asks otherwise, and a connected client can ask again.** The ceiling is server configuration. The application requests a lifetime per case at connect and can request a new certificate with another lifetime while connected. A 7 or 90 day default ceiling was rejected, and so was requiring the application to state a lifetime before enrolling.
+5. **Validity allows five minutes of clock difference at both ends.** An exact expiry with a backdated start was rejected.
+6. **The device key lives in the security chip.** It is a P-256 key the Secure Enclave, Android Keystore or Windows TPM creates and never releases, and a locked software P-256 key in R71's stores on Linux. P-256 is the one curve all three chips hold. The key signs each pending-queue entry directly, one signature per pushed changeset. A software Ed25519 key was rejected, since malware or a copied keychain can clone it, and so was a short-lived software key the chip certifies, which brings back copyable key material.
+7. **Chip attestation is verified where a device offers it and recorded in its certificate.** Each deployment decides whether peers or the server refuse unproven devices. Skipping attestation was rejected, since a modified client could then enrol a copyable key unseen.
+8. **The lost-device list shows a typed descriptor the application defines.** connetto keeps only what it needs to work, and the application decides what makes a device recognisable, a location included. A fixed set of fields connetto chooses was rejected, and so was server-derived location from network addresses.
+
+### Design
+
+**Certificate profile.** Device certificates follow the SPIFFE X509-SVID profile. The leaf has `cA` false, critical key usage `digitalSignature` only, extended key usage `serverAuth` and `clientAuth`, an empty subject, and exactly one critical URI subject alternative name, `connetto://<deployment-id>/account/<user-id>/device/<key-id>`, where `<key-id>` is the SHA-256 of the public key. Attestation evidence is a non-critical extension under an OID minted from a UUID in the `2.25` arc, holding `chip-proven` with the platform or `unproven`. `notAfter` is the issue time plus the granted lifetime, and the verifier applies the five-minute tolerance. Issuers are CA certificates the root signs, with `pathLenConstraint` 0 and key usage `keyCertSign` and `cRLSign`.
+
+**Enrolment, renewal and reissue on the wire.** Request and answer pairs join `ControlMessage`, modelled on `ContentTicketRequest` and `ContentTicketGrant`, each request carrying a `request_id` its answer quotes.
+
+- `EnrolChallengeRequest` is answered by `EnrolChallenge { nonce, expires_at }`, a single-use 32-byte nonce bound to the session and valid for 60 seconds.
+- `EnrolRequest { csr_der, lifetime_secs, attestation, descriptor }` is answered by `EnrolGrant { chain_der, revocation_lists_der }` or `EnrolRefused { reason }`, the reason being `OverCeiling { ceiling_secs }`, `Revoked`, `ChallengeExpired`, `InvalidRequest`, `AttestationRequired` or `IssuerUnavailable`.
+- `DevicesRequest` is answered by `DevicesList`, the caller's own enrolments, and `RevokeDeviceRequest { key_id }` by `DeviceRevokedAck` or `EnrolRefused`.
+- `RevocationUpdate { lists_der }` is pushed after every handshake and whenever a list changes, and `FatalErrorReason::DeviceRevoked` joins `SessionRevoked`.
+
+**Proof of possession.** The request is a PKCS #10 request (RFC 2986) the chip key signs, carrying the server nonce as its `challengePassword` attribute. EST binds proof of possession to the TLS session itself (RFC 7030 section 3.5), and connetto-server speaks plain WebSocket behind a TLS edge (R94 decision 14), so the nonce on the authenticated session plays that role. `rcgen` 0.14 writes requests with attributes and signs through its `SigningKey` trait, which the chip key implements.
+
+**Server.** `DeviceCertConfig` holds the issuer key and chain, the retired issuers still signing lists, a default lifetime of 24 hours and a ceiling of 30 days, with R37 setters in the style of `AuthConfig`. A lifetime over the ceiling is refused and never shortened, as `ShareError::TtlTooLong` refuses a share. The issuer key is provisioned like `CONNETTO_CONTENT_KEY` and checked at startup. The deployment table `connetto_device_enrolments`, which `preflight::require` requires, records per enrolment the account, the key id, every issued serial with its expiry, the attestation result, the auth-store session that last enrolled or renewed it, the enrolment, last-seen and revocation times, and the application's descriptor.
+
+**Client.** `NativeDurable` gains `with_certificate_lifetime(Duration)` and `with_device_descriptor(D)`, on the durable stage because peer features need a durable replica (R94 decision 6). `NativeClient` gains `reissue_certificate(lifetime)`, failing with `Offline`, `OverCeiling { ceiling }`, `Revoked` or `Refused`, plus `device_certificate()`, `devices()` and `revoke_device(key_id)`. Renewal runs on any connection past half-life with the stored lifetime. A renewal refused over a ceiling the operator lowered is repeated at the returned ceiling and emits `ClientEvent::CertificateLifetimeCapped`.
+
+**Lost-device notices are X.509 revocation lists**, one per issuer, built by `rcgen` and enforced by rustls's own verifier (`with_crls`), which checks the whole chain.
+
+- Each list carries the CRL Number, which RFC 5280 defines as increasing per issuer. A device keeps per issuer the verified list with the highest number, ignores a lower one, and ignores and logs an equal number with other content.
+- A complete list names only revoked unexpired certificates, so its size is bounded by the certificates issued within one ceiling.
+- `enforce_revocation_expiration` stays off, since an offline device's lists would otherwise expire and refuse every peer, against decision 1. A certificate from an issuer with no known list is accepted on expiry alone (`allow_unknown_revocation_status`).
+- The server pushes lists online. Peers exchange lists as the first frames inside an established link, verify each against the chain to a built-in root, store a newer one at once, and close any live link the new list revokes.
+- Lists live in the device-private tier, keyed by issuer key identifier.
+
+**Revoking a device.** Reporting a device lost adds every unexpired serial of its key to the next list, publishes it, closes the device's connections with `DeviceRevoked`, and revokes the auth-store sessions its enrolment row records. Revoking the sessions keeps a stolen device that is still signed in from enrolling a fresh key and undoing the report. The account owner reports from any live session, and the deployment operator through `AuthService`. A device that learns its own revocation deletes its key and certificate, stops its peer link and emits `ClientEvent::DeviceRevoked`. R78's courier refusals and R36's ban machinery consult the enrolment table.
+
+**Describing a device.** The descriptor is any type implementing `DeviceDescriptor` (`Serialize`, `DeserializeOwned`, `Send`, `Sync`, `'static`) in `connetto-core`, a tuple or a struct. The client sends it at enrolment and every renewal, in MessagePack of at most 4 KiB. The server stores it in columns of the deployment's own enrolment table named through an enrolment schema trait, as `DbAuthStore<S>` is generic over `ConnettoStoreSchema` (chapter 11). `NativeClient::devices()` returns `DeviceEntry<D>` values, and the application renders the list. `connetto_client::device` offers optional building blocks, namely the system device name where a platform lets an application read it (Android's `Settings.Global.DEVICE_NAME`, the host name on desktops, nothing on iPhone and iPad, where iOS 16 and later answer `"iPhone"` without a special entitlement), the platform and the model. A location is the application's to include as a client-reported field. The descriptor is untrusted input a stolen device can falsify, so it is shown and never consulted by a security decision, and one that fails to decode or exceeds the cap refuses the enrolment as `InvalidRequest`. The same descriptor serves a session list, which meets the same need.
+
+**Issuer rotation and compromise.** Peers verify any chain to a built-in root, so a new issuer needs no change on devices. A retired issuer stays on the server, signing lists for its own certificates, until its last certificate expires. Root rollover ships the new root beside the old one in an application update, as SPIFFE trust bundles carry several roots during rotation, through `with_deployment_roots`. A compromised issuer is revoked by a list the root signs offline, distributed like any other list. The operator tool `connetto-ca` runs the offline ceremonies, creating the root, signing an issuer and signing a root list, and never runs on the server.
+
+**Attestation.** Android sends its key attestation chain, which the server validates against Google's roots and revocation list, taking the first attestation extension only and checking the attested key and challenge. iOS and iPadOS send an App Attest attestation over the SHA-256 of the request. Windows records `unproven`, since Microsoft documents application-level key claims only for virtualisation-protected keys and its CA-side TPM attestation only for RSA keys. Linux and macOS record `unproven`.
+
+### Certificate lifecycle on a native client, every event in every situation
+
+`NoKey` is a device with no key, never enrolled or with its custody record gone. `Fresh` holds a valid certificate before half-life, `Aging` one past half-life, `Expired` one past `notAfter` plus tolerance by the local clock. `ClockOff` is a local clock that puts every certificate held outside its window. A revoked device moves to `NoKey` at once, so revocation appears as an event.
+
+| Event | NoKey | Fresh | Aging | Expired | ClockOff |
+|---|---|---|---|---|---|
+| Connected and signed in | create key, enrol | take lists | renew | renew | renew, keep `ClockOutsideWindow` raised |
+| Connection lost | stay a spectator | keep certificate, peer link continues | same as Fresh | peer link stays refused | peer link stays refused |
+| Half-life crossed | not applicable | becomes Aging, renews if connected | not applicable | not applicable | not applicable |
+| `reissue_certificate` called | enrol with that lifetime, or `Offline` | reissue, or `Offline` | reissue, or `Offline` | reissue, or `Offline` | reissue, or `Offline` |
+| Grant received | store, start peer link | replace certificate, restart listeners | same as Fresh | same as Fresh | store, stay ClockOff |
+| Refused over ceiling | `OverCeiling` to the caller, or a renewal retried at the ceiling with `CertificateLifetimeCapped` | same as NoKey | same | same | same |
+| Refused as revoked, or `DeviceRevoked` | not applicable | delete key and certificate, emit `DeviceRevoked`, become NoKey | same as Fresh | same as Fresh | same as Fresh |
+| Newer list from server or peer | store | store, close revoked peers, own serial listed means revoked | same as Fresh | same as Fresh | same as Fresh |
+| Peer link attempt (R76) | refuse, spectator | mutual TLS with lists | same as Fresh | refuse, emit `CertificateExpired` | refuse, emit `ClockOutsideWindow` |
+| Bluetooth exchange attempt (R76) | refuse | run the exchange | same as Fresh | refuse | refuse |
+| Custody record missing at open | stays NoKey | becomes NoKey, the old enrolment expires | same | same | same |
+| Wall clock changes | not applicable | re-evaluate the window | same | same | same |
+| Plain logout | nothing | keep key and certificate for that account's next sign-in | same | same | same |
+| `forget_device` | nothing | revoke the enrolment if connected, delete key and certificate | same | same | same |
+| Archive import (R75) | enrol a fresh key | retire the archived enrolment, mint a fresh key | same | same | same |
+| Account switch (R42) | each account follows its own row | same | same | same | same |
+
+Server side, an enrolment row is `Active` from its grant, `Revoked` from a report until its last serial expires, then purged. Renewing a `Revoked` row is refused as revoked.
 
 ### Steps
 
-1. The device keypair (`ed25519-dalek`) and its custody record type, one per account on the device per R42's model.
-2. The deployment CA keypair as provisioned material, verified at startup through the `preflight.rs` pattern, with the CA certificate handed to devices at enrolment for offline peer verification.
-3. Enrolment over the websocket: the device sends its public key while authenticated, the server records the enrolment and returns an `rcgen`-signed certificate (note rcgen 0.14's API break against 0.13 examples) plus the CA certificate. Automatic, no human step.
-4. Lifetime is application-requested under a server ceiling, refused if over, the R4 `capability_ttl` pattern, with renewal auto-run on any connectivity past half-life. Lifetime IS the offline revocation lag, stated in the docs rather than hidden. **The clock rule (2026-09-12):** validity is checked against the wall clock with a stated skew tolerance, and a device whose clock puts every certificate outside its window fails closed on every peer link and surfaces one typed event naming the cause, so an expedition device whose clock drifted for weeks off-grid is told why it sees no peers rather than seeing none silently. R72 absorbs this as the one wall-clock rule when it inventories the tree.
-5. Server-side enrolment revocation (a reported-lost device), the surface R78's courier refusals and the ban machinery consult.
-6. No offline enrolment and no sub-issuance, recorded as refusals with their reasoning.
-7. The lost-key path, on every platform (2026-09-12): a device whose custody record is gone, by a cleared keychain or a removed store, enrols again with a fresh key exactly as a first enrolment, and the dangling enrolment expires at its lifetime under the revocation-lag semantic of step 4. Provisional rows peers hold under the old key are adjudicated or retracted by the server's frontier like any other author's, since the device cannot sign for a key it no longer holds. Stated in chapter 19.
+1. The certificate profile, `DeviceCertConfig`, the issuer key checked at startup, the enrolment table under `preflight::require`, and the `connetto-ca` operator tool.
+2. The chip-held device key per platform with its custody report under R94 decision 13, one key per account on the device per R42's model, signing through `rcgen`'s `SigningKey`.
+3. Enrolment, renewal past half-life, `reissue_certificate`, and the builder's lifetime and descriptor setters.
+4. Attestation verification and its certificate extension.
+5. Revocation lists, their push and peer exchange, replay protection, device revocation with its sessions, and the device list.
+6. Issuer rotation, retired issuers signing their lists, and root-signed issuer revocation.
+7. **The clock rule (2026-09-12).** Validity is checked against the wall clock with the five-minute tolerance, and a device whose clock puts every certificate outside its window fails closed on every peer link and surfaces one typed event naming the cause, so an expedition device whose clock drifted for weeks off-grid is told why it sees no peers. R72 absorbs this as the one wall-clock rule when it inventories the tree.
+8. **The lost-key path, on every platform (2026-09-12).** A device whose custody record is gone, by a cleared keychain or a removed store, enrols again with a fresh key exactly as a first enrolment, and the dangling enrolment expires at its lifetime. Provisional rows peers hold under the old key are adjudicated or retracted by the server's frontier like any other author's, since the device cannot sign for a key it no longer holds. Stated in chapter 19.
+9. No offline enrolment and no sub-issuance, recorded as refusals with their reasoning.
+
+### Proof
+
+1. Enrolment, renewal past half-life, reissue with a new lifetime, refusal over the ceiling and refusal after revocation, Docker-gated against the real server.
+2. A list with a lower number never replaces a higher one, and an equal number with other content is ignored.
+3. A reported device is refused by a peer that learned the list only from another peer, with the server unreachable.
+4. Issuer rotation with one offline peer on each issuer, linking both ways, and a root-signed list making a revoked issuer's certificates refused.
+5. Attestation recorded as `chip-proven` on the A35s and the iPhone, and as `unproven` on Windows, macOS and Linux.
+6. A clock set outside the window refuses every peer and emits `ClockOutsideWindow`.
+7. A device with a cleared custody record enrols again under a fresh key, and a fresh Linux process reopens the device key from R71's durable stores.
 
 ### Done when
 
-A device enrols while online, holds key and certificates across process restarts behind the existing gate (across reboots on Linux too, proven by a fresh process reopening the device key from R71's durable stores), renews past half-life, is refused a lifetime over the ceiling, a revoked enrolment stops verifying, a device with a cleared custody record enrols again under a fresh key, and a device whose clock puts every certificate outside its window refuses every peer and says why, all proven by tests including one browser-independent native run.
+A native device enrols while online, holds its chip key and certificate across restarts, renews past half-life, is refused a lifetime over the ceiling, reissues at a new lifetime on request, is refused by peers once any notice of its revocation reaches them, survives an issuer rotation, re-enrols under a fresh key after losing its custody record, and refuses every peer with the reason when its clock is outside the window, all proven by the list above including native runs on the maintainer's devices.
 
 ---
 
@@ -5129,41 +5212,63 @@ A device enrols while online, holds key and certificates across process restarts
 
 ### Purpose
 
-The 2026-08-21 review found exactly-once splitting into three unreconciled domains (session watermark, courier, archive restore), and the maintainer decided one domain: every write carries its durable identity, (author device key, sequence), and the server keeps one applied frontier per device key that the normal path, the courier path and an archive restore all consult. The session watermark becomes a cache of the frontier rather than a second truth.
+The 2026-08-21 review found exactly-once splitting into three unreconciled domains (session watermark, courier, archive restore), and the maintainer decided on one domain. Every write carries its durable identity, (writer, sequence), and the server keeps one applied frontier per writer that the normal path, the courier path and an archive restore all consult. The session watermark becomes a cache of that frontier.
+
+### Decision, taken with the maintainer on 2026-10-02
+
+1. **A native device's writer is its device key, and a browser's writer is a number the server assigns.** Browsers never join a peer link and reach the server only through the signed-in session, and no browser API offers an application a chip-held signing key (WebAuthn credentials are `[SecureContext, Exposed=Window]` and unusable from the worker), so a browser profile holds a durable writer number the server issues and never enrols a key or certificate. The frontier keys on the writer, either kind. A non-exportable WebCrypto key in the browser, certified like a native key, was rejected, since its signatures would protect nothing on a path the session already authenticates.
 
 ### Steps
 
-1. The pending queue's sequence becomes the wire-visible half of the write identity, and `_connetto_pending` refuses at `PENDING_CAP` instead of evicting its oldest, because an evicted entry would leave provisional copies on peers that can never be confirmed or retracted (the R56-recorded hazard, now load-bearing). The refusal site (recorded 2026-09-12): not `push`, where the cap is applied today after the application's transaction has committed and the changeset is captured, since a refusal there loses the write as silently as the eviction does, but the commit hook connetto already installs (`CommitDecision`), which answers `Rollback` only for a commit that captured an application changeset with capture live while the in-memory pending count stands at the cap, so the refusal surfaces as a typed `ClientError` from the application's own transaction and the row never lands. Every commit under `SuspendedCapture` proceeds: the acknowledgement deletes of `reconcile_pending` and `MutationApplied`, and server patch application, are the commits that drain the queue, and a hook that refused them would leave the client write-blocked for ever (a Codex finding on the pull request, 2026-09-13). The proof includes an acknowledgement arriving at the cap and the next write succeeding.
-2. Mutations carry (device key, sequence), the server records the per-device frontier in the deployment-owned watermark table (schema change, free at 0.0.0), and `reconcile_pending` reconciles against the frontier so a couriered write is never re-applied on the author's next reconnect.
-3. A (key, sequence) collision is first-seen-wins, audited through R13's contract, the second refused: the Secure Scuttlebutt fork rule.
-4. Archive import retires the archived device's enrolment and mints a fresh key, with restored entries carrying their original (key, sequence) as provenance so the frontier dedups the logical writes across the restore. This amends the R56-landed import path.
+1. The pending queue's sequence becomes the wire-visible half of the write identity. The queue holds every unsent write and evicts none, so every entry a peer holds provisionally stays confirmable or retractable, the hazard R56 recorded.
+2. Mutations carry (writer, sequence), the server records the per-writer frontier in the deployment-owned watermark table (schema change, free at 0.0.0), and `reconcile_pending` reconciles against the frontier so a couriered write is never re-applied on the author's next reconnect. A browser profile receives its writer number at its first handshake and keeps it with its replica.
+3. A (writer, sequence) collision is first-seen-wins, audited through R13's contract, with the second refused, the Secure Scuttlebutt fork rule.
+4. Archive import retires the archived writer, a native device's enrolment or a browser's writer number, and gives the importing replica a fresh one, with restored entries carrying their original (writer, sequence) as provenance so the frontier dedups the logical writes across the restore. This amends the R56-landed import path.
 
 ### Done when
 
-A write applied through any path is refused by every other path, proven three ways: a replay after a simulated courier application, a restore-then-reupload, and a forged second changeset at an applied (key, sequence), each drawing the refusal and the audit record.
+A write applied through any path is refused by every other path, proven three ways, by a replay after a simulated courier application, by a restore-then-reupload, and by a forged second changeset at an applied (writer, sequence), each drawing the refusal and the audit record, for a native writer and for a browser writer.
 
 ---
 
 ## R76: the peer link
 
-**Status.** NOT STARTED.
+**Status.** NOT STARTED, its hosting, joining, Bluetooth and proof questions decided with the maintainer on 2026-10-02 (below).
 
 **Blocked on** R74.
 
 ### Purpose
 
-The LAN data plane R25 decided: discovery by gateway-probe first (a hotspot host IS the gateway) with mDNS as the general case, then mutual TLS over plain TCP between certified devices, native targets only.
+The local data plane R25 decided, discovery by gateway-probe first (a hotspot host is the gateway) with mDNS as the general case, then mutual TLS over plain TCP between certified devices, native targets only. Every native machine takes part, phones, tablets, laptops and desktops alike, so this phase also gives a group with no shared network a way to make one and to hand its details to every member.
+
+### Decisions, taken with the maintainer on 2026-10-02
+
+1. **Android, Windows and Linux start a hotspot from the application, and Apple devices join.** Android uses `startLocalOnlyHotspot`, Windows a Wi-Fi Direct advertisement in legacy mode, which ordinary devices join as an access point, and Linux NetworkManager's hotspot. macOS has no application API to host (`startIBSSMode` is deprecated since macOS 11), and iPhone and iPad host only through Personal Hotspot switched on in Settings, whose password the user types into the application once so the beacon can hand it out. Android as the only application-started host was rejected, since a group of laptops and iPhones would then need a travel router.
+2. **A Bluetooth beacon hands out the hotspot details, with a QR code and text as fallback.** Every machine in the set can scan and connect over Bluetooth from Rust through btleplug, which a desktop without a camera needs. With Bluetooth off, the host shows a `WIFI:` QR code and the same details as text. A QR code and text alone were rejected, since a desktop without a camera would type a long random password after every hotspot restart, and so were prepared shared networks alone.
+3. **The beacon is public, and each joining device gets the password through a short exchange in which both sides prove their identity.** The beacon carries the protocol version and the host certificate's fingerprint, as the mDNS TXT record does. A joining device connects to the host over Bluetooth, the two run the same mutual TLS as the Wi-Fi link with the same certificate and revocation-list checks, exchange lists, and only then does the host send `HotspotOffer { ssid, passphrase, security, bssid }`. Apple's Wi-Fi password sharing has the same shape, an identity proof over Bluetooth before the password is sent. A revoked or foreign device is refused. A beacon key the server gives every device was rejected, since a lost device keeps reading beacons until a new key reaches the others online, and so was an unencrypted password in the beacon, which lets any stranger fill and flood the hotspot.
+4. **An unattended run on emi and a recorded home run prove it.** On emi, from `main` on a schedule and never from a pull request, one A35's application starts the hotspot and the other A35 joins through the Android shell (`cmd wifi connect-network`), with permissions granted by adb. Before each peer phase closes, the maintainer runs a recorded session at home across every local machine (pippo on Linux, the Mac, the Windows machine, the iPhone, the iPad and the Galaxy M52), with Windows and Linux each hosting once. Manual home runs alone were rejected, and so was emi as a GitHub self-hosted runner, which GitHub advises against for public repositories.
+
+### Design
+
+- **The Bluetooth exchange.** The host serves through the platform's server role (`BluetoothGattServer` on Android, `GattServiceProvider` on Windows, BlueZ through `bluer` on Linux, `CBPeripheralManager` in the foreground on iPhone and iPad), Android's and Apple's in platform plugins on the `connetto-auth-session` pattern. The joiner writes to one characteristic and reads notifications on another. Frames are length-prefixed and split to the negotiated packet size, and rustls runs over that stream through `read_tls` and `write_tls`, which take any reader and writer. An A35 supports 16 advertising sets and 1,650 bytes of advertising data, measured.
+- **Joining.** iPhone and iPad join through `NEHotspotConfigurationManager`, which the user confirms. The Mac uses `CWInterface.associate`, which may ask for an administrator password. Windows saves a profile and calls `WlanConnect`. Linux calls NetworkManager's `AddAndActivateConnection`, and pippo's NetworkManager answers `auth` for `network-control` outside a desktop session, measured. Android uses the platform's network request with the user's approval in the application, and the shell in tests.
+- **Hosting permissions.** Android needs `CHANGE_WIFI_STATE`, `NEARBY_WIFI_DEVICES`, `BLUETOOTH_ADVERTISE` and `BLUETOOTH_CONNECT`. pippo's NetworkManager answers `no` to `wifi.share.protected` outside a desktop session, measured, so a refused hotspot maps to a typed error naming the permission. A host keeps its hotspot credentials in memory only, for the life of the hotspot.
+- **Revocation lists on the link.** Each side sends its CRL Numbers per issuer as the first frames inside the established TLS session and then any list the other lacks (R74). A live link whose peer the new list revokes closes with a typed reason.
+- **Discovery networks.** emi's eduroam put the two A35s in separate subnets, measured, so they reach each other by direct connection and never by mDNS. Devices on such a network meet through a hotspot.
 
 ### Steps
 
-1. Discovery: gateway-probe plus `mdns-sd` under service type `_connetto-peer._tcp.local`, the TXT record carrying protocol version and certificate fingerprint only, discovery treated as fully public with authentication only at the handshake.
-2. The link: `rustls` mutual TLS on TCP, both sides verifying against the deployment CA, refusing expired certificates.
-3. Platform notes made real: Android `LocalOnlyHotspot` guidance, `MulticastLock` for mDNS reception, iOS local-network permission, and the mixed-fleet rule that the Android device hosts.
-4. The BLE advertise-only beacon ("join my hotspot") is recorded as the later bootstrap and explicitly not built here.
+1. Discovery, gateway-probe plus `mdns-sd` under service type `_connetto-peer._tcp.local`, the TXT record carrying protocol version and certificate fingerprint only, discovery treated as fully public with authentication only at the handshake.
+2. The link, `rustls` mutual TLS on TCP, both sides verifying against the built-in roots with the revocation lists, refusing expired certificates.
+3. Hosting on Android, Windows and Linux, and the typed password entry for a hand-started iPhone or iPad Personal Hotspot.
+4. The Bluetooth beacon and exchange on every platform, and joining from every platform.
+5. The QR code and text fallback.
+6. Platform notes made real, `MulticastLock` for mDNS reception, iOS and macOS local-network permission, Android hotspot and Bluetooth permissions.
+7. The unattended emi run and the recorded home run.
 
 ### Done when
 
-Two native processes with valid certificates discover each other on one network and hold an authenticated link, a device with an expired or foreign certificate is refused, proven by tests on loopback plus one real two-machine or two-process LAN demonstration.
+Two native processes with valid certificates discover each other on one network and hold an authenticated link, a device with an expired, revoked or foreign certificate is refused, a device with no shared network learns the hotspot through the Bluetooth exchange or the QR fallback and links, proven by tests on loopback, by the unattended emi run, and by the recorded home run across every local machine with Windows and Linux each hosting once.
 
 ---
 
@@ -5245,13 +5350,14 @@ A photo authored offline on one device displays on a peer in camp (thumbnail imm
 
 ### Steps
 
-1. Every native-capable demo carries the camp flow per R54's rule: discover, exchange, provisional display with provenance, retraction display, courier offer.
+1. Every native-capable demo carries the camp flow per R54's rule, on every native platform in the set (Android, iOS, iPadOS, macOS, Windows, Linux), meaning hosting or joining a hotspot, discovery, exchange, provisional display with provenance, retraction display and the courier offer.
 2. The iOS hotspot zero-coverage field test, the one physical verification the design left open, recorded with its result.
-3. The gate section and CI gain whatever new legs the peer crates added.
+3. The unattended emi run grows to the full camp flow, and the recorded home run across every local machine (R76 decision 4) exercises it before the phase closes.
+4. The gate section and CI gain whatever new legs the peer crates added.
 
 ### Done when
 
-A person with two devices on one hotspot exercises the whole flow through a demo, and the field test's answer is recorded in chapter 19.
+The camp flow runs through a demo on every local machine in the recorded home run and unattended on the two emi A35s, and the field test's answer is recorded in chapter 19.
 
 ---
 
