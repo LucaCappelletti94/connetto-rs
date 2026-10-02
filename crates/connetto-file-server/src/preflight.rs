@@ -291,7 +291,8 @@ async fn check_reader_role<S: ConnettoFileSchema>(
         .select((pg_roles::rolsuper, pg_roles::rolbypassrls, pg_roles::oid))
         .load(conn)
         .await?;
-    if let Some(&(rolsuper, rolbypassrls, current_oid)) = rows.as_slice().first() {
+    // `RunQueryDsl::first` shadows the slice method here, hence the qualified call.
+    if let Some(&(rolsuper, rolbypassrls, current_oid)) = <[_]>::first(&rows) {
         if rolsuper {
             return Err(PreflightError::ReaderIsSuperuser);
         }

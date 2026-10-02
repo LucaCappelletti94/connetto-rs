@@ -14,7 +14,7 @@
 //! platforms answer [`AuthSessionError::Unsupported`].
 //!
 //! On Android it also hosts the prompt a Keystore-gated store unlocks through
-//! ([`device_secure`], [`approve_unlock`]), since the store is pure JNI and
+//! (`device_secure`, `approve_unlock`), since the store is pure JNI and
 //! cannot receive the prompt's callback itself.
 
 use std::time::Duration;

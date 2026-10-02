@@ -2445,6 +2445,7 @@ where
     /// # Errors
     ///
     /// [`ClientError`] when the in-memory database cannot be opened.
+    #[cfg(feature = "native-auth")]
     pub(crate) fn emptied(&self) -> Result<Self, ClientError> {
         Self::open(&Replica::in_memory(), "", &self.config, None)
     }

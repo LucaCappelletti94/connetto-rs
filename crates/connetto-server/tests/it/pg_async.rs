@@ -584,7 +584,7 @@ async fn pg_oplog_appends_and_reads_back() {
             .await
             .expect("read the column type");
     assert_eq!(
-        declared.as_slice().first().map(|row| row.name.as_str()),
+        <[_]>::first(&declared).map(|row| row.name.as_str()),
         Some(CHANGE_OP_TYPE),
         "the verb column is the enum type rather than text",
     );
