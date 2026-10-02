@@ -170,6 +170,8 @@ impl Auth {
             app_id: app_id.into(),
             #[cfg(target_os = "android")]
             keystore_prompt: None,
+            #[cfg(target_os = "windows")]
+            hello_owner: None,
         }
     }
 
@@ -261,6 +263,8 @@ pub struct KeyringAuth {
     app_id: String,
     #[cfg(target_os = "android")]
     keystore_prompt: Option<Arc<dyn crate::KeystorePrompt>>,
+    #[cfg(target_os = "windows")]
+    hello_owner: Option<Arc<dyn crate::HelloOwner>>,
 }
 
 #[cfg(feature = "native-auth")]
@@ -274,6 +278,16 @@ impl KeyringAuth {
     #[must_use]
     pub fn with_keystore_prompt(mut self, prompt: Arc<dyn crate::KeystorePrompt>) -> Self {
         self.keystore_prompt = Some(prompt);
+        self
+    }
+
+    /// The window the Windows Hello prompt over the gated secrets opens over.
+    /// Without one a Windows build keeps its secrets ungated and reports the
+    /// gate unsupported.
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub fn with_hello_owner(mut self, owner: Arc<dyn crate::HelloOwner>) -> Self {
+        self.hello_owner = Some(owner);
         self
     }
 }
@@ -290,6 +304,8 @@ impl NativeSignIn for KeyringAuth {
                 app_id: self.app_id,
                 #[cfg(target_os = "android")]
                 keystore_prompt: self.keystore_prompt,
+                #[cfg(target_os = "windows")]
+                hello_owner: self.hello_owner,
             },
         )
     }
@@ -459,6 +475,8 @@ pub struct Keyring {
     pub(crate) app_id: String,
     #[cfg(target_os = "android")]
     keystore_prompt: Option<Arc<dyn crate::KeystorePrompt>>,
+    #[cfg(target_os = "windows")]
+    hello_owner: Option<Arc<dyn crate::HelloOwner>>,
 }
 
 #[cfg(feature = "native-auth")]
@@ -482,6 +500,10 @@ impl StorageMarker for Keyring {
         #[cfg(target_os = "android")]
         if let Some(prompt) = &self.keystore_prompt {
             crate::keyring::set_keystore_prompt(&self.app_id, Arc::clone(prompt))?;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(owner) = &self.hello_owner {
+            crate::keyring::set_hello_owner(&self.app_id, Arc::clone(owner))?;
         }
         crate::keyring::arm_gate(&self.app_id, on)
     }

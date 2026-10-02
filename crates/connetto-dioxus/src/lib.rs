@@ -30,6 +30,10 @@ use dioxus_signals::{ReadSignal, WritableExt};
 mod away;
 #[cfg(feature = "desktop")]
 pub use away::use_away_input;
+#[cfg(all(feature = "hello", target_os = "windows"))]
+mod hello;
+#[cfg(all(feature = "hello", target_os = "windows"))]
+pub use hello::use_hello_owner;
 
 /// A live query bound to a component: the snapshot signal and an error slot.
 ///

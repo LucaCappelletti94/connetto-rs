@@ -146,7 +146,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R88~~ | The mobile build of a demo, Android on this workstation, iOS through the Mac |
 | done | ~~R51~~ | Native Apple gate, two upstream keychain changes patched in until released |
 | done | ~~R52~~ | Native Android gate, one upstream keystore change patched in until released |
-| any | R53 | Windows gate. W2 measured deterministic on a lent laptop, so a native gate exists, and it follows R51 and R52 |
+| built | R53 | Windows gate through a Windows Hello PRF store, proven on a lent laptop and awaiting commit |
 | blocked | R21 | One page codec. Blocked on the maintainers agreeing to the shared cipher source crates in `rusqlite/rusqlite` discussion #1908, without which it would run on permanent forks |
 | any | R57 | The demo feature gaps. Its step 8, the `MutationRejectReason` surface, gates R77 |
 | any | R61 | The portability download. Deadline is the first real deployment, the R31 class |
@@ -170,6 +170,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52, R74 and R95 wait on it |
 | blocked | R95 | Share keys added and removed on a running client. Blocked on R94 |
 | any | R96 | One server builder for programs that embed the server. Minted undesigned, so it starts with its design |
+| any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, three design points open |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
@@ -208,8 +209,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R50 the policy answers a write it never asks | **DONE** (2026-08-18) | nothing | no, discharged |
 | R35 narrow the over-broad column types | **DONE** (2026-08-05) | nothing | no |
 | R23 user-verified unlock (browser gate, custody, chapter 14) | **DONE** (2026-08-20) | nothing. Nine decisions recorded in the R23 section. Natives and Windows split to R51, R52, R53 | no |
-| R51 native Apple gate | **DONE** (2026-10-01) | nothing. The shared-authentication changes requested of `apple-native-keyring-store` (#26) and `security-framework` (#263, #264) are taken through pinned patches until released. Nine decisions shared with R52 in the R51 section | no |
-| R52 native Android gate | **DONE** (2026-09-30) | nothing. The unlock-once store option requested of `android-native-keyring-store` under #16 is taken through a pinned patch until released. Nine decisions shared with R51 in the R51 section | no |
+| R51 native Apple gate | **DONE** (2026-10-01) | nothing. The shared-authentication changes requested of `apple-native-keyring-store` (#26) and `security-framework` (#263, #264) are taken through pinned patches until released. The keychain crate cannot release while it depends on the unreviewed `security-framework` pull requests, so those decide when the patches go. Nine decisions shared with R52 in the R51 section | no |
+| R52 native Android gate | **DONE** (2026-09-30) | nothing. The unlock-once store option requested of `android-native-keyring-store` under #16 is taken through a pinned patch until released. What holds the release is `rust-mobile/ndk-context` #6 (the Android context in a `RwLock` instead of an unsynchronised `static mut`, stacked on #7), unreviewed since 2026-09-27. Nine decisions shared with R51 in the R51 section | no |
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
@@ -219,7 +220,8 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R94 one client builder per platform | STARTED 2026-09-28, minted and designed 2026-09-25 while planning R51, open points settled 2026-09-28, every construction site on the builders 2026-09-29, proof 1 passed 2026-09-29 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | R94. One decision and one open question in the section | no |
 | R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, undesigned | nothing, its design comes first | no |
-| R53 Windows gate | NOT STARTED, W2 measured 2026-09-30 | nothing. W2 found the `KeyCredentialManager` signature deterministic, so a native gate exists. The build waits on `connetto-client` building on Windows and on the testcontainers watchdog compiling there | no |
+| R97 the desktop login tab | NOT STARTED, minted 2026-10-02 from the R53 Windows proof | nothing, its three open design points come first | no |
+| R53 Windows gate | **BUILT** (2026-10-02), not yet committed | nothing. `HelloStore` is taken from the upstream branch at `01d7620` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
 | R28 part A, subscribe-time delivery gap | **DONE** (2026-08-03) | nothing | no |
@@ -2749,7 +2751,7 @@ Two platform behaviours found by the device runs shape the prompt code. Samsung 
 
 ### Proof
 
-**Passed on the iPhone 15 Pro Max on 2026-09-30** (`connetto-ios-proof --device`, evidence `target/ios-proof/00008130-000C718E2140001C-1790798566965` on the Mac): Face ID at the launch, sync, an offline write and its upload, then 36 s in Settings, the gate locked, Face ID once more on return, and a backend write reached the page after the approval. A cancelled sheet at launch refused the start with "the unlock prompt was dismissed", decision 6 on a device. **Passed on macOS 26.6.2 on 2026-10-01**, by the maintainer at the Mac: the `.app` that `connetto-macos-app` builds and signs, run against the dev stack, asked Touch ID once after the browser login, and again on return after more than 35 s in another app, and each approval opened the gate. The simulator run passes the iOS steps without a sheet, since the simulator never enforces the gate. Unit tests cover the keyring's state table (`keyring::gate`), the launch ask and the re-check (`tests/it/gate_recheck.rs`), and the lost-key wipe (`core_builder.rs`).
+**Passed on the iPhone 15 Pro Max on 2026-09-30** (`connetto-ios-proof --device`, evidence `target/ios-proof/00008130-000C718E2140001C-1790798566965` on the Mac): Face ID at the launch, sync, an offline write and its upload, then 36 s in Settings, the gate locked, Face ID once more on return, and a backend write reached the page after the approval. A cancelled sheet at launch refused the start with "the unlock prompt was dismissed", decision 6 on a device. **Passed on macOS 26.6.2 on 2026-10-01**, by the maintainer at the Mac: the `.app` that `connetto-macos-app` builds and signs, run against the dev stack, asked Touch ID once after the browser login, and again on return after more than 35 s in another app, and each approval opened the gate. On 2026-10-02 a relaunch in a fresh process unlocked with one Touch ID and no browser, a cancelled Touch ID at launch refused the start with "the unlock prompt was dismissed", closing the window during the prompt closed the app, and sign out deleted the replica with no prompt. The simulator run passes the iOS steps without a sheet, since the simulator never enforces the gate. Unit tests cover the keyring's state table (`keyring::gate`), the launch ask and the re-check (`tests/it/gate_recheck.rs`), and the lost-key wipe (`core_builder.rs`).
 
 ---
 
@@ -2790,12 +2792,24 @@ On the physical device, per the probe's A4 rule. **Passed on the Galaxy M52 on 2
 
 ## R53: Windows gate for stored secrets
 
-**Status.** NOT STARTED, W2 measured 2026-09-30. Split out of R23 on 2026-08-19.
+**Status.** Built and proven on 2026-10-02, not yet committed. Split out of R23 on 2026-08-19.
 
-**W2 is deterministic.** On a lent Windows 11 laptop with Windows Hello, a `KeyCredentialManager` key signed the same challenge to the same 256 bytes six times, twice in each of two runs and twice after a reboot. So a native gate exists: a wrapping key derived from one signature seals the secrets in the stock Windows credential store, the way the browser's extension output seeds one. W1 returned `verified=true` and stays worth nothing as a gate. The build waits on `connetto-client` building on Windows (vendored OpenSSL) and on the testcontainers watchdog compiling there.
+**Mechanism.** `windows-native-keyring-store`'s `HelloStore`, built upstream for this phase and pinned to `01d7620665ed0e118cd4a1a6e74a14be2eed07ad` until a release carries it, seals each secret with AES-256-GCM under a key derived from a Windows Hello passkey's PRF output through native WebAuthn API 9, with the Hello authenticator selected by enumeration. One approval enrolls, one approval unlocks each later launch, and entry deletion and an explicit `discard` need none. `UserConsentVerifier` stays unused, since a consent check our own code performs is worth nothing against an attacker holding the files.
 
-The probe's Windows leg (`webauth-spike/native/windows`, questions W1 to W3). W2 is decisive: whether a `KeyCredentialManager` key signs the same challenge byte-identically across invocations and across a reboot. Deterministic means a native gate can be seeded from the signature exactly as the browser extension's output seeds one. Not deterministic puts native Windows with the unsupported surfaces, which chapter 14 and the custody reason already name pending this measurement (R23 does that). W1 (`UserConsentVerifier`) is recorded as insufficient by construction: a consent check our own code performs is worth nothing against an attacker holding the files, and it is noted only so nobody later mistakes it for protection.
+**Integration.** A `WindowsBackend` joins the Apple and Android ones under `SecretGate`: reserved records in the ordinary Credential Manager store, refresh tokens and replica keys in one `HelloStore` per service. `KeyringAuth::with_hello_owner` takes the window the prompt opens over, and `connetto-dioxus`'s `use_hello_owner` (feature `hello`) lends the desktop window. No owner, or no Hello PRF, keeps the secrets ungated as `Unverified(Unsupported)`. A lost or corrupt credential discards the store and reports the loss once, which the durable build answers by wiping the replica. `forget_device` swaps the replica for an empty in-memory one before the wipe, since Windows refuses to delete an open file. Windows builds cross-compile on Linux for `x86_64-pc-windows-gnullvm` with llvm-mingw, and SQLCipher vendors OpenSSL there.
 
+**Proven on a lent Windows 11 laptop (build 26200, API 9).** Upstream: 45 scoped tests and a two-approval store proof with exact cleanup. Demo: first sign-in with one prompt and custody verified, relaunch with one prompt, the 30-second re-check with one more, sign out with no prompt and the replica files deleted. Windows disables the owner window while the prompt is up, so the app cannot be closed under it. The record is `plans/design-r53-windows-gate.md`, and the audit of the store's unsafe code is `upstream/windows-hello-unsafe-audit.md`.
+
+**Not measured.** Whether a Hello PRF credential survives a fingerprint change. The lent laptop's enrolled fingerprints cannot be changed without removing its owner's.
+
+
+---
+
+## R97: the desktop login tab
+
+**Status.** NOT STARTED, minted 2026-10-02 from the R53 Windows proof.
+
+A desktop sign-in leaves its browser tab open on the loopback page, and the app behind it. A page can close itself only if script opened it or its history holds one entry, and the identity provider's form adds history. Decided with the maintainer on 2026-10-02: macOS signs in through `ASWebAuthenticationSession`, which closes itself as it does on iOS, and Windows and Linux keep the system browser and bring the app's window back to the front after the login. Open before building: how the macOS session is built and anchored for a `dx` bundle, which layer brings the window forward and whether Windows lets a background process do it, and what the loopback page says. The working record is `plans/design-r97-desktop-login-tab.md`.
 ---
 
 ## R26: local data export

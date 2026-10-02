@@ -33,7 +33,8 @@ use crate::keyring::Keyring;
 use crate::replica::PENDING_LOGIN_RECORD;
 use crate::{AccessTokenSource, ClientError, IDENTITY_RECORD, encode_identity};
 /// OS secure storage for the refresh token: Keychain on Apple platforms,
-/// Credential Manager on Windows, and on Linux the store [`LinuxStore`](crate::LinuxStore) names.
+/// Credential Manager behind Windows Hello on Windows, and on Linux the store
+/// `LinuxStore` names.
 ///
 /// One service holds one entry per account, exactly as [`KeyringKeyStore`]
 /// holds one per replica record.
@@ -170,7 +171,7 @@ impl RefreshTokenStore for KeyringStore {
     }
 
     /// `Verified` where the platform keyring holds the secrets behind its user
-    /// verification (Apple), otherwise stored with none, for the stated reason.
+    /// verification (Apple, Android, Windows), otherwise stored with none, for the stated reason.
     fn protection(&self) -> Custody {
         self.keyring.protection()
     }
@@ -267,7 +268,7 @@ impl ReplicaKeyStore for KeyringKeyStore {
     }
 
     /// `Verified` where the platform keyring holds the secrets behind its user
-    /// verification (Apple), otherwise stored with none, for the stated reason.
+    /// verification (Apple, Android, Windows), otherwise stored with none, for the stated reason.
     fn protection(&self) -> Custody {
         self.keyring.protection()
     }

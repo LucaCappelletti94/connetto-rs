@@ -7,10 +7,20 @@ mod android;
 pub use android::KeystorePrompt;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
-#[cfg(any(test, target_os = "macos", target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    test,
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
 mod gate;
 #[cfg(target_os = "linux")]
 mod linux;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub use windows::{HelloCancellation, HelloOwner, HelloWindow};
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -101,35 +111,53 @@ impl Keyring {
 
     /// The custody the secrets under this service carry.
     #[cfg_attr(
-        not(any(target_os = "macos", target_os = "ios", target_os = "android")),
+        not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        )),
         expect(
             clippy::unused_self,
             reason = "only the gated platforms read their service's gate"
         )
     )]
     pub(crate) fn protection(&self) -> connetto_core::custody::Custody {
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         {
             gated::protection(&self.service)
         }
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        )))]
         {
             connetto_core::custody::Custody::Unverified(connetto_core::custody::NoGate::Unsupported)
         }
     }
 
     /// Whether the platform started the gated store over since the last call,
-    /// because the key sealing it was lost. Only Android loses one.
+    /// because the key sealing it was lost. Android and Windows lose one.
     #[cfg_attr(
-        not(target_os = "android"),
-        expect(clippy::unused_self, reason = "only Android loses a gated store's key")
+        not(any(target_os = "android", target_os = "windows")),
+        expect(
+            clippy::unused_self,
+            reason = "only Android and Windows lose a gated store's key"
+        )
     )]
     pub(crate) fn take_lost(&self) -> bool {
-        #[cfg(target_os = "android")]
+        #[cfg(any(target_os = "android", target_os = "windows"))]
         {
             gated::take_lost(&self.service)
         }
-        #[cfg(not(target_os = "android"))]
+        #[cfg(not(any(target_os = "android", target_os = "windows")))]
         {
             false
         }
@@ -141,7 +169,8 @@ impl Keyring {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         )),
         expect(clippy::unused_async, reason = "only the Linux and gated stores await")
     )]
@@ -150,7 +179,12 @@ impl Keyring {
         {
             self.store.read(&self.service, name).await
         }
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         {
             let name = name.to_owned();
             gated::blocking(&self.service, move |gate| gate.read(&name)).await
@@ -159,7 +193,8 @@ impl Keyring {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         )))]
         {
             platform::read(&self.service, name)
@@ -172,7 +207,8 @@ impl Keyring {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         )),
         expect(clippy::unused_async, reason = "only the Linux and gated stores await")
     )]
@@ -181,7 +217,12 @@ impl Keyring {
         {
             self.store.write(&self.service, name, secret).await
         }
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         {
             let (name, secret) = (name.to_owned(), secret.to_owned());
             gated::blocking(&self.service, move |gate| gate.write(&name, &secret)).await
@@ -190,7 +231,8 @@ impl Keyring {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         )))]
         {
             platform::write(&self.service, name, secret)
@@ -203,7 +245,8 @@ impl Keyring {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         )),
         expect(clippy::unused_async, reason = "only the Linux and gated stores await")
     )]
@@ -212,7 +255,12 @@ impl Keyring {
         {
             self.store.clear(&self.service, name).await
         }
-        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        ))]
         {
             let name = name.to_owned();
             gated::blocking(&self.service, move |gate| gate.clear(&name)).await
@@ -221,7 +269,8 @@ impl Keyring {
             target_os = "linux",
             target_os = "macos",
             target_os = "ios",
-            target_os = "android"
+            target_os = "android",
+            target_os = "windows"
         )))]
         {
             platform::clear(&self.service, name)
@@ -234,7 +283,8 @@ impl Keyring {
     target_os = "linux",
     target_os = "macos",
     target_os = "ios",
-    target_os = "android"
+    target_os = "android",
+    target_os = "windows"
 )))]
 mod platform {
     use std::sync::{Arc, LazyLock};
@@ -251,13 +301,6 @@ mod platform {
             .map_err(|err| ClientError::Auth(format!("keyring setup: {err}")))
     }
 
-    #[cfg(target_os = "windows")]
-    fn install_store() -> keyring_core::Result<()> {
-        keyring_core::set_default_store(windows_native_keyring_store::Store::new()?);
-        Ok(())
-    }
-
-    #[cfg(not(target_os = "windows"))]
     fn install_store() -> keyring_core::Result<()> {
         Err(keyring_core::Error::Invalid(
             "platform".to_owned(),
@@ -295,7 +338,12 @@ mod platform {
 
 /// The process-wide gates over the platform keyring, one per service, since
 /// the platform store is process-wide.
-#[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+#[cfg(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+))]
 mod gated {
     use std::collections::HashMap;
     use std::sync::{Arc, LazyLock, Mutex, PoisonError};
@@ -307,6 +355,8 @@ mod gated {
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     use super::apple::AppleBackend as Platform;
     use super::gate::{KeyringMechanism, SecretGate};
+    #[cfg(target_os = "windows")]
+    use super::windows::WindowsBackend as Platform;
     use crate::ClientError;
     use crate::away::GateMechanism;
 
@@ -347,9 +397,19 @@ mod gated {
         Ok(())
     }
 
+    /// Give the service's gated store the window its prompt opens over.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn set_owner(
+        service: &str,
+        owner: Arc<dyn super::HelloOwner>,
+    ) -> Result<(), ClientError> {
+        gate(service)?.backend().set_owner(owner);
+        Ok(())
+    }
+
     /// Whether the service's gated store was started over after its key was
     /// lost, reported once.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "windows"))]
     pub(crate) fn take_lost(service: &str) -> bool {
         gate(service).is_ok_and(|gate| gate.backend().take_lost())
     }
@@ -383,7 +443,12 @@ mod gated {
 ///
 /// [`ClientError`] when the platform store cannot be opened.
 #[cfg_attr(
-    not(any(target_os = "macos", target_os = "ios", target_os = "android")),
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    )),
     expect(
         clippy::unnecessary_wraps,
         reason = "only the gated platforms can fail to open the store"
@@ -393,11 +458,21 @@ pub(crate) fn arm_gate(
     service: &str,
     on: bool,
 ) -> Result<Option<std::sync::Arc<dyn crate::away::GateMechanism>>, ClientError> {
-    #[cfg(any(target_os = "macos", target_os = "ios", target_os = "android"))]
+    #[cfg(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    ))]
     {
         gated::arm(service, on)
     }
-    #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+    #[cfg(not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "android",
+        target_os = "windows"
+    )))]
     {
         let _ = (service, on);
         Ok(None)
@@ -415,4 +490,17 @@ pub(crate) fn set_keystore_prompt(
     prompt: std::sync::Arc<dyn KeystorePrompt>,
 ) -> Result<(), ClientError> {
     gated::set_prompt(service, prompt)
+}
+
+/// Give `service`'s Hello-gated secrets the window their prompt opens over.
+///
+/// # Errors
+///
+/// [`ClientError`] when the platform store cannot be opened.
+#[cfg(target_os = "windows")]
+pub(crate) fn set_hello_owner(
+    service: &str,
+    owner: std::sync::Arc<dyn HelloOwner>,
+) -> Result<(), ClientError> {
+    gated::set_owner(service, owner)
 }

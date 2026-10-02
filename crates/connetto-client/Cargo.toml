@@ -163,9 +163,11 @@ connetto-schema = { workspace = true, optional = true }
 # `sqlite3changeset_apply_v3`, which diesel-sqlite-session imports.
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dependencies]
 libsqlite3-sys = { version = ">=0.38, <0.39", features = ["bundled-sqlcipher"] }
+
 # The away/return re-check (R94) measures time away from the sleep-counting
 # monotonic clock: CLOCK_BOOTTIME on Linux and Android, CLOCK_MONOTONIC on
-# Apple. rustix wraps the syscall with no unsafe.
+# Apple. rustix wraps the syscall with no unsafe. Windows reads none.
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["time"] }
 
 # Apple keeps the secrets in the data protection keychain, the crate's
@@ -197,8 +199,13 @@ chacha20poly1305 = { version = "0.10", optional = true }
 # Waiting on a Secret Service prompt's Completed signal stream.
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
+# Windows: the Hello-gated named store (R53) beside the ordinary one. Windows
+# ships no OpenSSL, so SQLCipher builds its own from source as on Android.
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-native-keyring-store = { version = "1.1.0", optional = true }
+libsqlite3-sys = { version = ">=0.38, <0.39", features = [
+  "bundled-sqlcipher-vendored-openssl",
+] }
 
 # Every other native target launches the browser through `open`.
 [target.'cfg(not(any(target_os = "android", target_os = "ios", all(target_family = "wasm", target_os = "unknown"))))'.dependencies]

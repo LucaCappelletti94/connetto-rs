@@ -21,6 +21,13 @@ pub(crate) enum Refusal {
     Dismissed,
     /// The device has no passcode or secure lock screen, so no gated item can
     /// be created.
+    #[cfg_attr(
+        all(target_os = "windows", not(test)),
+        expect(
+            dead_code,
+            reason = "the Hello store reports a machine without Hello as unsupported"
+        )
+    )]
     NoDeviceLock,
     /// The build lacks what the gated store needs, an entitlement on Apple.
     NoEntitlement,
@@ -126,7 +133,7 @@ impl<B: Backend> SecretGate<B> {
     }
 
     /// The platform store behind the gate.
-    #[cfg(target_os = "android")]
+    #[cfg(any(target_os = "android", target_os = "windows"))]
     pub(crate) fn backend(&self) -> &B {
         &self.backend
     }
@@ -171,8 +178,18 @@ impl<B: Backend> SecretGate<B> {
             Mode::Open => Ok(Storage::Gated),
             Mode::Launch => {
                 if self.backend.opens_explicitly() {
-                    self.backend.open(&self.service, None)?;
-                    self.state().mode = Mode::Open;
+                    match self.backend.open(&self.service, None) {
+                        Ok(()) => self.state().mode = Mode::Open,
+                        Err(Refusal::NoEntitlement) => {
+                            self.fall_back(NoGate::Unsupported);
+                            return Ok(Storage::Ungated(NoGate::Unsupported));
+                        }
+                        Err(Refusal::NoDeviceLock) => {
+                            self.fall_back(NoGate::Offerable);
+                            return Ok(Storage::Ungated(NoGate::Offerable));
+                        }
+                        Err(refusal) => return Err(refusal.into()),
+                    }
                 }
                 Ok(Storage::Gated)
             }
@@ -461,7 +478,13 @@ mod tests {
         }
 
         fn open(&self, _service: &str, probe: Option<&str>) -> Result<(), Refusal> {
-            if self.script.lock().expect("lock").explicit_open {
+            let script = *self.script.lock().expect("lock");
+            if script.explicit_open {
+                match script.cannot {
+                    Some(Cannot::DeviceLock) => return Err(Refusal::NoDeviceLock),
+                    Some(Cannot::Entitlement) => return Err(Refusal::NoEntitlement),
+                    None => {}
+                }
                 return self.prompt();
             }
             match probe {
@@ -721,5 +744,25 @@ mod tests {
         assert_eq!(gate.ask(), GateAskOutcome::Approved);
         assert_eq!(fake.prompts(), 2, "the re-check runs the ceremony again");
         gate.read(KEY).expect("reopened");
+    }
+
+    #[test]
+    fn an_unlock_once_store_that_cannot_gate_falls_back_at_its_first_access() {
+        for (cannot, reason) in [
+            (Cannot::Entitlement, NoGate::Unsupported),
+            (Cannot::DeviceLock, NoGate::Offerable),
+        ] {
+            let (gate, fake) = gate(Script {
+                explicit_open: true,
+                cannot: Some(cannot),
+                ..Script::default()
+            });
+            gate.write(TOKEN, "refresh").expect("falls back");
+            assert_eq!(fake.storage_of(TOKEN), Some(Storage::Ungated(reason)));
+            assert_eq!(gate.protection(), Custody::Unverified(reason));
+            assert_eq!(gate.read(TOKEN).expect("read").as_deref(), Some("refresh"));
+            assert_eq!(gate.ask(), GateAskOutcome::Approved);
+            assert_eq!(fake.prompts(), 0);
+        }
     }
 }

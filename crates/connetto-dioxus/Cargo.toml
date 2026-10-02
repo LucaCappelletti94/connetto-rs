@@ -33,6 +33,9 @@ dioxus-desktop = { version = "0.7.9", optional = true }
 # iOS and Android and from window focus on the desktop (R94 decision 9). Off
 # by default, so the wasm build never pulls the native webview stack.
 desktop = ["dep:dioxus-desktop"]
+# Lends the desktop window to connetto's Windows Hello prompt (R53), with the
+# keyring sign-in that takes it.
+hello = ["desktop", "connetto-client/native-auth"]
 
 [dev-dependencies]
 # The hook integration test drives a real native client (a builder-built client

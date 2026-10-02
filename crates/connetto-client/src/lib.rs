@@ -122,6 +122,8 @@ pub use keyring::KeystorePrompt;
 pub use keyring::SecretStoreError;
 #[cfg(all(feature = "native-auth", target_os = "linux"))]
 pub use keyring::{Backend, KeyFile, LinuxStore};
+#[cfg(all(feature = "native-auth", target_os = "windows"))]
+pub use keyring::{HelloCancellation, HelloOwner, HelloWindow};
 pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
@@ -2434,6 +2436,17 @@ where
         conn.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
         Ok(conn)
+    }
+
+    /// An empty in-memory connection carrying this one's identity, which takes
+    /// its place once its replica file is to be deleted, so no handle keeps
+    /// the file open.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the in-memory database cannot be opened.
+    pub(crate) fn emptied(&self) -> Result<Self, ClientError> {
+        Self::open(&Replica::in_memory(), "", &self.config, None)
     }
 
     /// Shared open body: open the database, unlock the page codec, apply the

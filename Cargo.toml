@@ -138,6 +138,9 @@ security-framework = { git = "https://github.com/LucaCappelletti94/rust-security
 # app unlocks once per approval, the Android 13 expiry refusal, and a lost
 # Keystore key reported instead of replaced (#27), integrated on upstream main.
 android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "bcb27e8f6def5ed78dc75103562df63cad78f017" }
+# R53, until released: the Windows Hello PRF named store with keyless entry
+# deletion, explicit store discard, and user-scoped locks.
+windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "01d7620665ed0e118cd4a1a6e74a14be2eed07ad" }
 
 # diesel-sqlite-session takes diesel from git, which [patch.crates-io] does not reach.
 [patch."https://github.com/diesel-rs/diesel"]

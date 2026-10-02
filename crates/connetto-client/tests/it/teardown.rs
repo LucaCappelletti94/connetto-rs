@@ -482,6 +482,23 @@ async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
         keys.load(&record).await.expect("load").is_none(),
         "and its key record"
     );
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        open_handles_to(&path),
+        0,
+        "the live client keeps no handle on the deleted replica, which Windows needs to delete it"
+    );
+}
+
+/// How many of this process's open file descriptors point at `path` or its sidecars.
+#[cfg(target_os = "linux")]
+fn open_handles_to(path: &std::path::Path) -> usize {
+    let prefix = path.to_string_lossy().into_owned();
+    std::fs::read_dir("/proc/self/fd")
+        .expect("list this process's descriptors")
+        .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .filter(|target| target.to_string_lossy().starts_with(&prefix))
+        .count()
 }
 
 /// A build that kept nothing on the device has nothing to forget.

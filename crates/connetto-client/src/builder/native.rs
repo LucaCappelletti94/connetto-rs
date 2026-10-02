@@ -635,7 +635,9 @@ where
     /// is set, and they are read before anything is destroyed, since once
     /// the credential is gone they can no longer be uploaded. A held
     /// credential has no session to revoke, so its build only wipes. The
-    /// client is closed before the files go, and the application drops it
+    /// client is closed and its replica swapped for an empty in-memory one
+    /// before the files go, since Windows refuses to delete an open file, so
+    /// clones still alive read an empty replica. The application drops it
     /// afterwards.
     ///
     /// # Errors
@@ -652,6 +654,7 @@ where
             return Err(ForgetError::Purge(PurgeError::Unsynced(unsynced)));
         }
         self.core.close().await;
+        self.core.client().release_replica().await?;
         teardown.forget(&unsynced, force).await
     }
 }

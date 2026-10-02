@@ -332,13 +332,24 @@ fn Shell() -> Element {
     let mut stage = use_signal(|| Stage::Starting);
     use_context_provider(|| restart);
     let runtime = use_hook(tokio::runtime::Handle::current);
+    // Windows Hello prompts over this window.
+    #[cfg(target_os = "windows")]
+    let owner = connetto_dioxus::use_hello_owner();
     use_effect(move || {
         let _ = generation();
         let account = choice.peek().clone();
         stage.set(Stage::Starting);
         let runtime = runtime.clone();
+        #[cfg(target_os = "windows")]
+        let owner = Arc::clone(&owner);
         spawn(async move {
-            let outcome = runtime.spawn(setup(account)).await;
+            let outcome = runtime
+                .spawn(setup(
+                    account,
+                    #[cfg(target_os = "windows")]
+                    owner,
+                ))
+                .await;
             stage.set(match outcome {
                 Ok(Ok(parts)) => Stage::Ready(SessionParts(Rc::new(parts))),
                 Ok(Err(err)) => Stage::Failed(
@@ -389,7 +400,10 @@ fn Session(parts: SessionParts) -> Element {
     rsx! { App {} }
 }
 
-async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
+async fn setup(
+    account: AccountChoice,
+    #[cfg(target_os = "windows")] owner: Arc<dyn connetto_client::HelloOwner>,
+) -> anyhow::Result<Parts> {
     use anyhow::Context as _;
 
     let server = endpoint(
@@ -408,6 +422,14 @@ async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
         DEFAULT_AUTH_ORIGIN,
     );
 
+    let sign_in = platform_sign_in(
+        Auth::new(auth_origin, AUTH_PROVIDER)
+            .with_account(account)
+            .keyring(KEYRING_SERVICE),
+    );
+    #[cfg(target_os = "windows")]
+    let sign_in = sign_in.with_hello_owner(owner);
+
     tokio::fs::create_dir_all(data_dir())
         .await
         .context("creating the application data directory")?;
@@ -421,11 +443,7 @@ async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
                 "SELECT content_id FROM photos WHERE content_state = 'lost'",
                 "content_id",
             ))
-            .signed_in(platform_sign_in(
-                Auth::new(auth_origin, AUTH_PROVIDER)
-                    .with_account(account)
-                    .keyring(KEYRING_SERVICE),
-            ))
+            .signed_in(sign_in)
             .durable(data_dir())
             .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)))
             .connect_with_pump()
