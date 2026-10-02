@@ -241,7 +241,8 @@ impl ReplicaKeyStore for KeyringKeyStore {
 
     async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
         let stored = self.keyring.read(name).await?;
-        if self.keyring.take_lost() {
+        // A key that still reads, moved out of a store whose key went since, was not lost.
+        if self.keyring.take_lost() && stored.is_none() {
             return Err(ClientError::ReplicaKeyLost);
         }
         stored

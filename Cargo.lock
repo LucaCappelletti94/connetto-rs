@@ -86,7 +86,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "android-native-keyring-store"
 version = "1.0.0"
-source = "git+https://github.com/LucaCappelletti94/android-native-keyring-store?rev=ae12291f8f75e90da1adb819de0d545e299b4318#ae12291f8f75e90da1adb819de0d545e299b4318"
+source = "git+https://github.com/LucaCappelletti94/android-native-keyring-store?rev=9242bf8d59b1edd9ebd6ebcb1efc7b55623688d2#9242bf8d59b1edd9ebd6ebcb1efc7b55623688d2"
 dependencies = [
  "base64 0.22.1",
  "jni 0.21.1",
@@ -1035,6 +1035,7 @@ name = "connetto-client"
 version = "0.0.0"
 dependencies = [
  "android-native-keyring-store",
+ "android_system_properties",
  "anyhow",
  "apple-native-keyring-store",
  "axum",

@@ -4,7 +4,9 @@
 //! through `apple-native-keyring-store`'s protected store, configured with
 //! `shared-authentication` so one approval opens every gated item until
 //! [`reset_authentication`](protected::Store::reset_authentication). A gated
-//! secret carries `require-user-presence`, a biometric or the device passcode.
+//! secret carries `require-user-presence`, a biometric or the device passcode,
+//! and sits under its service with `.gated` appended, apart from any ungated
+//! copy.
 //! The data protection keychain needs the `keychain-access-groups`
 //! entitlement, which a bare signed binary lacks, and macOS then keeps its
 //! secrets in the login keychain instead, ungated.
@@ -27,6 +29,9 @@ const USER_CANCELED: i32 = -128;
 const AUTH_FAILED: i32 = -25293;
 /// `errSecMissingEntitlement`, a build without `keychain-access-groups`.
 const MISSING_ENTITLEMENT: i32 = -34018;
+/// Appended to the service of a gated item, so a gated and an ungated copy of
+/// one secret are two items rather than one whose protection is fixed.
+const GATED_SERVICE: &str = ".gated";
 
 /// The keychain stores one service's secrets live in.
 pub(crate) struct AppleBackend {
@@ -54,6 +59,13 @@ impl AppleBackend {
     }
 
     fn entry(&self, service: &str, name: &str, storage: Storage) -> Result<Entry, Refusal> {
+        let gated_service;
+        let service = if storage == Storage::Gated {
+            gated_service = format!("{service}{GATED_SERVICE}");
+            gated_service.as_str()
+        } else {
+            service
+        };
         #[cfg(target_os = "macos")]
         if self.unentitled.load(Ordering::Relaxed) {
             return self
@@ -73,7 +85,7 @@ impl AppleBackend {
         match status(err) {
             Some(MISSING_ENTITLEMENT) => {
                 self.unentitled.store(true, Ordering::Relaxed);
-                Refusal::NoEntitlement
+                Refusal::Unsupported
             }
             Some(AUTH_FAILED) if creating => Refusal::NoDeviceLock,
             Some(USER_CANCELED | AUTH_FAILED) => Refusal::Dismissed,
@@ -86,7 +98,7 @@ impl AppleBackend {
 /// protected one refused for a missing entitlement, which only macOS has.
 fn retry_ungated(refusal: &Refusal, storage: Storage) -> bool {
     cfg!(target_os = "macos")
-        && matches!(refusal, Refusal::NoEntitlement)
+        && matches!(refusal, Refusal::Unsupported)
         && matches!(storage, Storage::Ungated(_))
 }
 
@@ -130,13 +142,19 @@ impl Backend for AppleBackend {
             .map_err(ClientError::from)?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
-            Err(err) => {
-                let refusal = self.refusal(&err, false);
-                if retry_ungated(&refusal, storage) {
-                    return self.clear(service, name, storage);
-                }
-                Err(refusal.into())
-            }
+            Err(err) => match self.refusal(&err, false) {
+                refusal if retry_ungated(&refusal, storage) => self.clear(service, name, storage),
+                // A build without the entitlement holds no gated item.
+                Refusal::Unsupported => Ok(()),
+                refusal => Err(refusal.into()),
+            },
+        }
+    }
+
+    fn read_stranded(&self, service: &str, name: &str) -> Result<Option<String>, Refusal> {
+        match self.read(service, name, Storage::Gated) {
+            Err(Refusal::Unsupported) => Ok(None),
+            read => read,
         }
     }
 
@@ -211,7 +229,7 @@ mod tests {
         assert!(!backend.unentitled.load(Ordering::Relaxed));
         assert!(matches!(
             backend.refusal(&refused(MISSING_ENTITLEMENT), false),
-            Refusal::NoEntitlement
+            Refusal::Unsupported
         ));
         assert!(
             backend.unentitled.load(Ordering::Relaxed),
@@ -223,10 +241,10 @@ mod tests {
     fn only_macos_retries_an_ungated_secret_in_the_login_keychain() {
         let ungated = Storage::Ungated(NoGate::Unsupported);
         assert_eq!(
-            retry_ungated(&Refusal::NoEntitlement, ungated),
+            retry_ungated(&Refusal::Unsupported, ungated),
             cfg!(target_os = "macos")
         );
-        assert!(!retry_ungated(&Refusal::NoEntitlement, Storage::Gated));
+        assert!(!retry_ungated(&Refusal::Unsupported, Storage::Gated));
         assert!(!retry_ungated(&Refusal::Dismissed, ungated));
     }
 }

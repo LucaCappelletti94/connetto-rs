@@ -175,6 +175,7 @@ async fn prove(
     device
         .adb(&["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
         .await?;
+    unlock.dismiss_keyguard(device).await?;
     step("install");
     device
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
@@ -346,6 +347,32 @@ struct Unlock<'a> {
 }
 
 impl Unlock<'_> {
+    /// Clear a PIN keyguard, which waking the device leaves up and which hides
+    /// every app and browser tab behind it.
+    async fn dismiss_keyguard(self, device: &Device) -> Result<()> {
+        let Some(pin) = self.pin else {
+            return Ok(());
+        };
+        if !device.keyguard_showing().await? {
+            return Ok(());
+        }
+        device.adb(&["shell", "wm", "dismiss-keyguard"]).await?;
+        // The PIN pad needs a moment to take focus.
+        sleep(Duration::from_secs(1)).await;
+        device.adb(&["shell", "input", "text", pin]).await?;
+        device
+            .adb(&["shell", "input", "keyevent", "KEYCODE_ENTER"])
+            .await?;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while device.keyguard_showing().await? {
+            if Instant::now() >= deadline {
+                bail!("the keyguard stayed up after the PIN");
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+        Ok(())
+    }
+
     /// Wait for the unlock prompt, answer it, and wait for it to close.
     async fn approve(self, device: &Device, evidence: &Path, name: &str) -> Result<()> {
         let deadline = Instant::now() + Duration::from_secs(60);
@@ -687,6 +714,14 @@ impl Device {
         ])
         .await
         .map(drop)
+    }
+
+    /// Whether the keyguard covers the screen.
+    async fn keyguard_showing(&self) -> Result<bool> {
+        let window = self.adb(&["shell", "dumpsys", "window"]).await?;
+        Ok(window
+            .lines()
+            .any(|line| line.trim() == "isKeyguardShowing=true"))
     }
 
     /// Whether the platform's biometric or credential prompt holds the

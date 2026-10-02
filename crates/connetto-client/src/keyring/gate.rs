@@ -29,8 +29,9 @@ pub(crate) enum Refusal {
         )
     )]
     NoDeviceLock,
-    /// The build lacks what the gated store needs, an entitlement on Apple.
-    NoEntitlement,
+    /// The build or the platform lacks what the gated store needs, such as an
+    /// entitlement on Apple, a prompt or Android 11 on Android, or Windows Hello.
+    Unsupported,
     /// Anything else the store reported.
     Other(ClientError),
 }
@@ -42,8 +43,8 @@ impl From<Refusal> for ClientError {
             Refusal::NoDeviceLock => Self::SecretStore(SecretStoreError::Backend(
                 "the device has no passcode or secure lock screen".to_owned(),
             )),
-            Refusal::NoEntitlement => Self::SecretStore(SecretStoreError::Backend(
-                "the build lacks the entitlement the gated store needs".to_owned(),
+            Refusal::Unsupported => Self::SecretStore(SecretStoreError::Backend(
+                "this build or platform cannot gate its secrets".to_owned(),
             )),
             Refusal::Other(err) => err,
         }
@@ -59,6 +60,9 @@ pub(crate) enum Storage {
     Ungated(NoGate),
 }
 
+/// The ungated storage, whose reason the platform stores never read.
+const PLAIN: Storage = Storage::Ungated(NoGate::Offerable);
+
 /// One platform's secret store, as the gate drives it.
 pub(crate) trait Backend: Send + Sync {
     /// The secret under `name`, `None` when none was stored.
@@ -71,8 +75,12 @@ pub(crate) trait Backend: Send + Sync {
         secret: &str,
         storage: Storage,
     ) -> Result<(), Refusal>;
-    /// Remove the entry under `name`, if any. Never prompts.
+    /// Remove the entry under `name` from `storage` without a prompt, succeeding
+    /// where that storage cannot exist on this device.
     fn clear(&self, service: &str, name: &str, storage: Storage) -> Result<(), ClientError>;
+    /// The gated copy of `name` read while the secrets are ungated, prompting
+    /// only when a copy exists, and `None` when its key is gone.
+    fn read_stranded(&self, service: &str, name: &str) -> Result<Option<String>, Refusal>;
     /// Run the platform's prompt so the gated secrets open without another,
     /// `probe` naming a gated secret the prompt may read to raise it.
     fn open(&self, service: &str, probe: Option<&str>) -> Result<(), Refusal>;
@@ -180,7 +188,7 @@ impl<B: Backend> SecretGate<B> {
                 if self.backend.opens_explicitly() {
                     match self.backend.open(&self.service, None) {
                         Ok(()) => self.state().mode = Mode::Open,
-                        Err(Refusal::NoEntitlement) => {
+                        Err(Refusal::Unsupported) => {
                             self.fall_back(NoGate::Unsupported);
                             return Ok(Storage::Ungated(NoGate::Unsupported));
                         }
@@ -196,58 +204,62 @@ impl<B: Backend> SecretGate<B> {
         }
     }
 
-    /// The secret under `name`.
+    /// The secret under `name`, moving a copy an earlier launch stored under the
+    /// other storage to the one this launch uses.
     pub(crate) fn read(&self, name: &str) -> Result<Option<String>, ClientError> {
         if crate::is_reserved_record(name) {
-            return Ok(self.backend.read(
-                &self.service,
-                name,
-                Storage::Ungated(NoGate::Offerable),
-            )?);
+            return Ok(self.backend.read(&self.service, name, PLAIN)?);
         }
         let storage = self.gated_storage()?;
         let read = match self.backend.read(&self.service, name, storage) {
-            Err(Refusal::NoEntitlement) if storage == Storage::Gated => {
+            Err(Refusal::Unsupported) if storage == Storage::Gated => {
                 self.fall_back(NoGate::Unsupported);
                 return self.read(name);
             }
             read => read?,
         };
-        if storage == Storage::Gated {
-            let mut state = self.state();
-            if read.is_some() {
+        if let Some(secret) = read {
+            if storage == Storage::Gated {
+                let mut state = self.state();
                 state.probe = Some(name.to_owned());
                 if state.mode == Mode::Launch {
                     state.mode = Mode::Open;
                 }
             }
+            return Ok(Some(secret));
         }
-        Ok(read)
+        // A move verifies nothing, so it leaves the mode as it found it.
+        let stranded = match storage {
+            Storage::Gated => self.backend.read(&self.service, name, PLAIN)?,
+            Storage::Ungated(_) => self.backend.read_stranded(&self.service, name)?,
+        };
+        if let Some(secret) = &stranded {
+            self.write(name, secret)?;
+        }
+        Ok(stranded)
     }
 
-    /// Store `secret` under `name`.
+    /// Store `secret` under `name`, removing any copy under the other storage.
     pub(crate) fn write(&self, name: &str, secret: &str) -> Result<(), ClientError> {
         if crate::is_reserved_record(name) {
-            return Ok(self.backend.write(
-                &self.service,
-                name,
-                secret,
-                Storage::Ungated(NoGate::Offerable),
-            )?);
+            return Ok(self.backend.write(&self.service, name, secret, PLAIN)?);
         }
         let storage = self.gated_storage()?;
         match self.backend.write(&self.service, name, secret, storage) {
             Ok(()) => {
-                if storage == Storage::Gated {
+                let other = if storage == Storage::Gated {
                     self.state().probe = Some(name.to_owned());
-                }
-                Ok(())
+                    PLAIN
+                } else {
+                    Storage::Gated
+                };
+                self.backend.clear(&self.service, name, other)
             }
             Err(Refusal::NoDeviceLock) if storage == Storage::Gated => {
                 self.fall_back(NoGate::Offerable);
                 self.write(name, secret)
             }
-            Err(Refusal::NoEntitlement) if storage == Storage::Gated => {
+            Err(Refusal::Unsupported) if storage == Storage::Gated => {
                 self.fall_back(NoGate::Unsupported);
                 self.write(name, secret)
             }
@@ -255,17 +267,12 @@ impl<B: Backend> SecretGate<B> {
         }
     }
 
-    /// Remove the entry under `name`. Never prompts, locked or not.
+    /// Remove the entry under `name` from both storages, never prompting.
     pub(crate) fn clear(&self, name: &str) -> Result<(), ClientError> {
-        let storage = if crate::is_reserved_record(name) {
-            Storage::Ungated(NoGate::Offerable)
-        } else {
-            match self.state().mode {
-                Mode::Ungated(reason) => Storage::Ungated(reason),
-                Mode::Launch | Mode::Open | Mode::Locked => Storage::Gated,
-            }
-        };
-        self.backend.clear(&self.service, name, storage)?;
+        self.backend.clear(&self.service, name, PLAIN)?;
+        if !crate::is_reserved_record(name) {
+            self.backend.clear(&self.service, name, Storage::Gated)?;
+        }
         let mut state = self.state();
         if state.probe.as_deref() == Some(name) {
             state.probe = None;
@@ -364,6 +371,10 @@ mod tests {
 
     /// What the fake platform does on its next prompt or gated access.
     #[derive(Clone, Copy, Default)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "each flag scripts one independent platform behaviour"
+    )]
     struct Script {
         dismiss: bool,
         /// The refusal every gated create meets, and every gated read too for
@@ -373,13 +384,16 @@ mod tests {
         /// A gated create leaves the shared context able to read the item
         /// back unasked, as the iOS data protection keychain does.
         creation_authorises: bool,
+        /// The key behind the gated copies is gone, as after a screen lock or
+        /// Windows Hello was removed.
+        key_gone: bool,
     }
 
     /// Why the fake platform cannot hold a gated item.
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Cannot {
         DeviceLock,
-        Entitlement,
+        Gate,
     }
 
     /// A platform store recording every call, prompting only where the real
@@ -387,7 +401,8 @@ mod tests {
     #[derive(Default)]
     struct Fake {
         script: Mutex<Script>,
-        items: Mutex<HashMap<String, (String, Storage)>>,
+        gated: Mutex<HashMap<String, String>>,
+        plain: Mutex<HashMap<String, (String, NoGate)>>,
         prompts: Mutex<usize>,
         closes: Mutex<usize>,
         /// Whether the platform holds an approval, the shared context or the
@@ -400,12 +415,38 @@ mod tests {
             *self.prompts.lock().expect("lock")
         }
 
+        /// Where the one copy of `name` is, failing on a copy in each storage.
         fn storage_of(&self, name: &str) -> Option<Storage> {
-            self.items
+            let gated = self.gated.lock().expect("lock").contains_key(name);
+            let plain = self
+                .plain
                 .lock()
                 .expect("lock")
                 .get(name)
-                .map(|item| item.1)
+                .map(|item| item.1);
+            match (gated, plain) {
+                (true, Some(_)) => panic!("{name} has a copy in both storages"),
+                (true, None) => Some(Storage::Gated),
+                (false, reason) => reason.map(Storage::Ungated),
+            }
+        }
+
+        /// A copy an earlier launch stored.
+        fn seed(&self, name: &str, secret: &str, storage: Storage) {
+            match storage {
+                Storage::Gated => {
+                    self.gated
+                        .lock()
+                        .expect("lock")
+                        .insert(name.to_owned(), secret.to_owned());
+                }
+                Storage::Ungated(reason) => {
+                    self.plain
+                        .lock()
+                        .expect("lock")
+                        .insert(name.to_owned(), (secret.to_owned(), reason));
+                }
+            }
         }
 
         fn prompt(&self) -> Result<(), Refusal> {
@@ -425,23 +466,24 @@ mod tests {
             name: &str,
             storage: Storage,
         ) -> Result<Option<String>, Refusal> {
-            let unentitled = self.script.lock().expect("lock").cannot == Some(Cannot::Entitlement);
-            let item = self.items.lock().expect("lock").get(name).cloned();
-            match item {
-                Some((_, Storage::Gated)) if unentitled => Err(Refusal::NoEntitlement),
-                None if unentitled && storage == Storage::Gated => Err(Refusal::NoEntitlement),
-                Some((secret, Storage::Gated)) => {
-                    if !*self.approved.lock().expect("lock") {
-                        if self.script.lock().expect("lock").explicit_open {
-                            return Err(Refusal::Other(ClientError::Auth("store shut".into())));
-                        }
-                        self.prompt()?;
-                    }
-                    Ok(Some(secret))
-                }
-                Some((secret, Storage::Ungated(_))) => Ok(Some(secret)),
-                None => Ok(None),
+            let script = *self.script.lock().expect("lock");
+            if storage != Storage::Gated {
+                let plain = self.plain.lock().expect("lock");
+                return Ok(plain.get(name).map(|item| item.0.clone()));
             }
+            if script.cannot == Some(Cannot::Gate) {
+                return Err(Refusal::Unsupported);
+            }
+            let Some(secret) = self.gated.lock().expect("lock").get(name).cloned() else {
+                return Ok(None);
+            };
+            if !*self.approved.lock().expect("lock") {
+                if script.explicit_open {
+                    return Err(Refusal::Other(ClientError::Auth("store shut".into())));
+                }
+                self.prompt()?;
+            }
+            Ok(Some(secret))
         }
 
         fn write(
@@ -455,26 +497,40 @@ mod tests {
             if storage == Storage::Gated {
                 match script.cannot {
                     Some(Cannot::DeviceLock) => return Err(Refusal::NoDeviceLock),
-                    Some(Cannot::Entitlement) => return Err(Refusal::NoEntitlement),
+                    Some(Cannot::Gate) => return Err(Refusal::Unsupported),
                     None => {}
                 }
                 if script.explicit_open && !*self.approved.lock().expect("lock") {
                     return Err(Refusal::Other(ClientError::Auth("store shut".into())));
                 }
+                if script.creation_authorises {
+                    *self.approved.lock().expect("lock") = true;
+                }
             }
-            if storage == Storage::Gated && script.creation_authorises {
-                *self.approved.lock().expect("lock") = true;
-            }
-            self.items
-                .lock()
-                .expect("lock")
-                .insert(name.to_owned(), (secret.to_owned(), storage));
+            self.seed(name, secret, storage);
             Ok(())
         }
 
-        fn clear(&self, _service: &str, name: &str, _storage: Storage) -> Result<(), ClientError> {
-            self.items.lock().expect("lock").remove(name);
+        fn clear(&self, _service: &str, name: &str, storage: Storage) -> Result<(), ClientError> {
+            match storage {
+                Storage::Gated => self.gated.lock().expect("lock").remove(name).map(drop),
+                Storage::Ungated(_) => self.plain.lock().expect("lock").remove(name).map(drop),
+            };
             Ok(())
+        }
+
+        fn read_stranded(&self, _service: &str, name: &str) -> Result<Option<String>, Refusal> {
+            let Some(secret) = self.gated.lock().expect("lock").get(name).cloned() else {
+                return Ok(None);
+            };
+            if self.script.lock().expect("lock").key_gone {
+                self.gated.lock().expect("lock").clear();
+                return Ok(None);
+            }
+            if !*self.approved.lock().expect("lock") {
+                self.prompt()?;
+            }
+            Ok(Some(secret))
         }
 
         fn open(&self, _service: &str, probe: Option<&str>) -> Result<(), Refusal> {
@@ -482,7 +538,7 @@ mod tests {
             if script.explicit_open {
                 match script.cannot {
                     Some(Cannot::DeviceLock) => return Err(Refusal::NoDeviceLock),
-                    Some(Cannot::Entitlement) => return Err(Refusal::NoEntitlement),
+                    Some(Cannot::Gate) => return Err(Refusal::Unsupported),
                     None => {}
                 }
                 return self.prompt();
@@ -634,7 +690,7 @@ mod tests {
     #[test]
     fn a_first_read_without_the_entitlement_falls_back_before_any_write() {
         let (gate, fake) = gate(Script {
-            cannot: Some(Cannot::Entitlement),
+            cannot: Some(Cannot::Gate),
             ..Script::default()
         });
         assert_eq!(gate.read(TOKEN).expect("falls back"), None);
@@ -649,7 +705,7 @@ mod tests {
     #[test]
     fn a_build_without_the_entitlement_reports_the_gate_unsupported() {
         let (gate, fake) = gate(Script {
-            cannot: Some(Cannot::Entitlement),
+            cannot: Some(Cannot::Gate),
             ..Script::default()
         });
         gate.write(KEY, "key").expect("falls back");
@@ -688,7 +744,7 @@ mod tests {
         assert_eq!(gate.protection(), Custody::Verified);
 
         let (unentitled, _) = super::tests::gate(Script {
-            cannot: Some(Cannot::Entitlement),
+            cannot: Some(Cannot::Gate),
             ..Script::default()
         });
         unentitled.write(KEY, "key").expect("falls back");
@@ -749,7 +805,7 @@ mod tests {
     #[test]
     fn an_unlock_once_store_that_cannot_gate_falls_back_at_its_first_access() {
         for (cannot, reason) in [
-            (Cannot::Entitlement, NoGate::Unsupported),
+            (Cannot::Gate, NoGate::Unsupported),
             (Cannot::DeviceLock, NoGate::Offerable),
         ] {
             let (gate, fake) = gate(Script {
@@ -762,6 +818,144 @@ mod tests {
             assert_eq!(gate.protection(), Custody::Unverified(reason));
             assert_eq!(gate.read(TOKEN).expect("read").as_deref(), Some("refresh"));
             assert_eq!(gate.ask(), GateAskOutcome::Approved);
+            assert_eq!(fake.prompts(), 0);
+        }
+    }
+
+    /// Both kinds of platform store, the one prompting at a gated read and the
+    /// one opened by a ceremony before it.
+    const STORES: [Script; 2] = [
+        Script {
+            dismiss: false,
+            cannot: None,
+            explicit_open: false,
+            creation_authorises: false,
+            key_gone: false,
+        },
+        Script {
+            dismiss: false,
+            cannot: None,
+            explicit_open: true,
+            creation_authorises: false,
+            key_gone: false,
+        },
+    ];
+
+    const PLAIN: Storage = Storage::Ungated(NoGate::Offerable);
+
+    #[test]
+    fn a_secret_stored_ungated_moves_behind_the_gate_and_verifies_nothing() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            fake.seed(KEY, "key", PLAIN);
+            assert_eq!(gate.read(KEY).expect("read").as_deref(), Some("key"));
+            assert_eq!(fake.storage_of(KEY), Some(Storage::Gated));
+            let ceremony = usize::from(script.explicit_open);
+            assert_eq!(fake.prompts(), ceremony, "the move itself raises no prompt");
+            assert_eq!(
+                gate.is_open(),
+                script.explicit_open,
+                "only a ceremony that ran verifies the user"
+            );
+            assert_eq!(gate.ask(), GateAskOutcome::Approved);
+            assert_eq!(fake.prompts(), 1, "one prompt per launch either way");
+        }
+    }
+
+    #[test]
+    fn a_gate_turned_off_moves_each_gated_secret_out_for_one_prompt() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            gate.configure(false);
+            fake.seed(KEY, "key", Storage::Gated);
+            fake.seed(TOKEN, "refresh", Storage::Gated);
+            assert_eq!(gate.read(KEY).expect("read").as_deref(), Some("key"));
+            assert_eq!(gate.read(TOKEN).expect("read").as_deref(), Some("refresh"));
+            assert_eq!(fake.storage_of(KEY), Some(PLAIN));
+            assert_eq!(fake.storage_of(TOKEN), Some(PLAIN));
+            assert_eq!(fake.prompts(), 1, "one prompt moves every secret");
+            assert_eq!(gate.protection(), Custody::Unverified(NoGate::Offerable));
+        }
+    }
+
+    #[test]
+    fn a_dismissed_move_out_refuses_the_read_and_keeps_the_secret_gated() {
+        for script in STORES {
+            let (gate, fake) = gate(Script {
+                dismiss: true,
+                ..script
+            });
+            gate.configure(false);
+            fake.seed(KEY, "key", Storage::Gated);
+            assert!(matches!(
+                gate.read(KEY),
+                Err(ClientError::SecretStore(
+                    crate::keyring::SecretStoreError::PromptDismissed
+                ))
+            ));
+            assert_eq!(fake.storage_of(KEY), Some(Storage::Gated));
+        }
+    }
+
+    #[test]
+    fn a_gated_secret_whose_key_is_gone_reads_as_none_once_ungated() {
+        let (gate, fake) = gate(Script {
+            key_gone: true,
+            cannot: Some(Cannot::DeviceLock),
+            ..STORES[1]
+        });
+        fake.seed(KEY, "key", Storage::Gated);
+        assert_eq!(gate.read(KEY).expect("read"), None);
+        assert_eq!(fake.storage_of(KEY), None, "the dead copy is discarded");
+        assert_eq!(fake.prompts(), 0);
+    }
+
+    #[test]
+    fn an_ungated_read_of_nothing_prompts_for_nothing() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            gate.configure(false);
+            assert_eq!(gate.read(KEY).expect("read"), None);
+            assert_eq!(fake.prompts(), 0);
+        }
+    }
+
+    #[test]
+    fn a_write_leaves_one_copy_whichever_storage_held_the_last() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            fake.seed(TOKEN, "old", PLAIN);
+            gate.write(TOKEN, "rotated").expect("write");
+            assert_eq!(fake.storage_of(TOKEN), Some(Storage::Gated));
+
+            let (gate, fake) = super::tests::gate(script);
+            gate.configure(false);
+            fake.seed(TOKEN, "old", Storage::Gated);
+            gate.write(TOKEN, "rotated").expect("write");
+            assert_eq!(fake.storage_of(TOKEN), Some(PLAIN));
+            assert_eq!(fake.prompts(), 0, "dropping the gated copy never prompts");
+        }
+    }
+
+    #[test]
+    fn an_interrupted_move_reads_the_current_copy_and_the_next_write_drops_the_other() {
+        let (gate, fake) = gate(STORES[1]);
+        fake.seed(KEY, "moved", Storage::Gated);
+        fake.seed(KEY, "left behind", PLAIN);
+        assert_eq!(gate.read(KEY).expect("read").as_deref(), Some("moved"));
+        gate.write(KEY, "moved").expect("write");
+        assert_eq!(fake.storage_of(KEY), Some(Storage::Gated));
+    }
+
+    #[test]
+    fn a_delete_removes_both_copies_without_a_prompt_even_while_locked() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            fake.seed(TOKEN, "gated", Storage::Gated);
+            fake.seed(TOKEN, "plain", PLAIN);
+            gate.lock();
+            gate.clear(TOKEN).expect("delete");
+            assert_eq!(fake.storage_of(TOKEN), None);
             assert_eq!(fake.prompts(), 0);
         }
     }

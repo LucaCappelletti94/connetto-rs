@@ -26,6 +26,17 @@ const GATED_STORE: [(&str, &str); 3] = [
     ("user-auth-timeout", "0"),
 ];
 
+/// The API level a per-use Keystore key accepting the device credential needs.
+const ANDROID_11: u32 = 30;
+
+/// This device's API level, read as `0` when the property cannot be read.
+fn api_level() -> u32 {
+    android_system_properties::AndroidSystemProperties::new()
+        .get("ro.build.version.sdk")
+        .and_then(|level| level.parse().ok())
+        .unwrap_or(0)
+}
+
 /// The platform prompt an Android build unlocks its gated secrets through.
 ///
 /// `connetto-auth-session` implements both halves in Kotlin. An application
@@ -91,34 +102,59 @@ impl AndroidBackend {
             .clone()
     }
 
-    /// The gated store, created on first use. A device with no secure lock
-    /// screen, or a build with no prompt, cannot have one.
+    /// The gated store, created on first use. A device before Android 11 or
+    /// with no secure lock screen, or a build with no prompt, cannot have one.
     fn gated_store(&self) -> Result<Arc<Store>, Refusal> {
         let mut gated = self.gated.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(store) = gated.as_ref() {
             return Ok(Arc::clone(store));
         }
+        if api_level() < ANDROID_11 {
+            return Err(Refusal::Unsupported);
+        }
         let Some(prompt) = self.prompt() else {
-            return Err(Refusal::NoEntitlement);
+            return Err(Refusal::Unsupported);
         };
         if !prompt.device_secure().map_err(Refusal::Other)? {
             return Err(Refusal::NoDeviceLock);
         }
-        let config = HashMap::from(GATED_STORE);
-        let store = match Store::new_with_configuration(&config) {
-            Ok(store) => store,
-            // The key went with the screen lock, so every secret it sealed is
-            // gone. Start the store over and report the loss once.
-            Err(keyring_core::Error::BadStoreFormat(reason)) => {
-                tracing::warn!(%reason, "the gated store's Keystore key is gone, starting it over");
-                Store::delete(&config).map_err(|err| other(&err))?;
-                *self.lost.lock().unwrap_or_else(PoisonError::into_inner) = true;
-                Store::new_with_configuration(&config).map_err(|err| other(&err))?
-            }
-            Err(err) => return Err(other(&err)),
-        };
+        if let Some(store) = self.existing(&mut gated)? {
+            return Ok(store);
+        }
+        let store = Store::new_with_configuration(&HashMap::from(GATED_STORE))
+            .map_err(|err| other(&err))?;
         *gated = Some(Arc::clone(&store));
         Ok(store)
+    }
+
+    /// The gated store when one exists, never creating one.
+    fn existing_gated(&self) -> Result<Option<Arc<Store>>, Refusal> {
+        self.existing(&mut self.gated.lock().unwrap_or_else(PoisonError::into_inner))
+    }
+
+    /// The gated store behind `gated` when one exists, deleting a store whose
+    /// key went with the screen lock and reporting that loss once.
+    fn existing(&self, gated: &mut Option<Arc<Store>>) -> Result<Option<Arc<Store>>, Refusal> {
+        if let Some(store) = gated.as_ref() {
+            return Ok(Some(Arc::clone(store)));
+        }
+        let config = HashMap::from(GATED_STORE);
+        if api_level() < ANDROID_11 || !Store::exists(&config).map_err(|err| other(&err))? {
+            return Ok(None);
+        }
+        match Store::new_with_configuration(&config) {
+            Ok(store) => {
+                *gated = Some(Arc::clone(&store));
+                Ok(Some(store))
+            }
+            Err(keyring_core::Error::BadStoreFormat(reason)) => {
+                tracing::warn!(%reason, "the gated store's Keystore key is gone, discarding it");
+                Store::delete(&config).map_err(|err| other(&err))?;
+                *self.lost.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                Ok(None)
+            }
+            Err(err) => Err(other(&err)),
+        }
     }
 
     fn entry(&self, service: &str, name: &str, storage: Storage) -> Result<Entry, Refusal> {
@@ -152,18 +188,45 @@ impl Backend for AndroidBackend {
     }
 
     fn clear(&self, service: &str, name: &str, storage: Storage) -> Result<(), ClientError> {
-        let entry = self
-            .entry(service, name, storage)
-            .map_err(ClientError::from)?;
+        let entry = match storage {
+            Storage::Gated => match self.existing_gated()? {
+                Some(store) => store.build(service, name, None),
+                None => return Ok(()),
+            },
+            Storage::Ungated(_) => self.plain.build(service, name, None),
+        }
+        .map_err(|err| ClientError::from(other(&err)))?;
         match entry.delete_credential() {
             Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
             Err(err) => Err(refusal(&err).into()),
         }
     }
 
+    fn read_stranded(&self, service: &str, name: &str) -> Result<Option<String>, Refusal> {
+        let Some(store) = self.existing_gated()? else {
+            return Ok(None);
+        };
+        let entry = store
+            .build(service, name, None)
+            .map_err(|err| other(&err))?;
+        match entry.get_credential() {
+            Ok(_) => {}
+            Err(keyring_core::Error::NoEntry) => return Ok(None),
+            Err(err) => return Err(refusal(&err)),
+        }
+        if let Err(keyring_core::Error::NoStorageAccess(_)) = entry.get_password() {
+            self.open(service, None)?;
+        }
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(err) => Err(refusal(&err)),
+        }
+    }
+
     fn open(&self, _service: &str, _probe: Option<&str>) -> Result<(), Refusal> {
         let store = self.gated_store()?;
-        let prompt = self.prompt().ok_or(Refusal::NoEntitlement)?;
+        let prompt = self.prompt().ok_or(Refusal::Unsupported)?;
         let cipher = store.begin_unlock().map_err(|err| other(&err))?;
         if !prompt.approve(&cipher).map_err(Refusal::Other)? {
             return Err(Refusal::Dismissed);

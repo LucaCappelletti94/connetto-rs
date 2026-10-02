@@ -490,6 +490,50 @@ async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
     );
 }
 
+/// A schema with row-level-security policies still forgets its device, since
+/// the stand-in that replaces the closed replica holds none of its views.
+#[tokio::test]
+async fn a_client_whose_schema_has_policies_forgets_its_device() {
+    let ddl = "
+CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
+CREATE VIEW orders AS SELECT id, owner_id FROM orders_rls WHERE owner_id = current_app_user();
+";
+    let schema = SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        ddl,
+        vec![("orders", "orders_rls")],
+        vec!["orders"],
+        None::<&str>,
+    ));
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let keys = super::support::SharedKeys::default();
+    let credential = super::support::held("alice");
+    let record = credential.replica_name().to_owned();
+    let path = dir.path().join(&record);
+    keys.store(&record, &connetto_core::test_support::replica_key())
+        .await
+        .expect("seed the key");
+    let client = NativeClientBuilder::new("ws://127.0.0.1:1/", schema)
+        .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+        .signed_in(credential)
+        .durable(dir.path(), keys.clone())
+        .with_gate(Gate::off())
+        .connect()
+        .await
+        .expect("the durable client opens offline");
+
+    client
+        .forget_device(true)
+        .await
+        .expect("a schema with policies forgets its device");
+    assert!(!path.exists(), "the replica is gone");
+    assert!(
+        keys.load(&record).await.expect("load").is_none(),
+        "and its key record"
+    );
+}
+
 /// How many of this process's open file descriptors point at `path` or its sidecars.
 #[cfg(target_os = "linux")]
 fn open_handles_to(path: &std::path::Path) -> usize {

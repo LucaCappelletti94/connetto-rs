@@ -2447,7 +2447,12 @@ where
     /// [`ClientError`] when the in-memory database cannot be opened.
     #[cfg(feature = "native-auth")]
     pub(crate) fn emptied(&self) -> Result<Self, ClientError> {
-        Self::open(&Replica::in_memory(), "", &self.config, None)
+        // The stand-in has no schema, so the build's policy views are absent by design.
+        let config = self
+            .config
+            .clone()
+            .with_policy_tables(PolicyTables::default());
+        Self::open(&Replica::in_memory(), "", &config, None)
     }
 
     /// Shared open body: open the database, unlock the page codec, apply the

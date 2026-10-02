@@ -6,6 +6,7 @@
 //! the first unlock enrolls and every later unlock asserts. The prompt needs
 //! a live window, which the application lends through [`HelloOwner`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -91,7 +92,7 @@ impl WindowsBackend {
     /// The gated store, where this build and machine can gate at all.
     fn gated_store(&self, service: &str) -> Result<Arc<HelloStore>, Refusal> {
         if self.owner().is_none() {
-            return Err(Refusal::NoEntitlement);
+            return Err(Refusal::Unsupported);
         }
         HelloStore::capability().map_err(|err| refusal_of(&err))?;
         self.hello_store(service).map_err(Refusal::Other)
@@ -162,6 +163,52 @@ impl Backend for WindowsBackend {
         }
     }
 
+    fn read_stranded(&self, service: &str, name: &str) -> Result<Option<String>, Refusal> {
+        let store = self.hello_store(service).map_err(Refusal::Other)?;
+        let held = store
+            .search(&HashMap::new())
+            .map_err(|err| other(&err))?
+            .iter()
+            .any(|entry| {
+                entry
+                    .get_specifiers()
+                    .is_some_and(|(held_service, user)| held_service == service && user == name)
+            });
+        if !held {
+            return Ok(None);
+        }
+        let entry = store
+            .build(service, name, None)
+            .map_err(|err| other(&err))?;
+        if let Err(keyring_core::Error::NoStorageAccess(_)) = entry.get_password() {
+            match self.unlock(&store) {
+                Ok(()) => {}
+                Err(
+                    HelloError::KeyLost
+                    | HelloError::Corrupt(_)
+                    | HelloError::Discarding
+                    | HelloError::Unsupported(_),
+                ) => {
+                    tracing::warn!(
+                        "the gated store's Windows Hello credential is gone, discarding it"
+                    );
+                    store
+                        .discard(DISCARD_WINDOW)
+                        .map_err(|err| Refusal::Other(hello(&err)))?;
+                    *self.gated.lock().unwrap_or_else(PoisonError::into_inner) = None;
+                    *self.lost.lock().unwrap_or_else(PoisonError::into_inner) = true;
+                    return Ok(None);
+                }
+                Err(err) => return Err(refusal_of(&err)),
+            }
+        }
+        match entry.get_password() {
+            Ok(secret) => Ok(Some(secret)),
+            Err(keyring_core::Error::NoEntry) => Ok(None),
+            Err(err) => Err(refusal(&err)),
+        }
+    }
+
     fn open(&self, service: &str, _probe: Option<&str>) -> Result<(), Refusal> {
         let store = self.gated_store(service)?;
         match self.unlock(&store) {
@@ -195,7 +242,7 @@ fn refusal_of(err: &HelloError) -> Refusal {
         HelloError::Cancelled | HelloError::TimedOut | HelloError::MissingOwner => {
             Refusal::Dismissed
         }
-        HelloError::Unsupported(_) => Refusal::NoEntitlement,
+        HelloError::Unsupported(_) => Refusal::Unsupported,
         HelloError::Locked => Refusal::Other(ClientError::Locked),
         other_err => Refusal::Other(hello(other_err)),
     }

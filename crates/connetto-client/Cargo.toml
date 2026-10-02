@@ -53,6 +53,7 @@ native-auth = [
   "dep:windows-native-keyring-store",
   "dep:android-native-keyring-store",
   "dep:jni",
+  "dep:android_system_properties",
   "dep:webbrowser",
   "dep:open",
   "dep:connetto-schema",
@@ -224,6 +225,8 @@ android-native-keyring-store = { version = "1.0.0", optional = true }
 # The `javax.crypto.Cipher` the gated store hands the unlock prompt (R52), the
 # same jni the store and the Dioxus bridge link.
 jni = { version = "0.21", optional = true }
+# The API level, since the gated store needs Android 11.
+android_system_properties = { version = "0.1.6", optional = true }
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
