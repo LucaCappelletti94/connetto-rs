@@ -330,7 +330,8 @@ async fn recheck_after_time_away(
     device
         .adb(&["shell", "input", "keyevent", "KEYCODE_HOME"])
         .await?;
-    sleep(RECHECK_AFTER + Duration::from_secs(5)).await;
+    // The CI emulator draws a frame in seconds, so the app can see its suspension late.
+    sleep(RECHECK_AFTER + Duration::from_secs(30)).await;
     device.launch().await?;
     unlock.approve(device, evidence, "recheck-unlock").await?;
     let mut app = device.app().await?;
