@@ -93,7 +93,7 @@ security-framework = { git = "https://github.com/LucaCappelletti94/rust-security
 # R52, until released: user authentication on named stores (#28), a store the
 # app unlocks once per approval, the Android 13 expiry refusal, and a lost
 # Keystore key reported instead of replaced (#27), integrated on upstream main.
-android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "bcb27e8f6def5ed78dc75103562df63cad78f017" }
+android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "ae12291f8f75e90da1adb819de0d545e299b4318" }
 # R53, until released: the Windows Hello PRF named store with keyless entry
 # deletion, explicit store discard, and user-scoped locks.
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "01d7620665ed0e118cd4a1a6e74a14be2eed07ad" }
