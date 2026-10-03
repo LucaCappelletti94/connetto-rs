@@ -38,6 +38,8 @@ mod deployment_schema;
 
 mod e2e;
 
+mod enrolment;
+
 mod epoch;
 
 mod grants;

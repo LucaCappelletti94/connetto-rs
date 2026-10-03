@@ -11,12 +11,23 @@ const DEFAULT_LIFETIME: Duration = Duration::from_hours(24);
 const DEFAULT_CEILING: Duration = Duration::from_hours(24 * 30);
 /// How long before its issuer expires the server starts warning (R74 decision 14).
 const EXPIRY_WARNING: Duration = Duration::from_hours(24 * 60);
+/// How long an enrolment nonce stays valid.
+const CHALLENGE_WINDOW: Duration = Duration::from_secs(60);
+
+mod enrolment;
+
+pub(crate) use enrolment::PendingChallenge;
+pub use enrolment::{
+    DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore, MemoryEnrolments,
+    Recorded,
+};
 
 /// The issuer and the lifetimes it grants.
 pub struct DeviceCertConfig {
     issuer: DeviceIssuer,
     default_lifetime: Duration,
     ceiling: Duration,
+    challenge_window: Duration,
 }
 
 /// A requested lifetime over the ceiling, refused and never shortened.
@@ -62,6 +73,7 @@ impl DeviceCertConfig {
             issuer,
             default_lifetime: DEFAULT_LIFETIME,
             ceiling: DEFAULT_CEILING,
+            challenge_window: CHALLENGE_WINDOW,
         }
     }
 
@@ -77,6 +89,19 @@ impl DeviceCertConfig {
     pub const fn with_lifetime_ceiling(mut self, ceiling: Duration) -> Self {
         self.ceiling = ceiling;
         self
+    }
+
+    /// How long an enrolment nonce stays valid, 60 seconds by default.
+    #[must_use]
+    pub const fn with_challenge_window(mut self, window: Duration) -> Self {
+        self.challenge_window = window;
+        self
+    }
+
+    /// How long an enrolment nonce stays valid.
+    #[must_use]
+    pub const fn challenge_window(&self) -> Duration {
+        self.challenge_window
     }
 
     /// The issuer.

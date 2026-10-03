@@ -27,11 +27,12 @@ use std::time::{Duration, Instant};
 use connetto_core::auth::{Principal, Subject};
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR,
-    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, FatalError,
-    FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch,
-    MembershipOpened, MutationApplied, MutationConflict, MutationHeader, MutationPatch,
-    MutationReject, MutationRejectReason, NonFatalError, PauseCause, Pong, RateLimited,
-    SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
+    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, EnrolChallenge,
+    EnrolRefusal, EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired,
+    Handshake, HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict,
+    MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause,
+    Pong, RateLimited, SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+    SubscriptionSpec,
 };
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
@@ -1384,6 +1385,8 @@ struct SessionState<Id, Key> {
     /// after the frame that crossed it. A caller with no identity has no name
     /// to ban, so closing the socket is the whole outcome.
     closing: bool,
+    /// The enrolment nonce this session was last handed, spent by its next enrolment request.
+    enrol_challenge: Option<crate::device_cert::PendingChallenge>,
 }
 
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
@@ -1466,6 +1469,9 @@ pub struct SessionManager<
     /// Optional like the upkeep. Without one, a move-out escalates to the R7
     /// replace instead of withdrawing incrementally.
     withdrawal_source: OnceLock<Snap>,
+    /// Issues device certificates (R74). Without one, every enrolment is
+    /// refused as [`EnrolRefusal::IssuerUnavailable`].
+    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<Id>>>,
     /// The deployment's content ticket signer, called after a successful
     /// visibility check to mint a signed URL the caller may use at the file
     /// server. Generic rather than boxed so a deployment wires it at compile
@@ -1562,6 +1568,7 @@ where
         upkeep,
         second_opinion: second_opinion.map(OnceLock::from).unwrap_or_default(),
         withdrawal_source: withdrawal_source.map(OnceLock::from).unwrap_or_default(),
+        device_enrolment: OnceLock::new(),
         signer,
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
@@ -1613,6 +1620,18 @@ where
     /// The source handed over, when one is already installed.
     pub fn install_withdrawal_source(&self, source: Snap) -> Result<(), Snap> {
         self.withdrawal_source.set(source)
+    }
+
+    /// Enrol devices through `enrolment` (R74), set once after construction.
+    ///
+    /// # Errors
+    ///
+    /// The enrolment handed over, when one is already installed.
+    pub fn install_device_enrolment(
+        &self,
+        enrolment: Arc<crate::device_cert::DeviceEnrolment<Id>>,
+    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<Id>>> {
+        self.device_enrolment.set(enrolment)
     }
 
     /// Which refusal a transition failure is.
@@ -3574,6 +3593,7 @@ where
             resume,
             resume_read_budget,
             closing: refused == Reaction::Close,
+            enrol_challenge: None,
         };
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
@@ -3809,6 +3829,24 @@ where
             .map_err(transport_err)
     }
 
+    /// The installed enrolment and the account enrolling, or why this session cannot enrol.
+    fn enrolling(
+        &self,
+        state: &SessionState<Id, Key>,
+    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<Id>>, Id), EnrolRefusal> {
+        let user = state
+            .principal
+            .identity()
+            .ok_or(EnrolRefusal::Unidentified)?
+            .user_id
+            .clone();
+        let enrolment = self
+            .device_enrolment
+            .get()
+            .ok_or(EnrolRefusal::IssuerUnavailable)?;
+        Ok((Arc::clone(enrolment), user))
+    }
+
     async fn handle_control<T: Transport>(
         &self,
         transport: &mut T,
@@ -3861,6 +3899,42 @@ where
             }
             ControlMessage::ContentTicketRequest(req) => {
                 self.handle_content_ticket(transport, req, state).await
+            }
+            ControlMessage::EnrolChallengeRequest(req) => {
+                let answer = self
+                    .enrolling(state)
+                    .and_then(|(enrolment, _)| enrolment.challenge(&mut state.enrol_challenge));
+                let request_id = req.request_id;
+                let answer = match answer {
+                    Ok((nonce, window)) => ControlMessage::EnrolChallenge(EnrolChallenge {
+                        request_id,
+                        nonce,
+                        expires_in_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                    }),
+                    Err(reason) => {
+                        ControlMessage::EnrolRefused(EnrolRefused { request_id, reason })
+                    }
+                };
+                transport.send_control(answer).await.map_err(transport_err)
+            }
+            ControlMessage::EnrolRequest(req) => {
+                let request_id = req.request_id.clone();
+                let answer = match self.enrolling(state) {
+                    Ok((enrolment, user)) => {
+                        enrolment
+                            .enrol(&user, state.session_id, &mut state.enrol_challenge, req)
+                            .await
+                    }
+                    Err(refusal) => {
+                        state.enrol_challenge = None;
+                        Err(refusal)
+                    }
+                };
+                let answer = answer.map_or_else(
+                    |reason| ControlMessage::EnrolRefused(EnrolRefused { request_id, reason }),
+                    ControlMessage::EnrolGrant,
+                );
+                transport.send_control(answer).await.map_err(transport_err)
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
