@@ -86,7 +86,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 [[package]]
 name = "android-native-keyring-store"
 version = "1.0.0"
-source = "git+https://github.com/LucaCappelletti94/android-native-keyring-store?rev=9242bf8d59b1edd9ebd6ebcb1efc7b55623688d2#9242bf8d59b1edd9ebd6ebcb1efc7b55623688d2"
+source = "git+https://github.com/LucaCappelletti94/android-native-keyring-store?rev=0241aab48b0ff5dfcefb5c8f2eba5e4289dbefec#0241aab48b0ff5dfcefb5c8f2eba5e4289dbefec"
 dependencies = [
  "base64 0.22.1",
  "jni 0.21.1",
