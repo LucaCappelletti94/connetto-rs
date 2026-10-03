@@ -218,6 +218,10 @@ pub enum ClientError {
     #[cfg(feature = "device-identity")]
     #[error(transparent)]
     DeviceKey(#[from] device_key::DeviceKeyStoreError),
+    /// The security chip refused to hold or use a device key (R74).
+    #[cfg(feature = "device-identity")]
+    #[error(transparent)]
+    DeviceChip(device_key::ChipError),
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///

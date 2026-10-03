@@ -1112,6 +1112,7 @@ dependencies = [
  "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
+ "core-foundation",
  "diesel",
  "diesel-async",
  "diesel-sqlite-session",

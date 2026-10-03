@@ -11,6 +11,11 @@ use zeroize::Zeroizing;
 
 use crate::ClientError;
 
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod apple;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub use apple::EnclaveKey;
+
 /// Why no device key could be made.
 #[derive(Debug, thiserror::Error)]
 pub enum DeviceKeyStoreError {
@@ -126,6 +131,108 @@ pub(crate) async fn open_software_key(
     records.write(&name, &encoded).await?;
     let key = SoftwareKey::from_pkcs8(rng, &der).ok_or(DeviceKeyStoreError::Unreadable)?;
     Ok(OpenedKey { key, created: true })
+}
+
+/// One platform's security chip, as the open order drives it.
+pub(crate) trait ChipKeys: Send + Sync {
+    /// The key the chip holds.
+    type Key: DeviceKey + 'static;
+    /// The key stored under `label`, `None` when the chip holds none.
+    ///
+    /// # Errors
+    ///
+    /// [`ChipError`] when the chip cannot be asked.
+    fn find(&self, label: &str) -> Result<Option<Self::Key>, ChipError>;
+    /// Create a key under `label`, usable once the device was unlocked since
+    /// its restart (decision 11).
+    ///
+    /// # Errors
+    ///
+    /// [`ChipError::Unavailable`] when this device has no usable chip.
+    fn create(&self, label: &str) -> Result<Self::Key, ChipError>;
+}
+
+/// Why a chip could not hold a device key.
+#[derive(Debug, thiserror::Error)]
+pub enum ChipError {
+    /// No usable chip, so the device keeps a software key (decision 16).
+    #[error("no usable key chip: {0}")]
+    Unavailable(String),
+    /// The chip failed for another reason.
+    #[error("the key chip failed")]
+    Failed(#[source] Box<dyn std::error::Error + Send + Sync>),
+}
+
+/// The label a chip stores `account`'s key under for the app `service`.
+fn chip_label(service: &str, account: &str) -> String {
+    format!("connetto-device-key:{service}:{account}")
+}
+
+/// Open `account`'s device key, preferring the chip.
+///
+/// The chip's key wins when it holds one. Otherwise a stored software key
+/// wins, so a device that fell back once keeps its identity. Otherwise the
+/// chip makes a key, and a device without a usable chip makes a software key
+/// in `records` instead.
+///
+/// # Errors
+///
+/// The chip's failure other than [`ChipError::Unavailable`], or the store's.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "R74 step 3's enrolment opens the key")
+)]
+pub(crate) async fn open_device_key<C: ChipKeys + 'static>(
+    chip: std::sync::Arc<C>,
+    records: &impl KeyRecords,
+    service: &str,
+    account: &str,
+) -> Result<OpenedKey<Box<dyn DeviceKey>>, ClientError> {
+    let label = chip_label(service, account);
+    let found = {
+        let (chip, label) = (std::sync::Arc::clone(&chip), label.clone());
+        blocking(move || chip.find(&label)).await?
+    };
+    if let Some(key) = found {
+        return Ok(OpenedKey {
+            key: Box::new(key),
+            created: false,
+        });
+    }
+    let name = crate::device_key_record(account);
+    if records.read(&name).await?.is_some() {
+        let opened = open_software_key(records, account).await?;
+        return Ok(boxed(opened));
+    }
+    match blocking(move || chip.create(&label)).await {
+        Ok(key) => Ok(OpenedKey {
+            key: Box::new(key),
+            created: true,
+        }),
+        Err(ClientError::DeviceChip(ChipError::Unavailable(reason))) => {
+            tracing::warn!(%reason, "no usable key chip, keeping a software device key");
+            Ok(boxed(open_software_key(records, account).await?))
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn boxed(opened: OpenedKey<SoftwareKey>) -> OpenedKey<Box<dyn DeviceKey>> {
+    OpenedKey {
+        key: Box::new(opened.key),
+        created: opened.created,
+    }
+}
+
+/// Run a chip call off the async runtime, since a TPM takes hundreds of
+/// milliseconds to sign.
+async fn blocking<T: Send + 'static>(
+    call: impl FnOnce() -> Result<T, ChipError> + Send + 'static,
+) -> Result<T, ClientError> {
+    tokio::task::spawn_blocking(call)
+        .await
+        .map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))?
+        .map_err(ClientError::DeviceChip)
 }
 
 #[cfg(test)]

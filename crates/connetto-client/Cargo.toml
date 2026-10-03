@@ -41,7 +41,7 @@ postgres-types = ["diesel/postgres_backend"]
 # Native only, never wasm (the browser worker owns token custody there).
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
-device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring"]
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -151,7 +151,7 @@ getrandom = { version = "0.3", optional = true }
 # statement built from a ReplicaKey, and the hex a KeyringKeyStore persists.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
 # The software device key (R74 decision 16), the same ring rustls signs with.
-ring = { version = "0.17", optional = true }
+ring = { version = "0.17", features = ["std"], optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
 connetto-schema = { workspace = true, optional = true }
@@ -185,14 +185,18 @@ apple-native-keyring-store = { version = "1.0.2", features = [
   "protected",
 ], optional = true }
 # The keychain status codes behind a store refusal: a dismissed sheet, no
-# passcode, a missing entitlement.
-security-framework = { version = "3.7", optional = true }
+# passcode, a missing entitlement. `OSX_10_15` reaches the data protection
+# keychain, where the Secure Enclave keeps the device key (R74).
+security-framework = { version = "3.7", features = ["OSX_10_15"], optional = true }
+# The enclave's refusals arrive as `CFError`, which is not `Send`.
+core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 apple-native-keyring-store = { version = "1.0.2", features = [
   "protected",
 ], optional = true }
 security-framework = { version = "3.7", optional = true }
+core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
