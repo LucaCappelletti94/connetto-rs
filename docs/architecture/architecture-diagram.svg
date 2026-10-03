@@ -326,7 +326,7 @@
   <g id="native-client-zone">
     <rect x="980" y="20" width="660" height="760" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
     <text x="1310" y="46" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Native client (Dioxus app)</text>
-    <text x="1310" y="62" text-anchor="middle" font-size="10" fill="#4CAF50">connetto-client, in this repo, built and verified</text>
+    <text x="1310" y="62" text-anchor="middle" font-size="10" fill="#4CAF50">connetto-client, built and verified, constructed through NativeClientBuilder</text>
 
     <!-- ConnettoConnection -->
     <rect x="995" y="74" width="630" height="164" rx="8" fill="#E8F5E9" stroke="#4CAF50" stroke-width="1.5" />
@@ -505,7 +505,7 @@
       <rect width="296" height="76" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1" />
       <rect width="3" height="76" rx="1" fill="#4CAF50" />
       <text x="148" y="16" text-anchor="middle" font-size="11" font-weight="600" fill="#2E7D32">DB worker (connetto-web)</text>
-      <text x="148" y="32" text-anchor="middle" font-size="8.5" fill="#888">boot_db_worker, OPFS sahpool replica</text>
+      <text x="148" y="32" text-anchor="middle" font-size="8.5" fill="#888">WebClientBuilder boot, OPFS sahpool replica</text>
       <text x="148" y="47" text-anchor="middle" font-size="8.5" fill="#888">upstream ConnettoClient plus capture</text>
       <text x="148" y="62" text-anchor="middle" font-size="8.5" fill="#888">RelayHub fan-out to tab mirrors</text>
     </g>
