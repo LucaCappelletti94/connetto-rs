@@ -169,7 +169,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | any | R94 | One client builder per platform from shared configuration pieces. Needs nothing, and R51, R52, R74 and R95 wait on it |
 | blocked | R95 | Share keys added and removed on a running client. Blocked on R94 |
-| any | R96 | One server builder for programs that embed the server. Minted undesigned, so it starts with its design |
+| any | R96 | One server builder for programs that embed the server. Designed 2026-10-03, and R91 waits on it |
 | any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
@@ -214,12 +214,12 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
-| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20 | nothing. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
+| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20, waiting on R96 since 2026-10-03 | R96, so its login route and registry cache are built on the server builder once. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
 | R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | STARTED 2026-09-28, minted and designed 2026-09-25 while planning R51, open points settled 2026-09-28, every construction site on the builders 2026-09-29, proof 1 passed 2026-09-29 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | R94. One decision and one open question in the section | no |
-| R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, undesigned | nothing, its design comes first | no |
+| R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | IN PROGRESS, built 2026-10-02, proven on Windows and macOS 2026-10-03 | the Linux refocus proof | no |
 | R53 Windows gate | **DONE** (2026-10-02) | nothing. `HelloStore` is taken from the upstream branch at `3109f4d` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
@@ -409,7 +409,7 @@ graph TD
   R94 --> R74
   U10[upstream windows-native-keyring-store:<br/>a Windows Hello PRF named store] -.->|patched until released| R53
   R53 --> R97[R97 the desktop login tab]
-  R96[R96 one server builder]
+  R96[R96 one server builder] --> R91
   R26 --> R56[R56 local data import]
   R54[R54 every demo carries every feature] --> R57[R57 demo gaps from the export audit]
   R58[R58 read ceiling and keyset paging]
@@ -5497,7 +5497,9 @@ No durable credential exists in browser storage, the three auth endpoints serve 
 
 **Status.** NOT STARTED. Designed 2026-09-18 with the maintainer over one session, after an earlier attempt drifted, then reviewed twice the same night and corrected, recorded as decisions 2, 3, 11 and 12 below. Unblocked 2026-09-20 when the two caller fixes it waited on landed. The design record is `plans/apps-and-bots.md`, which carries every settled point with its date, the state table, the superseded shapes and the reasons, and outranks this section where they differ. `docs/prompt-apps-and-bots.md` is the superseded starting prompt.
 
-**Blocked on nothing.** The content-ticket caller fix (PR #41, 2026-09-20) carries both caller halves on the ticket and in the file server's rechecks, so an isolated session whose visibility comes from `inst:<id>` uploads with nothing more. The grant-move narrowing (PR #42, 2026-09-20) announces a moved grant to the subject it names, so an isolated uninstall resyncs that installation's session and no other. Both settings are always bound since PR #41's correction of chapter 08, a half the caller does not hold taking the absent marker, and every meter charges `meter_key` since the same day, which decision 10 overrides for a bot session. The file replica for bots is gated on R71 and ships with it, not here.
+**Blocked on R96** (decided with the maintainer 2026-10-03). The login exchange route and the session manager's registry cache are server construction, so they are built once on R96's builder rather than wired into the binary and moved again.
+
+**Its other prerequisites are met.** The content-ticket caller fix (PR #41, 2026-09-20) carries both caller halves on the ticket and in the file server's rechecks, so an isolated session whose visibility comes from `inst:<id>` uploads with nothing more. The grant-move narrowing (PR #42, 2026-09-20) announces a moved grant to the subject it names, so an isolated uninstall resyncs that installation's session and no other. Both settings are always bound since PR #41's correction of chapter 08, a half the caller does not hold taking the absent marker, and every meter charges `meter_key` since the same day, which decision 10 overrides for a bot session. The file replica for bots is gated on R71 and ships with it, not here.
 
 ### Purpose
 
@@ -5708,13 +5710,47 @@ A key added on a running client makes its rows appear in an open live query with
 
 ## R96: one server builder for programs that embed the server
 
-**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 11 at the maintainer's word, undesigned.
+**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 11 at the maintainer's word, designed 2026-10-03 with the maintainer. The working record, with the tree facts at `12fceca` and the sources read, is `plans/design-r96-server-builder.md` of the `connetto-rs-r96` worktree, copied to `~/.local/share/connetto-r88/notes/design-r96-server-builder.md`.
 
-**Blocked on nothing.** Its design comes first.
+**Blocked on nothing.** R91 waits on it (decided with the maintainer 2026-10-03), because R91 adds a login route and a registry cache to the server's construction, which this phase would otherwise move a second time. R74 does not wait, since its server half is two settings types with R37 setters that this builder gathers.
 
 ### Purpose
 
-The shipped server is configured by environment variables and builds its `SessionManager` and `Materializer` itself (`crates/connetto-server/src/bin/connetto-server.rs`). R37 gave the server's settings types `with_*` setters, but a Rust program embedding the server has no single builder, and the only `ServerConfig` is the test harness's. This phase gives it one, in the shape R94 settles for the client. Its contents and structure are designed with the maintainer before any code, as R94's were.
+The shipped server is configured by environment variables and builds everything itself. `crates/connetto-server/src/bin/connetto-server.rs` is 2103 lines, reads about 35 `CONNETTO_*` variables and wires the server through some 40 private functions, among them the ordering constraints R70 and R1 depend on. A Rust program embedding the server has to copy that wiring, the test harness carries a second partial copy in its `ServerConfig`, and 66 test sites build `SessionManager` by hand with 7 to 11 positional arguments. This phase gives the server one builder, in the shape R94 gave the client.
+
+### Decisions
+
+1. **Two terminals** (decided with the maintainer 2026-10-03). `build()` returns the parts, the routes, the change-stream future and a shutdown handle, for a program that mounts connetto into its own application. `serve(listener, shutdown)` binds and runs them. tonic's server builder offers the same pair (`serve` beside `serve_with_incoming`), and R94 decision 22 gave the client two terminals.
+2. **One router and one port** (researched at the maintainer's direction 2026-10-03). Sync becomes a WebSocket route at `/sync` beside `/auth` and `/files`, through an adapter from axum's WebSocket to connetto's `Transport`, which also brings WebSockets over HTTP/2 (axum 0.8). The parts expose the sync routes and the HTTP routes separately as well, so a deployment that gives WebSocket traffic dedicated hosts, as RFC 6455 section 1.8 suggests for larger setups, can split them. Rejected: the two listeners of today, since cookies are not isolated by port (RFC 6265 section 8.5), so the second port is no security boundary, and ElectricSQL and PowerSync each serve on one port.
+3. **OpenFGA is the only authorization the builder ships** (decided with the maintainer 2026-10-03). `RlsAuth::may_see` asks the live table, so it cannot answer for a row's previous version (`08-authorization.md`), and as the primary policy it would miss deletions and keep rows a caller left. Row-level security stays available as the optional second opinion, which only counts and names divergences.
+4. **One construction path** (decided with the maintainer 2026-10-03, as R94 decision 15 did for the client). The harness becomes a layer over the builder, every test site builds through it, and the `SessionManager` and `Materializer` constructors become internal. The seams only tests replace (the visibility policy, the handshake authority, the in-memory oplog, the loopback transport, injected pools, the in-memory auth store, ephemeral keys) sit behind a cargo feature the harness enables, so no production build can choose them.
+5. **`new` takes what has no honest default.** The owner and reader database URLs, the reader never falling back to the owner (R1), the two schema source documents with the version derived inside (R94 decisions 3 and 16), the persisted JWT keys, and the OpenFGA endpoint and store. Everything else is a setter over the existing R37 types: `SessionConfig`, `ReconnectPolicy`, `ThrottleConfig`, `AbuseLimits`, `OplogConfig`, `AuthConfig`, `ReaderReserve`, the OIDC providers, the redirect allowlist, the CORS origins, the cookie's `SameSite`, the slot, publication and oplog names, the writable tables, bans, audit and the content half.
+6. **Production takes the database auth store and persisted keys.** A restart under ephemeral keys invalidates every session, and an in-memory store forgets every session, so both move behind the test feature. The binary's environment contract changes with it: `CONNETTO_AUTH=in-memory` goes, and the JWT key files, and the ticket key when content is on, become required.
+7. **The default deployment tables come from the lib.** The binary's four table-macro instantiations (`Id = String`) move into the lib, and the builder's type parameters default to them, so a deployment with its own tables names its types.
+8. **The library never ends the process.** It installs no signal handler and starts no logging. A change stream that becomes unusable closes every session and ends the change-stream future with the error, and the binary decides to exit.
+9. **`build()` owns the ordering.** The preflight order, the epoch settled before any route is returned (R70 decisions 5 and 10), and the withdrawal source and the revocation and ban hooks installed once the manager exists, all move inside it. The binary becomes a translation from its environment to the builder.
+
+### Steps
+
+1. The adapter serving a session over axum's WebSocket, and the sync route.
+2. The default deployment types in the lib, then `ServerBuilder` with `new`, the setters, `build()` and `serve()`, carrying the binary's order.
+3. The binary rewritten over the builder, with the environment contract of decision 6.
+4. The test feature and its injection setters, the harness's `ServerConfig` as a layer over the builder, and every test site moved onto it, including the hand-rolled listeners and the auth-only and file-only stacks.
+5. The `SessionManager` and `Materializer` constructors made internal.
+6. The demo stacks, the device proofs and the browser stack on one port, the browser stack's development routes mounted on the parts.
+7. The chapters that describe the listeners, the environment and the embedding seam, and `connetto-server`'s crate documentation.
+
+### Proof
+
+1. An example program mounts the parts into its own axum application beside a route of its own, and a client syncs through it.
+2. The binary and both stacks serve sync, authentication and files on one port, and the e2e, restore and verified-topology suites and the Android and iOS device proofs pass against it.
+3. A change stream made unusable ends the change-stream future with the error and closes every session, and the process keeps running.
+4. A production build has no way to supply a visibility policy, the in-memory auth store or ephemeral keys.
+5. No test constructs `SessionManager` or `Materializer` directly, and every workspace builds and its tests pass.
+
+### Done when
+
+The binary, the harness, every test and an embedding program build the server through one builder, the server serves on one port, OpenFGA is the only primary authorization a build can choose, and the chapters describe the builder and the environment contract.
 
 ---
 
