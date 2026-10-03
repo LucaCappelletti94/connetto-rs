@@ -11,6 +11,10 @@ use zeroize::Zeroizing;
 
 use crate::ClientError;
 
+#[cfg(target_os = "android")]
+mod android;
+#[cfg(target_os = "android")]
+pub use android::{JavaAccess, KeystoreKey};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
