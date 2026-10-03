@@ -84,6 +84,7 @@ pub struct TabIdentity {
 use super::{
     aggregate::AggregateUpdate,
     content::{ContentTicketGrant, ContentTicketRequest},
+    enrolment::{EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefused, EnrolRequest},
     error::{FatalError, NonFatalError, RateLimited},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
@@ -138,6 +139,17 @@ pub enum ControlMessage {
     ContentTicketRequest(ContentTicketRequest),
     /// Server hands back the address that ticket authorizes.
     ContentTicketGrant(ContentTicketGrant),
+
+    /// Client asks for a nonce to enrol its device key (R74).
+    EnrolChallengeRequest(EnrolChallengeRequest),
+    /// Server hands back that nonce.
+    EnrolChallenge(EnrolChallenge),
+    /// Client asks for its device certificate.
+    EnrolRequest(EnrolRequest),
+    /// Server hands back the device certificate.
+    EnrolGrant(EnrolGrant),
+    /// Server refuses a challenge or an enrolment.
+    EnrolRefused(EnrolRefused),
 
     /// Client heartbeat probe.
     Ping(Ping),

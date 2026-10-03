@@ -9,6 +9,7 @@ pub mod aggregate;
 pub mod bulk;
 pub mod content;
 pub mod control;
+pub mod enrolment;
 pub mod error;
 pub mod flow;
 pub mod handshake;
@@ -20,6 +21,9 @@ pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
+pub use enrolment::{
+    EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest,
+};
 pub use error::{
     CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, FatalError, FatalErrorReason,
     NonFatalError, RateLimited, SUBSCRIPTION_REFUSED,

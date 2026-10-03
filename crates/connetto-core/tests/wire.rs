@@ -13,7 +13,8 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError,
+        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, EnrolChallenge,
+        EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError,
         FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
         LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
         MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, SnapshotBegin,
@@ -331,4 +332,66 @@ fn bulk_frames_round_trip() {
         99,
         vec![0x77, 0x88],
     )));
+}
+
+#[test]
+fn enrolment_control_round_trips() {
+    round_trip_control(&ControlMessage::EnrolChallengeRequest(
+        EnrolChallengeRequest {
+            request_id: "enrol-1".into(),
+        },
+    ));
+    round_trip_control(&ControlMessage::EnrolChallenge(EnrolChallenge {
+        request_id: "enrol-1".into(),
+        nonce: [7; 32],
+        expires_in_ms: 60_000,
+    }));
+    for lifetime_secs in [None, Some(86_400)] {
+        round_trip_control(&ControlMessage::EnrolRequest(EnrolRequest {
+            request_id: "enrol-2".into(),
+            csr: vec![0x30, 0x82, 0x01],
+            lifetime_secs,
+            descriptor: vec![0x93, 0x01, 0x02, 0x03],
+        }));
+    }
+    round_trip_control(&ControlMessage::EnrolGrant(EnrolGrant {
+        request_id: "enrol-2".into(),
+        chain: vec![
+            serde_bytes::ByteBuf::from(vec![0x30, 0x01]),
+            serde_bytes::ByteBuf::from(vec![0x30, 0x02]),
+        ],
+        revocation_lists: vec![serde_bytes::ByteBuf::from(vec![0x30, 0x03])],
+    }));
+    for reason in every_enrol_refusal() {
+        round_trip_control(&ControlMessage::EnrolRefused(EnrolRefused {
+            request_id: "enrol-2".into(),
+            reason,
+        }));
+    }
+}
+
+/// Every [`EnrolRefusal`]. The wildcard-free match stops this file compiling
+/// when a variant is added and not listed here.
+fn every_enrol_refusal() -> Vec<EnrolRefusal> {
+    let all = vec![
+        EnrolRefusal::Unidentified,
+        EnrolRefusal::IssuerUnavailable,
+        EnrolRefusal::ChallengeExpired,
+        EnrolRefusal::InvalidRequest,
+        EnrolRefusal::OverCeiling {
+            ceiling_secs: 2_592_000,
+        },
+        EnrolRefusal::Revoked,
+    ];
+    for reason in &all {
+        match reason {
+            EnrolRefusal::Unidentified
+            | EnrolRefusal::IssuerUnavailable
+            | EnrolRefusal::ChallengeExpired
+            | EnrolRefusal::InvalidRequest
+            | EnrolRefusal::OverCeiling { .. }
+            | EnrolRefusal::Revoked => {}
+        }
+    }
+    all
 }
