@@ -44,6 +44,7 @@ mod grouped_wire;
 mod failover;
 
 mod inprocess_loop;
+mod lifecycle;
 mod logging;
 
 mod macro_hygiene;

@@ -25,8 +25,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    LoopbackTransport, Materializer, PageSpec, ReconnectPolicy, RequestGuard, ResumePoint,
-    SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectPolicy,
+    ResumePoint, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
     loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
@@ -196,17 +196,19 @@ async fn connected_session(
     LoopbackTransport,
     tokio::task::JoinHandle<Result<(), SessionError>>,
 ) {
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         EmptySnapshot,
         DenyId2,
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
@@ -248,7 +250,9 @@ async fn connected_session(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_read_filter_withholds_a_denied_row_and_its_tombstone() {
     let fixture = Fixture::acquire().await;
-    let applier = Materializer::new(PG_DDL).expect("build applier");
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build applier");
     let mut replica = client_replica();
     let (manager, mut client, server) =
         connected_session(&fixture, "SELECT * FROM orders WHERE quantity > 0").await;

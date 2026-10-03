@@ -272,6 +272,7 @@ struct SessionRecord<Id> {
     retained: Option<crate::authn::provider::RetainedProviderToken>,
 }
 
+#[cfg(feature = "test-seams")]
 impl InMemoryAuthStore<String> {
     /// Build an empty store enforcing `lifetimes`, resolving identity to a
     /// deterministic UUID v5 string over `(issuer, subject)`.
@@ -284,6 +285,7 @@ impl InMemoryAuthStore<String> {
     }
 }
 
+#[cfg(feature = "test-seams")]
 impl<Id> InMemoryAuthStore<Id> {
     /// Build an empty store enforcing `lifetimes`, resolving each verified
     /// identity to a typed `Id` through `resolver`. This is the in-memory

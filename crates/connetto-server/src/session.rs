@@ -1477,89 +1477,31 @@ pub struct SessionManager<
     resume: ResumePoint,
 }
 
-impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
-where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    W: ConnettoWatermarkSchema<Id = String>,
-{
-    /// Build a manager with no re-execution connector and a default in-memory
-    /// oplog.
-    ///
-    /// The `authority` is required: nothing installs one by default, so a
-    /// deployment chooses its identity story explicitly. Aggregate
-    /// subscriptions need a connector; use
-    /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
-    /// default [`InMemoryOplog`]; use [`with_oplog`](Self::with_oplog) for another.
-    #[must_use]
-    pub fn new(
-        materializer: Materializer,
-        snapshot_source: Snap,
-        auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
-        target: PgWriteTarget<W>,
-        guard: Arc<RequestGuard<String>>,
-        config: SessionConfig,
-    ) -> Arc<Self> {
-        Self::with_oplog(
-            materializer,
-            snapshot_source,
-            auth,
-            authority,
-            NoConnector,
-            InMemoryOplog::default(),
-            target,
-            guard,
-            config,
-            None,
-            NoSigner,
-        )
-    }
-}
+/// The manager over the `String` ids and keys every construction shares.
+pub(crate) type ConnettoManager<Snap, Auth, W, C, O, S> =
+    SessionManager<Snap, Auth, W, C, O, String, String, S>;
 
-impl<Snap, Auth, C, W> SessionManager<Snap, Auth, W, C, InMemoryOplog>
-where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    C: ReadConnector,
-    C::Error: FailedRead,
-    W: ConnettoWatermarkSchema<Id = String>,
-{
-    /// Build a manager with a re-execution connector and a default in-memory
-    /// oplog. Use [`with_oplog`](Self::with_oplog) to supply another oplog.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
-    )]
-    #[must_use]
-    pub fn with_connector(
-        materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
-        snapshot_source: Snap,
-        auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
-        connector: C,
-        target: PgWriteTarget<W>,
-        guard: Arc<RequestGuard<String>>,
-        config: SessionConfig,
-        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
-    ) -> Arc<Self> {
-        Self::with_oplog(
-            materializer,
-            snapshot_source,
-            auth,
-            authority,
-            connector,
-            InMemoryOplog::default(),
-            target,
-            guard,
-            config,
-            upkeep,
-            NoSigner,
-        )
-    }
-}
-
-impl<Snap, Auth, C, O, W, S> SessionManager<Snap, Auth, W, C, O, String, String, S>
+/// The single assembly every manager construction goes through, which
+/// `ManagerBuilder` owns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
+)]
+pub(crate) fn assemble_manager<Snap, Auth, C, O, W, S>(
+    materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
+    snapshot_source: Snap,
+    auth: Auth,
+    authority: Arc<dyn HandshakeAuthority>,
+    connector: C,
+    oplog: O,
+    target: PgWriteTarget<W>,
+    guard: Arc<RequestGuard<String>>,
+    config: SessionConfig,
+    upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
+    signer: S,
+    withdrawal_source: Option<Snap>,
+    second_opinion: Option<Arc<dyn crate::parity::SecondOpinion<String, String>>>,
+) -> Arc<ConnettoManager<Snap, Auth, W, C, O, S>>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
@@ -1569,51 +1511,31 @@ where
     W: ConnettoWatermarkSchema<Id = String>,
     S: ContentTicketSigner,
 {
-    /// Build a manager with an explicit re-execution connector and oplog.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
-    )]
-    #[must_use]
-    pub fn with_oplog(
-        materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
-        snapshot_source: Snap,
-        auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
-        connector: C,
-        oplog: O,
-        target: PgWriteTarget<W>,
-        guard: Arc<RequestGuard<String>>,
-        config: SessionConfig,
-        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
-        signer: S,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            catalog: Arc::new(materializer.catalog().clone()),
-            materializer: Arc::new(Mutex::new(materializer)),
-            routes: Mutex::new(HashMap::new()),
-            computed_routes: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            snapshot_source,
-            auth,
-            authority,
-            connector,
-            oplog,
-            target,
-            next_session: AtomicU64::new(1),
-            next_consumer: AtomicU64::new(1),
-            config,
-            guard,
-            auth_retry: RetryPolicy::new(),
-            read_retry: RetryPolicy::new(),
-            upkeep,
-            second_opinion: OnceLock::new(),
-            withdrawal_source: OnceLock::new(),
-            signer,
-            history: parking_lot::RwLock::new(None),
-            resume: ResumePoint::default(),
-        })
-    }
+    Arc::new(SessionManager {
+        catalog: Arc::new(materializer.catalog().clone()),
+        materializer: Arc::new(Mutex::new(materializer)),
+        routes: Mutex::new(HashMap::new()),
+        computed_routes: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashMap::new()),
+        snapshot_source,
+        auth,
+        authority,
+        connector,
+        oplog,
+        target,
+        next_session: AtomicU64::new(1),
+        next_consumer: AtomicU64::new(1),
+        config,
+        guard,
+        auth_retry: RetryPolicy::new(),
+        read_retry: RetryPolicy::new(),
+        upkeep,
+        second_opinion: second_opinion.map(OnceLock::from).unwrap_or_default(),
+        withdrawal_source: withdrawal_source.map(OnceLock::from).unwrap_or_default(),
+        signer,
+        history: parking_lot::RwLock::new(None),
+        resume: ResumePoint::default(),
+    })
 }
 
 impl<Snap, Auth, C, O, Id, Key, W, S> SessionManager<Snap, Auth, W, C, O, Id, Key, S>

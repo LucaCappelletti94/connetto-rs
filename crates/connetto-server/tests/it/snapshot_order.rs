@@ -24,7 +24,7 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SnapshotEstimate,
     SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
@@ -142,16 +142,20 @@ async fn drain_to_barrier<T: Transport>(transport: &mut T, nonce: u64) -> Vec<St
 async fn snapshot_order_holds_when_the_credit_window_is_closed() {
     let fixture = Fixture::acquire().await;
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let config = SessionConfig::new().with_initial_credits(0);
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         SeedSnapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::new().with_initial_credits(0),
-    );
+    )
+    .with_session(config)
+    .build();
 
     let (server_end, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_end));

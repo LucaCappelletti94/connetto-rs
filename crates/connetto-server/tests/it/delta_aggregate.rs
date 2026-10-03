@@ -13,7 +13,9 @@ const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);";
 
 #[test]
 fn register_classifies_fold_aggregate_and_row() {
-    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
 
     let Registration::Computed(cap) = mat
         .register(1, "SELECT COUNT(*) FROM orders")
@@ -48,7 +50,9 @@ async fn install_fold_seed_delivers_initial_computed_value() {
     // dispatch: nothing has changed yet, so there is nothing to dispatch.
     // Later changes flow through dispatch, which
     // dispatch_folds_an_installed_ungrouped_count pins.
-    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let Registration::Computed(cap) = mat
         .register(1, "SELECT COUNT(*) FROM orders")
         .expect("register")
@@ -104,7 +108,9 @@ async fn dispatch_without_installed_fold_yields_no_computed() {
     // Registering a fold but never installing its seed must produce no
     // computed output: the engine holds buffered changes until the session
     // calls install_fold_seed.
-    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     mat.register(1, "SELECT COUNT(*) FROM orders")
         .expect("register");
 
@@ -128,7 +134,9 @@ async fn dispatch_without_installed_fold_yields_no_computed() {
 /// again: an installed ungrouped fold updates through dispatch itself.
 #[tokio::test]
 async fn dispatch_folds_an_installed_ungrouped_count() {
-    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let Registration::Computed(cap) = mat
         .register(1, "SELECT COUNT(*) FROM orders")
         .expect("register")
@@ -163,7 +171,9 @@ async fn dispatch_folds_an_installed_ungrouped_count() {
 async fn dispatch_folds_a_grouped_count_per_group() {
     const GROUPED_DDL: &str =
         "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT, status TEXT);";
-    let mut mat = Materializer::new(GROUPED_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(GROUPED_DDL)
+        .build()
+        .expect("build materializer");
     let Registration::Computed(cap) = mat
         .register(1, "SELECT status, COUNT(*) FROM orders GROUP BY status")
         .expect("register grouped")
@@ -270,7 +280,9 @@ async fn dispatch_folds_a_grouped_count_per_group() {
 async fn a_seed_past_the_group_budget_demotes_to_a_whole_read() {
     const GROUPED_DDL: &str =
         "CREATE TABLE orders (id INT PRIMARY KEY, quantity INT, status TEXT);";
-    let mut mat = Materializer::new(GROUPED_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(GROUPED_DDL)
+        .build()
+        .expect("build materializer");
     let Registration::Computed(cap) = mat
         .register(1, "SELECT status, COUNT(*) FROM orders GROUP BY status")
         .expect("register grouped")

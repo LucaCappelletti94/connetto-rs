@@ -255,10 +255,10 @@ pub(super) async fn wait_for_rows(db_path: &Path, want: i64, timeout: Duration) 
     }
 }
 
-/// Start a server again on the ports an earlier start of it used, and wait
-/// until it serves as [`start_server`] does. The ports are not reserved in
-/// between, so another process can take one, and this then fails naming the
-/// exit rather than starting on fresh ports, since the test observes a
+/// Start a server again on the port an earlier start of it used, and wait
+/// until it serves as [`start_server`] does. The port is not reserved in
+/// between, so another process can take it, and this then fails naming the
+/// exit rather than starting on a fresh port, since the test observes a
 /// restart.
 pub(super) async fn restart_server(
     auth: &AuthStack,
@@ -266,7 +266,7 @@ pub(super) async fn restart_server(
     timeout: Duration,
     spawn: impl FnOnce(Ports, &[(&str, &str)]) -> ChildGuard,
 ) -> ChildGuard {
-    let pairs = auth.env_pairs(ports.auth);
+    let pairs = auth.env_pairs(&ports.auth_base());
     let pairs: Vec<(&str, &str)> = pairs
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -294,35 +294,28 @@ pub(super) fn free_port() -> u16 {
         .port()
 }
 
-/// The sync and auth ports one server listens on.
+/// The one port a server listens on, serving sync, login and files.
 #[derive(Clone, Copy, Debug)]
 pub(super) struct Ports {
-    pub(super) sync: u16,
-    pub(super) auth: u16,
+    pub(super) port: u16,
 }
 
 impl Ports {
     fn reserve() -> Self {
-        let sync = free_port();
-        loop {
-            let auth = free_port();
-            if auth != sync {
-                return Self { sync, auth };
-            }
-        }
+        Self { port: free_port() }
     }
 
     pub(super) fn bind(self) -> String {
-        format!("127.0.0.1:{}", self.sync)
+        format!("127.0.0.1:{}", self.port)
     }
 
     pub(super) fn ws(self) -> String {
-        format!("ws://127.0.0.1:{}/", self.sync)
+        format!("ws://127.0.0.1:{}/sync", self.port)
     }
 
-    /// Base URL of the auth endpoints, which also serve the file routes.
+    /// Base URL of the login endpoints, which also serve the file routes.
     pub(super) fn auth_base(self) -> String {
-        format!("http://127.0.0.1:{}", self.auth)
+        format!("http://127.0.0.1:{}", self.port)
     }
 }
 
@@ -330,14 +323,14 @@ impl Ports {
 /// losing its ports.
 const START_ATTEMPTS: u32 = 3;
 
-/// Start a server through `spawn` on freshly reserved ports, and wait until
-/// both listeners answer as that server: the login endpoint redirects to the
-/// provider and the sync port completes a WebSocket handshake.
+/// Start a server through `spawn` on a freshly reserved port, and wait until
+/// it answers as that server: the login endpoint redirects to the provider
+/// and the sync route completes a WebSocket handshake.
 ///
 /// A reserved port is free only until the server binds it, and a container
 /// published in between can take it. The server then exits naming the bind,
-/// and this starts it again on fresh ports, at most [`START_ATTEMPTS`] times.
-/// `spawn` gets the ports and the auth settings for them.
+/// and this starts it again on a fresh port, at most [`START_ATTEMPTS`]
+/// times. `spawn` gets the port and the auth settings for it.
 pub(super) async fn start_server(
     auth: &AuthStack,
     timeout: Duration,
@@ -346,7 +339,7 @@ pub(super) async fn start_server(
     start_server_on(auth, timeout, Ports::reserve, spawn).await
 }
 
-/// [`start_server`] with the ports each attempt starts on coming from
+/// [`start_server`] with the port each attempt starts on coming from
 /// `reserve`.
 async fn start_server_on(
     auth: &AuthStack,
@@ -357,7 +350,7 @@ async fn start_server_on(
     let mut attempt = 1;
     loop {
         let ports = reserve();
-        let pairs = auth.env_pairs(ports.auth);
+        let pairs = auth.env_pairs(&ports.auth_base());
         let pairs: Vec<(&str, &str)> = pairs
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -690,23 +683,35 @@ async fn wait_for_pg_count(
     }
 }
 
-/// A loopback identity provider the server binary signs users in through.
-/// Started before any port is reserved, since the container's published port
-/// comes from the same range [`free_port`] draws from.
+/// A loopback identity provider and the JWT key files a server run with
+/// `CONNETTO_AUTH=database` signs its tokens with. Started before any port is
+/// reserved, since the container's published port comes from the same range
+/// [`free_port`] draws from.
 pub(super) struct AuthStack {
     idp: MockOauth,
+    private: String,
+    public: String,
+    #[expect(
+        dead_code,
+        reason = "the field is never read; it is dropped last, keeping the key files past the server restart"
+    )]
+    keys: TempDir,
 }
 
 impl AuthStack {
-    /// `CONNETTO_AUTH`, `CONNETTO_AUTH_BIND`, and the `CONNETTO_OIDC_PROVIDERS`
-    /// settings for a server whose auth endpoints listen on `auth_port`.
-    pub(super) fn env_pairs(&self, auth_port: u16) -> Vec<(String, String)> {
-        let callback = format!("http://127.0.0.1:{auth_port}/auth/callback");
+    /// `CONNETTO_AUTH`, the JWT key files, and the `CONNETTO_OIDC_PROVIDERS`
+    /// settings for a server whose login endpoints answer on `auth_base`.
+    pub(super) fn env_pairs(&self, auth_base: &str) -> Vec<(String, String)> {
+        let callback = format!("{auth_base}/auth/callback");
         let mut pairs = vec![
-            ("CONNETTO_AUTH".to_owned(), "in-memory".to_owned()),
+            ("CONNETTO_AUTH".to_owned(), "database".to_owned()),
             (
-                "CONNETTO_AUTH_BIND".to_owned(),
-                format!("127.0.0.1:{auth_port}"),
+                "CONNETTO_JWT_PRIVATE_KEY_FILE".to_owned(),
+                self.private.clone(),
+            ),
+            (
+                "CONNETTO_JWT_PUBLIC_KEY_FILE".to_owned(),
+                self.public.clone(),
             ),
         ];
         pairs.extend(self.idp.env_pairs(MOCK_OAUTH_PROVIDER, &callback));
@@ -714,10 +719,37 @@ impl AuthStack {
     }
 }
 
-/// Start the mock OAuth provider.
+/// A token signing key pair on disk, so an access token outlives the server
+/// restart the way it does in a deployment that supplies its keys.
+pub(super) fn signing_keys(dir: &TempDir) -> (String, String) {
+    let private = dir.path().join("jwt.pem");
+    let public = dir.path().join("jwt.pub.pem");
+    let run = |args: &[&str]| {
+        let status = Command::new("openssl")
+            .args(args)
+            .status()
+            .expect("run openssl");
+        assert!(status.success(), "openssl {args:?} failed");
+    };
+    let (private, public) = (
+        private.to_string_lossy().into_owned(),
+        public.to_string_lossy().into_owned(),
+    );
+    run(&["genpkey", "-algorithm", "ed25519", "-out", &private]);
+    run(&["pkey", "-in", &private, "-pubout", "-out", &public]);
+    (private, public)
+}
+
+/// Start the mock OAuth provider and mint the JWT key files it signs with.
 pub(super) async fn build_auth_stack() -> AuthStack {
+    let idp = MockOauth::start().await;
+    let keys = TempDir::new().expect("key dir");
+    let (private, public) = signing_keys(&keys);
     AuthStack {
-        idp: MockOauth::start().await,
+        idp,
+        private,
+        public,
+        keys,
     }
 }
 
@@ -821,6 +853,7 @@ async fn e2e_two_clients_snapshot_live_and_reconnect() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
 
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -907,6 +940,7 @@ async fn e2e_client_write_lands_in_pg_and_fans_out() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
 
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1009,6 +1043,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
         exec(&admin, stmt).await;
     }
     fixture.start_replication(&["owned"]).await;
+    fixture.provision_auth_tables().await;
 
     let reader_url = with_user_url(&url, "app_writer", "app_writer");
 
@@ -1029,8 +1064,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     let (ws, auth_base) = (ports.ws(), ports.auth_base());
 
     // Mint alice's token and derive the row owner from the resolved user_id.
-    // The in-memory store maps (issuer, subject) to a UUID v5, and the RLS
-    // policy compares owner against app.user_id, so the owner must be that UUID.
+    // The store maps (issuer, subject) to a UUID v5, and the RLS policy
+    // compares owner against app.user_id, so the owner must be that UUID.
     let (alice_token, alice_id) = mint_token(&auth_base).await;
 
     let mut dir = ReplicaDir::new();
@@ -1079,8 +1114,8 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     );
 }
 
-/// A server whose login port another process took before the server bound it
-/// is started again on fresh ports, and the test proceeds against it.
+/// A server whose port another process took before the server bound it is
+/// started again on a fresh one, and the test proceeds against it.
 #[tokio::test]
 async fn e2e_a_taken_port_starts_the_server_again_on_fresh_ports() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -1091,6 +1126,7 @@ async fn e2e_a_taken_port_starts_the_server_again_on_fresh_ports() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
 
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1099,8 +1135,8 @@ async fn e2e_a_taken_port_starts_the_server_again_on_fresh_ports() {
     let reserve = || {
         let ports = Ports::reserve();
         if taken.is_none() {
-            let thief = std::net::TcpListener::bind(format!("127.0.0.1:{}", ports.auth))
-                .expect("take the first login port");
+            let thief = std::net::TcpListener::bind(format!("127.0.0.1:{}", ports.port))
+                .expect("take the first port");
             taken = Some((ports, thief));
         }
         ports
@@ -1125,8 +1161,8 @@ async fn e2e_a_taken_port_starts_the_server_again_on_fresh_ports() {
 
     let (first, _thief) = taken.expect("the first start reserved ports");
     assert_ne!(
-        ports.auth, first.auth,
-        "the server serves on fresh ports, not the taken one"
+        ports.port, first.port,
+        "the server serves on a fresh port, not the taken one"
     );
     let (access, _) = mint_token(&ports.auth_base()).await;
     assert!(!access.is_empty(), "the restarted server signs a user in");
@@ -1163,6 +1199,7 @@ async fn e2e_unrestricted_table_delivers_without_policy() {
     let pool = Pool::builder().build(manager).await.expect("build pool");
 
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
 
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1209,6 +1246,7 @@ async fn run_server_exit_output(
         .env("DATABASE_URL", database_url)
         .env("CONNETTO_BIND", bind)
         .env("CONNETTO_PG_DDL", PG_DDL)
+        .env("CONNETTO_PG_POLICIES", NO_POLICIES)
         .env("CONNETTO_WRITABLE", "orders")
         .env("CONNETTO_SLOT", SLOT)
         .env("CONNETTO_PUBLICATION", PUBLICATION)
@@ -1244,9 +1282,10 @@ async fn e2e_startup_refuses_without_a_reader_role() {
     reset_fixture(&pool, &fixture).await;
 
     // Auth must be configured so the server reaches the reader-role check.
-    // The server exits before binding auth endpoints, so auth_port is a placeholder.
+    // The server exits before binding its listener, so the base is a
+    // placeholder.
     let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs(free_port());
+    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
     let auth_pairs: Vec<(&str, &str)> = auth_env
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
@@ -1278,7 +1317,16 @@ async fn e2e_startup_refuses_a_reconnect_log_without_its_commit_table() {
     exec(&pool, &format!("DROP TABLE {commit_table}")).await;
 
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
-    let output = run_server_exit_output(&url, Some(&reader_url), &[]).await;
+    // Auth is configured so the boot reaches the change-log preflight, where the missing commit table refuses.
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+    let mut extra: Vec<(&str, &str)> = auth_env
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
+    extra.extend(authorization.env_pairs());
+    let output = run_server_exit_output(&url, Some(&reader_url), &extra).await;
     // The next test's reset provisions the log again, commit table included.
     connetto_test_harness::provision_oplog(&pool).await;
     assert!(
@@ -1307,7 +1355,7 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
         &url,
         Some(&reader_url),
         &[
-            ("CONNETTO_AUTH", "in-memory"),
+            ("CONNETTO_AUTH", "database"),
             ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
             ("CONNETTO_OIDC_MYPROVIDER_KIND", "frobnicate"),
             ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
@@ -1379,7 +1427,7 @@ async fn e2e_startup_refuses_an_unrecognised_audit_mode() {
     let output = run_server_exit_output(
         &url,
         Some(&reader_url),
-        &[("CONNETTO_AUTH", "in-memory"), ("CONNETTO_AUDIT", "sqlite")],
+        &[("CONNETTO_AUTH", "database"), ("CONNETTO_AUDIT", "sqlite")],
     )
     .await;
     assert!(
@@ -1408,7 +1456,7 @@ async fn e2e_startup_refuses_a_miscapitalised_provider_name() {
         &url,
         Some(&reader_url),
         &[
-            ("CONNETTO_AUTH", "in-memory"),
+            ("CONNETTO_AUTH", "database"),
             ("CONNETTO_OIDC_PROVIDERS", "myprovider"),
             ("CONNETTO_OIDC_MYPROVIDER_KIND", "Google"),
             ("CONNETTO_OIDC_MYPROVIDER_CLIENT_ID", "unused"),
@@ -1476,6 +1524,7 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
 
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1527,7 +1576,7 @@ async fn e2e_server_logs_json_to_stdout_with_the_connection_context() {
 
     let listening = lines
         .iter()
-        .find(|line| line["message"] == "sync listener started")
+        .find(|line| line["message"] == "serving the sync, login and file routes")
         .unwrap_or_else(|| panic!("no listener event on stdout: {stdout}"));
     assert_eq!(
         listening["bind"], bind,
@@ -1572,6 +1621,7 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
 
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1740,6 +1790,7 @@ async fn e2e_content_routes_mount_on_the_auth_listener() {
     // every boot here needs the replication objects present.
     fixture.start_replication(&["orders"]).await;
     apply_content_deployment(&pool, true).await;
+    fixture.provision_auth_tables().await;
 
     let store = TempDir::new().expect("content store dir");
     let key_dir = TempDir::new().expect("content key dir");
@@ -1818,11 +1869,11 @@ async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
     reset_fixture(&pool, &fixture).await;
     fixture.start_replication(&["orders"]).await;
     apply_content_deployment(&pool, false).await;
+    fixture.provision_auth_tables().await;
 
-    let auth_port = free_port();
+    let content_base = format!("http://127.0.0.1:{}", free_port());
     let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs(auth_port);
-    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let auth_env = auth_stack.env_pairs(&content_base);
     let store = TempDir::new().expect("content store dir");
     let store_spec = format!("fs:{}", store.path().display());
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
@@ -1831,10 +1882,21 @@ async fn e2e_content_startup_refuses_a_deployment_without_the_file_tables() {
         .iter()
         .map(|(k, v)| (k.as_str(), v.as_str()))
         .collect();
+    let key_dir = TempDir::new().expect("content key dir");
+    let key_path = key_dir.path().join("ticket.der");
+    generate_ticket_key(&key_path);
     envs.extend([
         ("CONNETTO_CONTENT_URL", content_base.as_str()),
         ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+        (
+            "CONNETTO_CONTENT_KEY",
+            key_path.to_str().expect("utf-8 path"),
+        ),
     ]);
+    let fga_url = fixture.fga_url().await.to_owned();
+    let (_channel, fga_store) = fixture.fga_store().await;
+    envs.push(("CONNETTO_FGA_URL", fga_url.as_str()));
+    envs.push(("CONNETTO_FGA_STORE", fga_store.as_str()));
     let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
     assert!(
         !output.status.success(),
@@ -1861,10 +1923,9 @@ async fn e2e_content_startup_refuses_an_unparsable_store_spec() {
     reset_fixture(&pool, &fixture).await;
     fixture.start_replication(&["orders"]).await;
 
-    let auth_port = free_port();
+    let content_base = format!("http://127.0.0.1:{}", free_port());
     let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs(auth_port);
-    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let auth_env = auth_stack.env_pairs(&content_base);
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
     let mut envs: Vec<(&str, &str)> = auth_env
@@ -1905,10 +1966,9 @@ async fn e2e_content_startup_names_each_refused_setting() {
     // cases that reach it need a file-ready deployment.
     apply_content_deployment(&pool, true).await;
 
-    let auth_port = free_port();
+    let content_base = format!("http://127.0.0.1:{}", free_port());
     let auth_stack = build_auth_stack().await;
-    let auth_env = auth_stack.env_pairs(auth_port);
-    let content_base = format!("http://127.0.0.1:{auth_port}");
+    let auth_env = auth_stack.env_pairs(&content_base);
     let query_base = format!("{content_base}/?probe=1");
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
 
@@ -1919,6 +1979,8 @@ async fn e2e_content_startup_names_each_refused_setting() {
     std::fs::write(&junk_key, [0u8; 16]).expect("write the junk key");
     let missing_key = "/tmp/connetto-r69-definitely-not-a-key.pem";
 
+    let fga_url = fixture.fga_url().await.to_owned();
+    let (_channel, fga_store) = fixture.fga_store().await;
     let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
         (
             vec![
@@ -1964,12 +2026,21 @@ async fn e2e_content_startup_names_each_refused_setting() {
             "no query or fragment",
         ),
     ];
+    let key_dir = TempDir::new().expect("content key dir");
+    let key_path = key_dir.path().join("ticket.der");
+    generate_ticket_key(&key_path);
     for (extra, expected) in cases {
         let mut envs: Vec<(&str, &str)> = auth_env
             .iter()
             .map(|(k, v)| (k.as_str(), v.as_str()))
             .collect();
         envs.push(("CONNETTO_CONTENT_URL", content_base.as_str()));
+        envs.push((
+            "CONNETTO_CONTENT_KEY",
+            key_path.to_str().expect("utf-8 path"),
+        ));
+        envs.push(("CONNETTO_FGA_URL", fga_url.as_str()));
+        envs.push(("CONNETTO_FGA_STORE", fga_store.as_str()));
         envs.extend(extra);
         let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1985,8 +2056,7 @@ async fn e2e_content_startup_names_each_refused_setting() {
 /// unidentified file is refused, a file the deployment makes visible mints a
 /// URL that rides the query, and that URL answers its download route.
 ///
-/// `CONNETTO_CONTENT_KEY` stays unset here, so this boot also takes the
-/// ephemeral-keypair branch every other content test skips.
+/// A generated ticket keypair signs the ticket the bare download verifies.
 #[cfg(feature = "content")]
 #[tokio::test]
 #[expect(
@@ -2013,10 +2083,14 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
     fixture.start_replication(&["orders"]).await;
     apply_content_deployment(&pool, true).await;
     exec(&pool, "GRANT SELECT ON photos TO app_reader").await;
+    fixture.provision_auth_tables().await;
 
     let store = TempDir::new().expect("content store dir");
     let store_spec = format!("fs:{}", store.path().display());
 
+    let key_dir = TempDir::new().expect("content key dir");
+    let key_path = key_dir.path().join("ticket.der");
+    generate_ticket_key(&key_path);
     let auth_stack = build_auth_stack().await;
     let reader_url = with_user_url(&url, "app_reader", "app_reader");
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
@@ -2027,6 +2101,10 @@ async fn e2e_content_ticket_round_trips_over_a_live_session() {
         envs.extend([
             ("CONNETTO_CONTENT_URL", content_base.as_str()),
             ("CONNETTO_CONTENT_STORE", store_spec.as_str()),
+            (
+                "CONNETTO_CONTENT_KEY",
+                key_path.to_str().expect("utf-8 path"),
+            ),
         ]);
         spawn_server_cfg(
             &url,

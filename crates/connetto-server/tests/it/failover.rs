@@ -21,9 +21,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog, OplogConfig, PgOplog,
-    PgSnapshotSource, Position, ReconnectPolicy, RequestGuard, ResumePoint, SessionConfig,
-    SessionManager, TimelineHistory, loopback, pg_write_target, timeline,
+    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, NoSigner, Oplog, OplogConfig,
+    PgOplog, PgSnapshotSource, Position, ReconnectPolicy, ResumePoint, SessionManager,
+    TimelineHistory, loopback, pg_write_target, timeline,
 };
 use connetto_test_harness::Fixture;
 use connetto_test_harness::standby::{Pair, Switchboard};
@@ -191,19 +191,18 @@ fn manager_writing_to(
     writes: Pool<AsyncPgConnection>,
     oplog: PgOplog,
 ) -> Arc<Manager> {
-    SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
         RosterAuth::granting(CALLER).withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        oplog,
         pg_write_target::<ConnettoWatermark>(writes, PG_DDL).expect("write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
     )
+    .with_oplog(oplog)
+    .build()
 }
 
 /// Timeline 2, which ended timeline 1 at `0/10`.

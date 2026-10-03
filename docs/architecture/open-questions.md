@@ -437,7 +437,7 @@ See `11-authentication.md`. The architecture is decided (Backend-For-Frontend, c
 
 **Q11.2**: ~~Provider token retention. In scope, or explicitly out?~~
 
-**Decision: retained, not discarded.** The chosen auth store (in-memory or database) holds the user's provider tokens alongside the identity mapping, so an application that configured the right scopes on the provider reuses them to call the provider's own APIs. connetto exposes a lazy refreshing accessor that refreshes a token inline when it is about to be used and persists the rotated refresh token, and it runs no background refresh job, which is fewer provider requests and no scheduler shared between servers.
+**Decision: retained, not discarded.** The auth store holds the user's provider tokens alongside the identity mapping, so an application that configured the right scopes on the provider reuses them to call the provider's own APIs. connetto exposes a lazy refreshing accessor that refreshes a token inline when it is about to be used and persists the rotated refresh token, and it runs no background refresh job, which is fewer provider requests and no scheduler shared between servers.
 
 **Q11.3**: ~~Client-side ID token verification. Is the client-as-OAuth-client alternative supported at all, or is BFF the only sanctioned model?~~
 

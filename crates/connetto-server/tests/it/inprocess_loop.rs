@@ -113,7 +113,9 @@ fn mutation_insert(
 
 #[tokio::test]
 async fn in_process_loop_round_trips_cdc_and_a_mutation() {
-    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let registration = mat
         .register(1, "SELECT * FROM orders WHERE quantity > 0")
         .expect("register subscription");

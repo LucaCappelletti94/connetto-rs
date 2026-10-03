@@ -89,7 +89,7 @@ const ZSTD_LEVEL: i32 = 3;
 /// Failure surfaced by the materializer core.
 #[derive(Debug, thiserror::Error)]
 pub enum MaterializerError {
-    /// The Postgres DDL handed to [`Materializer::new`] did not parse.
+    /// The Postgres DDL handed to [`Materializer::builder`] did not parse.
     #[error("catalog parse failed: {0}")]
     Catalog(String),
     /// `subql` rejected a subscription registration.
@@ -505,88 +505,34 @@ pub struct CallerMappings {
 }
 
 impl Materializer<ParserDB, RuntimeWritableCatalog> {
-    /// Build a materializer over a Postgres DDL catalog with an empty write
-    /// policy (no writable tables).
-    ///
-    /// # Errors
-    ///
-    /// [`MaterializerError::Catalog`] when the DDL does not parse.
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use connetto_server::Materializer;
-    ///
-    /// let mut mat =
-    ///     Materializer::new("CREATE TABLE orders (id INT PRIMARY KEY, quantity INT);")?;
-    /// let registration = mat.register(1, "SELECT * FROM orders WHERE quantity > 0")?;
-    /// assert!(matches!(registration, connetto_server::Registration::Row(_)));
-    /// # Ok::<(), connetto_server::MaterializerError>(())
-    /// ```
-    pub fn new(pg_ddl: &str) -> Result<Self, MaterializerError> {
-        Self::with_write_catalog(pg_ddl, RuntimeWritableCatalog::default())
-    }
-}
-
-impl<W: WritableCatalog> Materializer<ParserDB, W> {
-    /// Build a materializer over a Postgres DDL catalog and a write policy,
-    /// with no re-execution connector: computed subscriptions register but
-    /// every read they need refuses.
-    ///
-    /// # Errors
-    ///
-    /// [`MaterializerError::Catalog`] when the DDL does not parse.
-    pub fn with_write_catalog(pg_ddl: &str, write: W) -> Result<Self, MaterializerError> {
-        Self::build(pg_ddl, write, None, None, crate::reexec::NoConnector)
+    /// Assemble a materializer over a Postgres DDL catalog, starting with an
+    /// empty write policy and no re-execution connector.
+    #[cfg(feature = "test-seams")]
+    #[must_use]
+    pub fn builder(pg_ddl: &str) -> MaterializerBuilder {
+        Self::builder_seam(pg_ddl)
     }
 
-    /// Build a materializer whose engine can compile a membership subquery and
-    /// whose reverse translation rewrites the caller.
-    ///
-    /// `translator` is the deployment's `rls2fga` translator, handed to the
-    /// `subql` engine so a bounded membership term classifies at registration
-    /// rather than being refused for want of one. `caller` is the mapping
-    /// [`Materializer::translate_subscription_sql`] rewrites the client's local
-    /// caller function with, `None` when no policy names the caller.
-    ///
-    /// # Errors
-    ///
-    /// [`MaterializerError::Catalog`] when the DDL does not parse.
-    pub fn with_translation(
-        pg_ddl: &str,
-        write: W,
-        translator: Translator,
-        caller: Option<CallerMappings>,
-    ) -> Result<Self, MaterializerError> {
-        Self::build(
-            pg_ddl,
-            write,
-            Some(translator),
-            caller,
-            crate::reexec::NoConnector,
-        )
+    /// The crate-internal half of the same assembly, for the production
+    /// paths that stay in this crate.
+    #[cfg(not(feature = "test-seams"))]
+    #[must_use]
+    pub(crate) fn builder(pg_ddl: &str) -> MaterializerBuilder {
+        Self::builder_seam(pg_ddl)
+    }
+
+    fn builder_seam(pg_ddl: &str) -> MaterializerBuilder {
+        MaterializerBuilder {
+            pg_ddl: pg_ddl.to_owned(),
+            write: RuntimeWritableCatalog::default(),
+            translator: None,
+            caller: None,
+            connector: crate::reexec::NoConnector,
+        }
     }
 }
 
 impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
-    /// Build a materializer that drives `connector` for every database read
-    /// the engine's computed tiers need: fold seeds installed by the session
-    /// aside, extremes, grouped re-reads, and captured row answers all go
-    /// through it, each read bounded by the budget its registration carried.
-    ///
-    /// # Errors
-    ///
-    /// [`MaterializerError::Catalog`] when the DDL does not parse.
-    pub fn with_read_connector(
-        pg_ddl: &str,
-        write: W,
-        translator: Option<Translator>,
-        caller: Option<CallerMappings>,
-        connector: C,
-    ) -> Result<Self, MaterializerError> {
-        Self::build(pg_ddl, write, translator, caller, connector)
-    }
-
     fn build(
         pg_ddl: &str,
         write: W,
@@ -696,6 +642,92 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             .as_ref()
             .and_then(|caller| caller.subjects.as_ref())
             .map(|mapping| mapping.sqlite_function.as_str())
+    }
+}
+
+/// Assembles one [`Materializer`]. The DDL catalog goes on
+/// [`Materializer::builder`], and the write policy, the translation pieces,
+/// and the re-execution connector go on setters.
+pub struct MaterializerBuilder<W = RuntimeWritableCatalog, C = crate::reexec::NoConnector>
+where
+    W: WritableCatalog,
+    C: ReadConnector,
+{
+    pg_ddl: String,
+    write: W,
+    translator: Option<Translator>,
+    caller: Option<CallerMappings>,
+    connector: C,
+}
+
+impl<W: WritableCatalog, C: ReadConnector> MaterializerBuilder<W, C> {
+    /// The writable tables and their version columns.
+    #[must_use]
+    pub fn with_write_catalog<T: WritableCatalog>(self, write: T) -> MaterializerBuilder<T, C> {
+        let Self {
+            pg_ddl,
+            translator,
+            caller,
+            connector,
+            ..
+        } = self;
+        MaterializerBuilder {
+            pg_ddl,
+            write,
+            translator,
+            caller,
+            connector,
+        }
+    }
+
+    /// The rls2fga translator the engine uses to classify a bounded
+    /// membership subquery at registration.
+    #[must_use]
+    pub fn with_translator(mut self, translator: Translator) -> Self {
+        self.translator = Some(translator);
+        self
+    }
+
+    /// The caller mapping reverse translation rewrites the client's local
+    /// caller function with.
+    #[must_use]
+    pub fn with_caller(mut self, caller: CallerMappings) -> Self {
+        self.caller = Some(caller);
+        self
+    }
+
+    /// The connector the engine's computed tiers read through.
+    #[must_use]
+    pub fn with_read_connector<T: ReadConnector>(self, connector: T) -> MaterializerBuilder<W, T> {
+        let Self {
+            pg_ddl,
+            write,
+            translator,
+            caller,
+            ..
+        } = self;
+        MaterializerBuilder {
+            pg_ddl,
+            write,
+            translator,
+            caller,
+            connector,
+        }
+    }
+
+    /// Build the materializer.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Catalog`] when the DDL does not parse.
+    pub fn build(self) -> Result<Materializer<ParserDB, W, C>, MaterializerError> {
+        Materializer::<ParserDB, W, C>::build(
+            &self.pg_ddl,
+            self.write,
+            self.translator,
+            self.caller,
+            self.connector,
+        )
     }
 }
 
@@ -2399,12 +2431,12 @@ mod membership_term_tests {
             .expect("the motivating policy translates")
             .into_parts()
             .1;
-        Materializer::with_translation(
-            SCHEMA,
-            RuntimeWritableCatalog::default(),
-            translator,
-            caller,
-        )
+        let builder = Materializer::builder(SCHEMA).with_translator(translator);
+        match caller {
+            Some(caller) => builder.with_caller(caller),
+            None => builder,
+        }
+        .build()
         .expect("the schema parses")
     }
 

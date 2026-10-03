@@ -30,8 +30,8 @@ use connetto_client::{
 use connetto_core::messages::SUBSCRIPTION_REFUSED;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    ConnettoReadSetup, InMemoryOplog, Materializer, NoConnector, NoSigner, Oplog, OplogConfig,
-    PageSpec, PgOplog, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    ConnettoReadSetup, InMemoryOplog, ManagerBuilder, Materializer, NoConnector, Oplog,
+    OplogConfig, PageSpec, PgOplog, RuntimeWritableCatalog, SessionConfig, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
@@ -584,17 +584,19 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
     reset_orders(&fixture).await;
     // Server: orders is writable so client mutations apply; snapshot seeds one row.
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
-    let materializer =
-        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     // Serve one connection over a localhost WebSocket.
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -756,17 +758,19 @@ async fn connection_autosubmits_writes_and_reports_changed_tables() {
     // Same wiring as the primary test: orders is writable, the snapshot seeds one
     // row.
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
-    let materializer =
-        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -914,17 +918,19 @@ async fn connection_is_a_diesel_connection() {
     // orders is writable so the client mutation applies. No subscription is
     // needed: this exercises the diesel Connection impl and auto-submit.
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
-    let materializer =
-        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1032,17 +1038,19 @@ async fn rejected_write_rolls_back_locally() {
     let fixture = Fixture::acquire().await;
     // A materializer with no writable tables rejects every client mutation, so
     // the optimistic local write must be undone when the reject arrives.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1163,18 +1171,20 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     let writable = RuntimeWritableCatalog::builder()
         .versioned("orders", "status")
         .build();
-    let materializer =
-        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
     let target = seeded_orders_target(&fixture, "server").await;
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1330,18 +1340,20 @@ async fn conflicting_write_converges_to_server_after_rollback() {
     let writable = RuntimeWritableCatalog::builder()
         .versioned("orders", "status")
         .build();
-    let materializer =
-        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
     let target = seeded_orders_target(&fixture, "seed").await;
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1634,27 +1646,22 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
     // reaches the client as a ClientEvent::Aggregate.
     // Bootstrap answers 3 before any change, the re-execution after the delete answers 9 and holds both changes.
     let connector = QueuedConnector::new([(3, before_every_change()), (9, after_every_change())]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1730,17 +1737,19 @@ async fn unsupported_subscription_is_rejected_without_closing() {
     let fixture = Fixture::acquire().await;
     // A query subql cannot register (a grouped aggregate) is refused at
     // registration and surfaces as a NonFatal event, not a dropped connection.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -1871,27 +1880,22 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         vec![PgValue::Null],
         vec![PgValue::Null, PgValue::Int(0)],
     ]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2054,27 +2058,22 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
         release: Arc::clone(&release),
         rows: Arc::new(Mutex::new(VecDeque::from([vec![PgValue::Int(0)]]))),
     };
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2142,27 +2141,22 @@ async fn an_aggregates_first_frame_is_its_full_result() {
         release: Arc::clone(&release),
         rows: Arc::new(Mutex::new(VecDeque::from([vec![PgValue::Int(0)]]))),
     };
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2208,17 +2202,19 @@ async fn aggregate_on_rls_table_is_rejected_without_closing() {
     const RLS_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, \
          status TEXT); ALTER TABLE orders ENABLE ROW LEVEL SECURITY;";
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(RLS_DDL).expect("build materializer");
+    let materializer = Materializer::builder(RLS_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2266,17 +2262,19 @@ async fn delta_aggregate_bootstrap_failure_is_nonfatal() {
     // execute_scalar_row is the trait default that rejects every seed). The
     // failed bootstrap unregisters the subscription and surfaces as a NonFatal
     // event, leaving the session intact.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2324,27 +2322,22 @@ async fn row_subscription_and_delta_aggregate_coexist() {
     // LivePatch to the row route and a folded AggregateUpdate to the delta
     // route. The two delivery paths are independent in one dispatch.
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2447,27 +2440,22 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
     // After an Unsubscribe, the server drops the accumulator and the route, so a
     // further CDC event produces no aggregate update for that consumer.
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(0)]]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2557,17 +2545,19 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     // The full live-query loop: a typed diesel query becomes a LiveQuery whose
     // rows refresh as the snapshot and CDC patches land, and dropping the
     // handle tears the server subscription down.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2695,27 +2685,22 @@ async fn live_value_tracks_a_server_aggregate() {
     // right method with a clear error.
     // COUNT(*) seed over the backend at subscribe time: 1 (the snapshot row).
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2826,27 +2811,22 @@ async fn live_value_decodes_a_temporal_aggregate() {
         .and_hms_opt(3, 4, 5)
         .expect("valid time");
     let connector = QueuedConnector::with_scalars([PgValue::Timestamp(seen)]);
-    let materializer = Materializer::with_read_connector(
-        METRICS_PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(METRICS_PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -2914,20 +2894,22 @@ async fn identical_row_watches_share_one_subscription() {
     // subscription. The recording snapshot source counts how many subscribes
     // reached the server, and both handles must follow a CDC patch, survive
     // one drop, and unsubscribe only when the last sharer is gone.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         RecordingSeed {
             seen: Arc::clone(&seen),
         },
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3075,20 +3057,22 @@ async fn distinct_row_queries_do_not_collapse() {
     let fixture = Fixture::acquire().await;
     // Dedup must key on the query: two different predicates each open their own
     // wire subscription, so the recorder sees two distinct select_sql.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         RecordingSeed {
             seen: Arc::clone(&seen),
         },
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3153,27 +3137,22 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
     // starve it: the late joiner instead resolves immediately from the cached
     // last value, and both handles fold a CDC update.
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3302,22 +3281,24 @@ async fn watch_fn_drives_a_boxed_row_query() {
     let inactive_id = rosetta_uuid::Uuid::utc_v7();
     let beta_id = rosetta_uuid::Uuid::utc_v7();
 
-    let materializer = Materializer::new(GADGETS_PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(GADGETS_PG_DDL)
+        .build()
+        .expect("build materializer");
     let seed = GadgetSeed {
         rows: vec![
             gadget(alpha_id, true, "alpha"),
             gadget(inactive_id, false, "zulu"),
         ],
     };
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         seed,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         gadgets_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3417,20 +3398,22 @@ async fn watch_fn_shares_a_subscription_with_watch() {
     // A boxed watch_fn and a typed live() watch that render the same spec
     // collapse onto one wire subscription through the shared attach_wire layer,
     // so the recorder sees exactly one subscribe.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
     let seen = Arc::new(Mutex::new(Vec::new()));
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         RecordingSeed {
             seen: Arc::clone(&seen),
         },
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3497,17 +3480,19 @@ async fn watch_fn_rejects_an_aggregate_query() {
     let fixture = Fixture::acquire().await;
     // watch_fn drives rows. A boxed aggregate shape is refused with the
     // row-vs-value error, before any subscription is registered.
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = server_write_target(&fixture);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -3551,8 +3536,10 @@ async fn gated_server(
     tokio::task::JoinHandle<()>,
 ) {
     reset_orders(fixture).await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         GatedSnapshot {
             entered: Arc::clone(entered),
@@ -3561,10 +3548,10 @@ async fn gated_server(
         },
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();
@@ -3718,16 +3705,18 @@ async fn the_snapshot_overlap_converges_on_the_later_value() {
 async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();
@@ -3818,16 +3807,18 @@ async fn a_departed_row_survives_only_while_another_subscription_covers_it() {
 async fn a_row_that_leaves_its_only_subscription_is_removed() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();
@@ -3919,15 +3910,18 @@ fn persisted_cursor(conn: &mut SqliteConnection) -> Option<Vec<u8>> {
 async fn no_resume_position_is_persisted_for_rows_that_never_arrived() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         CursoredSeed,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         server_write_target(&fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::new().with_initial_credits(0),
-    );
+    )
+    .with_session(SessionConfig::new().with_initial_credits(0))
+    .build();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();
@@ -4046,19 +4040,18 @@ fn status_manager<O: Oplog>(
     status: &'static str,
     oplog: O,
 ) -> Arc<SessionManager<StatusSnapshot, RosterAuth, ConnettoWatermark, NoConnector, O>> {
-    SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         StatusSnapshot { status },
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        oplog,
         server_write_target(fixture),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
     )
+    .with_oplog(oplog)
+    .build()
 }
 
 /// Drive one insert through `manager`, whatever oplog it holds.
@@ -4302,27 +4295,22 @@ async fn a_durable_log_lets_a_restart_resume_incrementally() {
 async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
     let fixture = Fixture::acquire().await;
     let connector = QueuedConnector::with_rows([vec![PgValue::Int(1)]]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");

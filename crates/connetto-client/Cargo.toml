@@ -256,7 +256,7 @@ connetto-core = { workspace = true, features = ["test-support"] }
 # Postgres path now (pg-async), so the harness supplies the fixture. The CDC
 # source stays the SQLite emulator, so reads are Docker-free and only the
 # write-path assertions need Postgres.
-connetto-server = { path = "../connetto-server" }
+connetto-server = { path = "../connetto-server", features = ["test-seams"] }
 connetto-test-harness = { path = "../connetto-test-harness" }
 # The loop and handshake tests derive the schema version the server compares
 # against, through the same translated-bundle step the server itself runs.

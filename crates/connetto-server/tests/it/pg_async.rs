@@ -19,10 +19,10 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, Materializer, Oplog, OplogConfig,
-    PageSpec, PgOplog, PgReadConnector, PgSnapshotSource, ReadBudget, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, loopback, pg_write_target, split_snapshot_cursor,
+    CHANGE_OP_TYPE, ChangeOp, ChangeOpSql, ChangeRecord, ManagerBuilder, Materializer, Oplog,
+    OplogConfig, PageSpec, PgOplog, PgReadConnector, PgSnapshotSource, ReadBudget,
+    RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
+    pg_write_target, split_snapshot_cursor,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
@@ -111,7 +111,9 @@ async fn async_pg_apply_inserts_row() {
         .await
         .expect("create table");
 
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let payload =
         zstd::encode_all(insert_changeset(1, "async", "t0").as_slice(), 3).expect("compress");
     let affected = materializer
@@ -211,7 +213,9 @@ async fn async_pg_snapshot_reads_rows() {
     let mut replica = SqliteConnection::establish(":memory:").expect("open sqlite");
     diesel::RunQueryDsl::execute(sql_query(ORDERS_SQLITE_DDL), &mut replica)
         .expect("create replica");
-    let applier = Materializer::new(ORDERS_PG_DDL).expect("build applier");
+    let applier = Materializer::builder(ORDERS_PG_DDL)
+        .build()
+        .expect("build applier");
     let compressed = zstd::encode_all(page.patchset.as_slice(), 3).expect("compress");
     applier
         .apply_diffset(&compressed, &mut replica)
@@ -384,17 +388,14 @@ async fn async_pg_reexec_bootstraps_min() {
             .expect("seed rows");
     }
 
-    let materializer = Materializer::with_read_connector(
-        AGGS_PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        PgReadConnector::with_session_setup(pool.clone()),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(AGGS_PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(pool.clone(), AGGS_PG_DDL)
         .expect("build write target");
-    let session = SessionManager::with_connector(
+    let session = ManagerBuilder::new(
         materializer,
         NoSnapshot,
         // Aggregate results never go through the policy.
@@ -402,10 +403,8 @@ async fn async_pg_reexec_bootstraps_min() {
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool),
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(session.clone().serve(server_transport));
@@ -485,7 +484,9 @@ async fn pg_oplog_appends_and_reads_back() {
     // Turn insert, update, and delete events from the emulator into oplog
     // records and append each. The emulator now stamps monotonic LSNs, so no
     // test-side stamping is needed.
-    let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
+    let mat = Materializer::builder(ORDERS_PG_DDL)
+        .build()
+        .expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
     let mut expected: Vec<(PgCommitPosition, String, bool, Vec<u8>)> = Vec::new();
     for sql in [
@@ -638,7 +639,9 @@ async fn pg_oplog_round_trips_a_composite_key() {
     );
     oplog.ensure_schema().await.expect("ensure schema");
 
-    let mat = Materializer::new(PAIRS_DDL).expect("build materializer");
+    let mat = Materializer::builder(PAIRS_DDL)
+        .build()
+        .expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(PAIRS_DDL).expect("open emu source");
     let mut appended: Vec<Vec<u8>> = Vec::new();
     for sql in [
@@ -687,7 +690,9 @@ async fn pg_oplog_round_trips_a_composite_key() {
 
 /// Two transactions as the emulator stamps them, the first of two rows and the second of one, with their records and commits.
 fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
-    let mat = Materializer::new(ORDERS_PG_DDL).expect("build materializer");
+    let mat = Materializer::builder(ORDERS_PG_DDL)
+        .build()
+        .expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(ORDERS_PG_DDL).expect("open emu source");
     let mut records = Vec::new();
     let mut commits = Vec::new();
@@ -897,30 +902,26 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
             .expect("seed rows");
     }
 
-    let materializer = Materializer::with_read_connector(
-        "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        PgReadConnector::with_session_setup(pool.clone()),
-    )
-    .expect("build materializer");
+    let materializer =
+        Materializer::builder("CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);")
+            .with_write_catalog(RuntimeWritableCatalog::default())
+            .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+            .build()
+            .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(
         pool.clone(),
         "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
     )
     .expect("build write target");
-    let session = SessionManager::with_connector(
+    let session = ManagerBuilder::new(
         materializer,
         NoSnapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool),
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(session.clone().serve(server_transport));
@@ -1017,7 +1018,9 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
 
     // Register the diesel-rendered SQLite shape with a typed bind and keep
     // the translation the registration used.
-    let mut materializer = Materializer::new(TRANSLATED_PG_DDL).expect("build materializer");
+    let mut materializer = Materializer::builder(TRANSLATED_PG_DDL)
+        .build()
+        .expect("build materializer");
     let binds = vec![connetto_core::messages::BindValue::Integer(0)];
     let reg = materializer
         .register_sqlite(
@@ -1057,7 +1060,9 @@ async fn snapshot_runs_the_translated_diesel_shape_with_binds() {
     let mut replica = SqliteConnection::establish(":memory:").expect("open sqlite");
     diesel::RunQueryDsl::execute(sql_query(TRANSLATED_SQLITE_DDL), &mut replica)
         .expect("create replica");
-    let applier = Materializer::new(TRANSLATED_PG_DDL).expect("build applier");
+    let applier = Materializer::builder(TRANSLATED_PG_DDL)
+        .build()
+        .expect("build applier");
     let compressed = zstd::encode_all(page.patchset.as_slice(), 3).expect("compress");
     applier
         .apply_diffset(&compressed, &mut replica)

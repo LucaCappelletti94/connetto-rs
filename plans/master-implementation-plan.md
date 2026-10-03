@@ -170,7 +170,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
-| any | R96 | One server builder for programs that embed the server. Designed 2026-10-03, and R91 waits on it |
+| done | ~~R96~~ | One server builder for programs that embed the server, built 2026-10-03, and R91 builds on it |
 | any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
@@ -215,12 +215,12 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R88 the mobile build of a demo | **DONE** (2026-09-24) | nothing. Android through #58, #60 and #66, iOS through #73, both proven unattended on the maintainer's devices | no |
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
-| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-09-20, waiting on R96 since 2026-10-03 | R96, so its login route and registry cache are built on the server builder once. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
+| R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-10-03 when R96 landed | nothing. Its login route and registry cache go on R96's server builder. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
 | R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | nothing since R94 (2026-09-30). One decision and one open question in the section | no |
-| R96 one server builder | NOT STARTED, minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
+| R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | IN PROGRESS, built 2026-10-02, proven on Windows and macOS 2026-10-03 | the Linux refocus proof | no |
 | R53 Windows gate | **DONE** (2026-10-02) | nothing. `HelloStore` is taken from the upstream branch at `3109f4d` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
@@ -5498,7 +5498,7 @@ No durable credential exists in browser storage, the three auth endpoints serve 
 
 **Status.** NOT STARTED. Designed 2026-09-18 with the maintainer over one session, after an earlier attempt drifted, then reviewed twice the same night and corrected, recorded as decisions 2, 3, 11 and 12 below. Unblocked 2026-09-20 when the two caller fixes it waited on landed. The design record is `plans/apps-and-bots.md`, which carries every settled point with its date, the state table, the superseded shapes and the reasons, and outranks this section where they differ. `docs/prompt-apps-and-bots.md` is the superseded starting prompt.
 
-**Blocked on R96** (decided with the maintainer 2026-10-03). The login exchange route and the session manager's registry cache are server construction, so they are built once on R96's builder rather than wired into the binary and moved again.
+**Built on R96** (decided with the maintainer 2026-10-03). The login exchange route and the session manager's registry cache are server construction, so they go on R96's `ServerBuilder` and its `ManagerBuilder` rather than into the binary.
 
 **Its other prerequisites are met.** The content-ticket caller fix (PR #41, 2026-09-20) carries both caller halves on the ticket and in the file server's rechecks, so an isolated session whose visibility comes from `inst:<id>` uploads with nothing more. The grant-move narrowing (PR #42, 2026-09-20) announces a moved grant to the subject it names, so an isolated uninstall resyncs that installation's session and no other. Both settings are always bound since PR #41's correction of chapter 08, a half the caller does not hold taking the absent marker, and every meter charges `meter_key` since the same day, which decision 10 overrides for a bot session. The file replica for bots is gated on R71 and ships with it, not here.
 
@@ -5711,9 +5711,11 @@ A key added on a running client makes its rows appear in an open live query with
 
 ## R96: one server builder for programs that embed the server
 
-**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 11 at the maintainer's word, designed 2026-10-03 with the maintainer. The working record, with the tree facts at `12fceca` and the sources read, is `plans/design-r96-server-builder.md` of the `connetto-rs-r96` worktree, copied to `~/.local/share/connetto-r88/notes/design-r96-server-builder.md`.
+**Status.** **DONE** (2026-10-03). Minted 2026-09-25 by R94's decision 11 at the maintainer's word and designed 2026-10-03 with the maintainer. The working record, with the tree facts, the census of construction sites, the serving lifecycle's state table and the sources read, is `plans/design-r96-server-builder.md`, copied to `~/.local/share/connetto-r88/notes/design-r96-server-builder.md`.
 
-**Blocked on nothing.** R91 waits on it (decided with the maintainer 2026-10-03), because R91 adds a login route and a registry cache to the server's construction, which this phase would otherwise move a second time. R74 does not wait, since its server half is two settings types with R37 setters that this builder gathers.
+**Built.** `connetto_server::ServerBuilder` (`crates/connetto-server/src/builder/`) is the one way to construct the server. `build()` returns the merged router, the sync and HTTP routes separately, the change-stream future and a `ServerHandle`, and `serve(listener, shutdown)` runs them. Sync is the WebSocket route `/sync` (`builder/ws.rs`) beside `/auth` and `/files` on one listener. `ManagerBuilder` (`src/manager_builder.rs`) and `Materializer::builder` are the one assembly path, public only under the `test-seams` feature with `InMemoryAuthStore::new` and `TokenAuthority::generate`, and the `SessionManager` and `Materializer` types have no other constructor. The binary (`src/bin/connetto-server.rs`) translates its environment into the builder. Beyond decision 8, `serve` also ends when the change stream gives up under a finite reconnect policy or its source ends, closing every session first, since serving on would keep clients connected with no live delivery. Proven by `tests/it/lifecycle.rs` (a real session over `/sync` on the built parts, the shutdown signal, an unusable change stream closing every session while the runtime keeps running), the e2e and restore suites against the one-port binary, `examples/embed.rs` mounting the parts beside its own route, the browser stack serving the server in process with its development routes on the parts (198 browser tests across 56 suites), the Android device proof on the one-port demo stack, and the whole root workspace's 1192 tests.
+
+**Blocked on nothing.** R91 builds on it, because R91 adds a login route and a registry cache to the server's construction. R74 did not wait, since its server half is two settings types with R37 setters that this builder gathers.
 
 ### Purpose
 

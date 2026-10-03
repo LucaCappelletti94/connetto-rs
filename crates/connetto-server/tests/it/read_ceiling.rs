@@ -18,8 +18,8 @@ use connetto_core::messages::{BulkMessage, ControlMessage, SUBSCRIPTION_REFUSED}
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::IncomingFrame;
 use connetto_server::{
-    AbuseConfig, Materializer, PgSnapshotSource, RequestGuard, SessionConfig, SessionManager,
-    ThrottleConfig, TierLimits, loopback, pg_write_target,
+    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PgSnapshotSource, RequestGuard,
+    SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
 use pg_walstream::{ChangeEvent, Lsn};
@@ -54,16 +54,19 @@ fn limits(page_bytes: u64, row_ceiling: u64, timeout: Duration) -> Arc<RequestGu
 fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> {
     let snapshot =
         PgSnapshotSource::from_ddl(fixture.admin().clone(), PG_DDL).expect("snapshot source");
-    SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         snapshot,
         RosterAuth::granting_nobody(),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        guard,
-        SessionConfig::default(),
     )
+    .with_guard(guard)
+    .build()
 }
 
 /// One in-process client on its own session.
@@ -452,9 +455,9 @@ mod aggregates {
     use connetto_core::messages::{ControlMessage, SUBSCRIPTION_REFUSED};
     use connetto_core::test_support::TestGrantChecker;
     use connetto_server::{
-        AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-        RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits,
-        loopback, pg_write_target,
+        AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
+        RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
+        pg_write_target,
     };
     use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
     use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
@@ -492,25 +495,21 @@ mod aggregates {
 
     fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> {
         let pool = fixture.admin().clone();
-        SessionManager::with_connector(
-            Materializer::with_read_connector(
-                PG_DDL,
-                RuntimeWritableCatalog::default(),
-                None,
-                None,
-                PgReadConnector::with_session_setup(pool.clone()),
-            )
-            .expect("build materializer"),
+        ManagerBuilder::new(
+            Materializer::builder(PG_DDL)
+                .with_write_catalog(RuntimeWritableCatalog::default())
+                .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+                .build()
+                .expect("build materializer"),
             PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
             // An aggregate result is global, so the policy never sees it.
             RosterAuth::granting_nobody(),
             Arc::new(TestGrantChecker),
             PgReadConnector::with_session_setup(pool.clone()),
             pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
-            guard,
-            SessionConfig::default(),
-            None,
         )
+        .with_guard(guard)
+        .build()
     }
 
     /// Enough rows that `MIN(n)` on an unindexed column cannot finish inside a

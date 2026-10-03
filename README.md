@@ -30,7 +30,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 99 phases, 79 done and 20 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 99 phases, 80 done and 19 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -40,7 +40,7 @@ The plan in `plans/master-implementation-plan.md` tracks 99 phases, 79 done and 
 | Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
-| Share keys on a running client, one server builder | R95, R96 |
+| Share keys on a running client | R95 |
 | The desktop login tab | R97 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
@@ -58,7 +58,7 @@ The drawing below is the whole system coloured by build status. It is too dense 
 | Crate | Role |
 |---|---|
 | `connetto-core` | Wire protocol, framing, and the traits every side agrees on |
-| `connetto-server` | Session manager, subscription materializer, auth stack, mutation handler |
+| `connetto-server` | Session manager, subscription materializer, auth stack, mutation handler, and the server builder that assembles them |
 | `connetto-client` | Native Diesel connection, its builder, background sync, live queries, teardown, archives |
 | `connetto-auth-session` | The platform browser tab a phone signs in through, returning to the app by redirect |
 | `connetto-schema` | The build step translating a deployment's Postgres sources into the bundle client and server share |

@@ -85,6 +85,12 @@ impl ReaderReserve {
         self
     }
 
+    /// The configured total the split is expressed against.
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.total
+    }
+
     /// Build the gate enforcing this split.
     ///
     /// # Panics

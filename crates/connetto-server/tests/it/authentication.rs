@@ -18,8 +18,8 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, Principal, SessionId, Subject, VerifiedSession};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 
@@ -140,16 +140,18 @@ async fn absent_grant_yields_an_unidentified_run() {
     let capture = CapturingSnapshot::default();
     let seen = Arc::clone(&capture.seen);
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         capture,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
 
@@ -201,16 +203,18 @@ async fn refused_grant_yields_an_unidentified_run() {
     let fixture = Fixture::acquire().await;
     let capture = CapturingSnapshot::default();
     let seen = Arc::clone(&capture.seen);
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         capture,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(AlwaysReject),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
 
@@ -263,16 +267,18 @@ async fn verified_identity_ignores_a_spoofed_client_id() {
     let resolved = AuthContext::new("resolved-user");
     let capture = CapturingSnapshot::default();
     let seen = Arc::clone(&capture.seen);
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         capture,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(FixedVerifier(resolved.clone())),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.serve(server_transport));
 

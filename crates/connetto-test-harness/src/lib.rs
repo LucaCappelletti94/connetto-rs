@@ -34,9 +34,9 @@ use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::CallerMappings;
 use connetto_server::openfga::{Counted, FgaAuth, StoreUpkeep};
 use connetto_server::{
-    InMemoryOplog, LoopbackTransport, Materializer, NoSigner, OidcProviderConfig, PgReadConnector,
-    PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RequestGuard, RlsAuth, RlsAuthError,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
+    InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoSigner, OidcProviderConfig,
+    PgReadConnector, PgSnapshotSource, ReconnectEvent, ReconnectPolicy, RequestGuard, RlsAuth,
+    RlsAuthError, RuntimeWritableCatalog, SessionConfig, SessionManager, loopback, pg_write_target,
 };
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -1603,7 +1603,7 @@ impl Server {
 ///
 /// # Panics
 ///
-/// Panics when the admin pool cannot be built, when replication setup fails, or when the materializer, write target, or withdrawal snapshot source cannot be constructed from `pg_ddl`. The `install_withdrawal_source` assertion is unreachable because the session manager is freshly constructed inside this function.
+/// Panics when the admin pool cannot be built, when replication setup fails, or when the materializer, write target, or withdrawal snapshot source cannot be constructed from `pg_ddl`.
 pub async fn spawn_server(
     config: ServerConfig,
     snapshot: PgSnapshotSource,
@@ -1629,42 +1629,36 @@ pub async fn spawn_server(
     }
     let upkeep = auth.upkeep();
     let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
-    let materializer =
-        Materializer::with_read_connector(&pg_ddl, writable, translator, caller, engine_connector)
-            .expect("build materializer");
+    let mut materializer_builder = Materializer::builder(&pg_ddl)
+        .with_write_catalog(writable)
+        .with_read_connector(engine_connector);
+    if let Some(translator) = translator {
+        materializer_builder = materializer_builder.with_translator(translator);
+    }
+    if let Some(caller) = caller {
+        materializer_builder = materializer_builder.with_caller(caller);
+    }
+    let materializer = materializer_builder.build().expect("build materializer");
     let write =
         pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
     let withdrawal_pool = connector_pool.clone();
     let connector = PgReadConnector::with_session_setup(connector_pool);
-    // The manager requires a handshake authority with no default (R2). The
-    // harness is test-only, so it installs the `test-support` stand-in that
-    // reads the subject out of the grant string, which is what
-    // `Client::handshake` assumes. Nothing here is reachable from a production
-    // build.
+    // The harness is test-only, so the stand-in authority reads the subject out of the grant string.
     let authority: Arc<dyn connetto_core::traits::HandshakeAuthority> =
         Arc::new(connetto_core::test_support::TestGrantChecker);
-    let manager = SessionManager::with_oplog(
-        materializer,
-        snapshot,
-        auth,
-        authority,
-        connector,
-        InMemoryOplog::default(),
-        write,
-        guard,
-        session,
-        upkeep,
-        signer,
-    );
-    // R27 decision 6: move-out withdrawals are read on the admin pool, as the
-    // binary reads them on DATABASE_URL's, because the caller can no longer
-    // see the rows a lost membership exposes. Keys only are sent.
+    // Move-out withdrawals read on the admin pool, keys only (R27 decision 6).
     let withdrawals =
         PgSnapshotSource::from_ddl(withdrawal_pool, &pg_ddl).expect("build withdrawal source");
-    assert!(
-        manager.install_withdrawal_source(withdrawals).is_ok(),
-        "nothing else installs a withdrawal source"
-    );
+    let mut manager_builder =
+        ManagerBuilder::new(materializer, snapshot, auth, authority, connector, write)
+            .with_guard(guard)
+            .with_session(session)
+            .with_signer(signer)
+            .with_withdrawal_source(withdrawals);
+    if let Some(upkeep) = upkeep {
+        manager_builder = manager_builder.with_upkeep(upkeep);
+    }
+    let manager = manager_builder.build();
 
     let restarts = Arc::new(AtomicU64::new(0));
     let ingest = spawn_ingest_task(
@@ -2089,8 +2083,8 @@ mod url_tests {
             "http://192.168.1.5:59293/default"
         );
         assert_eq!(
-            with_host("http://127.0.0.1:18081", "mac.local"),
-            "http://mac.local:18081"
+            with_host("http://127.0.0.1:19443", "mac.local"),
+            "http://mac.local:19443"
         );
     }
 }

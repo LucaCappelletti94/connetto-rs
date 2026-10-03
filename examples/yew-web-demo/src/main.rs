@@ -21,11 +21,12 @@
 //! trunk's glue does not initialize itself.
 //!
 //! Run against the demo stack (dev IdP, server on 7777, `connetto-demo-pg` on
-//! 55456): start the dev IdP with `CONNETTO_AUTH_BIND=127.0.0.1:18081` set,
-//! source `target/dev-idp.env`, start the server with `CONNETTO_AUTH`,
-//! `CONNETTO_AUTH_BIND`, `CONNETTO_AUTH_CORS_ORIGINS=http://127.0.0.1:9911`, the
+//! 55456): start the dev IdP with `CONNETTO_BIND=127.0.0.1:7777` set,
+//! source `target/dev-idp.env`, start the server with `CONNETTO_BIND`,
+//! `CONNETTO_AUTH`, the JWT key files,
+//! `CONNETTO_AUTH_CORS_ORIGINS=http://127.0.0.1:9911`, the
 //! OIDC provider vars from `target/dev-idp.env`, `CONNETTO_READER_URL`,
-//! `DATABASE_URL`, `CONNETTO_BIND`, `CONNETTO_WRITABLE`, and
+//! `DATABASE_URL`, `CONNETTO_WRITABLE`, and
 //! `CONNETTO_PG_DDL_FILE`, then `trunk serve` from this directory and open
 //! the served URL in several windows.
 
@@ -61,14 +62,14 @@ type Tab = MessageTransport<BroadcastChannel>;
 /// build time when set.
 const DEMO_WS_URL: &str = match option_env!("CONNETTO_DEMO_WS") {
     Some(url) => url,
-    None => "ws://127.0.0.1:7777/",
+    None => "ws://127.0.0.1:7777/sync",
 };
 /// The origin serving `connetto-server`'s auth router, which the worker's login
 /// navigation and `fetch` calls go to. `CONNETTO_DEMO_AUTH_ORIGIN` at build time
 /// moves it.
 const AUTH_ORIGIN: &str = match option_env!("CONNETTO_DEMO_AUTH_ORIGIN") {
     Some(origin) => origin,
-    None => "http://127.0.0.1:18081",
+    None => "http://127.0.0.1:7777",
 };
 /// The upstream subscription the worker registers.
 const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";

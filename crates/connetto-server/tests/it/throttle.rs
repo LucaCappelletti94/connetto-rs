@@ -34,9 +34,9 @@ use connetto_core::traits::{
 };
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    AbuseConfig, LoopbackTransport, Materializer, PageSpec, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig, TierLimits,
-    loopback, pg_write_target,
+    AbuseConfig, LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec,
+    RequestGuard, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig,
+    TierLimits, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -109,18 +109,24 @@ type Manager = Arc<SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>>;
 
 /// Build a manager whose only unusual setting is the throttle.
 fn manager(fixture: &Fixture, throttle: &ThrottleConfig) -> Manager {
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         // Rows come from the SeedSnapshot stub, not the live path.
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::new(*throttle, AbuseConfig::default())),
-        SessionConfig::default(),
     )
+    .with_guard(Arc::new(RequestGuard::new(
+        *throttle,
+        AbuseConfig::default(),
+    )))
+    .build()
 }
 
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
@@ -456,21 +462,24 @@ async fn a_tripped_credential_limit_stops_checking_grants() {
 
     let fixture = Fixture::acquire().await;
     let checked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(CountingAuthority(Arc::clone(&checked))),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::new(
-            ThrottleConfig::new()
-                .with_anonymous(TierLimits::anonymous().with_credential_refusals(LIMIT, WINDOW)),
-            AbuseConfig::default(),
-        )),
-        SessionConfig::default(),
-    );
+    )
+    .with_guard(Arc::new(RequestGuard::new(
+        ThrottleConfig::new()
+            .with_anonymous(TierLimits::anonymous().with_credential_refusals(LIMIT, WINDOW)),
+        AbuseConfig::default(),
+    )))
+    .build();
 
     let (server_end, mut client) = loopback();
     let server = Arc::clone(&manager);

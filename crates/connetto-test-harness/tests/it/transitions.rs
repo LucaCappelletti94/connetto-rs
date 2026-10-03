@@ -68,7 +68,9 @@ impl Replica {
             .expect("replica ddl");
         Self {
             conn,
-            applier: Materializer::new(FANOUT_PG_DDL).expect("applier"),
+            applier: Materializer::builder(FANOUT_PG_DDL)
+                .build()
+                .expect("applier"),
         }
     }
 

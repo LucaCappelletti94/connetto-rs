@@ -22,7 +22,9 @@ const PG_DDL: &str =
     "CREATE TABLE t (id INT PRIMARY KEY, name TEXT, amount INT, price FLOAT, tag BYTEA);";
 
 fn materializer() -> Materializer {
-    Materializer::new(PG_DDL).expect("build materializer")
+    Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer")
 }
 
 #[test]
@@ -232,7 +234,9 @@ fn registers_the_exact_shape_diesel_renders() {
 /// a read-tier computed subscription (`SeedPlan::Snapshot`), never as `Row`.
 #[test]
 fn latest_n_row_query_registers_as_snapshot_not_row() {
-    let mut mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mut mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let reg = mat
         .register(1, "SELECT * FROM t ORDER BY id DESC LIMIT 3")
         .expect("register");
@@ -298,20 +302,18 @@ fn every_aggregate_survives_the_reverse_translation() {
 #[test]
 fn the_subject_set_reach_reverses_to_the_membership_it_came_from() {
     const DDL: &str = "CREATE TABLE members (member TEXT NOT NULL);";
-    let materializer: Materializer<_, _, NoConnector> = Materializer::with_read_connector(
-        DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        Some(CallerMappings {
+    let materializer: Materializer<_, _, NoConnector> = Materializer::builder(DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_caller(CallerMappings {
             identity: SessionVariableMapping::current_setting("app.user_id", "current_app_user"),
             subjects: Some(
                 SessionVariableMapping::current_setting("app.subjects", "current_app_subjects")
                     .holding_set(','),
             ),
-        }),
-        NoConnector,
-    )
-    .expect("the catalog parses");
+        })
+        .with_read_connector(NoConnector)
+        .build()
+        .expect("the catalog parses");
     let reach = subject_set_reach("current_app_subjects", "member", ',');
     let pg = materializer
         .translate_subscription_sql(&format!("SELECT * FROM members WHERE {reach}"))

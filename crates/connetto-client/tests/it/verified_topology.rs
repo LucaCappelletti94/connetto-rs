@@ -23,14 +23,14 @@ use std::process::{Child, Command, Stdio};
 use tokio::net::TcpStream;
 use tokio::time::{Duration, Instant, sleep, timeout};
 
-/// The server's auth endpoints, its `CONNETTO_AUTH_BIND`.
+/// The server's login endpoints, on its `CONNETTO_BIND`.
 fn auth_base() -> String {
-    std::env::var("CONNETTO_TEST_AUTH_BASE").unwrap_or_else(|_| "http://127.0.0.1:18081".to_owned())
+    std::env::var("CONNETTO_TEST_AUTH_BASE").unwrap_or_else(|_| "http://127.0.0.1:7777".to_owned())
 }
 
 /// The server's sync endpoint, its `CONNETTO_BIND`.
 fn ws_url() -> String {
-    std::env::var("CONNETTO_TEST_WS").unwrap_or_else(|_| "ws://127.0.0.1:7777/".to_owned())
+    std::env::var("CONNETTO_TEST_WS").unwrap_or_else(|_| "ws://127.0.0.1:7777/sync".to_owned())
 }
 
 /// The provider name `dev_idp` registers.
@@ -44,15 +44,6 @@ fn bind_from_ws(url: &str) -> String {
         .split('/')
         .next()
         .unwrap_or(url)
-        .to_owned()
-}
-
-fn bind_from_http(base: &str) -> String {
-    base.strip_prefix("http://")
-        .unwrap_or(base)
-        .split('/')
-        .next()
-        .unwrap_or(base)
         .to_owned()
 }
 
@@ -84,11 +75,9 @@ async fn wait_for_child_port(child: &mut Child, bind: &str) {
 async fn maybe_spawn_server() -> Option<ServerGuard> {
     let bin = std::env::var("CONNETTO_SERVER_BIN").ok()?;
     let bind = bind_from_ws(&ws_url());
-    let auth_bind = bind_from_http(&auth_base());
     let mut command = Command::new(&bin);
     command
         .env("CONNETTO_BIND", &bind)
-        .env("CONNETTO_AUTH_BIND", &auth_bind)
         .env("CONNETTO_AUTH", "database")
         .env("CONNETTO_WRITABLE", "orders,photos")
         .stdout(Stdio::null())
@@ -103,7 +92,6 @@ async fn maybe_spawn_server() -> Option<ServerGuard> {
         .spawn()
         .unwrap_or_else(|err| panic!("spawning connetto-server at {bin}: {err}"));
     wait_for_child_port(&mut child, &bind).await;
-    wait_for_child_port(&mut child, &auth_bind).await;
     Some(ServerGuard(child))
 }
 

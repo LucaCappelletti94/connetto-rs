@@ -15,14 +15,14 @@
 //! `CONNETTO_DEMO_ADB_REVERSE` (comma-separated `device:host` port pairs) and
 //! `CONNETTO_DEMO_ISSUER` set, then stops.
 //!
-//! `CONNETTO_STACK_SYNC_PORT` and `CONNETTO_STACK_AUTH_PORT` move its
-//! listeners off 7777 and 18081. `CONNETTO_STACK_PUBLIC_HOST` puts it on the
-//! LAN for a phone that has no `adb reverse`, binding every interface and
-//! naming that host in every address it hands out. With it,
-//! `CONNETTO_STACK_TLS_CERT` and `CONNETTO_STACK_TLS_KEY` name a certificate
-//! for that host. The auth listener, which carries the login callback and
-//! content, is then served over TLS in front of the server's plain one, and
-//! the identity provider serves the same certificate itself.
+//! `CONNETTO_STACK_SYNC_PORT` moves its listener off 7777.
+//! `CONNETTO_STACK_PUBLIC_HOST` puts it on the LAN for a phone that has no
+//! `adb reverse`, binding every interface and naming that host in every
+//! address it hands out. With it, `CONNETTO_STACK_TLS_CERT` and
+//! `CONNETTO_STACK_TLS_KEY` name a certificate for that host. The listener,
+//! which carries the login callback and the file routes, is then served over
+//! TLS in front of the server's plain one, and the identity provider serves
+//! the same certificate itself.
 //!
 //! Where Docker cannot run, `CONNETTO_STACK_POSTGRES_URL`,
 //! `CONNETTO_STACK_OPENFGA_URL` and `CONNETTO_STACK_ISSUER` together name a
@@ -35,16 +35,14 @@ use std::ffi::OsString;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
-    AUTH_PORT_VAR, Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR,
-    TLS_KEY_VAR, ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
+    Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR, TLS_KEY_VAR,
+    ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
 };
 use connetto_test_harness::{MockOauth, with_host};
 
-/// The sync port the demo dials unless told otherwise, which a phone keeps.
+/// The port the demo dials unless told otherwise, which a phone keeps. The
+/// server serves sync, login and files on it all.
 const DEMO_SYNC_PORT: u16 = 7777;
-/// The auth port of the demo's default `AUTH_SERVER`, which a phone keeps. The
-/// server's auth listener serves content too.
-const DEMO_AUTH_PORT: u16 = 18081;
 const PROVIDER: &str = "dev-idp";
 /// The port in the demo's default `CONNETTO_DEMO_PG`.
 const DEMO_PG_PORT: u16 = 55456;
@@ -67,15 +65,13 @@ async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
     let plan = Addresses::from_env()?;
     let Addresses {
-        sync_port,
-        auth_port,
+        bind_port,
         public_host,
         tls,
-        sync_bind,
-        public_auth_bind,
-        auth_bind,
-        sync_address,
-        auth_base,
+        server_bind,
+        public_bind,
+        address,
+        base,
     } = plan;
 
     let mut args = std::env::args_os().skip(1).collect::<Vec<OsString>>();
@@ -90,18 +86,18 @@ async fn main() -> Result<()> {
     let server_bin = ensure_server_bin().await?;
     let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack", running.as_ref()).await?;
     let idp = identity_provider(running, public_host.as_deref(), tls.as_ref()).await?;
-    let mut envs = provisioned.server_env(&DEPLOYMENT, &sync_bind, &auth_bind, &auth_base);
-    envs.extend(idp.env_pairs(PROVIDER, &format!("{auth_base}/auth/callback")));
+    let mut envs = provisioned.server_env(&DEPLOYMENT, &server_bind, &base);
+    envs.extend(idp.env_pairs(PROVIDER, &format!("{base}/auth/callback")));
     envs.push((
         "CONNETTO_AUTH_REDIRECT_ALLOWLIST".to_owned(),
         APP_REDIRECT.to_owned(),
     ));
-    let _server = spawn_server(&server_bin, &envs, &sync_bind, &auth_bind).await?;
+    let _server = spawn_server(&server_bin, &envs, &server_bind).await?;
     let _tls = match &tls {
         Some((cert, key)) => Some(
             Relay::start_tls(
-                &public_auth_bind,
-                &auth_bind,
+                &public_bind,
+                &server_bind,
                 std::path::Path::new(cert),
                 std::path::Path::new(key),
             )
@@ -114,23 +110,18 @@ async fn main() -> Result<()> {
         || provisioned.fixture.admin_url().to_owned(),
         |host| with_host(provisioned.fixture.admin_url(), host),
     );
-    let reverse = device_reverse(
-        sync_port,
-        auth_port,
-        url_port(idp.issuer())?,
-        url_port(&pg_url)?,
-    )?;
+    let reverse = device_reverse(bind_port, url_port(idp.issuer())?, url_port(&pg_url)?)?;
     let reverse_spec = reverse
         .iter()
         .map(|(device, host)| format!("{device}:{host}"))
         .collect::<Vec<_>>()
         .join(",");
     let demo_env = vec![
-        ("CONNETTO_DEMO_SERVER".to_owned(), sync_address.clone()),
-        ("CONNETTO_DEMO_AUTH_ORIGIN".to_owned(), auth_base),
+        ("CONNETTO_DEMO_SERVER".to_owned(), address.clone()),
+        ("CONNETTO_DEMO_AUTH_ORIGIN".to_owned(), base),
         (
             "CONNETTO_DEMO_WS".to_owned(),
-            format!("ws://{sync_address}/"),
+            format!("ws://{address}/sync"),
         ),
         ("CONNETTO_DEMO_PG".to_owned(), pg_url),
         ("CONNETTO_DEMO_ADB_REVERSE".to_owned(), reverse_spec),
@@ -203,93 +194,84 @@ async fn pkcs12(cert: &str, key: &str) -> Result<Vec<u8>> {
 
 /// Where the stack listens and what it tells clients, from the environment.
 struct Addresses {
-    sync_port: u16,
-    auth_port: u16,
+    /// The port the demo dials and the listener answers on.
+    bind_port: u16,
     public_host: Option<String>,
     tls: Option<(String, String)>,
-    sync_bind: String,
-    /// The auth address clients reach, which a TLS relay owns when there is
-    /// one.
-    public_auth_bind: String,
-    /// The server's own auth listener, on loopback behind a TLS relay.
-    auth_bind: String,
-    sync_address: String,
-    auth_base: String,
+    /// The address the server binds, on loopback behind a TLS relay when
+    /// there is one.
+    server_bind: String,
+    /// The address clients reach, which a TLS relay owns when there is one.
+    public_bind: String,
+    /// The `host:port` a phone dials for sync.
+    address: String,
+    /// The base URL login and file routes answer on.
+    base: String,
 }
 
 impl Addresses {
     fn from_env() -> Result<Self> {
-        let [sync_port, auth_port] = ports(
+        let [bind_port] = ports(
             |name| std::env::var(name).ok(),
-            [
-                (SYNC_PORT_VAR, DEMO_SYNC_PORT),
-                (AUTH_PORT_VAR, DEMO_AUTH_PORT),
-            ],
+            [(SYNC_PORT_VAR, DEMO_SYNC_PORT)],
         )?;
         let public_host = std::env::var(PUBLIC_HOST_VAR).ok();
-        let (bind_host, host) = public_host
-            .as_deref()
-            .map_or(("127.0.0.1", "127.0.0.1"), |host| ("0.0.0.0", host));
+        let host_present = public_host.is_some();
+        let (bind_host, host) = match public_host.as_deref() {
+            Some(host) => ("0.0.0.0".to_owned(), host.to_owned()),
+            None => ("127.0.0.1".to_owned(), "127.0.0.1".to_owned()),
+        };
         let tls = match (
             std::env::var(TLS_CERT_VAR).ok(),
             std::env::var(TLS_KEY_VAR).ok(),
         ) {
-            (Some(cert), Some(key)) if public_host.is_some() => Some((cert, key)),
+            (Some(cert), Some(key)) if host_present => Some((cert, key)),
             (None, None) => None,
             _ => bail!("{TLS_CERT_VAR} and {TLS_KEY_VAR} go together, with {PUBLIC_HOST_VAR}"),
         };
-        let sync_bind = format!("{bind_host}:{sync_port}");
-        let public_auth_bind = format!("{bind_host}:{auth_port}");
-        let scheme = if tls.is_some() { "https" } else { "http" };
-        require_free(&sync_bind, SYNC_PORT_VAR)?;
-        require_free(&public_auth_bind, AUTH_PORT_VAR)?;
-        let auth_bind = if tls.is_some() {
+        let public_bind = format!("{bind_host}:{bind_port}");
+        require_free(&public_bind, SYNC_PORT_VAR)?;
+        let server_bind = if tls.is_some() {
             format!("127.0.0.1:{}", free_port()?)
         } else {
-            public_auth_bind.clone()
+            public_bind.clone()
         };
+        let scheme = if tls.is_some() { "https" } else { "http" };
         Ok(Self {
-            sync_port,
-            auth_port,
-            sync_address: format!("{host}:{sync_port}"),
-            auth_base: format!("{scheme}://{host}:{auth_port}"),
+            bind_port,
             public_host,
             tls,
-            sync_bind,
-            public_auth_bind,
-            auth_bind,
+            server_bind,
+            public_bind,
+            address: format!("{host}:{bind_port}"),
+            base: format!("{scheme}://{host}:{bind_port}"),
         })
     }
 }
 
 /// The `adb reverse` pairs, each the device port then the host port. The
-/// demo dials the default ports, while the server builds its login callback
-/// and other absolute URLs from the auth port it binds, which a phone's browser
-/// follows, so a moved auth port is reversed at its own number too.
+/// demo dials the default port for sync, login and files, while the server
+/// builds its login callback and other absolute URLs from the port it
+/// binds, which a phone's browser follows, so a moved port is reversed at
+/// its own number too.
 ///
 /// # Errors
 ///
-/// When a moved auth port is a device port the demo already dials, since one
+/// When a moved port is a device port the demo already dials, since one
 /// device port cannot reach two listeners.
-fn device_reverse(
-    sync_port: u16,
-    auth_port: u16,
-    issuer_port: u16,
-    pg_port: u16,
-) -> Result<Vec<(u16, u16)>> {
+fn device_reverse(bind_port: u16, issuer_port: u16, pg_port: u16) -> Result<Vec<(u16, u16)>> {
     let mut pairs = vec![
-        (DEMO_SYNC_PORT, sync_port),
-        (DEMO_AUTH_PORT, auth_port),
+        (DEMO_SYNC_PORT, bind_port),
         (issuer_port, issuer_port),
         (DEMO_PG_PORT, pg_port),
     ];
-    if auth_port != DEMO_AUTH_PORT {
-        if pairs.iter().any(|(device, _)| *device == auth_port) {
+    if bind_port != DEMO_SYNC_PORT {
+        if pairs.iter().any(|(device, _)| *device == bind_port) {
             bail!(
-                "{AUTH_PORT_VAR}={auth_port} is a port the demo dials on a phone, move the auth listener elsewhere"
+                "{SYNC_PORT_VAR}={bind_port} is a port the demo dials on a phone, move the listener elsewhere"
             );
         }
-        pairs.push((auth_port, auth_port));
+        pairs.push((bind_port, bind_port));
     }
     Ok(pairs)
 }
@@ -314,37 +296,38 @@ fn url_port(address: &str) -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DEMO_AUTH_PORT, DEMO_PG_PORT, DEMO_SYNC_PORT, device_reverse};
+    use super::{DEMO_PG_PORT, DEMO_SYNC_PORT, device_reverse};
 
-    /// The server builds its login callback and every other absolute URL from
-    /// the auth port it binds, and a phone's browser follows them. So a moved
-    /// auth port is reachable on the device at its own number as well as at
-    /// the one the demo dials.
+    /// The server builds its login callback and every other absolute URL
+    /// from the port it binds, and a phone's browser follows them. So a
+    /// moved port is reachable on the device at its own number as well as
+    /// at the one the demo dials.
     #[test]
-    fn a_moved_auth_port_is_reachable_on_the_device_at_its_own_number() {
-        let pairs = device_reverse(17777, 18181, 40000, 50000).expect("pairs");
-        assert!(pairs.contains(&(DEMO_AUTH_PORT, 18181)), "{pairs:?}");
+    fn a_moved_bind_port_is_reachable_on_the_device_at_its_own_number() {
+        let pairs = device_reverse(18181, 40000, 50000).expect("pairs");
+        assert!(pairs.contains(&(DEMO_SYNC_PORT, 18181)), "{pairs:?}");
         assert!(pairs.contains(&(18181, 18181)), "{pairs:?}");
     }
 
-    /// On the default ports each device port is reversed once.
+    /// On the default port each device port is reversed once.
     #[test]
-    fn default_ports_reverse_each_device_port_once() {
-        let pairs =
-            device_reverse(DEMO_SYNC_PORT, DEMO_AUTH_PORT, 40000, DEMO_PG_PORT).expect("pairs");
+    fn default_port_reverses_each_device_port_once() {
+        let pairs = device_reverse(DEMO_SYNC_PORT, 40000, DEMO_PG_PORT).expect("pairs");
         let mut devices = pairs.iter().map(|(device, _)| *device).collect::<Vec<_>>();
         devices.sort_unstable();
         devices.dedup();
         assert_eq!(devices.len(), pairs.len(), "{pairs:?}");
     }
 
-    /// A phone cannot reach two listeners at one device port, so an auth port
-    /// moved onto a port the demo already dials is refused.
+    /// A phone cannot reach two listeners at one device port, so a listener
+    /// port moved onto a port another service owns is refused.
     #[test]
-    fn an_auth_port_on_a_port_the_demo_dials_is_refused() {
-        for dialed in [DEMO_SYNC_PORT, DEMO_PG_PORT, 40000] {
-            let refused = device_reverse(17777, dialed, 40000, 50000);
-            assert!(refused.is_err(), "auth on {dialed}: {refused:?}");
+    fn a_bind_port_on_a_port_the_demo_dials_is_refused() {
+        for issuer in [40000, 50000] {
+            let refused = device_reverse(issuer, issuer, 50000);
+            assert!(refused.is_err(), "bind on {issuer}: {refused:?}");
         }
+        let refused = device_reverse(55456, 40000, DEMO_PG_PORT);
+        assert!(refused.is_err(), "bind on the pg port: {refused:?}");
     }
 }

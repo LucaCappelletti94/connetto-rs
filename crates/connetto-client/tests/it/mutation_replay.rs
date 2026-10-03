@@ -21,7 +21,7 @@ use connetto_core::messages::{ControlMessage, HandshakeAck};
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, ReplicaKeyStore, Transport};
 use connetto_core::{Cursor, test_support::TestGrantChecker};
 use connetto_server::{
-    LoopbackTransport, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
@@ -160,21 +160,20 @@ async fn reset_orders(fixture: &Fixture) {
 /// A manager whose `orders` table accepts client writes into the real Postgres
 /// target the test reads back through the admin pool.
 fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
-    let materializer = Materializer::with_write_catalog(
-        PG_DDL,
-        RuntimeWritableCatalog::builder().writable("orders").build(),
-    )
-    .expect("build materializer");
-    SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::builder().writable("orders").build())
+        .build()
+        .expect("build materializer");
+    ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
     )
+    .build()
 }
 
 /// Open one real server session and hand back the client transport.

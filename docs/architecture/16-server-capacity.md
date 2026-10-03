@@ -14,7 +14,7 @@ They also fail differently, which is why they are separate mechanisms rather tha
 
 ## The two pools
 
-**Built, sizes explicit since R39 (2026-08-08).** The server builds two Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/bin/connetto-server.rs`. Both default to bb8's ten connections, now stated rather than implied: `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` set them, and `CONNETTO_READER_RESERVE` (default 3) is expressed against the reader pool's configured total.
+**Built, sizes explicit since R39 (2026-08-08).** The server builds two Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/builder/mod.rs`. Both default to bb8's ten connections, now stated rather than implied: `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` set them, and `CONNETTO_READER_RESERVE` (default 3) is expressed against the reader pool's configured total.
 
 The **owner pool** connects as the deployment's owning role and carries re-execution (`PgAsyncDieselConnector`), the authentication store (`DbAuthStore`) and audit writes (`pg_audit_hook`). Row-level security does not apply to it, which is the entire reason a second pool exists.
 

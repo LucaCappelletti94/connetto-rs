@@ -1,9 +1,9 @@
 //! A standalone OIDC provider for local loops, standing in for Google or Entra.
 //!
-//! The reference `connetto-server` binary is a confidential OAuth client, so it
-//! needs a real provider to talk to. This starts the same containerised mock the
-//! tests use. The provider serves discovery, tokens and keys over HTTP, and its
-//! login form lets a browser choose the subject.
+//! The `connetto-server` binary is a confidential OAuth client, so it needs a
+//! real provider to talk to. This starts the same containerised mock the
+//! tests use. The provider serves discovery, tokens and keys over HTTP, and
+//! its login form lets a browser choose the subject.
 //!
 //! The helper writes the environment the server reads:
 //!
@@ -13,17 +13,17 @@
 //! cargo run --bin connetto-server
 //! ```
 //!
-//! The redirect defaults to `http://$CONNETTO_AUTH_BIND/auth/callback`, so the
-//! provider and server agree when they use the same `CONNETTO_AUTH_BIND`.
+//! The redirect defaults to `http://$CONNETTO_BIND/auth/callback`, so the
+//! provider and server agree when they use the same `CONNETTO_BIND`.
 
 use std::path::PathBuf;
 
 use anyhow::{Context as _, Result};
 use connetto_test_harness::{MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MockOauth};
 
-/// `connetto-server`'s own default for `CONNETTO_AUTH_BIND`, mirrored so the
+/// `connetto-server`'s own default for `CONNETTO_BIND`, mirrored so the
 /// callback lands where the server serves it.
-const DEFAULT_SERVER_AUTH_BIND: &str = "127.0.0.1:8081";
+const DEFAULT_SERVER_BIND: &str = "127.0.0.1:8080";
 
 /// The provider name a client names in its login request.
 const PROVIDER: &str = "dev-idp";
@@ -35,9 +35,8 @@ const DEFAULT_ENV_FILE: &str = "target/dev-idp.env";
 async fn main() -> Result<()> {
     connetto_core::logging::init_stdout();
 
-    let auth_bind =
-        std::env::var("CONNETTO_AUTH_BIND").unwrap_or_else(|_| DEFAULT_SERVER_AUTH_BIND.to_owned());
-    let callback = format!("http://{auth_bind}/auth/callback");
+    let bind = std::env::var("CONNETTO_BIND").unwrap_or_else(|_| DEFAULT_SERVER_BIND.to_owned());
+    let callback = format!("http://{bind}/auth/callback");
     let idp = MockOauth::start().await;
 
     let env_path = PathBuf::from(
