@@ -543,6 +543,8 @@ async fn watermark_survives_reconnect_reusing_session() {
 async fn single_connection_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
     Pool::builder()
         .max_size(1)
+        // Opened at build, so the 100 ms checkout bounds only the outage and never the first connect.
+        .min_idle(1)
         .connection_timeout(Duration::from_millis(100))
         .build(AsyncDieselConnectionManager::new(fixture.admin_url()))
         .await

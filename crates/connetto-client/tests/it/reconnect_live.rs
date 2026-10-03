@@ -498,6 +498,8 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
     connetto_test_harness::provision_watermark(fixture.admin()).await;
     let writes = diesel_async::pooled_connection::bb8::Pool::builder()
         .max_size(1)
+        // Opened at build, so the 100 ms checkout bounds only the outage and never the first connect.
+        .min_idle(1)
         .connection_timeout(Duration::from_millis(100))
         .build(
             diesel_async::pooled_connection::AsyncDieselConnectionManager::new(fixture.admin_url()),

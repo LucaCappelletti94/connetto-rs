@@ -201,6 +201,8 @@ async fn a_transient_read_pause_resumes_delivery_without_ending_anything() {
 
     let tiny_pool = Pool::builder()
         .max_size(1)
+        // Opened at build, so the 150 ms checkout bounds only the outage and never the first connect.
+        .min_idle(1)
         .connection_timeout(Duration::from_millis(150))
         .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
             fixture.admin_url().to_owned(),
