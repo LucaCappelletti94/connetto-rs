@@ -21,16 +21,16 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Aggregates | `COUNT`, `SUM`, `AVG`, variance and grouped folds per change, `MIN`, `MAX`, joins and rows re-executed per viewer |
 | Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans |
 | Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
-| Clients | Native Diesel connection, browser client on a worker over OPFS, Dioxus and Yew hooks |
+| Clients | One builder per platform, a native Diesel connection on desktop, Android and iOS, a browser client on a worker over OPFS, Dioxus and Yew hooks |
 | At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier, retention, several accounts |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
-| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over seven workspaces |
+| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over seven workspaces with proofs on an Android emulator and an iOS simulator |
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 99 phases, 78 done and 21 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 99 phases, 79 done and 20 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -40,7 +40,7 @@ The plan in `plans/master-implementation-plan.md` tracks 99 phases, 78 done and 
 | Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
-| One client builder per platform, share keys on a running client, one server builder | R94 to R96 |
+| Share keys on a running client, one server builder | R95, R96 |
 | The desktop login tab | R97 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
@@ -59,10 +59,12 @@ The drawing below is the whole system coloured by build status. It is too dense 
 |---|---|
 | `connetto-core` | Wire protocol, framing, and the traits every side agrees on |
 | `connetto-server` | Session manager, subscription materializer, auth stack, mutation handler |
-| `connetto-client` | Native Diesel connection, background sync, live queries, teardown, archives |
+| `connetto-client` | Native Diesel connection, its builder, background sync, live queries, teardown, archives |
+| `connetto-auth-session` | The platform browser tab a phone signs in through, returning to the app by redirect |
+| `connetto-schema` | The build step translating a deployment's Postgres sources into the bundle client and server share |
 | `connetto-web` | Browser platform on wasm32, the DB worker, the relay, storage and custody |
 | `connetto-dioxus`, `connetto-yew` | Framework adapters exposing live queries as hooks |
 | `connetto-file-core`, `connetto-file-server`, `connetto-file-client` | The file stack, which depends on connetto and never the reverse |
 | `connetto-test-harness` | The in-process CDC loop and the browser stack runner behind the tests |
 
-`examples/` holds a Dioxus desktop demo, Dioxus and Yew web demos, the browser smoke suite, and the passkey unlock proof.
+`examples/` holds a Dioxus demo for desktop, Android and iOS, Dioxus and Yew web demos sharing one deployment, the browser smoke suite, and the passkey unlock proof.
