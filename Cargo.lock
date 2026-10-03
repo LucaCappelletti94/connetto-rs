@@ -9753,7 +9753,7 @@ checksum = "f0805222e57f7521d6a62e36fa9163bc891acd422f971defe97d64e70d0a4fe5"
 [[package]]
 name = "windows-native-keyring-store"
 version = "1.1.0"
-source = "git+https://github.com/LucaCappelletti94/windows-native-keyring-store?rev=01d7620665ed0e118cd4a1a6e74a14be2eed07ad#01d7620665ed0e118cd4a1a6e74a14be2eed07ad"
+source = "git+https://github.com/LucaCappelletti94/windows-native-keyring-store?rev=3109f4d4347bba565cdbb2ae5d0439d5c03fbde6#3109f4d4347bba565cdbb2ae5d0439d5c03fbde6"
 dependencies = [
  "aes-gcm",
  "byteorder",
