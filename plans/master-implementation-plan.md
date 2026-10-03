@@ -153,6 +153,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R11 | The shared public store. Off the critical path |
 | any | R31 | Application schema majors. Deadline is the first deployment intending to survive a schema change |
 | done | ~~R87~~ | Storage quotas and deployment ceilings |
+| done | ~~R71~~ | Linux key custody across a reboot, which R74's device key shares on Linux |
 | any | R70 | Backup and restore. Step 4's OpenFGA reconcile needs only connetto's call, subql's `OpenFgaPolicy::reconcile_store` being in the pin, and step 2's frontier leg waits on R75, whose frontier is what it demonstrates against |
 | any | R72 | Clock discipline. Independent, and it absorbs the certificate clock rule R74 states |
 | any | R74 | Device identity and certificates, first of the peer phases. Needs nothing since R94, whose builders take the device key's store, the certificate lifetime setting and the enrolment step |
