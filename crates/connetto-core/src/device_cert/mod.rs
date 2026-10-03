@@ -10,11 +10,13 @@
 mod authority;
 mod certificate;
 mod identity;
+mod key;
 mod request;
 
 pub use authority::{DeviceIssuer, IssueError, IssuerError, RootCa, RootError, deployment_of_root};
 pub use certificate::{DeviceCertificate, ProfileError};
 pub use identity::{DeploymentId, DeviceIdentity, IdentityError, KeyId};
+pub use key::{CertificateSigner, DeviceKey, DeviceKeyError, KeyHome, key_id, public_key_info};
 pub use request::{CertificateRequest, RequestError};
 
 #[cfg(test)]

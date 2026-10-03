@@ -371,3 +371,59 @@ fn an_issuer_loads_from_its_stored_pkcs8_key() {
         Err(IssuerError::Key(_))
     ));
 }
+
+/// A device key held in memory, standing in for a chip.
+struct InMemory(KeyPair);
+
+impl DeviceKey for InMemory {
+    fn public_point(&self) -> [u8; 65] {
+        self.0
+            .der_bytes()
+            .try_into()
+            .expect("an uncompressed P-256 point")
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+        rcgen::SigningKey::sign(&self.0, message)
+            .map_err(|err| DeviceKeyError::Platform(Box::new(err)))
+    }
+
+    fn home(&self) -> KeyHome {
+        KeyHome::Software
+    }
+}
+
+#[test]
+fn a_device_key_requests_a_certificate_naming_it() {
+    let start = at(1_800_000_000);
+    let (_, issuer) = authorities(start);
+    let key = InMemory(KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key"));
+    let csr = CertificateRequest::build(&CertificateSigner::new(&key), &[4; 32]).expect("build");
+    let request = CertificateRequest::parse(&csr).expect("the request verifies");
+    let leaf = issuer
+        .issue(&request, "acct", start, DAY, [5; 16])
+        .expect("issue");
+    let cert = DeviceCertificate::parse(&leaf).expect("profile");
+    assert_eq!(cert.identity().key(), key_id(&key));
+    assert_eq!(
+        key_id(&key),
+        KeyId::of_public_key(&key.0.subject_public_key_info())
+    );
+}
+
+#[test]
+fn a_device_key_that_cannot_sign_builds_no_request() {
+    struct Refusing;
+    impl DeviceKey for Refusing {
+        fn public_point(&self) -> [u8; 65] {
+            [4; 65]
+        }
+        fn sign(&self, _: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+            Err(DeviceKeyError::Unavailable)
+        }
+        fn home(&self) -> KeyHome {
+            KeyHome::Software
+        }
+    }
+    assert!(CertificateRequest::build(&CertificateSigner::new(&Refusing), &[4; 32]).is_err());
+}
