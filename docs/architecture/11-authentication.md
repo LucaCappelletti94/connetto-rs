@@ -220,7 +220,7 @@ The token endpoints hand the client its `user_id` as the deployment's own typed 
 
 ### Native
 
-The native client uses Authorization Code with PKCE against connetto-server's login endpoint over a loopback redirect (a listener on `127.0.0.1`) and the system browser. connetto's refresh token is stored in OS secure storage (Keychain, Windows Credential Manager, libsecret). The access token lives in process memory and is regenerated from the refresh token as needed.
+The native client uses Authorization Code with PKCE against connetto-server's login endpoint over a loopback redirect (a listener on `127.0.0.1`) and the system browser. connetto's refresh token is stored in OS secure storage, behind the platform's user verification where it has one (Keychain, Android Keystore, Credential Manager under Windows Hello, libsecret). The access token lives in process memory and is regenerated from the refresh token as needed.
 
 ### Browser and worker topology
 

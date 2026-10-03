@@ -771,7 +771,7 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
         .load(&mut admin_conn)
         .await
         .unwrap();
-        intent_waiting = rows.as_slice().first().is_some_and(|row| row.waiting);
+        intent_waiting = <[_]>::first(&rows).is_some_and(|row| row.waiting);
         if intent_waiting {
             break;
         }
@@ -806,7 +806,7 @@ async fn sweep_waits_for_overlapping_intent_before_marking_deleting() {
         .load(&mut admin_conn)
         .await
         .unwrap();
-        sweep_waiting = rows.as_slice().first().is_some_and(|row| row.waiting);
+        sweep_waiting = <[_]>::first(&rows).is_some_and(|row| row.waiting);
         if sweep_waiting {
             break;
         }
@@ -933,7 +933,7 @@ async fn sweep_waits_for_overlapping_put_before_deleting_bytes() {
         .load(&mut check_conn)
         .await
         .unwrap();
-        waiting = rows.as_slice().first().is_some_and(|row| row.waiting);
+        waiting = <[_]>::first(&rows).is_some_and(|row| row.waiting);
         if waiting {
             break;
         }
@@ -1065,7 +1065,7 @@ async fn sweep_waits_for_overlapping_commit_verification() {
         .load(&mut check_conn)
         .await
         .unwrap();
-        waiting = rows.as_slice().first().is_some_and(|row| row.waiting);
+        waiting = <[_]>::first(&rows).is_some_and(|row| row.waiting);
         if waiting {
             break;
         }

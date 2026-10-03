@@ -12,6 +12,7 @@ use crate::AccessTokenSource;
 use crate::ClientError;
 #[cfg(feature = "native-auth")]
 use crate::auth::KeyringStore;
+use crate::away::GateMechanism;
 use crate::builder::core::REPLICA_PREFIX;
 use crate::replica::replica_db_name;
 #[cfg(feature = "native-auth")]
@@ -167,6 +168,10 @@ impl Auth {
         KeyringAuth {
             inner: self.provider_state(),
             app_id: app_id.into(),
+            #[cfg(target_os = "android")]
+            keystore_prompt: None,
+            #[cfg(target_os = "windows")]
+            hello_owner: None,
         }
     }
 
@@ -256,11 +261,35 @@ macro_rules! provider_hooks {
 pub struct KeyringAuth {
     inner: ProviderSignin,
     app_id: String,
+    #[cfg(target_os = "android")]
+    keystore_prompt: Option<Arc<dyn crate::KeystorePrompt>>,
+    #[cfg(target_os = "windows")]
+    hello_owner: Option<Arc<dyn crate::HelloOwner>>,
 }
 
 #[cfg(feature = "native-auth")]
 impl KeyringAuth {
     provider_hooks!();
+
+    /// The prompt the Keystore-gated secrets unlock through. Without one an
+    /// Android build keeps its secrets ungated and reports the gate
+    /// unsupported.
+    #[cfg(target_os = "android")]
+    #[must_use]
+    pub fn with_keystore_prompt(mut self, prompt: Arc<dyn crate::KeystorePrompt>) -> Self {
+        self.keystore_prompt = Some(prompt);
+        self
+    }
+
+    /// The window the Windows Hello prompt over the gated secrets opens over.
+    /// Without one a Windows build keeps its secrets ungated and reports the
+    /// gate unsupported.
+    #[cfg(target_os = "windows")]
+    #[must_use]
+    pub fn with_hello_owner(mut self, owner: Arc<dyn crate::HelloOwner>) -> Self {
+        self.hello_owner = Some(owner);
+        self
+    }
 }
 
 #[cfg(feature = "native-auth")]
@@ -273,6 +302,10 @@ impl NativeSignIn for KeyringAuth {
             self.inner.into_kind(),
             Keyring {
                 app_id: self.app_id,
+                #[cfg(target_os = "android")]
+                keystore_prompt: self.keystore_prompt,
+                #[cfg(target_os = "windows")]
+                hello_owner: self.hello_owner,
             },
         )
     }
@@ -424,13 +457,35 @@ pub trait StorageMarker: private::Sealed {
     fn refresh_store(
         &self,
     ) -> Option<Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>>;
+
+    /// Apply the build's gate setting to the secrets this storage holds, and
+    /// hand back the mechanism the client's re-check drives, `None` when the
+    /// storage has none.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the platform store cannot be opened.
+    fn arm_gate(&self, on: bool) -> Result<Option<Arc<dyn GateMechanism>>, ClientError>;
 }
 
 /// The OS keyring names both credential services with the app id.
 #[cfg(feature = "native-auth")]
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct Keyring {
     pub(crate) app_id: String,
+    #[cfg(target_os = "android")]
+    keystore_prompt: Option<Arc<dyn crate::KeystorePrompt>>,
+    #[cfg(target_os = "windows")]
+    hello_owner: Option<Arc<dyn crate::HelloOwner>>,
+}
+
+#[cfg(feature = "native-auth")]
+impl core::fmt::Debug for Keyring {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Keyring")
+            .field("app_id", &self.app_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[cfg(feature = "native-auth")]
@@ -439,6 +494,18 @@ impl StorageMarker for Keyring {
         &self,
     ) -> Option<Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>> {
         Some(Arc::new(KeyringStore::new(self.app_id.clone())))
+    }
+
+    fn arm_gate(&self, on: bool) -> Result<Option<Arc<dyn GateMechanism>>, ClientError> {
+        #[cfg(target_os = "android")]
+        if let Some(prompt) = &self.keystore_prompt {
+            crate::keyring::set_keystore_prompt(&self.app_id, Arc::clone(prompt))?;
+        }
+        #[cfg(target_os = "windows")]
+        if let Some(owner) = &self.hello_owner {
+            crate::keyring::set_hello_owner(&self.app_id, Arc::clone(owner))?;
+        }
+        crate::keyring::arm_gate(&self.app_id, on)
     }
 }
 
@@ -456,6 +523,10 @@ impl StorageMarker for NoKeyring {
         &self,
     ) -> Option<Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>> {
         self.store.clone()
+    }
+
+    fn arm_gate(&self, _on: bool) -> Result<Option<Arc<dyn GateMechanism>>, ClientError> {
+        Ok(None)
     }
 }
 

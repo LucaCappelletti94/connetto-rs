@@ -52,8 +52,9 @@ use std::sync::Arc;
 use base64::Engine as _;
 use connetto_client::teardown::{ForgetError, PurgeError, expiry_warning};
 use connetto_client::{
-    AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, ImportChoices, KeyringAuth,
-    NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning, decode_identity,
+    AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, Gate, ImportChoices,
+    KeyringAuth, NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning,
+    decode_identity,
 };
 use connetto_core::messages::FatalErrorReason;
 use connetto_dioxus::{use_away_input, use_live};
@@ -81,6 +82,10 @@ const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
 /// and the authentication session catches on iOS.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
+/// How long the app may be away before it asks for Face ID, a fingerprint or
+/// the device passcode again, where the platform gates the stored secrets.
+const RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// How long a login in the browser tab may take.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
@@ -98,9 +103,41 @@ extern "Kotlin" {
 
 /// On a phone, sign in through the platform's in-app browser tab and the app's
 /// own redirect (RFC 8252 section 7.1).
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(target_os = "ios")]
 fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
     auth.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
+}
+
+/// On Android, also unlock the Keystore-gated secrets through the platform's
+/// biometric or device-credential prompt, which `connetto-auth-session` hosts.
+#[cfg(target_os = "android")]
+fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
+    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(TabSession))
+        .with_keystore_prompt(Arc::new(KeystoreUnlock))
+}
+
+/// How long the unlock prompt may stay up.
+#[cfg(target_os = "android")]
+const UNLOCK_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The Keystore unlock prompt, through `connetto-auth-session`.
+#[cfg(target_os = "android")]
+struct KeystoreUnlock;
+
+#[cfg(target_os = "android")]
+impl connetto_client::KeystorePrompt for KeystoreUnlock {
+    fn device_secure(&self) -> Result<bool, ClientError> {
+        connetto_auth_session::device_secure().map_err(|err| ClientError::Auth(err.to_string()))
+    }
+
+    fn approve(&self, cipher: &manganis::jni::objects::GlobalRef) -> Result<bool, ClientError> {
+        connetto_auth_session::approve_unlock(
+            cipher.as_obj(),
+            "Unlock your synced data",
+            UNLOCK_WINDOW,
+        )
+        .map_err(|err| ClientError::Auth(err.to_string()))
+    }
 }
 
 /// The Custom Tab on Android or the authentication session on iOS, and the
@@ -295,13 +332,24 @@ fn Shell() -> Element {
     let mut stage = use_signal(|| Stage::Starting);
     use_context_provider(|| restart);
     let runtime = use_hook(tokio::runtime::Handle::current);
+    // Windows Hello prompts over this window.
+    #[cfg(target_os = "windows")]
+    let owner = connetto_dioxus::use_hello_owner();
     use_effect(move || {
         let _ = generation();
         let account = choice.peek().clone();
         stage.set(Stage::Starting);
         let runtime = runtime.clone();
+        #[cfg(target_os = "windows")]
+        let owner = Arc::clone(&owner);
         spawn(async move {
-            let outcome = runtime.spawn(setup(account)).await;
+            let outcome = runtime
+                .spawn(setup(
+                    account,
+                    #[cfg(target_os = "windows")]
+                    owner,
+                ))
+                .await;
             stage.set(match outcome {
                 Ok(Ok(parts)) => Stage::Ready(SessionParts(Rc::new(parts))),
                 Ok(Err(err)) => Stage::Failed(
@@ -352,7 +400,10 @@ fn Session(parts: SessionParts) -> Element {
     rsx! { App {} }
 }
 
-async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
+async fn setup(
+    account: AccountChoice,
+    #[cfg(target_os = "windows")] owner: Arc<dyn connetto_client::HelloOwner>,
+) -> anyhow::Result<Parts> {
     use anyhow::Context as _;
 
     let server = endpoint(
@@ -371,6 +422,14 @@ async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
         DEFAULT_AUTH_ORIGIN,
     );
 
+    let sign_in = platform_sign_in(
+        Auth::new(auth_origin, AUTH_PROVIDER)
+            .with_account(account)
+            .keyring(KEYRING_SERVICE),
+    );
+    #[cfg(target_os = "windows")]
+    let sign_in = sign_in.with_hello_owner(owner);
+
     tokio::fs::create_dir_all(data_dir())
         .await
         .context("creating the application data directory")?;
@@ -384,12 +443,9 @@ async fn setup(account: AccountChoice) -> anyhow::Result<Parts> {
                 "SELECT content_id FROM photos WHERE content_state = 'lost'",
                 "content_id",
             ))
-            .signed_in(platform_sign_in(
-                Auth::new(auth_origin, AUTH_PROVIDER)
-                    .with_account(account)
-                    .keyring(KEYRING_SERVICE),
-            ))
+            .signed_in(sign_in)
             .durable(data_dir())
+            .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)))
             .connect_with_pump()
             .await
             .map_err(|err| match err {
@@ -538,19 +594,29 @@ fn App() -> Element {
             .select((orders::quantity, diesel::dsl::count_star())),
     );
 
-    // Client event status line.
+    // Client event status line, and the gate's own line with whether it
+    // holds the app locked.
     let mut status: Signal<String> = use_signal(|| "connected".to_owned());
+    let mut gate: Signal<&'static str> = use_signal(|| "open");
     let event_rx = client.events();
     use_hook(move || {
         spawn(async move {
             let mut rx = event_rx;
             while let Ok(event) = rx.recv().await {
+                match event {
+                    ClientEvent::Locked => gate.set("locked, verify it is you to continue"),
+                    ClientEvent::UnlockDismissed => gate.set("unlock dismissed, still locked"),
+                    ClientEvent::Unlocked => gate.set("open"),
+                    _ => {}
+                }
                 if let Some(label) = status_label(&event) {
                     status.set(label);
                 }
             }
         })
     });
+    let custody = parts.0.native.custody();
+    let unlock_client = client.clone();
 
     // Session expiry warning and replica footprint, both refreshed as rows change.
     let mut expiry_warn: Signal<Option<String>> = use_signal(|| None);
@@ -600,6 +666,23 @@ fn App() -> Element {
             p {
                 style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
                 "status: " {status}
+            }
+            p {
+                style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
+                "custody: " {custody.to_string()}
+            }
+            p {
+                style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
+                "gate: " {gate}
+            }
+            if gate() != "open" {
+                button {
+                    onclick: move |_| {
+                        let client = unlock_client.clone();
+                        spawn(async move { client.unlock().await });
+                    },
+                    "Unlock"
+                }
             }
 
             if let Some(warn) = expiry_warn.read().clone() {

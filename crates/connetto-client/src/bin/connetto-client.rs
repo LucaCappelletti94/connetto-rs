@@ -174,7 +174,14 @@ async fn main() -> Result<()> {
 }
 
 /// Resolves on the first SIGINT, or on unix the first SIGTERM.
-fn terminate_signal() -> Result<impl std::future::Future<Output = ()>> {
+#[cfg_attr(
+    not(unix),
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "only unix installs a fallible SIGTERM handler"
+    )
+)]
+fn terminate_signal() -> Result<impl Future<Output = ()>> {
     #[cfg(unix)]
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing the SIGTERM handler")?;

@@ -1327,6 +1327,17 @@ where
         }
     }
 
+    /// Swap the replica for an empty in-memory one after [`close`](Self::close),
+    /// so no handle keeps the file open while it is deleted. Windows refuses to
+    /// delete an open file. Clones that stay alive read the empty replica.
+    #[cfg(feature = "native-auth")]
+    pub(crate) async fn release_replica(&self) -> Result<(), ClientError> {
+        let mut state = self.shared.state.lock().await;
+        let emptied = state.conn.emptied()?;
+        drop(std::mem::replace(&mut state.conn, emptied));
+        Ok(())
+    }
+
     /// Shared constructor body behind the two pump flavors.
     fn build<F, S>(
         mut conn: ConnettoConnection<T>,
@@ -2359,6 +2370,16 @@ where
     pub async fn enable_gate(&self, recheck: Option<Duration>, mechanism: Arc<dyn GateMechanism>) {
         let _state = self.shared.lock_interrupting().await;
         self.shared.gate.enable(recheck, mechanism);
+    }
+
+    /// Turn on the re-check open, for a launch whose prompt was approved.
+    pub(crate) async fn enable_verified_gate(
+        &self,
+        recheck: Option<Duration>,
+        mechanism: Arc<dyn GateMechanism>,
+    ) {
+        let _state = self.shared.lock_interrupting().await;
+        self.shared.gate.enable_verified(recheck, mechanism);
     }
 
     /// The application went away at `at`.

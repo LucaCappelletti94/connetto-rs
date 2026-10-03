@@ -183,7 +183,8 @@ pub type GateAskFuture = Pin<Box<dyn Future<Output = GateAskOutcome> + 'static>>
 /// What locks and re-asks the secret the gate protects.
 ///
 /// The mechanism is platform-specific. The browser implements it over the tab's
-/// unlock ceremony, and R51/R52 implement it natively later. The client calls
+/// unlock ceremony, and the native keyring over the Apple keychain's and the
+/// Android Keystore's own verification (R51, R52). The client calls
 /// [`lock`](Self::lock) the moment a re-check fires (it locks the protected
 /// secret) and drives [`ask`](Self::ask) to completion, and on
 /// [`GateAskOutcome::Approved`] the mechanism resumes access.
@@ -196,6 +197,11 @@ pub trait GateMechanism: Send + Sync {
     /// [`GateAskOutcome::Approved`] (and the mechanism resumes access) or
     /// [`GateAskOutcome::Dismissed`] (and the mechanism stays locked).
     fn ask(&self) -> GateAskFuture;
+    /// Whether the platform already verified the user this launch, so the
+    /// gate starts open rather than asking. False unless the mechanism knows.
+    fn is_open(&self) -> bool {
+        false
+    }
 }
 
 /// The wasm form of [`GateMechanism`], unconstrained because the runtime is
@@ -209,6 +215,11 @@ pub trait GateMechanism {
     /// [`GateAskOutcome::Approved`] (and the mechanism resumes access) or
     /// [`GateAskOutcome::Dismissed`] (and the mechanism stays locked).
     fn ask(&self) -> GateAskFuture;
+    /// Whether the platform already verified the user this launch, so the
+    /// gate starts open rather than asking. False unless the mechanism knows.
+    fn is_open(&self) -> bool {
+        false
+    }
 }
 
 /// Receives the gate's transitions the moment they happen.
@@ -319,17 +330,37 @@ impl GateController {
 
     /// Arm the re-check.
     ///
-    /// A gated launch starts locked, so the first access asks.
+    /// A gated launch starts locked, so the first access asks, unless the
+    /// mechanism reports the platform verified the user already.
     ///
     /// # Panics
     ///
     /// When the state lock is poisoned.
     pub fn enable(&self, recheck: Option<Duration>, mechanism: Arc<dyn GateMechanism>) {
+        // A gated launch starts locked, so the first access asks, unless the
+        // platform verified the user already this launch.
+        let locked = !mechanism.is_open();
+        self.arm(recheck, mechanism, locked);
+    }
+
+    /// Arm the re-check open, for a launch whose prompt was approved.
+    ///
+    /// # Panics
+    ///
+    /// When the state lock is poisoned.
+    pub(crate) fn enable_verified(
+        &self,
+        recheck: Option<Duration>,
+        mechanism: Arc<dyn GateMechanism>,
+    ) {
+        self.arm(recheck, mechanism, false);
+    }
+
+    fn arm(&self, recheck: Option<Duration>, mechanism: Arc<dyn GateMechanism>, locked: bool) {
         let mut state = self.state.lock().expect("the gate state lock");
         state.recheck = recheck;
+        state.locked = locked;
         state.mechanism = Some(mechanism);
-        // A gated launch starts locked, so the first access asks.
-        state.locked = true;
         state.prompting = false;
         state.pending_away = None;
     }

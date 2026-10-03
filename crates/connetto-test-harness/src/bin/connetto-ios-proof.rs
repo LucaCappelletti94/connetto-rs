@@ -1,6 +1,6 @@
 //! Deploys `examples/dioxus-desktop-demo` to an iOS simulator or a paired
 //! iPhone or iPad and walks R88's proof on it, which is sign in, sync, write
-//! offline and upload on reconnect.
+//! offline and upload on reconnect, then R51's re-check after time away.
 //!
 //! It runs on a Mac as the command of `connetto-demo-stack`, which provides the
 //! stack and the environment naming it.
@@ -202,6 +202,8 @@ async fn prove(
     wait_for_count(&stack.pg_url, offline + 1).await?;
     target.record(&mut app, evidence, "uploaded").await?;
 
+    let mut app = recheck_after_time_away(target, &mut inspector, stack, evidence).await?;
+
     step("sign out");
     sign_out(&mut app).await?;
     target.record(&mut app, evidence, "signed-out").await?;
@@ -231,6 +233,14 @@ async fn sign_in(
             let mut app = inspector.page(|url| url.starts_with("dioxus://")).await?;
             app.wait_for_text("status: connected", Duration::from_secs(90))
                 .await?;
+            // The simulator creates gated keychain items without enforcing
+            // them, so the custody reads verified there too. The sheet itself
+            // is proven on a device with a person.
+            app.wait_for_text(
+                "custody: released only after user verification",
+                Duration::from_secs(10),
+            )
+            .await?;
             return Ok(app);
         }
         if let Some(mut app) = inspector
@@ -280,6 +290,45 @@ async fn submit_login(login: &mut PageSession) -> Result<()> {
     } else {
         bail!("the login page has no username field")
     }
+}
+
+/// The demo's re-check grace, `RECHECK_AFTER` in its source.
+const RECHECK_AFTER: Duration = Duration::from_secs(30);
+/// The app the away step brings to the front in the demo's place.
+const SETTINGS: &str = "com.apple.Preferences";
+
+/// Leave the demo for longer than its re-check grace and come back: the gate
+/// locks and asks once, and the approval opens it with the session kept. A
+/// device holds the lock until the person approves, which the step waits to
+/// see. A simulator answers the sheet at once, so only the reopening shows.
+async fn recheck_after_time_away(
+    target: &Target,
+    inspector: &mut Inspector,
+    stack: &Stack,
+    evidence: &Path,
+) -> Result<PageSession> {
+    step("re-check after time away");
+    target.bring_to_front(SETTINGS).await?;
+    sleep(RECHECK_AFTER + Duration::from_secs(5)).await;
+    target.bring_to_front(BUNDLE).await?;
+    let mut app = inspector.page(|url| url.starts_with("dioxus://")).await?;
+    if let Target::Device { .. } = target {
+        app.wait_for_text("gate: locked", Duration::from_secs(30))
+            .await?;
+        eprintln!("approve Face ID or the passcode on the device");
+    }
+    app.wait_for_text("gate: open", Duration::from_secs(120))
+        .await?;
+    // The session outlived the lock: a backend write still reaches the page.
+    let before = order_count(&stack.pg_url).await?;
+    app.click("Insert via Postgres (backend writer)").await?;
+    app.wait_for_text(
+        &format!("COUNT(*) pushed by the server: {}", before + 1),
+        Duration::from_secs(30),
+    )
+    .await?;
+    target.record(&mut app, evidence, "rechecked").await?;
+    Ok(app)
 }
 
 fn step(name: &str) {
@@ -466,6 +515,24 @@ impl Target {
                 .await
                 .map(drop)
             }
+        }
+    }
+
+    /// Bring `bundle` to the front without restarting it.
+    async fn bring_to_front(&self, bundle: &str) -> Result<()> {
+        match self {
+            Self::Simulator { udid } => xcrun(&["simctl", "launch", udid, bundle]).await.map(drop),
+            Self::Device { udid, .. } => xcrun(&[
+                "devicectl",
+                "device",
+                "process",
+                "launch",
+                "--device",
+                udid,
+                bundle,
+            ])
+            .await
+            .map(drop),
         }
     }
 

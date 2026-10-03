@@ -7,6 +7,9 @@ mod aggregate_relay;
 
 mod apply_behaviour;
 
+#[cfg(all(feature = "native-auth", target_os = "macos"))]
+mod apple_keychain;
+
 mod authentication_client;
 #[cfg(feature = "native-auth")]
 mod builder_harness;

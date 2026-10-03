@@ -20,17 +20,39 @@ public final class AuthSessionPlugin: NSObject {
             let scheme = Bundle.main.bundleIdentifier?.lowercased()
         else { return }
         DispatchQueue.main.async {
-            let session = ASWebAuthenticationSession(url: target, callbackURLScheme: scheme) {
-                redirect, _ in
-                Self.lock.withLock {
-                    if let redirect { Self.pending = redirect.absoluteString }
-                    Self.session = nil
+            Self.whenActive {
+                let session = ASWebAuthenticationSession(url: target, callbackURLScheme: scheme) {
+                    redirect, _ in
+                    Self.lock.withLock {
+                        if let redirect { Self.pending = redirect.absoluteString }
+                        Self.session = nil
+                    }
                 }
+                session.prefersEphemeralWebBrowserSession = true
+                session.presentationContextProvider = Self.anchor
+                Self.lock.withLock { Self.session = session }
+                session.start()
             }
-            session.prefersEphemeralWebBrowserSession = true
-            session.presentationContextProvider = Self.anchor
-            Self.lock.withLock { Self.session = session }
-            session.start()
+        }
+    }
+
+    /// Runs `action` on the main queue once the app is active. A session
+    /// started while a system sheet such as Face ID is in front has no key
+    /// window to present from, and iOS drops it without an error.
+    private static func whenActive(_ action: @escaping () -> Void) {
+        if UIApplication.shared.applicationState == .active {
+            action()
+            return
+        }
+        let center = NotificationCenter.default
+        let observer = ActiveObserver()
+        observer.token = center.addObserver(
+            forName: UIApplication.didBecomeActiveNotification, object: nil, queue: .main
+        ) { _ in
+            guard let token = observer.token else { return }
+            observer.token = nil
+            center.removeObserver(token)
+            action()
         }
     }
 
@@ -50,4 +72,8 @@ private final class WindowAnchor: NSObject, ASWebAuthenticationPresentationConte
             ?? scenes.first.map { ASPresentationAnchor(windowScene: $0) }
             ?? ASPresentationAnchor()
     }
+}
+
+private final class ActiveObserver {
+    var token: NSObjectProtocol?
 }

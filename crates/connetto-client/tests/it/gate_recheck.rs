@@ -171,6 +171,8 @@ struct FakeMechanism {
 struct FakeMechanismState {
     locks: AtomicUsize,
     asks: AtomicUsize,
+    /// Whether the platform already verified the user this launch.
+    open: std::sync::atomic::AtomicBool,
     senders: Mutex<Vec<oneshot::Sender<GateAskOutcome>>>,
 }
 
@@ -180,6 +182,7 @@ impl FakeMechanism {
             state: Arc::new(FakeMechanismState {
                 locks: AtomicUsize::new(0),
                 asks: AtomicUsize::new(0),
+                open: std::sync::atomic::AtomicBool::new(false),
                 senders: Mutex::new(Vec::new()),
             }),
         }
@@ -207,6 +210,11 @@ impl FakeMechanism {
 impl GateMechanism for FakeMechanism {
     fn lock(&self) {
         self.state.locks.fetch_add(1, Ordering::Relaxed);
+        self.state.open.store(false, Ordering::Relaxed);
+    }
+
+    fn is_open(&self) -> bool {
+        self.state.open.load(Ordering::Relaxed)
     }
 
     fn ask(&self) -> GateAskFuture {
@@ -846,30 +854,68 @@ async fn a_gated_launch_refuses_with_conn_until_approval() {
     );
 }
 
-/// The gate a durable build carries reaches the client with its grace: a
-/// return within the grace keeps the gate open, a return beyond it locks.
-#[tokio::test]
-async fn a_built_gate_rechecks_a_return_beyond_its_grace() {
-    let dir = tempdir().expect("temp dir");
-    let script = Script::with(vec![ack()]);
-    let credential = super::support::held("tester");
-    let key_store = super::support::key_store(&credential).await;
-    let mechanism = FakeMechanism::new();
-    let (running, pump) = ClientBuilder::new(
-        super::support::bundle(DDL),
-        super::support::Once::new(script.clone()),
-    )
-    .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
-    .with_gate(Gate::default().with_recheck(Some(Duration::from_secs(60))))
-    .with_gate_mechanism(mechanism.clone())
-    .connect_with_pump()
+/// Build a gated client over `mechanism`, the connect running in its own task
+/// so the test can answer the launch prompt it waits on.
+fn gated_connect(
+    mechanism: &FakeMechanism,
+) -> tokio::task::JoinHandle<Result<(ConnettoClient<Script>, tempfile::TempDir), ClientError>> {
+    let mechanism = mechanism.clone();
+    tokio::spawn(async move {
+        let dir = tempdir().expect("temp dir");
+        let script = Script::with(vec![ack()]);
+        let credential = super::support::held("tester");
+        let key_store = super::support::key_store(&credential).await;
+        let (running, pump) = ClientBuilder::new(
+            super::support::bundle(DDL),
+            super::support::Once::new(script),
+        )
+        .signed_in(credential)
+        .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+        .with_gate(Gate::default().with_recheck(Some(Duration::from_secs(60))))
+        .with_gate_mechanism(mechanism)
+        .connect_with_pump()
+        .await?;
+        tokio::spawn(pump);
+        Ok((running.client().clone(), dir))
+    })
+}
+
+/// Wait until the mechanism was asked `count` times.
+async fn until_asked(mechanism: &FakeMechanism, count: usize) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while mechanism.asks() < count {
+            tokio::task::yield_now().await;
+        }
+    })
     .await
-    .expect("the gated build connects");
-    tokio::spawn(pump);
-    let client = running.client().clone();
+    .expect("the mechanism is asked in time");
+}
+
+/// A gated durable build's connect waits on the launch prompt, so the client
+/// it returns is open and nothing the application starts meets the lock, and
+/// the gate then carries the build's grace: a return within it stays open, a
+/// return beyond it locks.
+#[tokio::test]
+async fn a_built_gate_connects_after_the_launch_prompt_and_rechecks_beyond_its_grace() {
+    let mechanism = FakeMechanism::new();
+    let connecting = gated_connect(&mechanism);
+    until_asked(&mechanism, 1).await;
+    assert!(!connecting.is_finished(), "the connect waits on the prompt");
+    mechanism.resolve(GateAskOutcome::Approved);
+    let (client, _dir) = connecting
+        .await
+        .expect("the connect task")
+        .expect("the approved build connects");
     let mut events = client.events();
-    unlock_gate(&client, &mut events, &mechanism).await;
+    assert!(
+        client.with_conn(|_| ()).await.is_ok(),
+        "the client comes back open"
+    );
+    assert_eq!(
+        mechanism.asks(),
+        1,
+        "the launch asked once, though the mechanism never reports itself open"
+    );
 
     let clock = FakeClock::new();
     client.away(Moment::now(&clock)).await;
@@ -887,6 +933,22 @@ async fn a_built_gate_rechecks_a_return_beyond_its_grace() {
         next_gate_event(&mut events).await,
         ClientEvent::Locked,
         "a return beyond the build's grace locks"
+    );
+}
+
+/// A launch prompt the user dismisses fails the connect with the lock.
+#[tokio::test]
+async fn a_dismissed_launch_prompt_fails_the_connect() {
+    let mechanism = FakeMechanism::new();
+    let connecting = gated_connect(&mechanism);
+    until_asked(&mechanism, 1).await;
+    mechanism.resolve(GateAskOutcome::Dismissed);
+    assert!(
+        matches!(
+            connecting.await.expect("the connect task"),
+            Err(ClientError::Locked)
+        ),
+        "a dismissed launch refuses the client"
     );
 }
 
@@ -1077,4 +1139,43 @@ async fn a_locked_value_handle_keeps_its_value_until_the_unlock() {
         .expect("the unlock wakes the held push in time")
         .expect("the client is alive");
     assert_eq!(count.value(), Some(2));
+}
+
+/// A mechanism the platform already opened this launch, as a native keyring
+/// whose secrets the sign-in read behind the user's verification, starts the
+/// gate open and asks nothing more, and a return beyond the grace still locks.
+#[tokio::test]
+async fn a_mechanism_already_open_at_launch_starts_the_gate_open() {
+    let dir = tempdir().expect("temp dir");
+    let script = Script::with(vec![ack()]);
+    let credential = super::support::held("tester");
+    let key_store = super::support::key_store(&credential).await;
+    let mechanism = FakeMechanism::new();
+    mechanism.state.open.store(true, Ordering::Relaxed);
+    let (running, pump) = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::Once::new(script.clone()),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+    .with_gate(Gate::default().with_recheck(Some(Duration::from_secs(60))))
+    .with_gate_mechanism(mechanism.clone())
+    .connect_with_pump()
+    .await
+    .expect("the gated build connects");
+    tokio::spawn(pump);
+    let client = running.client().clone();
+    let mut events = client.events();
+    assert_eq!(mechanism.asks(), 0, "an open launch asks nothing");
+    assert!(
+        client.with_conn(|_| ()).await.is_ok(),
+        "an open launch refuses nothing"
+    );
+
+    let clock = FakeClock::new();
+    client.away(Moment::now(&clock)).await;
+    clock.set(Duration::from_secs(90), Duration::from_secs(90));
+    client.back(Moment::now(&clock)).await;
+    assert_eq!(next_gate_event(&mut events).await, ClientEvent::Locked);
+    assert_eq!(mechanism.asks(), 1, "the re-check asks");
 }

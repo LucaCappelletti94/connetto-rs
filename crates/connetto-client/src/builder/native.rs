@@ -292,6 +292,9 @@ where
     /// The core signed-in stage this build is, once its sign-in resolved,
     /// beside the provider session behind it.
     async fn into_core(self) -> Result<(CoreSignedIn<T, C>, Resolved), ClientError> {
+        // The refresh token is durable even when the replica is not, so the
+        // keyring keeps it gated. No re-check runs without a durable stage.
+        let _ = self.storage.arm_gate(true)?;
         let resolved = resolve_sign_in(self.kind, &self.storage).await?;
         let core = CoreSignedIn {
             base: self.base,
@@ -464,9 +467,9 @@ where
         self
     }
 
-    /// The mechanism the gate's lock and ask ride on. The seam R51 and R52
-    /// implement with the platform's biometric ceremony, and the one tests
-    /// use to approve or dismiss a check.
+    /// The mechanism the gate's lock and ask ride on, in place of the one the
+    /// platform keyring supplies. The seam a key store the application names
+    /// gates through, and the one tests use to approve or dismiss a check.
     #[must_use]
     pub fn with_gate_mechanism(mut self, mechanism: impl GateMechanism + 'static) -> Self {
         self.mechanism = Some(Arc::new(mechanism));
@@ -479,8 +482,8 @@ where
     /// name, or provisions it on a fresh run, opens the file under the
     /// device-private tier when the build has one, and attaches content at
     /// the directory beside the file on the same root key. The custody is
-    /// the weaker of the stores' claims and the build's own level, which is
-    /// `Unverified(NoGate::Unsupported)` natively until R51 and R52.
+    /// the weakest of the stores' claims, `Verified` when the platform's
+    /// keyring holds the secrets behind its user verification.
     ///
     /// # Errors
     ///
@@ -543,13 +546,18 @@ where
         ),
         ClientError,
     > {
+        // The platform's own mechanism, when the storage has one, gates the
+        // secrets before the sign-in first touches them. A mechanism the
+        // application named takes its place.
+        let platform = self.storage.arm_gate(self.gate.on())?;
+        let mechanism = self.mechanism.or(platform);
+        let resolved = resolve_sign_in(self.kind, &self.storage).await?;
         let claims = self
             .storage
             .refresh_store()
             .map(|store| store.protection())
             .into_iter()
             .collect();
-        let resolved = resolve_sign_in(self.kind, &self.storage).await?;
         let key_store = Arc::new(self.key_store);
         let core = CoreDurable {
             base: self.base,
@@ -558,7 +566,7 @@ where
             key_store: SharedKeys(Arc::clone(&key_store)),
             claims,
             gate: self.gate,
-            mechanism: self.mechanism,
+            mechanism,
         };
         Ok((core, resolved, key_store))
     }
@@ -627,7 +635,9 @@ where
     /// is set, and they are read before anything is destroyed, since once
     /// the credential is gone they can no longer be uploaded. A held
     /// credential has no session to revoke, so its build only wipes. The
-    /// client is closed before the files go, and the application drops it
+    /// client is closed and its replica swapped for an empty in-memory one
+    /// before the files go, since Windows refuses to delete an open file, so
+    /// clones still alive read an empty replica. The application drops it
     /// afterwards.
     ///
     /// # Errors
@@ -644,6 +654,7 @@ where
             return Err(ForgetError::Purge(PurgeError::Unsynced(unsynced)));
         }
         self.core.close().await;
+        self.core.client().release_replica().await?;
         teardown.forget(&unsynced, force).await
     }
 }

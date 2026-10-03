@@ -116,10 +116,14 @@ pub use builder::{
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
+#[cfg(all(feature = "native-auth", target_os = "android"))]
+pub use keyring::KeystorePrompt;
 #[cfg(feature = "native-auth")]
 pub use keyring::SecretStoreError;
 #[cfg(all(feature = "native-auth", target_os = "linux"))]
 pub use keyring::{Backend, KeyFile, LinuxStore};
+#[cfg(all(feature = "native-auth", target_os = "windows"))]
+pub use keyring::{HelloCancellation, HelloOwner, HelloWindow};
 pub use live::{
     ConnettoClient, LiveGroups, LiveHandle, LiveQuery, LiveRows, LiveValue,
     subscription_is_aggregate, subscription_tables,
@@ -239,6 +243,12 @@ pub enum ClientError {
     /// or with an explicit data wipe.
     #[error("no replica key was provisioned or cached, so the replica cannot be opened encrypted")]
     ReplicaKeyMissing,
+    /// The platform destroyed every key it held behind the user's
+    /// verification, as Android does when the screen lock is removed. A
+    /// durable build answers it by wiping the replica and starting a fresh one
+    /// the server resyncs, since nothing can open the old one again.
+    #[error("the platform lost the replica key, so the replica can never be opened again")]
+    ReplicaKeyLost,
     /// The replica's schema and the policy-table map disagree about which
     /// tables the row-level-security translation split.
     ///
@@ -2426,6 +2436,23 @@ where
         conn.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
         Ok(conn)
+    }
+
+    /// An empty in-memory connection carrying this one's identity, which takes
+    /// its place once its replica file is to be deleted, so no handle keeps
+    /// the file open.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the in-memory database cannot be opened.
+    #[cfg(feature = "native-auth")]
+    pub(crate) fn emptied(&self) -> Result<Self, ClientError> {
+        // The stand-in has no schema, so the build's policy views are absent by design.
+        let config = self
+            .config
+            .clone()
+            .with_policy_tables(PolicyTables::default());
+        Self::open(&Replica::in_memory(), "", &config, None)
     }
 
     /// Shared open body: open the database, unlock the page codec, apply the

@@ -15,12 +15,11 @@ use core::time::Duration;
 use std::sync::Arc;
 
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
-use connetto_core::custody::{Custody, NoGate};
+use connetto_core::custody::Custody;
 use connetto_core::messages::Grant;
 use connetto_core::schema::CALLER_FUNCTION;
 use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
 
-use crate::GateMechanism;
 use crate::Replica;
 use crate::ReplicaStorage;
 use crate::TransportFactory;
@@ -40,6 +39,7 @@ use crate::replica::Encrypted;
 #[cfg(feature = "native-transport")]
 use crate::replica::provision_replica_key;
 use crate::{AccessTokenSource, ClientConfig, ClientError, ConnettoConnection};
+use crate::{GateAskOutcome, GateMechanism};
 
 /// The replica name a build with no identity uses for its client id, and the
 /// prefix every durable replica record is named under. Fixed, because the
@@ -352,25 +352,21 @@ pub(crate) struct RunInputs {
     pub(crate) fresh: bool,
 }
 
-/// The custody a build reports, the weakest of its own level and the claims
-/// the stores it uses make. An `Ephemeral` claim dominates, because a key
-/// that dies with the process protects nothing after it. Otherwise the
-/// build's reason wins the tie between two `Unverified` levels.
-pub(crate) fn custody_of(claims: &[Custody], build: Custody) -> Custody {
+/// The custody a build reports, the weakest claim of the stores it uses. An
+/// `Ephemeral` claim dominates, because a key that dies with the process
+/// protects nothing after it, and an `Unverified` claim beats `Verified`.
+pub(crate) fn custody_of(claims: &[Custody]) -> Custody {
     if claims
         .iter()
         .any(|claim| matches!(claim, Custody::Ephemeral))
     {
         return Custody::Ephemeral;
     }
-    match build {
-        Custody::Verified => claims
-            .iter()
-            .copied()
-            .find(|claim| matches!(claim, Custody::Unverified(_)))
-            .unwrap_or(Custody::Verified),
-        Custody::Ephemeral | Custody::Unverified(_) => build,
-    }
+    claims
+        .iter()
+        .copied()
+        .find(|claim| matches!(claim, Custody::Unverified(_)))
+        .unwrap_or(Custody::Verified)
 }
 
 /// The in-memory replica a build with nothing at rest opens, with the
@@ -951,9 +947,7 @@ where
     /// An existing replica opens under the key the store holds for it. A
     /// fresh one takes the stored key, or one minted where the platform can
     /// mint. Content attaches where the place put it, on the same root key.
-    /// The custody is the weaker of the stores' claims and the build's own
-    /// level, which is `Unverified(NoGate::Unsupported)` until a platform
-    /// gate lands.
+    /// The custody is the weakest of the stores' claims.
     ///
     /// # Errors
     ///
@@ -996,8 +990,15 @@ where
 
     async fn resolve(self) -> Result<DurableResolved<T, C>, ClientError> {
         let (name, caller, login, token_source) = self.credential.into_parts();
-        let located = self.place.locate(&name)?;
-        let stored = self.key_store.load(&located.record).await?;
+        let mut located = self.place.locate(&name)?;
+        let stored = match self.key_store.load(&located.record).await {
+            Err(ClientError::ReplicaKeyLost) => {
+                wipe_lost(&located)?;
+                located = self.place.locate(&name)?;
+                None
+            }
+            stored => stored?,
+        };
         let key = match stored {
             Some(key) => key,
             None if located.exists => return Err(ClientError::ReplicaKeyMissing),
@@ -1005,7 +1006,7 @@ where
         };
         let mut claims = self.claims;
         claims.push(self.key_store.protection());
-        let custody = custody_of(&claims, Custody::Unverified(NoGate::Unsupported));
+        let custody = custody_of(&claims);
         let gate = if self.gate.on() {
             self.mechanism.map(|mechanism| (self.gate, mechanism))
         } else {
@@ -1025,6 +1026,25 @@ where
             gate,
         })
     }
+}
+
+/// Wipe a replica whose key the platform lost, with its tier and content,
+/// since nothing can open it again. Its unsynced writes went with the key.
+#[cfg(feature = "native-transport")]
+fn wipe_lost(located: &Located) -> Result<(), ClientError> {
+    tracing::warn!(
+        replica = %located.url,
+        "the platform lost the replica key, starting a fresh replica"
+    );
+    crate::teardown::purge_replica(std::path::Path::new(&located.url), &[], true)
+        .map_err(|err| ClientError::Session(format!("wiping a replica whose key was lost: {err}")))
+}
+
+/// The browser keeps its keys in its own storage, which never reports a lost
+/// key, so the refusal stands there.
+#[cfg(not(feature = "native-transport"))]
+fn wipe_lost(_located: &Located) -> Result<(), ClientError> {
+    Err(ClientError::ReplicaKeyLost)
 }
 
 /// Mint and store the key of a fresh replica, where the platform has an RNG.
@@ -1346,9 +1366,8 @@ where
     .await?;
     let sleeper = sleeper.unwrap_or_else(default_sleeper);
     let (client, pump) = ConnettoClient::with_reconnect(conn, dialer, sleeper, policy);
-    if let Some((gate, mechanism)) = inputs.gate {
-        client.enable_gate(gate.recheck(), mechanism).await;
-    }
+    // Content attaches before the gate arms, since its heal pass reads the
+    // replica through the client.
     let content = match content {
         Some(content) => Some(
             content
@@ -1357,6 +1376,16 @@ where
         ),
         None => None,
     };
+    if let Some((gate, mechanism)) = inputs.gate {
+        // The launch prompt resolves before the client is handed back, as the
+        // browser's boot waits on its unlock, so nothing the application
+        // starts meets the lock. A launch whose sign-in already read the
+        // secrets behind the platform's verification asks nothing more.
+        if !mechanism.is_open() && mechanism.ask().await == GateAskOutcome::Dismissed {
+            return Err(ClientError::Locked);
+        }
+        client.enable_verified_gate(gate.recheck(), mechanism).await;
+    }
     let pump: CorePump = Box::pin(pump);
     Ok((
         CoreClient {
@@ -1394,30 +1423,18 @@ mod tests {
     use super::custody_of;
 
     #[test]
-    fn a_verified_build_reports_the_weakest_store_claim() {
-        let unverified = Custody::Unverified(NoGate::Offerable);
+    fn a_build_reports_the_weakest_claim_of_the_stores_it_uses() {
+        let offerable = Custody::Unverified(NoGate::Offerable);
+        let unsupported = Custody::Unverified(NoGate::Unsupported);
         assert_eq!(
-            custody_of(&[Custody::Verified, unverified], Custody::Verified),
-            unverified
-        );
-        assert_eq!(
-            custody_of(&[unverified, Custody::Ephemeral], Custody::Verified),
-            Custody::Ephemeral
-        );
-        assert_eq!(
-            custody_of(&[Custody::Verified], Custody::Verified),
+            custody_of(&[Custody::Verified, Custody::Verified]),
             Custody::Verified
         );
-    }
-
-    #[test]
-    fn an_unverified_build_keeps_its_own_reason_over_a_store_claim() {
-        let build = Custody::Unverified(NoGate::Unsupported);
+        assert_eq!(custody_of(&[Custody::Verified, offerable]), offerable);
+        assert_eq!(custody_of(&[unsupported, Custody::Verified]), unsupported);
         assert_eq!(
-            custody_of(&[Custody::Unverified(NoGate::Offerable)], build),
-            build
+            custody_of(&[offerable, Custody::Ephemeral]),
+            Custody::Ephemeral
         );
-        assert_eq!(custody_of(&[Custody::Verified], build), build);
-        assert_eq!(custody_of(&[Custody::Ephemeral], build), Custody::Ephemeral);
     }
 }

@@ -12,10 +12,11 @@
 //! `security` takes that password only as an argument, where other processes
 //! of the same user can read it while it runs, so this suits a single-user
 //! Mac and not a shared runner. The
-//! demo's bundle identifier and every paired iPhone and iPad are registered,
-//! and a development profile covering them is written where `dx` looks for
-//! one. It prints the identity's SHA-1, which `dx build --apple-team-id`
-//! takes.
+//! demo's bundle identifier, every paired iPhone and iPad and this Mac are
+//! registered, and two development profiles are written where `dx` looks for
+//! them, one covering the phones and tablets and one covering this Mac, which
+//! the macOS `.app` embeds so the data protection keychain admits it (R51).
+//! It prints the identity's SHA-1, which `dx build --apple-team-id` takes.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -30,7 +31,35 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 const BUNDLE: &str = "dev.connetto.dioxusdemo";
-const PROFILE_NAME: &str = "connetto dioxus demo development";
+/// The two development profiles, for iOS and for this Mac.
+#[derive(Clone, Copy)]
+enum Profile {
+    Ios,
+    Mac,
+}
+
+impl Profile {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Ios => "connetto dioxus demo development",
+            Self::Mac => "connetto dioxus demo macos development",
+        }
+    }
+
+    const fn kind(self) -> &'static str {
+        match self {
+            Self::Ios => "IOS_APP_DEVELOPMENT",
+            Self::Mac => "MAC_APP_DEVELOPMENT",
+        }
+    }
+
+    const fn extension(self) -> &'static str {
+        match self {
+            Self::Ios => "mobileprovision",
+            Self::Mac => "provisionprofile",
+        }
+    }
+}
 const API: &str = "https://api.appstoreconnect.apple.com/v1";
 
 #[tokio::main]
@@ -43,12 +72,15 @@ async fn main() -> Result<()> {
     let certificate = ensure_certificate(&api, &keychain, &dir).await?;
     let bundle = ensure_bundle(&api).await?;
     let devices = ensure_devices(&api).await?;
-    let profile = ensure_profile(&api, &bundle, &certificate, &devices).await?;
+    let profile = ensure_profile(&api, &bundle, &certificate, &devices, Profile::Ios).await?;
     eprintln!(
         "profile {} covers {} device(s)",
         profile.display(),
         devices.len()
     );
+    let mac = ensure_this_mac(&api).await?;
+    let profile = ensure_profile(&api, &bundle, &certificate, &[mac], Profile::Mac).await?;
+    eprintln!("profile {} covers this Mac", profile.display());
     let identity = ios_signing::identity()
         .await?
         .context("the keychain holds no valid signing identity")?;
@@ -492,7 +524,58 @@ async fn ensure_devices(api: &Api) -> Result<Vec<String>> {
     Ok(ids)
 }
 
-/// A development profile for the bundle, the certificate and every device,
+/// The id of this Mac, registered under its provisioning UDID when missing.
+async fn ensure_this_mac(api: &Api) -> Result<String> {
+    // A process Rosetta translated, as the Intel rustup's cargo is, hands its
+    // children the Intel slice, whose report gives the platform UUID in place
+    // of the provisioning UDID. On Apple silicon the report runs native.
+    let apple_silicon = run("sysctl", &["-n", "hw.optional.arm64"])
+        .await
+        .is_ok_and(|value| value.trim() == "1");
+    let report = if apple_silicon {
+        run(
+            "arch",
+            &["-arm64", "system_profiler", "SPHardwareDataType", "-json"],
+        )
+        .await?
+    } else {
+        run("system_profiler", &["SPHardwareDataType", "-json"]).await?
+    };
+    let hardware: Value = serde_json::from_str(&report).context("parsing the hardware report")?;
+    let udid = hardware["SPHardwareDataType"][0]["provisioning_UDID"]
+        .as_str()
+        .context("the hardware report names no provisioning UDID")?
+        .to_owned();
+    // The filter matches loosely, so the answer is checked for this UDID.
+    let found = api.get(&format!("devices?filter[udid]={udid}")).await?;
+    if let Some(id) = found["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|device| device["attributes"]["udid"] == udid.as_str())
+        .and_then(|device| device["id"].as_str())
+    {
+        eprintln!("this Mac ({udid})");
+        return Ok(id.to_owned());
+    }
+    eprintln!("this Mac ({udid}), registering it");
+    let created = api
+        .post(
+            "devices",
+            &json!({ "data": { "type": "devices", "attributes": {
+                "name": "connetto proof Mac",
+                "udid": udid,
+                "platform": "MAC_OS",
+            } } }),
+        )
+        .await?;
+    Ok(created["data"]["id"]
+        .as_str()
+        .context("a device without an id")?
+        .to_owned())
+}
+
+/// A development profile for the bundle, the certificate and the devices,
 /// written where `dx` reads profiles. An older profile of the same name is
 /// replaced, since a profile's devices and certificates are fixed.
 async fn ensure_profile(
@@ -500,9 +583,10 @@ async fn ensure_profile(
     bundle: &str,
     certificate: &str,
     devices: &[String],
+    profile: Profile,
 ) -> Result<PathBuf> {
     let existing = api
-        .get(&format!("profiles?filter[name]={PROFILE_NAME}"))
+        .get(&format!("profiles?filter[name]={}", profile.name()))
         .await?;
     for profile in existing["data"].as_array().into_iter().flatten() {
         if let Some(id) = profile["id"].as_str() {
@@ -519,7 +603,7 @@ async fn ensure_profile(
             "profiles",
             &json!({ "data": {
                 "type": "profiles",
-                "attributes": { "name": PROFILE_NAME, "profileType": "IOS_APP_DEVELOPMENT" },
+                "attributes": { "name": profile.name(), "profileType": profile.kind() },
                 "relationships": {
                     "bundleId": { "data": { "type": "bundleIds", "id": bundle } },
                     "certificates": { "data": ids("certificates", &[certificate.to_owned()]) },
@@ -541,7 +625,7 @@ async fn ensure_profile(
         .context("a profile without a uuid")?;
     let folder = home()?.join("Library/Developer/Xcode/UserData/Provisioning Profiles");
     tokio::fs::create_dir_all(&folder).await?;
-    let path = folder.join(format!("{uuid}.mobileprovision"));
+    let path = folder.join(format!("{uuid}.{}", profile.extension()));
     tokio::fs::write(&path, content).await?;
     Ok(path)
 }
