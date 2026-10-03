@@ -325,3 +325,49 @@ fn a_certificate_outside_the_profile_is_refused() {
         assert_eq!(DeviceCertificate::parse(&sign(params)), Err(refusal));
     }
 }
+
+#[test]
+fn a_root_reloaded_from_its_parts_signs_issuers_the_issuer_accepts() {
+    let start = at(1_800_000_000);
+    let created = RootCa::create(deployment(), start, 10 * YEAR).expect("create the root");
+    let key = KeyPair::try_from(created.private_key_der().as_slice()).expect("key from PKCS #8");
+    let root = RootCa::from_parts(created.certificate().to_vec(), key).expect("reload the root");
+    let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let issuer_cert = root
+        .sign_issuer(&issuer_key.subject_public_key_info(), start, YEAR, [2; 16])
+        .expect("sign the issuer");
+    assert!(DeviceIssuer::new(issuer_cert, issuer_key, created.certificate()).is_ok());
+}
+
+#[test]
+fn a_root_reloaded_with_another_key_is_refused() {
+    let start = at(1_800_000_000);
+    let created = RootCa::create(deployment(), start, 10 * YEAR).expect("create the root");
+    let other = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("other key");
+    assert_eq!(
+        RootCa::from_parts(created.certificate().to_vec(), other).err(),
+        Some(RootError::KeyMismatch)
+    );
+}
+
+#[test]
+fn an_issuer_loads_from_its_stored_pkcs8_key() {
+    let start = at(1_800_000_000);
+    let root = RootCa::create(deployment(), start, 10 * YEAR).expect("root");
+    let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let issuer_cert = root
+        .sign_issuer(&issuer_key.subject_public_key_info(), start, YEAR, [2; 16])
+        .expect("sign");
+    assert!(
+        DeviceIssuer::from_pkcs8(
+            issuer_cert.clone(),
+            &issuer_key.serialize_der(),
+            root.certificate()
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        DeviceIssuer::from_pkcs8(issuer_cert, b"not a key", root.certificate()),
+        Err(IssuerError::Key(_))
+    ));
+}

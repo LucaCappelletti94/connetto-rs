@@ -5128,6 +5128,7 @@ Each was asked with primary references for every option, and the rejected option
 12. **Queued writes form a hash chain whose newest entry the chip signs at each hand-off** (2026-10-03). Each pending entry carries the hash of the entry before it in its writer's queue, as Scuttlebutt feeds link each message to the previous one, and the chip signs only the newest entry each time the queue is handed to the server or a peer. A receiver checks the chain back to its last verified entry, and a courier forwards only a range ending at a signed entry. One signature per write was rejected, since Chrome measured TPM P-256 signing at 200 ms typical and 600 ms slow, so a backlog of 100 offline writes would take 20 to 60 seconds on Windows, and Android documents StrongBox as slower still.
 13. **Attestation has three levels, set once at enrolment** (2026-10-03). `chip-proven` means Android attested the device key at the `TrustedEnvironment` or `StrongBox` level, never `Software`. `app-attested` means Apple's App Attest signed over the certificate request on iPhone, iPad or Mac, which proves a genuine copy of the app asked and says nothing about where the key lives, since App Attest attests its own separate key. Every other device is `unproven`. Renewals keep the enrolment's level and never attest again, since Apple warns its servers may throttle attestation. Two levels counting App Attest as `chip-proven` was rejected, since the certificate would claim more than Apple proves.
 14. **The issuer is replaced every year and the root lasts 10 years** (2026-10-03). `connetto-ca` signs a new issuer yearly, valid one year plus the certificate ceiling so its last certificates stay checkable, within NIST SP 800-57's one-to-three-year bound for a private signature key. The root lasts 10 years, and its rollover ships the next root in an application update at least a year before expiry. The server warns at startup when its issuer has less than 60 days left. A three-year issuer with a 20-year root was rejected, since a stolen issuer key would then sign for up to three years unless the root revokes it first.
+15. **`connetto-ca` stores the root key encrypted under an operator passphrase** (2026-10-03). The root key is written as PKCS #8 encrypted with PBES2 (scrypt and AES-256-CBC, RFC 8018) and the passphrase is asked at every ceremony, as step-ca encrypts its keys with a password, so a copy found on a backup is useless without the passphrase and the operator can keep several copies apart. The issuer key on the server stays a plain file, provisioned like `CONNETTO_CONTENT_KEY`. A plain root key file kept offline was rejected, since anyone copying it could sign issuers and revocation lists until the root is replaced.
 
 ### Design
 
@@ -5189,9 +5190,9 @@ Server side, an enrolment row is `Active` from its grant, `Revoked` from a repor
 
 ### Steps
 
-1. The certificate profile, `DeviceCertConfig`, the issuer key checked at startup, the enrolment table under `preflight::require`, and the `connetto-ca` operator tool.
+1. The certificate profile, `DeviceCertConfig`, the issuer key checked at startup, and the `connetto-ca` operator tool.
 2. The chip-held device key per platform with its custody report under R94 decision 13, one key per account on the device per R42's model, signing through `rcgen`'s `SigningKey`.
-3. Enrolment, renewal past half-life, `reissue_certificate`, and the builder's lifetime and descriptor setters.
+3. Enrolment, renewal past half-life, `reissue_certificate`, the builder's lifetime and descriptor setters, and the enrolment table under `preflight::require` with the schema trait that names its descriptor columns.
 4. Attestation verification and its certificate extension.
 5. Revocation lists, their push and peer exchange, replay protection, device revocation with its sessions, and the device list.
 6. Issuer rotation, retired issuers signing their lists, and root-signed issuer revocation.

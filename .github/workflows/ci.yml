@@ -686,6 +686,7 @@ jobs:
             packages: >-
               -p connetto-core
               -p connetto-schema
+              -p connetto-ca
               -p connetto-test-harness
               -p connetto-dioxus
               -p connetto-yew

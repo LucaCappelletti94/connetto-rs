@@ -74,15 +74,28 @@
 //!   `CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS` (default `30`),
 //!   `CONNETTO_CONTENT_WARN_FRACTION` (default `0.8`) and
 //!   `CONNETTO_CONTENT_CEILING_REFRESH_SECS` (default `10`).
+//! - `CONNETTO_DEVICE_ROOT`, `CONNETTO_DEVICE_ISSUER_CERT`,
+//!   `CONNETTO_DEVICE_ISSUER_KEY`: the paths of the deployment root's DER
+//!   certificate and of the issuer certificate and PKCS #8 key `connetto-ca
+//!   issuer` writes (R74). Set together or not at all. Unset, devices cannot
+//!   enrol. Set, the server refuses to start when the root did not sign the
+//!   issuer or the issuer has expired, and warns when it has less than sixty
+//!   days left.
+//! - `CONNETTO_DEVICE_CERT_DEFAULT_SECS`: a device certificate's lifetime when
+//!   the application requests none (default 86400).
+//! - `CONNETTO_DEVICE_CERT_CEILING_SECS`: the longest lifetime granted, a
+//!   longer request refused (default 2592000, 30 days).
 //!
 //! The process exits `1` when the change stream cannot answer what a row
 //! looked like before it changed, or gives up reconnecting, and returns its
 //! build or HTTP errors as failures.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::device_cert::DeviceIssuer;
 use connetto_core::env::{read_ddl, var_or};
+use connetto_server::device_cert::DeviceCertConfig;
 use connetto_server::builder::{
     ContentSettings, Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema,
     StoreSpec, TokenKeys,
@@ -347,6 +360,55 @@ async fn content_settings() -> Result<Option<ContentSettings>> {
 ///
 /// When any setting is absent, blank, or names a mode this binary no longer
 /// serves.
+/// `<key>` as whole seconds, `None` when unset or blank.
+fn env_secs(key: &str) -> Result<Option<Duration>> {
+    var_nonempty(key)
+        .map(|text| {
+            text.parse()
+                .map(Duration::from_secs)
+                .with_context(|| format!("parsing {key}: {text:?}"))
+        })
+        .transpose()
+}
+
+/// The device certificate settings from `CONNETTO_DEVICE_*`, checked at `now`.
+/// `None` when none of the three files is named, so devices cannot enrol.
+fn device_certs(now: SystemTime) -> Result<Option<DeviceCertConfig>> {
+    let files = [
+        "CONNETTO_DEVICE_ROOT",
+        "CONNETTO_DEVICE_ISSUER_CERT",
+        "CONNETTO_DEVICE_ISSUER_KEY",
+    ]
+    .map(|key| (key, var_nonempty(key)));
+    if files.iter().all(|(_, path)| path.is_none()) {
+        return Ok(None);
+    }
+    let [root, cert, key] = files.map(|(key, path)| {
+        let path = path.ok_or_else(|| {
+            anyhow!("set {key}: the device root, issuer certificate and issuer key go together")
+        })?;
+        std::fs::read(&path).with_context(|| format!("reading {key} at {path}"))
+    });
+    let (root, cert) = (root?, cert?);
+    let key = zeroize::Zeroizing::new(key?);
+    let issuer = DeviceIssuer::from_pkcs8(cert, &key, &root)
+        .context("loading the device certificate issuer")?;
+    let mut config = DeviceCertConfig::new(issuer);
+    if let Some(lifetime) = env_secs("CONNETTO_DEVICE_CERT_DEFAULT_SECS")? {
+        config = config.with_default_lifetime(lifetime);
+    }
+    if let Some(ceiling) = env_secs("CONNETTO_DEVICE_CERT_CEILING_SECS")? {
+        config = config.with_lifetime_ceiling(ceiling);
+    }
+    if let Some(expiring) = config.check(now)? {
+        tracing::warn!(
+            days_left = expiring.left.as_secs() / 86_400,
+            "the device certificate issuer expires soon, sign the next one with connetto-ca"
+        );
+    }
+    Ok(Some(config))
+}
+
 async fn builder_from_env() -> Result<ServerBuilder> {
     let auth = var_or("CONNETTO_AUTH", "");
     match auth.as_str() {
@@ -382,6 +444,8 @@ async fn builder_from_env() -> Result<ServerBuilder> {
     let providers = oidc_providers()?;
     let keys = jwt_keys()?;
     let content = content_settings().await?;
+    // Checked at boot, so a broken or expired issuer refuses to start.
+    let _device_certs = device_certs(SystemTime::now())?;
     let openfga = OpenFga::new(
         var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081"),
         std::env::var("CONNETTO_FGA_STORE").map_err(|_| {

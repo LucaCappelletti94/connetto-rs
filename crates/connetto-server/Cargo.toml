@@ -19,7 +19,7 @@ name = "connetto-server"
 path = "src/bin/connetto-server.rs"
 
 [dependencies]
-connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "logging", "env"] }
+connetto-core = { workspace = true, features = ["native-transport", "diesel-pg", "logging", "env", "device-cert"] }
 # Derives the schema version it presents at handshake, hashing the translated
 # bundle rather than the source documents alone.
 connetto-schema = { workspace = true }
@@ -96,6 +96,8 @@ jsonwebtoken = "9"
 ring = "0.17"
 axum = { version = "0.8", features = ["ws"] }
 uuid = { version = "1", features = ["v4", "v5"] }
+# The device issuer key read at boot is wiped once loaded.
+zeroize = "1"
 sha2 = "0.10"
 serde.workspace = true
 # OIDC provider verification (docs/architecture/11-authentication.md phase 3).
@@ -137,6 +139,8 @@ content = ["dep:connetto-file-server"]
 test-seams = []
 
 [dev-dependencies]
+# The device certificate settings tests create a root and issuer of their own.
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
 # The e2e content boot tests write the ticket key document the server loads,
 # through the same ring keypair the server's signer parses.
 ring = "0.17"
