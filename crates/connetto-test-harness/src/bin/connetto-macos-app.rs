@@ -59,6 +59,14 @@ async fn main() -> Result<()> {
         .context("the signing keychain holds no identity, run connetto-ios-signing")?;
     let keychain = ios_signing::keychain()?.display().to_string();
     let entitlements = entitlements.display().to_string();
+    // A bundle's signature covers its frameworks, so they are signed first.
+    for framework in frameworks(&app).await? {
+        codesign(
+            &["--force", "--sign", &identity, "--keychain", &keychain],
+            &framework,
+        )
+        .await?;
+    }
     codesign(
         &[
             "--force",
@@ -75,6 +83,24 @@ async fn main() -> Result<()> {
     codesign(&["--verify", "--deep", "--strict"], &app).await?;
     println!("{}", app.display());
     Ok(())
+}
+
+/// The frameworks `dx` embedded, such as the one carrying the Swift plugins.
+async fn frameworks(app: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut entries = match tokio::fs::read_dir(app.join("Contents/Frameworks")).await {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(found),
+        Err(err) => return Err(err).context("listing the bundle's frameworks"),
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .context("listing the bundle's frameworks")?
+    {
+        found.push(entry.path());
+    }
+    Ok(found)
 }
 
 /// The newest development profile covering this Mac, which

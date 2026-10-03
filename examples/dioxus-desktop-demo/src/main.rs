@@ -164,7 +164,8 @@ impl connetto_client::AuthorizationSession for TabSession {
 }
 
 /// On a desktop, sign in through the system browser and a loopback listener
-/// (RFC 8252 section 7.3).
+/// (RFC 8252 section 7.3), so the user's own browser serves the login with its
+/// sessions and password manager.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
     auth
@@ -335,6 +336,9 @@ fn Shell() -> Element {
     // Windows Hello prompts over this window.
     #[cfg(target_os = "windows")]
     let owner = connetto_dioxus::use_hello_owner();
+    // The browser holds the front after a login, so the window takes it back.
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    let window = dioxus::desktop::window();
     use_effect(move || {
         let _ = generation();
         let account = choice.peek().clone();
@@ -342,6 +346,8 @@ fn Shell() -> Element {
         let runtime = runtime.clone();
         #[cfg(target_os = "windows")]
         let owner = Arc::clone(&owner);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let window = window.clone();
         spawn(async move {
             let outcome = runtime
                 .spawn(setup(
@@ -360,6 +366,8 @@ fn Shell() -> Element {
                 ),
                 Err(err) => Stage::Failed(format!("the setup task stopped: {err}")),
             });
+            #[cfg(not(any(target_os = "android", target_os = "ios")))]
+            window.set_focus();
         });
     });
     let session = *generation.read();

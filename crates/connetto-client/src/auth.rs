@@ -808,8 +808,11 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
     let query = target.split_once('?').map_or("", |(_, query)| query);
     let delivered = code_and_state(query, "loopback callback");
 
-    let page =
-        "<!doctype html><html><body>Login complete. You may close this window.</body></html>";
+    let page = if delivered.is_ok() {
+        LOGIN_COMPLETE_PAGE
+    } else {
+        LOGIN_FAILED_PAGE
+    };
     let response = format!(
         "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
         page.len(),
@@ -818,6 +821,15 @@ async fn accept_loopback_code(listener: &TcpListener) -> Result<(String, String)
     let _ = stream.flush().await;
     delivered
 }
+
+/// The page a completed login ends on, which closes itself where the browser
+/// allows, since only a tab with one history entry may.
+const LOGIN_COMPLETE_PAGE: &str = "<!doctype html><html><body><script>window.close()</script>\
+     Login complete. Return to the app.</body></html>";
+
+/// The page a refused or malformed redirect ends on.
+const LOGIN_FAILED_PAGE: &str =
+    "<!doctype html><html><body>The login did not complete. Return to the app.</body></html>";
 
 /// The query of a URL, or nothing when it has none.
 fn query_of(url: &str) -> &str {
@@ -856,6 +868,40 @@ mod tests {
 
     fn names(values: &[&str]) -> Vec<String> {
         values.iter().map(|v| (*v).to_owned()).collect()
+    }
+
+    /// The browser tab the login ends in, as the loopback listener answers a
+    /// redirect to `query`.
+    async fn loopback_page(query: &str) -> String {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("port").port();
+        let request = format!("GET /callback?{query} HTTP/1.1\r\n\r\n");
+        let browser = tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("connect");
+            stream.write_all(request.as_bytes()).await.expect("request");
+            let mut page = String::new();
+            stream.read_to_string(&mut page).await.expect("response");
+            page
+        });
+        let _ = super::accept_loopback_code(&listener).await;
+        browser.await.expect("browser")
+    }
+
+    #[tokio::test]
+    async fn the_login_tab_says_whether_the_login_completed() {
+        let completed = loopback_page("code=abc&state=xyz").await;
+        assert!(completed.contains("Login complete"), "{completed}");
+        let refused = loopback_page("error=access_denied&state=xyz").await;
+        assert!(
+            !refused.contains("Login complete"),
+            "a refused login is not reported complete: {refused}"
+        );
     }
 
     /// R42: the native account index, which is the only thing that can answer
