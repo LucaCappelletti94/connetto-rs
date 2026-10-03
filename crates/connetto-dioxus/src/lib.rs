@@ -14,6 +14,14 @@
 //! query-builder closure instead of a query value and yields the same
 //! `UseLive<Vec<R>>`, sharing the identical lifecycle and drop-unsubscribe
 //! contract.
+//!
+//! A desktop sign-in ends in the system browser, which keeps the front. The
+//! application brings its window back once its setup completes, with
+//! `dioxus::desktop::window().set_focus()` where the setup task finishes, as
+//! `examples/dioxus-desktop-demo` does. connetto knows no window, so this
+//! adapter offers no hook for it, except that `use_hello_owner` raises the
+//! window when it lends it, since Windows shows Hello only over a window in
+//! front.
 
 use connetto_client::dsl::Watchable;
 use connetto_client::{ConnettoClient, LiveHandle};

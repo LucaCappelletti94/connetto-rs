@@ -40,6 +40,9 @@ impl HelloOwner for Owner {
         state.next = state.next.wrapping_add(1);
         let id = state.next;
         state.active = Some((id, cancel));
+        drop(state);
+        // Windows shows the prompt only over a window in front, and a login leaves the browser there.
+        window.set_focus();
         Some(Arc::new(Lease {
             window,
             id,
