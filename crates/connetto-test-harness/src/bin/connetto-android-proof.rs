@@ -57,6 +57,8 @@ const INTERSTITIALS: [&str; 3] = [
 const BROWSER_ROLE: &str = "android.app.role.BROWSER";
 /// The global setting `svc power stayon` writes.
 const STAY_ON: &str = "stay_on_while_plugged_in";
+/// The global setting that, when nonzero, keeps crash and freeze dialogs off the screen.
+const HIDE_ERROR_DIALOGS: &str = "hide_error_dialogs";
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -81,12 +83,17 @@ async fn main() -> Result<()> {
     // the browser role for the run and the device's own choice returns after.
     let previous = device.browser_role_holder().await?;
     // The proof keeps the screen on, and a phone left on the cable must not stay lit after it.
-    let stay_on = device.stay_on().await?;
+    let stay_on = device.global_setting(STAY_ON).await?;
+    // A system app freezing on a slow device covers every screen the proof taps with a dialog.
+    let error_dialogs = device.global_setting(HIDE_ERROR_DIALOGS).await?;
     device.set_browser_role_holder(BROWSER).await?;
     let unlock = Unlock {
         pin: unlock_pin.as_deref(),
     };
-    let outcome = prove(&device, apk, &stack, &evidence, unlock).await;
+    let outcome = match device.hide_error_dialogs().await {
+        Ok(()) => prove(&device, apk, &stack, &evidence, unlock).await,
+        Err(err) => Err(err),
+    };
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
     tokio::fs::write(evidence.join("logcat.txt"), log)
         .await
@@ -112,20 +119,13 @@ async fn main() -> Result<()> {
             .await
             .map(drop),
     };
-    let screen = match stay_on.as_deref() {
-        Some(value) => {
-            device
-                .adb(&["shell", "settings", "put", "global", STAY_ON, value])
-                .await
-        }
-        None => {
-            device
-                .adb(&["shell", "settings", "delete", "global", STAY_ON])
-                .await
-        }
-    }
-    .map(drop);
-    outcome.and(restored).and(screen)
+    let screen = device
+        .restore_global_setting(STAY_ON, stay_on.as_deref())
+        .await;
+    let dialogs = device
+        .restore_global_setting(HIDE_ERROR_DIALOGS, error_dialogs.as_deref())
+        .await;
+    outcome.and(restored).and(screen).and(dialogs)
 }
 
 /// What `connetto-demo-stack` tells its command.
@@ -644,14 +644,51 @@ impl Device {
             .map(ToOwned::to_owned))
     }
 
-    /// The device's own stay-on setting, `None` when it holds none.
-    async fn stay_on(&self) -> Result<Option<String>> {
+    /// The device's own value of a global setting, `None` when it holds none.
+    async fn global_setting(&self, name: &str) -> Result<Option<String>> {
         let value = self
-            .adb(&["shell", "settings", "get", "global", STAY_ON])
+            .adb(&["shell", "settings", "get", "global", name])
             .await?;
         Ok(Some(value.trim())
             .filter(|value| *value != "null")
             .map(ToOwned::to_owned))
+    }
+
+    /// Put back a global setting read by [`Self::global_setting`].
+    async fn restore_global_setting(&self, name: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => {
+                self.adb(&["shell", "settings", "put", "global", name, value])
+                    .await
+            }
+            None => {
+                self.adb(&["shell", "settings", "delete", "global", name])
+                    .await
+            }
+        }
+        .map(drop)
+    }
+
+    /// Keep crash and freeze dialogs off the screen and close any already showing.
+    async fn hide_error_dialogs(&self) -> Result<()> {
+        self.adb(&[
+            "shell",
+            "settings",
+            "put",
+            "global",
+            HIDE_ERROR_DIALOGS,
+            "1",
+        ])
+        .await?;
+        self.adb(&[
+            "shell",
+            "am",
+            "broadcast",
+            "-a",
+            "android.intent.action.CLOSE_SYSTEM_DIALOGS",
+        ])
+        .await
+        .map(drop)
     }
 
     async fn set_browser_role_holder(&self, package: &str) -> Result<()> {
