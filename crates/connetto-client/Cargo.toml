@@ -39,6 +39,9 @@ postgres-types = ["diesel/postgres_backend"]
 # loopback listener, system browser, OS secure storage for the refresh token,
 # and the HTTP calls to connetto-server's login, token, and refresh endpoints.
 # Native only, never wasm (the browser worker owns token custody there).
+# A device identity key for peer sync (R74): in the security chip, or a
+# software key in the plain secret store where no chip is usable.
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -147,6 +150,8 @@ getrandom = { version = "0.3", optional = true }
 # Wiping the transient hex strings that carry key material: the `PRAGMA key`
 # statement built from a ReplicaKey, and the hex a KeyringKeyStore persists.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# The software device key (R74 decision 16), the same ring rustls signs with.
+ring = { version = "0.17", optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
 connetto-schema = { workspace = true, optional = true }
@@ -250,6 +255,7 @@ web-sys = { version = "0.3", features = ["Window", "Performance"] }
 uuid = { version = "1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
+parking_lot = "0.12"
 # The shared fake transport the suites here drive `connect` and `resume` with.
 connetto-core = { workspace = true, features = ["test-support"] }
 # The loop tests run the real server in-process. Its write target is the real

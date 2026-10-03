@@ -72,6 +72,8 @@ pub mod away;
 pub mod builder;
 pub mod cipher;
 mod clock;
+#[cfg(feature = "device-identity")]
+pub mod device_key;
 pub mod dsl;
 mod grant_expiry;
 pub mod harden;
@@ -136,7 +138,7 @@ pub use reconnect::{FirstThen, ReconnectPolicy, Sleeper, TransportFactory};
 pub use replica::provision_replica_key;
 pub use replica::{
     Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
-    encode_identity, is_reserved_record, replica_db_name,
+    device_key_record, encode_identity, is_reserved_record, replica_db_name,
 };
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
@@ -212,6 +214,10 @@ pub enum ClientError {
     #[cfg(feature = "native-auth")]
     #[error("secret store: {0}")]
     SecretStore(keyring::SecretStoreError),
+    /// No device key could be made (R74).
+    #[cfg(feature = "device-identity")]
+    #[error(transparent)]
+    DeviceKey(#[from] device_key::DeviceKeyStoreError),
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///
