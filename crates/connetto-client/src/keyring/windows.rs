@@ -12,9 +12,8 @@ use std::time::Duration;
 
 use keyring_core::Entry;
 use keyring_core::api::CredentialStoreApi;
-use windows_native_keyring_store::hello::HelloError;
 pub use windows_native_keyring_store::hello::{HelloCancellation, HelloWindow};
-use windows_native_keyring_store::{HelloStore, Store};
+use windows_native_keyring_store::{HelloStore, SealError, Store};
 
 use super::gate::{Backend, Refusal, Storage};
 use crate::ClientError;
@@ -94,17 +93,17 @@ impl WindowsBackend {
         if self.owner().is_none() {
             return Err(Refusal::Unsupported);
         }
-        HelloStore::capability().map_err(|err| refusal_of(&err))?;
+        windows_native_keyring_store::hello::capability().map_err(|err| refusal_of(&err))?;
         self.hello_store(service).map_err(Refusal::Other)
     }
 
     /// One Windows Hello prompt over the owner's window.
-    fn unlock(&self, store: &HelloStore) -> Result<(), HelloError> {
-        let owner = self.owner().ok_or(HelloError::MissingOwner)?;
+    fn unlock(&self, store: &HelloStore) -> Result<(), SealError> {
+        let owner = self.owner().ok_or(SealError::MissingOwner)?;
         let cancellation = HelloCancellation::new();
         let window = owner
             .lease(cancellation.clone())
-            .ok_or(HelloError::MissingOwner)?;
+            .ok_or(SealError::MissingOwner)?;
         store.unlock(window, &cancellation, UNLOCK_WINDOW)
     }
 
@@ -184,10 +183,10 @@ impl Backend for WindowsBackend {
             match self.unlock(&store) {
                 Ok(()) => {}
                 Err(
-                    HelloError::KeyLost
-                    | HelloError::Corrupt(_)
-                    | HelloError::Discarding
-                    | HelloError::Unsupported(_),
+                    SealError::KeyLost
+                    | SealError::Corrupt(_)
+                    | SealError::Discarding
+                    | SealError::Unsupported(_),
                 ) => {
                     tracing::warn!(
                         "the gated store's Windows Hello credential is gone, discarding it"
@@ -212,7 +211,7 @@ impl Backend for WindowsBackend {
     fn open(&self, service: &str, _probe: Option<&str>) -> Result<(), Refusal> {
         let store = self.gated_store(service)?;
         match self.unlock(&store) {
-            Err(HelloError::KeyLost | HelloError::Corrupt(_) | HelloError::Discarding) => {
+            Err(SealError::KeyLost | SealError::Corrupt(_) | SealError::Discarding) => {
                 let fresh = self.start_over(service, &store)?;
                 self.unlock(&fresh).map_err(|err| refusal_of(&err))
             }
@@ -237,13 +236,11 @@ impl Backend for WindowsBackend {
 }
 
 /// A Hello refusal as the gate sees it.
-fn refusal_of(err: &HelloError) -> Refusal {
+fn refusal_of(err: &SealError) -> Refusal {
     match err {
-        HelloError::Cancelled | HelloError::TimedOut | HelloError::MissingOwner => {
-            Refusal::Dismissed
-        }
-        HelloError::Unsupported(_) => Refusal::Unsupported,
-        HelloError::Locked => Refusal::Other(ClientError::Locked),
+        SealError::Cancelled | SealError::TimedOut | SealError::MissingOwner => Refusal::Dismissed,
+        SealError::Unsupported(_) => Refusal::Unsupported,
+        SealError::Locked => Refusal::Other(ClientError::Locked),
         other_err => Refusal::Other(hello(other_err)),
     }
 }
@@ -262,7 +259,7 @@ fn other(err: &keyring_core::Error) -> Refusal {
     Refusal::Other(ClientError::Auth(format!("windows hello store: {err}")))
 }
 
-fn hello(err: &HelloError) -> ClientError {
+fn hello(err: &SealError) -> ClientError {
     ClientError::Auth(format!("windows hello: {err}"))
 }
 
