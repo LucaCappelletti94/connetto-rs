@@ -439,6 +439,7 @@ struct DeviceSetup {
     lifetime: Option<core::time::Duration>,
     descriptor: Vec<u8>,
     refused: Option<String>,
+    roots: Vec<Vec<u8>>,
     #[cfg(target_os = "android")]
     java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
@@ -453,6 +454,9 @@ impl DeviceSetup {
     fn keys(&self, service: &str, account: &str) -> Result<Arc<dyn DeviceKeys>, ClientError> {
         if let Some(reason) = &self.refused {
             return Err(ClientError::DeviceDescriptor(reason.clone()));
+        }
+        if self.roots.is_empty() {
+            return Err(ClientError::MissingDeploymentRoots);
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let chip = Arc::new(crate::device_key::SecureEnclave);
@@ -513,6 +517,16 @@ where
             }
             Err(err) => self.device.refused = Some(err.to_string()),
         }
+        self
+    }
+
+    /// The DER roots of the deployment, shipped with the application, which
+    /// every certificate this device receives and every revocation list must
+    /// chain to (decisions 3 and 23). A build with a device identity that
+    /// names none fails to connect. Several roots carry a root rollover.
+    #[must_use]
+    pub fn with_deployment_roots(mut self, roots: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        self.device.roots = roots.into_iter().collect();
         self
     }
 
@@ -647,8 +661,16 @@ where
                 // Read before the pump runs, so a restarted client reports its
                 // certificate from the moment it is handed back.
                 let held = core.client().stored_certificate().await?;
-                let (enroller, handle) =
-                    Enroller::new(keys, device.lifetime, device.descriptor, held);
+                let (kept, lists) = core.client().revocation_inbox().await?;
+                let (enroller, handle) = Enroller::new(
+                    keys,
+                    device.lifetime,
+                    device.descriptor,
+                    device.roots,
+                    held,
+                    kept,
+                    lists,
+                );
                 let enrolment = core.client().enrolment(enroller);
                 let pump: CorePump = Box::pin(async move {
                     tokio::join!(pump, enrolment);
@@ -781,6 +803,44 @@ where
     #[must_use]
     pub fn device_certificate(&self) -> Option<DeviceCertificate> {
         self.device.as_ref().and_then(EnrolHandle::certificate)
+    }
+
+    /// The account's devices, for the lost-device list, each descriptor read
+    /// as the application's `D` (R74 step 5).
+    ///
+    /// # Errors
+    ///
+    /// [`CertificateError::Offline`] with no server reachable,
+    /// [`CertificateError::Refused`] for a refusal, and
+    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    #[cfg(feature = "device-identity")]
+    pub async fn devices<D: DeviceDescriptor>(
+        &self,
+    ) -> Result<Vec<crate::enrolment::DeviceEntry<D>>, CertificateError> {
+        match &self.device {
+            Some(device) => device.devices().await,
+            None => Err(CertificateError::NoIdentity),
+        }
+    }
+
+    /// Report the account's device holding `key` lost. The server lists its
+    /// certificates, closes its connections and revokes its sessions, and a
+    /// device reporting itself deletes its own key (R74 step 5).
+    ///
+    /// # Errors
+    ///
+    /// [`CertificateError::Offline`] with no server reachable,
+    /// [`CertificateError::Refused`] for a key that is not the account's, and
+    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    #[cfg(feature = "device-identity")]
+    pub async fn revoke_device(
+        &self,
+        key: connetto_core::device_cert::KeyId,
+    ) -> Result<(), CertificateError> {
+        match &self.device {
+            Some(device) => device.revoke(key).await,
+            None => Err(CertificateError::NoIdentity),
+        }
     }
 
     /// Where this device's key lives, a chip or software in the secret

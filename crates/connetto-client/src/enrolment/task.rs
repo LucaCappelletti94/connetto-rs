@@ -7,16 +7,20 @@ use core::time::Duration;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use std::collections::HashMap;
+
 use connetto_core::device_cert::{
-    CertificateRequest, CertificateSigner, DeviceCertificate, DeviceKey, KeyHome, key_id,
+    CertificateRequest, CertificateSigner, DeviceCertificate, DeviceDescriptor, DeviceKey, KeyHome,
+    KeyId, RevocationList, certificate_key_id, key_id, verify_chain,
 };
 use connetto_core::messages::{
-    ControlMessage, EnrolChallengeRequest, EnrolRefusal, EnrolRequest, SyncStatus,
+    ControlMessage, DeviceSummary, DevicesRequest, EnrolChallengeRequest, EnrolRefusal,
+    EnrolRequest, FatalErrorReason, RevokeDeviceRequest, SignedList, SyncStatus,
 };
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::{Answer, Held, Standing, half_life};
+use super::{Answer, Held, KeptList, Standing, half_life};
 use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
 use crate::{ClientError, ClientEvent};
 
@@ -118,11 +122,49 @@ pub(crate) trait Link: Send + Sync + 'static {
     fn store(&self, held: Held) -> impl Future<Output = Result<(), ClientError>> + Send;
     /// Forget the certificate the replica holds.
     fn forget(&self) -> impl Future<Output = Result<(), ClientError>> + Send;
+    /// Keep `kept` as its signer's list.
+    fn store_list(&self, kept: KeptList) -> impl Future<Output = Result<(), ClientError>> + Send;
+}
+
+/// One enrolled device of the account, as the lost-device list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceEntry<D> {
+    /// The device key, which its certificate's identity names.
+    pub key: KeyId,
+    /// When the key first enrolled.
+    pub enrolled_at: SystemTime,
+    /// When the key last enrolled or renewed.
+    pub last_seen: SystemTime,
+    /// When the key was reported lost.
+    pub revoked_at: Option<SystemTime>,
+    /// What the device described itself as, `None` when it sent nothing this
+    /// build's descriptor type reads.
+    pub descriptor: Option<D>,
+}
+
+impl<D: DeviceDescriptor> DeviceEntry<D> {
+    fn of(summary: &DeviceSummary) -> Self {
+        let at = |secs: u64| SystemTime::UNIX_EPOCH + Duration::from_secs(secs);
+        Self {
+            key: KeyId::from_bytes(summary.key_id),
+            enrolled_at: at(summary.enrolled_at_secs),
+            last_seen: at(summary.last_seen_secs),
+            revoked_at: summary.revoked_at_secs.map(at),
+            descriptor: rmp_serde::from_slice(&summary.descriptor).ok(),
+        }
+    }
 }
 
 enum Command {
     Reissue {
         lifetime: Duration,
+        reply: oneshot::Sender<Result<(), CertificateError>>,
+    },
+    Devices {
+        reply: oneshot::Sender<Result<Vec<DeviceSummary>, CertificateError>>,
+    },
+    Revoke {
+        key: KeyId,
         reply: oneshot::Sender<Result<(), CertificateError>>,
     },
 }
@@ -131,6 +173,9 @@ enum Command {
 pub(crate) struct Enroller {
     keys: Arc<dyn DeviceKeys>,
     held: Option<Held>,
+    roots: Vec<Vec<u8>>,
+    kept: Vec<KeptList>,
+    lists: super::ListInbox,
     lifetime: Option<Duration>,
     descriptor: Vec<u8>,
     commands: mpsc::UnboundedReceiver<Command>,
@@ -148,13 +193,17 @@ pub(crate) struct EnrolHandle {
 
 impl Enroller {
     /// A task enrolling `keys` at `lifetime`, the server's default when
-    /// `None`, sending `descriptor`, starting from the certificate `held`
-    /// the replica holds, and the handle that steers it.
+    /// `None`, sending `descriptor`, verifying against `roots`, starting
+    /// from the certificate `held` and the lists `kept` the replica holds and
+    /// taking pushed `lists`, and the handle that steers it.
     pub(crate) fn new(
         keys: Arc<dyn DeviceKeys>,
         lifetime: Option<Duration>,
         descriptor: Vec<u8>,
+        roots: Vec<Vec<u8>>,
         held: Option<Held>,
+        kept: Vec<KeptList>,
+        lists: super::ListInbox,
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
@@ -163,6 +212,9 @@ impl Enroller {
             Self {
                 keys: Arc::clone(&keys),
                 held,
+                roots,
+                kept,
+                lists,
                 lifetime,
                 descriptor,
                 commands,
@@ -185,6 +237,27 @@ impl EnrolHandle {
         let (reply, answer) = oneshot::channel();
         self.commands
             .send(Command::Reissue { lifetime, reply })
+            .map_err(|_| CertificateError::Offline)?;
+        answer.await.unwrap_or(Err(CertificateError::Offline))
+    }
+
+    /// The account's devices.
+    pub(crate) async fn devices<D: DeviceDescriptor>(
+        &self,
+    ) -> Result<Vec<DeviceEntry<D>>, CertificateError> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Devices { reply })
+            .map_err(|_| CertificateError::Offline)?;
+        let summaries = answer.await.unwrap_or(Err(CertificateError::Offline))?;
+        Ok(summaries.iter().map(DeviceEntry::of).collect())
+    }
+
+    /// Report the device holding `key` lost.
+    pub(crate) async fn revoke(&self, key: KeyId) -> Result<(), CertificateError> {
+        let (reply, answer) = oneshot::channel();
+        self.commands
+            .send(Command::Revoke { key, reply })
             .map_err(|_| CertificateError::Offline)?;
         answer.await.unwrap_or(Err(CertificateError::Offline))
     }
@@ -268,6 +341,30 @@ struct Run<L> {
     enroller: Enroller,
     held: Option<Held>,
     key: Option<Arc<dyn DeviceKey>>,
+    kept: HashMap<Vec<u8>, KeptList>,
+}
+
+/// What the intake makes of a verified list against the one kept from the same signer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Intake {
+    /// Higher-numbered, or the first from its signer, so it replaces the kept one.
+    Newer,
+    /// The kept list itself, or an older one.
+    Stale,
+    /// The kept number with other content, which only a faulty or hostile
+    /// signer produces, so it is logged and ignored.
+    Conflicting,
+}
+
+pub(super) fn intake(kept: Option<&KeptList>, list: &RevocationList) -> Intake {
+    match kept {
+        None => Intake::Newer,
+        Some(kept) if list.number() > kept.number => Intake::Newer,
+        Some(kept) if list.number() == kept.number && list.der() != kept.list.as_slice() => {
+            Intake::Conflicting
+        }
+        Some(_) => Intake::Stale,
+    }
 }
 
 impl<L: Link> Run<L> {
@@ -300,7 +397,7 @@ impl<L: Link> Run<L> {
     async fn exchange(
         &mut self,
         lifetime: Option<Duration>,
-    ) -> Result<(Arc<dyn DeviceKey>, Vec<Vec<u8>>), Failed> {
+    ) -> Result<(Arc<dyn DeviceKey>, Vec<Vec<u8>>, Vec<SignedList>), Failed> {
         let key = self.key().await.map_err(Failed::Device)?;
         let id = request_id();
         let asked = self
@@ -338,10 +435,10 @@ impl<L: Link> Run<L> {
             )
             .await
             .map_err(sent)?;
-        let Answer::Grant(chain) = answer(asked).await? else {
+        let Answer::Grant(chain, lists) = answer(asked).await? else {
             return Err(unexpected());
         };
-        Ok((key, chain))
+        Ok((key, chain, lists))
     }
 
     /// Ask for a certificate at `lifetime` and keep what is granted. A
@@ -366,7 +463,11 @@ impl<L: Link> Run<L> {
             other => other,
         };
         match outcome {
-            Ok((key, chain)) => self.keep(&*key, chain, lifetime).await,
+            Ok((key, chain, lists)) => {
+                self.keep(&*key, chain, lifetime).await?;
+                self.take_lists(lists).await;
+                Ok(())
+            }
             Err(Failed::Refused(EnrolRefusal::Revoked)) => {
                 self.revoked().await;
                 Err(CertificateError::Revoked)
@@ -393,6 +494,8 @@ impl<L: Link> Run<L> {
         }
         let issuer = chain.swap_remove(1);
         let certificate = chain.swap_remove(0);
+        verify_chain(&certificate, &issuer, &self.enroller.roots)
+            .map_err(|_| protocol("does not chain to a deployment root"))?;
         let leaf = DeviceCertificate::parse(&certificate)
             .map_err(|_| protocol("is not a device certificate"))?;
         if leaf.identity().key() != key_id(key) {
@@ -429,6 +532,84 @@ impl<L: Link> Run<L> {
         self.link.emit(ClientEvent::DeviceRevoked);
     }
 
+    /// Keep each verified list newer than the one kept from its signer, and
+    /// take this device's own listed certificate as its revocation (lifecycle
+    /// row "Newer list from server or peer", decision 22).
+    async fn take_lists(&mut self, lists: Vec<SignedList>) {
+        for signed in lists {
+            let list =
+                match RevocationList::verify(&signed.list, &signed.signer, &self.enroller.roots) {
+                    Ok(list) => list,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "a revocation list was refused");
+                        continue;
+                    }
+                };
+            let signer_key = list.issuer().as_bytes().to_vec();
+            match intake(self.kept.get(&signer_key), &list) {
+                Intake::Stale => continue,
+                Intake::Conflicting => {
+                    tracing::warn!(
+                        number = list.number(),
+                        "a revocation list repeats a kept number with other content"
+                    );
+                    continue;
+                }
+                Intake::Newer => {}
+            }
+            let kept = KeptList {
+                signer_key: signer_key.clone(),
+                number: list.number(),
+                list: signed.list,
+                signer: signed.signer,
+            };
+            if let Err(err) = self.link.store_list(kept.clone()).await {
+                tracing::warn!(error = %err, "a revocation list could not be kept");
+                continue;
+            }
+            self.kept.insert(signer_key, kept);
+            let own = self.held.as_ref().is_some_and(|held| {
+                certificate_key_id(&held.issuer).is_ok_and(|issuer| issuer == list.issuer())
+                    && list.revokes(held.leaf.serial())
+            });
+            if own {
+                self.revoked().await;
+            }
+        }
+    }
+
+    /// One request and its one answer, for the device list and reports.
+    async fn ask_once(&self, msg: impl FnOnce(String) -> ControlMessage) -> Result<Answer, Failed> {
+        let id = request_id();
+        let asked = self.link.ask(id.clone(), msg(id)).await.map_err(sent)?;
+        answer(asked).await
+    }
+
+    async fn devices(&self) -> Result<Vec<DeviceSummary>, CertificateError> {
+        match self
+            .ask_once(|request_id| ControlMessage::DevicesRequest(DevicesRequest { request_id }))
+            .await?
+        {
+            Answer::Devices(devices) => Ok(devices),
+            _ => Err(unexpected().into()),
+        }
+    }
+
+    async fn revoke(&self, key: KeyId) -> Result<(), CertificateError> {
+        match self
+            .ask_once(|request_id| {
+                ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+                    request_id,
+                    key_id: *key.as_bytes(),
+                })
+            })
+            .await?
+        {
+            Answer::Revoked => Ok(()),
+            _ => Err(unexpected().into()),
+        }
+    }
+
     /// Act on a live connection as the certificate's standing says
     /// (lifecycle rows "Connected and signed in" and "Half-life crossed").
     async fn on_connected(&mut self) {
@@ -450,11 +631,16 @@ impl<L: Link> Run<L> {
 pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
     let mut events = link.events();
     let held = enroller.held.take();
+    let kept = core::mem::take(&mut enroller.kept)
+        .into_iter()
+        .map(|kept| (kept.signer_key.clone(), kept))
+        .collect();
     let mut run = Run {
         link,
         enroller,
         held,
         key: None,
+        kept,
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
@@ -477,6 +663,9 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 Ok(ClientEvent::SyncStatus(SyncStatus::Connected)) | Err(RecvError::Lagged(_)) => {
                     due = true;
                 }
+                Ok(ClientEvent::ServerClosed { reason: FatalErrorReason::DeviceRevoked }) => {
+                    run.revoked().await;
+                }
                 Ok(_) => {}
                 Err(RecvError::Closed) => return,
             },
@@ -489,8 +678,15 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     };
                     let _ = reply.send(outcome);
                 }
+                Some(Command::Devices { reply }) => {
+                    let _ = reply.send(run.devices().await);
+                }
+                Some(Command::Revoke { key, reply }) => {
+                    let _ = reply.send(run.revoke(key).await);
+                }
                 None => steering = false,
             },
+            Some(lists) = run.enroller.lists.recv() => run.take_lists(lists).await,
             () = tokio::time::sleep(look) => due = run.link.connected().await,
         }
     }

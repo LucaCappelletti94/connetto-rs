@@ -4,18 +4,20 @@ use core::time::Duration;
 use std::time::SystemTime;
 
 use connetto_core::device_cert::DeviceCertificate;
-use connetto_core::messages::{ControlMessage, EnrolRefusal};
+use connetto_core::messages::{ControlMessage, DeviceSummary, EnrolRefusal, SignedList};
 use connetto_core::traits::Transport;
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{ClientError, ConnettoConnection, SuspendedCapture};
 
 mod task;
 
-pub use task::CertificateError;
+pub use task::{CertificateError, DeviceEntry};
 pub(crate) use task::{DeviceKeys, EnrolHandle, Enroller, Link, PlatformKeys, run};
+#[cfg(test)]
+use task::{Intake, intake};
 
 diesel::table! {
     /// The device's certificate, one row, kept beside the replica's other bookkeeping.
@@ -27,10 +29,25 @@ diesel::table! {
     }
 }
 
-/// Creates the certificate table on every open of a replica that enrols.
+diesel::table! {
+    /// The verified revocation list kept per signer, the highest-numbered one.
+    _connetto_revocation_list (signer_key) {
+        signer_key -> Binary,
+        number -> BigInt,
+        list -> Binary,
+        signer -> Binary,
+    }
+}
+
+/// Creates the certificate and list tables on every open of a replica that enrols.
 pub(crate) const CERTIFICATE_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_device_certificate \
      (id INTEGER PRIMARY KEY CHECK (id = 1), certificate BLOB NOT NULL, issuer BLOB NOT NULL, \
-     lifetime_secs INTEGER)";
+     lifetime_secs INTEGER); \
+     CREATE TABLE IF NOT EXISTS _connetto_revocation_list \
+     (signer_key BLOB PRIMARY KEY, number INTEGER NOT NULL, list BLOB NOT NULL, signer BLOB NOT NULL)";
+
+/// Where the enrolment task receives the lists the server pushes.
+pub(crate) type ListInbox = mpsc::UnboundedReceiver<Vec<SignedList>>;
 
 /// How far a local clock may disagree before a certificate counts as outside its window.
 pub(crate) const TOLERANCE: Duration = Duration::from_mins(5);
@@ -40,8 +57,12 @@ pub(crate) const TOLERANCE: Duration = Duration::from_mins(5);
 pub(crate) enum Answer {
     /// The nonce the request must carry.
     Challenge([u8; 32]),
-    /// The certificate, then its issuer.
-    Grant(Vec<Vec<u8>>),
+    /// The certificate, then its issuer, and the lists the device should hold.
+    Grant(Vec<Vec<u8>>, Vec<SignedList>),
+    /// The account's devices.
+    Devices(Vec<DeviceSummary>),
+    /// A device was revoked.
+    Revoked,
     /// Why the server refused.
     Refused(EnrolRefusal),
 }
@@ -54,6 +75,8 @@ impl Answer {
             ControlMessage::EnrolChallenge(_)
                 | ControlMessage::EnrolGrant(_)
                 | ControlMessage::EnrolRefused(_)
+                | ControlMessage::DevicesList(_)
+                | ControlMessage::DeviceRevokedAck(_)
         )
     }
 
@@ -72,8 +95,13 @@ impl Answer {
                         .into_iter()
                         .map(serde_bytes::ByteBuf::into_vec)
                         .collect(),
+                    grant.revocation_lists,
                 ),
             )),
+            ControlMessage::DevicesList(list) => {
+                Some((list.request_id, Self::Devices(list.devices)))
+            }
+            ControlMessage::DeviceRevokedAck(ack) => Some((ack.request_id, Self::Revoked)),
             ControlMessage::EnrolRefused(refused) => {
                 Some((refused.request_id, Self::Refused(refused.reason)))
             }
@@ -168,6 +196,52 @@ fn store(db: &mut SqliteConnection, held: &Held) -> Result<(), ClientError> {
     Ok(())
 }
 
+/// One kept list, by the key identifier of its signer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct KeptList {
+    pub(crate) signer_key: Vec<u8>,
+    pub(crate) number: u64,
+    pub(crate) list: Vec<u8>,
+    pub(crate) signer: Vec<u8>,
+}
+
+#[derive(Queryable)]
+struct ListRow {
+    signer_key: Vec<u8>,
+    number: i64,
+    list: Vec<u8>,
+    signer: Vec<u8>,
+}
+
+fn load_lists(db: &mut SqliteConnection) -> Result<Vec<KeptList>, ClientError> {
+    use _connetto_revocation_list::dsl;
+    let rows: Vec<ListRow> = dsl::_connetto_revocation_list
+        .select((dsl::signer_key, dsl::number, dsl::list, dsl::signer))
+        .load(db)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| KeptList {
+            signer_key: row.signer_key,
+            number: u64::try_from(row.number).unwrap_or_default(),
+            list: row.list,
+            signer: row.signer,
+        })
+        .collect())
+}
+
+fn store_list(db: &mut SqliteConnection, kept: &KeptList) -> Result<(), ClientError> {
+    use _connetto_revocation_list::dsl;
+    diesel::replace_into(dsl::_connetto_revocation_list)
+        .values((
+            dsl::signer_key.eq(&kept.signer_key),
+            dsl::number.eq(i64::try_from(kept.number).unwrap_or(i64::MAX)),
+            dsl::list.eq(&kept.list),
+            dsl::signer.eq(&kept.signer),
+        ))
+        .execute(db)?;
+    Ok(())
+}
+
 fn delete(db: &mut SqliteConnection) -> Result<(), ClientError> {
     diesel::delete(_connetto_device_certificate::table).execute(db)?;
     Ok(())
@@ -227,6 +301,31 @@ where
     pub(crate) fn delete_device_certificate(&mut self) -> Result<(), ClientError> {
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         delete(&mut self.db)
+    }
+
+    /// The revocation lists the replica keeps, one per signer.
+    pub(crate) fn revocation_lists(&mut self) -> Result<Vec<KeptList>, ClientError> {
+        load_lists(&mut self.db)
+    }
+
+    /// Keep `kept` as its signer's list, replacing the one before.
+    pub(crate) fn store_revocation_list(&mut self, kept: &KeptList) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        store_list(&mut self.db, kept)
+    }
+
+    /// The lists the server pushes from now on, for the enrolment task.
+    pub(crate) fn subscribe_revocations(&mut self) -> ListInbox {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.list_sink = Some(sender);
+        receiver
+    }
+
+    /// Hand pushed lists to the enrolment task, dropping them when none listens.
+    pub(crate) fn push_revocations(&self, lists: Vec<SignedList>) {
+        if let Some(sink) = &self.list_sink {
+            let _ = sink.send(lists);
+        }
     }
 }
 

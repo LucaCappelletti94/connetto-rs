@@ -88,7 +88,7 @@ pub mod replica;
 mod subscriptions;
 
 #[cfg(feature = "device-identity")]
-pub use enrolment::CertificateError;
+pub use enrolment::{CertificateError, DeviceEntry};
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
@@ -237,6 +237,13 @@ pub enum ClientError {
     #[cfg(all(feature = "device-identity", target_os = "android"))]
     #[error("the device key needs JNI access: call NativeDurable::with_java_access")]
     MissingJavaAccess,
+    /// A build with a device identity connected without naming the roots its
+    /// certificates and revocation lists are checked against (R74 decision 23).
+    #[cfg(feature = "device-identity")]
+    #[error(
+        "the device identity needs its deployment roots: call NativeDurable::with_deployment_roots"
+    )]
+    MissingDeploymentRoots,
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///
@@ -2422,6 +2429,9 @@ pub struct ConnettoConnection<T: Transport> {
     /// Emptied on disconnect, which ends every wait at once.
     #[cfg(feature = "device-identity")]
     enrol_waiters: HashMap<String, tokio::sync::oneshot::Sender<enrolment::Answer>>,
+    /// Where pushed revocation lists go, the enrolment task's inbox.
+    #[cfg(feature = "device-identity")]
+    list_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<connetto_core::messages::SignedList>>>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -2637,6 +2647,8 @@ where
             tier_schema: None,
             #[cfg(feature = "device-identity")]
             enrol_waiters: HashMap::new(),
+            #[cfg(feature = "device-identity")]
+            list_sink: None,
         };
         conn.attach_tier(replica.tier())?;
         Ok(conn)
@@ -3763,6 +3775,15 @@ where
                 return Err(ClientError::Protocol(
                     "unexpected bulk frame from server".into(),
                 ));
+            }
+            // Lists a server with device certificates pushes. A build without a
+            // device identity has nothing to check them with.
+            Some(IncomingFrame::Control(ControlMessage::RevocationUpdate(update))) => {
+                #[cfg(feature = "device-identity")]
+                self.push_revocations(update.lists);
+                #[cfg(not(feature = "device-identity"))]
+                drop(update);
+                return Ok(None);
             }
             Some(IncomingFrame::Control(msg)) => {
                 #[cfg(feature = "device-identity")]

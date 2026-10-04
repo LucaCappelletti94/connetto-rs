@@ -66,6 +66,11 @@ const APP_NONE: &str = "r74-no-issuer";
 const APP_RESTART: &str = "r74-restart";
 const APP_OFFLINE: &str = "r74-offline";
 const APP_FORGET: &str = "r74-forget";
+const APP_PHONE: &str = "r74-phone";
+const APP_LAPTOP: &str = "r74-laptop";
+const APP_LEARNED: &str = "r74-learned";
+const APP_UNTRUSTED: &str = "r74-untrusted";
+const APP_NO_ROOTS: &str = "r74-no-roots";
 
 /// What the lost-device list shows about these test devices.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -121,11 +126,15 @@ async fn enrolment_phase() {
         "renewal" => renewal().await,
         "reissue" => reissue().await,
         "cap" => cap().await,
-        "revoke" => revoke().await,
+        "revoke" => Box::pin(revoke()).await,
         "spectator" => spectator().await,
         "restart" => restart().await,
         "offline" => offline().await,
         "forget" => forget().await,
+        "report" => report().await,
+        "learned" => learned_at_connect().await,
+        "untrusted" => untrusted().await,
+        "no-roots" => no_roots().await,
         other => panic!("unknown enrolment phase {other:?}"),
     }
 }
@@ -136,18 +145,32 @@ async fn enrolment_phase() {
 /// PKCS #8 bytes, so the two `rcgen` majors in the graph never meet as one
 /// value.
 fn issuer() -> DeviceIssuer {
-    let now = SystemTime::now();
-    let root = RootCa::create(
-        DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
-        now - DAY,
-        3650 * DAY,
-    )
-    .expect("root");
-    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
-    let cert = root
-        .sign_issuer(&key.public_key_der(), now - DAY, 395 * DAY, [1; 16])
-        .expect("issuer");
-    DeviceIssuer::from_pkcs8(cert, &key.serialize_der(), root.certificate()).expect("load")
+    let (root, cert, key) = authority();
+    DeviceIssuer::from_pkcs8(cert.clone(), key, root).expect("load")
+}
+
+/// The one root, issuer certificate and issuer key of this process.
+fn authority() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>) {
+    static AUTHORITY: std::sync::OnceLock<(Vec<u8>, Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
+    AUTHORITY.get_or_init(|| {
+        let now = SystemTime::now();
+        let root = RootCa::create(
+            DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
+            now - DAY,
+            3650 * DAY,
+        )
+        .expect("root");
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+        let cert = root
+            .sign_issuer(&key.public_key_der(), now - DAY, 395 * DAY, [1; 16])
+            .expect("issuer");
+        (root.certificate().to_vec(), cert, key.serialize_der())
+    })
+}
+
+/// The deployment root the builds ship.
+fn root() -> Vec<u8> {
+    authority().0.clone()
 }
 
 /// Serve the auth router with one containerised provider, returning the base
@@ -246,6 +269,21 @@ async fn sync_server(
     config: DeviceCertConfig,
     store: Arc<MemoryEnrolments<String>>,
 ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let (addr, server, _) = sync_server_with_manager(fixture, service, config, store).await;
+    (addr, server)
+}
+
+/// As [`sync_server`], also handing back the manager an operator revokes through.
+async fn sync_server_with_manager(
+    fixture: &Fixture,
+    service: &Arc<AuthService<InMemoryAuthStore>>,
+    config: DeviceCertConfig,
+    store: Arc<MemoryEnrolments<String>>,
+) -> (
+    std::net::SocketAddr,
+    tokio::task::JoinHandle<()>,
+    Arc<Manager>,
+) {
     let manager = manager(fixture, service);
     assert!(
         manager
@@ -253,7 +291,8 @@ async fn sync_server(
             .is_ok(),
         "installs once"
     );
-    spawn_server(manager).await
+    let (addr, server) = spawn_server(Arc::clone(&manager)).await;
+    (addr, server, manager)
 }
 
 /// A fresh-login keyring sign-in as `subject`, the services named by `app_id`.
@@ -340,6 +379,7 @@ fn signed_in(
     NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
         .signed_in(sign_in)
         .durable(dir)
+        .with_deployment_roots([root()])
 }
 
 /// Await an event matching `is` within `deadline`, skipping every other event.
@@ -749,6 +789,7 @@ async fn revoke() {
         NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
             .signed_in(last_used(&base, APP_REVOKE))
             .durable(dir.path())
+            .with_deployment_roots([root()])
             .connect()
             .await
             .expect("the second build signs back in and connects");
@@ -884,6 +925,7 @@ async fn offline() {
     let client = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
         .signed_in(fresh_login(&base, APP_OFFLINE, "enrol-user"))
         .durable(dir.path())
+        .with_deployment_roots([root()])
         .connect()
         .await
         .expect("the build opens offline");
@@ -948,4 +990,287 @@ async fn forget() {
         keys.load(&record).await.expect("keyring read").is_none(),
         "the key record is gone"
     );
+}
+
+diesel::table! {
+    /// connetto's kept revocation lists, as an operator inspecting a replica reads them.
+    _connetto_revocation_list (signer_key) {
+        signer_key -> Binary,
+        number -> BigInt,
+        list -> Binary,
+        signer -> Binary,
+    }
+}
+
+/// The CRL Number and DER of each list the replica keeps.
+async fn kept_lists(
+    client: &NativeClient<connetto_client::NativeTransport>,
+) -> Vec<(i64, Vec<u8>)> {
+    use diesel::prelude::*;
+    client
+        .client()
+        .with_conn(|conn| {
+            _connetto_revocation_list::table
+                .select((
+                    _connetto_revocation_list::number,
+                    _connetto_revocation_list::list,
+                ))
+                .load::<(i64, Vec<u8>)>(conn.conn())
+                .expect("the list table reads")
+        })
+        .await
+        .expect("the gate is open")
+}
+
+/// Wait until the replica keeps a list revoking `serial`.
+async fn wait_for_listed(
+    client: &NativeClient<connetto_client::NativeTransport>,
+    serial: &[u8],
+    deadline: Duration,
+) -> bool {
+    let until = Instant::now() + deadline;
+    while Instant::now() < until {
+        let roots = [root()];
+        let listed = kept_lists(client).await.into_iter().any(|(_, der)| {
+            connetto_core::device_cert::RevocationList::verify(&der, &authority().1, &roots)
+                .is_ok_and(|list| list.revokes(serial))
+        });
+        if listed {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A device reports another of the account's devices lost: the reported one
+/// is closed, deletes its key and says so, the reporter keeps a list naming
+/// it, and the device list shows it revoked with the descriptors read back.
+#[test]
+fn reporting_a_device_lost_revokes_it_everywhere() {
+    run_phase("report");
+}
+
+async fn report() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let (phone_dir, laptop_dir) = (tempdir().expect("dir"), tempdir().expect("dir"));
+    let phone_name = Descriptor {
+        name: "phone".into(),
+        city: "Milan".into(),
+    };
+    let phone = signed_in(
+        addr,
+        fresh_login(&base, APP_PHONE, "enrol-user"),
+        phone_dir.path(),
+    )
+    .with_device_descriptor(&phone_name)
+    .connect()
+    .await
+    .expect("the phone connects");
+    let laptop = signed_in(
+        addr,
+        fresh_login(&base, APP_LAPTOP, "enrol-user"),
+        laptop_dir.path(),
+    )
+    .connect()
+    .await
+    .expect("the laptop connects");
+    let phone_cert = wait_for_certificate(&phone, BOUND)
+        .await
+        .expect("the phone enrols");
+    wait_for_certificate(&laptop, BOUND)
+        .await
+        .expect("the laptop enrols");
+    assert!(
+        !kept_lists(&laptop).await.is_empty(),
+        "a handshake hands over the current list"
+    );
+    let mut phone_events = phone.client().events();
+
+    laptop
+        .revoke_device(phone_cert.identity().key())
+        .await
+        .expect("the laptop reports the phone");
+
+    assert!(
+        next_event(&mut phone_events, BOUND, |event| matches!(
+            event,
+            ClientEvent::DeviceRevoked
+        ))
+        .await
+        .is_some(),
+        "the phone hears it was revoked"
+    );
+    assert!(
+        phone.device_certificate().is_none(),
+        "the phone's certificate is gone"
+    );
+    let user = phone.session().expect("a session").user_id().to_owned();
+    assert!(
+        KeyringStore::new(APP_PHONE)
+            .load(&device_record(&user))
+            .await
+            .expect("keyring read")
+            .is_none(),
+        "the phone's key record is gone"
+    );
+    assert!(
+        wait_for_listed(&laptop, phone_cert.serial(), BOUND).await,
+        "the laptop keeps a list naming the phone"
+    );
+    let devices = laptop
+        .devices::<Descriptor>()
+        .await
+        .expect("the device list");
+    let listed = devices
+        .iter()
+        .find(|device| device.key == phone_cert.identity().key())
+        .expect("the phone is listed");
+    assert!(listed.revoked_at.is_some());
+    assert_eq!(listed.descriptor.as_ref(), Some(&phone_name));
+    assert!(
+        devices.iter().any(|device| device.revoked_at.is_none()),
+        "the laptop stays"
+    );
+    assert!(
+        matches!(
+            laptop
+                .revoke_device(connetto_core::device_cert::KeyId::from_bytes([3; 32]))
+                .await,
+            Err(CertificateError::Refused(EnrolRefusal::InvalidRequest))
+        ),
+        "a key not the account's is refused"
+    );
+    phone.close().await;
+    laptop.close().await;
+}
+
+/// A device revoked while it was away finds its own serial in the list its
+/// next handshake hands over, and deletes its key.
+#[test]
+fn a_device_revoked_while_away_learns_it_at_connect() {
+    run_phase("learned");
+}
+
+async fn learned_at_connect() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    let first = signed_in(
+        addr,
+        fresh_login(&base, APP_LEARNED, "enrol-user"),
+        dir.path(),
+    )
+    .connect()
+    .await
+    .expect("connects");
+    let cert = wait_for_certificate(&first, BOUND).await.expect("enrols");
+    first.close().await;
+    drop(first);
+
+    assert!(
+        manager
+            .revoke_device(cert.identity().key())
+            .await
+            .expect("revoke")
+    );
+
+    let (second, pump) = signed_in(addr, last_used(&base, APP_LEARNED), dir.path())
+        .connect_with_pump()
+        .await
+        .expect("signs back in");
+    let mut events = second.client().events();
+    tokio::spawn(pump);
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::DeviceRevoked
+        ))
+        .await
+        .is_some(),
+        "the list naming it revokes it"
+    );
+    assert!(second.device_certificate().is_none());
+    second.close().await;
+}
+
+/// A grant from an issuer outside the build's roots is refused and kept nowhere.
+#[test]
+fn a_grant_outside_the_roots_is_refused() {
+    run_phase("untrusted");
+}
+
+async fn untrusted() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    let stranger = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(0xbad)),
+        SystemTime::now() - DAY,
+        3650 * DAY,
+    )
+    .expect("another root");
+    let client =
+        NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
+            .signed_in(fresh_login(&base, APP_UNTRUSTED, "enrol-user"))
+            .durable(dir.path())
+            .with_deployment_roots([stranger.certificate().to_vec()])
+            .connect()
+            .await
+            .expect("connects");
+    assert!(
+        matches!(
+            client.reissue_certificate(Duration::from_secs(3600)).await,
+            Err(CertificateError::Device(_))
+        ),
+        "a chain to another root is refused"
+    );
+    assert!(client.device_certificate().is_none());
+    assert!(kept_lists(&client).await.is_empty(), "and so is its list");
+    client.close().await;
+}
+
+/// A build with a device identity and no roots does not connect.
+#[test]
+fn a_build_without_roots_refuses_to_connect() {
+    run_phase("no-roots");
+}
+
+async fn no_roots() {
+    let (base, _service, _idp) = spawn_auth().await;
+    let dir = tempdir().expect("dir");
+    let refused = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+        .signed_in(fresh_login(&base, APP_NO_ROOTS, "enrol-user"))
+        .durable(dir.path())
+        .connect()
+        .await;
+    assert!(matches!(
+        refused,
+        Err(connetto_client::ClientError::MissingDeploymentRoots)
+    ));
 }

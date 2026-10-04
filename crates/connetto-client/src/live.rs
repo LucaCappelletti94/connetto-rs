@@ -2907,6 +2907,11 @@ where
         let mut state = self.shared.lock_interrupting().await;
         state.conn.delete_device_certificate()
     }
+
+    async fn store_list(&self, kept: crate::enrolment::KeptList) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.store_revocation_list(&kept)
+    }
 }
 
 #[cfg(feature = "device-identity")]
@@ -2925,6 +2930,16 @@ where
             .await
             .conn
             .device_certificate()
+    }
+
+    /// The revocation lists the replica keeps, and the lists the server
+    /// pushes from now on, taken before the pump runs so none is missed.
+    pub(crate) async fn revocation_inbox(
+        &self,
+    ) -> Result<(Vec<crate::enrolment::KeptList>, crate::enrolment::ListInbox), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        let kept = state.conn.revocation_lists()?;
+        Ok((kept, state.conn.subscribe_revocations()))
     }
 
     /// The enrolment task beside this client's pump, ending with it.

@@ -5,7 +5,7 @@ use std::time::SystemTime;
 use base64::Engine as _;
 use connetto_core::device_cert::{
     CertificateRequest, CertificateSigner, DeploymentId, DeviceCertificate, DeviceIssuer,
-    DeviceKey, RootCa, public_key_info,
+    DeviceKey, RevocationList, Revoked, RootCa, public_key_info,
 };
 use diesel::Connection as _;
 use diesel::connection::SimpleConnection as _;
@@ -13,7 +13,9 @@ use diesel::sqlite::SqliteConnection;
 use parking_lot::Mutex;
 
 use super::task::next_look;
-use super::{CERTIFICATE_DDL, Held, Standing, TOLERANCE, delete, load, store};
+use super::{
+    CERTIFICATE_DDL, Held, Intake, KeptList, Standing, TOLERANCE, delete, intake, load, store,
+};
 use crate::ClientError;
 use crate::device_key::{KeyRecords, open_software_key};
 
@@ -171,4 +173,82 @@ async fn the_replica_keeps_one_certificate_and_forgets_it() {
     assert_eq!(loaded.leaf, second.leaf);
     delete(&mut db).expect("delete");
     assert!(load(&mut db).expect("emptied").is_none());
+}
+
+#[tokio::test]
+async fn a_lower_number_never_replaces_a_higher_and_an_equal_one_with_other_content_is_ignored() {
+    let start = whole_second();
+    let records = Memory::default();
+    let issuer_key = open_software_key(&records, "issuer")
+        .await
+        .expect("issuer key");
+    let pkcs8 = base64::engine::general_purpose::STANDARD
+        .decode(
+            records
+                .0
+                .lock()
+                .get(&crate::device_key_record("issuer"))
+                .expect("stored"),
+        )
+        .expect("base64");
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(9)),
+        start - HOUR,
+        3650 * 24 * HOUR,
+    )
+    .expect("root");
+    let issuer_der = root
+        .sign_issuer(
+            &public_key_info(&issuer_key.key),
+            start - HOUR,
+            400 * 24 * HOUR,
+            [4; 16],
+        )
+        .expect("issuer");
+    let issuer =
+        DeviceIssuer::from_pkcs8(issuer_der.clone(), &pkcs8, root.certificate()).expect("load");
+    let roots = [root.certificate().to_vec()];
+    let list = |number: u64, serial: u8| {
+        let der = issuer
+            .sign_list(
+                number,
+                &[Revoked {
+                    serial: vec![serial; 16],
+                    at: start,
+                }],
+                start,
+                start + HOUR,
+            )
+            .expect("sign");
+        RevocationList::verify(&der, &issuer_der, &roots).expect("verifies")
+    };
+    let kept_of = |list: &RevocationList| KeptList {
+        signer_key: list.issuer().as_bytes().to_vec(),
+        number: list.number(),
+        list: list.der().to_vec(),
+        signer: issuer_der.clone(),
+    };
+    let five = list(5, 1);
+    assert_eq!(
+        intake(None, &five),
+        Intake::Newer,
+        "the first list from a signer"
+    );
+    let kept = kept_of(&five);
+    assert_eq!(intake(Some(&kept), &list(6, 1)), Intake::Newer);
+    assert_eq!(
+        intake(Some(&kept), &list(4, 2)),
+        Intake::Stale,
+        "a lower number"
+    );
+    assert_eq!(
+        intake(Some(&kept), &five),
+        Intake::Stale,
+        "the kept list again"
+    );
+    assert_eq!(
+        intake(Some(&kept), &list(5, 2)),
+        Intake::Conflicting,
+        "the kept number with other content"
+    );
 }
