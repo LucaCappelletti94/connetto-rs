@@ -91,6 +91,12 @@ impl ReaderReserve {
         self.total
     }
 
+    /// The share only identified callers may reach.
+    #[must_use]
+    pub const fn reserved(&self) -> u32 {
+        self.reserved
+    }
+
     /// Build the gate enforcing this split.
     ///
     /// # Panics

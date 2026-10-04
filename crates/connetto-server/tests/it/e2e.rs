@@ -694,7 +694,7 @@ pub(super) struct AuthStack {
     public: String,
     #[expect(
         dead_code,
-        reason = "the field is never read; it is dropped last, keeping the key files past the server restart"
+        reason = "the field is never read, and it is dropped last, keeping the key files past the server restart"
     )]
     keys: TempDir,
 }
@@ -1388,6 +1388,63 @@ async fn e2e_startup_refuses_an_unrecognised_oidc_provider() {
         stderr.contains("microsoft"),
         "expected recognised provider list in stderr, got: {stderr}"
     );
+}
+
+/// A setting that cannot be parsed refuses boot, and the refusal names the
+/// setting it choked on: the owner pool size is a number the build reads, and
+/// the cookie's same-site mode is a word it whitelists.
+#[tokio::test]
+async fn e2e_startup_refuses_unparsable_pool_size_and_cookie_mode() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
+    let pool = Pool::builder().build(manager).await.expect("build pool");
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
+    let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
+
+    // A pool size that is not a number refuses at the parse.
+    {
+        let mut extra: Vec<(&str, &str)> = auth_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        extra.extend(authorization.env_pairs());
+        extra.push(("CONNETTO_OWNER_POOL_SIZE", "soon"));
+        let output = run_server_exit_output(&url, Some(&reader_url), &extra).await;
+        assert!(!output.status.success(), "an unparsable pool size refuses");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("parsing CONNETTO_OWNER_POOL_SIZE"),
+            "the refusal names the pool size it choked on, got: {stderr}"
+        );
+    }
+
+    // A same-site mode the cookie does not know refuses at the parse.
+    {
+        let mut extra: Vec<(&str, &str)> = auth_env
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        extra.extend(authorization.env_pairs());
+        extra.push(("CONNETTO_AUTH_COOKIE_SAMESITE", "relax"));
+        let output = run_server_exit_output(&url, Some(&reader_url), &extra).await;
+        assert!(
+            !output.status.success(),
+            "an unknown same-site mode refuses"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("unknown CONNETTO_AUTH_COOKIE_SAMESITE"),
+            "the refusal names the same-site mode it refused, got: {stderr}"
+        );
+    }
 }
 
 /// Asking for records without asking for logins refuses startup.

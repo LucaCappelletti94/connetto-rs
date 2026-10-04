@@ -5,7 +5,9 @@
 //! signing keypair, the authorization endpoint and store, the identity
 //! providers, and `CONNETTO_BIND`), builds the [`ServerBuilder`] parts, and
 //! mounts them beside a route of its own, so the application serves the sync,
-//! login and file routes from its own listener.
+//! login and file routes from its own listener, and it exits `1` when the
+//! change stream ends, because a supervisor that sees a clean exit would not
+//! restart one that can no longer deliver.
 
 use anyhow::{Context, Result, anyhow};
 use connetto_core::env::{read_ddl, var_or};
@@ -139,13 +141,24 @@ async fn main() -> Result<()> {
     let mut change_stream = tokio::spawn(parts.change_stream);
     tokio::select! {
         outcome = &mut change_stream => {
-            match outcome {
-                Ok(Ok(())) => {}
-                Ok(Err(err)) => tracing::error!(error = %err, "the change stream stopped"),
-                Err(err) => tracing::error!(error = %err, "the change stream task failed"),
-            }
+            let terminal = match outcome {
+                Ok(Ok(())) => false,
+                Ok(Err(err)) => {
+                    tracing::error!(error = %err, "the change stream stopped");
+                    true
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "the change stream task failed");
+                    true
+                }
+            };
             let closed = parts.handle.shutdown().await;
             tracing::info!(closed, "the change stream ended, shutting down");
+            // Live delivery has stopped, so the run ends nonzero, the way
+            // the binary's supervisor contract says a terminal stream ends.
+            if terminal {
+                std::process::exit(1);
+            }
         }
         _ = tokio::signal::ctrl_c() => {
             let closed = parts.handle.shutdown().await;

@@ -13,6 +13,7 @@
 mod content;
 mod ws;
 
+use std::fmt;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -139,11 +140,34 @@ impl ContentTicketSigner for ContentSigner {
 #[derive(Debug, Error)]
 #[error("building the Postgres pool at {url}: {source}")]
 pub struct PoolError {
-    /// The conninfo the pool tried to open against.
+    /// The conninfo the pool tried to open against, its password redacted.
     pub url: String,
     /// The pool builder's own error.
     #[source]
     pub source: diesel_async::pooled_connection::PoolError,
+}
+
+/// The conninfo for the error text and the `Debug` line, its password made
+/// unreadable.
+fn redact_password(conninfo: &str) -> String {
+    let Some(scheme_end) = conninfo.find("://") else {
+        return conninfo.to_owned();
+    };
+    let Some(at) = conninfo.rfind('@') else {
+        return conninfo.to_owned();
+    };
+    let userinfo_start = scheme_end + "://".len();
+    if at < userinfo_start {
+        return conninfo.to_owned();
+    }
+    match conninfo[userinfo_start..at].find(':') {
+        Some(colon) => {
+            let mut redacted = conninfo.to_owned();
+            redacted.replace_range(userinfo_start + colon + 1..at, "****");
+            redacted
+        }
+        None => conninfo.to_owned(),
+    }
 }
 
 async fn build_pool(url: &str, size: u32) -> Result<PgPool, PoolError> {
@@ -153,16 +177,25 @@ async fn build_pool(url: &str, size: u32) -> Result<PgPool, PoolError> {
         .build(manager)
         .await
         .map_err(|source| PoolError {
-            url: url.to_owned(),
+            url: redact_password(url),
             source,
         })
 }
 
 /// The two database roles the server runs over.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Database {
     owner_url: String,
     reader_url: String,
+}
+
+impl fmt::Debug for Database {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Database")
+            .field("owner_url", &redact_password(&self.owner_url))
+            .field("reader_url", &redact_password(&self.reader_url))
+            .finish()
+    }
 }
 
 impl Database {
@@ -198,10 +231,19 @@ impl ServerSchema {
 }
 
 /// The persisted JWT keypair, both halves PKCS8 PEM Ed25519.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct TokenKeys {
     private: Vec<u8>,
     public: Vec<u8>,
+}
+
+impl fmt::Debug for TokenKeys {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenKeys")
+            .field("private", &"present")
+            .field("public", &"present")
+            .finish()
+    }
 }
 
 impl TokenKeys {
@@ -263,6 +305,20 @@ pub enum BuildError {
     /// No identity provider is configured, so no client can log in.
     #[error("no identity providers configured, so no client can log in")]
     NoProviders,
+    /// A pool named no connections, which the pool builder panics on.
+    #[error("the {what} is zero, and a pool needs at least one connection")]
+    PoolSizeZero {
+        /// Which pool named no connections.
+        what: String,
+    },
+    /// A reader reserve that overruns the pool it reserves.
+    #[error("the reader reserve of {reserved} connections overruns the reader pool's {total}")]
+    ReserveOverTotal {
+        /// How many connections the reserve holds back.
+        reserved: u32,
+        /// The reader pool the reserve is expressed against.
+        total: u32,
+    },
     /// The authorization store refused the model or the facts behind it.
     #[error(transparent)]
     Authorization(#[from] SetupError),
@@ -364,17 +420,53 @@ pub struct ServerParts {
 /// The change-stream future the parts hand over.
 pub type ChangeStream = Pin<Box<dyn Future<Output = Result<(), ServeError>> + Send>>;
 
+/// One background loop the build started, the slot-lag watcher and the
+/// content sweep, shared by the handle's clones and stopped by the last one.
+#[derive(Clone)]
+struct BackgroundTask {
+    task: Arc<tokio::task::JoinHandle<()>>,
+}
+
+impl BackgroundTask {
+    /// Own one spawned loop, so its stop follows the handle's clones.
+    fn new(task: tokio::task::JoinHandle<()>) -> Self {
+        Self {
+            task: Arc::new(task),
+        }
+    }
+
+    /// Stop the loop, idempotent, so an explicit stop and the drop compose.
+    fn stop(&self) {
+        self.task.abort();
+    }
+}
+
+impl Drop for BackgroundTask {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 /// The shutdown half of a built server.
 #[derive(Clone)]
 pub struct ServerHandle {
     manager: Arc<ServerManager>,
+    lag_watch: Option<BackgroundTask>,
+    sweep: Option<BackgroundTask>,
 }
 
 impl ServerHandle {
-    /// Close every live session with `ServerShuttingDown` and wait up to
-    /// [`SHUTDOWN_GRACE`] for their own close, so the close frame is
-    /// delivered rather than raced. Returns how many were told.
+    /// Stop the background loops the build started, close every live session
+    /// with `ServerShuttingDown` and wait up to [`SHUTDOWN_GRACE`] for their
+    /// own close, so the close frame is delivered rather than raced. Returns
+    /// how many were told.
     pub async fn shutdown(&self) -> usize {
+        if let Some(watch) = &self.lag_watch {
+            watch.stop();
+        }
+        if let Some(sweep) = &self.sweep {
+            sweep.stop();
+        }
         let told = self.manager.shutdown().await;
         await_sessions_drained(&self.manager).await;
         told
@@ -674,8 +766,35 @@ impl ServerBuilder {
             return Err(BuildError::NoProviders);
         }
 
+        // The pool builder panics on a zero size and the gate on an overrun
+        // reserve, so the arithmetic is refused before anything starts.
+        if owner_pool_size == 0 {
+            return Err(BuildError::PoolSizeZero {
+                what: "owner pool".to_owned(),
+            });
+        }
+        if reader_reserve.total() == 0 {
+            return Err(BuildError::PoolSizeZero {
+                what: "reader pool".to_owned(),
+            });
+        }
+        if reader_reserve.reserved() > reader_reserve.total() {
+            return Err(BuildError::ReserveOverTotal {
+                reserved: reader_reserve.reserved(),
+                total: reader_reserve.total(),
+            });
+        }
+        if content
+            .as_ref()
+            .is_some_and(|settings| settings.owner_pool_size == 0)
+        {
+            return Err(BuildError::PoolSizeZero {
+                what: "content owner pool".to_owned(),
+            });
+        }
+
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
-        let oplog = prepare_change_log(
+        let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
             &publication,
@@ -722,6 +841,7 @@ impl ServerBuilder {
             pg_ddl: schema.pg_ddl,
         };
         let file_router = reader.file_router;
+        let sweep = reader.sweep;
         // Move-out withdrawals read on the owner pool, where the membership that ended no longer hides the rows (R27 decision 6).
         let withdrawals = PgSnapshotSource::from_ddl(pool.clone(), &feed.pg_ddl)?;
         let manager = ManagerBuilder::new(
@@ -749,14 +869,18 @@ impl ServerBuilder {
             Arc::clone(&manager),
             Arc::clone(&service),
             pool,
-            feed,
-            reconnect_policy,
             registry,
             Routes {
                 redirect_allowlist,
                 cookie_same_site,
                 file_router,
                 cors_origins,
+            },
+            StreamWiring {
+                feed,
+                policy: reconnect_policy,
+                lag_watch,
+                sweep,
             },
         ))
     }
@@ -765,11 +889,13 @@ impl ServerBuilder {
     /// signal or a terminal change-stream outcome.
     ///
     /// The shutdown signal stops accepting, closes every session with
-    /// `ServerShuttingDown`, waits up to [`SHUTDOWN_GRACE`] for the sessions'
-    /// own close, stops the change stream, and returns `Ok`. A change stream
-    /// that cannot answer what a row looked like before it changed, gives up
-    /// reconnecting, or ends its source closes every session the same way and
-    /// returns the outcome, and the embedder decides what to do with it.
+    /// `ServerShuttingDown`, a handshake still in flight told the same
+    /// instead of registering, waits up to [`SHUTDOWN_GRACE`] for the
+    /// sessions' own close, stops the change stream, the slot-lag watcher and
+    /// the content sweep, and returns `Ok`. A change stream that cannot answer
+    /// what a row looked like before it changed, gives up reconnecting, or
+    /// ends its source closes every session the same way and returns the
+    /// outcome, and the embedder decides what to do with it.
     ///
     /// # Errors
     ///
@@ -803,21 +929,33 @@ impl ServerBuilder {
                     .flatten()
             }
             () = shutdown => {
+                // Stop accepting before the drain, so no session registers
+                // into the registry the drain empties.
+                http.abort();
                 let told = parts.handle.shutdown().await;
                 tracing::info!(closed = told, "shutting down");
                 // A stream that ends while the shutdown waits is of interest
                 // only for its error, so give it the grace to end and log it.
                 tokio::select! {
-                    outcome = &mut change_stream => {
-                        if let Err(err) = outcome {
-                            tracing::error!(error = %err, "the change stream stopped while shutting down");
+                    outcome = &mut change_stream => match outcome {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            tracing::error!(
+                                error = %err,
+                                "the change stream stopped while shutting down"
+                            );
                         }
-                    }
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                "the change stream task failed while shutting down"
+                            );
+                        }
+                    },
                     () = tokio::time::sleep(SHUTDOWN_GRACE) => {
                         change_stream.abort();
                     }
                 }
-                http.abort();
                 Ok(())
             }
         }
@@ -825,8 +963,9 @@ impl ServerBuilder {
 }
 
 /// Check what the change stream needs, then set up the reconnect log and the
-/// slot watch. Everything here reads or writes connetto's own bookkeeping, so
-/// it runs on the owner pool.
+/// slot watch, handing back the watch's stop handle so a refusal after it
+/// started cannot leave it running. Everything here reads or writes connetto's
+/// own bookkeeping, so it runs on the owner pool.
 async fn prepare_change_log(
     pool: &PgPool,
     slot: &str,
@@ -834,7 +973,7 @@ async fn prepare_change_log(
     oplog_table: &str,
     oplog_config: OplogConfig,
     lag_watch: Duration,
-) -> Result<PgOplog, BuildError> {
+) -> Result<(PgOplog, Option<BackgroundTask>), BuildError> {
     // Absent, these turn the change stream into a retry loop that never
     // succeeds and the first change into a failure on a boot that looked
     // healthy (R32), and a table without its previous image cannot answer
@@ -851,19 +990,18 @@ async fn prepare_change_log(
         ],
     )
     .await?;
-    if lag_watch.is_zero() {
+    let watch = if lag_watch.is_zero() {
         tracing::warn!(
             "the slot lag watch is off, so nothing will report a slot filling \
              the primary's disk before it does"
         );
+        None
     } else {
-        tokio::spawn(crate::slot::log_lag_forever(
-            pool.clone(),
-            slot.to_owned(),
-            lag_watch,
-        ));
-    }
-    Ok(PgOplog::new(pool.clone(), oplog_table, oplog_config))
+        Some(BackgroundTask::new(tokio::spawn(
+            crate::slot::log_lag_forever(pool.clone(), slot.to_owned(), lag_watch),
+        )))
+    };
+    Ok((PgOplog::new(pool.clone(), oplog_table, oplog_config), watch))
 }
 
 /// Build the guard both surfaces share, the request limits and the abuse
@@ -956,7 +1094,7 @@ async fn build_reader_side(
     content: Option<ContentSettings>,
 ) -> Result<ReaderSide, BuildError> {
     let pool = build_pool(&database.reader_url, reader_pool_size).await?;
-    let (signer, file_router) = content::build(
+    let (signer, file_router, sweep) = content::build(
         content,
         &database.owner_url,
         &database.reader_url,
@@ -969,6 +1107,7 @@ async fn build_reader_side(
         pool,
         signer,
         file_router,
+        sweep,
         snapshot,
     })
 }
@@ -1271,11 +1410,13 @@ struct Pools {
     reader: PgPool,
 }
 
-/// The reader pool's three consumers, the pool, the file half and the snapshot source.
+/// The reader pool's three consumers, the pool, the file half, its sweep's
+/// stop handle and the snapshot source.
 struct ReaderSide {
     pool: PgPool,
     signer: ContentSigner,
     file_router: Option<Router>,
+    sweep: Option<BackgroundTask>,
     snapshot: PgSnapshotSource,
 }
 
@@ -1366,15 +1507,24 @@ fn change_stream(
     })
 }
 
+/// The change stream's feed and reconnect policy, beside the background loop
+/// guards the builder spawned, carried as one param beside the shared
+/// collaborators.
+struct StreamWiring {
+    feed: Feed,
+    policy: ReconnectPolicy,
+    lag_watch: Option<BackgroundTask>,
+    sweep: Option<BackgroundTask>,
+}
+
 /// The assembled server's parts, the three routers and the change stream.
 fn assemble_parts(
     manager: Arc<ServerManager>,
     service: Arc<Service>,
     pool: PgPool,
-    feed: Feed,
-    policy: ReconnectPolicy,
     registry: Arc<ProviderRegistry>,
     settings: Routes,
+    wiring: StreamWiring,
 ) -> ServerParts {
     let http_routes = auth_router(
         Arc::clone(&service),
@@ -1390,8 +1540,18 @@ fn assemble_parts(
         router,
         sync_routes,
         http_routes,
-        change_stream: change_stream(Arc::clone(&manager), service, pool, feed, policy),
-        handle: ServerHandle { manager },
+        change_stream: change_stream(
+            Arc::clone(&manager),
+            service,
+            pool,
+            wiring.feed,
+            wiring.policy,
+        ),
+        handle: ServerHandle {
+            manager,
+            lag_watch: wiring.lag_watch,
+            sweep: wiring.sweep,
+        },
     }
 }
 
@@ -1418,6 +1578,104 @@ mod tests {
         .await
         .expect_err("no signer is configured");
         assert!(matches!(err, ContentSignerError::NotConfigured));
+    }
+
+    /// Whatever shape a conninfo has, its password never reaches the pool
+    /// error's text, while the target stays named.
+    #[test]
+    fn a_pool_error_keeps_the_password_to_itself() {
+        let source = diesel_async::pooled_connection::PoolError::ConnectionError(
+            diesel::result::ConnectionError::BadConnection("refused".to_owned()),
+        );
+        let err = PoolError {
+            url: redact_password("postgres://owner:owner-secret@127.0.0.1:1/db"),
+            source,
+        };
+        assert!(
+            !err.to_string().contains("owner-secret"),
+            "the pool error keeps the password to itself: {err}"
+        );
+        assert!(
+            err.to_string().contains("127.0.0.1:1"),
+            "but it still names the target: {err}"
+        );
+    }
+
+    /// A conninfo with no password, or no userinfo at all, is redacted to
+    /// itself, and a passworded one keeps its shape.
+    #[test]
+    fn redaction_leaves_a_passwordless_conninfo_alone() {
+        assert_eq!(
+            redact_password("postgres://owner@127.0.0.1:1/db"),
+            "postgres://owner@127.0.0.1:1/db"
+        );
+        assert_eq!(
+            redact_password("postgres://127.0.0.1:1/db"),
+            "postgres://127.0.0.1:1/db"
+        );
+        assert_eq!(
+            redact_password("postgres://owner:owner-secret@127.0.0.1:1/db"),
+            "postgres://owner:****@127.0.0.1:1/db"
+        );
+    }
+
+    /// The settings a deployment hands the builder keep their passwords, key
+    /// material and client secret out of the `Debug` line the builder and its
+    /// pieces print.
+    #[test]
+    fn the_builder_pieces_keep_their_secrets_out_of_their_debug_line() {
+        let database = Database::new(
+            "postgres://owner:owner-secret@127.0.0.1:1/db",
+            "postgres://reader:reader-secret@127.0.0.1:1/db",
+        );
+        let keys = TokenKeys::from_pem(b"PRIVATE-PEM-BYTES".to_vec(), b"PUBLIC-PEM-BYTES".to_vec());
+        let provider = OidcProvider::Generic(
+            OidcProviderConfig::new(
+                "dev",
+                "dev-client",
+                "https://idp.example",
+                "https://app.example/callback",
+            )
+            .with_client_secret(Some("oidc-secret".to_owned())),
+        );
+        let settings = ContentSettings {
+            base_url: "http://127.0.0.1:8099".to_owned(),
+            ttl: Duration::from_secs(60),
+            read_ceiling: 1 << 20,
+            grace: Duration::ZERO,
+            cadence: Duration::from_secs(1),
+            quota_identity: 0,
+            storage_ceiling: 0,
+            bandwidth_ceiling: 0,
+            bandwidth_window_days: 30,
+            warn_fraction: 0.8,
+            ceiling_refresh: Duration::from_secs(10),
+            owner_pool_size: 2,
+            store: StoreSpec::Fs(std::env::temp_dir()),
+            key: vec![191, 208, 187],
+        };
+        let builder = ServerBuilder::new(
+            database,
+            ServerSchema::new("CREATE TABLE t (id INT PRIMARY KEY);", ""),
+            keys,
+            OpenFga::new("http://127.0.0.1:1", "store"),
+        )
+        .oidc_providers(vec![provider])
+        .content(Some(settings));
+        let shown = format!("{builder:?}");
+        for secret in [
+            "owner-secret",
+            "reader-secret",
+            "PRIVATE-PEM-BYTES",
+            "PUBLIC-PEM-BYTES",
+            "oidc-secret",
+            "[191, 208, 187]",
+        ] {
+            assert!(
+                !shown.contains(secret),
+                "the Debug line keeps its secrets: {shown}"
+            );
+        }
     }
 
     /// Credentials ride only the origins `CONNETTO_AUTH_CORS_ORIGINS` lists. A

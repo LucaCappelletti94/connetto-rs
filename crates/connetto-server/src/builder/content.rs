@@ -1,6 +1,7 @@
 //! The file-serving half of the assembled server: its settings, its chunk
 //! store, and the build that mounts its routes beside the login endpoints.
 
+use std::fmt;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -86,7 +87,7 @@ pub enum ContentBuildError {
 }
 
 /// The resolved file settings, read once before building the file half.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ContentSettings {
     /// The address the file routes answer on, with no trailing slash, query
     /// or fragment.
@@ -120,6 +121,27 @@ pub struct ContentSettings {
     pub store: StoreSpec,
     /// The ticket keypair, PKCS8 DER Ed25519.
     pub key: Vec<u8>,
+}
+
+impl fmt::Debug for ContentSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ContentSettings")
+            .field("base_url", &self.base_url)
+            .field("ttl", &self.ttl)
+            .field("read_ceiling", &self.read_ceiling)
+            .field("grace", &self.grace)
+            .field("cadence", &self.cadence)
+            .field("quota_identity", &self.quota_identity)
+            .field("storage_ceiling", &self.storage_ceiling)
+            .field("bandwidth_ceiling", &self.bandwidth_ceiling)
+            .field("bandwidth_window_days", &self.bandwidth_window_days)
+            .field("warn_fraction", &self.warn_fraction)
+            .field("ceiling_refresh", &self.ceiling_refresh)
+            .field("owner_pool_size", &self.owner_pool_size)
+            .field("store", &self.store)
+            .field("key", &"present")
+            .finish()
+    }
 }
 
 impl ContentSettings {
@@ -164,14 +186,21 @@ fn ticket_keypair(
     Ok((signer, public))
 }
 
-/// Reclaim unreferenced chunks on a cadence, the way the slot watch runs. A
-/// failed pass is logged, not fatal, the next pass retries what it lost.
+/// Reclaim unreferenced chunks on a cadence, the way the slot watch runs,
+/// handing back the loop's stop handle so a refusal after it started cannot
+/// leave it running. A failed pass is logged, not fatal, the next pass
+/// retries what it lost.
 #[cfg(feature = "content")]
-fn spawn_sweep(admin: DbPool, spec: StoreSpec, grace: Duration, cadence: Duration) {
+fn spawn_sweep(
+    admin: DbPool,
+    spec: StoreSpec,
+    grace: Duration,
+    cadence: Duration,
+) -> Option<super::BackgroundTask> {
     if cadence.is_zero() {
-        return;
+        return None;
     }
-    tokio::spawn(async move {
+    Some(super::BackgroundTask::new(tokio::spawn(async move {
         let store = match open_store(&spec) {
             Ok(store) => store,
             Err(err) => {
@@ -193,7 +222,7 @@ fn spawn_sweep(admin: DbPool, spec: StoreSpec, grace: Duration, cadence: Duratio
                 Err(err) => tracing::warn!(error = %err, "content sweep failed"),
             }
         }
-    });
+    })))
 }
 
 /// The file-serving half of the deployment.
@@ -214,9 +243,16 @@ pub(crate) async fn build(
     owner_url: &str,
     reader_url: &str,
     reader_pool_size: u32,
-) -> Result<(super::ContentSigner, Option<Router>), ContentBuildError> {
+) -> Result<
+    (
+        super::ContentSigner,
+        Option<Router>,
+        Option<super::BackgroundTask>,
+    ),
+    ContentBuildError,
+> {
     let Some(settings) = settings else {
-        return Ok((super::ContentSigner::None, None));
+        return Ok((super::ContentSigner::None, None, None));
     };
     settings.validate()?;
     let (signer, public) = ticket_keypair(&settings)?;
@@ -259,7 +295,7 @@ pub(crate) async fn build(
             "the chunk store and the database disagreed, reconciled before serving",
         );
     }
-    spawn_sweep(
+    let sweep = spawn_sweep(
         admin,
         settings.store.clone(),
         settings.grace,
@@ -276,7 +312,11 @@ pub(crate) async fn build(
         bandwidth_window_days = settings.bandwidth_window_days,
         "file routes mounted beside the login endpoints",
     );
-    Ok((super::ContentSigner::Files(Box::new(signer)), Some(router)))
+    Ok((
+        super::ContentSigner::Files(Box::new(signer)),
+        Some(router),
+        sweep,
+    ))
 }
 
 /// The no-op shape of [`build`] for a server built without the `content`
@@ -287,14 +327,21 @@ pub(crate) async fn build(
     _owner_url: &str,
     _reader_url: &str,
     _reader_pool_size: u32,
-) -> Result<(super::ContentSigner, Option<Router>), ContentBuildError> {
+) -> Result<
+    (
+        super::ContentSigner,
+        Option<Router>,
+        Option<super::BackgroundTask>,
+    ),
+    ContentBuildError,
+> {
     if settings.is_some() {
         tracing::warn!(
             "file settings were handed over but this server was built without \
              the content feature, so no file routes are mounted"
         );
     }
-    Ok((super::ContentSigner::None, None))
+    Ok((super::ContentSigner::None, None, None))
 }
 
 #[cfg(all(test, feature = "content"))]
@@ -402,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn a_deployment_without_settings_mounts_nothing() {
         use crate::builder::ContentSigner;
-        let (signer, router) = build(None, "postgres://unused", "postgres://unused", 1)
+        let (signer, router, _) = build(None, "postgres://unused", "postgres://unused", 1)
             .await
             .expect("no settings is a valid deployment");
         assert!(matches!(signer, ContentSigner::None));
@@ -487,7 +534,8 @@ mod tests {
             store: StoreSpec::Fs(dir.path().to_path_buf()),
             key: doc.as_ref().to_vec(),
         };
-        let (signer, router) = build(Some(settings), &admin_url, &reader_url, 2)
+        // The sweep's guard stays alive until the tick below, then stops it.
+        let (signer, router, _sweep) = build(Some(settings), &admin_url, &reader_url, 2)
             .await
             .expect("a configured deployment builds");
         let url = ContentTicketSigner::mint(

@@ -21,7 +21,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use connetto_core::auth::{Principal, Subject};
@@ -1478,6 +1478,10 @@ pub struct SessionManager<
     /// Run loops that have started and not yet ended, which the shutdown
     /// grace counts because the registry drains at the moment of the close.
     open_sessions: Arc<AtomicUsize>,
+    /// Set once the manager has been told to go away, so a handshake that
+    /// completes during the shutdown is told the shutdown rather than
+    /// registering into the drained registry.
+    shutting_down: AtomicBool,
 }
 
 /// Keeps the open-run-loop count right while one `serve` is in flight.
@@ -1562,6 +1566,7 @@ where
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
         open_sessions: Arc::new(AtomicUsize::new(0)),
+        shutting_down: AtomicBool::new(false),
     })
 }
 
@@ -1769,10 +1774,11 @@ where
     /// [`FatalErrorReason::ServerShuttingDown`], returning how many were told.
     ///
     /// A client that learns the server is going away backs off instead of
-    /// reconnecting immediately into a dying process. The registry is drained,
-    /// so a handshake racing the shutdown registers into an empty map and is
-    /// closed by the listener stopping rather than by a second frame.
+    /// reconnecting immediately into a dying process. The flag is set before
+    /// the drain, so a handshake racing the shutdown is told the shutdown at
+    /// its registration instead of registering into the drained registry.
     pub async fn shutdown(&self) -> usize {
+        self.shutting_down.store(true, Ordering::Release);
         self.close_all(FatalErrorReason::ServerShuttingDown).await
     }
 
@@ -1999,15 +2005,22 @@ where
     /// cursors and the pending buffer, and two readers would each consume the
     /// other's changes. Last-wins also makes a reconnect racing its own
     /// half-dead socket self-heal.
+    ///
+    /// Refused while the manager is shutting down, reporting whether the
+    /// claim registered, so a handshake completing over the drain is told the
+    /// shutdown instead of stranding an entry the drain already emptied.
     async fn register_connection(
         &self,
         session_id: SessionId,
         connection_num: u64,
         user: Option<String>,
         tx: &mpsc::UnboundedSender<Outbound>,
-    ) {
+    ) -> bool {
         let superseded = {
             let mut sessions = self.sessions.lock().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return false;
+            }
             sessions.insert(
                 session_id,
                 LiveSession {
@@ -2027,6 +2040,7 @@ where
                 FatalErrorReason::ConnectionSuperseded,
             )));
         }
+        true
     }
 
     /// Drop the registry entry only if this connection still owns it: a
@@ -2949,7 +2963,7 @@ where
     /// both the server's current cursor and that watermark.
     ///
     /// Returns the session identity, or `None` when the peer closed before
-    /// sending a handshake.
+    /// sending a handshake, or the manager is shutting down.
     #[expect(
         clippy::too_many_lines,
         reason = "registration must sit between the grant checks and the ack, so splitting it would let a revocation cross the gap again"
@@ -3069,15 +3083,26 @@ where
         // fire as soon as the ack arrives. Without the entry already in the map
         // those calls see None and the fatal frame is never delivered.
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
-        self.register_connection(
-            session_id,
-            connection_num,
-            principal
-                .identity()
-                .map(|identity| identity.user_id.to_string()),
-            &outbound_tx,
-        )
-        .await;
+        if !self
+            .register_connection(
+                session_id,
+                connection_num,
+                principal
+                    .identity()
+                    .map(|identity| identity.user_id.to_string()),
+                &outbound_tx,
+            )
+            .await
+        {
+            // The shutdown began while this handshake ran, so the session is
+            // told to go away rather than registered into the drained registry.
+            let _ = transport
+                .send_control(ControlMessage::FatalError(FatalError::new(
+                    FatalErrorReason::ServerShuttingDown,
+                )))
+                .await;
+            return Ok(None);
+        }
         // Judged only once registered, so a history read that lands meanwhile
         // either shows here or closes this connection (R73).
         let resume = self.resume_from(handshake.last_cursor.as_ref());

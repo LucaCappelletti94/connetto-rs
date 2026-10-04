@@ -170,7 +170,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
-| done | ~~R96~~ | One server builder for programs that embed the server, built 2026-10-03, and R91 builds on it |
+| done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
 | any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 

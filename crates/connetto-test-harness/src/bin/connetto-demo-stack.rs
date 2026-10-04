@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
         ("CONNETTO_DEMO_AUTH_ORIGIN".to_owned(), base),
         (
             "CONNETTO_DEMO_WS".to_owned(),
-            format!("ws://{address}/sync"),
+            demo_ws_url(&address, tls.as_ref()),
         ),
         ("CONNETTO_DEMO_PG".to_owned(), pg_url),
         ("CONNETTO_DEMO_ADB_REVERSE".to_owned(), reverse_spec),
@@ -294,9 +294,16 @@ fn url_port(address: &str) -> Result<u16> {
         .ok_or_else(|| anyhow!("{address} names no port"))
 }
 
+/// The `CONNETTO_DEMO_WS` value, whose scheme follows the TLS relay that
+/// fronts the listener.
+fn demo_ws_url(address: &str, tls: Option<&(String, String)>) -> String {
+    let scheme = if tls.is_some() { "wss" } else { "ws" };
+    format!("{scheme}://{address}/sync")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{DEMO_PG_PORT, DEMO_SYNC_PORT, device_reverse};
+    use super::{DEMO_PG_PORT, DEMO_SYNC_PORT, demo_ws_url, device_reverse};
 
     /// The server builds its login callback and every other absolute URL
     /// from the port it binds, and a phone's browser follows them. So a
@@ -329,5 +336,20 @@ mod tests {
         }
         let refused = device_reverse(55456, 40000, DEMO_PG_PORT);
         assert!(refused.is_err(), "bind on the pg port: {refused:?}");
+    }
+
+    /// The demo WebSocket address takes `wss` only when a TLS relay fronts
+    /// the listener.
+    #[test]
+    fn the_demo_ws_url_takes_its_scheme_from_the_tls_relay() {
+        assert_eq!(
+            demo_ws_url("192.168.1.4:9443", None),
+            "ws://192.168.1.4:9443/sync"
+        );
+        let pair = (String::new(), String::new());
+        assert_eq!(
+            demo_ws_url("192.168.1.4:9443", Some(&pair)),
+            "wss://192.168.1.4:9443/sync"
+        );
     }
 }

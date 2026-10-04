@@ -320,8 +320,6 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
 
 /// The variable that moves a stack's sync, login and file listener.
 pub const SYNC_PORT_VAR: &str = "CONNETTO_STACK_SYNC_PORT";
-/// The variable that moves a stack's dev-routes listener.
-pub const AUTH_PORT_VAR: &str = "CONNETTO_STACK_AUTH_PORT";
 /// The variable that puts a stack on the LAN. Its listeners bind every
 /// interface, and every address a client or its browser follows names this
 /// host.

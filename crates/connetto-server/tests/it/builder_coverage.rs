@@ -11,10 +11,10 @@
 use std::time::{Duration, Instant};
 
 use connetto_core::PROTOCOL_VERSION;
-use connetto_core::codec::{TAG_CONTROL, encode_control};
+use connetto_core::codec::{TAG_BULK, TAG_CONTROL, encode_bulk, encode_control};
 use connetto_core::messages::{
-    AckCredits, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, HandshakeAck,
-    NonFatalError, RateLimited, Subscribe, SubscriptionSpec,
+    AckCredits, BulkMessage, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake,
+    HandshakeAck, NonFatalError, RateLimited, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::builder::{
@@ -28,7 +28,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
-    OPLOG_TABLE, PUBLICATION, SLOT, isolated_session_keyring,
+    OPLOG_TABLE, PUBLICATION, SLOT, drop_slot, isolated_session_keyring,
 };
 use diesel::{ExpressionMethods, QueryDsl, QueryableByName};
 use diesel_async::pooled_connection::bb8::Pool;
@@ -37,9 +37,11 @@ use futures_util::{SinkExt as _, StreamExt as _};
 use openidconnect::reqwest;
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
+use tracing::Instrument;
 
 use super::e2e::{
     NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, audit_ops, exec, mint_token,
@@ -85,6 +87,8 @@ diesel::table! {
     }
 }
 
+connetto_file_server::connetto_file_tables!();
+
 /// A catalog read the DSL cannot name, one column per field.
 #[derive(QueryableByName)]
 struct WalLsn {
@@ -99,31 +103,7 @@ struct ConfirmedLsn {
     lsn: Option<i64>,
 }
 
-/// The walsender pid occupying the slot, if one is connected.
-#[derive(QueryableByName)]
-struct ActivePid {
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
-    pid: Option<i64>,
-}
-
-/// Terminate the walsender holding the slot, so the stream ends cleanly and
-/// the slot can be dropped.
-async fn kill_walsender(pool: &Pool<AsyncPgConnection>) {
-    let mut conn = pool.get().await.expect("a connection");
-    let rows: Vec<ActivePid> = diesel::sql_query(format!(
-        "SELECT active_pid::bigint AS pid FROM pg_replication_slots \
-         WHERE slot_name = '{SLOT}'"
-    ))
-    .load(&mut *conn)
-    .await
-    .expect("read the slot's walsender");
-    let pid = rows.into_iter().next().and_then(|row| row.pid);
-    if let Some(pid) = pid {
-        exec(pool, &format!("SELECT pg_terminate_backend({pid})")).await;
-    }
-}
-
-/// The slot's confirmed position; the catalog view is one the DSL cannot name.
+/// The slot's confirmed position, read from the catalog view the DSL cannot name.
 async fn slot_confirmed_lsn(pool: &Pool<AsyncPgConnection>) -> i64 {
     let mut conn = pool.get().await.expect("a connection");
     let rows: Vec<ConfirmedLsn> = diesel::sql_query(format!(
@@ -405,41 +385,69 @@ async fn a_stream_end_during_shutdown_is_logged_and_serve_returns_ok() {
     let port = listener.local_addr().expect("local address").port();
     let (builder, _idp, _keys) = builder_over(&fixture, port).await;
     let base = format!("http://127.0.0.1:{port}");
+    // A finite policy, so the stream's reconnects run out inside the grace.
+    let builder = builder.reconnect_policy(
+        ReconnectPolicy::new()
+            .with_initial_backoff(Duration::from_millis(50))
+            .with_max_backoff(Duration::from_millis(100))
+            .with_max_attempts(Some(2)),
+    );
 
     let (fire, signal) = tokio::sync::oneshot::channel::<()>();
-    let serve = tokio::spawn(async move {
-        let shutdown = async move {
-            let _ = signal.await;
-        };
-        builder.serve(listener, shutdown).await
-    });
-    wait_ready(&base).await;
+    let (outcome, mut client, capture) = with_capture(
+        "a_stream_end_during_shutdown_is_logged_and_serve_returns_ok",
+        |capture| async move {
+            let serve = tokio::spawn(
+                async move {
+                    let shutdown = async move {
+                        let _ = signal.await;
+                    };
+                    builder.serve(listener, shutdown).await
+                }
+                .instrument(tracing::Span::current()),
+            );
+            wait_ready(&base).await;
 
-    let (token, _) = mint_token(&base).await;
-    let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
-    client
-        .send_control(ControlMessage::Subscribe(Subscribe {
-            sub_id: "orders".to_owned(),
-            spec: SubscriptionSpec::new("SELECT * FROM orders"),
-        }))
-        .await
-        .expect("send the subscription");
-    match next_control(&mut client).await {
-        ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == "orders" => {}
-        other => panic!("the snapshot opened with {other:?} instead"),
-    }
+            let (token, _) = mint_token(&base).await;
+            let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
+            client
+                .send_control(ControlMessage::Subscribe(Subscribe {
+                    sub_id: "orders".to_owned(),
+                    spec: SubscriptionSpec::new("SELECT * FROM orders"),
+                }))
+                .await
+                .expect("send the subscription");
+            match next_control(&mut client).await {
+                ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == "orders" => {}
+                other => panic!("the snapshot opened with {other:?} instead"),
+            }
 
-    fire.send(()).expect("fire the shutdown signal");
-    // The walsender ends the source while the shutdown is waiting for it.
-    kill_walsender(&pool).await;
+            fire.send(()).expect("fire the shutdown signal");
+            // The slot goes away while the shutdown waits, so the stream's
+            // reconnects fail and its attempts run out inside the grace.
+            drop_slot(&pool).await;
 
-    let outcome = tokio::time::timeout(BOUND, serve)
-        .await
-        .expect("serve ends on the signal")
-        .expect("serve joins");
+            let outcome = tokio::time::timeout(BOUND, serve)
+                .await
+                .expect("serve ends on the signal")
+                .expect("serve joins");
+            (outcome, client, capture)
+        },
+    )
+    .await;
     assert!(
         outcome.is_ok(),
         "a stream end during shutdown is logged, not returned: {outcome:?}"
+    );
+    let lines = capture.lines();
+    assert!(
+        lines.iter().any(|line| {
+            line["message"] == "the change stream stopped while shutting down"
+                && line["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("gave up after 2 attempts"))
+        }),
+        "the stream's own error is logged for the operator: {lines:?}"
     );
 
     let last = loop {
@@ -455,11 +463,87 @@ async fn a_stream_end_during_shutdown_is_logged_and_serve_returns_ok() {
     }
 }
 
-/// A handshake that registers after the drain is not told the shutdown: it
-/// holds the grace to the full five seconds, the elapsed grace is logged, and
-/// the late session is closed by the listener stopping rather than a frame.
+/// A client that upgraded but never sent a frame holds the grace to the full
+/// five seconds: it is not registered, so the drain does not reach it, and the
+/// registered session is the one told.
 #[tokio::test]
 async fn a_late_session_holds_the_shutdown_to_the_grace() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let (builder, _idp, _keys) = builder_over(&fixture, port).await;
+    let base = format!("http://127.0.0.1:{port}");
+
+    let parts = builder.build().await.expect("the deployment assembles");
+    let handle = parts.handle.clone();
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    // One registered session the drain reaches, and one client that upgraded
+    // but sends no frame, so its run loop sits in the handshake unregistered.
+    let mut a = anonymous_session(&format!("127.0.0.1:{port}"), "grace-a").await;
+    let c_tcp = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("connect the sync route");
+    let mut c = WebSocketTransport::connect(&format!("ws://127.0.0.1:{port}/sync"), c_tcp)
+        .await
+        .expect("the axum adapter answers the WebSocket handshake");
+
+    let (told, elapsed, capture) = with_capture(
+        "a_late_session_holds_the_shutdown_to_the_grace",
+        |capture| async move {
+            let started = Instant::now();
+            let told = handle.shutdown().await;
+            (told, started.elapsed(), capture)
+        },
+    )
+    .await;
+    assert_eq!(told, 1, "only the registered session was told");
+    assert!(
+        elapsed >= Duration::from_millis(4800),
+        "the grace ran out with the unregistered session still open, it lasted {elapsed:?}"
+    );
+    let lines = capture.lines();
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["message"] == "shutdown grace elapsed with sessions still open"),
+        "the elapsed grace is logged: {lines:?}"
+    );
+
+    // The registered session hears the shutdown it was told.
+    match next_control(&mut a).await {
+        ControlMessage::FatalError(FatalError {
+            reason: FatalErrorReason::ServerShuttingDown,
+        }) => {}
+        other => panic!("the drained session's last frame says {other:?}"),
+    }
+    // The unregistered client hears no frame at all: the drain does not reach
+    // it, and only the listener stopping closes it.
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), c.recv())
+            .await
+            .is_err(),
+        "the unregistered client hears no frame, only the listener stopping"
+    );
+    stream.abort();
+    http.abort();
+}
+
+/// A handshake whose registration lands after the shutdown flag is set is told
+/// the shutdown instead of acked: the racing session gets the fatal as its
+/// first frame, and the registry is empty when the grace ends.
+#[tokio::test]
+async fn a_handshake_racing_the_shutdown_is_told_not_registered() {
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
     let fixture = Fixture::acquire().await;
@@ -505,7 +589,7 @@ async fn a_late_session_holds_the_shutdown_to_the_grace() {
     exec(&pool, "ANALYZE big").await;
     exec(&pool, "GRANT SELECT ON big TO app_reader").await;
 
-    let mut a = anonymous_session(&format!("127.0.0.1:{port}"), "grace-a").await;
+    let mut a = anonymous_session(&format!("127.0.0.1:{port}"), "race-a").await;
     a.send_control(ControlMessage::Subscribe(Subscribe {
         sub_id: "big".to_owned(),
         spec: SubscriptionSpec::new("SELECT * FROM big ORDER BY body"),
@@ -517,45 +601,49 @@ async fn a_late_session_holds_the_shutdown_to_the_grace() {
         other => panic!("the snapshot opened with {other:?} instead"),
     }
 
-    // B's handshake is in flight and blocked on the permit A holds, so it
-    // can only land once A's session is torn down by the drain.
+    // B's handshake is in flight and blocked on the permit A holds, so it can
+    // only register once A's session is torn down by the drain.
     let addr = format!("127.0.0.1:{port}");
-    let b_task = tokio::spawn(async move { anonymous_session(&addr, "grace-b").await });
-
-    let (told, elapsed, capture) = with_capture(
-        "a_late_session_holds_the_shutdown_to_the_grace",
-        |capture| async move {
-            let started = Instant::now();
-            let told = handle.shutdown().await;
-            (told, started.elapsed(), capture)
-        },
-    )
-    .await;
-    assert_eq!(
-        told, 1,
-        "only the session the drain reached was told; the late one registered after it"
-    );
-    assert!(
-        elapsed >= Duration::from_millis(4800),
-        "the grace ran out with the late session still open, it lasted {elapsed:?}"
-    );
-    let lines = capture.lines();
-    assert!(
-        lines
-            .iter()
-            .any(|line| line["message"] == "shutdown grace elapsed with sessions still open"),
-        "the elapsed grace is logged: {lines:?}"
-    );
-
-    // The late session got no second frame: it is still open and silent, and
-    // only the listener stopping will close it.
-    let mut b = b_task.await.expect("the late session joins");
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), b.recv())
+    let b_task = tokio::spawn(async move {
+        let tcp = TcpStream::connect(&addr)
             .await
-            .is_err(),
-        "the late session hears no frame, only the listener stopping"
+            .expect("connect the sync route for the racing session");
+        let mut client = WebSocketTransport::connect(&format!("ws://{addr}/sync"), tcp)
+            .await
+            .expect("the axum adapter answers the racing handshake");
+        client
+            .send_control(ControlMessage::Handshake(Handshake::new(
+                PROTOCOL_VERSION,
+                "race-b",
+            )))
+            .await
+            .expect("send the racing handshake");
+        client
+    });
+
+    let told = handle.shutdown().await;
+    assert_eq!(told, 1, "only the session the drain reached was told");
+
+    // B's registration lands after the flag, so B is told instead of acked.
+    let mut b = b_task.await.expect("the racing session joins");
+    match b.recv().await {
+        Ok(Some(IncomingFrame::Control(ControlMessage::FatalError(FatalError {
+            reason: FatalErrorReason::ServerShuttingDown,
+        })))) => {}
+        other => panic!("the racing session's first frame says {other:?}"),
+    }
+    assert_eq!(
+        handle.live_connections().await,
+        0,
+        "the racing session never registered"
     );
+
+    match next_control(&mut a).await {
+        ControlMessage::FatalError(FatalError {
+            reason: FatalErrorReason::ServerShuttingDown,
+        }) => {}
+        other => panic!("the drained session's last frame says {other:?}"),
+    }
     stream.abort();
     http.abort();
 }
@@ -757,7 +845,7 @@ async fn the_abuse_setter_bans_the_identity_that_crosses() {
     let (token, user_id) = mint_token(&base).await;
     let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
 
-    // The first ghost is refused and tallied; the second crosses the
+    // The first ghost is refused and tallied, the second crosses and is applied.
     // person's limit, which bans off the caller's path.
     for sub_id in ["ghost-one", "ghost-two"] {
         client
@@ -795,14 +883,19 @@ async fn the_abuse_setter_bans_the_identity_that_crosses() {
 
     // The crossing person's live connection is closed by the ban's close
     // hook, with no frame to say why.
-    let closed = loop {
+    let deadline = Instant::now() + BOUND;
+    let mut closed = false;
+    while !closed {
+        assert!(
+            Instant::now() < deadline,
+            "the banned person's session is closed by the ban"
+        );
         if let Ok(Ok(None) | Err(_)) =
-            tokio::time::timeout(Duration::from_secs(5), client.recv()).await
+            tokio::time::timeout(Duration::from_millis(200), client.recv()).await
         {
-            break true;
+            closed = true;
         }
-    };
-    assert!(closed, "the banned person's session is closed by the ban");
+    }
 
     // A fresh login for the same identity is refused at the handshake: no
     // ack, only a closed connection.
@@ -880,7 +973,7 @@ async fn the_oplog_config_bounds_the_reconnect_log() {
     let parts = builder.build().await.expect("the deployment assembles");
     let stream = tokio::spawn(parts.change_stream);
 
-    // Five changes, one commit each; the log may hold two of them.
+    // Five changes, one commit each. The log may hold two of them.
     let mut last: i64 = 0;
     for id in 101..=105 {
         exec(
@@ -1255,8 +1348,7 @@ async fn a_slot_recreated_past_the_log_trims_the_log_at_boot() {
 
     // The slot is recreated at the write-ahead head, past the ingested
     // commits, so the boot's check finds the gap.
-    kill_walsender(&pool).await;
-    exec(&pool, &format!("SELECT pg_drop_replication_slot('{SLOT}')")).await;
+    drop_slot(&pool).await;
     exec(
         &pool,
         &format!("SELECT pg_create_logical_replication_slot('{SLOT}', 'pgoutput')"),
@@ -1443,6 +1535,111 @@ async fn no_providers_refuses_the_build_before_anything_runs() {
     );
 }
 
+/// A pool named no connections, or a reader reserve that overruns the pool
+/// it reserves, is a refusal before anything starts, the content settings'
+/// pools included.
+#[tokio::test]
+async fn a_zero_pool_or_an_overrun_reserve_refuses_before_anything_starts() {
+    let builder = || {
+        let keys = TempDir::new().expect("a key dir");
+        let (private, public) = signing_keys(&keys);
+        let token = TokenKeys::from_pem(
+            std::fs::read(&private).expect("read the private half"),
+            std::fs::read(&public).expect("read the public half"),
+        );
+        ServerBuilder::new(
+            Database::new(
+                "postgres://connetto:connetto@127.0.0.1:1/connetto",
+                "postgres://connetto:connetto@127.0.0.1:1/connetto",
+            ),
+            ServerSchema::new("CREATE TABLE t (id INT PRIMARY KEY);", ""),
+            token,
+            OpenFga::new("http://127.0.0.1:1", "store"),
+        )
+        .oidc_providers(vec![OidcProvider::Generic(OidcProviderConfig::new(
+            "dev",
+            "dev-client",
+            "https://idp.example",
+            "https://app.example/callback",
+        ))])
+    };
+    let content = |owner_pool_size: u32| ContentSettings {
+        base_url: "http://127.0.0.1:8099".to_owned(),
+        ttl: Duration::from_secs(60),
+        read_ceiling: 1 << 20,
+        grace: Duration::ZERO,
+        cadence: Duration::ZERO,
+        quota_identity: 0,
+        storage_ceiling: 0,
+        bandwidth_ceiling: 0,
+        bandwidth_window_days: 30,
+        warn_fraction: 0.8,
+        ceiling_refresh: Duration::from_secs(10),
+        owner_pool_size,
+        store: StoreSpec::Fs(std::env::temp_dir()),
+        key: Vec::new(),
+    };
+
+    // The refusal lands before the first pool, so no pool is ever dialed.
+    let zero_owner = refused(
+        builder().owner_pool_size(0).build().await,
+        "a zero owner pool refuses",
+    );
+    assert!(
+        matches!(
+            zero_owner,
+            BuildError::PoolSizeZero { ref what } if *what == "owner pool"
+        ),
+        "the refusal names the owner pool: {zero_owner}"
+    );
+
+    let zero_reader = refused(
+        builder()
+            .reader_reserve(ReaderReserve::new().with_total(0))
+            .build()
+            .await,
+        "a \
+               zero reader pool refuses",
+    );
+    assert!(
+        matches!(
+            zero_reader,
+            BuildError::PoolSizeZero { ref what } if *what == "reader pool"
+        ),
+        "the refusal names the reader pool: {zero_reader}"
+    );
+
+    let overrun = refused(
+        builder()
+            .reader_reserve(ReaderReserve::new().with_total(2).with_reserved(3))
+            .build()
+            .await,
+        "an overrun reserve refuses",
+    );
+    assert!(
+        matches!(
+            overrun,
+            BuildError::ReserveOverTotal {
+                reserved: 3,
+                total: 2
+            }
+        ),
+        "the refusal names the overrun: {overrun}"
+    );
+
+    let zero_content = refused(
+        builder().content(Some(content(0))).build().await,
+        "a zero content pool refuses",
+    );
+    assert!(
+        matches!(
+            zero_content,
+            BuildError::PoolSizeZero { ref what } if *what == "content owner pool"
+        ),
+        "the refusal names the content owner pool: {zero_content}"
+    );
+}
+
 /// An authorization endpoint the build cannot reach is a refusal that names
 /// the endpoint, whether the address will not parse or nothing answers it.
 #[tokio::test]
@@ -1502,6 +1699,183 @@ async fn an_unreachable_authorization_endpoint_refuses_naming_it() {
     }
 }
 
+/// A build refusal that lands after the slot-lag watcher and the content
+/// sweep started stops both: the slot goes and the watcher never warns, and
+/// the chunk the sweep would have reclaimed stays in place.
+#[tokio::test]
+async fn a_build_refusal_stops_the_background_loops_it_started() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+
+    // A chunk the sweep would reclaim on its next pass.
+    let dir = TempDir::new().expect("a store directory");
+    let hash = "cd".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
+             VALUES (decode('{hash}', 'hex'), 'deleting')"
+        ),
+    )
+    .await;
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("a ticket key")
+        .as_ref()
+        .to_vec();
+    let settings = ContentSettings {
+        base_url: "http://127.0.0.1:8099".to_owned(),
+        ttl: Duration::from_secs(60),
+        read_ceiling: 1 << 20,
+        grace: Duration::ZERO,
+        cadence: Duration::from_millis(100),
+        quota_identity: 0,
+        storage_ceiling: 0,
+        bandwidth_ceiling: 0,
+        bandwidth_window_days: 30,
+        warn_fraction: 0.8,
+        ceiling_refresh: Duration::from_secs(10),
+        owner_pool_size: 2,
+        store: StoreSpec::Fs(dir.path().to_path_buf()),
+        key,
+    };
+    // The endpoint refusal lands after the watcher and the sweep spawned.
+    let builder = builder_schema(
+        &fixture,
+        0,
+        &idp,
+        ("not a url at all", &store),
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+    )
+    .slot_lag_watch(Duration::from_millis(100))
+    .content(Some(settings));
+    let err = refused(
+        builder.build().await,
+        "a bad endpoint refuses after the loops started",
+    );
+    match err {
+        BuildError::AuthorizationEndpoint(why) => {
+            assert!(
+                why.contains("parsing the endpoint"),
+                "the refusal names the parsing failure: {why}"
+            );
+        }
+        other => panic!("the build answered {other:?}"),
+    }
+
+    // The loops the refusal outlived are stopped: the slot goes and the
+    // watcher never warns, and the chunk the sweep would have reclaimed
+    // stays in place.
+    drop_slot(&pool).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        !record_logged("replication slot is gone", "slot", SLOT),
+        "the slot-lag watcher kept running after the refusal"
+    );
+    assert!(
+        planted.exists(),
+        "the content sweep kept running after the refusal"
+    );
+}
+
+/// The slot-lag watcher and the content sweep are owned by the handle's
+/// clones: dropping the last one stops both, so the slot goes and the
+/// watcher never warns, and the chunk the sweep would have reclaimed stays
+/// in place.
+#[tokio::test]
+async fn dropping_the_last_handle_stops_the_background_loops() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+
+    let dir = TempDir::new().expect("a store directory");
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    let fga_url = fixture.fga_url().await.to_owned();
+    let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("a ticket key")
+        .as_ref()
+        .to_vec();
+    let settings = ContentSettings {
+        base_url: "http://127.0.0.1:8099".to_owned(),
+        ttl: Duration::from_secs(60),
+        read_ceiling: 1 << 20,
+        grace: Duration::ZERO,
+        cadence: Duration::from_millis(100),
+        quota_identity: 0,
+        storage_ceiling: 0,
+        bandwidth_ceiling: 0,
+        bandwidth_window_days: 30,
+        warn_fraction: 0.8,
+        ceiling_refresh: Duration::from_secs(10),
+        owner_pool_size: 2,
+        store: StoreSpec::Fs(dir.path().to_path_buf()),
+        key,
+    };
+    let builder = builder_schema(
+        &fixture,
+        0,
+        &idp,
+        (&fga_url, &store),
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+    )
+    .slot_lag_watch(Duration::from_millis(100))
+    .content(Some(settings));
+    let parts = builder.build().await.expect("the deployment assembles");
+
+    // A chunk the sweep would reclaim on its next pass, planted while the
+    // loops run and just before the last handle goes.
+    let hash = "cd".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
+             VALUES (decode('{hash}', 'hex'), 'deleting')"
+        ),
+    )
+    .await;
+    drop(parts);
+    drop_slot(&pool).await;
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    assert!(
+        !record_logged("replication slot is gone", "slot", SLOT),
+        "the slot-lag watcher outlived the last handle"
+    );
+    assert!(
+        planted.exists(),
+        "the content sweep outlived the last handle"
+    );
+}
+
 /// The sync adapter over a real listener: a non-connetto frame is skipped and
 /// the handshake that follows still opens, a frame it cannot speak ends the
 /// session with an error the log can name, and a client's close ends the
@@ -1552,42 +1926,49 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
 
             // An empty frame is an error the session ends on, and the log names it.
             let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
-            ws.send(WsMessage::Binary(vec![]))
-                .await
-                .expect("send the empty frame");
-            let r = tokio::time::timeout(BOUND, ws.next()).await;
-            assert!(
-                !matches!(r, Ok(Some(Ok(_)))),
-                "the empty frame ends the session: {r:?}"
-            );
-            assert!(
-                logged(
-                    "session ended with an error",
-                    "error",
-                    "empty websocket frame"
-                )
-                .await,
-                "the error the session ended on is named"
-            );
+            frame_ends_the_session_named(&mut ws, vec![], "empty websocket frame").await;
 
             // A frame with a tag the codec does not know is the same, named.
             let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
-            ws.send(WsMessage::Binary(vec![0x99, 1, 2, 3]))
-                .await
-                .expect("send the unknown frame");
-            let r = tokio::time::timeout(BOUND, ws.next()).await;
+            frame_ends_the_session_named(
+                &mut ws,
+                vec![0x99, 1, 2, 3],
+                "unknown websocket frame tag",
+            )
+            .await;
+
+            // A bulk frame from a client is not a mutation patch, so the
+            // session ends on it, named.
+            let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
+            ws.send(WsMessage::Binary(control_frame(
+                &ControlMessage::Handshake(Handshake::new(PROTOCOL_VERSION, "bulk")),
+            )))
+            .await
+            .expect("send the handshake");
             assert!(
-                !matches!(r, Ok(Some(Ok(_)))),
-                "the unknown tag ends the session: {r:?}"
+                matches!(
+                    raw_control(&mut ws).await,
+                    Some(ControlMessage::HandshakeAck(_))
+                ),
+                "the handshake opens before the bulk frame"
             );
+            let mut bulk_frame = vec![TAG_BULK];
+            bulk_frame.extend(
+                encode_bulk(&BulkMessage::SnapshotPatch(SnapshotPatch::new(
+                    "orders",
+                    vec![],
+                )))
+                .expect("encode the bulk frame"),
+            );
+            frame_ends_the_session_named(&mut ws, bulk_frame, "unexpected bulk frame from client")
+                .await;
+
+            // A frame the WebSocket protocol itself rejects is the same,
+            // named at the protocol layer.
+            let _raw = send_unmasked_frame(port).await;
             assert!(
-                logged(
-                    "session ended with an error",
-                    "error",
-                    "unknown websocket frame tag"
-                )
-                .await,
-                "the error the session ended on is named"
+                logged("session ended with an error", "error", "websocket error").await,
+                "the protocol error the session ended on is named"
             );
 
             // A client's close ends the session cleanly: no fatal frame, just
@@ -1618,6 +1999,59 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
     .await;
     stream.abort();
     http.abort();
+}
+
+/// Send `frame` and prove the session ends on it, with the log naming `needle`.
+async fn frame_ends_the_session_named(
+    ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    frame: Vec<u8>,
+    needle: &str,
+) {
+    ws.send(WsMessage::Binary(frame))
+        .await
+        .expect("send the frame");
+    let r = tokio::time::timeout(BOUND, ws.next()).await;
+    assert!(
+        !matches!(r, Ok(Some(Ok(_)))),
+        "the frame ends the session: {r:?}"
+    );
+    assert!(
+        logged("session ended with an error", "error", needle).await,
+        "the error the session ended on is named: {needle}"
+    );
+}
+
+/// Upgrade `/sync` by hand and send a client frame without its mask bit,
+/// returning the socket so it stays open while the server names the
+/// violation.
+async fn send_unmasked_frame(port: u16) -> TcpStream {
+    let mut raw = TcpStream::connect(format!("127.0.0.1:{port}"))
+        .await
+        .expect("connect the sync route");
+    raw.write_all(
+        format!(
+            "GET /sync HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
+             Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        .as_bytes(),
+    )
+    .await
+    .expect("send the upgrade");
+    let mut head = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        let n = raw.read(&mut chunk).await.expect("read the upgrade answer");
+        assert!(n > 0, "the listener closed mid-upgrade");
+        head.extend_from_slice(&chunk[..n]);
+        if head.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+    raw.write_all(&[0x82, 0x04, 0x00, 0x01, 0x02, 0x03, 0x04])
+        .await
+        .expect("send the unmasked frame");
+    raw
 }
 
 /// A content deployment the builder cannot run is a refusal that names the
@@ -1798,6 +2232,103 @@ async fn a_content_sweep_and_reconcile_say_what_they_do() {
     );
 
     handle.shutdown().await;
+}
+
+/// A sweep tick reclaims a chunk the registry has marked `deleting`: the file
+/// goes out of the store and the registry row goes with it.
+#[tokio::test]
+async fn a_sweep_tick_reclaims_a_chunk_marked_deleting() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+
+    // The chunk the sweep reclaims: a store file and a registry row that
+    // names it `deleting`.
+    let dir = TempDir::new().expect("a store directory");
+    let hash_bytes = vec![0xCDu8; 32];
+    let hash = "cd".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    {
+        let mut conn = pool.get().await.expect("a connection");
+        diesel::insert_into(_cfs_chunk_registry::table)
+            .values((
+                _cfs_chunk_registry::chunk_hash.eq(hash_bytes.clone()),
+                _cfs_chunk_registry::state.eq("deleting"),
+            ))
+            .execute(&mut *conn)
+            .await
+            .expect("plant the registry row");
+    }
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    let fga_url = fixture.fga_url().await.to_owned();
+    let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("a ticket key")
+        .as_ref()
+        .to_vec();
+    let settings = ContentSettings {
+        base_url: "http://127.0.0.1:8099".to_owned(),
+        ttl: Duration::from_secs(60),
+        read_ceiling: 1 << 20,
+        grace: Duration::ZERO,
+        cadence: Duration::from_millis(500),
+        quota_identity: 0,
+        storage_ceiling: 0,
+        bandwidth_ceiling: 0,
+        bandwidth_window_days: 30,
+        warn_fraction: 0.8,
+        ceiling_refresh: Duration::from_secs(10),
+        owner_pool_size: 2,
+        store: StoreSpec::Fs(dir.path().to_path_buf()),
+        key,
+    };
+    let builder = builder_schema(
+        &fixture,
+        0,
+        &idp,
+        (&fga_url, &store),
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+    )
+    .content(Some(settings));
+    let parts = builder.build().await.expect("the deployment assembles");
+
+    // One sweep tick at the cadence reclaims the planted chunk.
+    let deadline = Instant::now() + BOUND;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the sweep tick reclaimed the planted chunk"
+        );
+        let gone = {
+            let mut conn = pool.get().await.expect("a connection");
+            let rows: i64 = _cfs_chunk_registry::table
+                .filter(_cfs_chunk_registry::chunk_hash.eq(hash_bytes.clone()))
+                .count()
+                .get_result(&mut *conn)
+                .await
+                .expect("count the registry rows");
+            rows == 0 && !planted.exists()
+        };
+        if gone {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+
+    parts.handle.shutdown().await;
 }
 
 /// The photo table and the two contract functions a configured deployment
