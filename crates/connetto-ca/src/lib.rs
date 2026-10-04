@@ -3,15 +3,20 @@
 //!
 //! [`init`] creates the root, which names a fresh deployment UUID and whose
 //! key is stored encrypted under the operator's passphrase. [`sign_issuer`]
-//! signs the yearly issuer the server holds. The root never runs on the
-//! server, so this crate is a tool for the operator's offline machine.
+//! signs the yearly issuer the server holds. [`revoke_issuer`] adds an issuer
+//! to the root's one numbered list, which the server publishes beside its
+//! issuers' lists. The root never runs on the server, so this crate is a tool
+//! for the operator's offline machine.
 
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use connetto_core::device_cert::{DeploymentId, IssuerError, RootCa, RootError};
+use connetto_core::device_cert::{
+    DeploymentId, IssuerError, ListError, RevocationList, Revoked, RootCa, RootError,
+    certificate_serial, verify_signer,
+};
 use pkcs8::{EncryptedPrivateKeyInfo, PrivateKeyInfo};
 use rand_core::{OsRng, RngCore as _};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
@@ -25,6 +30,8 @@ pub const ROOT_KEY: &str = "root.key.p8e";
 pub const ISSUER_CERTIFICATE: &str = "issuer.der";
 /// The issuer key the server holds, plain PKCS #8.
 pub const ISSUER_KEY: &str = "issuer.key";
+/// The root's list of revoked issuers, the file the server publishes.
+pub const ROOT_LIST: &str = "root-list.der";
 
 /// How long a root lasts (R74 decision 14).
 pub const ROOT_VALIDITY: Duration = Duration::from_hours(24 * 365 * 10);
@@ -56,6 +63,15 @@ pub enum CaError {
     /// Encrypting the root key failed.
     #[error("the root key could not be encrypted")]
     Encrypt(#[source] pkcs8::Error),
+    /// The issuer to revoke was not signed by this root.
+    #[error("the issuer was not signed by this root")]
+    NotThisRootsIssuer,
+    /// The issuer is already on the root's list.
+    #[error("the issuer is already revoked")]
+    AlreadyRevoked,
+    /// The list could not be read back or signed.
+    #[error(transparent)]
+    List(#[from] ListError),
     /// Reading or writing a file failed.
     #[error("{}: {source}", path.display())]
     Io {
@@ -125,6 +141,51 @@ pub fn sign_issuer(
         (&key_path, &key_der, true),
         (&certificate_path, &certificate, false),
     ])
+}
+
+/// Add the issuer whose certificate is at `issuer` to the root's list in
+/// `ca_dir`, revoked at `now`, and sign the complete list under the next
+/// number, replacing [`ROOT_LIST`]. The list promises its next within
+/// [`ISSUER_VALIDITY`], the longest any issuer it names lives.
+///
+/// # Errors
+///
+/// [`CaError::Passphrase`] when the passphrase does not open the root key,
+/// [`CaError::NotThisRootsIssuer`] for an issuer another root signed,
+/// [`CaError::AlreadyRevoked`] for one already listed, or the error of a
+/// step that failed.
+pub fn revoke_issuer(
+    ca_dir: &Path,
+    passphrase: &str,
+    issuer: &Path,
+    now: SystemTime,
+) -> Result<(), CaError> {
+    let root = open_root(ca_dir, passphrase)?;
+    let issuer = read(issuer)?;
+    let roots = [root.certificate().to_vec()];
+    match verify_signer(&issuer, &roots) {
+        Ok(()) if issuer.as_slice() != root.certificate() => {}
+        Ok(()) | Err(ListError::Untrusted) => return Err(CaError::NotThisRootsIssuer),
+        Err(other) => return Err(other.into()),
+    }
+    let serial = certificate_serial(&issuer)?;
+    let path = ca_dir.join(ROOT_LIST);
+    let (number, mut revoked) = if path.exists() {
+        let kept = RevocationList::verify(&read(&path)?, root.certificate(), &roots)?;
+        (kept.number(), kept.revoked().to_vec())
+    } else {
+        (0, Vec::new())
+    };
+    if revoked.iter().any(|entry| entry.serial == serial) {
+        return Err(CaError::AlreadyRevoked);
+    }
+    revoked.push(Revoked { serial, at: now });
+    let list = root.sign_list(number + 1, &revoked, now, now + ISSUER_VALIDITY)?;
+    // Written beside, then moved over, so a failed write keeps the old list.
+    let staged = ca_dir.join(format!("{ROOT_LIST}.new"));
+    let _ = std::fs::remove_file(&staged);
+    write_new(&[(&staged, &list, false)])?;
+    std::fs::rename(&staged, &path).map_err(|source| CaError::Io { path, source })
 }
 
 /// Open the root in `dir` with the operator's passphrase.

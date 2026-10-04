@@ -118,3 +118,61 @@ fn the_issuer_lasts_a_year_and_the_ceiling() {
     .expect("load");
     assert_eq!(loaded.not_after(), now() + ISSUER_VALIDITY);
 }
+
+#[test]
+fn revoking_issuers_numbers_one_complete_root_list() {
+    use connetto_core::device_cert::{RevocationList, certificate_serial};
+    let ca = tempfile::tempdir().expect("ca dir");
+    let (first, second, stranger) = (
+        tempfile::tempdir().expect("issuer dir"),
+        tempfile::tempdir().expect("issuer dir"),
+        tempfile::tempdir().expect("other ca dir"),
+    );
+    init(ca.path(), PASSPHRASE, now()).expect("init");
+    sign_issuer(ca.path(), PASSPHRASE, first.path(), now()).expect("first issuer");
+    sign_issuer(ca.path(), PASSPHRASE, second.path(), now()).expect("second issuer");
+    let root = std::fs::read(ca.path().join(ROOT_CERTIFICATE)).expect("root");
+    let issuer = |dir: &tempfile::TempDir| dir.path().join(ISSUER_CERTIFICATE);
+    let serial = |dir: &tempfile::TempDir| {
+        certificate_serial(&std::fs::read(issuer(dir)).expect("issuer")).expect("serial")
+    };
+
+    revoke_issuer(ca.path(), PASSPHRASE, &issuer(&first), now()).expect("revoke the first");
+    let list = std::fs::read(ca.path().join(ROOT_LIST)).expect("the root list");
+    let one = RevocationList::verify(&list, &root, std::slice::from_ref(&root)).expect("verifies");
+    assert_eq!(one.number(), 1);
+    assert!(one.revokes(&serial(&first)));
+    assert!(!one.revokes(&serial(&second)));
+
+    let later = now() + Duration::from_hours(1);
+    revoke_issuer(ca.path(), PASSPHRASE, &issuer(&second), later).expect("revoke the second");
+    let list = std::fs::read(ca.path().join(ROOT_LIST)).expect("the root list");
+    let two = RevocationList::verify(&list, &root, std::slice::from_ref(&root)).expect("verifies");
+    assert_eq!(two.number(), 2, "the next list takes the next number");
+    assert!(
+        two.revokes(&serial(&first)),
+        "and keeps every issuer revoked before"
+    );
+    assert!(two.revokes(&serial(&second)));
+    assert_eq!(
+        two.revoked()[0].at,
+        now(),
+        "an earlier revocation keeps its date"
+    );
+
+    assert!(matches!(
+        revoke_issuer(ca.path(), PASSPHRASE, &issuer(&first), later),
+        Err(CaError::AlreadyRevoked)
+    ));
+    init(stranger.path(), PASSPHRASE, now()).expect("another root");
+    let foreign = tempfile::tempdir().expect("foreign issuer dir");
+    sign_issuer(stranger.path(), PASSPHRASE, foreign.path(), now()).expect("foreign issuer");
+    assert!(matches!(
+        revoke_issuer(ca.path(), PASSPHRASE, &issuer(&foreign), later),
+        Err(CaError::NotThisRootsIssuer)
+    ));
+    assert!(matches!(
+        revoke_issuer(ca.path(), "wrong", &issuer(&first), later),
+        Err(CaError::Passphrase)
+    ));
+}

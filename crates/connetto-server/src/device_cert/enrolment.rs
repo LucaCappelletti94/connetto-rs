@@ -25,6 +25,8 @@ pub struct Enrolment<Id> {
     pub key: KeyId,
     /// The certificate's serial.
     pub serial: [u8; 16],
+    /// The issuer that signed it, whose list names it once its key is revoked.
+    pub issuer: KeyId,
     /// When the certificate starts, which is when the key was last seen.
     pub issued_at: SystemTime,
     /// When the certificate expires.
@@ -111,8 +113,9 @@ pub trait EnrolmentStore<Id>: Send + Sync + 'static {
         at: SystemTime,
     ) -> EnrolmentFuture<'a, Revocation>;
 
-    /// Every serial of a revoked key whose certificate has not expired at `now`.
-    fn revoked_serials(&self, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>>;
+    /// Every serial `issuer` signed for a revoked key, whose certificate has
+    /// not expired at `now`.
+    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>>;
 
     /// The next CRL Number of the issuer `issuer`, above every number handed
     /// out before, across restarts.
@@ -250,12 +253,12 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
         Box::pin(core::future::ready(Ok(self.revoke_now(user, key, at))))
     }
 
-    fn revoked_serials(&self, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
+    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
         let state = self.state.lock();
         let serials = state
             .grants
             .iter()
-            .filter(|grant| grant.expires_at > now)
+            .filter(|grant| grant.issuer == issuer && grant.expires_at > now)
             .filter_map(|grant| {
                 let at = state.rows.get(&grant.key)?.revoked_at?;
                 Some(Revoked {
@@ -398,6 +401,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             user: user.clone(),
             key: KeyId::of_public_key(csr.public_key()),
             serial,
+            issuer: issuer.key_id(),
             issued_at: not_before,
             expires_at: not_before + lifetime,
             session,
@@ -459,20 +463,26 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         Ok(built)
     }
 
+    /// One list per issuer still signing, the current one and every retired
+    /// one not yet expired, then the root's lists as given.
     async fn build_lists(&self) -> Result<Vec<SignedList>, EnrolmentError> {
-        let issuer = self.config.issuer();
         let now = SystemTime::now();
-        let revoked = self.store.revoked_serials(now).await?;
-        let number = self.store.next_list_number(issuer.key_id()).await?;
-        // No list promises a next one later than the longest certificate it
-        // could name stays valid.
-        let list = issuer
-            .sign_list(number, &revoked, now, now + self.config.ceiling())
-            .map_err(EnrolmentError::new)?;
-        Ok(vec![SignedList {
-            list,
-            signer: issuer.certificate().to_vec(),
-        }])
+        let mut lists = Vec::new();
+        for issuer in self.config.signing_issuers(now) {
+            let revoked = self.store.revoked_serials(issuer.key_id(), now).await?;
+            let number = self.store.next_list_number(issuer.key_id()).await?;
+            // No list promises a next one later than the longest certificate
+            // it could name stays valid.
+            let list = issuer
+                .sign_list(number, &revoked, now, now + self.config.ceiling())
+                .map_err(EnrolmentError::new)?;
+            lists.push(SignedList {
+                list,
+                signer: issuer.certificate().to_vec(),
+            });
+        }
+        lists.extend_from_slice(self.config.root_lists());
+        Ok(lists)
     }
 
     /// Revoke `key`, `user`'s when one is named, and publish the list that

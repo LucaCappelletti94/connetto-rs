@@ -20,7 +20,8 @@ pub use identity::{DeploymentId, DeviceIdentity, IdentityError, KeyId};
 pub use key::{CertificateSigner, DeviceKey, DeviceKeyError, KeyHome, key_id, public_key_info};
 pub use request::{CertificateRequest, RequestError};
 pub use revocation::{
-    ListError, RevocationList, Revoked, certificate_key_id, verify_chain, verify_signer,
+    ListError, RevocationList, Revoked, certificate_key_id, certificate_serial, verify_chain,
+    verify_signer,
 };
 
 /// What an application tells the lost-device list about a device, a tuple or a

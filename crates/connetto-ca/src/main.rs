@@ -3,11 +3,14 @@
 //! ```text
 //! connetto-ca init <ca-dir> [--passphrase-file PATH]
 //! connetto-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]
+//! connetto-ca revoke-issuer <ca-dir> <issuer.der> [--passphrase-file PATH]
 //! ```
 //!
 //! `init` creates the deployment's root in `<ca-dir>` and prints the
 //! deployment UUID. `issuer` signs a new issuer with that root and writes the
-//! certificate and plain key the server is given into `<out-dir>`. Without
+//! certificate and plain key the server is given into `<out-dir>`.
+//! `revoke-issuer` adds an issuer to the root's list and signs it again as
+//! `<ca-dir>/root-list.der`, the file the server publishes. Without
 //! `--passphrase-file` the passphrase is read from the terminal.
 
 use std::path::{Path, PathBuf};
@@ -33,7 +36,7 @@ enum CommandError {
     Ca(#[from] connetto_ca::CaError),
 }
 
-const USAGE: &str = "usage: connetto-ca init <ca-dir> [--passphrase-file PATH]\n       connetto-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]";
+const USAGE: &str = "usage: connetto-ca init <ca-dir> [--passphrase-file PATH]\n       connetto-ca issuer <ca-dir> <out-dir> [--passphrase-file PATH]\n       connetto-ca revoke-issuer <ca-dir> <issuer.der> [--passphrase-file PATH]";
 
 fn main() -> ExitCode {
     match run(std::env::args().skip(1).collect()) {
@@ -73,6 +76,16 @@ fn run(mut args: Vec<String>) -> Result<(), CommandError> {
                 Path::new(ca_dir),
                 &passphrase,
                 Path::new(out_dir),
+                SystemTime::now(),
+            )?;
+            Ok(())
+        }
+        [command, ca_dir, issuer] if command == "revoke-issuer" => {
+            let passphrase = passphrase(passphrase_file.as_deref(), false)?;
+            connetto_ca::revoke_issuer(
+                Path::new(ca_dir),
+                &passphrase,
+                Path::new(issuer),
                 SystemTime::now(),
             )?;
             Ok(())

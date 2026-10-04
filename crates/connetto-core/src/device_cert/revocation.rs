@@ -10,7 +10,9 @@ use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 use x509_parser::revocation_list::CertificateRevocationList;
 
-use super::authority::{DeviceIssuer, to_time};
+use rcgen::KeyPair;
+
+use super::authority::{DeviceIssuer, RootCa, to_time};
 use super::identity::KeyId;
 
 /// One certificate a list revokes.
@@ -27,7 +29,7 @@ pub struct Revoked {
 pub struct RevocationList {
     issuer: KeyId,
     number: u64,
-    serials: Vec<Vec<u8>>,
+    revoked: Vec<Revoked>,
     der: Vec<u8>,
 }
 
@@ -55,8 +57,8 @@ pub enum ListError {
 }
 
 impl DeviceIssuer {
-    /// Sign list number `number`, revoking `revoked`, issued at `this_update`
-    /// and promising the next by `next_update`.
+    /// Sign list number `number`, revoking the device certificates `revoked`,
+    /// issued at `this_update` and promising the next by `next_update`.
     ///
     /// # Errors
     ///
@@ -69,6 +71,52 @@ impl DeviceIssuer {
         this_update: SystemTime,
         next_update: SystemTime,
     ) -> Result<Vec<u8>, ListError> {
+        sign(
+            self.certificate(),
+            self.key(),
+            number,
+            revoked,
+            this_update,
+            next_update,
+        )
+    }
+}
+
+impl RootCa {
+    /// Sign the root's list number `number`, revoking the issuers `revoked`,
+    /// issued at `this_update` and promising the next by `next_update`.
+    ///
+    /// # Errors
+    ///
+    /// As [`DeviceIssuer::sign_list`].
+    pub fn sign_list(
+        &self,
+        number: u64,
+        revoked: &[Revoked],
+        this_update: SystemTime,
+        next_update: SystemTime,
+    ) -> Result<Vec<u8>, ListError> {
+        sign(
+            self.certificate(),
+            self.key(),
+            number,
+            revoked,
+            this_update,
+            next_update,
+        )
+    }
+}
+
+/// A list signed by the CA certificate `certificate` holding `key`.
+fn sign(
+    certificate: &[u8],
+    key: &KeyPair,
+    number: u64,
+    revoked: &[Revoked],
+    this_update: SystemTime,
+    next_update: SystemTime,
+) -> Result<Vec<u8>, ListError> {
+    {
         let revoked_certs = revoked
             .iter()
             .map(|entry| {
@@ -88,9 +136,19 @@ impl DeviceIssuer {
             revoked_certs,
             key_identifier_method: KeyIdMethod::Sha256,
         };
-        let signer = Issuer::from_ca_cert_der(&self.certificate().into(), self.key())?;
+        let signer = Issuer::from_ca_cert_der(&certificate.into(), key)?;
         Ok(params.signed_by(&signer)?.der().to_vec())
     }
+}
+
+/// The serial of the certificate `der`, which a list names it by.
+///
+/// # Errors
+///
+/// [`ListError::Malformed`] when `der` is not a certificate.
+pub fn certificate_serial(der: &[u8]) -> Result<Vec<u8>, ListError> {
+    let (_, cert) = X509Certificate::from_der(der).map_err(|_| ListError::Malformed)?;
+    Ok(cert.raw_serial().to_vec())
 }
 
 /// The key identifier of the certificate `der`, the SHA-256 of its public key,
@@ -172,14 +230,20 @@ impl RevocationList {
             [number] => *number,
             _ => return Err(ListError::NoNumber),
         };
-        let serials = crl
+        let revoked = crl
             .iter_revoked_certificates()
-            .map(|revoked| revoked.raw_serial().to_vec())
+            .map(|revoked| {
+                let secs = u64::try_from(revoked.revocation_date.timestamp()).unwrap_or_default();
+                Revoked {
+                    serial: revoked.raw_serial().to_vec(),
+                    at: std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+                }
+            })
             .collect();
         Ok(Self {
             issuer: KeyId::of_public_key(signer_cert.public_key().raw),
             number,
-            serials,
+            revoked,
             der: list.to_vec(),
         })
     }
@@ -199,9 +263,15 @@ impl RevocationList {
     /// Whether the list revokes the certificate whose serial is `serial`.
     #[must_use]
     pub fn revokes(&self, serial: &[u8]) -> bool {
-        self.serials
+        self.revoked
             .iter()
-            .any(|listed| trim(listed) == trim(serial))
+            .any(|listed| trim(&listed.serial) == trim(serial))
+    }
+
+    /// Every certificate the list revokes, with when.
+    #[must_use]
+    pub fn revoked(&self) -> &[Revoked] {
+        &self.revoked
     }
 
     /// The list as signed.

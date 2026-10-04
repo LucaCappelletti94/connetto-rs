@@ -559,3 +559,63 @@ fn webpki_refuses_a_certificate_the_list_revokes() {
     ));
     assert!(check(&kept_leaf).is_ok());
 }
+
+#[test]
+fn a_root_signed_list_revokes_an_issuer_and_webpki_refuses_its_chain() {
+    let start = at(1_800_000_000);
+    let (root, issuer) = authorities(start);
+    let leaf = issued(&issuer, start, 0x33);
+    let issuer_serial = certificate_serial(issuer.certificate()).expect("the issuer's serial");
+    let der = root
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: issuer_serial.clone(),
+                at: start + DAY / 4,
+            }],
+            start + DAY / 4,
+            start + 30 * DAY,
+        )
+        .expect("the root signs");
+    let roots = [root.certificate().to_vec()];
+    let list = RevocationList::verify(&der, root.certificate(), &roots).expect("verifies");
+    assert!(list.revokes(&issuer_serial));
+    assert_eq!(
+        list.issuer(),
+        certificate_key_id(root.certificate()).expect("root key")
+    );
+
+    let crl = webpki::CertRevocationList::from(
+        webpki::BorrowedCertRevocationList::from_der(&der).expect("webpki parses it"),
+    );
+    let crls = [&crl];
+    let root_der = rustls_pki_types::CertificateDer::from(root.certificate().to_vec());
+    let anchors = [anchor_from_trusted_cert(&root_der).expect("anchor")];
+    let leaf_der = rustls_pki_types::CertificateDer::from(leaf);
+    let end_entity = EndEntityCert::try_from(&leaf_der).expect("leaf");
+    let intermediates = [rustls_pki_types::CertificateDer::from(
+        issuer.certificate().to_vec(),
+    )];
+    let options = webpki::RevocationOptionsBuilder::new(&crls)
+        .expect("options")
+        .with_status_policy(webpki::UnknownStatusPolicy::Allow)
+        .build();
+    let verdict = end_entity.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        &anchors,
+        &intermediates,
+        rustls_pki_types::UnixTime::since_unix_epoch(
+            at(1_800_000_000)
+                .duration_since(UNIX_EPOCH)
+                .expect("after the epoch")
+                + DAY / 2,
+        ),
+        KeyUsage::client_auth(),
+        Some(options),
+        None,
+    );
+    assert!(
+        matches!(verdict, Err(webpki::Error::CertRevoked)),
+        "a leaf under a revoked issuer is refused"
+    );
+}

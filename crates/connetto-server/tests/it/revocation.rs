@@ -277,3 +277,113 @@ async fn the_operator_revokes_any_key_once() {
             .is_err()
     );
 }
+
+/// An issuer as its certificate and its PKCS #8 key.
+type IssuerBytes = (Vec<u8>, Vec<u8>);
+
+/// A root and two issuers it signed, each as its certificate and PKCS #8 key,
+/// so a test loads one issuer into two configurations.
+fn root_and_two_issuers() -> (connetto_core::device_cert::RootCa, IssuerBytes, IssuerBytes) {
+    use connetto_core::device_cert::{DeploymentId, RootCa};
+    let now = std::time::SystemTime::now();
+    let day = Duration::from_hours(24);
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(0x0f0f)),
+        now - day,
+        3650 * day,
+    )
+    .expect("root");
+    let issuer = |serial: u8| {
+        let key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("issuer key");
+        let cert = root
+            .sign_issuer(
+                &key.subject_public_key_info(),
+                now - day,
+                395 * day,
+                [serial; 16],
+            )
+            .expect("issuer");
+        (cert, key.serialize_der())
+    };
+    let (old, new) = (issuer(1), issuer(2));
+    (root, old, new)
+}
+
+fn load(
+    root: &connetto_core::device_cert::RootCa,
+    (cert, key): &IssuerBytes,
+) -> connetto_core::device_cert::DeviceIssuer {
+    connetto_core::device_cert::DeviceIssuer::from_pkcs8(cert.clone(), key, root.certificate())
+        .expect("load the issuer")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_issuer_keeps_listing_its_certificates_beside_the_roots_list() {
+    use connetto_core::device_cert::Revoked;
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (root, old, new) = root_and_two_issuers();
+    let roots = [root.certificate().to_vec()];
+
+    let before = enrolling_manager(
+        &fixture,
+        Some(DeviceEnrolment::new(
+            DeviceCertConfig::new(load(&root, &old)),
+            Arc::clone(&store) as _,
+        )),
+    )
+    .await;
+    let mut device = connect(&before, Some("alice")).await;
+    let key = device_key();
+    let cert = enrolled(&mut device, &key).await;
+
+    // The root revokes some third issuer offline, and the operator rotates.
+    let now = std::time::SystemTime::now();
+    let root_list = SignedList {
+        list: root
+            .sign_list(
+                1,
+                &[Revoked {
+                    serial: vec![9; 16],
+                    at: now,
+                }],
+                now,
+                now + Duration::from_hours(24 * 400),
+            )
+            .expect("the root signs"),
+        signer: root.certificate().to_vec(),
+    };
+    let after = enrolling_manager(
+        &fixture,
+        Some(DeviceEnrolment::new(
+            DeviceCertConfig::new(load(&root, &new))
+                .with_retired_issuer(load(&root, &old))
+                .with_root_list(root_list),
+            Arc::clone(&store) as _,
+        )),
+    )
+    .await;
+    assert!(after.revoke_device(key_id(&key)).await.expect("revoke"));
+    let lists = manager_lists(&after).await;
+    assert_eq!(
+        lists.len(),
+        3,
+        "the current issuer, the retired one, the root"
+    );
+    let by_signer = |signer: &[u8]| {
+        let list = lists
+            .iter()
+            .find(|list| list.signer == signer)
+            .expect("a list from that signer");
+        RevocationList::verify(&list.list, &list.signer, &roots).expect("verifies")
+    };
+    assert!(
+        by_signer(&old.0).revokes(cert.serial()),
+        "the retired issuer lists its own"
+    );
+    assert!(
+        !by_signer(&new.0).revokes(cert.serial()),
+        "the new issuer signed none of it"
+    );
+    assert!(by_signer(root.certificate()).revokes(&[9; 16]));
+}

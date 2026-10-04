@@ -86,6 +86,11 @@ impl RootCa {
         &self.certificate
     }
 
+    /// The root's signing key.
+    pub(super) const fn key(&self) -> &KeyPair {
+        &self.key
+    }
+
     /// The root's private key as PKCS #8 DER, for `connetto-ca` to encrypt and store.
     #[must_use]
     pub fn private_key_der(&self) -> zeroize::Zeroizing<Vec<u8>> {

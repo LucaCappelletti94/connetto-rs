@@ -4,6 +4,7 @@
 use std::time::{Duration, SystemTime};
 
 use connetto_core::device_cert::DeviceIssuer;
+use connetto_core::messages::SignedList;
 
 /// A certificate's lifetime when the application requests none (R74 decision 4).
 const DEFAULT_LIFETIME: Duration = Duration::from_hours(24);
@@ -28,6 +29,8 @@ pub struct DeviceCertConfig {
     default_lifetime: Duration,
     ceiling: Duration,
     challenge_window: Duration,
+    retired: Vec<DeviceIssuer>,
+    root_lists: Vec<SignedList>,
 }
 
 /// A requested lifetime over the ceiling, refused and never shortened.
@@ -74,6 +77,8 @@ impl DeviceCertConfig {
             default_lifetime: DEFAULT_LIFETIME,
             ceiling: DEFAULT_CEILING,
             challenge_window: CHALLENGE_WINDOW,
+            retired: Vec::new(),
+            root_lists: Vec::new(),
         }
     }
 
@@ -96,6 +101,37 @@ impl DeviceCertConfig {
     pub const fn with_challenge_window(mut self, window: Duration) -> Self {
         self.challenge_window = window;
         self
+    }
+
+    /// An issuer this one replaced, kept to sign the lists of its own
+    /// certificates until it expires, after its last certificate (decision 14).
+    #[must_use]
+    pub fn with_retired_issuer(mut self, issuer: DeviceIssuer) -> Self {
+        self.retired.push(issuer);
+        self
+    }
+
+    /// A list the root signed offline with `connetto-ca revoke-issuer`,
+    /// published beside the issuers' own lists.
+    #[must_use]
+    pub fn with_root_list(mut self, list: SignedList) -> Self {
+        self.root_lists.push(list);
+        self
+    }
+
+    /// The issuers whose lists are published at `now`: the current one, and
+    /// every retired one not yet expired.
+    pub(crate) fn signing_issuers(&self, now: SystemTime) -> impl Iterator<Item = &DeviceIssuer> {
+        core::iter::once(&self.issuer).chain(
+            self.retired
+                .iter()
+                .filter(move |retired| retired.not_after() > now),
+        )
+    }
+
+    /// The root-signed lists published as given.
+    pub(crate) fn root_lists(&self) -> &[SignedList] {
+        &self.root_lists
     }
 
     /// The longest lifetime granted.
