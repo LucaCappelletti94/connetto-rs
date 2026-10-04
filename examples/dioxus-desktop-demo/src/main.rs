@@ -336,7 +336,7 @@ fn Shell() -> Element {
     // Windows Hello prompts over this window.
     #[cfg(target_os = "windows")]
     let owner = connetto_dioxus::use_hello_owner();
-    // The browser holds the front after a login, so the window takes it back.
+    // The browser holds the front after a login, so the window asks for it back.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let window = dioxus::desktop::window();
     use_effect(move || {
