@@ -26,6 +26,8 @@
 | The OpenFGA store | `CONNETTO_FGA_STORE` | Only when OpenFGA's own datastore lives in the same cluster | Refused without the id. A new model loads every fact from Postgres (`ModelState::Written`), an installed one reconciles only its whole-shape regions (`ModelState::Adopted`) |
 | The token signing key pair | `CONNETTO_JWT_PRIVATE_KEY_FILE`, `CONNETTO_JWT_PUBLIC_KEY_FILE` | **No** | Refused. The deployment keeps the pair on disk so a token survives a restart |
 | The content ticket key | `CONNETTO_CONTENT_KEY` | **No** | Refused when `CONNETTO_CONTENT_URL` is set, which is what makes the key required. It is the deployment's own and survives a restart |
+| The device certificate issuer, its key and the root it chains to (R74) | `CONNETTO_DEVICE_ROOT`, `CONNETTO_DEVICE_ISSUER_CERT`, `CONNETTO_DEVICE_ISSUER_KEY`, written by `connetto-ca issuer` | **No** | None named means no issuer. Some but not all named, an issuer the root did not sign, or an expired issuer refuses startup, and one with under sixty days left is logged |
+| The device root key and the root's revocation list (R74) | `root.key.p8e` and `root-list.der` in the operator's `connetto-ca` directory, the key encrypted under a passphrase | **No**, and never on the server | Not read by the server, which ships the root certificate in the applications |
 | Provider client secrets | `CONNETTO_OIDC_<PROVIDER>_CLIENT_SECRET` | **No** | Re-issued by the provider |
 
 **The slot is recreated after every restore, whatever the method.** A physical base backup omits `pg_replslot`, and a logical dump carries no slots. A recreated slot starts at the restored cluster's current write position.
