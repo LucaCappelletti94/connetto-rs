@@ -392,11 +392,12 @@ async fn close_every_session(manager: &Arc<ServerManager>) {
     await_sessions_drained(manager).await;
 }
 
-// The close frame is queued, not sent, so the exit waits on the sessions' own
-// close rather than racing it.
+// The close frame is queued, not sent, and the registry drains at the
+// moment of the close, so the exit waits on the run loops that are still
+// open rather than on the registry.
 async fn await_sessions_drained(manager: &ServerManager) {
     let poll = async {
-        while manager.live_connections().await > 0 {
+        while manager.open_sessions() > 0 {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     };
@@ -766,9 +767,9 @@ impl ServerBuilder {
     /// The shutdown signal stops accepting, closes every session with
     /// `ServerShuttingDown`, waits up to [`SHUTDOWN_GRACE`] for the sessions'
     /// own close, stops the change stream, and returns `Ok`. A change stream
-    /// that cannot answer what a row looked like before it changed, or that
-    /// gives up reconnecting, closes every session the same way and returns
-    /// the outcome, and the embedder decides what to do with it.
+    /// that cannot answer what a row looked like before it changed, gives up
+    /// reconnecting, or ends its source closes every session the same way and
+    /// returns the outcome, and the embedder decides what to do with it.
     ///
     /// # Errors
     ///
@@ -1343,7 +1344,9 @@ fn change_stream(
         {
             Ok(()) => {
                 // The source ended cleanly, which for a change stream is an
-                // outcome the embedder has to act on, not a success.
+                // outcome the embedder has to act on, not a success, and the
+                // sessions it would leave have no live delivery.
+                close_every_session(&manager).await;
                 Err(ServeError::ChangeStreamStopped(
                     "the change stream source ended".to_owned(),
                 ))

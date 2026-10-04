@@ -21,7 +21,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use connetto_core::auth::{Principal, Subject};
@@ -1475,6 +1475,32 @@ pub struct SessionManager<
     history: parking_lot::RwLock<Option<TimelineHistory>>,
     /// Where a reconnect of the change feed resumes, the last row or commit the ingest finished handling.
     resume: ResumePoint,
+    /// Run loops that have started and not yet ended, which the shutdown
+    /// grace counts because the registry drains at the moment of the close.
+    open_sessions: Arc<AtomicUsize>,
+}
+
+/// Keeps the open-run-loop count right while one `serve` is in flight.
+///
+/// The increment happens before the handshake, so a handshake that is still
+/// in flight counts, and the drop decrements on every exit of the `serve` it
+/// guards, panic included.
+struct OpenSessionTally {
+    open: Arc<AtomicUsize>,
+}
+
+impl OpenSessionTally {
+    /// Count one more open run loop.
+    fn start(open: Arc<AtomicUsize>) -> Self {
+        open.fetch_add(1, Ordering::Relaxed);
+        Self { open }
+    }
+}
+
+impl Drop for OpenSessionTally {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// The manager over the `String` ids and keys every construction shares.
@@ -1535,6 +1561,7 @@ where
         signer,
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
+        open_sessions: Arc::new(AtomicUsize::new(0)),
     })
 }
 
@@ -1757,6 +1784,15 @@ where
     /// waits for this to reach the number it expects.
     pub async fn live_connections(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// How many run loops have started and not yet ended.
+    ///
+    /// The registry drains at the moment a close is issued, so the shutdown
+    /// grace counts these instead, and a handshake still in flight counts
+    /// before it registers.
+    pub fn open_sessions(&self) -> usize {
+        self.open_sessions.load(Ordering::Relaxed)
     }
 
     /// Store the timeline history read before the feed opens, closing every live connection when it changed.
@@ -3462,6 +3498,7 @@ where
         self: Arc<Self>,
         mut transport: T,
     ) -> Result<(), SessionError> {
+        let _tally = OpenSessionTally::start(self.open_sessions.clone());
         let Some(outcome) = self.run_handshake(&mut transport).await? else {
             return Ok(());
         };

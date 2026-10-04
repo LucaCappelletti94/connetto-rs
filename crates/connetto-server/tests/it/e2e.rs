@@ -45,14 +45,15 @@ use serde_json::json;
 pub(super) const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 pub(super) const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
-const OWNED_PG_DDL: &str = "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
+pub(super) const OWNED_PG_DDL: &str =
+    "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT);";
 const OWNED_QUERY: &str = "SELECT * FROM owned";
 /// The policy document the `owned` fixture's server derives its model from.
 ///
 /// The schema and the policies reach the binary as two documents, so the
 /// statement enabling row-level security belongs here beside the policy rather
 /// than in [`OWNED_PG_DDL`], which is what clients sync.
-const OWNED_POLICIES: &str = "ALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
+pub(super) const OWNED_POLICIES: &str = "ALTER TABLE owned ENABLE ROW LEVEL SECURITY;\n\
      CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true));";
 
 /// `orders` carries no policy at all, so its document is empty.
@@ -755,7 +756,7 @@ pub(super) async fn build_auth_stack() -> AuthStack {
 
 /// Drive the login dance through the server binary's auth endpoints and return
 /// the callback JSON body.
-async fn token_body(auth_base: &str, subject: &str) -> serde_json::Value {
+pub(super) async fn token_body(auth_base: &str, subject: &str) -> serde_json::Value {
     let agent = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .build()
@@ -808,10 +809,10 @@ async fn token_body(auth_base: &str, subject: &str) -> serde_json::Value {
     serde_json::from_str(&body).expect("callback JSON body")
 }
 
-/// Drive the login dance through the server binary's auth endpoints and return
-/// the minted `(access_token, user_id)` pair.
-pub(super) async fn mint_token(auth_base: &str) -> (String, String) {
-    let body = token_body(auth_base, "e2e-user").await;
+/// Drive the login dance through the server's auth endpoints for `subject`
+/// and return the minted `(access_token, user_id, refresh_token)` triple.
+pub(super) async fn mint_tokens(auth_base: &str, subject: &str) -> (String, String, String) {
+    let body = token_body(auth_base, subject).await;
     let access_token = body["access_token"]
         .as_str()
         .expect("access_token in callback JSON")
@@ -820,6 +821,17 @@ pub(super) async fn mint_token(auth_base: &str) -> (String, String) {
         .as_str()
         .expect("user_id in callback JSON")
         .to_owned();
+    let refresh_token = body["refresh_token"]
+        .as_str()
+        .expect("refresh_token in callback JSON")
+        .to_owned();
+    (access_token, user_id, refresh_token)
+}
+
+/// Drive the login dance through the server binary's auth endpoints and return
+/// the minted `(access_token, user_id)` pair.
+pub(super) async fn mint_token(auth_base: &str) -> (String, String) {
+    let (access_token, user_id, _refresh) = mint_tokens(auth_base, "e2e-user").await;
     (access_token, user_id)
 }
 
@@ -828,11 +840,8 @@ pub(super) async fn mint_token(auth_base: &str) -> (String, String) {
 /// Only the audit test needs it, because logging out is the one producer
 /// reachable from outside the process.
 pub(super) async fn mint_refresh_token(auth_base: &str) -> String {
-    let body = token_body(auth_base, "e2e-user").await;
-    body["refresh_token"]
-        .as_str()
-        .expect("refresh_token in callback JSON")
-        .to_owned()
+    let (_access, _user, refresh) = mint_tokens(auth_base, "e2e-user").await;
+    refresh
 }
 
 #[tokio::test]
@@ -1683,7 +1692,7 @@ async fn e2e_a_real_logout_is_recorded_in_the_audit_table() {
 }
 
 /// Every `op` recorded so far, in order.
-async fn audit_ops(pool: &Pool<AsyncPgConnection>) -> Vec<String> {
+pub(super) async fn audit_ops(pool: &Pool<AsyncPgConnection>) -> Vec<String> {
     #[derive(QueryableByName)]
     struct Row {
         #[diesel(sql_type = diesel::sql_types::Text)]

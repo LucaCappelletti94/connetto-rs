@@ -34,13 +34,16 @@ use super::e2e::{
 };
 
 /// How long the readiness probe and the frame waits give the server.
-const BOUND: Duration = Duration::from_secs(30);
+pub(super) const BOUND: Duration = Duration::from_secs(30);
 
 /// The one-construction-path server over `fixture`, the way the binary
 /// translates its environment: the owner and reader roles, the schema
 /// documents, the persisted JWT keypair, the loopback identity provider and
 /// the fixture's authorization store.
-async fn builder_over(fixture: &Fixture, port: u16) -> (ServerBuilder, MockOauth, TempDir) {
+pub(super) async fn builder_over(
+    fixture: &Fixture,
+    port: u16,
+) -> (ServerBuilder, MockOauth, TempDir) {
     let url = fixture.admin_url().to_owned();
     let reader = with_user_url(&url, "app_reader", "app_reader");
     let idp = MockOauth::start().await;
@@ -75,7 +78,7 @@ async fn builder_over(fixture: &Fixture, port: u16) -> (ServerBuilder, MockOauth
 }
 
 /// The admin pool over the fixture's database.
-async fn admin_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+pub(super) async fn admin_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
     let manager =
         AsyncDieselConnectionManager::<AsyncPgConnection>::new(fixture.admin_url().to_owned());
     Pool::builder().build(manager).await.expect("build pool")
@@ -86,7 +89,7 @@ async fn admin_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
 /// # Panics
 ///
 /// When the endpoint never answers within the bound.
-async fn wait_ready(base: &str) {
+pub(super) async fn wait_ready(base: &str) {
     let agent = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .timeout(Duration::from_secs(2))
@@ -115,7 +118,7 @@ async fn wait_ready(base: &str) {
 /// # Panics
 ///
 /// When the transport closes or stalls before the bound.
-async fn next_control(client: &mut WebSocketTransport<TcpStream>) -> ControlMessage {
+pub(super) async fn next_control(client: &mut WebSocketTransport<TcpStream>) -> ControlMessage {
     let deadline = Instant::now() + BOUND;
     loop {
         assert!(Instant::now() < deadline, "the session went quiet");
@@ -131,7 +134,7 @@ async fn next_control(client: &mut WebSocketTransport<TcpStream>) -> ControlMess
 }
 
 /// Open a session on the sync route with `token` and wait for the ack.
-async fn live_session(addr: &str, token: &str) -> WebSocketTransport<TcpStream> {
+pub(super) async fn live_session(addr: &str, token: &str) -> WebSocketTransport<TcpStream> {
     let tcp = TcpStream::connect(addr)
         .await
         .expect("connect the sync route");

@@ -156,6 +156,10 @@ openidconnect = { version = "4.0.1", default-features = false, features = ["reqw
 tower = { version = "0.5", features = ["util"] }
 # Serving the built parts on a real listener in the lifecycle test.
 axum = { version = "0.8", features = ["ws"] }
+# The content deployment's DDL, applied by the sweep and reconcile tests.
+connetto-file-server = { path = "../connetto-file-server" }
+# The raw-frame WebSocket client the sync adapter tests drive over `/sync`.
+tokio-tungstenite = "0.24"
 http-body-util = "0.1"
 # Isolated per-client SQLite database directories in the multi-process e2e test.
 tempfile = "3"
