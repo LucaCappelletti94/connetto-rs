@@ -33,7 +33,7 @@ use connetto_server::{
     ReaderReserve, RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig,
     TierLimits, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID, with_user};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID, with_user};
 use diesel::prelude::*;
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -135,7 +135,7 @@ async fn setup(fixture: &Fixture, snail_secs: f64) -> Pool<AsyncPgConnection> {
     .await
 }
 
-type Manager = Arc<SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark>>;
+type Manager = Arc<SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults>>;
 
 /// Build a manager over the reader pool whose only unusual setting is the
 /// reserve, wired exactly as the binary wires it: the snapshot source, the
@@ -187,7 +187,7 @@ fn manager_with(
             .withholding(WITHHELD_ID),
         authority,
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(reader.clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(reader.clone(), PG_DDL).expect("build write target"),
     )
     .with_guard(Arc::new(guard))
     .build()

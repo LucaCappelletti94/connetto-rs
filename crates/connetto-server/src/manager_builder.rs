@@ -20,8 +20,8 @@ use crate::openfga::StoreUpkeep;
 use crate::oplog::{InMemoryOplog, Oplog};
 use crate::parity::SecondOpinion;
 use crate::reexec::FailedRead;
+use crate::schema::ConnettoSchema;
 use crate::session::{NoSigner, SessionConfig, SnapshotSource};
-use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::PgWriteTarget;
 
 /// Assembles one [`SessionManager`](crate::session::SessionManager).
@@ -36,11 +36,11 @@ use crate::write_target::PgWriteTarget;
 /// the materializer's connector type. The engine keeps the copy its read
 /// mode took at materializer construction, so the two sides are the
 /// deployment's to wire, a shared handle or two reads of one pool.
-pub struct ManagerBuilder<Snap, Auth, W, C, O, S>
+pub struct ManagerBuilder<Snap, Auth, D, C, O, S>
 where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    W: ConnettoWatermarkSchema<Id = String>,
+    Snap: SnapshotSource<D::Id>,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres>,
+    D: ConnettoSchema,
     C: ReadConnector,
     C::Error: FailedRead,
     O: Oplog,
@@ -49,23 +49,23 @@ where
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
     snapshot_source: Snap,
     auth: Auth,
-    authority: Arc<dyn HandshakeAuthority>,
+    authority: Arc<dyn HandshakeAuthority<D::Id>>,
     connector: C,
-    target: PgWriteTarget<W>,
-    guard: Option<Arc<RequestGuard<String>>>,
+    target: PgWriteTarget<D>,
+    guard: Option<Arc<RequestGuard<D::Id>>>,
     session: Option<SessionConfig>,
     oplog: O,
     upkeep: Option<Arc<dyn StoreUpkeep>>,
     signer: S,
     withdrawal_source: Option<Snap>,
-    second_opinion: Option<Arc<dyn SecondOpinion<String, String>>>,
+    second_opinion: Option<Arc<dyn SecondOpinion<D::Id, String>>>,
 }
 
-impl<Snap, Auth, W, C> ManagerBuilder<Snap, Auth, W, C, InMemoryOplog, NoSigner>
+impl<Snap, Auth, D, C> ManagerBuilder<Snap, Auth, D, C, InMemoryOplog, NoSigner>
 where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    W: ConnettoWatermarkSchema<Id = String>,
+    Snap: SnapshotSource<D::Id>,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres>,
+    D: ConnettoSchema,
     C: ReadConnector,
     C::Error: FailedRead,
 {
@@ -76,9 +76,9 @@ where
         materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
         snapshot_source: Snap,
         auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
+        authority: Arc<dyn HandshakeAuthority<D::Id>>,
         connector: C,
-        target: PgWriteTarget<W>,
+        target: PgWriteTarget<D>,
     ) -> Self {
         Self {
             materializer,
@@ -98,11 +98,11 @@ where
     }
 }
 
-impl<Snap, Auth, W, C, O, S> ManagerBuilder<Snap, Auth, W, C, O, S>
+impl<Snap, Auth, D, C, O, S> ManagerBuilder<Snap, Auth, D, C, O, S>
 where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    W: ConnettoWatermarkSchema<Id = String>,
+    Snap: SnapshotSource<D::Id>,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres>,
+    D: ConnettoSchema,
     C: ReadConnector,
     C::Error: FailedRead,
     O: Oplog,
@@ -110,7 +110,7 @@ where
 {
     /// The counters the server meters and tallies against.
     #[must_use]
-    pub fn with_guard(mut self, guard: Arc<RequestGuard<String>>) -> Self {
+    pub fn with_guard(mut self, guard: Arc<RequestGuard<D::Id>>) -> Self {
         self.guard = Some(guard);
         self
     }
@@ -124,7 +124,7 @@ where
 
     /// The oplog the reconnect catchup reads from.
     #[must_use]
-    pub fn with_oplog<NewO: Oplog>(self, oplog: NewO) -> ManagerBuilder<Snap, Auth, W, C, NewO, S> {
+    pub fn with_oplog<NewO: Oplog>(self, oplog: NewO) -> ManagerBuilder<Snap, Auth, D, C, NewO, S> {
         let Self {
             materializer,
             snapshot_source,
@@ -172,7 +172,7 @@ where
     pub fn with_signer<NewS: ContentTicketSigner>(
         self,
         signer: NewS,
-    ) -> ManagerBuilder<Snap, Auth, W, C, O, NewS> {
+    ) -> ManagerBuilder<Snap, Auth, D, C, O, NewS> {
         let Self {
             materializer,
             snapshot_source,
@@ -216,14 +216,14 @@ where
     /// Asks a second executor about every current row alongside the one that
     /// delivers, so a divergence between them is counted and named.
     #[must_use]
-    pub fn with_second_opinion(mut self, second: Arc<dyn SecondOpinion<String, String>>) -> Self {
+    pub fn with_second_opinion(mut self, second: Arc<dyn SecondOpinion<D::Id, String>>) -> Self {
         self.second_opinion = Some(second);
         self
     }
 
     /// Build the manager.
     #[must_use]
-    pub fn build(self) -> Arc<crate::session::ConnettoManager<Snap, Auth, W, C, O, S>> {
+    pub fn build(self) -> Arc<crate::session::ConnettoManager<Snap, Auth, D, C, O, S>> {
         let guard = self
             .guard
             .unwrap_or_else(|| Arc::new(RequestGuard::default()));

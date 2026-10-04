@@ -25,7 +25,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{PatchSet, SimpleTable};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
@@ -164,7 +164,7 @@ async fn spawn_server(
     fixture: &Fixture,
     sessions: usize,
 ) -> (
-    Arc<SessionManager<RecordingSnapshot, RosterAuth, ConnettoWatermark>>,
+    Arc<SessionManager<RecordingSnapshot, RosterAuth, ConnettoDefaults>>,
     Arc<Mutex<Vec<String>>>,
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
@@ -182,7 +182,7 @@ async fn spawn_server(
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

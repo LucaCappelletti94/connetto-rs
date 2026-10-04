@@ -16,14 +16,14 @@ use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
     RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
 
 /// A manager whose computed subscriptions read through connetto's connector.
-type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
+type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 fn manager(fixture: &Fixture) -> Arc<Manager> {
     let guard = Arc::new(RequestGuard::new(
@@ -43,7 +43,7 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
         RosterAuth::granting_nobody(),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
     )
     .with_guard(guard)
     .build()

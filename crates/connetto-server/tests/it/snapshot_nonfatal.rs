@@ -25,7 +25,7 @@ use connetto_server::{
     Position, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
@@ -95,7 +95,7 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -186,7 +186,7 @@ async fn refusals_are_byte_identical_across_causes() {
                 RosterAuth::granting_nobody().withholding(WITHHELD_ID),
                 Arc::new(TestGrantChecker),
                 NoConnector,
-                pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+                pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
                     .expect("build write target"),
             )
             .build();
@@ -299,7 +299,7 @@ async fn a_capture_reads_only_the_records_its_own_test_provoked() {
                 RosterAuth::granting_nobody().withholding(WITHHELD_ID),
                 Arc::new(TestGrantChecker),
                 NoConnector,
-                pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+                pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
                     .expect("build write target"),
             )
             .build();
@@ -378,7 +378,7 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_oplog(oplog)
@@ -616,7 +616,7 @@ async fn a_mid_read_page_failure_causes_exactly_one_restart_then_refuses() {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

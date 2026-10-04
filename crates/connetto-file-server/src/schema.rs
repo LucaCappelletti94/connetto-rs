@@ -206,6 +206,13 @@ where
     /// fits every deployment that applies it; a deployment with its own DDL
     /// overrides the constant to match its name.
     const TRAFFIC_SQL: &'static str = "_cfs_traffic";
+    /// The tables this schema reads and writes, by name (R98 decision 5).
+    const TABLES: &'static [&'static str] = &[
+        Self::MANIFESTS_SQL,
+        Self::MANIFEST_CHUNKS_SQL,
+        Self::CHUNK_REGISTRY_SQL,
+        Self::TRAFFIC_SQL,
+    ];
 
     /// Build `manifests.file_id = file_id AND manifests.uploaded_by = caller`.
     fn manifest_pk_eq(file_id: Vec<u8>, caller: String) -> Self::ManifestPkEq;

@@ -23,7 +23,7 @@ use connetto_server::{
     SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
@@ -135,7 +135,7 @@ struct Order {
     status: Option<String>,
 }
 
-type Manager = SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>;
+type Manager = SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults>;
 
 /// One `orders` row as the Postgres target reports it (`INT` -> `i32`).
 type PgOrderRow = (i32, Option<f64>, Option<i32>, Option<String>);
@@ -277,7 +277,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -392,7 +392,7 @@ async fn offline_write_reflushes_after_resume() {
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -517,7 +517,7 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(writes.clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(writes.clone(), PG_DDL).expect("build write target"),
     )
     .with_session(SessionConfig::default().with_write_retry_budget(Duration::from_millis(200)))
     .build();
@@ -618,7 +618,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

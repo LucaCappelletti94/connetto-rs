@@ -66,10 +66,10 @@ use crate::oplog::{CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, catchup_
 use crate::reexec::{FailedRead, NoConnector, ReadBudget, ReadFailure};
 use crate::reserve::ReaderPermit;
 use crate::row_view::ValuesRow;
+use crate::schema::ConnettoSchema;
 use crate::slot::SlotError;
 use crate::throttle::{ReadLimits, Tier};
 use crate::timeline::{Position, TimelineError, TimelineHistory};
-use crate::watermark_schema::ConnettoWatermarkSchema;
 use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
 use connetto_core::auth::CapabilityKey;
 use connetto_core::auth::{AuthContext, CapabilitySubject};
@@ -1392,10 +1392,10 @@ struct SessionState<Id, Key> {
 pub struct SessionManager<
     Snap,
     Auth,
-    W,
+    D,
     C = NoConnector,
     O = InMemoryOplog,
-    Id = String,
+    Id = <D as ConnettoSchema>::Id,
     Key = String,
     S = NoSigner,
 > where
@@ -1403,7 +1403,7 @@ pub struct SessionManager<
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
     C: ReadConnector,
     O: Oplog,
-    W: ConnettoWatermarkSchema<Id = Id>,
+    D: ConnettoSchema<Id = Id>,
     S: ContentTicketSigner,
 {
     materializer: Arc<Mutex<Materializer<ParserDB, RuntimeWritableCatalog, C>>>,
@@ -1429,7 +1429,7 @@ pub struct SessionManager<
     authority: Arc<dyn HandshakeAuthority<Id, Key>>,
     connector: C,
     oplog: O,
-    target: PgWriteTarget<W>,
+    target: PgWriteTarget<D>,
     next_session: AtomicU64,
     next_consumer: AtomicU64,
     config: SessionConfig,
@@ -1508,8 +1508,8 @@ impl Drop for OpenSessionTally {
 }
 
 /// The manager over the `String` ids and keys every construction shares.
-pub(crate) type ConnettoManager<Snap, Auth, W, C, O, S> =
-    SessionManager<Snap, Auth, W, C, O, String, String, S>;
+pub(crate) type ConnettoManager<Snap, Auth, D, C, O, S> =
+    SessionManager<Snap, Auth, D, C, O, <D as ConnettoSchema>::Id, String, S>;
 
 /// The single assembly every manager construction goes through, which
 /// `ManagerBuilder` owns.
@@ -1517,28 +1517,28 @@ pub(crate) type ConnettoManager<Snap, Auth, W, C, O, S> =
     clippy::too_many_arguments,
     reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
 )]
-pub(crate) fn assemble_manager<Snap, Auth, C, O, W, S>(
+pub(crate) fn assemble_manager<Snap, Auth, C, O, D, S>(
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
     snapshot_source: Snap,
     auth: Auth,
-    authority: Arc<dyn HandshakeAuthority>,
+    authority: Arc<dyn HandshakeAuthority<D::Id>>,
     connector: C,
     oplog: O,
-    target: PgWriteTarget<W>,
-    guard: Arc<RequestGuard<String>>,
+    target: PgWriteTarget<D>,
+    guard: Arc<RequestGuard<D::Id>>,
     config: SessionConfig,
     upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
     signer: S,
     withdrawal_source: Option<Snap>,
-    second_opinion: Option<Arc<dyn crate::parity::SecondOpinion<String, String>>>,
-) -> Arc<ConnettoManager<Snap, Auth, W, C, O, S>>
+    second_opinion: Option<Arc<dyn crate::parity::SecondOpinion<D::Id, String>>>,
+) -> Arc<ConnettoManager<Snap, Auth, D, C, O, S>>
 where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
+    Snap: SnapshotSource<D::Id>,
+    Auth: VisibilityPolicy<Watcher = Arc<Principal<D::Id>>, Backend = Postgres>,
     C: ReadConnector,
     C::Error: FailedRead,
     O: Oplog,
-    W: ConnettoWatermarkSchema<Id = String>,
+    D: ConnettoSchema,
     S: ContentTicketSigner,
 {
     Arc::new(SessionManager {
@@ -1570,7 +1570,7 @@ where
     })
 }
 
-impl<Snap, Auth, C, O, Id, Key, W, S> SessionManager<Snap, Auth, W, C, O, Id, Key, S>
+impl<Snap, Auth, C, O, Id, Key, D, S> SessionManager<Snap, Auth, D, C, O, Id, Key, S>
 where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
@@ -1580,7 +1580,7 @@ where
     O: Oplog,
     Id: core::fmt::Display + Clone + Send + Sync + 'static,
     Key: CapabilityKey,
-    W: ConnettoWatermarkSchema<Id = Id>,
+    D: ConnettoSchema<Id = Id>,
     S: ContentTicketSigner,
 {
     /// Ask a second executor about every current row alongside the one that

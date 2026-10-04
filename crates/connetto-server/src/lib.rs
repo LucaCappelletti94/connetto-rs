@@ -62,6 +62,7 @@ pub mod reach;
 pub mod reexec;
 pub mod reserve;
 pub mod row_view;
+pub mod schema;
 pub mod session;
 pub mod slot;
 pub mod snapshot;
@@ -83,7 +84,7 @@ pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
 // matching on a refused verb can spell its type.
 pub use subql::visibility::WriteOp;
-// Re-exported so the `connetto_auth_tables!` macro can name it as
+// Re-exported so `connetto_schema!` can name it as
 // `$crate::SessionId` in a consumer's crate, which need not depend on
 // connetto-core directly.
 pub use authn::http::{
@@ -109,6 +110,9 @@ pub use connetto_core::SessionId;
 pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };
+#[cfg(feature = "content")]
+#[doc(hidden)]
+pub use connetto_file_server as __files;
 #[cfg(feature = "test-seams")]
 pub use manager_builder::ManagerBuilder;
 #[cfg(feature = "test-seams")]
@@ -129,6 +133,7 @@ pub use reexec::{
 };
 pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
+pub use schema::ConnettoSchema;
 pub use session::{
     NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, ResumePoint, SessionConfig,
     SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, StreamCheck,

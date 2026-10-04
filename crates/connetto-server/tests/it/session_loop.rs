@@ -24,7 +24,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -170,7 +170,7 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 /// to the sessions through the manager.
 async fn drive_cdc<S, A>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<S, A, ConnettoWatermark>,
+    manager: &SessionManager<S, A, ConnettoDefaults>,
     sql: &str,
 ) where
     S: SnapshotSource,
@@ -202,7 +202,7 @@ async fn loopback_session_full_lifecycle() {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_session(config)
@@ -346,7 +346,7 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         RosterAuth::granting("client-ws").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -588,7 +588,7 @@ async fn loopback_session_composite_key_sync() {
         RosterAuth::granting("client-ck"),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), READINGS_PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), READINGS_PG_DDL)
             .expect("build write target"),
     )
     .build();

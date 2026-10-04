@@ -32,7 +32,7 @@ use connetto_server::{
     PageSpec, PgOplog, SnapshotEstimate, SnapshotPage, SnapshotSource, catchup_decision, loopback,
     pg_write_target, slot,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
 
 /// Its own slot and table names, so this never contends with the shared fixture
@@ -298,7 +298,7 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         connetto_server::NoConnector,
-        pg_write_target::<ConnettoWatermark>(admin.clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(admin.clone(), PG_DDL).expect("build write target"),
     )
     .with_oplog(PgOplog::new(admin.clone(), OPLOG, OplogConfig::default()))
     .build();

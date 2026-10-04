@@ -22,7 +22,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, SnapshotEstimate, SnapshotPage,
     SnapshotSource, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgSqliteEmuSource, SourceItem};
 
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT);";
@@ -130,7 +130,7 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_upkeep(upkeep)

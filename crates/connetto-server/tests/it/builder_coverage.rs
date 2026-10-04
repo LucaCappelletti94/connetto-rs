@@ -23,8 +23,8 @@ use connetto_server::builder::{
 };
 use connetto_server::{
     AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
-    ReaderReserve, ReconnectPolicy, RuntimeWritableCatalog, SessionConfig, ThrottleConfig,
-    TierLimits, WebSocketTransport,
+    PreflightError, ReaderReserve, ReconnectPolicy, RuntimeWritableCatalog, SessionConfig,
+    ThrottleConfig, TierLimits, WebSocketTransport,
 };
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
@@ -1697,6 +1697,55 @@ async fn an_unreachable_authorization_endpoint_refuses_naming_it() {
         }
         other => panic!("the build answered {other:?}"),
     }
+}
+
+/// The refusal a build over `fixture` answers once `turn_on` set it up, which
+/// must be a missing artifact.
+async fn missing(fixture: &Fixture, turn_on: fn(ServerBuilder) -> ServerBuilder) -> String {
+    let (builder, _idp, _keys) = builder_over(fixture, 0).await;
+    match refused(turn_on(builder).build().await, "a missing table refuses") {
+        BuildError::Preflight(err @ PreflightError::Missing { .. }) => err.to_string(),
+        other => panic!("the build answered {other:?}"),
+    }
+}
+
+/// A table one of the schema's members names and the deployment never
+/// created refuses the build naming it, the ban and audit tables only when
+/// those are turned on.
+#[tokio::test]
+async fn a_missing_schema_table_refuses_naming_it() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    exec(&pool, "DROP TABLE auth_events").await;
+
+    let bans = missing(&fixture, |builder| builder.bans(true)).await;
+    assert!(
+        bans.starts_with("table connetto_bans does not exist"),
+        "{bans}"
+    );
+    let audit = missing(&fixture, |builder| builder.audit(true)).await;
+    assert!(
+        audit.starts_with("table auth_events does not exist"),
+        "{audit}"
+    );
+
+    exec(&pool, "DROP TABLE _connetto_mutations").await;
+    let watermark = missing(&fixture, |builder| builder).await;
+    assert!(
+        watermark.starts_with("table _connetto_mutations does not exist"),
+        "{watermark}"
+    );
+
+    exec(&pool, "DROP TABLE connetto_provider_tokens").await;
+    let auth = missing(&fixture, |builder| builder).await;
+    assert!(
+        auth.starts_with("table connetto_provider_tokens does not exist"),
+        "{auth}"
+    );
 }
 
 /// A build refusal that lands after the slot-lag watcher and the content

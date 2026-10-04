@@ -25,7 +25,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SnapshotEstimate,
     SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::QueryableByName;
 use diesel::sql_query;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -251,7 +251,7 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
         .build()
         .expect("build materializer");
     let target =
-        pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
+        pg_write_target::<ConnettoDefaults>(writer_pool, PG_DDL).expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
         NoSnapshot,
@@ -340,7 +340,7 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
         .build()
         .expect("build materializer");
     let target =
-        pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
+        pg_write_target::<ConnettoDefaults>(writer_pool, PG_DDL).expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
         NoSnapshot,
@@ -429,7 +429,7 @@ async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() 
                 .withholding(WITHHELD_ID),
             Arc::new(TestGrantChecker),
             NoConnector,
-            pg_write_target::<ConnettoWatermark>(writer_pool.clone(), PG_DDL)
+            pg_write_target::<ConnettoDefaults>(writer_pool.clone(), PG_DDL)
                 .expect("build write target"),
         )
         .build()

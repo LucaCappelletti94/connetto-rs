@@ -37,6 +37,7 @@ use subql::ParserDB;
 use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 
 use crate::capability::CallerBinding;
+use crate::schema::ConnettoSchema;
 use crate::watermark_schema::ConnettoWatermarkSchema;
 use connetto_core::auth::CapabilityKey;
 
@@ -123,15 +124,15 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
 /// subql's catalog-only entry point, so the catalog is shared by reference
 /// across the apply `await` (`ParserDB` is `Sync`) with no per-write engine to
 /// build.
-pub struct PgWriteTarget<W> {
+pub struct PgWriteTarget<D> {
     pool: Pool<AsyncPgConnection>,
     catalog: ParserDB,
     /// The setting a policy reads the caller's identity from.
     user_setting: std::sync::Arc<str>,
     /// The deployment's watermark schema, carried only in the type system so
-    /// `commit`/`last_applied` name its table. `fn() -> W` keeps the target
-    /// `Send`/`Sync` regardless of `W`.
-    _watermark: PhantomData<fn() -> W>,
+    /// `commit`/`last_applied` name its watermark table. `fn() -> D` keeps the
+    /// target `Send`/`Sync` regardless of `D`.
+    _watermark: PhantomData<fn() -> D>,
 }
 
 /// Build a Postgres write target over a pool and the catalog DDL.
@@ -139,10 +140,10 @@ pub struct PgWriteTarget<W> {
 /// # Errors
 ///
 /// [`MaterializerError::Catalog`] when the DDL does not parse.
-pub fn pg_write_target<W: ConnettoWatermarkSchema>(
+pub fn pg_write_target<D: ConnettoSchema>(
     pool: Pool<AsyncPgConnection>,
     pg_ddl: &str,
-) -> Result<PgWriteTarget<W>, MaterializerError> {
+) -> Result<PgWriteTarget<D>, MaterializerError> {
     let catalog = ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
         .map_err(|err| MaterializerError::Catalog(format!("{err:?}")))?;
     Ok(PgWriteTarget {
@@ -173,7 +174,7 @@ fn is_rls_violation(text: &str) -> bool {
     text.to_lowercase().contains("row-level security")
 }
 
-impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
+impl<D: ConnettoSchema> PgWriteTarget<D> {
     /// Read the caller's identity from `setting` rather than the default.
     ///
     /// The share-key setting has been the application's choice since R4; this
@@ -207,7 +208,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     /// `docs/architecture/08-authorization.md`.
     pub(crate) async fn commit<Key: CapabilityKey>(
         &self,
-        caller: &Principal<W::Id, Key>,
+        caller: &Principal<D::Id, Key>,
         plan: &WritePlan,
         payload_zstd: &[u8],
         session_id: SessionId,
@@ -224,7 +225,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(async move |c| {
                 // A commit whose answer was lost is already covered, and applying it again would write it twice.
-                if watermark_of::<W>(c, watermark_session)
+                if watermark_of::<D::Watermark>(c, watermark_session)
                     .await?
                     .is_some_and(|last| last >= seq)
                 {
@@ -253,7 +254,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
                 // apply and its dedupe record are one atomic step. The
                 // deployment owns the table; connetto keeps the monotone
                 // GREATEST advance inside `watermark_upsert`.
-                W::watermark_upsert(watermark_session, seq)
+                D::Watermark::watermark_upsert(watermark_session, seq)
                     .execute(c)
                     .await?;
                 Ok(WriteOutcome::Applied)
@@ -270,7 +271,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
         session_id: SessionId,
     ) -> Result<Option<u64>, WriteError> {
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        let last_seq = watermark_of::<W>(&mut conn, session_id).await?;
+        let last_seq = watermark_of::<D::Watermark>(&mut conn, session_id).await?;
         Ok(last_seq.and_then(|seq| u64::try_from(seq).ok()))
     }
 
@@ -285,7 +286,7 @@ impl<W: ConnettoWatermarkSchema> PgWriteTarget<W> {
     pub(crate) async fn file_visible_to_caller<Key: CapabilityKey>(
         &self,
         file_id: [u8; 32],
-        caller: &Principal<W::Id, Key>,
+        caller: &Principal<D::Id, Key>,
     ) -> Result<bool, WriteError> {
         use visibility::connetto_visible_files;
         let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));

@@ -22,7 +22,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, WebSocketTransport,
     pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, committed_at};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, committed_at};
 use diesel::prelude::*;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
@@ -39,7 +39,7 @@ diesel::table! {
 }
 
 /// A manager whose computed subscriptions read through connetto's connector.
-type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
+type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 fn manager(fixture: &Fixture) -> Arc<Manager> {
     let guard = Arc::new(RequestGuard::new(
@@ -59,7 +59,7 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
         RosterAuth::granting("token"),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool.clone()),
-        pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
     )
     .with_guard(guard)
     .build()

@@ -18,7 +18,7 @@ use connetto_server::{
     PageSpec, RequestGuard, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, with_user};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, with_user};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -364,7 +364,7 @@ pub(crate) async fn request_ticket(
 pub(crate) type TicketManager<S> = SessionManager<
     NeverSnapshot,
     RosterAuth,
-    ConnettoWatermark,
+    ConnettoDefaults,
     NoConnector,
     InMemoryOplog,
     String,
@@ -392,7 +392,7 @@ pub(crate) fn build_manager_named_setting<S: ContentTicketSigner>(
         roster,
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL)
+        pg_write_target::<ConnettoDefaults>(reader_pool, PG_DDL)
             .expect("build write target")
             .with_user_setting(user_setting),
     )

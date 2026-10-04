@@ -42,11 +42,10 @@ use connetto_server::{
     AbuseConfig, AbuseLimits, ConnectionLimits, Crossing, Enforcement, EnforcementFuture,
     EnforcementPolicy, LoopbackTransport, ManagerBuilder, Materializer, NewBan, NoConnector,
     PageSpec, PersonLimits, RequestGuard, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, ThrottleConfig, TierLimits, connetto_audit_table, connetto_ban_table, loopback,
-    pg_ban_store, pg_write_target,
+    SnapshotSource, ThrottleConfig, TierLimits, loopback, pg_ban_store, pg_write_target,
 };
 use connetto_test_harness::{
-    ConnettoWatermark, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
+    ConnettoDefaults, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
 };
 use diesel::prelude::*;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -56,15 +55,9 @@ use subql::backend::Postgres as PgBackend;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
-// The reference defaults over `Id = String`, which is what `TestGrantChecker`
+// The default schema is over `Id = String`, which is what `TestGrantChecker`
 // resolves a `user:` grant to.
-connetto_ban_table!(String, diesel::sql_types::Text);
-connetto_audit_table!(
-    String,
-    diesel::sql_types::Text,
-    uuid::Uuid,
-    diesel::sql_types::Uuid,
-);
+use connetto_server::defaults::{auth_events, connetto_bans};
 
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
@@ -284,12 +277,12 @@ fn throttled_guard(
     policy: Option<Arc<dyn EnforcementPolicy<String>>>,
 ) -> Arc<RequestGuard<String>> {
     let mut built = RequestGuard::new(*throttle, abuse)
-        .with_bans(pg_ban_store::<ConnettoBans>(fixture.admin().clone()));
+        .with_bans(pg_ban_store::<ConnettoDefaults>(fixture.admin().clone()));
     if let Some(policy) = policy {
         built = built.with_enforcement(policy);
     }
     let built = Arc::new(built);
-    built.set_audit_hook(pg_audit_hook::<ConnettoAudit>(fixture.admin().clone()));
+    built.set_audit_hook(pg_audit_hook::<ConnettoDefaults>(fixture.admin().clone()));
     built
 }
 
@@ -299,7 +292,7 @@ fn manager<A>(
     fixture: &Fixture,
     auth: A,
     guard: &Arc<RequestGuard<String>>,
-) -> Arc<SessionManager<KeyedSnapshot, A, ConnettoWatermark>>
+) -> Arc<SessionManager<KeyedSnapshot, A, ConnettoDefaults>>
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
     A::Error: core::fmt::Display,
@@ -312,7 +305,7 @@ where
         auth,
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_guard(Arc::clone(guard))
@@ -340,7 +333,7 @@ fn times_asked(counter: &AtomicUsize) -> usize {
 
 /// Open a connection presenting `grants`, expecting the handshake to succeed.
 async fn connect<A>(
-    manager: &Arc<SessionManager<KeyedSnapshot, A, ConnettoWatermark>>,
+    manager: &Arc<SessionManager<KeyedSnapshot, A, ConnettoDefaults>>,
     client_id: &str,
     grants: &[&str],
 ) -> Live
@@ -373,7 +366,7 @@ where
 /// what a banned caller sees and what a caller whose subscription failed sees,
 /// so neither learns which happened.
 async fn handshake_accepted<A>(
-    manager: &Arc<SessionManager<KeyedSnapshot, A, ConnettoWatermark>>,
+    manager: &Arc<SessionManager<KeyedSnapshot, A, ConnettoDefaults>>,
     client_id: &str,
     grants: &[&str],
 ) -> bool
@@ -621,7 +614,7 @@ async fn an_expiry_lapses_silently_and_only_a_lift_is_recorded() {
     reset_tables(&fixture).await;
     let guard = guard(&fixture, limits(2, 1), None);
     let manager = manager(&fixture, silent_policy(), &guard);
-    let bans = pg_ban_store::<ConnettoBans>(fixture.admin().clone());
+    let bans = pg_ban_store::<ConnettoDefaults>(fixture.admin().clone());
     let session = connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4());
 
     bans.impose(NewBan::starting_now(
@@ -803,7 +796,7 @@ async fn a_ban_applies_under_row_level_security_with_no_policy_admitting_anyone(
 
     let guard = guard(&fixture, limits(2, 1), None);
     let manager = manager(&fixture, silent_policy(), &guard);
-    let bans = pg_ban_store::<ConnettoBans>(fixture.admin().clone());
+    let bans = pg_ban_store::<ConnettoDefaults>(fixture.admin().clone());
     bans.impose(NewBan::starting_now(
         "heidi".to_owned(),
         connetto_core::SessionId::from_uuid(uuid::Uuid::new_v4()),

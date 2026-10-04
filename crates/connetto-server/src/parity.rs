@@ -60,9 +60,8 @@ use connetto_core::auth::CapabilityKey;
 /// A second executor asked about the row as it is now, alongside the one that
 /// delivers.
 ///
-/// Type-erased on purpose. The session manager is generic over the deployment's
-/// identity type while row-level security answers only for the reference one,
-/// and the row arrives as whichever view the change path built. Erasure costs
+/// Type-erased on purpose, because the row arrives as whichever view the change
+/// path built. Erasure costs
 /// one boxed future per compared event, paid only by a run that asked for the
 /// comparison.
 pub trait SecondOpinion<Id, Key>: Send + Sync {
@@ -80,11 +79,15 @@ pub trait SecondOpinion<Id, Key>: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
-impl<Key: CapabilityKey> SecondOpinion<String, Key> for RlsAuth<Key> {
+impl<Id, Key> SecondOpinion<Id, Key> for RlsAuth<Id, Key>
+where
+    Id: Display + Send + Sync + 'static,
+    Key: CapabilityKey,
+{
     fn compare<'a>(
         &'a self,
         row: &'a (dyn RowView<Backend = Postgres> + Sync),
-        watchers: &'a [Arc<Principal<String, Key>>],
+        watchers: &'a [Arc<Principal<Id, Key>>],
         shipped: &'a [Verdict],
     ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {

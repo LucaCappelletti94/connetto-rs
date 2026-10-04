@@ -34,7 +34,7 @@ use connetto_server::{
     OplogConfig, PageSpec, PgOplog, RuntimeWritableCatalog, SessionConfig, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -458,13 +458,13 @@ impl SnapshotSource for GatedSnapshot {
     }
 }
 
-fn gadgets_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
-    pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), GADGETS_PG_DDL)
+fn gadgets_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoDefaults> {
+    pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), GADGETS_PG_DDL)
         .expect("build write target")
 }
 
-fn server_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
-    pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+fn server_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<ConnettoDefaults> {
+    pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target")
 }
 
@@ -473,7 +473,7 @@ fn server_write_target(fixture: &Fixture) -> connetto_server::PgWriteTarget<Conn
 async fn seeded_orders_target(
     fixture: &Fixture,
     status: &str,
-) -> connetto_server::PgWriteTarget<ConnettoWatermark> {
+) -> connetto_server::PgWriteTarget<ConnettoDefaults> {
     reset_orders(fixture).await;
     let mut conn = fixture.admin().get().await.expect("admin connection");
     diesel_async::RunQueryDsl::execute(
@@ -487,7 +487,7 @@ async fn seeded_orders_target(
     )
     .await
     .expect("seed order");
-    pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target")
 }
 
@@ -1651,7 +1651,7 @@ async fn aggregate_subscription_bootstraps_and_updates_through_the_client() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -1795,7 +1795,7 @@ async fn unsupported_subscription_is_rejected_without_closing() {
 /// Drive the emulator to completion, dispatching every produced CDC event
 /// through the manager so delta aggregates fold in-process.
 async fn drain_events<S, C, O>(
-    manager: &SessionManager<S, RosterAuth, ConnettoWatermark, C, O>,
+    manager: &SessionManager<S, RosterAuth, ConnettoDefaults, C, O>,
     source: &mut PgSqliteEmuSource,
 ) where
     S: SnapshotSource,
@@ -1885,7 +1885,7 @@ async fn delta_aggregates_bootstrap_and_fold_through_the_client() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -2063,7 +2063,7 @@ async fn a_change_during_an_aggregate_bootstrap_is_counted() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -2146,7 +2146,7 @@ async fn an_aggregates_first_frame_is_its_full_result() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -2327,7 +2327,7 @@ async fn row_subscription_and_delta_aggregate_coexist() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -2445,7 +2445,7 @@ async fn unsubscribing_a_delta_aggregate_stops_updates() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -2690,7 +2690,7 @@ async fn live_value_tracks_a_server_aggregate() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -2816,7 +2816,7 @@ async fn live_value_decodes_a_temporal_aggregate() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -3142,7 +3142,7 @@ async fn identical_value_watches_share_one_sub_and_late_joiner_resolves_from_cac
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -3531,7 +3531,7 @@ async fn gated_server(
     release: &Arc<Notify>,
     rows: Vec<Order>,
 ) -> (
-    Arc<SessionManager<GatedSnapshot, RosterAuth, ConnettoWatermark>>,
+    Arc<SessionManager<GatedSnapshot, RosterAuth, ConnettoDefaults>>,
     std::net::SocketAddr,
     tokio::task::JoinHandle<()>,
 ) {
@@ -3567,7 +3567,7 @@ async fn gated_server(
 /// as the standing CDC ingestor does.
 async fn drive_cdc<S: SnapshotSource>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<S, RosterAuth, ConnettoWatermark>,
+    manager: &SessionManager<S, RosterAuth, ConnettoDefaults>,
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
@@ -4039,7 +4039,7 @@ fn status_manager<O: Oplog>(
     fixture: &Fixture,
     status: &'static str,
     oplog: O,
-) -> Arc<SessionManager<StatusSnapshot, RosterAuth, ConnettoWatermark, NoConnector, O>> {
+) -> Arc<SessionManager<StatusSnapshot, RosterAuth, ConnettoDefaults, NoConnector, O>> {
     ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .build()
@@ -4057,7 +4057,7 @@ fn status_manager<O: Oplog>(
 /// Drive one insert through `manager`, whatever oplog it holds.
 async fn drive_insert<O: Oplog>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<StatusSnapshot, RosterAuth, ConnettoWatermark, NoConnector, O>,
+    manager: &SessionManager<StatusSnapshot, RosterAuth, ConnettoDefaults, NoConnector, O>,
     sql: &str,
 ) {
     source.execute_sql(sql).expect("execute dml");
@@ -4300,7 +4300,7 @@ async fn a_restart_reads_the_last_synced_value_from_the_resting_table() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,

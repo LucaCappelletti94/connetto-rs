@@ -2,8 +2,9 @@
 //!
 //! connetto owns no schema. A deployment declares its own `sessions` and
 //! `provider_tokens` tables (see `docs/architecture/11-authentication.md`) and
-//! implements [`ConnettoStoreSchema`] for them, either by hand or through the
-//! [`connetto_auth_tables!`](crate::connetto_auth_tables) convenience macro.
+//! implements [`ConnettoStoreSchema`] for them, either by hand or through
+//! [`connetto_schema!`](crate::connetto_schema), and names it as the `Auth`
+//! member of its [`ConnettoSchema`](crate::schema::ConnettoSchema).
 //! [`DbAuthStore`](super::store::DbAuthStore) is generic over this trait and
 //! keeps every query and security decision (identity resolution, refresh-token
 //! rotation, reuse-is-theft, deadline capping); only the mechanical diesel
@@ -125,6 +126,10 @@ where
         + Sync
         + 'static;
 
+    /// The tables this member reads and writes, by name, which startup
+    /// requires to exist (R98 decision 5).
+    const TABLES: &'static [&'static str];
+
     /// The sessions table, the `INSERT` target.
     type Sessions: Table + QueryId + Default + Send + 'static;
     /// The sessions table laundered as an opaque query source for plain SELECTs.
@@ -235,6 +240,7 @@ where
 /// connetto_server::connetto_auth_tables!(String, diesel::sql_types::Text);
 /// let store = DbAuthStore::<ConnettoAuthSchema>::new(pool, lifetimes, resolver);
 /// ```
+#[doc(hidden)]
 #[macro_export]
 macro_rules! connetto_auth_tables {
     ($id:ty, $id_sql:ty) => {
@@ -307,6 +313,8 @@ macro_rules! connetto_auth_tables {
 
         impl $crate::authn::schema::ConnettoStoreSchema for ConnettoAuthSchema {
             type Id = $id;
+            const TABLES: &'static [&'static str] =
+                &["connetto_sessions", "connetto_provider_tokens"];
 
             type Sessions = connetto_sessions::table;
             type SessionsQuery = connetto_sessions::table;

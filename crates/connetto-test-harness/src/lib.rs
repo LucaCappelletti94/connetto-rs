@@ -81,13 +81,9 @@ pub use roster::{RosterAuth, WITHHELD_ID};
 /// bodies, matching `Insert::<_, String, Vec<u8>>`.
 pub type RowValue = Value<String, Vec<u8>>;
 
-/// The reference watermark schema over `Id = String`, the shape every
-/// harness-backed test uses. connetto ships no schema, so the harness owns
-/// this reference via the macro, matching [`WATERMARK_DDL`].
-pub mod watermark {
-    connetto_server::connetto_watermark_table!(String);
-}
-pub use watermark::ConnettoWatermark;
+/// The default deployment schema over `Id = String`, the shape every
+/// harness-backed test uses, matching [`WATERMARK_DDL`].
+pub use connetto_server::defaults::ConnettoDefaults;
 
 /// The logical replication slot the CDC source follows. Matches the server
 /// binary default.
@@ -684,7 +680,7 @@ pub async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
 
 /// Reference DDL for the exactly-once watermark keyed on the session handle
 /// alone (R2). connetto emits no DDL, so the harness owns this table and keeps
-/// the shape matching the `ConnettoWatermark` reference schema.
+/// the shape matching the default schema's watermark member.
 pub const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
     (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)";
 
@@ -1404,7 +1400,7 @@ impl ContentTicketSigner for BoxSigner {
 type HarnessManager = SessionManager<
     PgSnapshotSource,
     HarnessAuth,
-    ConnettoWatermark,
+    ConnettoDefaults,
     PgReadConnector,
     InMemoryOplog,
     String,
@@ -1640,7 +1636,7 @@ pub async fn spawn_server(
     }
     let materializer = materializer_builder.build().expect("build materializer");
     let write =
-        pg_write_target::<ConnettoWatermark>(write_pool, &pg_ddl).expect("build write target");
+        pg_write_target::<ConnettoDefaults>(write_pool, &pg_ddl).expect("build write target");
     let withdrawal_pool = connector_pool.clone();
     let connector = PgReadConnector::with_session_setup(connector_pool);
     // The harness is test-only, so the stand-in authority reads the subject out of the grant string.
@@ -2365,7 +2361,7 @@ mod running_services_tests {
     use openfga_client::tonic::transport::Channel;
 
     use super::Fixture;
-    use super::watermark::_connetto_mutations;
+    use connetto_server::defaults::_connetto_mutations;
 
     /// A second database in a container's cluster stands in for a cluster
     /// something else started, beside that container's authorization service.

@@ -8,13 +8,15 @@
 
 **Built.** A deployment holds state in three places, which are its Postgres cluster, the stores beside it, and key files. The server binary emits no DDL, so every table below is created by the deployment's migration, and the table says what the server does at startup when one is missing.
 
+**Built (R98, 2026-10-04).** Every table connetto reads through a trait is a member of one `ConnettoSchema`, and the startup check names each member's tables from the `TABLES` the member reports, so a custom member is checked by its own names. Only names are checked, never columns.
+
 | Artifact | Named by | In a Postgres backup | At startup when missing |
 |---|---|---|---|
 | Application tables | `CONNETTO_PG_DDL` | Yes | The deployment's own concern |
-| `connetto_sessions`, `connetto_provider_tokens` | `connetto_auth_tables!` | Yes | No check. The first login or refresh fails |
-| `_connetto_mutations`, the exactly-once watermark | `connetto_watermark_table!` | Yes | No check. The first client write fails (`11-authentication.md`) |
-| `connetto_bans` | `ban.rs` | Yes | No check |
-| The audit table, only under `CONNETTO_AUDIT=database` | `connetto_audit_table!` | Yes | No check |
+| `connetto_sessions`, `connetto_provider_tokens` | `ConnettoSchema::Auth`, emitted by `connetto_schema!` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
+| `_connetto_mutations`, the exactly-once watermark | `ConnettoSchema::Watermark` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
+| `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by `preflight::require` (`Artifact::Table`) when bans are on |
+| The audit table, only under `CONNETTO_AUDIT=database` | `ConnettoSchema::Audit` | Yes | Refused by `preflight::require` (`Artifact::Table`) when the audit is on |
 | The reconnect log, `connetto_oplog`, and its last commit, `connetto_oplog_commit` | `CONNETTO_OPLOG_TABLE`, with `_commit` appended for the second | Yes | Both refused by `preflight::require` (`Artifact::Table`) |
 | `connetto_epoch`, the cluster the deployment last served from | `connetto_server::epoch::EPOCH_DDL` | Yes, which is what lets a restore into another cluster be seen | Refused by `preflight::require` (`Artifact::Table`) |
 | The publication and its previous images | `CONNETTO_PUBLICATION` | Yes | Refused (`Artifact::Publication`, `Artifact::PreviousImages`, and `Artifact::PublishedTable` for every table a policy reads) |
@@ -66,3 +68,5 @@
 **The binary is a translation from its environment into one `ServerBuilder`, and the builder is the one assembly path.** The binary reads every setting, binds the one listener and serves through the builder's own lifecycle, and owns what a process owns and a library must not own, the logging, the shutdown signal and the exit code. `CONNETTO_BIND` (default `127.0.0.1:8080`) names the one listener that serves the `/sync` WebSocket route, the login endpoints and the file routes. `CONNETTO_AUTH` accepts only `database`, the persisted JWT key files are required so a token survives a restart, and `CONNETTO_CONTENT_KEY` is required when `CONNETTO_CONTENT_URL` is set. The process exits `1` when the change stream cannot answer what a row looked like before it changed, or gives up reconnecting.
 
 **A program embeds the same builder.** `ServerBuilder::build` returns the parts, the merged router, the sync routes and the HTTP routes separately, the change-stream future and the shutdown handle, and a program that embeds the server mounts them into its own application. `ServerBuilder::serve` binds them and runs the serving lifecycle without ever ending the process, the change-stream future closes every session when a terminal outcome arrives, and the shutdown signal closes every session with `ServerShuttingDown` on its own drain. `crates/connetto-server/examples/embed.rs` builds the parts and mounts them beside a route of its own, so the application serves the sync, login and file routes from its own listener.
+
+**Built (R98, 2026-10-04). The builder takes the deployment's schema as its one type parameter.** `ServerBuilder` defaults to `ConnettoDefaults`, the tables `connetto_schema!` emits under the names this chapter lists, with a `String` user id and `DefaultUuidResolver` mapping each login to it. `ServerBuilder::deployment_schema::<D>(resolver)` serves over a deployment's own `ConnettoSchema` instead, with any user id type, and takes the `IdentityResolver` typed by that id at the same call, so a schema switch without one does not compile. `identity_resolver` replaces the resolver without switching schema, which is how a deployment maps logins into its own users table. `crates/connetto-server/tests/it/deployment_schema.rs` serves a deployment with its own watermark table and a `uuid::Uuid` user id.

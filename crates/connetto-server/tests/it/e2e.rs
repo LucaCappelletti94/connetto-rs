@@ -1322,6 +1322,7 @@ async fn e2e_startup_refuses_a_reconnect_log_without_its_commit_table() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
     let commit_table = connetto_server::PgOplog::commit_table(connetto_test_harness::OPLOG_TABLE);
     exec(&pool, &format!("DROP TABLE {commit_table}")).await;
 
@@ -2027,6 +2028,7 @@ async fn e2e_content_startup_names_each_refused_setting() {
     let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.clone());
     let pool = Pool::builder().build(manager).await.expect("build pool");
     reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
     fixture.start_replication(&["orders"]).await;
     // Sweep cadence is parsed after the content preflight, so the refusal
     // cases that reach it need a file-ready deployment.

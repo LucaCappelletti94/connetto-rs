@@ -2,9 +2,10 @@
 //! currently refusing.
 //!
 //! connetto owns no schema. A deployment declares the table and implements
-//! [`ConnettoBanSchema`] for it, by hand or through the
-//! [`connetto_ban_table!`](crate::connetto_ban_table) convenience macro, the
-//! same arrangement as [`ConnettoStoreSchema`](crate::authn::ConnettoStoreSchema),
+//! [`ConnettoBanSchema`] for it, by hand or through
+//! [`connetto_schema!`](crate::connetto_schema), and names it as the `Bans`
+//! member of its [`ConnettoSchema`](crate::schema::ConnettoSchema), the same
+//! arrangement as [`ConnettoStoreSchema`](crate::authn::ConnettoStoreSchema),
 //! [`ConnettoWatermarkSchema`](crate::watermark_schema::ConnettoWatermarkSchema)
 //! and [`ConnettoAuditSchema`](crate::audit::ConnettoAuditSchema).
 //!
@@ -196,6 +197,10 @@ where
     /// [`ConnettoAuditSchema`](crate::audit::ConnettoAuditSchema) carries.
     type Id: Clone + core::fmt::Display + Send + Sync + 'static;
 
+    /// The tables this member reads and writes, by name, which startup
+    /// requires to exist (R98 decision 5).
+    const TABLES: &'static [&'static str];
+
     /// The bans table laundered as an opaque query source for the plain SELECT.
     type BansQuery: Default + Send;
     /// The `session` column (`Uuid`).
@@ -225,7 +230,8 @@ where
     fn ban_delete(user_id: &Self::Id) -> Self::Lift;
 }
 
-/// A [`BanStore`] over `B` on the given pool.
+/// A [`BanStore`] over the deployment's ban table, `D`'s [`Bans`] member, on
+/// the given pool.
 ///
 /// **The owner pool, never the reader pool.** The reader pool connects as a role
 /// row-level security applies to, and an invisible row there is not an error but
@@ -234,12 +240,14 @@ where
 /// already where the auth store reads. The accepted cost is that a deployment
 /// cannot use row-level security to partition bans between its own tenants and
 /// must express that in the query instead.
+///
+/// [`Bans`]: crate::schema::ConnettoSchema::Bans
 #[must_use]
-pub fn pg_ban_store<B>(pool: Pool<AsyncPgConnection>) -> Arc<dyn BanStore<B::Id>>
+pub fn pg_ban_store<D>(pool: Pool<AsyncPgConnection>) -> Arc<dyn BanStore<D::Id>>
 where
-    B: ConnettoBanSchema,
+    D: crate::schema::ConnettoSchema,
 {
-    Arc::new(PgBanStore::<B> {
+    Arc::new(PgBanStore::<D::Bans> {
         pool,
         schema: PhantomData,
     })
@@ -316,6 +324,7 @@ impl<B: ConnettoBanSchema> BanStore<B::Id> for PgBanStore<B> {
 /// connetto_server::connetto_ban_table!(String, diesel::sql_types::Text);
 /// // now `ConnettoBans` implements `ConnettoBanSchema`.
 /// ```
+#[doc(hidden)]
 #[macro_export]
 macro_rules! connetto_ban_table {
     ($id:ty, $id_sql:ty $(,)?) => {
@@ -355,6 +364,7 @@ macro_rules! connetto_ban_table {
 
         impl $crate::ban::ConnettoBanSchema for ConnettoBans {
             type Id = $id;
+            const TABLES: &'static [&'static str] = &["connetto_bans"];
             type BansQuery = connetto_bans::table;
             type Session = connetto_bans::session;
             type Reason = connetto_bans::reason;

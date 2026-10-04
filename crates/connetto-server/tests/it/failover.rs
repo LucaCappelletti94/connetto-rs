@@ -28,7 +28,7 @@ use connetto_server::{
 use connetto_test_harness::Fixture;
 use connetto_test_harness::standby::{Pair, Switchboard};
 use connetto_test_harness::{
-    ConnettoWatermark, OPLOG_TABLE, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID, exec, pool_for,
+    ConnettoDefaults, OPLOG_TABLE, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID, exec, pool_for,
     provision_watermark,
 };
 use diesel_async::AsyncPgConnection;
@@ -50,7 +50,7 @@ const WAIT: Duration = Duration::from_secs(120);
 type Manager = SessionManager<
     PgSnapshotSource,
     RosterAuth,
-    ConnettoWatermark,
+    ConnettoDefaults,
     NoConnector,
     PgOplog,
     String,
@@ -199,7 +199,7 @@ fn manager_writing_to(
         RosterAuth::granting(CALLER).withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(writes, PG_DDL).expect("write target"),
+        pg_write_target::<ConnettoDefaults>(writes, PG_DDL).expect("write target"),
     )
     .with_oplog(oplog)
     .build()

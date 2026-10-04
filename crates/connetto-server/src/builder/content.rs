@@ -13,8 +13,7 @@ use crate::builder::PoolError;
 use crate::builder::build_pool;
 #[cfg(feature = "content")]
 use connetto_file_server::{
-    self as files, AnyStore, DbPool, DefaultFileSchema, FsStore, PreflightError, TicketSigner,
-    TicketVerifier,
+    self as files, AnyStore, DbPool, FsStore, PreflightError, TicketSigner, TicketVerifier,
 };
 
 /// The chunk store the file half serves.
@@ -191,7 +190,7 @@ fn ticket_keypair(
 /// leave it running. A failed pass is logged, not fatal, the next pass
 /// retries what it lost.
 #[cfg(feature = "content")]
-fn spawn_sweep(
+fn spawn_sweep<D: crate::schema::ConnettoSchema>(
     admin: DbPool,
     spec: StoreSpec,
     grace: Duration,
@@ -214,7 +213,7 @@ fn spawn_sweep(
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            match files::sweep::<DefaultFileSchema>(&admin, &store, grace).await {
+            match files::sweep::<D::Files>(&admin, &store, grace).await {
                 Ok(0) => {}
                 Ok(removed) => {
                     tracing::info!(removed, "content sweep reclaimed unreferenced chunks");
@@ -238,7 +237,7 @@ fn spawn_sweep(
 /// and a bulk read never spends the change path's reader share (R81's
 /// finding).
 #[cfg(feature = "content")]
-pub(crate) async fn build(
+pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     settings: Option<ContentSettings>,
     owner_url: &str,
     reader_url: &str,
@@ -258,7 +257,7 @@ pub(crate) async fn build(
     let (signer, public) = ticket_keypair(&settings)?;
     let admin = build_pool(owner_url, settings.owner_pool_size).await?;
     let reader = build_pool(reader_url, reader_pool_size).await?;
-    let router = files::serve(files::Config::<DefaultFileSchema> {
+    let router = files::serve(files::Config::<D::Files> {
         pools: files::AppPools {
             admin: admin.clone(),
             reader,
@@ -281,7 +280,7 @@ pub(crate) async fn build(
         _schema: std::marker::PhantomData,
     })
     .await?;
-    let reconciled = files::reconcile_store::<DefaultFileSchema>(
+    let reconciled = files::reconcile_store::<D::Files>(
         &admin,
         &open_store(&settings.store)?,
         &files::CallerSettings::default(),
@@ -295,7 +294,7 @@ pub(crate) async fn build(
             "the chunk store and the database disagreed, reconciled before serving",
         );
     }
-    let sweep = spawn_sweep(
+    let sweep = spawn_sweep::<D>(
         admin,
         settings.store.clone(),
         settings.grace,
@@ -322,7 +321,11 @@ pub(crate) async fn build(
 /// The no-op shape of [`build`] for a server built without the `content`
 /// feature. A configured deployment still hears about it.
 #[cfg(not(feature = "content"))]
-pub(crate) async fn build(
+#[expect(
+    clippy::extra_unused_type_parameters,
+    reason = "one call site serves both builds, and the content build reads the schema's file member"
+)]
+pub(crate) async fn build<D: crate::schema::ConnettoSchema>(
     settings: Option<ContentSettings>,
     _owner_url: &str,
     _reader_url: &str,
@@ -449,9 +452,14 @@ mod tests {
     #[tokio::test]
     async fn a_deployment_without_settings_mounts_nothing() {
         use crate::builder::ContentSigner;
-        let (signer, router, _) = build(None, "postgres://unused", "postgres://unused", 1)
-            .await
-            .expect("no settings is a valid deployment");
+        let (signer, router, _) = build::<crate::defaults::ConnettoDefaults>(
+            None,
+            "postgres://unused",
+            "postgres://unused",
+            1,
+        )
+        .await
+        .expect("no settings is a valid deployment");
         assert!(matches!(signer, ContentSigner::None));
         assert!(router.is_none());
     }
@@ -535,9 +543,10 @@ mod tests {
             key: doc.as_ref().to_vec(),
         };
         // The sweep's guard stays alive until the tick below, then stops it.
-        let (signer, router, _sweep) = build(Some(settings), &admin_url, &reader_url, 2)
-            .await
-            .expect("a configured deployment builds");
+        let (signer, router, _sweep) =
+            build::<crate::defaults::ConnettoDefaults>(Some(settings), &admin_url, &reader_url, 2)
+                .await
+                .expect("a configured deployment builds");
         let url = ContentTicketSigner::mint(
             &signer,
             &identified("caller-9"),
