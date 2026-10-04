@@ -40,6 +40,8 @@ mod e2e;
 
 mod enrolment;
 
+mod revocation;
+
 mod epoch;
 
 mod grants;

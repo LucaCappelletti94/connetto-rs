@@ -708,7 +708,7 @@ async fn revoke() {
         .await
         .expect("the enrolment grants");
     let key = first.identity().key();
-    store.revoke(key);
+    store.revoke_key(key);
 
     let mut events = client.client().events();
     assert!(

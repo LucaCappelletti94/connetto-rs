@@ -1,6 +1,7 @@
 //! Device enrolment over a live session (R74 step 3).
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use connetto_core::device_cert::{
@@ -17,13 +18,20 @@ use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
 
 use super::ticket_shared::{
-    OkSigner, build_manager_with_guard, do_handshake, do_handshake_anon, setup_reader,
+    OkSigner, TicketManager, build_manager_with_guard, do_handshake_anon, do_handshake_with,
+    setup_reader,
 };
 
 const DAY: Duration = Duration::from_hours(24);
 
 /// An issuer valid for a year and a month from now, under a fresh root.
 fn issuer() -> (Vec<u8>, DeviceIssuer) {
+    let (_, cert, issuer) = rooted_issuer();
+    (cert, issuer)
+}
+
+/// A fresh root's certificate, an issuer's certificate it signed, and the issuer.
+pub(super) fn rooted_issuer() -> (Vec<u8>, Vec<u8>, DeviceIssuer) {
     let now = SystemTime::now();
     let root = RootCa::create(
         DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
@@ -41,7 +49,7 @@ fn issuer() -> (Vec<u8>, DeviceIssuer) {
         )
         .expect("issuer");
     let issuer = DeviceIssuer::new(cert.clone(), key, root.certificate()).expect("load");
-    (cert, issuer)
+    (root.certificate().to_vec(), cert, issuer)
 }
 
 /// A session for `identity`, `None` meaning anonymous, against a manager that
@@ -52,6 +60,19 @@ async fn session(
     config: Option<DeviceCertConfig>,
     store: &Arc<MemoryEnrolments<String>>,
 ) -> LoopbackTransport {
+    let manager = enrolling_manager(
+        fixture,
+        config.map(|config| DeviceEnrolment::new(config, Arc::clone(store) as _)),
+    )
+    .await;
+    connect(&manager, identity).await
+}
+
+/// A manager that enrols through `enrolment` when one is given.
+pub(super) async fn enrolling_manager(
+    fixture: &Fixture,
+    enrolment: Option<DeviceEnrolment<String>>,
+) -> Arc<TicketManager<OkSigner>> {
     let manager = build_manager_with_guard(
         setup_reader(fixture).await,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
@@ -61,35 +82,56 @@ async fn session(
         )),
         OkSigner,
     );
-    if let Some(config) = config {
+    if let Some(enrolment) = enrolment {
         manager
-            .install_device_enrolment(Arc::new(DeviceEnrolment::new(
-                config,
-                Arc::clone(store) as _,
-            )))
+            .install_device_enrolment(Arc::new(enrolment))
             .unwrap_or_else(|_| panic!("installed once"));
     }
+    manager
+}
+
+/// A session for `identity`, `None` meaning anonymous, on `manager`.
+pub(super) async fn connect(
+    manager: &Arc<TicketManager<OkSigner>>,
+    identity: Option<&str>,
+) -> LoopbackTransport {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
     let (server_end, mut client) = loopback();
-    tokio::spawn(manager.serve(server_end));
+    tokio::spawn(Arc::clone(manager).serve(server_end));
+    // One session per connection, as one per login, since a second live
+    // connection on one session supersedes the first.
+    let handle = format!("conn-{}", NEXT.fetch_add(1, Ordering::Relaxed));
     match identity {
-        Some(identity) => do_handshake(&mut client, identity).await,
-        None => do_handshake_anon(&mut client, "anon").await,
+        Some(identity) => {
+            do_handshake_with(
+                &mut client,
+                &handle,
+                &[&format!("user:{identity}#{handle}")],
+            )
+            .await;
+        }
+        None => do_handshake_anon(&mut client, &handle).await,
     }
     client
 }
 
-async fn ask(client: &mut LoopbackTransport, message: ControlMessage) -> ControlMessage {
+/// Send `message` and return the next control frame, past any revocation
+/// lists the server pushes unasked.
+pub(super) async fn ask(client: &mut LoopbackTransport, message: ControlMessage) -> ControlMessage {
     client.send_control(message).await.expect("send");
     loop {
         match client.recv().await.expect("recv") {
+            Some(
+                IncomingFrame::Control(ControlMessage::RevocationUpdate(_))
+                | IncomingFrame::Bulk(_),
+            ) => {}
             Some(IncomingFrame::Control(reply)) => return reply,
-            Some(IncomingFrame::Bulk(_)) => {}
             None => panic!("the session closed"),
         }
     }
 }
 
-async fn challenge(client: &mut LoopbackTransport) -> ControlMessage {
+pub(super) async fn challenge(client: &mut LoopbackTransport) -> ControlMessage {
     ask(
         client,
         ControlMessage::EnrolChallengeRequest(EnrolChallengeRequest {
@@ -99,7 +141,7 @@ async fn challenge(client: &mut LoopbackTransport) -> ControlMessage {
     .await
 }
 
-async fn nonce(client: &mut LoopbackTransport) -> [u8; 32] {
+pub(super) async fn nonce(client: &mut LoopbackTransport) -> [u8; 32] {
     match challenge(client).await {
         ControlMessage::EnrolChallenge(EnrolChallenge {
             request_id, nonce, ..
@@ -111,7 +153,7 @@ async fn nonce(client: &mut LoopbackTransport) -> [u8; 32] {
     }
 }
 
-async fn enrol(
+pub(super) async fn enrol(
     client: &mut LoopbackTransport,
     key: &KeyPair,
     nonce: [u8; 32],
@@ -130,14 +172,14 @@ async fn enrol(
     .await
 }
 
-fn refused(reason: EnrolRefusal, request_id: &str) -> ControlMessage {
+pub(super) fn refused(reason: EnrolRefusal, request_id: &str) -> ControlMessage {
     ControlMessage::EnrolRefused(EnrolRefused {
         request_id: request_id.into(),
         reason,
     })
 }
 
-fn device_key() -> KeyPair {
+pub(super) fn device_key() -> KeyPair {
     KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key")
 }
 
@@ -311,7 +353,6 @@ async fn a_revoked_key_is_refused() {
     let fixture = Fixture::acquire().await;
     let store = Arc::new(MemoryEnrolments::default());
     let key = device_key();
-    store.revoke(KeyId::of_public_key(&key.subject_public_key_info()));
     let mut client = session(
         &fixture,
         Some("alice"),
@@ -320,9 +361,15 @@ async fn a_revoked_key_is_refused() {
     )
     .await;
     let handed = nonce(&mut client).await;
+    assert!(matches!(
+        enrol(&mut client, &key, handed, None, Vec::new()).await,
+        ControlMessage::EnrolGrant(_)
+    ));
+    store.revoke_key(KeyId::of_public_key(&key.subject_public_key_info()));
+    let handed = nonce(&mut client).await;
     let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
     assert_eq!(reply, refused(EnrolRefusal::Revoked, "e"));
-    assert_eq!(store.records(), Vec::new());
+    assert_eq!(store.records().len(), 1, "the renewal records nothing");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

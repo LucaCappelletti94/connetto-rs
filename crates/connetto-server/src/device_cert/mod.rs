@@ -18,8 +18,8 @@ mod enrolment;
 
 pub(crate) use enrolment::PendingChallenge;
 pub use enrolment::{
-    DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore, MemoryEnrolments,
-    Recorded,
+    Device, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore,
+    MemoryEnrolments, Recorded, Revocation, RevokeError, SessionRevoker,
 };
 
 /// The issuer and the lifetimes it grants.
@@ -96,6 +96,12 @@ impl DeviceCertConfig {
     pub const fn with_challenge_window(mut self, window: Duration) -> Self {
         self.challenge_window = window;
         self
+    }
+
+    /// The longest lifetime granted.
+    #[must_use]
+    pub const fn ceiling(&self) -> Duration {
+        self.ceiling
     }
 
     /// How long an enrolment nonce stays valid.
