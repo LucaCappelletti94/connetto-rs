@@ -16,9 +16,10 @@
 //! contract.
 //!
 //! A desktop sign-in ends in the system browser, which keeps the front. The
-//! application brings its window back once its setup completes, with
+//! application asks for its window back once its setup completes, with
 //! `dioxus::desktop::window().set_focus()` where the setup task finishes, as
-//! `examples/dioxus-desktop-demo` does. connetto knows no window, so this
+//! `examples/dioxus-desktop-demo` does, and GNOME on Wayland answers that with
+//! its notification that the app is ready. connetto knows no window, so this
 //! adapter offers no hook for it, except that `use_hello_owner` raises the
 //! window when it lends it, since Windows shows Hello only over a window in
 //! front.

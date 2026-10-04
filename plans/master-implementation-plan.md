@@ -171,7 +171,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
 | done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
-| any | R97 | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
+| done | ~~R97~~ | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
@@ -221,7 +221,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | nothing since R94 (2026-09-30). One decision and one open question in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
-| R97 the desktop login tab | IN PROGRESS, built 2026-10-02, proven on Windows and macOS 2026-10-03 | the Linux refocus proof | no |
+| R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R53 Windows gate | **DONE** (2026-10-02) | nothing. `HelloStore` is taken from the upstream branch at `3109f4d` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -2810,7 +2810,7 @@ On the physical device, per the probe's A4 rule. **Passed on the Galaxy M52 on 2
 
 ## R97: the desktop login tab
 
-**Status.** IN PROGRESS, built 2026-10-02. The loopback page closes itself where the browser allows and reports a refused login as not complete, the demo brings its window back after setup, and `connetto-dioxus`'s Hello owner raises the window when it lends it, since Windows shows Hello only over a window in front. Proven on Windows and on macOS on 2026-10-03: the window came forward by itself, Windows with the Hello prompt over it and macOS with one Touch ID, and the tab stayed open with "Login complete. Return to the app." The Linux refocus proof remains.
+**Status.** DONE 2026-10-04, built 2026-10-02. The loopback page closes itself where the browser allows and reports a refused login as not complete, the demo asks for its window back after setup, and `connetto-dioxus`'s Hello owner raises the window when it lends it, since Windows shows Hello only over a window in front. Proven on Windows and on macOS on 2026-10-03: the window came forward by itself, Windows with the Hello prompt over it and macOS with one Touch ID, and the tab stayed open with "Login complete. Return to the app." Measured on GNOME 46 on 2026-10-04, headless on pippo against the dev stack with real Chrome, five runs per session. On X11 the demo came forward within 0.7 s of the loopback page every time, including a run whose form was submitted by a real compositor click. On Wayland, Ubuntu's default, mutter refused the raise every time, marked the window as wanting attention and showed "connetto live demo is ready", which brings it forward when clicked. GNOME raises a window on Wayland only with an activation token from the focused application or from the requester's own recent input, and a web page has no way to hand one over, so the notification is the platform's answer, decided with the maintainer on 2026-10-04. The tab stays open with the same text on both. The harness and its accommodations are in the design record.
 
 A desktop sign-in leaves its browser tab open on the loopback page, and the app behind it. A page can close itself only if script opened it or its history holds one entry, and the identity provider's form adds history. Decided with the maintainer on 2026-10-02 and 2026-10-03: macOS, Windows and Linux keep the user's own browser and the loopback redirect, so the login has the browser's sessions and password manager, the page tries `window.close()` and otherwise tells the user to return to the app, and the app brings its window back to the front. Measured and rejected on 2026-10-03: `ASWebAuthenticationSession` on macOS, whose ephemeral window shares no sessions or passwords with the browser and whose shared session raises a consent dialog the maintainer judged worse. The working record is `plans/design-r97-desktop-login-tab.md`.
 ---
