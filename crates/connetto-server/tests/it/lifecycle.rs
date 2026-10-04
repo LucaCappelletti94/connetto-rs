@@ -249,10 +249,11 @@ async fn a_shutdown_signal_ends_serve_with_the_sessions_closed() {
     }
 }
 
-/// The terminal change-stream outcome (R6 decision 4): once the live table
-/// no longer records the previous image the catalog the server presents still
-/// names, the next change is undeliverable, `serve` returns the refusal after
-/// closing every session, and the runtime keeps working.
+/// The terminal change-stream outcome (R6 decision 4): once a table the boot
+/// preflight saw recording full previous images is switched to
+/// `REPLICA IDENTITY DEFAULT`, the next delete carries the key alone and is
+/// undeliverable, `serve` returns the refusal after closing every session,
+/// and the runtime keeps working.
 #[tokio::test]
 async fn an_unusable_change_stream_ends_serve_with_the_sessions_closed() {
     let _keyring = connetto_test_harness::isolated_session_keyring();
@@ -296,19 +297,10 @@ async fn an_unusable_change_stream_ends_serve_with_the_sessions_closed() {
         other => panic!("the snapshot opened with {other:?} instead"),
     }
 
-    // The live table drops the columns the catalog the server presents still
-    // names, so the stream's copy of the next delete carries the key and
-    // nothing else, and the previous image cannot be judged.
-    exec(&pool, "DROP TABLE orders").await;
-    exec(&pool, "CREATE TABLE orders (id INT PRIMARY KEY)").await;
-    exec(&pool, "GRANT SELECT ON orders TO app_reader").await;
-    exec(&pool, "INSERT INTO orders VALUES (1)").await;
-    exec(
-        &pool,
-        &format!("ALTER PUBLICATION {PUBLICATION} ADD TABLE orders"),
-    )
-    .await;
-    exec(&pool, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
+    // The operator drops the previous images after the boot preflight passed,
+    // so the stream's copy of the next delete carries the key and nothing
+    // else, and the previous image cannot be judged.
+    exec(&pool, "ALTER TABLE orders REPLICA IDENTITY DEFAULT").await;
     exec(&pool, "DELETE FROM orders WHERE id = 1").await;
 
     let outcome = tokio::time::timeout(BOUND, serve)
