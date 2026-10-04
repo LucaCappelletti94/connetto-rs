@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use connetto_core::device_cert::{
-    CertificateRequest, CertificateSigner, DeviceCertificate, DeviceKey, key_id,
+    CertificateRequest, CertificateSigner, DeviceCertificate, DeviceKey, KeyHome, key_id,
 };
 use connetto_core::messages::{
     ControlMessage, EnrolChallengeRequest, EnrolRefusal, EnrolRequest, SyncStatus,
@@ -135,6 +135,7 @@ pub(crate) struct Enroller {
     descriptor: Vec<u8>,
     commands: mpsc::UnboundedReceiver<Command>,
     published: watch::Sender<Option<DeviceCertificate>>,
+    home: watch::Sender<Option<KeyHome>>,
 }
 
 /// The application's half, held by the native client.
@@ -142,6 +143,7 @@ pub(crate) struct EnrolHandle {
     keys: Arc<dyn DeviceKeys>,
     commands: mpsc::UnboundedSender<Command>,
     published: watch::Receiver<Option<DeviceCertificate>>,
+    home: watch::Receiver<Option<KeyHome>>,
 }
 
 impl Enroller {
@@ -156,6 +158,7 @@ impl Enroller {
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
+        let (home, homed) = watch::channel(None);
         (
             Self {
                 keys: Arc::clone(&keys),
@@ -164,11 +167,13 @@ impl Enroller {
                 descriptor,
                 commands,
                 published,
+                home,
             },
             EnrolHandle {
                 keys,
                 commands: sender,
                 published: observed,
+                home: homed,
             },
         )
     }
@@ -187,6 +192,11 @@ impl EnrolHandle {
     /// The certificate this device holds.
     pub(crate) fn certificate(&self) -> Option<DeviceCertificate> {
         self.published.borrow().clone()
+    }
+
+    /// Where the device key lives, once it is open.
+    pub(crate) fn key_home(&self) -> Option<KeyHome> {
+        *self.home.borrow()
     }
 
     /// Delete the device key wherever it is held.
@@ -281,6 +291,7 @@ impl<L: Link> Run<L> {
             self.publish();
         }
         let key: Arc<dyn DeviceKey> = Arc::from(opened.key);
+        self.enroller.home.send_replace(Some(key.home()));
         self.key = Some(Arc::clone(&key));
         Ok(key)
     }
@@ -412,6 +423,7 @@ impl<L: Link> Run<L> {
             tracing::warn!(error = %err, "the revoked certificate could not be deleted");
         }
         self.key = None;
+        self.enroller.home.send_replace(None);
         self.held = None;
         self.publish();
         self.link.emit(ClientEvent::DeviceRevoked);

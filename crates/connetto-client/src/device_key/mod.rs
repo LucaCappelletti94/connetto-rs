@@ -23,6 +23,12 @@ mod apple;
 pub use apple::EnclaveKey;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) use apple::SecureEnclave;
+#[cfg(target_os = "windows")]
+mod windows;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::Tpm;
+#[cfg(target_os = "windows")]
+pub use windows::TpmKey;
 
 /// Why no device key could be made.
 #[derive(Debug, thiserror::Error)]
@@ -162,10 +168,20 @@ pub(crate) trait ChipKeys: Send + Sync {
 
 /// A platform without a key chip connetto reaches, so every device key there
 /// is a software key (decision 16).
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+)))]
 pub(crate) struct NoChip;
 
-#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "android",
+    target_os = "windows"
+)))]
 impl ChipKeys for NoChip {
     type Key = SoftwareKey;
 
@@ -266,6 +282,33 @@ fn boxed(opened: OpenedKey<SoftwareKey>) -> OpenedKey<Box<dyn DeviceKey>> {
         key: Box::new(opened.key),
         created: opened.created,
     }
+}
+
+/// The DER `ECDSA-Sig-Value` of a signature given as fixed-width `r || s`.
+#[cfg(any(target_os = "windows", test))]
+fn der_signature(fixed: &[u8; 64]) -> Vec<u8> {
+    fn integer(out: &mut Vec<u8>, value: &[u8]) {
+        let start = value
+            .iter()
+            .position(|&byte| byte != 0)
+            .unwrap_or(value.len() - 1);
+        let value = &value[start..];
+        let pad = value[0] & 0x80 != 0;
+        out.push(0x02);
+        out.push(u8::try_from(value.len() + usize::from(pad)).unwrap_or(u8::MAX));
+        if pad {
+            out.push(0);
+        }
+        out.extend_from_slice(value);
+    }
+    let mut body = Vec::with_capacity(70);
+    integer(&mut body, &fixed[..32]);
+    integer(&mut body, &fixed[32..]);
+    let mut der = Vec::with_capacity(body.len() + 2);
+    der.push(0x30);
+    der.push(u8::try_from(body.len()).unwrap_or(u8::MAX));
+    der.extend_from_slice(&body);
+    der
 }
 
 /// Run a chip call off the async runtime, since a TPM takes hundreds of

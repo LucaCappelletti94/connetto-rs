@@ -20,7 +20,7 @@ use connetto_client::{
     KeyringKeyStore, KeyringStore, NativeClient, NativeClientBuilder, NativeDurable,
     REPLICA_PREFIX, SyncStatus, device_key_record, replica_db_name,
 };
-use connetto_core::device_cert::{DeploymentId, DeviceCertificate, DeviceIssuer, RootCa};
+use connetto_core::device_cert::{DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome, RootCa};
 use connetto_core::messages::EnrolRefusal;
 use connetto_core::traits::{HandshakeAuthority, RefreshTokenStore};
 use connetto_server::device_cert::{
@@ -461,6 +461,11 @@ async fn first_connect() {
         rmp_serde::to_vec_named(&descriptor).expect("serializes")
     );
     assert_eq!(cert.identity().account(), session.user_id());
+    assert_eq!(
+        client.device_key_home(),
+        Some(KeyHome::Software),
+        "a Linux build without a key chip reports its software key"
+    );
     client.close().await;
 }
 

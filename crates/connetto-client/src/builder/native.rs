@@ -41,7 +41,7 @@ use crate::teardown::content_dir;
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
 use crate::{ClientError, ConnettoClient, Custody};
 #[cfg(feature = "device-identity")]
-use connetto_core::device_cert::{DeviceCertificate, DeviceDescriptor};
+use connetto_core::device_cert::{DeviceCertificate, DeviceDescriptor, KeyHome};
 
 /// The platform transport, a WebSocket over a plain loopback socket or a
 /// TLS stream the platform's trust store verified.
@@ -460,7 +460,14 @@ impl DeviceSetup {
         let chip = Arc::new(crate::device_key::AndroidKeystore::new(
             self.java.clone().ok_or(ClientError::MissingJavaAccess)?,
         ));
-        #[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+        #[cfg(target_os = "windows")]
+        let chip = Arc::new(crate::device_key::Tpm);
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        )))]
         let chip = Arc::new(crate::device_key::NoChip);
         Ok(Arc::new(PlatformKeys {
             chip,
@@ -774,6 +781,16 @@ where
     #[must_use]
     pub fn device_certificate(&self) -> Option<DeviceCertificate> {
         self.device.as_ref().and_then(EnrolHandle::certificate)
+    }
+
+    /// Where this device's key lives, a chip or software in the secret
+    /// store, once it is open, and `None` for a build without a device
+    /// identity (R74 step 2). Reported beside [`custody`](Self::custody) and
+    /// never folded into it, since the key sits outside the unlock gate.
+    #[cfg(feature = "device-identity")]
+    #[must_use]
+    pub fn device_key_home(&self) -> Option<KeyHome> {
+        self.device.as_ref().and_then(EnrolHandle::key_home)
     }
 }
 

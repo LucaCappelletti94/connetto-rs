@@ -273,3 +273,26 @@ async fn the_enclave_or_its_fallback_signs_and_reopens() {
     assert_eq!(first.key.public_point(), again.key.public_point());
     eprintln!("device key home: {:?}", first.key.home());
 }
+
+#[test]
+fn a_fixed_width_signature_becomes_a_der_one_that_verifies() {
+    use ring::rand::SystemRandom;
+    use ring::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair as _};
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).expect("key");
+    let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+        .expect("pair");
+    // Enough signatures that some have a high bit or a leading zero in r or s.
+    for round in 0..200_u32 {
+        let message = round.to_be_bytes();
+        let fixed: [u8; 64] = pair
+            .sign(&rng, &message)
+            .expect("sign")
+            .as_ref()
+            .try_into()
+            .expect("64 bytes");
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, pair.public_key().as_ref())
+            .verify(&message, &der_signature(&fixed))
+            .expect("the DER signature verifies");
+    }
+}
