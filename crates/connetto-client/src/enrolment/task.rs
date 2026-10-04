@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use connetto_core::device_cert::{
     CertificateRequest, CertificateSigner, DeviceCertificate, DeviceDescriptor, DeviceKey, KeyHome,
-    KeyId, RevocationList, certificate_key_id, key_id, verify_chain,
+    KeyId, RevocationList, certificate_key_id, certificate_serial, key_id, verify_chain,
 };
 use connetto_core::messages::{
     ControlMessage, DeviceSummary, DevicesRequest, EnrolChallengeRequest, EnrolRefusal,
@@ -342,6 +342,14 @@ struct Run<L> {
     held: Option<Held>,
     key: Option<Arc<dyn DeviceKey>>,
     kept: HashMap<Vec<u8>, KeptList>,
+    /// A certificate the root withdrew, whose key enrols again.
+    withdrawn: Option<Withdrawn>,
+}
+
+/// A certificate withdrawn because the root revoked its issuer.
+struct Withdrawn {
+    /// Its lifetime, which the re-enrolment asks for again.
+    lifetime: Option<Duration>,
 }
 
 /// What the intake makes of a verified list against the one kept from the same signer.
@@ -516,6 +524,19 @@ impl<L: Link> Run<L> {
         Ok(())
     }
 
+    /// Delete a certificate whose issuer the root revoked, keep the key, and
+    /// say so, the key enrolling again when connected (decision 24).
+    async fn withdraw(&mut self) {
+        let lifetime = self.held.as_ref().and_then(|held| held.lifetime);
+        if let Err(err) = self.link.forget().await {
+            tracing::warn!(error = %err, "the withdrawn certificate could not be deleted");
+        }
+        self.held = None;
+        self.withdrawn = Some(Withdrawn { lifetime });
+        self.publish();
+        self.link.emit(ClientEvent::CertificateWithdrawn);
+    }
+
     /// Delete the key and certificate of a revoked device and say so
     /// (lifecycle row "Refused as revoked").
     async fn revoked(&mut self) {
@@ -546,6 +567,11 @@ impl<L: Link> Run<L> {
                     }
                 };
             let signer_key = list.issuer().as_bytes().to_vec();
+            let from_root = self
+                .enroller
+                .roots
+                .iter()
+                .any(|root| root.as_slice() == signed.signer.as_slice());
             match intake(self.kept.get(&signer_key), &list) {
                 Intake::Stale => continue,
                 Intake::Conflicting => {
@@ -572,8 +598,14 @@ impl<L: Link> Run<L> {
                 certificate_key_id(&held.issuer).is_ok_and(|issuer| issuer == list.issuer())
                     && list.revokes(held.leaf.serial())
             });
+            let issuer_revoked = from_root
+                && self.held.as_ref().is_some_and(|held| {
+                    certificate_serial(&held.issuer).is_ok_and(|serial| list.revokes(&serial))
+                });
             if own {
                 self.revoked().await;
+            } else if issuer_revoked {
+                self.withdraw().await;
             }
         }
     }
@@ -615,7 +647,13 @@ impl<L: Link> Run<L> {
     async fn on_connected(&mut self) {
         let outcome = match Standing::of(self.held.as_ref(), SystemTime::now()) {
             Standing::Fresh => return,
-            Standing::NoKey => self.request(self.enroller.lifetime, true).await,
+            Standing::NoKey => {
+                let lifetime = self
+                    .withdrawn
+                    .take()
+                    .map_or(self.enroller.lifetime, |withdrawn| withdrawn.lifetime);
+                self.request(lifetime, true).await
+            }
             Standing::Aging | Standing::Expired | Standing::ClockOff => {
                 let lifetime = self.held.as_ref().and_then(|held| held.lifetime);
                 self.request(lifetime, true).await
@@ -641,6 +679,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         held,
         key: None,
         kept,
+        withdrawn: None,
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
@@ -686,7 +725,12 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 }
                 None => steering = false,
             },
-            Some(lists) = run.enroller.lists.recv() => run.take_lists(lists).await,
+            Some(lists) = run.enroller.lists.recv() => {
+                run.take_lists(lists).await;
+                if run.withdrawn.is_some() {
+                    due = run.link.connected().await;
+                }
+            }
             () = tokio::time::sleep(look) => due = run.link.connected().await,
         }
     }

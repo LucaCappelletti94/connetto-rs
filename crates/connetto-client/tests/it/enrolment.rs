@@ -71,6 +71,7 @@ const APP_LAPTOP: &str = "r74-laptop";
 const APP_LEARNED: &str = "r74-learned";
 const APP_UNTRUSTED: &str = "r74-untrusted";
 const APP_NO_ROOTS: &str = "r74-no-roots";
+const APP_ROTATION: &str = "r74-rotation";
 
 /// What the lost-device list shows about these test devices.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -135,6 +136,7 @@ async fn enrolment_phase() {
         "learned" => learned_at_connect().await,
         "untrusted" => untrusted().await,
         "no-roots" => no_roots().await,
+        "rotation" => Box::pin(rotation_withdraws()).await,
         other => panic!("unknown enrolment phase {other:?}"),
     }
 }
@@ -151,8 +153,17 @@ fn issuer() -> DeviceIssuer {
 
 /// The one root, issuer certificate and issuer key of this process.
 fn authority() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>) {
-    static AUTHORITY: std::sync::OnceLock<(Vec<u8>, Vec<u8>, Vec<u8>)> = std::sync::OnceLock::new();
-    AUTHORITY.get_or_init(|| {
+    &rotation().0
+}
+
+/// The process's fixture bytes: the root, its first issuer and that issuer's
+/// key, a second issuer and key under the same root, and a list the root
+/// signed revoking the first issuer.
+struct Rotation((Vec<u8>, Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>), Vec<u8>);
+
+fn rotation() -> &'static Rotation {
+    static ROTATION: std::sync::OnceLock<Rotation> = std::sync::OnceLock::new();
+    ROTATION.get_or_init(|| {
         let now = SystemTime::now();
         let root = RootCa::create(
             DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
@@ -164,8 +175,33 @@ fn authority() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>) {
         let cert = root
             .sign_issuer(&key.public_key_der(), now - DAY, 395 * DAY, [1; 16])
             .expect("issuer");
-        (root.certificate().to_vec(), cert, key.serialize_der())
+        let next_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("next issuer key");
+        let next_cert = root
+            .sign_issuer(&next_key.public_key_der(), now - DAY, 395 * DAY, [2; 16])
+            .expect("next issuer");
+        let root_list = root
+            .sign_list(
+                1,
+                &[connetto_core::device_cert::Revoked {
+                    serial: connetto_core::device_cert::certificate_serial(&cert).expect("serial"),
+                    at: now,
+                }],
+                now,
+                now + 395 * DAY,
+            )
+            .expect("the root revokes the first issuer");
+        Rotation(
+            (root.certificate().to_vec(), cert, key.serialize_der()),
+            (next_cert, next_key.serialize_der()),
+            root_list,
+        )
     })
+}
+
+/// The second issuer of [`rotation`].
+fn next_issuer() -> DeviceIssuer {
+    let Rotation((root, _, _), (cert, key), _) = rotation();
+    DeviceIssuer::from_pkcs8(cert.clone(), key, root).expect("load")
 }
 
 /// The deployment root the builds ship.
@@ -1273,4 +1309,97 @@ async fn no_roots() {
         refused,
         Err(connetto_client::ClientError::MissingDeploymentRoots)
     ));
+}
+
+/// The operator rotates to a new issuer and the root revokes the old one: a
+/// device holding a certificate from the old issuer withdraws it, says so,
+/// and enrols the same key under the new issuer.
+#[test]
+fn a_root_revoking_the_issuer_withdraws_and_re_enrols_the_key() {
+    run_phase("rotation");
+}
+
+async fn rotation_withdraws() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (old_addr, _old_server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    let first = signed_in(
+        old_addr,
+        fresh_login(&base, APP_ROTATION, "enrol-user"),
+        dir.path(),
+    )
+    .connect()
+    .await
+    .expect("connects");
+    let old_cert = wait_for_certificate(&first, BOUND).await.expect("enrols");
+    first.close().await;
+    drop(first);
+
+    let Rotation((root, _, _), (new_issuer, _), root_list) = rotation();
+    let (new_addr, _new_server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(next_issuer())
+            .with_retired_issuer(issuer())
+            .with_root_list(connetto_core::messages::SignedList {
+                list: root_list.clone(),
+                signer: root.clone(),
+            }),
+        Arc::clone(&store),
+    )
+    .await;
+    let (second, pump) = signed_in(new_addr, last_used(&base, APP_ROTATION), dir.path())
+        .connect_with_pump()
+        .await
+        .expect("signs back in");
+    assert_eq!(
+        second
+            .device_certificate()
+            .map(|cert| cert.serial().to_vec()),
+        Some(old_cert.serial().to_vec()),
+        "the old certificate is held at start"
+    );
+    let mut events = second.client().events();
+    tokio::spawn(pump);
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::CertificateWithdrawn
+        ))
+        .await
+        .is_some(),
+        "the device withdraws the certificate the root's list voids"
+    );
+    let until = Instant::now() + BOUND;
+    let renewed = loop {
+        if let Some(cert) = second.device_certificate()
+            && cert.serial() != old_cert.serial()
+        {
+            break cert;
+        }
+        assert!(Instant::now() < until, "the key re-enrols within the bound");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(
+        renewed.identity().key(),
+        old_cert.identity().key(),
+        "the same key"
+    );
+    let records = wait_for_records(&store, 2, BOUND)
+        .await
+        .expect("both grants recorded");
+    assert_eq!(
+        records[1].issuer,
+        connetto_core::device_cert::certificate_key_id(new_issuer).expect("key id"),
+        "the key re-enrols under the new issuer"
+    );
+    second.close().await;
 }

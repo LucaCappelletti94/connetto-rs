@@ -1154,6 +1154,10 @@ pub enum ClientEvent {
     /// The server refused this device's key as revoked, so the key and its
     /// certificate are deleted and the device holds no identity (R74).
     DeviceRevoked,
+    /// The root revoked the issuer of this device's certificate, so peers
+    /// refuse it. The certificate is deleted, the key kept, and the device
+    /// enrols the key again on its next connection (R74 decision 24).
+    CertificateWithdrawn,
 }
 
 /// A primary-key column value carried on a mutation event.
