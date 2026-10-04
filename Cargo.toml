@@ -134,11 +134,11 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 # since this is key custody code.
 apple-native-keyring-store = { git = "https://github.com/LucaCappelletti94/apple-native-keyring-store", rev = "0cbad3f4f8a67491455a838e842476c9b5be07a4" }
 security-framework = { git = "https://github.com/LucaCappelletti94/rust-security-framework", rev = "6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9" }
-# R52, until released: user authentication on named stores (#28), a store the
-# app unlocks once per approval and finds and deletes entries in while locked,
-# the Android 13 expiry refusal, and a lost Keystore key reported instead of
-# replaced with `Store::exists` (#27), integrated on upstream main.
-android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "0241aab48b0ff5dfcefb5c8f2eba5e4289dbefec" }
+# R52, until released: user authentication on named stores (#28) and a lost
+# Keystore key reported with `Store::exists` (#27), both merged upstream, plus
+# a store the app unlocks once per approval and finds and deletes entries in
+# while locked, and the Android 13 expiry refusal, stacked on upstream main.
+android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "d82b446a99102f44829d17c39671adffba57a64e" }
 # R53, until released: the Windows Hello PRF named store with keyless entry
 # deletion, explicit store discard, and user-scoped locks.
 windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "3109f4d4347bba565cdbb2ae5d0439d5c03fbde6" }
