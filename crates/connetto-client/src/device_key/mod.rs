@@ -14,11 +14,15 @@ use crate::ClientError;
 #[cfg(target_os = "android")]
 mod android;
 #[cfg(target_os = "android")]
+pub(crate) use android::AndroidKeystore;
+#[cfg(target_os = "android")]
 pub use android::{JavaAccess, KeystoreKey};
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 mod apple;
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub use apple::EnclaveKey;
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+pub(crate) use apple::SecureEnclave;
 
 /// Why no device key could be made.
 #[derive(Debug, thiserror::Error)]
@@ -33,10 +37,6 @@ pub enum DeviceKeyStoreError {
 
 /// Where an account's device key record is read and written, the platform
 /// secret store in a client and a map in tests.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R74 step 3's enrolment opens the key")
-)]
 pub(crate) trait KeyRecords: Send + Sync {
     /// The secret stored under `name`, `None` when none was.
     fn read(&self, name: &str) -> impl Future<Output = Result<Option<String>, ClientError>> + Send;
@@ -46,6 +46,8 @@ pub(crate) trait KeyRecords: Send + Sync {
         name: &str,
         secret: &str,
     ) -> impl Future<Output = Result<(), ClientError>> + Send;
+    /// Remove whatever is stored under `name`.
+    fn delete(&self, name: &str) -> impl Future<Output = Result<(), ClientError>> + Send;
 }
 
 impl KeyRecords for crate::keyring::Keyring {
@@ -55,6 +57,10 @@ impl KeyRecords for crate::keyring::Keyring {
 
     async fn write(&self, name: &str, secret: &str) -> Result<(), ClientError> {
         crate::keyring::Keyring::write(self, name, secret).await
+    }
+
+    async fn delete(&self, name: &str) -> Result<(), ClientError> {
+        crate::keyring::Keyring::clear(self, name).await
     }
 }
 
@@ -75,10 +81,6 @@ pub struct OpenedKey<K> {
 }
 
 impl SoftwareKey {
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "R74 step 3's enrolment opens the key")
-    )]
     fn from_pkcs8(rng: SystemRandom, der: &[u8]) -> Option<Self> {
         let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, der, &rng).ok()?;
         let point = pair.public_key().as_ref().try_into().ok()?;
@@ -109,10 +111,6 @@ impl DeviceKey for SoftwareKey {
 /// # Errors
 ///
 /// The store's error, or [`ClientError::DeviceKey`] when no key could be made.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R74 step 3's enrolment opens the key")
-)]
 pub(crate) async fn open_software_key(
     records: &impl KeyRecords,
     account: &str,
@@ -154,6 +152,36 @@ pub(crate) trait ChipKeys: Send + Sync {
     ///
     /// [`ChipError::Unavailable`] when this device has no usable chip.
     fn create(&self, label: &str) -> Result<Self::Key, ChipError>;
+    /// Delete every key stored under `label`, succeeding when there is none.
+    ///
+    /// # Errors
+    ///
+    /// [`ChipError`] when the chip cannot be asked.
+    fn delete(&self, label: &str) -> Result<(), ChipError>;
+}
+
+/// A platform without a key chip connetto reaches, so every device key there
+/// is a software key (decision 16).
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+pub(crate) struct NoChip;
+
+#[cfg(not(any(target_os = "macos", target_os = "ios", target_os = "android")))]
+impl ChipKeys for NoChip {
+    type Key = SoftwareKey;
+
+    fn find(&self, _label: &str) -> Result<Option<SoftwareKey>, ChipError> {
+        Ok(None)
+    }
+
+    fn create(&self, _label: &str) -> Result<SoftwareKey, ChipError> {
+        Err(ChipError::Unavailable(
+            "this platform has no key chip connetto reaches".into(),
+        ))
+    }
+
+    fn delete(&self, _label: &str) -> Result<(), ChipError> {
+        Ok(())
+    }
 }
 
 /// Why a chip could not hold a device key.
@@ -182,10 +210,6 @@ fn chip_label(service: &str, account: &str) -> String {
 /// # Errors
 ///
 /// The chip's failure other than [`ChipError::Unavailable`], or the store's.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R74 step 3's enrolment opens the key")
-)]
 pub(crate) async fn open_device_key<C: ChipKeys + 'static>(
     chip: std::sync::Arc<C>,
     records: &impl KeyRecords,
@@ -219,6 +243,22 @@ pub(crate) async fn open_device_key<C: ChipKeys + 'static>(
         }
         Err(err) => Err(err),
     }
+}
+
+/// Delete `account`'s device key wherever it is held, the chip and the store.
+///
+/// # Errors
+///
+/// The chip's failure, or the store's.
+pub(crate) async fn delete_device_key<C: ChipKeys + 'static>(
+    chip: std::sync::Arc<C>,
+    records: &impl KeyRecords,
+    service: &str,
+    account: &str,
+) -> Result<(), ClientError> {
+    let label = chip_label(service, account);
+    blocking(move || chip.delete(&label)).await?;
+    records.delete(&crate::device_key_record(account)).await
 }
 
 fn boxed(opened: OpenedKey<SoftwareKey>) -> OpenedKey<Box<dyn DeviceKey>> {

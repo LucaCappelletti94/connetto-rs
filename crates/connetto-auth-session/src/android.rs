@@ -156,3 +156,25 @@ fn jni_call<R>(
         .ok_or_else(|| AuthSessionError::Bridge("no Android activity".to_owned()))?
         .map_err(|err| AuthSessionError::Bridge(err.to_string()))
 }
+
+/// The Java VM reached through the Activity, for the device key.
+#[cfg(feature = "device-identity")]
+pub(crate) struct ActivityJava;
+
+#[cfg(feature = "device-identity")]
+impl connetto_client::device_key::JavaAccess for ActivityJava {
+    fn with_env(
+        &self,
+        body: &mut dyn FnMut(&mut JNIEnv<'_>),
+    ) -> Result<(), connetto_client::ClientError> {
+        with_activity(|env, _| {
+            body(env);
+            Some(())
+        })
+        .ok_or_else(|| {
+            connetto_client::ClientError::DeviceChip(
+                connetto_client::device_key::ChipError::Failed("no Android activity".into()),
+            )
+        })
+    }
+}

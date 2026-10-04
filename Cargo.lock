@@ -1076,6 +1076,7 @@ dependencies = [
 name = "connetto-auth-session"
 version = "0.0.0"
 dependencies = [
+ "connetto-client",
  "manganis",
  "thiserror 2.0.20",
  "tokio",
@@ -1131,11 +1132,13 @@ dependencies = [
  "rcgen 0.13.2",
  "reqwest 0.12.28",
  "ring",
+ "rmp-serde",
  "rosetta-uuid",
  "rustix",
  "rustls",
  "security-framework",
  "serde",
+ "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
  "sqlite-diff-rs",

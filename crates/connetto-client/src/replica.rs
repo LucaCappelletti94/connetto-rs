@@ -432,7 +432,7 @@ const DEVICE_KEY_RECORD_PREFIX: &str = "connetto-device-key:";
 
 /// The record holding `account`'s software device key, reserved so it is
 /// never offered as an account and stays outside the unlock gate (R74
-/// decision 11). `account` is the encoded identity [`encode_identity`] makes.
+/// decision 11). `account` is the account's replica name, [`replica_db_name`].
 #[must_use]
 pub fn device_key_record(account: &str) -> String {
     format!("{DEVICE_KEY_RECORD_PREFIX}{account}")

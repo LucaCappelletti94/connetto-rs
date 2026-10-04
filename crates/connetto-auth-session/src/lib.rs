@@ -83,6 +83,15 @@ pub fn delivered() -> Result<Option<String>, AuthSessionError> {
     Ok(None)
 }
 
+/// The JNI access an Android build's device key needs, reaching the Java VM
+/// through the Activity Dioxus holds, for
+/// `NativeDurable::with_java_access` (R74 decision 20).
+#[cfg(all(target_os = "android", feature = "device-identity"))]
+#[must_use]
+pub fn java_access() -> std::sync::Arc<dyn connetto_client::device_key::JavaAccess> {
+    std::sync::Arc::new(android::ActivityJava)
+}
+
 /// Whether the device has a secure lock screen, which a key held behind the
 /// user's verification needs.
 ///

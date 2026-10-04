@@ -26,6 +26,9 @@ mod coverage_resync;
 
 mod encrypted_replica;
 
+#[cfg(feature = "device-identity")]
+mod enrolment;
+
 mod full_resync;
 
 #[cfg(feature = "native-auth")]

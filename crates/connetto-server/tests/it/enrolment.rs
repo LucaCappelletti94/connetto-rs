@@ -154,9 +154,9 @@ async fn a_signed_in_device_enrols_and_is_recorded() {
     )
     .await;
     let key = device_key();
-    let issued = nonce(&mut client).await;
+    let handed = nonce(&mut client).await;
 
-    let reply = enrol(&mut client, &key, issued, None, vec![0x91, 0x01]).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x01]).await;
     let ControlMessage::EnrolGrant(EnrolGrant {
         request_id, chain, ..
     }) = reply
@@ -201,7 +201,7 @@ async fn an_anonymous_caller_cannot_enrol() {
     );
     let reply = enrol(&mut client, &device_key(), [0; 32], None, Vec::new()).await;
     assert_eq!(reply, refused(EnrolRefusal::Unidentified, "e"));
-    assert!(store.records().is_empty());
+    assert_eq!(store.records(), Vec::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -234,26 +234,26 @@ async fn a_nonce_serves_one_request_only() {
         "no challenge was asked"
     );
 
-    let issued = nonce(&mut client).await;
+    let handed = nonce(&mut client).await;
     let reply = enrol(&mut client, &key, [9; 32], None, Vec::new()).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
-        "a nonce the server never issued"
+        "a nonce the server never handed"
     );
-    let reply = enrol(&mut client, &key, issued, None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
         "the failed attempt spent it"
     );
 
-    let issued = nonce(&mut client).await;
+    let handed = nonce(&mut client).await;
     assert!(matches!(
-        enrol(&mut client, &key, issued, None, Vec::new()).await,
+        enrol(&mut client, &key, handed, None, Vec::new()).await,
         ControlMessage::EnrolGrant(_)
     ));
-    let reply = enrol(&mut client, &key, issued, None, Vec::new()).await;
+    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
     assert_eq!(
         reply,
         refused(EnrolRefusal::ChallengeExpired, "e"),
@@ -268,8 +268,8 @@ async fn an_expired_nonce_is_refused() {
     let store = Arc::new(MemoryEnrolments::default());
     let config = DeviceCertConfig::new(issuer().1).with_challenge_window(Duration::ZERO);
     let mut client = session(&fixture, Some("alice"), Some(config), &store).await;
-    let issued = nonce(&mut client).await;
-    let reply = enrol(&mut client, &device_key(), issued, None, Vec::new()).await;
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &device_key(), handed, None, Vec::new()).await;
     assert_eq!(reply, refused(EnrolRefusal::ChallengeExpired, "e"));
 }
 
@@ -319,10 +319,10 @@ async fn a_revoked_key_is_refused() {
         &store,
     )
     .await;
-    let issued = nonce(&mut client).await;
-    let reply = enrol(&mut client, &key, issued, None, Vec::new()).await;
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, Vec::new()).await;
     assert_eq!(reply, refused(EnrolRefusal::Revoked, "e"));
-    assert!(store.records().is_empty());
+    assert_eq!(store.records(), Vec::new());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -350,8 +350,8 @@ async fn a_malformed_request_or_oversized_descriptor_is_refused() {
     .await;
     assert_eq!(reply, refused(EnrolRefusal::InvalidRequest, "e"));
 
-    let issued = nonce(&mut client).await;
-    let reply = enrol(&mut client, &device_key(), issued, None, vec![0; 4097]).await;
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &device_key(), handed, None, vec![0; 4097]).await;
     assert_eq!(reply, refused(EnrolRefusal::InvalidRequest, "e"));
-    assert!(store.records().is_empty());
+    assert_eq!(store.records(), Vec::new());
 }

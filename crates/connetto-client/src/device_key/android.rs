@@ -5,10 +5,6 @@
 //! so it signs once the device was unlocked since its restart (decision 11).
 //! The application hands in its JNI access, since reaching the Java VM takes
 //! `unsafe` code this crate forbids, the way it hands in the unlock prompt.
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R74 step 3's enrolment opens the key")
-)]
 
 use std::sync::Arc;
 
@@ -184,6 +180,32 @@ impl ChipKeys for AndroidKeystore {
         }
         self.find(label)?
             .ok_or_else(|| ChipError::Unavailable("the Keystore did not keep the new key".into()))
+    }
+
+    fn delete(&self, label: &str) -> Result<(), ChipError> {
+        java(&*self.java, |env| {
+            let store = loaded_keystore(env)?;
+            let alias = env.new_string(label)?;
+            let present = env
+                .call_method(
+                    &store,
+                    "containsAlias",
+                    "(Ljava/lang/String;)Z",
+                    &[JValue::Object(&alias)],
+                )?
+                .z()?;
+            if !present {
+                return Ok(());
+            }
+            env.call_method(
+                &store,
+                "deleteEntry",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&alias)],
+            )?;
+            Ok(())
+        })?;
+        Ok(())
     }
 }
 

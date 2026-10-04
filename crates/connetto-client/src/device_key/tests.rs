@@ -26,6 +26,11 @@ impl KeyRecords for Memory {
         self.0.lock().insert(name.to_owned(), secret.to_owned());
         std::future::ready(Ok(()))
     }
+
+    fn delete(&self, name: &str) -> impl Future<Output = Result<(), ClientError>> + Send {
+        self.0.lock().remove(name);
+        std::future::ready(Ok(()))
+    }
 }
 
 const ALICE: &str = "\"alice\"";
@@ -116,15 +121,71 @@ impl ChipKeys for FakeChip {
     }
 
     fn create(&self, label: &str) -> Result<FakeChipKey, ChipError> {
-        *self.creations.lock() += 1;
+        let made = {
+            let mut creations = self.creations.lock();
+            *creations += 1;
+            *creations
+        };
         if self.refuses {
             return Err(ChipError::Unavailable("no secure enclave".into()));
         }
         let mut point = [4_u8; 65];
-        point[1] = u8::try_from(self.keys.lock().len()).expect("few keys");
+        point[1] = u8::try_from(made).expect("few keys");
         self.keys.lock().insert(label.to_owned(), point);
         Ok(FakeChipKey(point))
     }
+
+    fn delete(&self, label: &str) -> Result<(), ChipError> {
+        self.keys.lock().remove(label);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_deleted_chip_key_is_replaced_by_a_fresh_one() {
+    let (chip, records) = (Arc::new(FakeChip::default()), Memory::default());
+    let first = open_device_key(Arc::clone(&chip), &records, "svc", ALICE)
+        .await
+        .expect("create");
+    delete_device_key(Arc::clone(&chip), &records, "svc", ALICE)
+        .await
+        .expect("delete");
+    assert!(chip.keys.lock().is_empty());
+    let again = open_device_key(Arc::clone(&chip), &records, "svc", ALICE)
+        .await
+        .expect("recreate");
+    assert!(again.created);
+    assert_ne!(first.key.public_point(), again.key.public_point());
+}
+
+#[tokio::test]
+async fn a_deleted_software_key_is_replaced_by_a_fresh_one() {
+    let chip = Arc::new(FakeChip {
+        refuses: true,
+        ..FakeChip::default()
+    });
+    let records = Memory::default();
+    let first = open_device_key(Arc::clone(&chip), &records, "svc", ALICE)
+        .await
+        .expect("create");
+    assert_eq!(first.key.home(), KeyHome::Software);
+    delete_device_key(Arc::clone(&chip), &records, "svc", ALICE)
+        .await
+        .expect("delete");
+    assert!(records.0.lock().is_empty(), "the software record is gone");
+    let again = open_device_key(Arc::clone(&chip), &records, "svc", ALICE)
+        .await
+        .expect("recreate");
+    assert!(again.created);
+    assert_ne!(first.key.public_point(), again.key.public_point());
+}
+
+#[tokio::test]
+async fn deleting_with_nothing_stored_succeeds() {
+    let (chip, records) = (Arc::new(FakeChip::default()), Memory::default());
+    delete_device_key(chip, &records, "svc", ALICE)
+        .await
+        .expect("nothing to delete is no failure");
 }
 
 #[tokio::test]

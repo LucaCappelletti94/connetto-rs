@@ -32,7 +32,7 @@ pub struct EnrolRequest {
     pub csr: Vec<u8>,
     /// The lifetime the application asks for, the server's default when `None`.
     pub lifetime_secs: Option<u64>,
-    /// The application's device descriptor, `MessagePack`, at most 4 KiB.
+    /// The application's device descriptor, `MessagePack`, at most 4096 bytes.
     #[serde(with = "serde_bytes")]
     pub descriptor: Vec<u8>,
 }

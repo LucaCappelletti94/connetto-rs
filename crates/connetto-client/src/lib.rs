@@ -75,6 +75,8 @@ mod clock;
 #[cfg(feature = "device-identity")]
 pub mod device_key;
 pub mod dsl;
+#[cfg(feature = "device-identity")]
+mod enrolment;
 mod grant_expiry;
 pub mod harden;
 #[cfg(feature = "native-auth")]
@@ -85,6 +87,8 @@ pub mod reconnect;
 pub mod replica;
 mod subscriptions;
 
+#[cfg(feature = "device-identity")]
+pub use enrolment::CertificateError;
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
@@ -222,6 +226,17 @@ pub enum ClientError {
     #[cfg(feature = "device-identity")]
     #[error(transparent)]
     DeviceChip(device_key::ChipError),
+    /// The device descriptor cannot be sent, since it does not serialize or
+    /// is over the 4096 bytes the server accepts (R74).
+    #[cfg(feature = "device-identity")]
+    #[error("the device descriptor cannot be sent: {0}")]
+    DeviceDescriptor(String),
+    /// An Android build with a device identity connected without the JNI
+    /// access its key needs, which `NativeDurable::with_java_access` hands in
+    /// (R74 decision 20).
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    #[error("the device key needs JNI access: call NativeDurable::with_java_access")]
+    MissingJavaAccess,
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///
@@ -1121,6 +1136,17 @@ pub enum ClientEvent {
     /// now answers its policy views as that caller. Every live query over
     /// the replica refreshes.
     IdentityStated,
+    /// A renewal asked for a certificate lifetime over the server's ceiling,
+    /// which its operator lowered, and was granted at the ceiling (R74).
+    CertificateLifetimeCapped {
+        /// The lifetime asked for.
+        requested: Duration,
+        /// The ceiling granted instead, which later renewals ask for.
+        ceiling: Duration,
+    },
+    /// The server refused this device's key as revoked, so the key and its
+    /// certificate are deleted and the device holds no identity (R74).
+    DeviceRevoked,
 }
 
 /// A primary-key column value carried on a mutation event.
@@ -2392,6 +2418,10 @@ pub struct ConnettoConnection<T: Transport> {
     /// moved, which is one integer read per schema (R62 decisions 1 and 4).
     main_schema: i64,
     tier_schema: Option<i64>,
+    /// Enrolment requests awaiting their answer, by the `request_id` it quotes.
+    /// Emptied on disconnect, which ends every wait at once.
+    #[cfg(feature = "device-identity")]
+    enrol_waiters: HashMap<String, tokio::sync::oneshot::Sender<enrolment::Answer>>,
 }
 
 impl<T> ConnettoConnection<T>
@@ -2535,6 +2565,8 @@ where
         db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
         // After the subscription tables, since it references `_connetto_query`.
         db.batch_execute(aggregates::AGGREGATE_DDL)?;
+        #[cfg(feature = "device-identity")]
+        db.batch_execute(enrolment::CERTIFICATE_DDL)?;
         // Once per open, before anything can re-claim: a watch the previous run
         // died still holding gets its countdown from now, so the UI has this
         // run to re-claim it and an abandoned one retires. Ahead of the capture
@@ -2603,6 +2635,8 @@ where
             durable: replica.key().is_some(),
             main_schema,
             tier_schema: None,
+            #[cfg(feature = "device-identity")]
+            enrol_waiters: HashMap::new(),
         };
         conn.attach_tier(replica.tier())?;
         Ok(conn)
@@ -2873,6 +2907,8 @@ where
         self.attach_replay = AttachReplay::Idle;
         // A fresh transport replays every pending write, so no resend stays owed.
         self.resend = Resend::Idle;
+        #[cfg(feature = "device-identity")]
+        self.enrol_waiters.clear();
         if self.wire.take().is_some() {
             self.notices
                 .push_back(ClientEvent::SyncStatus(SyncStatus::Offline));
@@ -3641,12 +3677,16 @@ where
     ///
     /// [`ClientError`] on a transport, apply, or protocol failure.
     pub async fn pump_one(&mut self) -> Result<ClientEvent, ClientError> {
-        if let Some(notice) = self.notices.pop_front() {
-            return Ok(notice);
+        loop {
+            if let Some(notice) = self.notices.pop_front() {
+                return Ok(notice);
+            }
+            let frame = self.wire()?.transport.recv().await;
+            let frame = self.judge(frame)?;
+            if let Some(event) = self.handle_frame(frame).await? {
+                return Ok(event);
+            }
         }
-        let frame = self.wire()?.transport.recv().await;
-        let frame = self.judge(frame)?;
-        self.handle_frame(frame).await
     }
 
     /// Like [`pump_one`](Self::pump_one), but abandons the idle wait when
@@ -3681,28 +3721,29 @@ where
             frame = wire.transport.recv() => frame,
         };
         let frame = self.judge(frame)?;
-        self.handle_frame(frame).await.map(Some)
+        self.handle_frame(frame).await
     }
 
     /// Apply one received frame: bulk patches mutate the replica and advance
-    /// flow control, control frames map onto their [`ClientEvent`]s.
+    /// flow control, control frames map onto their [`ClientEvent`]s, and an
+    /// enrolment answer goes to its waiter with nothing to report.
     async fn handle_frame(
         &mut self,
         frame: Option<IncomingFrame>,
-    ) -> Result<ClientEvent, ClientError> {
-        match frame {
+    ) -> Result<Option<ClientEvent>, ClientError> {
+        let event = match frame {
             // A peer that closed cleanly is as gone as one that failed, so the
             // wire goes and the change is announced behind this event.
             None => {
                 self.disconnected();
-                Ok(ClientEvent::Closed)
+                ClientEvent::Closed
             }
             Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(patch))) => {
                 self.apply_patch(&patch.patchset_zstd, None, Some(&patch.sub_id))?;
                 self.ack_one().await?;
-                Ok(ClientEvent::SnapshotApplied {
+                ClientEvent::SnapshotApplied {
                     sub_id: patch.sub_id,
-                })
+                }
             }
             Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
                 self.apply_patch(
@@ -3712,17 +3753,29 @@ where
                 )?;
                 self.last_cursor = Some(patch.cursor.clone());
                 self.ack_one().await?;
-                Ok(ClientEvent::LivePatch {
+                ClientEvent::LivePatch {
                     sub_id: patch.sub_id,
                     cursor: patch.cursor,
                     patchset_zstd: patch.patchset_zstd.into(),
-                })
+                }
             }
-            Some(IncomingFrame::Bulk(_)) => Err(ClientError::Protocol(
-                "unexpected bulk frame from server".into(),
-            )),
-            Some(IncomingFrame::Control(msg)) => self.handle_control(msg),
-        }
+            Some(IncomingFrame::Bulk(_)) => {
+                return Err(ClientError::Protocol(
+                    "unexpected bulk frame from server".into(),
+                ));
+            }
+            Some(IncomingFrame::Control(msg)) => {
+                #[cfg(feature = "device-identity")]
+                if enrolment::Answer::is_answer(&msg) {
+                    if let Some((request_id, answer)) = enrolment::Answer::of(msg) {
+                        self.answer_enrolment(&request_id, answer);
+                    }
+                    return Ok(None);
+                }
+                self.handle_control(msg)?
+            }
+        };
+        Ok(Some(event))
     }
 
     /// Send a keepalive probe. The matching [`ClientEvent::Pong`] from a later

@@ -1,8 +1,4 @@
 //! The device key in Apple's Secure Enclave (R74 decision 6).
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "R74 step 3's enrolment opens the key")
-)]
 
 use connetto_core::device_cert::{DeviceKey, DeviceKeyError, KeyHome};
 use security_framework::access_control::{ProtectionMode, SecAccessControl};
@@ -125,5 +121,17 @@ impl ChipKeys for SecureEnclave {
         let key = SecKey::new(&options)
             .map_err(|err| ChipError::Unavailable(EnclaveFailure::from(err).to_string()))?;
         EnclaveKey::new(key)
+    }
+
+    fn delete(&self, label: &str) -> Result<(), ChipError> {
+        let mut search = ItemSearchOptions::new();
+        search.class(ItemClass::key()).label(label);
+        #[cfg(target_os = "macos")]
+        search.ignore_legacy_keychains();
+        match search.delete() {
+            Ok(()) => Ok(()),
+            Err(err) if matches!(err.code(), ITEM_NOT_FOUND | MISSING_ENTITLEMENT) => Ok(()),
+            Err(err) => Err(ChipError::Failed(Box::new(err))),
+        }
     }
 }

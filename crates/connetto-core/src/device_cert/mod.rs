@@ -19,6 +19,18 @@ pub use identity::{DeploymentId, DeviceIdentity, IdentityError, KeyId};
 pub use key::{CertificateSigner, DeviceKey, DeviceKeyError, KeyHome, key_id, public_key_info};
 pub use request::{CertificateRequest, RequestError};
 
+/// What an application tells the lost-device list about a device, a tuple or a
+/// struct it defines, sent at enrolment in `MessagePack` of at most 4096 bytes.
+pub trait DeviceDescriptor:
+    serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
+{
+}
+
+impl<D> DeviceDescriptor for D where
+    D: serde::Serialize + serde::de::DeserializeOwned + Send + Sync + 'static
+{
+}
+
 #[cfg(test)]
 use request::challenge_attribute;
 

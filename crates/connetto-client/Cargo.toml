@@ -41,7 +41,7 @@ postgres-types = ["diesel/postgres_backend"]
 # Native only, never wasm (the browser worker owns token custody there).
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
-device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation"]
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -82,6 +82,10 @@ connetto-core.workspace = true
 # supplies the v4 randomness on wasm32-unknown-unknown (Web Crypto); on
 # native, v4 uses the platform RNG and `js` is inert.
 uuid = { version = "1", default-features = false, features = ["v4", "v5", "js"] }
+# The device descriptor goes to the server in MessagePack (R74).
+rmp-serde = { workspace = true, optional = true }
+# The certificate chain an enrolment grant carries.
+serde_bytes = { workspace = true, optional = true }
 # Local store plus the SQLite session extension: the capture hook for local
 # writes and the native apply for server patches. The third-party-backend
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
