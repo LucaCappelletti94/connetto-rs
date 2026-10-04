@@ -17,10 +17,10 @@ use connetto_core::messages::{ControlMessage, FatalErrorReason, Grant, Handshake
 use connetto_core::traits::{GrantRefused, HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{PROTOCOL_VERSION, Principal, Subject};
 use connetto_server::{
-    AuthConfig, AuthService, CookieSameSite, GenericOidcProvider, InMemoryAuthStore, Materializer,
-    PageSpec, ProviderRegistry, RedirectPolicy, RequestGuard, ResolvedIdentity, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TokenAuthority, auth_router,
-    loopback, pg_write_target,
+    AuthConfig, AuthService, CookieSameSite, GenericOidcProvider, InMemoryAuthStore,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, ProviderRegistry, RedirectPolicy,
+    RequestGuard, ResolvedIdentity, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    TokenAuthority, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoWatermark, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth, WITHHELD_ID,
@@ -116,16 +116,18 @@ fn manager_with(
     fixture: &Fixture,
 ) -> Arc<SessionManager<CapturingSnapshot, RosterAuth, ConnettoWatermark>> {
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.
-    SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         snapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         authority,
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
     )
+    .build()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

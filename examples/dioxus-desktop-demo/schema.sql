@@ -6,7 +6,7 @@
 -- connetto_file_server::DEPLOYMENT_DDL, connetto_server::epoch::EPOCH_DDL,
 -- roles.sql (the non-owner role required by CONNETTO_READER_URL), then
 -- content.sql.
--- The server also requires CONNETTO_AUTH, CONNETTO_AUTH_BIND, and the
+-- The server also requires CONNETTO_BIND, CONNETTO_AUTH, the JWT key files, and the
 -- CONNETTO_OIDC_* variables written by the dev IdP (see dev_idp.rs).
 -- The key default is load-bearing on the client rather than here: build.rs
 -- translates it through pg2sqlite into the replica's own DEFAULT (uuidv4()),

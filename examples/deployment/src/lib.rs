@@ -28,14 +28,14 @@ pub const ROLES_SQL: &str = include_str!("../roles.sql");
 /// crate was built.
 pub const DEMO_WS_URL: &str = match option_env!("CONNETTO_TEST_WS") {
     Some(url) => url,
-    None => "ws://127.0.0.1:7777/",
+    None => "ws://127.0.0.1:7777/sync",
 };
 
-/// The browser stack's auth listener, as `CONNETTO_TEST_AUTH_BASE` named it
-/// when this crate was built.
+/// The browser stack's one address, as `CONNETTO_TEST_AUTH_BASE` named it when
+/// this crate was built.
 pub const AUTH_BASE: &str = match option_env!("CONNETTO_TEST_AUTH_BASE") {
     Some(base) => base,
-    None => "http://127.0.0.1:18099",
+    None => "http://127.0.0.1:7777",
 };
 
 /// The auth stack's route that hands back the delivered code in its URL.

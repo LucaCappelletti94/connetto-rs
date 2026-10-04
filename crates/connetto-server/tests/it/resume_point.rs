@@ -19,9 +19,9 @@ use connetto_core::auth::Principal;
 use connetto_core::messages::BindValue;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
-    Materializer, NoConnector, NoSigner, Oplog, OplogConfig, PageSpec, PgOplog, ReconnectPolicy,
-    RequestGuard, ResumePoint, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, TimelineHistory, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, Oplog, OplogConfig, PageSpec, PgOplog,
+    ReconnectPolicy, ResumePoint, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    TimelineHistory, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{
@@ -155,20 +155,23 @@ async fn manager(fixture: &Fixture) -> (Arc<Manager>, PgOplog) {
         .await;
     let probe = PgOplog::new(fixture.admin().clone(), OPLOG, OplogConfig::default());
     probe.ensure_schema().await.expect("provision the log");
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         EmptySnapshot,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        PgOplog::new(fixture.admin().clone(), OPLOG, OplogConfig::default()),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
-    );
+    )
+    .with_oplog(PgOplog::new(
+        fixture.admin().clone(),
+        OPLOG,
+        OplogConfig::default(),
+    ))
+    .build();
     (manager, probe)
 }
 

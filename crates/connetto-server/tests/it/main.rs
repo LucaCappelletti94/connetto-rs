@@ -6,6 +6,7 @@
 //! `cargo nextest run --cargo-profile testfast --all-features -E 'test(subscription_translate::)'`.
 
 mod abuse;
+mod builder_coverage;
 
 mod ticket_shared;
 
@@ -44,6 +45,7 @@ mod grouped_wire;
 mod failover;
 
 mod inprocess_loop;
+mod lifecycle;
 mod logging;
 
 mod macro_hygiene;

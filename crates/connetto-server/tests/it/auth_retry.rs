@@ -19,8 +19,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PageSpec, ReconnectEvent, RequestGuard, SessionConfig, SessionError,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectEvent, SessionError,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture};
 use subql::backend::Postgres;
@@ -139,16 +139,16 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
     let fixture = Fixture::acquire().await;
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL).build().expect("materializer"),
         EmptySnapshot,
         AlwaysErrSee,
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     // Connect a client and subscribe so a route is registered. `dispatch_event`
     // only consults the auth policy when there is at least one watcher.
@@ -222,16 +222,16 @@ async fn ingest_emits_auth_retry_events_and_broadcasts_pause_resume() {
     use std::sync::atomic::{AtomicU32, Ordering};
 
     let fixture = Fixture::acquire().await;
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL).build().expect("materializer"),
         EmptySnapshot,
         AlwaysErrSee,
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let _server = tokio::spawn(manager.clone().serve(server_transport));

@@ -21,8 +21,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, WebSocketTransport, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -192,21 +192,26 @@ async fn drive_cdc<S, A>(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_session_full_lifecycle() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let config = SessionConfig::new().with_initial_credits(1);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        config,
-    );
+    )
+    .with_session(config)
+    .build();
 
     // A separate catalog-driven applier standing in for the client's local store.
-    let applier = Materializer::new(PG_DDL).expect("build client applier");
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build client applier");
     let mut replica = client_replica();
 
     let (server_transport, mut client) = loopback();
@@ -332,19 +337,23 @@ async fn loopback_session_full_lifecycle() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn websocket_session_delivers_snapshot_and_live_patch() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("client-ws").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
-    let applier = Materializer::new(PG_DDL).expect("build client applier");
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build client applier");
     let mut replica = client_replica();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -570,19 +579,23 @@ fn reading_replica() -> SqliteConnection {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn loopback_session_composite_key_sync() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(READINGS_PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(READINGS_PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedReadings,
         RosterAuth::granting("client-ck"),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), READINGS_PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
-    let applier = Materializer::new(READINGS_PG_DDL).expect("build client applier");
+    let applier = Materializer::builder(READINGS_PG_DDL)
+        .build()
+        .expect("build client applier");
     let mut replica = reading_replica();
 
     let (server_transport, mut client) = loopback();

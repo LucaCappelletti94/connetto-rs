@@ -133,7 +133,11 @@ async fn prove(
     let (mut relay, sync_url) = match target {
         Target::Simulator { .. } => {
             let relay = Relay::start("127.0.0.1:0", &stack.server).await?;
-            let url = format!("ws://127.0.0.1:{}/", relay.address().port());
+            let url = format!(
+                "ws://127.0.0.1:{}{}",
+                relay.address().port(),
+                connetto_server::SYNC_PATH
+            );
             (relay, url)
         }
         Target::Device { .. } => {
@@ -142,7 +146,12 @@ async fn prove(
                 .as_ref()
                 .context("a device run needs the stack's TLS certificate")?;
             let relay = Relay::start_tls("0.0.0.0:0", &stack.server, cert, key).await?;
-            let url = format!("wss://{}:{}/", stack.host()?, relay.address().port());
+            let url = format!(
+                "wss://{}:{}{}",
+                stack.host()?,
+                relay.address().port(),
+                connetto_server::SYNC_PATH
+            );
             (relay, url)
         }
     };

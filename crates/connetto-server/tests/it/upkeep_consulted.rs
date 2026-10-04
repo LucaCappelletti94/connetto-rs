@@ -19,8 +19,8 @@ use connetto_core::messages::BindValue;
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, NoSigner, PageSpec, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgSqliteEmuSource, SourceItem};
@@ -122,20 +122,19 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
     let count = Arc::new(AtomicU64::new(0));
     let upkeep: Arc<dyn StoreUpkeep> = Arc::new(CountingUpkeep(Arc::clone(&count)));
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         EmptySnapshot,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        InMemoryOplog::default(),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        Some(upkeep),
-        NoSigner,
-    );
+    )
+    .with_upkeep(upkeep)
+    .build();
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     source

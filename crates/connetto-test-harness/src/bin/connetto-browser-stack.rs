@@ -1,4 +1,34 @@
 //! Runs the browser stack and browser suites without hand-started services.
+//!
+//! The stack provisions Postgres, the authorization service and the dev
+//! identity provider, then builds the connetto server in this process through
+//! `ServerBuilder` and serves the `/sync` route, the login endpoints, the file
+//! routes and the development routes on one address, which the suites read
+//! from the environment the stack passes them. The suites' own page, the
+//! wasm-bindgen-test runner's content server, listens on the page port, and
+//! the server lists that origin as the one whose login requests carry
+//! credentials.
+//!
+//! ```text
+//! cargo run -p connetto-test-harness --bin connetto-browser-stack
+//! cargo run -p connetto-test-harness --bin connetto-browser-stack --shard I/N
+//! cargo run -p connetto-test-harness --bin connetto-browser-stack --build-only DIR
+//! cargo run -p connetto-test-harness --bin connetto-browser-stack -- <program> [args]
+//! ```
+//!
+//! Bare, it runs the verified-topology step and then the default suites, one
+//! at a time through `wasm-pack test --headless --chrome`, each with
+//! `WASM_BINDGEN_TEST_TIMEOUT` and a shared `CARGO_TARGET_DIR` unless the
+//! caller set them. `--shard I/N` runs the suites whose position lands on `I`
+//! round-robin, so N shards cover the list once with no shared stack between
+//! them. `--build-only DIR` builds and copies the binaries a shard run needs
+//! into DIR. Given a program after `--`, it runs that program against the
+//! stack instead of the default suites.
+//!
+//! `CONNETTO_STACK_SYNC_PORT` moves the server off 7777 and
+//! `CONNETTO_STACK_PAGE_PORT` moves the page off 18101. `CONNETTO_SERVER_BIN`
+//! names the server binary the verified-topology step spawns and
+//! `CONNETTO_TOPOLOGY_BIN` a prebuilt verified-topology binary.
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
@@ -8,24 +38,24 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context as _, Result, anyhow};
-use axum::routing::get;
+use axum::Router;
+use axum::http::StatusCode;
+use axum::routing::{get, post};
 use connetto_core::auth::CapabilitySubject;
+use connetto_server::builder::{
+    ContentSettings, Database, OidcProvider, OpenFga, ServerBuilder, ServerHandle, ServerSchema,
+    StoreSpec, TokenKeys,
+};
 use connetto_server::capability::MintCapabilityKey;
-use connetto_server::{
-    AuthConfig, AuthService, CookieSameSite, DbAuthStore, DefaultUuidResolver, GenericOidcProvider,
-    ProviderRegistry, RedirectPolicy, RequestGuard, TokenAuthority, auth_router,
-    connetto_auth_tables,
-};
+use connetto_server::{CookieSameSite, RuntimeWritableCatalog};
 use connetto_test_harness::stack::{
-    AUTH_PORT_VAR, CONTENT_PORT_VAR, Deployment, KeyDir, Provisioned, SYNC_PORT_VAR, TaskGuard,
-    display_command, ensure_server_bin, exe_name, ports, provision, repo_path, require_free,
-    require_success, run_process, spawn_server, strings, wait_for_tcp, wait_until_closed,
+    Deployment, KeyDir, SYNC_PORT_VAR, display_command, ensure_server_bin, exe_name, ports,
+    provision, repo_path, require_free, require_success, run_process, strings, wait_for_tcp,
+    wait_until_closed,
 };
-use connetto_test_harness::{Fixture, MockOauth};
+use connetto_test_harness::{Fixture, MockOauth, PUBLICATION, SLOT, with_user};
 use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::pooled_connection::bb8::Pool;
-use tokio::process::{Child, Command};
+use tokio::process::Command;
 use tower_http::cors::{AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
 const LANDING_PATH: &str = "/dev/landing";
@@ -35,6 +65,11 @@ const SHARE_PATH: &str = "/dev/share";
 /// Where a suite posts hex file ids whose stored chunks the stack deletes before restarting the server, so the boot reconcile marks those files lost.
 const LOSE_CONTENT_PATH: &str = "/dev/lose-content";
 const BROWSER_PROVIDER: &str = "dev-idp";
+/// The port the wasm-bindgen-test runner's content server listens on unless
+/// `CONNETTO_STACK_PAGE_PORT` moves it, the origin the server lists for
+/// credentialed logins.
+const DEFAULT_PAGE_PORT: u16 = 18101;
+const PAGE_PORT_VAR: &str = "CONNETTO_STACK_PAGE_PORT";
 
 const DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../../examples/deployment/schema.sql"),
@@ -44,7 +79,6 @@ const DEPLOYMENT: Deployment = Deployment {
     published: &["orders", "order_lines", "photos"],
     writable: "orders,photos",
 };
-connetto_auth_tables!(String, diesel::sql_types::Text);
 
 diesel::table! {
     /// The file server's chunk rows, as the lose-content route reads them.
@@ -61,86 +95,263 @@ diesel::table! {
 }
 
 struct Services {
-    provisioned: Provisioned,
+    provisioned: connetto_test_harness::stack::Provisioned,
     idp: MockOauth,
-    server_bin: PathBuf,
     envs: Vec<(String, String)>,
     addresses: Addresses,
     share: Arc<Share>,
 }
 
-/// The sync server child, which the lose-content route stops and starts again.
-#[derive(Clone)]
-struct SyncServer {
-    child: Arc<tokio::sync::Mutex<Option<Child>>>,
-    server_bin: PathBuf,
-    envs: Arc<Vec<(String, String)>>,
-    content_dir: PathBuf,
-    admin_url: String,
-    sync_bind: String,
-    content_bind: String,
+/// Every address one run binds and hands its suites, from its two ports. The
+/// server serves sync, login and files on one; the test-runner page server
+/// keeps its own, and only its origin may carry login credentials.
+#[derive(Debug, PartialEq, Eq)]
+struct Addresses {
+    bind: String,
+    page_bind: String,
+    sync_ws: String,
+    base: String,
+    callback: String,
 }
 
-impl SyncServer {
-    fn new(services: &Services) -> Self {
-        Self {
-            child: Arc::new(tokio::sync::Mutex::new(None)),
-            server_bin: services.server_bin.clone(),
-            envs: Arc::new(services.envs.clone()),
-            content_dir: services.provisioned.content_store.path.clone(),
-            admin_url: services.provisioned.fixture.admin_url().to_owned(),
-            sync_bind: services.addresses.sync_bind.clone(),
-            content_bind: services.addresses.content_bind.clone(),
-        }
+impl Addresses {
+    fn from_env(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let [sync, page] = ports(
+            var,
+            [(SYNC_PORT_VAR, 7777), (PAGE_PORT_VAR, DEFAULT_PAGE_PORT)],
+        )?;
+        let base = format!("http://127.0.0.1:{sync}");
+        Ok(Self {
+            bind: format!("127.0.0.1:{sync}"),
+            page_bind: format!("127.0.0.1:{page}"),
+            sync_ws: format!("ws://127.0.0.1:{sync}/sync"),
+            callback: format!("{base}/auth/callback"),
+            base,
+        })
     }
 
-    async fn start(&self) -> Result<()> {
-        let mut slot = self.child.lock().await;
-        *slot = Some(self.spawn().await?);
-        Ok(())
+    /// What the suites read, the wasm ones at compile time through `option_env!`.
+    fn suite_env(&self) -> [(String, String); 3] {
+        [
+            ("CONNETTO_TEST_WS", &self.sync_ws),
+            ("CONNETTO_TEST_AUTH_BASE", &self.base),
+            ("WASM_BINDGEN_TEST_ADDRESS", &self.page_bind),
+        ]
+        .map(|(key, value)| (key.to_owned(), value.clone()))
     }
+}
 
-    async fn spawn(&self) -> Result<Child> {
-        // The child's auth listener carries the file routes the suites fetch.
-        spawn_server(
-            &self.server_bin,
-            &self.envs,
-            &self.sync_bind,
-            &self.content_bind,
+/// The named collaborators the in-process server builds from, held so a
+/// restart rebuilds from the same deployment.
+struct ServerConfig {
+    database: Database,
+    schema: ServerSchema,
+    keys: TokenKeys,
+    openfga: OpenFga,
+    provider: OidcProvider,
+    writable: RuntimeWritableCatalog,
+    content: ContentSettings,
+    page_origin: String,
+}
+
+impl ServerConfig {
+    /// The builder this deployment assembles, ready for `build()`.
+    fn builder(&self) -> ServerBuilder {
+        ServerBuilder::new(
+            self.database.clone(),
+            self.schema.clone(),
+            self.keys.clone(),
+            self.openfga.clone(),
         )
-        .await
+        .slot(SLOT)
+        .publication(PUBLICATION)
+        .slot_lag_watch(Duration::ZERO)
+        .oidc_providers(vec![self.provider.clone()])
+        .writable(self.writable.clone())
+        .content(Some(self.content.clone()))
+        // The suites' page is the only client of the login endpoints, and its
+        // runner picks a port this stack pins, so one listed origin suffices.
+        // The suites also walk the login with a `fetch`, and the browser presents
+        // `Origin: null` on every cross-origin redirect hop of that walk, so the
+        // callback hop is answered under that origin too. The cookies are
+        // `SameSite: Strict`, so a null-origin request carries none.
+        .cors_origins(vec![self.page_origin.clone(), "null".to_owned()])
+        .cookie_same_site(CookieSameSite::Strict)
+    }
+}
+
+/// One running instance, the listener's task, the change stream and the
+/// shutdown handle.
+struct Running {
+    serve: tokio::task::JoinHandle<()>,
+    stream: tokio::task::JoinHandle<()>,
+    handle: ServerHandle,
+}
+
+/// The in-process server, which the lose-content route stops and starts again.
+#[derive(Clone)]
+struct InProcServer {
+    config: Arc<ServerConfig>,
+    admin_url: String,
+    bind: String,
+    share: Arc<Share>,
+    state: Arc<tokio::sync::Mutex<Option<Running>>>,
+}
+
+impl InProcServer {
+    fn new(services: &Services) -> Result<Self> {
+        let provisioned = &services.provisioned;
+        let keys = &provisioned.keys;
+        let admin = provisioned.fixture.admin_url().to_owned();
+        let content_dir = provisioned.content_store.path.clone();
+        let content = ContentSettings {
+            base_url: services.addresses.base.clone(),
+            ttl: Duration::from_secs(3600),
+            read_ceiling: 1 << 26,
+            grace: Duration::from_secs(3600),
+            // A per-second sweep so a suite's import never waits on the 3600
+            // default cadence.
+            cadence: Duration::from_secs(1),
+            quota_identity: 0,
+            storage_ceiling: 0,
+            bandwidth_ceiling: 0,
+            bandwidth_window_days: 30,
+            warn_fraction: 0.8,
+            ceiling_refresh: Duration::from_secs(10),
+            owner_pool_size: 10,
+            store: StoreSpec::Fs(content_dir.clone()),
+            key: fs::read(&keys.content_der)
+                .with_context(|| format!("reading {}", keys.content_der.display()))?,
+        };
+        Ok(Self {
+            config: Arc::new(ServerConfig {
+                database: Database::new(
+                    admin.clone(),
+                    with_user(&admin, "connetto_reader", "connetto_reader"),
+                ),
+                schema: ServerSchema::new(DEPLOYMENT.schema, DEPLOYMENT.policies),
+                keys: TokenKeys::from_pem(
+                    fs::read(&keys.private)
+                        .with_context(|| format!("reading {}", keys.private.display()))?,
+                    fs::read(&keys.public)
+                        .with_context(|| format!("reading {}", keys.public.display()))?,
+                ),
+                openfga: OpenFga::new(provisioned.fga_url.clone(), provisioned.fga_store.clone()),
+                provider: OidcProvider::Generic(
+                    services
+                        .idp
+                        .oidc_config(BROWSER_PROVIDER, &services.addresses.callback),
+                ),
+                writable: writable_catalog(DEPLOYMENT.writable),
+                content,
+                page_origin: format!("http://{}", services.addresses.page_bind),
+            }),
+            admin_url: admin,
+            bind: services.addresses.bind.clone(),
+            share: services.share.clone(),
+            state: Arc::new(tokio::sync::Mutex::new(None)),
+        })
+    }
+
+    /// Build the parts, mount the development routes on them, and serve them
+    /// on the stack's one address.
+    async fn build_running(&self) -> Result<Running> {
+        let parts = self
+            .config
+            .builder()
+            .build()
+            .await
+            .map_err(|err| anyhow!("assembling the in-process server: {err}"))?;
+        let handle = parts.handle.clone();
+        let app = parts
+            .router
+            .merge(dev_routes(self.clone(), (*self.share).clone()));
+        let listener = tokio::net::TcpListener::bind(&self.bind)
+            .await
+            .with_context(|| format!("binding {}", self.bind))?;
+        let serve = tokio::spawn(async move {
+            if let Err(err) = axum::serve(listener, app).await {
+                eprintln!("browser stack server stopped: {err}");
+            }
+        });
+        let stream = tokio::spawn(async move {
+            if let Err(err) = parts.change_stream.await {
+                eprintln!("the in-process server's change stream stopped: {err}");
+            }
+        });
+        if !wait_for_tcp(&self.bind, Duration::from_secs(20)).await {
+            serve.abort();
+            stream.abort();
+            return Err(anyhow!("the in-process server did not open {}", self.bind));
+        }
+        Ok(Running {
+            serve,
+            stream,
+            handle,
+        })
+    }
+
+    /// Build and serve a fresh instance.
+    async fn start(&self) -> Result<()> {
+        let running = self.build_running().await?;
+        let mut slot = self.state.lock().await;
+        *slot = Some(running);
+        Ok(())
     }
 
     /// Stops the server, deletes the stored chunks of `file_ids`, and starts it again.
     async fn lose_content_and_restart(&self, file_ids: Vec<Vec<u8>>) -> Result<()> {
+        let hashes = self.lost_chunk_hashes(&file_ids).await?;
+        if hashes.is_empty() {
+            return Err(anyhow!("no stored file matches the ids the request names"));
+        }
+        let mut slot = self.state.lock().await;
+        let Some(running) = slot.take() else {
+            return Err(anyhow!("the in-process server is not running"));
+        };
+        // The listener goes first, so a reconnecting suite cannot land on a
+        // manager that is already shutting down.
+        running.serve.abort();
+        running.handle.shutdown().await;
+        running.stream.abort();
+        wait_until_closed(&self.bind, Duration::from_secs(10)).await;
+        self.delete_chunks(&hashes).await?;
+        let running = self.build_running().await?;
+        *slot = Some(running);
+        Ok(())
+    }
+
+    /// The stored chunk hashes the named files' manifests refer to.
+    async fn lost_chunk_hashes(&self, file_ids: &[Vec<u8>]) -> Result<Vec<Vec<u8>>> {
         use _cfs_manifest_chunks as chunks;
-        use connetto_file_core::ChunkStore as _;
         use diesel::{ExpressionMethods as _, QueryDsl as _};
         use diesel_async::{AsyncConnection as _, RunQueryDsl as _};
 
         let mut conn = AsyncPgConnection::establish(&self.admin_url)
             .await
             .context("connecting to name the lost chunks")?;
-        let hashes: Vec<Vec<u8>> = chunks::table
-            .filter(chunks::file_id.eq_any(&file_ids))
+        chunks::table
+            .filter(chunks::file_id.eq_any(file_ids))
             .select(chunks::chunk_hash)
             .distinct()
             .load(&mut conn)
             .await
-            .context("reading the files' chunks")?;
-        if hashes.is_empty() {
-            return Err(anyhow!("no stored file matches the ids the request names"));
-        }
-        let store = connetto_file_server::FsStore::new(&self.content_dir)
-            .with_context(|| format!("opening {}", self.content_dir.display()))?;
-        let mut slot = self.child.lock().await;
-        if let Some(mut child) = slot.take() {
-            child.kill().await.context("stopping connetto-server")?;
-        }
-        wait_until_closed(&self.sync_bind, Duration::from_secs(10)).await;
-        wait_until_closed(&self.content_bind, Duration::from_secs(10)).await;
+            .context("reading the files' chunks")
+    }
+
+    /// Delete the stored chunks a restart is about to mark lost.
+    async fn delete_chunks(&self, hashes: &[Vec<u8>]) -> Result<()> {
+        use connetto_file_core::ChunkStore as _;
+
+        let dir = match &self.config.content.store {
+            StoreSpec::Fs(dir) => dir,
+            StoreSpec::Object(_) => unreachable!("the stack serves a directory store"),
+        };
+        let store = connetto_file_server::FsStore::new(dir)
+            .with_context(|| format!("opening {}", dir.display()))?;
         for hash in hashes {
             let hash: [u8; 32] = hash
+                .as_slice()
                 .try_into()
                 .map_err(|_| anyhow!("a stored chunk hash is not 32 bytes"))?;
             store
@@ -148,9 +359,69 @@ impl SyncServer {
                 .await
                 .map_err(|err| anyhow!("deleting a lost chunk: {err}"))?;
         }
-        *slot = Some(self.spawn().await?);
         Ok(())
     }
+}
+
+/// The runtime write policy a comma-separated spec names, each entry a table
+/// or a table with its version column.
+fn writable_catalog(spec: &str) -> RuntimeWritableCatalog {
+    let mut builder = RuntimeWritableCatalog::builder();
+    for entry in spec
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+    {
+        builder = match entry.split_once(':') {
+            Some((table, version)) => builder.versioned(table.trim(), version.trim()),
+            None => builder.writable(entry),
+        };
+    }
+    builder.build()
+}
+
+/// The stack's development routes, mounted on the server's own router.
+fn dev_routes(server: InProcServer, share: Share) -> Router {
+    // The R90 browser contract fetches with `credentials: "include"`, and a
+    // wildcard `Access-Control-Allow-Origin` is hard-rejected with credentials,
+    // so the harness echoes the requesting origin instead of `Any`.
+    let cors = CorsLayer::new()
+        .allow_origin(AllowOrigin::mirror_request())
+        .allow_credentials(true)
+        .allow_methods(AllowMethods::mirror_request())
+        .allow_headers(AllowHeaders::mirror_request());
+    Router::new()
+        .route(
+            LANDING_PATH,
+            get(|| async { "connetto dev landing: the code is in this URL" }),
+        )
+        // Hand-built rather than serialized, so the stack keeps its
+        // dependency list to what it already needs.
+        .route(
+            SHARE_PATH,
+            get(|| async move {
+                format!(
+                    "{{\"grant\":\"{}\",\"subject\":\"{}\",\"photo\":\"{}\"}}",
+                    share.token, share.subject, share.photo
+                )
+            }),
+        )
+        .route(
+            LOSE_CONTENT_PATH,
+            post(|body: String| async move {
+                let Some(file_ids) = parse_file_ids(&body).filter(|ids| !ids.is_empty()) else {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        "the body names hex file ids".to_owned(),
+                    );
+                };
+                match server.lose_content_and_restart(file_ids).await {
+                    Ok(()) => (StatusCode::OK, String::new()),
+                    Err(err) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{err:#}")),
+                }
+            }),
+        )
+        .layer(cors)
 }
 
 /// Parses whitespace-separated 64-character hex file ids.
@@ -166,51 +437,6 @@ fn parse_file_ids(body: &str) -> Option<Vec<Vec<u8>>> {
                 .flatten()
         })
         .collect()
-}
-
-/// Every address one run binds and hands its suites, from its three ports.
-#[derive(Debug, PartialEq, Eq)]
-struct Addresses {
-    sync_bind: String,
-    auth_bind: String,
-    content_bind: String,
-    sync_ws: String,
-    auth_base: String,
-    content_base: String,
-    callback: String,
-}
-
-impl Addresses {
-    fn from_env(var: impl Fn(&str) -> Option<String>) -> Result<Self> {
-        let [sync, auth, content] = ports(
-            var,
-            [
-                (SYNC_PORT_VAR, 7777),
-                (AUTH_PORT_VAR, 18099),
-                (CONTENT_PORT_VAR, 18100),
-            ],
-        )?;
-        let auth_base = format!("http://127.0.0.1:{auth}");
-        Ok(Self {
-            sync_bind: format!("127.0.0.1:{sync}"),
-            auth_bind: format!("127.0.0.1:{auth}"),
-            content_bind: format!("127.0.0.1:{content}"),
-            sync_ws: format!("ws://127.0.0.1:{sync}/"),
-            callback: format!("{auth_base}/auth/callback"),
-            auth_base,
-            content_base: format!("http://127.0.0.1:{content}"),
-        })
-    }
-
-    /// What the suites read, the wasm ones at compile time through `option_env!`.
-    fn suite_env(&self) -> [(String, String); 3] {
-        [
-            ("CONNETTO_TEST_WS", &self.sync_ws),
-            ("CONNETTO_TEST_AUTH_BASE", &self.auth_base),
-            ("CONNETTO_TEST_CONTENT_BASE", &self.content_base),
-        ]
-        .map(|(key, value)| (key.to_owned(), value.clone()))
-    }
 }
 
 /// One slice of the suite list, `--shard I/N`: this process runs every suite
@@ -239,17 +465,15 @@ async fn main() -> Result<()> {
         return prebuild(&dir).await;
     }
     let addresses = Addresses::from_env(|name| std::env::var(name).ok())?;
-    require_free(&addresses.sync_bind, SYNC_PORT_VAR)?;
-    require_free(&addresses.auth_bind, AUTH_PORT_VAR)?;
-    require_free(&addresses.content_bind, CONTENT_PORT_VAR)?;
+    require_free(&addresses.bind, SYNC_PORT_VAR)?;
+    require_free(&addresses.page_bind, PAGE_PORT_VAR)?;
 
     let (shard, command) = cli_arguments()?;
     let server_bin = ensure_server_bin().await?;
     let services = prepare_services(server_bin, addresses).await?;
 
     if let Some((program, args)) = command {
-        let server = SyncServer::new(&services);
-        let _auth = start_auth_stack(&services, server.clone()).await?;
+        let server = InProcServer::new(&services)?;
         server.start().await?;
         run_process(&program, &args, &services.envs).await?;
     } else {
@@ -257,12 +481,9 @@ async fn main() -> Result<()> {
         // shard pays it. A bare invocation is shard 1 of 1 and keeps it.
         if shard.is_none_or(|shard| shard.index == 1) {
             run_verified_topology(&services).await?;
-            let addresses = &services.addresses;
-            wait_until_closed(&addresses.sync_bind, Duration::from_secs(5)).await;
-            wait_until_closed(&addresses.auth_bind, Duration::from_secs(5)).await;
+            wait_until_closed(&services.addresses.bind, Duration::from_secs(5)).await;
         }
-        let server = SyncServer::new(&services);
-        let _auth = start_auth_stack(&services, server.clone()).await?;
+        let server = InProcServer::new(&services)?;
         server.start().await?;
         run_default_browser_suites(&services, shard).await?;
     }
@@ -358,17 +579,9 @@ async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<S
     let schema_file = repo_path(&["examples", "deployment", "schema.sql"])?;
     let policies_file = repo_path(&["examples", "deployment", "policies.sql"])?;
 
-    let mut envs = provisioned.server_env(
-        &DEPLOYMENT,
-        &addresses.sync_bind,
-        &addresses.auth_bind,
-        &addresses.content_base,
-    );
-    envs.extend(addresses.suite_env());
+    let mut envs = addresses.suite_env().to_vec();
     envs.extend(
         [
-            ("CONNETTO_CONTENT_SWEEP_SECS", "1".to_owned()),
-            ("CONNETTO_SLOT_LAG_SECS", "0".to_owned()),
             ("CONNETTO_TEST_PROVIDER", BROWSER_PROVIDER.to_owned()),
             (
                 "CONNETTO_TEST_PG_DDL_FILE",
@@ -382,126 +595,18 @@ async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<S
         ]
         .map(|(key, value)| (key.to_owned(), value)),
     );
+    // The real binary the verified-topology run spawns reads the same
+    // single-port contract the in-process server builds from.
+    envs.extend(provisioned.server_env(&DEPLOYMENT, &addresses.bind, &addresses.base));
     envs.extend(idp.env_pairs(BROWSER_PROVIDER, &addresses.callback));
 
     Ok(Services {
         provisioned,
         idp,
-        server_bin,
         envs,
         addresses,
         share: Arc::new(share),
     })
-}
-
-async fn start_auth_stack(services: &Services, server: SyncServer) -> Result<TaskGuard> {
-    let auth_bind = &services.addresses.auth_bind;
-    let listener = tokio::net::TcpListener::bind(auth_bind)
-        .await
-        .with_context(|| format!("binding {auth_bind}"))?;
-    let provider = GenericOidcProvider::discover(
-        services
-            .idp
-            .oidc_config(BROWSER_PROVIDER, &services.addresses.callback),
-        openidconnect::reqwest::Client::new(),
-    )
-    .await
-    .map_err(|err| anyhow!("discovering the browser provider: {err}"))?;
-    let mut registry = ProviderRegistry::new();
-    registry.register(Arc::new(provider));
-    let registry = Arc::new(registry);
-
-    let config = AuthConfig::default();
-    let private = tokio::fs::read(&services.provisioned.keys.private)
-        .await
-        .with_context(|| format!("reading {}", services.provisioned.keys.private.display()))?;
-    let public = tokio::fs::read(&services.provisioned.keys.public)
-        .await
-        .with_context(|| format!("reading {}", services.provisioned.keys.public.display()))?;
-    let authority = TokenAuthority::from_ed_pem(&private, &public, &config)
-        .map_err(|err| anyhow!("loading the browser signing keypair: {err}"))?;
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
-        services.provisioned.fixture.admin_url(),
-    );
-    let pool = Pool::builder()
-        .build(manager)
-        .await
-        .context("building the browser auth Postgres pool")?;
-    let store: DbAuthStore<ConnettoAuthSchema> = DbAuthStore::new(
-        pool,
-        config.refresh_lifetimes(),
-        Arc::new(DefaultUuidResolver),
-    );
-    let service = Arc::new(
-        AuthService::new(
-            Arc::new(authority),
-            Arc::new(store),
-            Arc::new(RequestGuard::default()),
-        )
-        .with_registry(Arc::clone(&registry)),
-    );
-    // The R90 browser contract fetches with `credentials: "include"`, and a
-    // wildcard `Access-Control-Allow-Origin` is hard-rejected with credentials,
-    // so the harness echoes the requesting origin instead of `Any`.
-    let cors = CorsLayer::new()
-        .allow_origin(AllowOrigin::mirror_request())
-        .allow_credentials(true)
-        .allow_methods(AllowMethods::mirror_request())
-        .allow_headers(AllowHeaders::mirror_request());
-    // The share route stands in for whatever a deployment's sharing does. A
-    // suite fetches it rather than reading a value baked at compile time,
-    // because a stale binary would otherwise carry the previous run's key
-    // while the database holds this run's row.
-    let share = services.share.clone();
-    let app = auth_router(
-        service,
-        registry,
-        RedirectPolicy::default(),
-        CookieSameSite::Strict,
-    )
-    .route(
-        LANDING_PATH,
-        get(|| async { "connetto dev landing: the code is in this URL" }),
-    )
-    .route(
-        SHARE_PATH,
-        get(|| async move {
-            // Hand-built rather than serialized, so the stack keeps its
-            // dependency list to what it already needs.
-            format!(
-                "{{\"grant\":\"{}\",\"subject\":\"{}\",\"photo\":\"{}\"}}",
-                share.token, share.subject, share.photo
-            )
-        }),
-    )
-    .route(
-        LOSE_CONTENT_PATH,
-        axum::routing::post(|body: String| async move {
-            let Some(file_ids) = parse_file_ids(&body).filter(|ids| !ids.is_empty()) else {
-                return (
-                    axum::http::StatusCode::BAD_REQUEST,
-                    "the body names hex file ids".to_owned(),
-                );
-            };
-            match server.lose_content_and_restart(file_ids).await {
-                Ok(()) => (axum::http::StatusCode::OK, String::new()),
-                Err(err) => (
-                    axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("{err:#}"),
-                ),
-            }
-        }),
-    )
-    .layer(cors);
-    let handle = tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, app).await {
-            eprintln!("browser auth stack stopped: {err}");
-        }
-    });
-    if !wait_for_tcp(auth_bind, Duration::from_secs(20)).await {
-        return Err(anyhow!("browser auth stack did not open {auth_bind}"));
-    }
-    Ok(TaskGuard { handle })
 }
 
 /// The verified-topology run, or with `run` false the build of the binary it runs.
@@ -793,8 +898,8 @@ async fn seed_share(fixture: &Fixture, keys: &KeyDir) -> Result<Share> {
     let public = tokio::fs::read(&keys.public)
         .await
         .with_context(|| format!("reading {}", keys.public.display()))?;
-    let config = AuthConfig::default();
-    let authority = TokenAuthority::from_ed_pem(&private, &public, &config)
+    let config = connetto_server::AuthConfig::default();
+    let authority = connetto_server::TokenAuthority::from_ed_pem(&private, &public, &config)
         .map_err(|err| anyhow!("building the token authority: {err}"))?;
     let token = authority
         .mint_capability(
@@ -826,58 +931,52 @@ mod tests {
     }
 
     /// A port override moves every address built on that port and no other,
-    /// and the suites are handed the ports the stack binds, so an auth callback
-    /// or suite base left on a default would send a browser to a closed port.
+    /// and the suites are handed the ports the stack binds, so an auth
+    /// callback or suite base left on a default would send a browser to a
+    /// closed port.
     #[test]
     fn each_port_override_moves_only_its_own_addresses() {
         assert_eq!(
             read(&[]).expect("defaults"),
             Addresses {
-                sync_bind: "127.0.0.1:7777".to_owned(),
-                auth_bind: "127.0.0.1:18099".to_owned(),
-                content_bind: "127.0.0.1:18100".to_owned(),
-                sync_ws: "ws://127.0.0.1:7777/".to_owned(),
-                auth_base: "http://127.0.0.1:18099".to_owned(),
-                content_base: "http://127.0.0.1:18100".to_owned(),
-                callback: "http://127.0.0.1:18099/auth/callback".to_owned(),
+                bind: "127.0.0.1:7777".to_owned(),
+                page_bind: "127.0.0.1:18101".to_owned(),
+                sync_ws: "ws://127.0.0.1:7777/sync".to_owned(),
+                base: "http://127.0.0.1:7777".to_owned(),
+                callback: "http://127.0.0.1:7777/auth/callback".to_owned(),
             }
         );
         assert_eq!(
             read(&[("CONNETTO_STACK_SYNC_PORT", "27777")]).expect("sync only"),
             Addresses {
-                sync_bind: "127.0.0.1:27777".to_owned(),
-                auth_bind: "127.0.0.1:18099".to_owned(),
-                content_bind: "127.0.0.1:18100".to_owned(),
-                sync_ws: "ws://127.0.0.1:27777/".to_owned(),
-                auth_base: "http://127.0.0.1:18099".to_owned(),
-                content_base: "http://127.0.0.1:18100".to_owned(),
-                callback: "http://127.0.0.1:18099/auth/callback".to_owned(),
+                bind: "127.0.0.1:27777".to_owned(),
+                page_bind: "127.0.0.1:18101".to_owned(),
+                sync_ws: "ws://127.0.0.1:27777/sync".to_owned(),
+                base: "http://127.0.0.1:27777".to_owned(),
+                callback: "http://127.0.0.1:27777/auth/callback".to_owned(),
             }
         );
         let moved = read(&[
             ("CONNETTO_STACK_SYNC_PORT", "27777"),
-            ("CONNETTO_STACK_AUTH_PORT", "28099"),
-            ("CONNETTO_STACK_CONTENT_PORT", "28100"),
+            ("CONNETTO_STACK_PAGE_PORT", "28101"),
         ])
-        .expect("all three");
+        .expect("both");
         assert_eq!(
             moved,
             Addresses {
-                sync_bind: "127.0.0.1:27777".to_owned(),
-                auth_bind: "127.0.0.1:28099".to_owned(),
-                content_bind: "127.0.0.1:28100".to_owned(),
-                sync_ws: "ws://127.0.0.1:27777/".to_owned(),
-                auth_base: "http://127.0.0.1:28099".to_owned(),
-                content_base: "http://127.0.0.1:28100".to_owned(),
-                callback: "http://127.0.0.1:28099/auth/callback".to_owned(),
+                bind: "127.0.0.1:27777".to_owned(),
+                page_bind: "127.0.0.1:28101".to_owned(),
+                sync_ws: "ws://127.0.0.1:27777/sync".to_owned(),
+                base: "http://127.0.0.1:27777".to_owned(),
+                callback: "http://127.0.0.1:27777/auth/callback".to_owned(),
             }
         );
         assert_eq!(
             moved.suite_env(),
             [
-                ("CONNETTO_TEST_WS", "ws://127.0.0.1:27777/"),
-                ("CONNETTO_TEST_AUTH_BASE", "http://127.0.0.1:28099"),
-                ("CONNETTO_TEST_CONTENT_BASE", "http://127.0.0.1:28100"),
+                ("CONNETTO_TEST_WS", "ws://127.0.0.1:27777/sync"),
+                ("CONNETTO_TEST_AUTH_BASE", "http://127.0.0.1:27777"),
+                ("WASM_BINDGEN_TEST_ADDRESS", "127.0.0.1:28101"),
             ]
             .map(|(key, value)| (key.to_owned(), value.to_owned()))
         );
@@ -888,15 +987,12 @@ mod tests {
     #[test]
     fn ports_that_collide_or_are_not_ports_are_refused() {
         let refused: [&[(&str, &str)]; 6] = [
-            &[("CONNETTO_STACK_SYNC_PORT", "18099")],
-            &[
-                ("CONNETTO_STACK_AUTH_PORT", "28000"),
-                ("CONNETTO_STACK_CONTENT_PORT", "28000"),
-            ],
+            &[("CONNETTO_STACK_SYNC_PORT", "18101")],
+            &[("CONNETTO_STACK_PAGE_PORT", "7777")],
             &[("CONNETTO_STACK_SYNC_PORT", "0")],
             &[("CONNETTO_STACK_SYNC_PORT", "65536")],
-            &[("CONNETTO_STACK_AUTH_PORT", "")],
-            &[("CONNETTO_STACK_CONTENT_PORT", "http://127.0.0.1:28100")],
+            &[("CONNETTO_STACK_PAGE_PORT", "")],
+            &[("CONNETTO_STACK_PAGE_PORT", "http://127.0.0.1:28101")],
         ];
         for pairs in refused {
             assert!(read(pairs).is_err(), "{pairs:?} was accepted");

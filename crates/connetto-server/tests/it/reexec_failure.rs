@@ -9,8 +9,8 @@ use std::time::Duration;
 use connetto_core::messages::{ControlMessage, PauseCause, SUBSCRIPTION_REFUSED};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
-    AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, ReconnectEvent, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
+    AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, ReconnectEvent,
+    RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
     pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
@@ -54,24 +54,20 @@ fn full_manager(
     snapshot_pool: Pool<AsyncPgConnection>,
     write_pool: Pool<AsyncPgConnection>,
 ) -> Arc<Manager> {
-    SessionManager::with_connector(
-        Materializer::with_read_connector(
-            catalog_ddl,
-            RuntimeWritableCatalog::default(),
-            None,
-            None,
-            PgReadConnector::with_session_setup(connector_pool.clone()),
-        )
-        .expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(catalog_ddl)
+            .with_write_catalog(RuntimeWritableCatalog::default())
+            .with_read_connector(PgReadConnector::with_session_setup(connector_pool.clone()))
+            .build()
+            .expect("build materializer"),
         PgSnapshotSource::from_ddl(snapshot_pool, schema_ddl).expect("snapshot source"),
         auth,
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(connector_pool),
         pg_write_target::<ConnettoWatermark>(write_pool, schema_ddl).expect("build write target"),
-        guard,
-        SessionConfig::default(),
-        None,
     )
+    .with_guard(guard)
+    .build()
 }
 
 /// Dropping column n poisons re-execution of SELECT MIN(n): the database returns

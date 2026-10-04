@@ -22,8 +22,8 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::QueryableByName;
@@ -242,24 +242,25 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin().clone();
     let writer_pool = setup(&fixture).await;
-    let materializer = Materializer::with_write_catalog(
-        PG_DDL,
-        RuntimeWritableCatalog::builder()
-            .versioned("notes", "edited_at")
-            .build(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(
+            RuntimeWritableCatalog::builder()
+                .versioned("notes", "edited_at")
+                .build(),
+        )
+        .build()
+        .expect("build materializer");
     let target =
         pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         NoSnapshot,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
@@ -330,24 +331,25 @@ async fn rls_write_filter_refuses_handing_a_row_to_another_owner() {
     let fixture = Fixture::acquire().await;
     let admin = fixture.admin().clone();
     let writer_pool = setup(&fixture).await;
-    let materializer = Materializer::with_write_catalog(
-        PG_DDL,
-        RuntimeWritableCatalog::builder()
-            .versioned("notes", "edited_at")
-            .build(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(
+            RuntimeWritableCatalog::builder()
+                .versioned("notes", "edited_at")
+                .build(),
+        )
+        .build()
+        .expect("build materializer");
     let target =
         pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         NoSnapshot,
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
@@ -408,14 +410,15 @@ async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() 
     let admin = fixture.admin().clone();
     let writer_pool = setup(&fixture).await;
     let build = || {
-        let materializer = Materializer::with_write_catalog(
-            PG_DDL,
-            RuntimeWritableCatalog::builder()
-                .versioned("notes", "edited_at")
-                .build(),
-        )
-        .expect("build materializer");
-        SessionManager::new(
+        let materializer = Materializer::builder(PG_DDL)
+            .with_write_catalog(
+                RuntimeWritableCatalog::builder()
+                    .versioned("notes", "edited_at")
+                    .build(),
+            )
+            .build()
+            .expect("build materializer");
+        ManagerBuilder::new(
             materializer,
             NoSnapshot,
             // Admit the unnamed caller so the seq-1 refusal comes from Postgres, not from
@@ -425,11 +428,11 @@ async fn an_unidentified_caller_writes_under_a_capability_and_not_without_one() 
                 .and_the_unnamed_caller()
                 .withholding(WITHHELD_ID),
             Arc::new(TestGrantChecker),
+            NoConnector,
             pg_write_target::<ConnettoWatermark>(writer_pool.clone(), PG_DDL)
                 .expect("build write target"),
-            Arc::new(RequestGuard::default()),
-            SessionConfig::default(),
         )
+        .build()
     };
 
     // Presenting nothing: the insert is refused, because with neither an

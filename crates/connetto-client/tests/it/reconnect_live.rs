@@ -19,8 +19,9 @@ use connetto_client::{
 };
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    LoopbackTransport, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
+    SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -267,17 +268,19 @@ async fn fence(client: &ConnettoClient<LoopbackTransport>, nonce: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let slot: ServeSlot = Arc::new(Mutex::new(None));
     let offline = Arc::new(AtomicBool::new(false));
@@ -379,21 +382,20 @@ async fn offline_write_reflushes_after_resume() {
     connetto_test_harness::provision_watermark(fixture.admin()).await;
     // Writes need an explicitly writable table: a default materializer
     // rejects every client mutation.
-    let materializer = Materializer::with_write_catalog(
-        PG_DDL,
-        RuntimeWritableCatalog::builder().writable("orders").build(),
-    )
-    .expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::builder().writable("orders").build())
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let slot: ServeSlot = Arc::new(Mutex::new(None));
     let offline = Arc::new(AtomicBool::new(false));
 
@@ -506,19 +508,19 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
         )
         .await
         .expect("build the write pool");
-    let manager = SessionManager::new(
-        Materializer::with_write_catalog(
-            PG_DDL,
-            RuntimeWritableCatalog::builder().writable("orders").build(),
-        )
-        .expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_write_catalog(RuntimeWritableCatalog::builder().writable("orders").build())
+            .build()
+            .expect("build materializer"),
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(writes.clone(), PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default().with_write_retry_budget(Duration::from_millis(200)),
-    );
+    )
+    .with_session(SessionConfig::default().with_write_retry_budget(Duration::from_millis(200)))
+    .build();
     let slot: ServeSlot = Arc::new(Mutex::new(None));
     let (client, pump) = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
@@ -607,17 +609,19 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
     let dir = tempfile::tempdir().expect("data dir");
     let credential = super::support::held("token");
 
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let slot: ServeSlot = Arc::new(Mutex::new(None));
 

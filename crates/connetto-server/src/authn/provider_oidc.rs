@@ -10,6 +10,7 @@
 //! issuer matching is insufficient: the Microsoft preset accepts an any-tenant
 //! issuer pattern and validates it after verification.
 
+use std::fmt;
 use std::time::SystemTime;
 
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
@@ -85,7 +86,7 @@ impl IssuerMatch {
 /// The four values a provider cannot be discovered without are arguments to
 /// [`new`](Self::new) rather than chained, because there is no honest default
 /// for any of them and an empty string would fail late, at discovery.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OidcProviderConfig {
     name: String,
     client_id: String,
@@ -94,6 +95,20 @@ pub struct OidcProviderConfig {
     redirect_url: String,
     scopes: Vec<String>,
     assurance: AssuranceRequirement,
+}
+
+impl fmt::Debug for OidcProviderConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OidcProviderConfig")
+            .field("name", &self.name)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &self.client_secret.is_some())
+            .field("issuer", &self.issuer)
+            .field("redirect_url", &self.redirect_url)
+            .field("scopes", &self.scopes)
+            .field("assurance", &self.assurance)
+            .finish()
+    }
 }
 
 impl OidcProviderConfig {

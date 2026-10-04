@@ -15,7 +15,7 @@ use connetto_core::messages::{ControlMessage, Handshake, Subscribe, Subscription
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{
-    ConnettoReadSetup, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
+    ConnettoReadSetup, ManagerBuilder, Materializer, PageSpec, RuntimeWritableCatalog,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
@@ -173,17 +173,14 @@ async fn reexec_bootstraps_folds_and_retriggers() {
     let fixture = Fixture::acquire().await;
     // Bootstrap answers 10 before any change, the re-execution after the delete answers 20 and holds both changes.
     let connector = QueuedConnector::new([(10, before_every_change()), (20, after_every_change())]);
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         NoSnapshot,
         // Aggregate results never go through the policy.
@@ -191,10 +188,8 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         Arc::new(TestGrantChecker),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));

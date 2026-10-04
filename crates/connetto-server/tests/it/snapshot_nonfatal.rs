@@ -21,9 +21,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    InMemoryOplog, Materializer, NoConnector, NoSigner, OplogConfig, PageKey, PageSpec, Position,
-    RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    TimelineHistory, loopback, pg_write_target,
+    InMemoryOplog, ManagerBuilder, Materializer, NoConnector, OplogConfig, PageKey, PageSpec,
+    Position, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
@@ -85,18 +85,20 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         BrokenSnapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let (server_end, mut client) = loopback();
     let server = Arc::clone(&manager);
@@ -175,17 +177,19 @@ async fn refusals_are_byte_identical_across_causes() {
         "refusals_are_byte_identical_across_causes",
         |logs| async move {
             let fixture = Fixture::acquire().await;
-            let materializer = Materializer::new(PG_DDL).expect("build materializer");
-            let manager = SessionManager::new(
+            let materializer = Materializer::builder(PG_DDL)
+                .build()
+                .expect("build materializer");
+            let manager = ManagerBuilder::new(
                 materializer,
                 BrokenSnapshot,
                 RosterAuth::granting_nobody().withholding(WITHHELD_ID),
                 Arc::new(TestGrantChecker),
+                NoConnector,
                 pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
                     .expect("build write target"),
-                Arc::new(RequestGuard::default()),
-                SessionConfig::default(),
-            );
+            )
+            .build();
 
             let (server_end, mut client) = loopback();
             let server = Arc::clone(&manager);
@@ -287,16 +291,18 @@ async fn a_capture_reads_only_the_records_its_own_test_provoked() {
         "a_capture_reads_only_the_records_its_own_test_provoked",
         |logs| async move {
             let fixture = Fixture::acquire().await;
-            let manager = SessionManager::new(
-                Materializer::new(PG_DDL).expect("build materializer"),
+            let manager = ManagerBuilder::new(
+                Materializer::builder(PG_DDL)
+                    .build()
+                    .expect("build materializer"),
                 BrokenSnapshot,
                 RosterAuth::granting_nobody().withholding(WITHHELD_ID),
                 Arc::new(TestGrantChecker),
+                NoConnector,
                 pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
                     .expect("build write target"),
-                Arc::new(RequestGuard::default()),
-                SessionConfig::default(),
-            );
+            )
+            .build();
 
             // The session this test owns, under the span this body runs in.
             let (mine_end, mut mine) = loopback();
@@ -355,7 +361,9 @@ async fn a_capture_reads_only_the_records_its_own_test_provoked() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     // A tiny window: after four inserts the oldest two are pruned, so a
     // cursor at the first event is outside retention and the subscription
     // takes the resync path rather than oplog catchup.
@@ -364,20 +372,17 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
             .with_max_entries(2)
             .with_max_age(Duration::from_hours(72)),
     );
-    let manager = SessionManager::with_oplog(
+    let manager = ManagerBuilder::new(
         materializer,
         BrokenSnapshot,
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        oplog,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
-    );
+    )
+    .with_oplog(oplog)
+    .build();
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let mut first_lsn = None;
@@ -602,17 +607,19 @@ async fn drain_until_pong<T: Transport>(client: &mut T, nonce: u64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mid_read_page_failure_causes_exactly_one_restart_then_refuses() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         PagedThenBrokenSnapshot::new(3),
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let (server_end, mut client) = loopback();
     let server = Arc::clone(&manager);
     let serve = tokio::spawn(

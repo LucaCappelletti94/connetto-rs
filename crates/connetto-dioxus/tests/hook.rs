@@ -13,9 +13,8 @@ use connetto_client::{ConnettoClient, Grant, HeldCredential, NativeClientBuilder
 use connetto_core::{Cursor, HandshakeAuthority, test_support::TestGrantChecker};
 use connetto_dioxus::{use_live, use_live_fn};
 use connetto_server::{
-    ConnettoReadSetup, Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport,
-    pg_write_target,
+    ConnettoReadSetup, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -300,27 +299,22 @@ async fn use_live_renders_and_follows_cdc() {
         // COUNT(*) seed over the empty backend.
         rows: Arc::new(StdMutex::new(vec![vec![PgValue::Int(0)]])),
     };
-    let materializer = Materializer::with_read_connector(
-        PG_DDL,
-        RuntimeWritableCatalog::default(),
-        None,
-        None,
-        connector.clone(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(RuntimeWritableCatalog::default())
+        .with_read_connector(connector.clone())
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::with_connector(
+    let manager = ManagerBuilder::new(
         materializer,
         EmptySnapshot,
         RosterAuth::granting("dioxus-test").withholding(WITHHELD_ID),
         test_verifier(),
         connector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-    );
+    )
+    .build();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
@@ -389,18 +383,20 @@ async fn use_live_renders_and_follows_cdc() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn use_live_fn_follows_a_boxed_row_query() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedOneOrder,
         RosterAuth::granting("dioxus-fn-test").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         target,
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();

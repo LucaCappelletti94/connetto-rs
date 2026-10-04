@@ -15,7 +15,9 @@ pub use connetto_core::auth::VerifiedSession;
 use connetto_core::auth::{AuthContext, CapabilitySubject, Subject};
 use connetto_core::messages::Grant;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+#[cfg(feature = "test-seams")]
 use ring::rand::SystemRandom;
+#[cfg(feature = "test-seams")]
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
@@ -301,6 +303,7 @@ pub struct TokenAuthority {
 }
 
 impl TokenAuthority {
+    #[cfg(feature = "test-seams")]
     /// Build over a freshly generated ephemeral Ed25519 keypair.
     ///
     /// Suits the in-memory store, which is itself ephemeral, and local loops.

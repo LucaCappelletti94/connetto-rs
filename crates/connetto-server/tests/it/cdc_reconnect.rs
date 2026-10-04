@@ -25,8 +25,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    Materializer, PageSpec, ReconnectPolicy, RequestGuard, ResumePoint, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectPolicy, ResumePoint,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoWatermark, Fixture, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID,
@@ -165,17 +165,21 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         .await;
     fixture.start_replication(&["orders"]).await;
 
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         EmptySnapshot,
         RosterAuth::granting("reader").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
-    let applier = Materializer::new(PG_DDL).expect("build applier");
+    )
+    .build();
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build applier");
     let mut replica = client_replica();
 
     let (server_transport, mut client) = loopback();

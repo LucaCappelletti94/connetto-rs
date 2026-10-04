@@ -1,452 +1,147 @@
 //! The connetto sync server as a runnable process.
 //!
+//! The binary is a translation from its environment into a
+//! [`ServerBuilder`], which owns the assembly, and from its signal surface
+//! into the process outcome. It reads every setting, hands over the named
+//! collaborators, binds the one listener, and serves through the builder's
+//! own lifecycle. It owns what a process owns and a library must not own:
+//! the logging, the shutdown signal, and the exit code.
+//!
 //! Configuration comes from the environment:
 //!
-//! - `CONNETTO_BIND`: listen address (default `127.0.0.1:8080`).
-//! - `DATABASE_URL`: Postgres conninfo for the CDC replication stream, snapshot
-//!   reads, and aggregate re-execution. The role needs `REPLICATION`.
-//! - `CONNETTO_PG_DDL` or `CONNETTO_PG_DDL_FILE`: the Postgres catalog DDL.
-//! - `CONNETTO_WRITABLE`: comma-separated tables that accept client mutations,
-//!   each `table` or `table:version_column` (the version column conflict-checks
-//!   version-bearing updates and deletes). Unset means no table is writable, so
-//!   every client mutation is rejected. Writes apply to the source Postgres.
-//! - `CONNETTO_SLOT`: pre-created logical replication slot (default
-//!   `connetto_slot`).
-//! - `CONNETTO_PUBLICATION`: publication the slot follows (default
-//!   `connetto_pub`).
-//! - `CONNETTO_READER_URL`: required non-superuser conninfo. Snapshots, read
-//!   authorization, and mutation applies run under Postgres Row-Level Security
-//!   as that role, and the server refuses to start without it, because the
-//!   owner pool bypasses every policy (Postgres applies none to a superuser or
-//!   table owner). The role needs `SELECT, INSERT, UPDATE` on
-//!   `_connetto_mutations` (the exactly-once watermark table). connetto emits
-//!   no DDL, so the deployment creates that table (see
-//!   `docs/architecture/11-authentication.md`) alongside the auth tables. A
-//!   restricted role cannot `CREATE` in schema `public` on Postgres 15 and
-//!   later, so the admin runs the migration.
-//! - `CONNETTO_OWNER_POOL_SIZE`: connections in the owner pool (default 10,
-//!   bb8's own default made explicit).
-//! - `CONNETTO_READER_POOL_SIZE`: connections in the reader pool (default 10).
-//! - `CONNETTO_READER_RESERVE`: reader connections held back for callers whose
-//!   handshake resolved an identity (default 3). Unidentified callers may hold
-//!   at most the pool size less this, so signed-in traffic cannot be starved
-//!   by anonymous volume, and setting it equal to the pool size turns
-//!   anonymous database access off. Must not exceed
-//!   `CONNETTO_READER_POOL_SIZE`. See
-//!   `docs/architecture/16-server-capacity.md`.
-//! - `CONNETTO_OIDC_PROVIDERS`: which identity providers `CONNETTO_AUTH` logs
-//!   users in with, as a comma-separated list of provider names. Each name is
-//!   what a client puts in `?provider=`, and each reads its own settings from
-//!   `CONNETTO_OIDC_<NAME>_*`: `KIND` (one of `google`, `microsoft` or
-//!   `generic`, lowercase), `CLIENT_ID`, `CLIENT_SECRET`, `REDIRECT_URL`,
-//!   `ISSUER` and `SCOPES`. An empty list, an unset kind, or a miscapitalised
-//!   one refuses startup. Several providers is the ordinary case: a deployment
-//!   offering both a corporate login and Google registers two.
-//! - `CONNETTO_BANS`: set to `database` to ban an identity that crosses an
-//!   abuse threshold, reading and writing `connetto_bans` on the owner pool.
-//!   Unset, a crossing is logged and nothing is banned, because the table is
-//!   the deployment's and connetto emits no DDL. Reading it on the reader pool
-//!   would be worse than not checking at all, since row-level security makes an
-//!   invisible row zero rows rather than an error.
+//! - `CONNETTO_BIND` (default `127.0.0.1:8080`): the one listener that
+//!   serves the `/sync` WebSocket route, the login endpoints, and the file
+//!   routes.
+//! - `DATABASE_URL`: the owner conninfo, a role that may create and read the
+//!   replication slot.
+//! - `CONNETTO_READER_URL`: a non-superuser conninfo subject to row-level
+//!   security. Every read a caller touches and every replica snapshot goes
+//!   through this role, so connetto never serves reads or writes from the
+//!   owner pool.
+//! - `CONNETTO_PG_DDL` or `CONNETTO_PG_DDL_FILE`: the catalog DDL.
+//! - `CONNETTO_PG_POLICIES` or `CONNETTO_PG_POLICIES_FILE`: the read
+//!   policies. Both are translated and hashed into the schema version the
+//!   server presents at handshake.
+//! - `CONNETTO_WRITABLE`: the tables clients may write, one per entry, each
+//!   `table` or `table:version_column` for conflict-checked updates.
+//! - `CONNETTO_SLOT` (default `connetto_slot`), `CONNETTO_PUBLICATION`
+//!   (default `connetto_pub`), `CONNETTO_OPLOG_TABLE` (default
+//!   `connetto_oplog`): the replication objects and the reconnect log.
+//! - `CONNETTO_OWNER_POOL_SIZE` (default `10`): the owner pool's size.
+//! - `CONNETTO_READER_POOL_SIZE` (default `10`) and
+//!   `CONNETTO_READER_RESERVE` (default `3`): the reader pool's size and the
+//!   share the change path holds back from callers.
+//! - `CONNETTO_SLOT_LAG_SECS` (default `60`, `0` turning the watch off): how
+//!   far behind the owner's timeline the slot may run before one warning
+//!   fires.
+//! - `CONNETTO_AUTH`: the login machinery. Only `database` is served, which
+//!   stores sessions and provider tokens in Postgres and signs users in
+//!   through the identity providers below.
+//! - `CONNETTO_AUDIT`: set to `database` to record every access change in
+//!   the application's own table.
+//! - `CONNETTO_JWT_PRIVATE_KEY_FILE` and `CONNETTO_JWT_PUBLIC_KEY_FILE`:
+//!   the persisted Ed25519 signing keypair, PKCS8 PEM, required. A token
+//!   minted under one key must verify after a restart, so the deployment
+//!   keeps the key on disk.
+//! - `CONNETTO_OIDC_PROVIDERS`: a comma-separated list of provider names,
+//!   each configured under its own `CONNETTO_OIDC_<NAME>_KIND`
+//!   (`google`, `microsoft` or `generic`), `_CLIENT_ID`, `_CLIENT_SECRET`,
+//!   `_REDIRECT_URL`, optional `_ISSUER` and `_SCOPES`, the name upper-cased
+//!   with everything outside letters and digits turned into underscores.
+//! - `CONNETTO_BANS`: set to `database` to ban identities that cross an
+//!   abuse threshold.
+//! - `CONNETTO_FGA_URL` (default `http://127.0.0.1:8081`): the
+//!   authorization endpoint.
+//! - `CONNETTO_FGA_STORE`: required. The authorization store the deployment
+//!   owns, which connetto fills with the rules it derives from the policies.
+//! - `CONNETTO_AUTH_COOKIE_SAMESITE` (default `strict`, or `none` for a
+//!   cross-origin deployment): the session cookie's same-site policy.
+//! - `CONNETTO_AUTH_REDIRECT_ALLOWLIST`: a comma-separated list of exact
+//!   redirect URIs the deployment serves beyond the providers'.
+//! - `CONNETTO_AUTH_CORS_ORIGINS`: a comma-separated list of origins whose
+//!   login requests carry credentials.
+//! - `CONNETTO_CONTENT_URL` (unset serving no files): the address the file
+//!   routes answer on. With it set, `CONNETTO_CONTENT_STORE` (required,
+//!   `fs:<dir>` or an `object_store` URL) and `CONNETTO_CONTENT_KEY`
+//!   (required, the ticket keypair as PKCS8 DER) are required, alongside
+//!   `CONNETTO_CONTENT_TICKET_TTL_SECS` (default `3600`),
+//!   `CONNETTO_CONTENT_READ_CEILING` (default `67108864`),
+//!   `CONNETTO_CONTENT_SWEEP_GRACE_SECS` (default the ticket lifetime),
+//!   `CONNETTO_CONTENT_SWEEP_SECS` (default `3600`, `0` turning the sweep
+//!   off), `CONNETTO_CONTENT_QUOTA_BYTES` (default `0`, unlimited),
+//!   `CONNETTO_CONTENT_STORAGE_CEILING` (default `0`),
+//!   `CONNETTO_CONTENT_BANDWIDTH_CEILING` (default `0`),
+//!   `CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS` (default `30`),
+//!   `CONNETTO_CONTENT_WARN_FRACTION` (default `0.8`) and
+//!   `CONNETTO_CONTENT_CEILING_REFRESH_SECS` (default `10`).
 //!
-//! - `CONNETTO_SLOT`, `CONNETTO_PUBLICATION`, `CONNETTO_OPLOG_TABLE`: the
-//!   logical replication slot (with the `pgoutput` plugin), the publication,
-//!   and the table the reconnect log lives in. Default `connetto_slot`,
-//!   `connetto_pub` and `connetto_oplog`. All three are the deployment's to
-//!   provision, connetto creates no server objects, and startup refuses when
-//!   one is absent rather than discovering it on the first change.
-//! - `CONNETTO_SLOT_LAG_SECS`: how often the slot's retained write-ahead log,
-//!   its remaining headroom and its reservation status are written to the log,
-//!   in seconds. Default 60, `0` turns the watch off. Deciding when a number
-//!   is alarming belongs to the deployment's log aggregator, so the line goes
-//!   out at one level on a fixed interval rather than escalating on a
-//!   threshold connetto picked.
-//! - `CONNETTO_CONTENT_URL`: the base URL content tickets embed, which is the
-//!   auth listener's public address, a path prefix allowed, with no query or
-//!   fragment and a trailing slash ignored. Unset means no file routes and the
-//!   signer-refused detail on every ticket request, as today. Set, the four
-//!   file routes mount on the auth listener under its CORS layer, and the
-//!   file server's preflight must pass before the server starts, so the
-//!   `_cfs_` tables and the two deployment contract functions
-//!   (`connetto_visible_files`, `connetto_set_content_state`) must be in
-//!   place.
-//! - `CONNETTO_CONTENT_KEY`: a PKCS8 DER Ed25519 keypair for ticket signing.
-//!   Unset with the URL set generates an ephemeral keypair, so tickets do
-//!   not survive a restart.
-//! - `CONNETTO_CONTENT_STORE`: the chunk store, `fs:<dir>` for a directory
-//!   or any `object_store` URL (`s3://bucket`, `file:///data`). Required
-//!   once `CONNETTO_CONTENT_URL` is set.
-//! - `CONNETTO_CONTENT_TICKET_TTL_SECS`: ticket lifetime in seconds
-//!   (default 3600). A ticket's revocation lag is exactly this.
-//! - `CONNETTO_CONTENT_READ_CEILING`: the bytes one response may serve
-//!   under a read ticket (default 64 MiB).
-//! - `CONNETTO_CONTENT_SWEEP_GRACE_SECS`: how long a recent manifest is
-//!   spared by the sweep (default: the ticket lifetime).
-//! - `CONNETTO_CONTENT_SWEEP_SECS`: how often the sweep runs
-//!   (default 3600, `0` turns it off).
-//! - `CONNETTO_CONTENT_QUOTA_BYTES`: storage a single uploader may hold
-//!   across their committed manifests; a commit past it answers `507`.
-//!   `0` (default) is unlimited.
-//! - `CONNETTO_CONTENT_STORAGE_CEILING`: deployment-wide stored bytes over
-//!   distinct committed chunks; commits past it answer `503` with
-//!   `Retry-After`. `0` (default) is unlimited.
-//! - `CONNETTO_CONTENT_BANDWIDTH_CEILING`: deployment-wide bytes served
-//!   plus accepted inside the window; reads and commits past it answer
-//!   `503` with `Retry-After`. `0` (default) is unlimited.
-//! - `CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS`: trailing window length in
-//!   UTC day rows (default 30).
-//! - `CONNETTO_CONTENT_WARN_FRACTION`: fraction of each ceiling where one
-//!   structured warning fires per crossing, re-armed below (default 0.8).
-//! - `CONNETTO_CONTENT_CEILING_REFRESH_SECS`: how often each file-server
-//!   replica re-reads the cached deployment totals; the overshoot a ceiling
-//!   allows is bounded by this interval times the deployment's throughput
-//!   (default 10).
+//! The process exits `1` when the change stream cannot answer what a row
+//! looked like before it changed, or gives up reconnecting, and returns its
+//! build or HTTP errors as failures.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::env::{read_ddl, var_or};
-use connetto_core::messages::{ContentVerb, FatalErrorReason};
-use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
-use connetto_core::{CALLER_FUNCTION, SUBJECTS_FUNCTION, SessionId};
-#[cfg(feature = "content")]
-use connetto_file_server::{
-    self as files, DbPool, DefaultFileSchema, TicketSigner, TicketVerifier,
+use connetto_server::builder::{
+    ContentSettings, Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema,
+    StoreSpec, TokenKeys,
 };
-use connetto_server::CallerMappings;
-use connetto_server::audit::pg_audit_hook;
-use connetto_server::epoch::{self, Epoch, Found};
-use connetto_server::openfga::{Counted, FgaAuth, ModelState, ModelSubject, Translated};
-use connetto_server::reach::GrantReach;
 use connetto_server::{
-    AbuseConfig, Artifact, AuthConfig, AuthService, AuthStore, AuthStoreError, CookieSameSite,
-    DbAuthStore, DefaultUuidResolver, GenericOidcProvider, InMemoryAuthStore, IssuedSession,
-    Materializer, OidcProviderConfig, OplogConfig, PgOplog, PgReadConnector, PgSnapshotSource,
-    ProviderRegistry, ReaderGate, ReaderReserve, ReconnectEvent, ReconnectPolicy, RedirectPolicy,
-    RefreshOutcome, RequestGuard, ResolvedIdentity, RetainedProviderToken, RuntimeWritableCatalog,
-    SessionConfig, SessionError, SessionManager, StreamCheck, ThrottleConfig, TokenAuthority,
-    WebSocketTransport, auth_router, connetto_audit_table, connetto_auth_tables,
-    connetto_ban_table, connetto_watermark_table, is_loopback_host, pg_ban_store, pg_write_target,
-    preflight,
+    AuthConfig, CookieSameSite, OidcProviderConfig, ReaderReserve, RuntimeWritableCatalog,
 };
-use openfga_client::client::OpenFgaServiceClient;
-use openfga_client::tonic::transport::Channel;
-use pg2sqlite::prelude::SessionVariableMapping;
-use rls2fga::translator::Translator;
-use subql::backend::Postgres;
-use subql::visibility::openfga::OpenFgaPolicy;
-
-use diesel_async::AsyncPgConnection;
-use diesel_async::pooled_connection::AsyncDieselConnectionManager;
-use diesel_async::pooled_connection::bb8::Pool;
-use sqlparser::dialect::PostgreSqlDialect;
-use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 use tokio::net::TcpListener;
-use tokio::task::JoinSet;
-use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-/// The change-path executor this binary serves through, named once because the
-/// session manager's type parameter and the function that builds it must agree.
-type ServerAuth = FgaAuth<String, String, Counted<Channel>>;
-
-/// Whether `origin` is a loopback origin, so script served from it may read a
-/// login response without being listed.
-///
-/// No scheme condition, unlike the redirect policy's own loopback rule: an
-/// origin is not a delivery target, and a page served over `https` from a
-/// loopback development server is still the developer's own.
-fn is_loopback_origin(origin: &str) -> bool {
-    url::Url::parse(origin).is_ok_and(|parsed| is_loopback_host(&parsed))
-}
-
-// The reference binary uses the default connetto auth and watermark tables over
-// `Id = String` (Text `user_id`), matching the `DefaultUuidResolver`. These
-// generate the `connetto_sessions`/`connetto_provider_tokens` tables plus
-// `ConnettoAuthSchema`, and the `_connetto_mutations` table plus
-// `ConnettoWatermark`. connetto emits no DDL; the deployment runs the migration.
-connetto_auth_tables!(String, diesel::sql_types::Text);
-connetto_watermark_table!(String);
-connetto_audit_table!(
-    String,
-    diesel::sql_types::Text,
-    uuid::Uuid,
-    diesel::sql_types::Uuid,
-);
-connetto_ban_table!(String, diesel::sql_types::Text);
-
-/// The auth store chosen at startup. A single concrete type so the auth
-/// service and session-verifier futures stay `Send`.
-/// Each `async fn` erases the two arm future types through `.await`.
-enum ServerStore {
-    /// Single-server, ephemeral, deterministic identity mapping.
-    InMemory(InMemoryAuthStore),
-    /// Durable, identity resolved by the deployment.
-    Db(DbAuthStore<ConnettoAuthSchema>),
-}
-
-impl AuthStore for ServerStore {
-    type Id = String;
-
-    async fn create_session(
-        &self,
-        identity: &ResolvedIdentity,
-        now: SystemTime,
-    ) -> Result<IssuedSession, AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.create_session(identity, now).await,
-            Self::Db(store) => store.create_session(identity, now).await,
-        }
-    }
-
-    async fn session_is_live(
-        &self,
-        session_id: SessionId,
-        now: SystemTime,
-    ) -> Result<bool, AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.session_is_live(session_id, now).await,
-            Self::Db(store) => store.session_is_live(session_id, now).await,
-        }
-    }
-
-    async fn rotate_refresh(
-        &self,
-        refresh_token: &str,
-        now: SystemTime,
-    ) -> Result<RefreshOutcome, AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.rotate_refresh(refresh_token, now).await,
-            Self::Db(store) => store.rotate_refresh(refresh_token, now).await,
-        }
-    }
-
-    async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.revoke_session(session_id).await,
-            Self::Db(store) => store.revoke_session(session_id).await,
-        }
-    }
-
-    async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.revoke_every_session().await,
-            Self::Db(store) => store.revoke_every_session().await,
-        }
-    }
-
-    async fn session_for_refresh(
-        &self,
-        refresh_token: &str,
-    ) -> Result<Option<SessionId>, AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.session_for_refresh(refresh_token).await,
-            Self::Db(store) => store.session_for_refresh(refresh_token).await,
-        }
-    }
-
-    async fn set_retained_provider_token(
-        &self,
-        session_id: SessionId,
-        token: &RetainedProviderToken,
-        now: SystemTime,
-    ) -> Result<(), AuthStoreError> {
-        match self {
-            Self::InMemory(store) => {
-                store
-                    .set_retained_provider_token(session_id, token, now)
-                    .await
-            }
-            Self::Db(store) => {
-                store
-                    .set_retained_provider_token(session_id, token, now)
-                    .await
-            }
-        }
-    }
-
-    async fn retained_provider_token(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<RetainedProviderToken>, AuthStoreError> {
-        match self {
-            Self::InMemory(store) => store.retained_provider_token(session_id).await,
-            Self::Db(store) => store.retained_provider_token(session_id).await,
-        }
+/// Read a `u32` from `<key>`, or `default` when unset.
+fn env_u32(key: &str, default: u32) -> Result<u32> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .with_context(|| format!("parsing {key}: {text:?}")),
     }
 }
 
-/// Build the guard both surfaces share: the request limits and the abuse
-/// thresholds, plus the ban list when `CONNETTO_BANS` asks for one.
-///
-/// The ban list reads and writes on the **owner** pool. On the reader pool an
-/// invisible row is zero rows rather than an error, so the fail-closed check
-/// would never fire and a ban would silently not apply.
-fn build_guard(
-    pool: &Pool<AsyncPgConnection>,
-    reader_gate: ReaderGate,
-) -> Result<Arc<RequestGuard<String>>> {
-    let guard = RequestGuard::new(ThrottleConfig::default(), AbuseConfig::default())
-        .with_reader_gate(reader_gate);
-    // Without the ban list a crossed threshold is logged and nothing is banned.
-    let guard = if database_toggle("CONNETTO_BANS")? {
-        tracing::info!("banning identities that cross an abuse threshold");
-        guard.with_bans(pg_ban_store::<ConnettoBans>(pool.clone()))
-    } else {
-        guard
-    };
-    Ok(Arc::new(guard))
+/// Read a `u64` from `<key>`, or `default` when unset.
+fn env_u64(key: &str, default: u64) -> Result<u64> {
+    match std::env::var(key) {
+        Err(_) => Ok(default),
+        Ok(text) => text
+            .trim()
+            .parse()
+            .with_context(|| format!("parsing {key}: {text:?}")),
+    }
+}
+
+/// The value of `<key>` when it is set to something other than blank.
+fn var_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+}
+
+/// Split a comma-separated setting into its trimmed non-empty entries.
+fn comma_list(text: &str) -> Vec<String> {
+    text.split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Whether `key` asks for the database-backed table it names.
 ///
 /// Off unless switched on: the table belongs to the application and connetto
-/// emits no DDL, so a server pointed at a database without it must not attempt
-/// reads or writes.
+/// emits no DDL, so a server pointed at a database without it must not
+/// attempt reads or writes.
 fn database_toggle(key: &str) -> Result<bool> {
     match var_or(key, "").as_str() {
         "" => Ok(false),
         "database" => Ok(true),
         other => Err(anyhow!("unknown {key} mode {other:?}, expected database")),
     }
-}
-
-/// Build the auth service and provider registry when `CONNETTO_AUTH` selects a
-/// store (`in-memory` or `database`). Unset leaves the trusting verifier and no
-/// auth endpoints, which suits dev and the pre-acquisition client loops until
-/// phases 4 and 5.
-async fn build_auth(
-    pool: &Pool<AsyncPgConnection>,
-    guard: Arc<RequestGuard<String>>,
-) -> Result<Option<(Arc<AuthService<ServerStore>>, Arc<ProviderRegistry>)>> {
-    // Parsed before anything else, so a bad value fails on the spot rather
-    // than behind identity-provider discovery, and so that asking for records
-    // without asking for logins is refused instead of silently doing nothing.
-    // Without it, no access change is recorded.
-    let audit = database_toggle("CONNETTO_AUDIT")?;
-    let mode = var_or("CONNETTO_AUTH", "");
-    if mode.is_empty() {
-        if audit {
-            return Err(anyhow!(
-                "CONNETTO_AUDIT is set but CONNETTO_AUTH is not: every access change \
-                 recorded here comes from the login machinery, so there would be \
-                 nothing to record"
-            ));
-        }
-        return Ok(None);
-    }
-    let config = AuthConfig::default();
-    let store = match mode.as_str() {
-        "in-memory" => ServerStore::InMemory(InMemoryAuthStore::new(config.refresh_lifetimes())),
-        "database" => {
-            // connetto emits no DDL: the deployment owns and migrates the
-            // `connetto_sessions`/`connetto_provider_tokens` tables. The
-            // reference binary resolves identity to a deterministic UUID v5.
-            ServerStore::Db(DbAuthStore::new(
-                pool.clone(),
-                config.refresh_lifetimes(),
-                Arc::new(DefaultUuidResolver),
-            ))
-        }
-        other => {
-            return Err(anyhow!(
-                "unknown CONNETTO_AUTH mode {other:?}, expected in-memory or database"
-            ));
-        }
-    };
-    let authority = build_token_authority(&config)?;
-    let registry = Arc::new(build_registry(&config).await?);
-    let service = Arc::new(
-        AuthService::new(Arc::new(authority), Arc::new(store), guard)
-            .with_registry(Arc::clone(&registry)),
-    );
-    if audit {
-        let hook = pg_audit_hook::<ConnettoAudit>(pool.clone());
-        // The same sink on both, because a ban is detected in the guard and
-        // every other access change is produced here.
-        service.guard().set_audit_hook(Arc::clone(&hook));
-        service.set_audit_hook(hook);
-        tracing::info!("recording access changes to auth_events");
-    }
-    Ok(Some((service, registry)))
-}
-
-/// Build the provider registry from `CONNETTO_OIDC_PROVIDERS`.
-///
-/// The value is a comma-separated list of provider names, and each name is the
-/// string a client puts in `?provider=`. Every other setting is read per name,
-/// from `CONNETTO_OIDC_<NAME>_*`, where `<NAME>` is the name upper-cased with
-/// every character outside `A-Z0-9` turned into an underscore. So a deployment
-/// offering Google and its own issuer sets
-/// `CONNETTO_OIDC_PROVIDERS=google,acme` and then
-/// `CONNETTO_OIDC_GOOGLE_KIND`, `CONNETTO_OIDC_GOOGLE_CLIENT_ID`, and the same
-/// under `CONNETTO_OIDC_ACME_`.
-///
-/// The name is the key rather than a slot invented for the purpose, because the
-/// name already has to be unique: it is what a login request selects on. Two
-/// names that differ only outside `A-Z0-9` would collide into one prefix, so
-/// that is refused by name rather than resolved by precedence.
-///
-/// Per name, `KIND` is `google`, `microsoft` or `generic`, where the first two
-/// discover the respective provider and `generic` discovers
-/// `CONNETTO_OIDC_<NAME>_ISSUER`. Anything else, including an unset or
-/// miscapitalised value, refuses startup naming the value, so a typo cannot
-/// silently select a different provider. Each also reads `CLIENT_ID`,
-/// `CLIENT_SECRET` (optional), `REDIRECT_URL`, and `SCOPES` (comma-separated).
-async fn build_registry(config: &AuthConfig) -> Result<ProviderRegistry> {
-    let names = var_or("CONNETTO_OIDC_PROVIDERS", "")
-        .split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    if names.is_empty() {
-        return Err(anyhow!(
-            "CONNETTO_OIDC_PROVIDERS is unset, expected a comma-separated list of provider \
-             names, each configured under CONNETTO_OIDC_<NAME>_*"
-        ));
-    }
-    let mut prefixes: std::collections::HashMap<String, String> =
-        std::collections::HashMap::with_capacity(names.len());
-    let mut registry = ProviderRegistry::new();
-    let http = openidconnect::reqwest::ClientBuilder::new()
-        .redirect(openidconnect::reqwest::redirect::Policy::none())
-        .build()
-        .context("building the OIDC HTTP client")?;
-    for name in &names {
-        let prefix = env_prefix(name);
-        if let Some(other) = prefixes.insert(prefix.clone(), name.clone()) {
-            return Err(anyhow!(
-                "provider names {other:?} and {name:?} both read their settings from \
-                 CONNETTO_OIDC_{prefix}_, so one would silently take the other's credentials"
-            ));
-        }
-        let kind = var_or(&format!("CONNETTO_OIDC_{prefix}_KIND"), "");
-        let provider_config = oidc_config_from_env(config, name, &prefix)?;
-        let provider = match kind.as_str() {
-            "google" => GenericOidcProvider::google(provider_config, http.clone()).await,
-            "microsoft" => GenericOidcProvider::microsoft(provider_config, http.clone()).await,
-            "generic" => GenericOidcProvider::discover(provider_config, http.clone()).await,
-            "" => {
-                return Err(anyhow!(
-                    "CONNETTO_OIDC_{prefix}_KIND is unset for provider {name:?}, expected one \
-                     of google, microsoft, or generic"
-                ));
-            }
-            other => {
-                return Err(anyhow!(
-                    "unrecognised CONNETTO_OIDC_{prefix}_KIND {other:?} for provider {name:?}, \
-                     expected one of google, microsoft, or generic (names are lowercase)"
-                ));
-            }
-        }
-        .map_err(|err| anyhow!("configuring the {kind} provider {name:?}: {err}"))?;
-        registry.register(Arc::new(provider));
-    }
-    tracing::info!(providers = ?names, "identity providers registered");
-    Ok(registry)
 }
 
 /// The environment prefix a provider's settings live under: the name upper-cased
@@ -492,358 +187,85 @@ fn oidc_config_from_env(
     .with_scopes(scopes))
 }
 
-/// Load the Ed25519 signing keypair from `CONNETTO_JWT_PRIVATE_KEY_FILE` and
-/// `CONNETTO_JWT_PUBLIC_KEY_FILE` (PKCS#8 PEM), or generate an ephemeral one.
-/// An ephemeral key does not survive a restart, so a durable deployment supplies a
-/// stable key.
-fn build_token_authority(config: &AuthConfig) -> Result<TokenAuthority> {
-    if let (Ok(private_path), Ok(public_path)) = (
-        std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE"),
-        std::env::var("CONNETTO_JWT_PUBLIC_KEY_FILE"),
-    ) {
-        let private =
-            std::fs::read(&private_path).with_context(|| format!("reading {private_path}"))?;
-        let public =
-            std::fs::read(&public_path).with_context(|| format!("reading {public_path}"))?;
-        TokenAuthority::from_ed_pem(&private, &public, config)
-            .map_err(|err| anyhow!("loading JWT keypair: {err}"))
-    } else {
-        tracing::warn!(
-            "no CONNETTO_JWT_*_KEY_FILE set, generating an ephemeral Ed25519 keypair, so \
-             tokens do not survive a restart"
-        );
-        TokenAuthority::generate(config).map_err(|err| anyhow!("generating JWT keypair: {err}"))
+/// The identity providers `CONNETTO_OIDC_PROVIDERS` names, each from its own
+/// `CONNETTO_OIDC_<NAME>_*` settings. Discovery happens in the build, so this
+/// reads settings only.
+fn oidc_providers() -> Result<Vec<OidcProvider>> {
+    let names = comma_list(&var_or("CONNETTO_OIDC_PROVIDERS", ""));
+    if names.is_empty() {
+        return Err(anyhow!(
+            "CONNETTO_OIDC_PROVIDERS is unset, expected a comma-separated list of provider names, \
+             each configured under CONNETTO_OIDC_<NAME>_*"
+        ));
     }
-}
-
-/// The chunk store named by `CONNETTO_CONTENT_STORE`, parsed before anything
-/// opens it so the sweep task and the router each hold their own handle on
-/// the same location.
-#[cfg(feature = "content")]
-enum StoreSpec {
-    /// A directory chunk store.
-    Fs(std::path::PathBuf),
-    /// An `object_store` URL backend.
-    Object(url::Url),
-}
-
-/// Parse the `CONNETTO_CONTENT_STORE` value: `fs:<dir>` for the directory
-/// store, anything else an `object_store` URL.
-#[cfg(feature = "content")]
-fn parse_store_spec(spec: &str) -> Result<StoreSpec> {
-    if let Some(dir) = spec.strip_prefix("fs:") {
-        if dir.trim().is_empty() {
-            return Err(anyhow!("CONNETTO_CONTENT_STORE: fs: needs a directory"));
-        }
-        return Ok(StoreSpec::Fs(std::path::PathBuf::from(dir)));
-    }
-    url::Url::parse(spec)
-        .map(StoreSpec::Object)
-        .with_context(|| format!("parsing CONNETTO_CONTENT_STORE: {spec:?}"))
-}
-
-/// Open the store one handle names.
-#[cfg(feature = "content")]
-fn open_store(spec: &StoreSpec) -> Result<files::AnyStore> {
-    match spec {
-        StoreSpec::Fs(dir) => files::FsStore::new(dir)
-            .map(files::AnyStore::Fs)
-            .map_err(|err| anyhow!("opening the chunk store at {}: {err}", dir.display())),
-        StoreSpec::Object(url) => files::AnyStore::from_url(url)
-            .map_err(|err| anyhow!("opening the chunk store at {url}: {err}")),
-    }
-}
-
-/// The ticket keypair: `CONNETTO_CONTENT_KEY`'s PKCS8 DER when set, an
-/// ephemeral one otherwise, warned about the way the JWT keys warn. Returns
-/// the signer and the public half the mounted routes verify with.
-#[cfg(feature = "content")]
-fn ticket_keypair(
-    der: Option<&[u8]>,
-    base_url: &str,
-    ttl: Duration,
-    read_ceiling: u64,
-) -> Result<(TicketSigner, Vec<u8>)> {
-    if let Some(der) = der {
-        let signer = TicketSigner::from_pkcs8_der(der, base_url, ttl, read_ceiling)
-            .map_err(|err| anyhow!("loading the content ticket key: {err}"))?;
-        let public = signer.public_key_bytes().to_vec();
-        Ok((signer, public))
-    } else {
-        tracing::warn!(
-            "no CONNETTO_CONTENT_KEY set, generating an ephemeral content ticket keypair, \
-             so tickets do not survive a restart"
-        );
-        TicketSigner::generate(base_url, ttl, read_ceiling)
-            .map_err(|err| anyhow!("generating the content ticket keypair: {err}"))
-    }
-}
-
-/// The resolved `CONNETTO_CONTENT_*` settings, read once at startup so
-/// building the file half takes no environment at all.
-#[derive(Clone, Debug)]
-struct ContentSettings {
-    /// The address the file routes answer on, trailing slashes trimmed.
-    base_url: String,
-    ttl: Duration,
-    read_ceiling: u64,
-    grace: Duration,
-    cadence: Duration,
-    quota_identity: u64,
-    storage_ceiling: u64,
-    bandwidth_ceiling: u64,
-    bandwidth_window_days: i32,
-    warn_fraction: f64,
-    ceiling_refresh: Duration,
-    owner_pool_size: u32,
-    store_setting: String,
-    key_path: Option<std::path::PathBuf>,
-}
-
-impl ContentSettings {
-    /// Read the `CONNETTO_CONTENT_*` settings. `CONNETTO_CONTENT_URL` unset
-    /// answers `None`, the no-files deployment of today; set, every other
-    /// setting is parsed on the spot so a typo refuses startup by name.
-    fn from_env() -> Result<Option<Self>> {
-        let Some(base_url) = var_nonempty("CONNETTO_CONTENT_URL") else {
-            return Ok(None);
-        };
-        // The signer appends `/files/...` textually to this text, so the
-        // trailing slash goes and a query or fragment has nowhere to go.
-        if base_url.contains('?') || base_url.contains('#') {
+    let mut prefixes: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut providers = Vec::with_capacity(names.len());
+    let config = AuthConfig::default();
+    for name in &names {
+        let prefix = env_prefix(name);
+        if let Some(other) = prefixes.insert(prefix.clone(), name.clone()) {
             return Err(anyhow!(
-                "CONNETTO_CONTENT_URL must carry no query or fragment, only the \
-                 address the file routes answer on: {base_url}"
+                "providers {other:?} and {name:?} both read CONNETTO_OIDC_{prefix}_*"
             ));
         }
-        let ttl = Duration::from_secs(env_u64("CONNETTO_CONTENT_TICKET_TTL_SECS", 3_600)?);
-        Ok(Some(Self {
-            base_url: base_url.trim_end_matches('/').to_owned(),
-            read_ceiling: env_u64("CONNETTO_CONTENT_READ_CEILING", 1 << 26)?,
-            grace: Duration::from_secs(env_u64(
-                "CONNETTO_CONTENT_SWEEP_GRACE_SECS",
-                ttl.as_secs(),
-            )?),
-            cadence: Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_SECS", 3_600)?),
-            quota_identity: env_u64("CONNETTO_CONTENT_QUOTA_BYTES", 0)?,
-            storage_ceiling: env_u64("CONNETTO_CONTENT_STORAGE_CEILING", 0)?,
-            bandwidth_ceiling: env_u64("CONNETTO_CONTENT_BANDWIDTH_CEILING", 0)?,
-            bandwidth_window_days: {
-                let days = env_u64("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS", 30)?;
-                // A zero window makes the predicate match no day row, the
-                // meter reads zero forever and the ceiling can never trip,
-                // silently. A window of a day is the minimum that measures
-                // anything.
-                if days == 0 {
-                    return Err(anyhow!(
-                        "CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS must be at least 1"
-                    ));
-                }
-                i32::try_from(days).map_err(|_| {
-                    anyhow!("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS is out of range for an i32")
-                })?
-            },
-            warn_fraction: match std::env::var("CONNETTO_CONTENT_WARN_FRACTION") {
-                Err(_) => 0.8,
-                Ok(text) => text
-                    .trim()
-                    .parse::<f64>()
-                    .map(|fraction| fraction.clamp(0.0, 1.0))
-                    .with_context(|| format!("parsing CONNETTO_CONTENT_WARN_FRACTION: {text:?}"))?,
-            },
-            ceiling_refresh: Duration::from_secs(env_u64(
-                "CONNETTO_CONTENT_CEILING_REFRESH_SECS",
-                10,
-            )?),
-            owner_pool_size: env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?,
-            store_setting: var_nonempty("CONNETTO_CONTENT_STORE")
-                .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?,
-            key_path: var_nonempty("CONNETTO_CONTENT_KEY").map(std::path::PathBuf::from),
-            ttl,
-        }))
-    }
-}
-
-/// The file-serving half of the deployment, from the `CONNETTO_CONTENT_*`
-/// settings.
-///
-/// `CONNETTO_CONTENT_URL` unset answers no signer and no router, which is
-/// the no-files deployment of today. Set, the store opens, the keypair
-/// loads, and the file server's preflight runs before startup proceeds, so a
-/// deployment missing its `_cfs_` tables or its two contract functions
-/// refuses to start naming what is absent.
-///
-/// The router mounts on the auth listener under its `CorsLayer` (R69
-/// decision 1), and the pools are the file router's own two built from the
-/// same conninfos, so an upload never queues behind the change stream for
-/// the owner pool and a bulk read never spends the change path's reader
-/// share (R81's finding).
-#[cfg(feature = "content")]
-async fn build_content(
-    settings: Option<ContentSettings>,
-    admin_url: &str,
-    reader_url: &str,
-    reader_pool_size: u32,
-) -> Result<(ServerSigner, Option<axum::Router>)> {
-    let Some(settings) = settings else {
-        return Ok((ServerSigner::None, None));
-    };
-    let spec = parse_store_spec(&settings.store_setting)?;
-    let der = match settings.key_path {
-        // Spawned because startup runs on the async runtime, and one key
-        // file is worth the round trip off the worker thread.
-        Some(path) => {
-            let shown = path.display().to_string();
-            Some(
-                tokio::task::spawn_blocking(move || std::fs::read(&path))
-                    .await
-                    .map_err(|err| anyhow!("joining the key read: {err}"))?
-                    .with_context(|| format!("reading {shown}"))?,
-            )
-        }
-        None => None,
-    };
-    let (signer, public) = ticket_keypair(
-        der.as_deref(),
-        &settings.base_url,
-        settings.ttl,
-        settings.read_ceiling,
-    )?;
-    let admin = build_pool(admin_url, settings.owner_pool_size).await?;
-    let reader = build_pool(reader_url, reader_pool_size).await?;
-    let router = files::serve(files::Config::<DefaultFileSchema> {
-        pools: files::AppPools {
-            admin: admin.clone(),
-            reader,
-        },
-        store: open_store(&spec)?,
-        verifier: TicketVerifier::new(public),
-        grace: settings.grace,
-        // This binary binds the caller under connetto's default names, which
-        // is what its session manager is left configured with.
-        caller_settings: files::CallerSettings::default(),
-        quotas: files::QuotaSettings {
-            identity_quota: settings.quota_identity,
-            storage_ceiling: settings.storage_ceiling,
-            bandwidth_ceiling: settings.bandwidth_ceiling,
-            window_days: settings.bandwidth_window_days,
-            warn_fraction: settings.warn_fraction,
-            refresh: settings.ceiling_refresh,
-        },
-        ceilings: files::CeilingCache::default(),
-        _schema: std::marker::PhantomData,
-    })
-    .await
-    .map_err(|err| anyhow!("content preflight: {err}"))?;
-    let reconciled = files::reconcile_store::<DefaultFileSchema>(
-        &admin,
-        &open_store(&spec)?,
-        &files::CallerSettings::default(),
-        settings.grace,
-    )
-    .await
-    .map_err(|err| anyhow!("reconciling the chunk store with the database: {err}"))?;
-    if reconciled.orphans_removed > 0 || !reconciled.lost.is_empty() {
-        tracing::warn!(
-            orphans_removed = reconciled.orphans_removed,
-            lost = reconciled.lost.len(),
-            "the chunk store and the database disagreed, reconciled before serving",
-        );
-    }
-    spawn_sweep(admin, spec, settings.grace, settings.cadence);
-    tracing::info!(
-        base = %settings.base_url,
-        store = %settings.store_setting,
-        ticket_ttl_secs = settings.ttl.as_secs(),
-        sweep_secs = settings.cadence.as_secs(),
-        quota_bytes = settings.quota_identity,
-        storage_ceiling = settings.storage_ceiling,
-        bandwidth_ceiling = settings.bandwidth_ceiling,
-        bandwidth_window_days = settings.bandwidth_window_days,
-        "file routes mounted on the auth listener",
-    );
-    Ok((ServerSigner::Files(Box::new(signer)), Some(router)))
-}
-
-/// The no-op shape of [`build_content`] for a binary built without the
-/// `content` feature. A configured deployment still hears about it.
-#[cfg(not(feature = "content"))]
-async fn build_content(
-    settings: Option<ContentSettings>,
-    _admin_url: &str,
-    _reader_url: &str,
-    _reader_pool_size: u32,
-) -> Result<(ServerSigner, Option<axum::Router>)> {
-    if settings.is_some() {
-        tracing::warn!(
-            "CONNETTO_CONTENT_URL is set but this binary was built without the content \
-             feature, so no file routes are mounted"
-        );
-    }
-    Ok((ServerSigner::None, None))
-}
-
-/// Reclaim unreferenced chunks on a cadence, the way the slot watch runs.
-/// A failed pass is logged, not fatal, the next pass retries what it lost.
-#[cfg(feature = "content")]
-fn spawn_sweep(admin: DbPool, spec: StoreSpec, grace: Duration, cadence: Duration) {
-    if cadence.is_zero() {
-        return;
-    }
-    tokio::spawn(async move {
-        let store = match open_store(&spec) {
-            Ok(store) => store,
-            Err(err) => {
-                tracing::error!(error = %err, "the content sweep has no store");
-                return;
+        let kind = var_or(&format!("CONNETTO_OIDC_{prefix}_KIND"), "");
+        let provider_config = oidc_config_from_env(&config, name, &prefix)?;
+        let provider = match kind.as_str() {
+            "google" => OidcProvider::Google(provider_config),
+            "microsoft" => OidcProvider::Microsoft(provider_config),
+            "generic" => OidcProvider::Generic(provider_config),
+            "" => {
+                return Err(anyhow!(
+                    "set CONNETTO_OIDC_{prefix}_KIND for provider {name:?} to google, microsoft \
+                     or generic"
+                ));
+            }
+            other => {
+                return Err(anyhow!(
+                    "unknown CONNETTO_OIDC_{prefix}_KIND {other:?} for provider {name:?}, \
+                     expected google, microsoft or generic"
+                ));
             }
         };
-        let mut ticker = tokio::time::interval(cadence);
-        // The first tick completes at once, before the deployment can have
-        // orphaned anything, so spend it here.
-        ticker.tick().await;
-        loop {
-            ticker.tick().await;
-            match files::sweep::<DefaultFileSchema>(&admin, &store, grace).await {
-                Ok(0) => {}
-                Ok(removed) => {
-                    tracing::info!(removed, "content sweep reclaimed unreferenced chunks");
-                }
-                Err(err) => tracing::warn!(error = %err, "content sweep failed"),
-            }
-        }
-    });
-}
-
-/// Read a `u32` from `<key>`, or `default` when unset.
-fn env_u32(key: &str, default: u32) -> Result<u32> {
-    match std::env::var(key) {
-        Err(_) => Ok(default),
-        Ok(text) => text
-            .trim()
-            .parse()
-            .with_context(|| format!("parsing {key}: {text:?}")),
+        providers.push(provider);
     }
+    Ok(providers)
 }
 
-/// Read a `u64` from `<key>`, or `default` when unset.
-#[cfg(feature = "content")]
-fn env_u64(key: &str, default: u64) -> Result<u64> {
-    match std::env::var(key) {
-        Err(_) => Ok(default),
-        Ok(text) => text
-            .trim()
-            .parse()
-            .with_context(|| format!("parsing {key}: {text:?}")),
+/// The persisted JWT keypair, both halves required.
+fn jwt_keys() -> Result<TokenKeys> {
+    let private_path = std::env::var("CONNETTO_JWT_PRIVATE_KEY_FILE").context(
+        "set CONNETTO_JWT_PRIVATE_KEY_FILE to the PKCS8 PEM private half of the signing keypair",
+    )?;
+    let public_path = std::env::var("CONNETTO_JWT_PUBLIC_KEY_FILE").context(
+        "set CONNETTO_JWT_PUBLIC_KEY_FILE to the PKCS8 PEM public half of the signing keypair",
+    )?;
+    let private =
+        std::fs::read(&private_path).with_context(|| format!("reading {private_path}"))?;
+    let public = std::fs::read(&public_path).with_context(|| format!("reading {public_path}"))?;
+    Ok(TokenKeys::from_pem(private, public))
+}
+
+/// The reader pool's size and the share of it the change path holds back.
+fn reader_reserve() -> Result<ReaderReserve> {
+    let total = env_u32("CONNETTO_READER_POOL_SIZE", ReaderReserve::DEFAULT_TOTAL)?;
+    let reserved = env_u32("CONNETTO_READER_RESERVE", ReaderReserve::DEFAULT_RESERVED)?;
+    if reserved > total {
+        return Err(anyhow!(
+            "CONNETTO_READER_RESERVE={reserved} cannot exceed CONNETTO_READER_POOL_SIZE={total}"
+        ));
     }
+    Ok(ReaderReserve::new()
+        .with_total(total)
+        .with_reserved(reserved))
 }
 
-/// The value of `<key>` when it is set to something other than blank.
-fn var_nonempty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
+/// The session cookie's same-site policy from `CONNETTO_AUTH_COOKIE_SAMESITE`.
+fn cookie_same_site() -> Result<CookieSameSite> {
+    let value = var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict");
+    CookieSameSite::parse(&value).ok_or_else(|| {
+        anyhow!("unknown CONNETTO_AUTH_COOKIE_SAMESITE {value:?}, expected strict or none")
+    })
 }
 
 /// Parse `CONNETTO_WRITABLE` into a runtime write policy. Each comma-separated
@@ -862,477 +284,129 @@ fn writable_catalog() -> RuntimeWritableCatalog {
     builder.build()
 }
 
-async fn build_pool(url: &str, size: u32) -> Result<Pool<AsyncPgConnection>> {
-    let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(url.to_owned());
-    Pool::builder()
-        .max_size(size)
-        .build(manager)
-        .await
-        .context("building the Postgres connection pool")
-}
-
-/// Check what the change stream needs, then set up the reconnect log and the
-/// slot watch. Everything here reads or writes connetto's own bookkeeping, so
-/// it runs on the owner pool: the reader pool is what callers contend for, and
-/// R39 holds a share of it back for identified traffic that background work
-/// must not spend.
-async fn prepare_change_log(
-    pool: &Pool<AsyncPgConnection>,
-    slot: &str,
-    publication: &str,
-    oplog_table: &str,
-) -> Result<PgOplog> {
-    // connetto emits no DDL. The deployment owns the `_connetto_mutations`
-    // watermark table (see `docs/architecture/11-authentication.md`) and the
-    // `ConnettoWatermark` reference schema keys on it.
-    //
-    // The same rule makes these five a startup refusal rather than a
-    // discovery. Absent, the slot and the publication turn the change stream
-    // into a retry loop that never succeeds, and the oplog table and its commit
-    // table turn the first change into a failure on a boot that looked healthy
-    // (R32). The fifth is a property rather than an object: a replicated table that does
-    // not record the row as it was cannot answer whether a caller could see the
-    // version that has just gone, so the change path refuses that table on
-    // every event (R6). Checked after the publication, since it reads the
-    // publication's own table list.
-    let commit_table = PgOplog::commit_table(oplog_table);
-    preflight::require(
-        pool,
-        &[
-            Artifact::ReplicationSlot(slot),
-            Artifact::Publication(publication),
-            Artifact::Table(oplog_table),
-            Artifact::Table(&commit_table),
-            Artifact::PreviousImages { publication },
-        ],
-    )
-    .await?;
-
-    // A slot retains write-ahead log until its consumer confirms it, so a stuck
-    // or departed server fills the primary's disk and stops writes for every
-    // application on it. connetto cannot prevent that and can say it is
-    // happening.
-    let lag_secs = u64::from(env_u32("CONNETTO_SLOT_LAG_SECS", 60)?);
-    if lag_secs == 0 {
-        tracing::warn!(
-            "CONNETTO_SLOT_LAG_SECS is 0, so the replication slot is not watched: nothing \
-             will report a slot filling the primary's disk before it does"
-        );
-    } else {
-        tokio::spawn(connetto_server::slot::log_lag_forever(
-            pool.clone(),
-            slot.to_owned(),
-            Duration::from_secs(lag_secs),
-        ));
-    }
-
-    // The reconnect log is durable, so what a resuming client is owed survives
-    // a restart. In memory it did not, and an empty log reads as "this client
-    // has missed nothing", which silently lost every change made while the
-    // server was down (R32).
-    Ok(PgOplog::new(
-        pool.clone(),
-        oplog_table,
-        OplogConfig::default(),
-    ))
-}
-/// The deployment's caller pairing for reverse translation (R27): the SQLite
-/// functions the deployment names, paired against the settings the server
-/// binds them to. A subscription that names the caller's local function
-/// reverse translates against these, and a membership test over the caller's
-/// share keys reverse translates against the second as a set, not as a
-/// comparison against the joined text that matches nobody.
-fn caller_mapping() -> CallerMappings {
-    CallerMappings {
-        identity: SessionVariableMapping::current_setting(DEFAULT_USER_SETTING, CALLER_FUNCTION),
-        subjects: Some(
-            SessionVariableMapping::current_setting(
-                <String as CapabilityKey>::SETTING,
-                SUBJECTS_FUNCTION,
-            )
-            .holding_set(<String as CapabilityKey>::SEPARATOR),
-        ),
-    }
-}
-
-/// The concrete manager this binary serves.
-type ServerManager = SessionManager<
-    PgSnapshotSource,
-    ServerAuth,
-    ConnettoWatermark,
-    PgReadConnector,
-    PgOplog,
-    String,
-    String,
-    ServerSigner,
->;
-
-/// The content ticket signer this binary mints with, chosen at startup.
-///
-/// `None` is the no-files deployment of today: the session answers every
-/// ticket request with the distinct signer-failure detail. `Files` is the
-/// file server's own signer over the one keypair the decision keeps in
-/// `main`, whose public half verifies the tickets at the routes mounted
-/// beside the login endpoints.
-enum ServerSigner {
-    /// `CONNETTO_CONTENT_URL` is unset.
-    None,
-    /// The file server's signer, boxed so the variant stays small.
-    #[cfg(feature = "content")]
-    Files(Box<TicketSigner>),
-}
-
-/// Why one mint through [`ServerSigner`] failed.
-#[derive(Debug, thiserror::Error)]
-enum SignerError {
-    /// The deployment serves no files.
-    #[error("this deployment serves no files (CONNETTO_CONTENT_URL is unset)")]
-    NotConfigured,
-    /// The file server's signer refused.
-    #[cfg(feature = "content")]
-    #[error(transparent)]
-    Ticket(#[from] files::ticket::TicketError),
-}
-
-impl ContentTicketSigner for ServerSigner {
-    type Error = SignerError;
-
-    async fn mint(
-        &self,
-        caller: &connetto_core::auth::ContentCaller,
-        file_id: [u8; 32],
-        verb: ContentVerb,
-    ) -> Result<String, Self::Error> {
-        match self {
-            Self::None => Err(SignerError::NotConfigured),
-            #[cfg(feature = "content")]
-            Self::Files(signer) => {
-                ContentTicketSigner::mint(signer.as_ref(), caller, file_id, verb)
-                    .await
-                    .map_err(SignerError::Ticket)
-            }
-        }
-    }
-}
-
-/// R27 decision 6: move-out withdrawals are read on `DATABASE_URL`'s pool,
-/// because the policy that made those rows visible to the caller is exactly
-/// the membership that ended, so a read as the caller finds nothing precisely
-/// when there is something to withdraw. Keys only are sent, and only what the
-/// change-path executor denies.
-fn install_withdrawals(
-    manager: &ServerManager,
-    pool: &Pool<AsyncPgConnection>,
-    pg_ddl: &str,
-) -> Result<()> {
-    let withdrawals = PgSnapshotSource::from_ddl(pool.clone(), pg_ddl)
-        .map_err(|err| anyhow!("building the withdrawal source: {err}"))?;
-    if manager.install_withdrawal_source(withdrawals).is_err() {
-        return Err(anyhow!("the withdrawal source was installed twice"));
-    }
-    Ok(())
-}
-
-/// The reader pool's size and its reserved share (R39). Both explicit so the
-/// reserve is expressed against a number the operator can see, with the split
-/// refused up front when no such split exists.
-fn reader_split() -> Result<(u32, crate::ReaderGate)> {
-    let total = env_u32("CONNETTO_READER_POOL_SIZE", ReaderReserve::DEFAULT_TOTAL)?;
-    let reserved = env_u32("CONNETTO_READER_RESERVE", ReaderReserve::DEFAULT_RESERVED)?;
-    if reserved > total {
-        return Err(anyhow!(
-            "CONNETTO_READER_RESERVE ({reserved}) exceeds \
-             CONNETTO_READER_POOL_SIZE ({total}), so no split exists"
-        ));
-    }
-    Ok((
-        total,
-        ReaderReserve::new()
-            .with_total(total)
-            .with_reserved(reserved)
-            .gate(),
-    ))
-}
-
-/// Startup is one straight read of the deployment: every component is built,
-/// checked and wired here so no setting is applied in a place a reader has
-/// to hunt for.
-#[expect(
-    clippy::too_many_lines,
-    reason = "startup reads as one straight deployment"
-)]
-#[tokio::main]
-async fn main() -> Result<()> {
-    // `pg_walstream` reports every standby status update at `info`, which is one
-    // line per ten seconds per server whether or not anything happened, and it
-    // buries this server's own events. `RUST_LOG` brings it back.
-    connetto_core::logging::init_stdout_with_default("info,pg_walstream=warn");
-    let bind = var_or("CONNETTO_BIND", "127.0.0.1:8080");
-    let database_url = std::env::var("DATABASE_URL").context("set DATABASE_URL")?;
-    let pg_ddl = read_ddl("CONNETTO_PG_DDL")?;
-    let slot = var_or("CONNETTO_SLOT", "connetto_slot");
-    let publication = var_or("CONNETTO_PUBLICATION", "connetto_pub");
-    let oplog_table = var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog");
-    let pool = build_pool(&database_url, env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?).await?;
-    let oplog = prepare_change_log(&pool, &slot, &publication, &oplog_table).await?;
-    // Two handles on the shipped connector over the owner pool: one the
-    // engine drives for every computed read, one the session uses for fold
-    // seeds. Aggregate reads are global statistics, so the owner pool is the
-    // deliberate choice (no RLS applies to them by construction).
-    let connector = PgReadConnector::with_session_setup(pool.clone());
-    let engine_connector = PgReadConnector::with_session_setup(pool.clone());
-
-    let (reader_pool_size, reader_gate) = reader_split()?;
-
-    // The handshake authority is a required constructor argument with no
-    // default (R2), so the auth service is built first and the server refuses
-    // to run without one: an unset CONNETTO_AUTH would otherwise mean a
-    // handshake with nothing to check a grant against.
-    let guard = build_guard(&pool, reader_gate)?;
-    let Some((service, registry)) = build_auth(&pool, Arc::clone(&guard)).await? else {
-        return Err(anyhow!(
-            "set CONNETTO_AUTH to in-memory or database: the server refuses to run \
-             without a handshake authority, because it would otherwise have no way to \
-             check a grant or to sign the credential a run resumes on"
-        ));
+/// The resolved `CONNETTO_CONTENT_*` settings, or `None` when the deployment
+/// serves no files.
+async fn content_settings() -> Result<Option<ContentSettings>> {
+    let Some(base_url) = var_nonempty("CONNETTO_CONTENT_URL") else {
+        return Ok(None);
     };
-    let authority: Arc<dyn HandshakeAuthority> = Arc::new(service.handshake_authority());
-
-    // Snapshots, read authorization, and the write apply all run under RLS as
-    // the reader role, which must be subject to RLS (non-superuser, not the
-    // table owner). Postgres applies no policy to a superuser or table owner,
-    // so serving reads or writes from the owner pool would bypass RLS
-    // entirely, and the server refuses to start instead of falling back to it.
-    let reader_url = std::env::var("CONNETTO_READER_URL").map_err(|_| {
-        anyhow!(
-            "set CONNETTO_READER_URL to a non-superuser conninfo subject to Row-Level \
-             Security (the server does not serve reads or writes from the owner pool)"
-        )
-    })?;
-    let reader_pool = build_pool(&reader_url, reader_pool_size).await?;
-    // The file routes mount on the auth listener beside the login
-    // endpoints, and the session mints with the same keypair the mounted
-    // routes verify with, so no key material leaves the process.
-    let (signer, file_router) = build_content(
-        ContentSettings::from_env()?,
-        &database_url,
-        &reader_url,
-        reader_pool_size,
-    )
-    .await?;
-    let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &pg_ddl)
-        .map_err(|err| anyhow!("building snapshot source: {err}"))?
-        .with_publication(publication.as_str());
-    // Read here rather than at the top, so the startup refusals that come
-    // before this one keep their order. It goes into the version the server
-    // advertises beside the schema, because a policy decides which view a
-    // logical name resolves to on a replica, so a changed policy makes an
-    // existing replica stale and a client holding one has to be told.
-    let pg_policies = read_ddl("CONNETTO_PG_POLICIES")?;
-    let (auth, translator, reach) =
-        build_authorization(&pool, &reader_pool, &pg_ddl, &pg_policies, &publication).await?;
-    // The membership term's subquery classifies against the deployment's own
-    // policies, so the materializer's engine gets the translator that read them.
-    let upkeep_translator = translator.clone();
-    let materializer = Materializer::with_read_connector(
-        &pg_ddl,
-        writable_catalog(),
-        Some(translator),
-        Some(caller_mapping()),
-        engine_connector,
-    )
-    .map_err(|err| anyhow!("building materializer: {err}"))?;
-    let upkeep = auth.upkeep(reach, upkeep_translator, reader_pool.clone());
-    let write = pg_write_target::<ConnettoWatermark>(reader_pool, &pg_ddl)
-        .map_err(|err| anyhow!("building write target: {err}"))?;
-
-    let manager = SessionManager::with_oplog(
-        materializer,
-        snapshot,
-        auth,
-        authority,
-        connector,
-        oplog,
-        write,
-        Arc::clone(&guard),
-        SessionConfig::new().with_schema_version(Some(
-            connetto_schema::translate::<String>(&pg_ddl, &pg_policies)
-                .map_err(|err| anyhow!("translating the replica schema: {err}"))?
-                .version(),
-        )),
-        Some(upkeep),
-        signer,
-    );
-    install_withdrawals(&manager, &pool, &pg_ddl)?;
-    // Revoking a session closes its live connection rather than only refusing
-    // its next handshake. The hook fires synchronously inside the revoke, so
-    // the close itself rides a spawned task.
-    {
-        let revoke_manager = Arc::clone(&manager);
-        service.set_revocation_hook(Arc::new(move |session_id| {
-            let manager = Arc::clone(&revoke_manager);
-            tokio::spawn(async move {
-                manager
-                    .close_session(session_id, FatalErrorReason::SessionRevoked)
-                    .await;
-            });
-        }));
+    if base_url.contains('?') || base_url.contains('#') {
+        return Err(anyhow!(
+            "CONNETTO_CONTENT_URL must carry no query or fragment, only the address the file \
+             routes answer on: {base_url}"
+        ));
     }
-    // A ban closes every connection the person holds, telling them nothing.
-    {
-        let ban_manager = Arc::clone(&manager);
-        guard.set_close_hook(Arc::new(move |user| {
-            let manager = Arc::clone(&ban_manager);
-            tokio::spawn(async move {
-                manager.close_person(&user).await;
-            });
-        }));
-    }
-    // A restore rewinds the session store with the rows, so the cluster and the
-    // slot are settled before either listener opens (R70 decisions 5 and 10).
-    preflight::require(&pool, &[Artifact::Table(epoch::EPOCH_TABLE)]).await?;
-    let check = manager
-        .check_before_stream(&database_url, &pool, &slot)
+    let store = StoreSpec::parse(
+        &var_nonempty("CONNETTO_CONTENT_STORE")
+            .context("set CONNETTO_CONTENT_STORE to fs:<dir> or an object_store URL")?,
+    )
+    .context("parsing CONNETTO_CONTENT_STORE")?;
+    let key_path = var_nonempty("CONNETTO_CONTENT_KEY")
+        .context("set CONNETTO_CONTENT_KEY to the PKCS8 DER ticket keypair, required once CONNETTO_CONTENT_URL is set")?;
+    // Spawned because startup runs on the async runtime, and one key file is
+    // worth the round trip off the worker thread.
+    let shown = key_path.clone();
+    let key = tokio::task::spawn_blocking(move || std::fs::read(&shown))
         .await
-        .map_err(|err| anyhow!("settling the change feed before serving: {err}"))?;
-    settle_epoch(&manager, &service, &pool, check, Found::AtBoot).await?;
-    let cookie_same_site =
-        CookieSameSite::parse(&var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")).ok_or_else(
-            || {
-                anyhow!(
-                    "unknown CONNETTO_AUTH_COOKIE_SAMESITE {:?}, expected strict or none",
-                    var_or("CONNETTO_AUTH_COOKIE_SAMESITE", "strict")
-                )
-            },
-        )?;
-    spawn_auth_endpoints(
-        &service,
-        registry,
-        file_router,
-        &var_or("CONNETTO_AUTH_BIND", "127.0.0.1:8081"),
-        &comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")),
-        &comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")),
-        cookie_same_site,
-    )
-    .await?;
-    run(
-        &manager,
-        &service,
-        &pool,
-        FeedSource {
-            database_url: &database_url,
-            slot: &slot,
-            publication: &publication,
-            pg_ddl: &pg_ddl,
+        .map_err(|err| anyhow!("joining the key read: {err}"))?
+        .with_context(|| format!("reading {key_path}"))?;
+    let ttl = Duration::from_secs(env_u64("CONNETTO_CONTENT_TICKET_TTL_SECS", 3_600)?);
+    Ok(Some(ContentSettings {
+        base_url: base_url.trim_end_matches('/').to_owned(),
+        ttl,
+        read_ceiling: env_u64("CONNETTO_CONTENT_READ_CEILING", 1 << 26)?,
+        grace: Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_GRACE_SECS", ttl.as_secs())?),
+        cadence: Duration::from_secs(env_u64("CONNETTO_CONTENT_SWEEP_SECS", 3_600)?),
+        quota_identity: env_u64("CONNETTO_CONTENT_QUOTA_BYTES", 0)?,
+        storage_ceiling: env_u64("CONNETTO_CONTENT_STORAGE_CEILING", 0)?,
+        bandwidth_ceiling: env_u64("CONNETTO_CONTENT_BANDWIDTH_CEILING", 0)?,
+        bandwidth_window_days: {
+            let days = env_u64("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS", 30)?;
+            i32::try_from(days).map_err(|_| {
+                anyhow!("CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS={days} is out of range")
+            })?
         },
-        &bind,
-    )
-    .await
+        warn_fraction: match std::env::var("CONNETTO_CONTENT_WARN_FRACTION") {
+            Err(_) => 0.8,
+            Ok(text) => text
+                .trim()
+                .parse::<f64>()
+                .map(|fraction| fraction.clamp(0.0, 1.0))
+                .with_context(|| format!("parsing CONNETTO_CONTENT_WARN_FRACTION: {text:?}"))?,
+        },
+        ceiling_refresh: Duration::from_secs(env_u64("CONNETTO_CONTENT_CEILING_REFRESH_SECS", 10)?),
+        owner_pool_size: env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?,
+        store,
+        key,
+    }))
 }
 
-/// The auth listener's `CorsLayer`: loopback origins plus what
-/// `CONNETTO_AUTH_CORS_ORIGINS` lists. The file routes ride the same layer
-/// because a `PUT` or a JSON `POST` from a dev-server origin preflights, and
-/// one origin means a deployment names its origins once.
+/// The builder from the environment, every setting read once at startup.
 ///
-/// Credentials, which the R90 browser contract's `credentials: "include"`
-/// fetches need, ride only the listed origins. A loopback page is answered
-/// without them unless it is listed, whatever address the listener binds, so
-/// under `SameSite=None` no local page can spend a user's refresh cookie and
-/// read the token. A development page lists its own origin to carry one.
-fn cors_layer(cors_origins: &[String]) -> CorsLayer {
-    let answered = cors_origins.to_vec();
-    let credentialed = cors_origins.to_vec();
-    CorsLayer::new()
-        .allow_origin(AllowOrigin::predicate(move |origin, _parts| {
-            origin.to_str().is_ok_and(|origin| {
-                is_loopback_origin(origin) || answered.iter().any(|allowed| allowed == origin)
-            })
-        }))
-        .allow_credentials(AllowCredentials::predicate(move |origin, _parts| {
-            origin
-                .to_str()
-                .is_ok_and(|origin| credentialed.iter().any(|allowed| allowed == origin))
-        }))
-        // Wildcards are illegal with credentials, so the answer mirrors what
-        // the preflight asked for.
-        .allow_methods(AllowMethods::mirror_request())
-        .allow_headers(AllowHeaders::mirror_request())
-}
-
-/// Mount the file router on the auth listener's router before the CORS layer
-/// goes on, so the file routes answer at the login endpoints' origin.
-fn mount_on_auth_listener(auth: axum::Router, files: Option<axum::Router>) -> axum::Router {
-    match files {
-        Some(files) => auth.merge(files),
-        None => auth,
-    }
-}
-
-/// Split a comma-separated setting into its trimmed non-empty entries.
-fn comma_list(text: &str) -> Vec<String> {
-    text.split(',')
-        .map(str::trim)
-        .filter(|entry| !entry.is_empty())
-        .map(str::to_owned)
-        .collect()
-}
-
-/// Serve the login and refresh endpoints beside the sync listener, and the
-/// file routes when the deployment configured a content backend. The one
-/// `CorsLayer` covers both surfaces, so a browser client sees one origin.
+/// # Errors
 ///
-/// `redirect_allowlist` holds exact non-loopback client redirect URIs that
-/// are permitted (a browser client lists its own callback under
-/// `CONNETTO_AUTH_REDIRECT_ALLOWLIST`). Loopback redirects are always
-/// allowed, so a native client needs no entry. `cors_origins` lists exact
-/// origins whose script may read a login response
-/// (`CONNETTO_AUTH_CORS_ORIGINS`). An app served from a different origin
-/// than these endpoints needs one, because without it the browser refuses
-/// to hand the response to the page. Loopback origins are always allowed,
-/// mirroring the redirect policy's loopback rule and for the same reason:
-/// script on a loopback origin is already on the machine.
-///
-/// The listener is bound before this returns, so an address another process
-/// holds stops the start instead of leaving a server that cannot sign anyone
-/// in. Returns the bound address.
-async fn spawn_auth_endpoints(
-    service: &Arc<AuthService<ServerStore>>,
-    registry: Arc<ProviderRegistry>,
-    file_router: Option<axum::Router>,
-    auth_bind: &str,
-    redirect_allowlist: &[String],
-    cors_origins: &[String],
-    cookie_same_site: CookieSameSite,
-) -> Result<SocketAddr> {
-    let router = mount_on_auth_listener(
-        auth_router(
-            Arc::clone(service),
-            registry,
-            RedirectPolicy::new(redirect_allowlist.to_vec()),
-            cookie_same_site,
-        ),
-        file_router,
-    )
-    .layer(cors_layer(cors_origins));
-    let listener = TcpListener::bind(auth_bind)
-        .await
-        .with_context(|| format!("binding the auth endpoints at {auth_bind}"))?;
-    let bound = listener
-        .local_addr()
-        .with_context(|| format!("reading the auth endpoints' address {auth_bind}"))?;
-    tracing::info!(bind = %bound, "auth endpoints listening");
-    tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
-            tracing::error!(error = %err, "auth endpoint server stopped");
+/// When any setting is absent, blank, or names a mode this binary no longer
+/// serves.
+async fn builder_from_env() -> Result<ServerBuilder> {
+    let auth = var_or("CONNETTO_AUTH", "");
+    match auth.as_str() {
+        "database" => {}
+        "" => {
+            return Err(anyhow!(
+                "set CONNETTO_AUTH to database: the server refuses to run without the login \
+                 machinery, because it would otherwise have no way to check a grant or to sign \
+                 the credential a run resumes on"
+            ));
         }
-    });
-    Ok(bound)
+        other => {
+            return Err(anyhow!(
+                "unknown CONNETTO_AUTH mode {other:?}, expected database"
+            ));
+        }
+    }
+    let audit = database_toggle("CONNETTO_AUDIT")?;
+    let bans = database_toggle("CONNETTO_BANS")?;
+    let database = Database::new(
+        std::env::var("DATABASE_URL").context("set DATABASE_URL")?,
+        std::env::var("CONNETTO_READER_URL").map_err(|_| {
+            anyhow!(
+                "set CONNETTO_READER_URL to a non-superuser conninfo subject to row-level \
+                 security: connetto serves no reads or writes from the owner pool"
+            )
+        })?,
+    );
+    let schema = ServerSchema::new(
+        read_ddl("CONNETTO_PG_DDL")?,
+        read_ddl("CONNETTO_PG_POLICIES")?,
+    );
+    let providers = oidc_providers()?;
+    let keys = jwt_keys()?;
+    let content = content_settings().await?;
+    let openfga = OpenFga::new(
+        var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081"),
+        std::env::var("CONNETTO_FGA_STORE").map_err(|_| {
+            anyhow!("set CONNETTO_FGA_STORE to the authorization store this deployment owns")
+        })?,
+    );
+    Ok(ServerBuilder::new(database, schema, keys, openfga)
+        .slot(var_or("CONNETTO_SLOT", "connetto_slot"))
+        .publication(var_or("CONNETTO_PUBLICATION", "connetto_pub"))
+        .oplog_table(var_or("CONNETTO_OPLOG_TABLE", "connetto_oplog"))
+        .owner_pool_size(env_u32("CONNETTO_OWNER_POOL_SIZE", 10)?)
+        .slot_lag_watch(Duration::from_secs(u64::from(env_u32(
+            "CONNETTO_SLOT_LAG_SECS",
+            60,
+        )?)))
+        .reader_reserve(reader_reserve()?)
+        .oidc_providers(providers)
+        .audit(audit)
+        .bans(bans)
+        .redirect_allowlist(comma_list(&var_or("CONNETTO_AUTH_REDIRECT_ALLOWLIST", "")))
+        .cors_origins(comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")))
+        .cookie_same_site(cookie_same_site()?)
+        .writable(writable_catalog())
+        .content(content))
 }
-
-/// How long a shutdown waits for the live sessions to flush their close frame
-/// and tear down before the process exits anyway.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only
 /// the interrupt arm can fire.
@@ -1360,744 +434,52 @@ async fn shutdown_signal() {
     }
 }
 
-/// The change path's executor: translate the deployment's policies, put the
-/// rules on the authorization service, fill the facts behind them if they are
-/// new, and answer through the composition.
-///
-/// Two clients over one endpoint. Questions go through [`Counted`], which is
-/// where `AUTHORIZATION_CALLS` counts round trips, and the setup calls do not,
-/// so writing a model does not read as a change-path question.
-async fn build_authorization(
-    owner_pool: &Pool<AsyncPgConnection>,
-    reader_pool: &Pool<AsyncPgConnection>,
-    pg_ddl: &str,
-    policies: &str,
-    publication: &str,
-) -> Result<(ServerAuth, Translator, GrantReach)> {
-    let translated = Translated::of::<String>(pg_ddl, policies, DEFAULT_USER_SETTING)?;
-
-    // A policy reading a table the change stream does not carry never hears
-    // that a grant was given or taken away, so the store goes stale and then
-    // answers confidently and wrongly. The publication is known and the
-    // policies are known, so this is a set difference that names the table.
-    let required: Vec<Artifact<'_>> = translated
-        .policy_tables()
-        .iter()
-        .map(|table| Artifact::PublishedTable { publication, table })
-        .collect();
-    preflight::require(owner_pool, &required).await?;
-
-    let endpoint = var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081");
-    let store_id = std::env::var("CONNETTO_FGA_STORE").map_err(|_| {
-        anyhow!(
-            "set CONNETTO_FGA_STORE to the authorization store this deployment owns: \
-             connetto writes the rules it derives from your policies into a store, and \
-             it does not create one"
-        )
-    })?;
-    let channel = Channel::from_shared(endpoint.clone())
-        .with_context(|| format!("parsing CONNETTO_FGA_URL {endpoint}"))?
-        .connect()
-        .await
-        .with_context(|| format!("connecting to the authorization service at {endpoint}"))?;
-
-    let mut setup = OpenFgaServiceClient::new(channel.clone());
-    let model = translated.install_model(&mut setup, &store_id).await?;
-    // Build the loader once: both the Written and Adopted paths use it, though
-    // for different passes. The uncounted client keeps boot writes out of the
-    // authorization-call counter.
-    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
-        translated.shapes_arc(),
-        setup,
-        store_id.clone(),
-    )
-    .map_err(|err| anyhow!("preparing the fact loader: {err}"))?
-    .authorization_model_id(model.id().to_owned());
-    match &model {
-        ModelState::Written(_) => {
-            let n = translated
-                .load_into(reader_pool, &loader)
-                .await
-                .map_err(|err| anyhow!("loading the authorization store: {err}"))?;
-            tracing::info!(
-                model = model.id(),
-                facts = n,
-                "authorization rules are new, loading the facts behind them"
-            );
-        }
-        ModelState::Adopted(_) => {
-            // Reconcile the whole-shape materialisation regions on every
-            // adopted boot. A region already correct costs a read round-trip
-            // with zero writes; a missing region is filled in case the
-            // previous boot failed before materialise_groups completed.
-            translated
-                .reconcile_materialised(reader_pool, &loader)
-                .await
-                .map_err(|err| anyhow!("reconciling the authorization store: {err}"))?;
-            tracing::info!(
-                model = model.id(),
-                "authorization rules already installed, reconciling whole-shape regions"
-            );
-        }
-    }
-
-    let naming = translated.naming();
-    let (shapes, translator, reach) = translated.into_parts();
-
-    let delegate = OpenFgaPolicy::new(
-        Arc::clone(&shapes),
-        OpenFgaServiceClient::new(Counted::new(channel)),
-        store_id,
-    )
-    .map_err(|err| anyhow!("building the authorization delegate: {err}"))?
-    .authorization_model_id(model.id().to_owned());
-    Ok((FgaAuth::new(shapes, delegate, naming), translator, reach))
-}
-
-/// Report one change-stream or authorization retry, so reconnect churn and an
-/// authorization outage are both visible to whatever the embedder already runs.
-fn log_reconnect(event: &ReconnectEvent<'_>) {
-    let millis =
-        |backoff: &std::time::Duration| u64::try_from(backoff.as_millis()).unwrap_or(u64::MAX);
-    match event {
-        ReconnectEvent::Retrying {
-            attempt,
-            backoff,
-            error,
-        } => tracing::warn!(
-            attempt,
-            backoff_ms = millis(backoff),
-            error,
-            "change stream lost, retrying"
-        ),
-        ReconnectEvent::GaveUp { attempts, error } => tracing::error!(
-            attempts,
-            error,
-            "change stream gave up reconnecting, live delivery has stopped"
-        ),
-        ReconnectEvent::AuthRetrying {
-            attempt,
-            backoff,
-            error,
-        } => tracing::warn!(
-            attempt,
-            backoff_ms = millis(backoff),
-            error,
-            "authorization service unreachable, holding the event and retrying"
-        ),
-        ReconnectEvent::ReadRetrying {
-            attempt,
-            backoff,
-            error,
-        } => tracing::warn!(
-            attempt,
-            backoff_ms = millis(backoff),
-            error,
-            "computed read unreachable, holding the event and retrying"
-        ),
-    }
-}
-
-/// Revoke every login session when the feed reads from another cluster, or at boot when the slot resumed past the reconnect log, then record the cluster and trim the log (R70 decisions 5, 10 and 18).
-async fn settle_epoch(
-    manager: &ServerManager,
-    service: &AuthService<ServerStore>,
-    pool: &Pool<AsyncPgConnection>,
-    check: StreamCheck,
-    found: Found,
-) -> Result<()> {
-    let settled = epoch::compare(pool, check.system)
-        .await
-        .map_err(|err| anyhow!("reading the recorded cluster: {err}"))?;
-    if let Some(cause) = epoch::revocation(settled, check, found) {
-        let revoked = service
-            .revoke_every_session()
-            .await
-            .map_err(|err| anyhow!("revoking every session after a restore: {err}"))?;
-        tracing::error!(
-        revoked,
-        cause = %cause,
-        "the database was restored or replaced, so every login session was revoked \
-         and each device logs in again"
-        );
-    }
-    // Recorded and trimmed only once the revocation held, so a failure meets the same restore on the next try.
-    if settled != Epoch::Same {
-        epoch::record(pool, check.system)
-            .await
-            .map_err(|err| anyhow!("recording the database's cluster: {err}"))?;
-    }
-    if let Some(resume) = check.gap {
-        manager
-            .reconcile_stream(resume)
-            .await
-            .map_err(|err| anyhow!("trimming the reconnect log past a gap: {err}"))?;
-    }
-    Ok(())
-}
-
-/// Where the change feed reads from.
-struct FeedSource<'a> {
-    database_url: &'a str,
-    slot: &'a str,
-    publication: &'a str,
-    pg_ddl: &'a str,
-}
-
-/// Start CDC ingestion and serve connections until the listener fails or a
-/// shutdown signal arrives.
-async fn run(
-    manager: &Arc<ServerManager>,
-    service: &Arc<AuthService<ServerStore>>,
-    pool: &Pool<AsyncPgConnection>,
-    feed: FeedSource<'_>,
-    bind: &str,
-) -> Result<()> {
-    let FeedSource {
-        database_url,
-        slot,
-        publication,
-        pg_ddl,
-    } = feed;
-    // Fail fast on a bad catalog DDL; the reconnect loop rebuilds the catalog
-    // per connect and must not spin on a deterministic parse error.
-    ParserDB::parse::<PostgreSqlDialect>(pg_ddl)
-        .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
-    let ingest_manager = manager.clone();
-    let gap_manager = manager.clone();
-    let gap_service = service.clone();
-    let gap_pool = pool.clone();
-    let url = database_url.to_owned();
-    let slot = slot.to_owned();
-    let publication = publication.to_owned();
-    let ddl = pg_ddl.to_owned();
-    tokio::spawn(async move {
-        // Reconnect the replication stream forever. An ordinary drop loses no
-        // events, because the stream resumes right after the last one dispatched.
-        let connect = |resume: connetto_server::ResumePoint| {
-            let (url, slot, publication, ddl) =
-                (url.clone(), slot.clone(), publication.clone(), ddl.clone());
-            let (pool, manager, service) =
-                (gap_pool.clone(), gap_manager.clone(), gap_service.clone());
-            async move {
-                let catalog = ParserDB::parse::<PostgreSqlDialect>(&ddl)
-                    .map_err(|err| anyhow!("parsing catalog DDL: {err:?}"))?;
-                let check = manager
-                    .check_before_stream(&url, &pool, &slot)
-                    .await
-                    .map_err(|err| anyhow!("{err}"))?;
-                settle_epoch(&manager, &service, &pool, check, Found::WhileRunning).await?;
-                // Read after the checks, which clear it on a changed timeline or a skipped stretch.
-                let config = PgStreamingConfig::new(url, slot, publication).start(resume.get());
-                PgStreamingCdcSource::connect(config, catalog)
-                    .await
-                    .map_err(|err| anyhow!("opening CDC stream: {err}"))
-            }
-        };
-        match ingest_manager
-            .ingest_with_reconnect(connect, &ReconnectPolicy::default(), |event| {
-                log_reconnect(&event);
-            })
-            .await
-        {
-            Ok(()) => {}
-            // The change stream cannot answer what a row looked like before it
-            // changed, and no restart of the stream will change that. Serving on
-            // means choosing between leaving a row on a device its owner may no
-            // longer see and handing its key to somebody who never could, so the
-            // server stops instead and the restart meets the startup refusal
-            // naming the table (R6 decision 4).
-            Err(err @ SessionError::ChangeStreamUnusable(_)) => {
-                tracing::error!(error = %err, "refusing to serve");
-                let told = ingest_manager.shutdown().await;
-                tracing::info!(closed = told, "closed every connection");
-                tokio::time::sleep(SHUTDOWN_GRACE).await;
-                std::process::exit(1);
-            }
-            Err(err) => tracing::error!(error = %err, "change stream ingest stopped"),
-        }
-    });
-
-    let listener = TcpListener::bind(bind)
+#[tokio::main]
+async fn main() -> Result<()> {
+    // `pg_walstream` reports every standby status update at `info`, which is
+    // one line per ten seconds whether or not anything happened, and it
+    // buries this server's own events. `RUST_LOG` brings it back.
+    connetto_core::logging::init_stdout_with_default("info,pg_walstream=warn");
+    let builder = builder_from_env().await?;
+    let bind = var_or("CONNETTO_BIND", "127.0.0.1:8080");
+    let listener = TcpListener::bind(&bind)
         .await
         .with_context(|| format!("binding {bind}"))?;
-    tracing::info!(bind = %bind, "sync listener started");
-    let mut sessions = JoinSet::new();
-    loop {
-        let accepted = tokio::select! {
-            accepted = listener.accept() => accepted,
-            () = shutdown_signal() => break,
-        };
-        let (tcp, _peer) = accepted.context("accepting a connection")?;
-        // Reap the finished ones here, so the set holds only live sessions.
-        while sessions.try_join_next().is_some() {}
-        let session = manager.clone();
-        sessions.spawn(async move {
-            let transport = match WebSocketTransport::accept(tcp).await {
-                Ok(transport) => transport,
-                Err(err) => {
-                    tracing::warn!(error = %err, "websocket handshake failed");
-                    return;
-                }
-            };
-            if let Err(err) = session.serve(transport).await {
-                tracing::warn!(error = %err, "session ended with an error");
-            }
-        });
+    tracing::info!(bind = %bind, "serving the sync, login and file routes");
+    match builder.serve(listener, shutdown_signal()).await {
+        Ok(()) => Ok(()),
+        Err(err @ ServeError::ChangeStreamUnusable(_)) => {
+            tracing::error!(error = %err, "the change stream cannot answer, refusing to serve");
+            std::process::exit(1);
+        }
+        Err(err @ ServeError::ChangeStreamStopped(_)) => {
+            tracing::error!(error = %err, "the change stream stopped, refusing to serve");
+            std::process::exit(1);
+        }
+        Err(err) => Err(err.into()),
     }
-
-    let told = manager.shutdown().await;
-    tracing::info!(closed = told, "shutting down");
-    // The close frame is queued, not sent: each session's own loop delivers it
-    // and then tears down, so the exit waits on those rather than racing them.
-    if tokio::time::timeout(SHUTDOWN_GRACE, async {
-        while sessions.join_next().await.is_some() {}
-    })
-    .await
-    .is_err()
-    {
-        tracing::warn!("shutdown grace elapsed with sessions still open");
-    }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::body::Body;
-    use axum::http::{Method, Request, StatusCode};
-    use tower::{Layer, ServiceExt};
-
-    /// A caller carrying only an identity, which is what these mints exercise.
-    fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
-        connetto_core::auth::ContentCaller::new(Some(user_id.to_owned()), None)
-    }
-
-    #[tokio::test]
-    async fn an_unset_deployment_refuses_every_ticket() {
-        let err = ContentTicketSigner::mint(
-            &ServerSigner::None,
-            &identified("u-1"),
-            [0u8; 32],
-            ContentVerb::Read,
-        )
-        .await
-        .expect_err("no signer is configured");
-        assert!(matches!(err, SignerError::NotConfigured));
-    }
 
     #[test]
     fn comma_lists_trim_and_drop_empties() {
         assert_eq!(
-            comma_list(" https://a.example ,https://b.example, "),
-            vec![
-                "https://a.example".to_owned(),
-                "https://b.example".to_owned()
-            ]
+            comma_list(" a , ,b ,c,, "),
+            vec!["a", "b", "c"],
+            "entries are trimmed and blanks dropped"
         );
-        assert_eq!(comma_list(" , "), Vec::<String>::new());
-    }
-
-    /// Credentials ride only the origins `CONNETTO_AUTH_CORS_ORIGINS` lists. A
-    /// loopback page is still answered without being listed, and without
-    /// credentials, whatever address the listener binds, so under
-    /// `SameSite=None` no local page can spend a refresh cookie it was not
-    /// listed for. A development page lists its own origin to carry one.
-    #[tokio::test]
-    async fn the_cors_layer_carries_credentials_only_for_trusted_origins() {
-        async fn answer(listed: &[&str], origin: &str) -> axum::response::Response {
-            let listed: Vec<String> = listed.iter().map(|&origin| origin.to_owned()).collect();
-            let layer = cors_layer(&listed);
-            let router = layer.layer(axum::Router::new().route(
-                "/auth/refresh",
-                axum::routing::post(|| async { StatusCode::NO_CONTENT }),
-            ));
-            router
-                .oneshot(
-                    Request::builder()
-                        .method(Method::POST)
-                        .uri("/auth/refresh")
-                        .header("origin", origin)
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("response")
-        }
-        fn credentialed(response: &axum::response::Response) -> bool {
-            response
-                .headers()
-                .get("access-control-allow-credentials")
-                .is_some_and(|value| value == "true")
-        }
-        const APP: &str = "https://app.example";
-        const DEV: &str = "http://127.0.0.1:5173";
-
-        let trusted = answer(&[APP], APP).await;
         assert_eq!(
-            trusted.headers()["access-control-allow-origin"],
-            APP,
-            "the configured origin is answered"
+            comma_list(""),
+            Vec::<String>::new(),
+            "blank reads as nothing"
         );
-        assert!(
-            credentialed(&trusted),
-            "and the answer permits the cookie to ride"
-        );
-
-        let unlisted = answer(&[APP], DEV).await;
         assert_eq!(
-            unlisted.headers()["access-control-allow-origin"],
-            DEV,
-            "a loopback page is answered without being configured"
+            comma_list("   "),
+            Vec::<String>::new(),
+            "whitespace reads as nothing"
         );
-        assert!(
-            !credentialed(&unlisted),
-            "but its cookie never rides until its origin is listed"
-        );
-
-        let listed = answer(&[APP, DEV], DEV).await;
-        assert!(
-            credentialed(&listed),
-            "a development page that lists its origin carries the cookie"
-        );
-
-        for hostile in ["https://evil.example", "http://evil.localhost:5173"] {
-            let answered = answer(&[APP], hostile).await;
-            assert!(
-                !answered
-                    .headers()
-                    .contains_key("access-control-allow-origin"),
-                "{hostile} gets no answer, so the browser refuses it the response"
-            );
-            assert!(!credentialed(&answered), "and no credentials for {hostile}");
-        }
-    }
-
-    /// A taken auth address stops the start, because a server left without
-    /// its login endpoints cannot sign anyone in. A free one serves them.
-    #[tokio::test]
-    async fn a_taken_auth_address_stops_the_start_and_a_free_one_serves() {
-        let config = AuthConfig::default();
-        let authority = TokenAuthority::generate(&config).expect("an ephemeral token authority");
-        let store = ServerStore::InMemory(InMemoryAuthStore::new(config.refresh_lifetimes()));
-        let guard = Arc::new(RequestGuard::new(
-            ThrottleConfig::default(),
-            AbuseConfig::default(),
-        ));
-        let service = Arc::new(
-            AuthService::new(Arc::new(authority), Arc::new(store), Arc::clone(&guard))
-                .with_registry(Arc::new(ProviderRegistry::new())),
-        );
-        let taken = std::net::TcpListener::bind("127.0.0.1:0").expect("hold an address");
-        let taken_addr = taken.local_addr().expect("the held address").to_string();
-        let refused = spawn_auth_endpoints(
-            &service,
-            Arc::new(ProviderRegistry::new()),
-            None,
-            &taken_addr,
-            &[],
-            &[],
-            CookieSameSite::default(),
-        )
-        .await
-        .expect_err("a taken address must stop the start");
-        assert!(
-            format!("{refused:#}").contains(&taken_addr),
-            "the refusal names the address, got {refused:#}"
-        );
-
-        let bound = spawn_auth_endpoints(
-            &service,
-            Arc::new(ProviderRegistry::new()),
-            Some(
-                axum::Router::new().route("/files/{id}", axum::routing::get(|| async { "served" })),
-            ),
-            "127.0.0.1:0",
-            &[],
-            &[],
-            CookieSameSite::default(),
-        )
-        .await
-        .expect("a free address binds");
-        let body = openidconnect::reqwest::get(format!("http://{bound}/files/abc"))
-            .await
-            .expect("the bound listener answers")
-            .text()
-            .await
-            .expect("a body");
-        assert_eq!(body, "served");
-    }
-
-    #[tokio::test]
-    async fn the_file_routes_share_the_auth_listeners_cors_layer() {
-        let file_routes =
-            axum::Router::new().route("/files/{id}", axum::routing::get(|| async { "served" }));
-        let app = mount_on_auth_listener(axum::Router::new(), Some(file_routes))
-            .layer(cors_layer(&["https://app.example".to_owned()]));
-
-        let preflight = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method(Method::OPTIONS)
-                    .uri("/files/abc")
-                    .header("origin", "https://app.example")
-                    .header("access-control-request-method", "PUT")
-                    .body(Body::empty())
-                    .expect("a preflight request"),
-            )
-            .await
-            .expect("the layer answers the preflight");
-        assert_eq!(preflight.status(), StatusCode::OK);
-        assert_eq!(
-            allowed_origin(&preflight).as_deref(),
-            Some("https://app.example"),
-            "a listed origin may upload"
-        );
-
-        let served = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri("/files/abc")
-                    .header("origin", "http://localhost:5173")
-                    .body(Body::empty())
-                    .expect("a get request"),
-            )
-            .await
-            .expect("the merged router serves the file route");
-        assert_eq!(served.status(), StatusCode::OK);
-        assert_eq!(
-            allowed_origin(&served).as_deref(),
-            Some("http://localhost:5173"),
-            "a loopback origin is always allowed"
-        );
-
-        let refused = app
-            .oneshot(
-                Request::builder()
-                    .uri("/files/abc")
-                    .header("origin", "https://elsewhere.example")
-                    .body(Body::empty())
-                    .expect("a get request"),
-            )
-            .await
-            .expect("the router still serves the body");
-        assert!(
-            allowed_origin(&refused).is_none(),
-            "an unlisted origin must not be handed the response"
-        );
-    }
-
-    /// The `access-control-allow-origin` header, if the CORS layer granted one.
-    fn allowed_origin(response: &axum::http::Response<Body>) -> Option<String> {
-        response
-            .headers()
-            .get("access-control-allow-origin")
-            .map(|value| value.to_str().expect("ascii header").to_owned())
-    }
-
-    #[cfg(feature = "content")]
-    mod content {
-        use super::*;
-
-        #[test]
-        fn fs_prefix_names_a_directory() {
-            match parse_store_spec("fs:/var/lib/connetto/content").expect("a directory store") {
-                StoreSpec::Fs(dir) => assert_eq!(dir.as_os_str(), "/var/lib/connetto/content"),
-                StoreSpec::Object(_) => panic!("fs: names the directory store"),
-            }
-        }
-
-        #[test]
-        fn an_object_url_names_an_object_store() {
-            match parse_store_spec("s3://bucket/prefix").expect("an object store") {
-                StoreSpec::Object(url) => assert_eq!(url.scheme(), "s3"),
-                StoreSpec::Fs(_) => panic!("a url names an object store"),
-            }
-        }
-
-        #[test]
-        fn fs_without_a_directory_and_an_unparsable_url_are_refused() {
-            assert!(parse_store_spec("fs:").is_err());
-            assert!(parse_store_spec("not a url").is_err());
-        }
-
-        #[tokio::test]
-        async fn a_keypair_loaded_from_der_mints_what_its_public_half_verifies() {
-            let rng = ring::rand::SystemRandom::new();
-            let doc = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).expect("a fresh key");
-            let (signer, public) = ticket_keypair(
-                Some(doc.as_ref()),
-                "http://127.0.0.1:8081",
-                Duration::from_secs(60),
-                1 << 20,
-            )
-            .expect("a keypair from its DER");
-            let url = ContentTicketSigner::mint(
-                &signer,
-                &identified("caller-1"),
-                [7u8; 32],
-                ContentVerb::Read,
-            )
-            .await
-            .expect("a minted read url");
-            let token = url.split_once("?t=").expect("the token rides the url").1;
-            let payload = TicketVerifier::new(public)
-                .verify(token)
-                .expect("the minted token verifies");
-            assert_eq!(payload.file_id, [7u8; 32]);
-            assert_eq!(payload.caller.identity(), Some("caller-1"));
-        }
-
-        #[tokio::test]
-        async fn an_ephemeral_keypair_mints_what_its_public_half_verifies() {
-            let (signer, public) = ticket_keypair(
-                None,
-                "http://127.0.0.1:8081",
-                Duration::from_secs(60),
-                1 << 20,
-            )
-            .expect("an ephemeral keypair");
-            let url = ContentTicketSigner::mint(
-                &signer,
-                &identified("caller-2"),
-                [9u8; 32],
-                ContentVerb::Write { declared_len: 128 },
-            )
-            .await
-            .expect("a minted write url");
-            assert!(url.starts_with("http://127.0.0.1:8081/files/"));
-            assert!(url.contains("/intent?t="));
-            let token = url.split_once("?t=").expect("the token rides the url").1;
-            let payload = TicketVerifier::new(public)
-                .verify(token)
-                .expect("the minted token verifies");
-            assert_eq!(payload.file_id, [9u8; 32]);
-        }
-
-        /// The no-files deployment is the common one: no settings, no
-        /// signer, no router, and the environment reads as none.
-        #[tokio::test]
-        async fn a_deployment_without_settings_mounts_nothing() {
-            let (signer, router) = build_content(None, "postgres://unused", "postgres://unused", 1)
-                .await
-                .expect("no settings is a valid deployment");
-            assert!(matches!(signer, ServerSigner::None));
-            assert!(router.is_none());
-            assert!(
-                ContentSettings::from_env()
-                    .expect("an unset environment reads cleanly")
-                    .is_none(),
-                "CONNETTO_CONTENT_URL unset is the no-files deployment"
-            );
-        }
-
-        /// A configured deployment builds the whole file half in process:
-        /// the deployment DDL, the router's preflight, a signer whose mints
-        /// the mounted routes would verify, and one sweep tick reclaimed on
-        /// the cadence.
-        #[tokio::test]
-        async fn a_configured_deployment_mounts_routes_and_sweeps() {
-            use diesel_async::RunQueryDsl as _;
-            const DEPLOYMENT_SQL: &[&str] = &[
-                "CREATE TABLE photos (content_id BYTEA PRIMARY KEY, content_state TEXT NOT NULL \
-                 DEFAULT 'staged')",
-                "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[]) \
-                 RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER SET search_path TO '' AS $$ \
-                 SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f \
-                 WHERE EXISTS (SELECT 1 FROM public.photos p WHERE p.content_id = f)) $$",
-                "CREATE OR REPLACE FUNCTION connetto_set_content_state(p_file_id BYTEA, \
-                 p_new_state TEXT, p_caller TEXT) RETURNS BYTEA \
-                 LANGUAGE plpgsql SECURITY DEFINER SET search_path TO '' \
-                 AS $$ BEGIN UPDATE public.photos SET content_state = p_new_state \
-                 WHERE content_id = p_file_id; RETURN p_file_id; END; $$",
-            ];
-            let fixture = connetto_test_harness::Fixture::acquire().await;
-            let admin_url = fixture.admin_url().to_owned();
-            let pool = build_pool(&admin_url, 2)
-                .await
-                .expect("a pool on the fixture");
-            let mut conn = pool.get().await.expect("a connection");
-            for stmt in [
-                "DROP TABLE IF EXISTS photos CASCADE",
-                "DROP TABLE IF EXISTS _cfs_manifest_chunks CASCADE",
-                "DROP TABLE IF EXISTS _cfs_manifests CASCADE",
-                "DROP TABLE IF EXISTS _cfs_chunk_registry CASCADE",
-                "DROP TABLE IF EXISTS _cfs_traffic CASCADE",
-                "DROP FUNCTION IF EXISTS connetto_visible_files(BYTEA[])",
-                "DROP FUNCTION IF EXISTS connetto_set_content_state(BYTEA, TEXT, TEXT)",
-            ] {
-                diesel::sql_query(stmt)
-                    .execute(&mut *conn)
-                    .await
-                    .expect("a clean slate");
-            }
-            for stmt in connetto_file_server::DEPLOYMENT_DDL.split(';') {
-                let meaningful = stmt
-                    .lines()
-                    .any(|line| !line.trim().is_empty() && !line.trim_start().starts_with("--"));
-                if meaningful {
-                    diesel::sql_query(stmt.trim())
-                        .execute(&mut *conn)
-                        .await
-                        .expect("the deployment applies");
-                }
-            }
-            for stmt in DEPLOYMENT_SQL {
-                diesel::sql_query(*stmt)
-                    .execute(&mut *conn)
-                    .await
-                    .expect("the contract applies");
-            }
-            for stmt in [
-                "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
-                 THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
-                "GRANT USAGE ON SCHEMA public TO app_reader",
-                "GRANT SELECT ON photos TO app_reader",
-                "GRANT SELECT ON _cfs_chunk_registry, _cfs_manifests, _cfs_manifest_chunks \
-                 TO app_reader",
-            ] {
-                diesel::sql_query(stmt)
-                    .execute(&mut *conn)
-                    .await
-                    .expect("the reader role can read the deployment");
-            }
-            let reader_url =
-                connetto_test_harness::with_user(&admin_url, "app_reader", "app_reader");
-            drop(conn);
-            let dir = tempfile::tempdir().expect("a chunk directory");
-            let settings = ContentSettings {
-                base_url: "http://127.0.0.1:8099".to_owned(),
-                ttl: Duration::from_secs(60),
-                read_ceiling: 1 << 20,
-                grace: Duration::ZERO,
-                cadence: Duration::from_secs(1),
-                owner_pool_size: 2,
-                store_setting: format!("fs:{}", dir.path().display()),
-                key_path: None,
-                quota_identity: 0,
-                storage_ceiling: 0,
-                bandwidth_ceiling: 0,
-                bandwidth_window_days: 30,
-                warn_fraction: 0.8,
-                ceiling_refresh: Duration::from_secs(10),
-            };
-            let (signer, router) = build_content(Some(settings), &admin_url, &reader_url, 2)
-                .await
-                .expect("a configured deployment builds");
-            let url = ContentTicketSigner::mint(
-                &signer,
-                &identified("caller-9"),
-                [3u8; 32],
-                ContentVerb::Read,
-            )
-            .await
-            .expect("the deployment signer mints");
-            assert!(url.starts_with("http://127.0.0.1:8099/files/"));
-            assert!(router.is_some(), "the file router rides the auth listener");
-            // One sweep tick at the cadence, so the reclaim arm runs.
-            tokio::time::sleep(Duration::from_millis(1_300)).await;
-        }
     }
 }

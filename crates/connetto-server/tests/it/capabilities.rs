@@ -199,7 +199,8 @@ async fn visible_in_snapshot(source: &PgSnapshotSource, caller: &Principal) -> V
     let mut replica = SqliteConnection::establish(":memory:").expect("open replica");
     diesel::RunQueryDsl::execute(sql_query(REPLICA_DDL), &mut replica).expect("replica ddl");
     let compressed = zstd::encode_all(page.patchset.as_slice(), 3).expect("compress");
-    Materializer::new(CATALOG_DDL)
+    Materializer::builder(CATALOG_DDL)
+        .build()
         .expect("applier")
         .apply_diffset(&compressed, &mut replica)
         .expect("apply snapshot");

@@ -6,6 +6,25 @@
 //! state machine. This crate owns sessions, authorization, per-session patchset
 //! assembly, the write path, the oplog and catchup, and all retry.
 //!
+//! * [`builder`] is the one assembly path. [`ServerBuilder`] names the
+//!   collaborators a deployment hands over, [`ServerBuilder::build`] returns
+//!   the parts (the merged router, the sync routes and the HTTP routes
+//!   separately, the change-stream future, and the shutdown handle) and
+//!   [`ServerBuilder::serve`] owns the serving lifecycle. The parts serve
+//!   through one listener, the sync route at [`SYNC_PATH`] beside the login
+//!   endpoints and the file routes.
+//! * The assembled server authorizes every row through OpenFGA. Row-level
+//!   security stays available as the optional second opinion that counts and
+//!   names divergences.
+//! * The production build takes the database auth store and the persisted JWT
+//!   keypair. The in-memory store and ephemeral key generation exist only
+//!   behind the `test-seams` feature.
+//! * The serving lifecycle closes every session when the shutdown signal or a
+//!   terminal change-stream outcome arrives, and the library never ends the
+//!   process, installs no signal handler and initializes no logging. The
+//!   binary is a translation from its environment into the builder, and its
+//!   contract is documented in `src/bin/connetto-server.rs`. A program that
+//!   embeds the server follows `examples/embed.rs`.
 //! * [`materializer`] holds the session-agnostic [`Materializer`] core that
 //!   wraps one `subql` engine.
 //! * the native [`Transport`](connetto_core::traits::Transport) implementations
@@ -24,12 +43,15 @@ pub mod audit;
 pub mod auth;
 pub mod authn;
 pub mod ban;
+pub mod builder;
 pub mod capability;
 pub mod counters;
+pub mod defaults;
 pub mod epoch;
 pub mod fence;
 pub mod guard;
 mod key_filter;
+mod manager_builder;
 pub mod materializer;
 pub mod openfga;
 pub mod oplog;
@@ -78,10 +100,19 @@ pub use authn::{
     VerifiedSession,
 };
 pub use authn::{ConnettoStoreSchema, DbAuthStore, StoreColumn};
+pub use builder::{
+    BuildError, ChangeStream, ContentBuildError, ContentSettings, ContentSigner,
+    ContentSignerError, PoolError, SHUTDOWN_GRACE, SYNC_PATH, ServeError, ServerBuilder,
+    ServerHandle, ServerParts,
+};
 pub use connetto_core::SessionId;
 pub use connetto_core::transport::{
     LoopbackError, LoopbackTransport, WebSocketError, WebSocketTransport, loopback,
 };
+#[cfg(feature = "test-seams")]
+pub use manager_builder::ManagerBuilder;
+#[cfg(feature = "test-seams")]
+pub use materializer::MaterializerBuilder;
 pub use materializer::{
     CallerMappings, ComputedCapture, ComputedChange, Dispatched, FoldSeeded, MatchedPatch,
     Materializer, MaterializerError, ReadConnector, Registration, RuntimeVersionColumn,

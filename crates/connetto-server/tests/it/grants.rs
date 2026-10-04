@@ -21,8 +21,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION, SessionId};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
-    SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use tracing::Instrument;
@@ -117,16 +117,18 @@ async fn arrive(
     let snapshot = CapturingSnapshot::default();
     let authority: Arc<dyn HandshakeAuthority> = Arc::new(TestGrantChecker);
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         snapshot.clone(),
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         authority,
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(
         manager

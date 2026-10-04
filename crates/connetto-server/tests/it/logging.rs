@@ -103,3 +103,20 @@ where
         .instrument(tracing::info_span!("test", test))
         .await
 }
+
+/// Whether any record the target has logged carries `message` with the
+/// `field` value containing `needle`, out of the whole shared buffer.
+///
+/// A span filter cannot reach the tasks the axum router spawns for its
+/// connections and the tasks the builder spawns for its watchers, so a
+/// record such a task logs is proven the way this one is: by a message no
+/// other test emits and a field value the task's own error supplies.
+pub(crate) fn record_logged(message: &str, field: &str, needle: &str) -> bool {
+    BUFFER.lines(0).iter().any(|line| {
+        line.get("message").and_then(|value| value.as_str()) == Some(message)
+            && line
+                .get(field)
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| value.contains(needle))
+    })
+}

@@ -134,12 +134,11 @@ pub async fn provision(
 
 impl Provisioned {
     /// The environment `connetto-server` runs this deployment with, serving
-    /// sync on `sync_bind` and auth plus content on `auth_bind`.
+    /// sync, login and file routes on `bind`.
     pub fn server_env(
         &self,
         deployment: &Deployment,
-        sync_bind: &str,
-        auth_bind: &str,
+        bind: &str,
         content_base: &str,
     ) -> Vec<(String, String)> {
         let admin = self.fixture.admin_url();
@@ -149,8 +148,7 @@ impl Provisioned {
                 "CONNETTO_READER_URL",
                 with_user(admin, "connetto_reader", "connetto_reader"),
             ),
-            ("CONNETTO_BIND", sync_bind.to_owned()),
-            ("CONNETTO_AUTH_BIND", auth_bind.to_owned()),
+            ("CONNETTO_BIND", bind.to_owned()),
             ("CONNETTO_AUTH", "database".to_owned()),
             ("CONNETTO_WRITABLE", deployment.writable.to_owned()),
             ("CONNETTO_CONTENT_URL", content_base.to_owned()),
@@ -259,9 +257,8 @@ impl Drop for TaskGuard {
     }
 }
 
-/// Spawn `connetto-server` with `envs`, its auth listener on `auth_bind`,
-/// and wait until both listeners accept. Dropping the returned child, or any
-/// error on the way, kills the server.
+/// Spawn `connetto-server` with `envs` and wait until its listener accepts.
+/// Dropping the returned child, or any error on the way, kills the server.
 ///
 /// # Errors
 ///
@@ -269,22 +266,17 @@ impl Drop for TaskGuard {
 pub async fn spawn_server(
     server_bin: &Path,
     envs: &[(String, String)],
-    sync_bind: &str,
-    auth_bind: &str,
+    bind: &str,
 ) -> Result<Child> {
     let mut child = Command::new(server_bin)
         .envs(envs.iter().cloned())
-        .env("CONNETTO_AUTH_BIND", auth_bind)
         // The server logs to stdout. Nulling it hid every server line from CI.
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .kill_on_drop(true)
         .spawn()
         .context("spawning connetto-server")?;
-    wait_for_child_port(&mut child, sync_bind, "connetto-server").await?;
-    if !wait_for_tcp(auth_bind, Duration::from_secs(20)).await {
-        return Err(anyhow!("connetto-server did not open {auth_bind}"));
-    }
+    wait_for_child_port(&mut child, bind, "connetto-server").await?;
     Ok(child)
 }
 
@@ -326,12 +318,8 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
     }
 }
 
-/// The variable that moves a stack's sync listener.
+/// The variable that moves a stack's sync, login and file listener.
 pub const SYNC_PORT_VAR: &str = "CONNETTO_STACK_SYNC_PORT";
-/// The variable that moves a stack's auth listener.
-pub const AUTH_PORT_VAR: &str = "CONNETTO_STACK_AUTH_PORT";
-/// The variable that moves a stack's content listener.
-pub const CONTENT_PORT_VAR: &str = "CONNETTO_STACK_CONTENT_PORT";
 /// The variable that puts a stack on the LAN. Its listeners bind every
 /// interface, and every address a client or its browser follows names this
 /// host.

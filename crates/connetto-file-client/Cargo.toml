@@ -87,7 +87,7 @@ web-sys = { version = "0.3", features = [
 [target.'cfg(not(all(target_family = "wasm", target_os = "unknown")))'.dev-dependencies]
 connetto-test-harness = { path = "../connetto-test-harness" }
 connetto-file-server = { path = "../connetto-file-server" }
-connetto-server = { path = "../connetto-server" }
+connetto-server = { path = "../connetto-server", features = ["test-seams"] }
 connetto-client = { path = "../connetto-client", default-features = false, features = ["native-transport", "native-auth"] }
 tokio = { workspace = true, features = ["test-util", "rt-multi-thread", "macros", "time"] }
 tempfile = "3"

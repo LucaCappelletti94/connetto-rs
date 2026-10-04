@@ -14,8 +14,8 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, Transport};
 use connetto_server::{
-    AbuseConfig, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, PageSpec,
-    RequestGuard, SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
+    AbuseConfig, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
+    PageSpec, RequestGuard, SessionError, SessionManager, SnapshotEstimate, SnapshotPage,
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, with_user};
@@ -384,21 +384,21 @@ pub(crate) fn build_manager_named_setting<S: ContentTicketSigner>(
     signer: S,
     user_setting: &str,
 ) -> Arc<TicketManager<S>> {
-    SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         NeverSnapshot,
         roster,
         Arc::new(TestGrantChecker),
         NoConnector,
-        InMemoryOplog::default(),
         pg_write_target::<ConnettoWatermark>(reader_pool, PG_DDL)
             .expect("build write target")
             .with_user_setting(user_setting),
-        guard,
-        SessionConfig::default(),
-        None,
-        signer,
     )
+    .with_guard(guard)
+    .with_signer(signer)
+    .build()
 }
 
 /// Build a session manager whose guard the caller chooses.

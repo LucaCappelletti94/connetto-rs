@@ -21,7 +21,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use connetto_core::auth::{Principal, Subject};
@@ -1475,91 +1475,63 @@ pub struct SessionManager<
     history: parking_lot::RwLock<Option<TimelineHistory>>,
     /// Where a reconnect of the change feed resumes, the last row or commit the ingest finished handling.
     resume: ResumePoint,
+    /// Run loops that have started and not yet ended, which the shutdown
+    /// grace counts because the registry drains at the moment of the close.
+    open_sessions: Arc<AtomicUsize>,
+    /// Set once the manager has been told to go away, so a handshake that
+    /// completes during the shutdown is told the shutdown rather than
+    /// registering into the drained registry.
+    shutting_down: AtomicBool,
 }
 
-impl<Snap, Auth, W> SessionManager<Snap, Auth, W, NoConnector, InMemoryOplog>
-where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    W: ConnettoWatermarkSchema<Id = String>,
-{
-    /// Build a manager with no re-execution connector and a default in-memory
-    /// oplog.
-    ///
-    /// The `authority` is required: nothing installs one by default, so a
-    /// deployment chooses its identity story explicitly. Aggregate
-    /// subscriptions need a connector; use
-    /// [`with_connector`](Self::with_connector) to supply one. Reconnect uses a
-    /// default [`InMemoryOplog`]; use [`with_oplog`](Self::with_oplog) for another.
-    #[must_use]
-    pub fn new(
-        materializer: Materializer,
-        snapshot_source: Snap,
-        auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
-        target: PgWriteTarget<W>,
-        guard: Arc<RequestGuard<String>>,
-        config: SessionConfig,
-    ) -> Arc<Self> {
-        Self::with_oplog(
-            materializer,
-            snapshot_source,
-            auth,
-            authority,
-            NoConnector,
-            InMemoryOplog::default(),
-            target,
-            guard,
-            config,
-            None,
-            NoSigner,
-        )
+/// Keeps the open-run-loop count right while one `serve` is in flight.
+///
+/// The increment happens before the handshake, so a handshake that is still
+/// in flight counts, and the drop decrements on every exit of the `serve` it
+/// guards, panic included.
+struct OpenSessionTally {
+    open: Arc<AtomicUsize>,
+}
+
+impl OpenSessionTally {
+    /// Count one more open run loop.
+    fn start(open: Arc<AtomicUsize>) -> Self {
+        open.fetch_add(1, Ordering::Relaxed);
+        Self { open }
     }
 }
 
-impl<Snap, Auth, C, W> SessionManager<Snap, Auth, W, C, InMemoryOplog>
-where
-    Snap: SnapshotSource,
-    Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
-    C: ReadConnector,
-    C::Error: FailedRead,
-    W: ConnettoWatermarkSchema<Id = String>,
-{
-    /// Build a manager with a re-execution connector and a default in-memory
-    /// oplog. Use [`with_oplog`](Self::with_oplog) to supply another oplog.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
-    )]
-    #[must_use]
-    pub fn with_connector(
-        materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
-        snapshot_source: Snap,
-        auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
-        connector: C,
-        target: PgWriteTarget<W>,
-        guard: Arc<RequestGuard<String>>,
-        config: SessionConfig,
-        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
-    ) -> Arc<Self> {
-        Self::with_oplog(
-            materializer,
-            snapshot_source,
-            auth,
-            authority,
-            connector,
-            InMemoryOplog::default(),
-            target,
-            guard,
-            config,
-            upkeep,
-            NoSigner,
-        )
+impl Drop for OpenSessionTally {
+    fn drop(&mut self) {
+        self.open.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-impl<Snap, Auth, C, O, W, S> SessionManager<Snap, Auth, W, C, O, String, String, S>
+/// The manager over the `String` ids and keys every construction shares.
+pub(crate) type ConnettoManager<Snap, Auth, W, C, O, S> =
+    SessionManager<Snap, Auth, W, C, O, String, String, S>;
+
+/// The single assembly every manager construction goes through, which
+/// `ManagerBuilder` owns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
+)]
+pub(crate) fn assemble_manager<Snap, Auth, C, O, W, S>(
+    materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
+    snapshot_source: Snap,
+    auth: Auth,
+    authority: Arc<dyn HandshakeAuthority>,
+    connector: C,
+    oplog: O,
+    target: PgWriteTarget<W>,
+    guard: Arc<RequestGuard<String>>,
+    config: SessionConfig,
+    upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
+    signer: S,
+    withdrawal_source: Option<Snap>,
+    second_opinion: Option<Arc<dyn crate::parity::SecondOpinion<String, String>>>,
+) -> Arc<ConnettoManager<Snap, Auth, W, C, O, S>>
 where
     Snap: SnapshotSource,
     Auth: VisibilityPolicy<Watcher = Arc<Principal>, Backend = Postgres>,
@@ -1569,51 +1541,33 @@ where
     W: ConnettoWatermarkSchema<Id = String>,
     S: ContentTicketSigner,
 {
-    /// Build a manager with an explicit re-execution connector and oplog.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "every collaborator the manager owns is named here and a config struct would move the same arity behind another type"
-    )]
-    #[must_use]
-    pub fn with_oplog(
-        materializer: Materializer<ParserDB, RuntimeWritableCatalog, C>,
-        snapshot_source: Snap,
-        auth: Auth,
-        authority: Arc<dyn HandshakeAuthority>,
-        connector: C,
-        oplog: O,
-        target: PgWriteTarget<W>,
-        guard: Arc<RequestGuard<String>>,
-        config: SessionConfig,
-        upkeep: Option<Arc<dyn crate::openfga::StoreUpkeep>>,
-        signer: S,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            catalog: Arc::new(materializer.catalog().clone()),
-            materializer: Arc::new(Mutex::new(materializer)),
-            routes: Mutex::new(HashMap::new()),
-            computed_routes: Mutex::new(HashMap::new()),
-            sessions: Mutex::new(HashMap::new()),
-            snapshot_source,
-            auth,
-            authority,
-            connector,
-            oplog,
-            target,
-            next_session: AtomicU64::new(1),
-            next_consumer: AtomicU64::new(1),
-            config,
-            guard,
-            auth_retry: RetryPolicy::new(),
-            read_retry: RetryPolicy::new(),
-            upkeep,
-            second_opinion: OnceLock::new(),
-            withdrawal_source: OnceLock::new(),
-            signer,
-            history: parking_lot::RwLock::new(None),
-            resume: ResumePoint::default(),
-        })
-    }
+    Arc::new(SessionManager {
+        catalog: Arc::new(materializer.catalog().clone()),
+        materializer: Arc::new(Mutex::new(materializer)),
+        routes: Mutex::new(HashMap::new()),
+        computed_routes: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashMap::new()),
+        snapshot_source,
+        auth,
+        authority,
+        connector,
+        oplog,
+        target,
+        next_session: AtomicU64::new(1),
+        next_consumer: AtomicU64::new(1),
+        config,
+        guard,
+        auth_retry: RetryPolicy::new(),
+        read_retry: RetryPolicy::new(),
+        upkeep,
+        second_opinion: second_opinion.map(OnceLock::from).unwrap_or_default(),
+        withdrawal_source: withdrawal_source.map(OnceLock::from).unwrap_or_default(),
+        signer,
+        history: parking_lot::RwLock::new(None),
+        resume: ResumePoint::default(),
+        open_sessions: Arc::new(AtomicUsize::new(0)),
+        shutting_down: AtomicBool::new(false),
+    })
 }
 
 impl<Snap, Auth, C, O, Id, Key, W, S> SessionManager<Snap, Auth, W, C, O, Id, Key, S>
@@ -1820,10 +1774,11 @@ where
     /// [`FatalErrorReason::ServerShuttingDown`], returning how many were told.
     ///
     /// A client that learns the server is going away backs off instead of
-    /// reconnecting immediately into a dying process. The registry is drained,
-    /// so a handshake racing the shutdown registers into an empty map and is
-    /// closed by the listener stopping rather than by a second frame.
+    /// reconnecting immediately into a dying process. The flag is set before
+    /// the drain, so a handshake racing the shutdown is told the shutdown at
+    /// its registration instead of registering into the drained registry.
     pub async fn shutdown(&self) -> usize {
+        self.shutting_down.store(true, Ordering::Release);
         self.close_all(FatalErrorReason::ServerShuttingDown).await
     }
 
@@ -1835,6 +1790,15 @@ where
     /// waits for this to reach the number it expects.
     pub async fn live_connections(&self) -> usize {
         self.sessions.lock().await.len()
+    }
+
+    /// How many run loops have started and not yet ended.
+    ///
+    /// The registry drains at the moment a close is issued, so the shutdown
+    /// grace counts these instead, and a handshake still in flight counts
+    /// before it registers.
+    pub fn open_sessions(&self) -> usize {
+        self.open_sessions.load(Ordering::Relaxed)
     }
 
     /// Store the timeline history read before the feed opens, closing every live connection when it changed.
@@ -2041,15 +2005,22 @@ where
     /// cursors and the pending buffer, and two readers would each consume the
     /// other's changes. Last-wins also makes a reconnect racing its own
     /// half-dead socket self-heal.
+    ///
+    /// Refused while the manager is shutting down, reporting whether the
+    /// claim registered, so a handshake completing over the drain is told the
+    /// shutdown instead of stranding an entry the drain already emptied.
     async fn register_connection(
         &self,
         session_id: SessionId,
         connection_num: u64,
         user: Option<String>,
         tx: &mpsc::UnboundedSender<Outbound>,
-    ) {
+    ) -> bool {
         let superseded = {
             let mut sessions = self.sessions.lock().await;
+            if self.shutting_down.load(Ordering::Acquire) {
+                return false;
+            }
             sessions.insert(
                 session_id,
                 LiveSession {
@@ -2069,6 +2040,7 @@ where
                 FatalErrorReason::ConnectionSuperseded,
             )));
         }
+        true
     }
 
     /// Drop the registry entry only if this connection still owns it: a
@@ -2991,7 +2963,7 @@ where
     /// both the server's current cursor and that watermark.
     ///
     /// Returns the session identity, or `None` when the peer closed before
-    /// sending a handshake.
+    /// sending a handshake, or the manager is shutting down.
     #[expect(
         clippy::too_many_lines,
         reason = "registration must sit between the grant checks and the ack, so splitting it would let a revocation cross the gap again"
@@ -3111,15 +3083,26 @@ where
         // fire as soon as the ack arrives. Without the entry already in the map
         // those calls see None and the fatal frame is never delivered.
         let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Outbound>();
-        self.register_connection(
-            session_id,
-            connection_num,
-            principal
-                .identity()
-                .map(|identity| identity.user_id.to_string()),
-            &outbound_tx,
-        )
-        .await;
+        if !self
+            .register_connection(
+                session_id,
+                connection_num,
+                principal
+                    .identity()
+                    .map(|identity| identity.user_id.to_string()),
+                &outbound_tx,
+            )
+            .await
+        {
+            // The shutdown began while this handshake ran, so the session is
+            // told to go away rather than registered into the drained registry.
+            let _ = transport
+                .send_control(ControlMessage::FatalError(FatalError::new(
+                    FatalErrorReason::ServerShuttingDown,
+                )))
+                .await;
+            return Ok(None);
+        }
         // Judged only once registered, so a history read that lands meanwhile
         // either shows here or closes this connection (R73).
         let resume = self.resume_from(handshake.last_cursor.as_ref());
@@ -3540,6 +3523,7 @@ where
         self: Arc<Self>,
         mut transport: T,
     ) -> Result<(), SessionError> {
+        let _tally = OpenSessionTally::start(self.open_sessions.clone());
         let Some(outcome) = self.run_handshake(&mut transport).await? else {
             return Ok(());
         };

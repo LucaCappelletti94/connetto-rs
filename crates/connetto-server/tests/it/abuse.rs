@@ -40,10 +40,10 @@ use connetto_server::audit::{AUTH_OP_TYPE, AuthOp, pg_audit_hook};
 use connetto_server::ban::Instant;
 use connetto_server::{
     AbuseConfig, AbuseLimits, ConnectionLimits, Crossing, Enforcement, EnforcementFuture,
-    EnforcementPolicy, LoopbackTransport, Materializer, NewBan, PageSpec, PersonLimits,
-    RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    ThrottleConfig, TierLimits, connetto_audit_table, connetto_ban_table, loopback, pg_ban_store,
-    pg_write_target,
+    EnforcementPolicy, LoopbackTransport, ManagerBuilder, Materializer, NewBan, NoConnector,
+    PageSpec, PersonLimits, RequestGuard, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, ThrottleConfig, TierLimits, connetto_audit_table, connetto_ban_table, loopback,
+    pg_ban_store, pg_write_target,
 };
 use connetto_test_harness::{
     ConnettoWatermark, Fixture, RosterAuth, RowValue, WITHHELD_ID, insert_changeset,
@@ -304,16 +304,19 @@ where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
     A::Error: core::fmt::Display,
 {
-    let manager = SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         KeyedSnapshot,
         auth,
         Arc::new(TestGrantChecker),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::clone(guard),
-        SessionConfig::default(),
-    );
+    )
+    .with_guard(Arc::clone(guard))
+    .build();
     let closing = Arc::clone(&manager);
     guard.set_close_hook(Arc::new(move |user| {
         let manager = Arc::clone(&closing);

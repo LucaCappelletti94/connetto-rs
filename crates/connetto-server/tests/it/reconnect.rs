@@ -30,10 +30,10 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    ChangeRecord, InMemoryOplog, LoopbackTransport, Materializer, NoConnector, NoSigner, Oplog,
-    OplogConfig, PageSpec, PgOplog, Position, ReadFence, RequestGuard, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen,
-    loopback, pg_write_target,
+    ChangeRecord, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
+    Oplog, OplogConfig, PageSpec, PgOplog, Position, ReadFence, SessionConfig, SessionManager,
+    SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -275,17 +275,19 @@ async fn subscribe<T: Transport>(client: &mut T) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn catchup_within_window_streams_missed_ops() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     // Drive a stream: two inserts (the synced prefix), then update, insert,
     // delete (the events the client will miss and catch up on).
@@ -337,7 +339,9 @@ async fn catchup_within_window_streams_missed_ops() {
     assert_eq!(events.len(), 5, "one CDC event per statement");
 
     // Build the client's replica as of the second event (the synced prefix).
-    let applier = Materializer::new(PG_DDL).expect("build applier");
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build applier");
     let mut replica = client_replica();
     for event in &events[..2] {
         let patch = applier.encode_patch(event).expect("encode prefix patch");
@@ -388,27 +392,26 @@ async fn catchup_within_window_streams_missed_ops() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cursor_outside_window_forces_full_resync() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     // A tiny window: after four inserts the oldest two are pruned.
     let oplog = InMemoryOplog::new(
         OplogConfig::new()
             .with_max_entries(2)
             .with_max_age(Duration::from_hours(72)),
     );
-    let manager = SessionManager::with_oplog(
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        oplog,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
-    );
+    )
+    .with_oplog(oplog)
+    .build();
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
 
@@ -464,17 +467,19 @@ async fn cursor_outside_window_forces_full_resync() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn tombstone_replays_the_delete() {
     let fixture = Fixture::acquire().await;
-    let materializer = Materializer::new(PG_DDL).expect("build materializer");
-    let manager = SessionManager::new(
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
         materializer,
         SeedSnapshot,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
 
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
 
@@ -500,7 +505,9 @@ async fn tombstone_replays_the_delete() {
     assert_eq!(events.len(), 2);
 
     // The client synced through the insert and holds the row locally.
-    let applier = Materializer::new(PG_DDL).expect("build applier");
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build applier");
     let mut replica = client_replica();
     let insert_patch = applier.encode_patch(&events[0]).expect("encode insert");
     applier
@@ -711,23 +718,23 @@ async fn scripted(
     PgSqliteEmuSource,
 ) {
     let script = Arc::new(std::sync::Mutex::new(Script::default()));
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         SeedSnapshot,
         RosterAuth::granting("client-a"),
         test_verifier(),
         NoConnector,
-        ScriptedOplog {
-            inner: InMemoryOplog::new(OplogConfig::default()),
-            script: Arc::clone(&script),
-        },
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        config,
-        None,
-        NoSigner,
-    );
+    )
+    .with_oplog(ScriptedOplog {
+        inner: InMemoryOplog::new(OplogConfig::default()),
+        script: Arc::clone(&script),
+    })
+    .with_session(config)
+    .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let mut events = Vec::new();
     for id in 1..=3 {
@@ -922,24 +929,23 @@ type RestartManager =
 
 /// A manager over the existing restart log table, as a restarted process builds it.
 fn restarted_manager(fixture: &Fixture) -> Arc<RestartManager> {
-    SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         SeedSnapshot,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        PgOplog::new(
-            fixture.admin().clone(),
-            RESTART_OPLOG,
-            OplogConfig::default(),
-        ),
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
     )
+    .with_oplog(PgOplog::new(
+        fixture.admin().clone(),
+        RESTART_OPLOG,
+        OplogConfig::default(),
+    ))
+    .build()
 }
 
 /// Open a session on a restart manager resuming at `resume`, returning the client half once the ack arrived.
@@ -1092,16 +1098,18 @@ impl SnapshotSource for FencedSeed {
 type FencedManager = SessionManager<FencedSeed, RosterAuth, ConnettoWatermark>;
 
 fn fenced_manager(fixture: &Fixture, seed: FencedSeed) -> Arc<FencedManager> {
-    SessionManager::new(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         seed,
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
     )
+    .build()
 }
 
 /// Open a session on a fenced manager, presenting `resume` when given.
@@ -1188,7 +1196,9 @@ async fn a_snapshot_replays_a_transaction_it_missed_that_was_dispatched_before_i
         panic!("expected snapshot begin");
     };
     let mut replica = client_replica();
-    let applier = Materializer::new(PG_DDL).expect("build applier");
+    let applier = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build applier");
     let BulkMessage::SnapshotPatch(page) = next_bulk(&mut client).await else {
         panic!("expected the seed page");
     };

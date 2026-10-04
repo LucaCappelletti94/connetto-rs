@@ -28,9 +28,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    CatchupDecision, ChangeRecord, InMemoryOplog, Materializer, NoSigner, Oplog, OplogConfig,
-    PageSpec, PgOplog, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
-    SnapshotSource, catchup_decision, loopback, pg_write_target, slot,
+    CatchupDecision, ChangeRecord, InMemoryOplog, ManagerBuilder, Materializer, Oplog, OplogConfig,
+    PageSpec, PgOplog, SnapshotEstimate, SnapshotPage, SnapshotSource, catchup_decision, loopback,
+    pg_write_target, slot,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem};
@@ -47,7 +47,9 @@ const PG_DDL: &str =
 /// materializer, so their positions are the shape the log actually stores
 /// rather than numbers a test invented.
 fn records() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
-    let mat = Materializer::new(PG_DDL).expect("build materializer");
+    let mat = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let mut out = Vec::new();
     let mut commits = Vec::new();
@@ -287,20 +289,19 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
         "a commit record ends past where it starts, which is why the start cannot stand in for it",
     );
 
-    let manager = SessionManager::with_oplog(
-        Materializer::new(PG_DDL).expect("build materializer"),
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
         NoSnapshot,
         // This suite opens no subscription, so the policy is never consulted.
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         connetto_server::NoConnector,
-        PgOplog::new(admin.clone(), OPLOG, OplogConfig::default()),
         pg_write_target::<ConnettoWatermark>(admin.clone(), PG_DDL).expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-        None,
-        NoSigner,
-    );
+    )
+    .with_oplog(PgOplog::new(admin.clone(), OPLOG, OplogConfig::default()))
+    .build();
 
     let (server_end, mut client) = loopback();
     let serve = manager.clone();

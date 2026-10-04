@@ -2,7 +2,7 @@
 //!
 //! Configuration comes from the environment:
 //!
-//! - `CONNETTO_SERVER`: server WebSocket URL (default `ws://127.0.0.1:8080/`),
+//! - `CONNETTO_SERVER`: server WebSocket URL (default `ws://127.0.0.1:8080/sync`),
 //!   `wss://` anywhere and plain `ws://` only to a loopback host.
 //! - `CONNETTO_SCHEMA_SQL` or `CONNETTO_SCHEMA_SQL_FILE`: the Postgres schema
 //!   the server serves (required). The client translates it, with
@@ -197,7 +197,7 @@ fn terminate_signal() -> Result<impl Future<Output = ()>> {
 }
 
 async fn run() -> Result<()> {
-    let server = var_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/");
+    let server = var_or("CONNETTO_SERVER", "ws://127.0.0.1:8080/sync");
     let sub_id = var_or("CONNETTO_SUB_ID", "default");
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
     let schema_sql = read_ddl("CONNETTO_SCHEMA_SQL").context("set CONNETTO_SCHEMA_SQL")?;

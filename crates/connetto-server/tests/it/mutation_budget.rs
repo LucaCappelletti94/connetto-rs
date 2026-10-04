@@ -12,8 +12,8 @@ use connetto_core::messages::{ControlMessage, MutationRejectReason};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::Transport;
 use connetto_server::{
-    AbuseConfig, Materializer, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    ThrottleConfig, loopback, pg_write_target,
+    AbuseConfig, ManagerBuilder, Materializer, NoConnector, RequestGuard, RuntimeWritableCatalog,
+    SessionManager, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
 
@@ -46,30 +46,32 @@ fn manager(
     writer_pool: diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
     limit: u64,
 ) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoWatermark, connetto_server::NoConnector>> {
-    let materializer = Materializer::with_write_catalog(
-        PG_DDL,
-        RuntimeWritableCatalog::builder()
-            .versioned("notes", "edited_at")
-            .build(),
-    )
-    .expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(
+            RuntimeWritableCatalog::builder()
+                .versioned("notes", "edited_at")
+                .build(),
+        )
+        .build()
+        .expect("build materializer");
     let target =
         pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
     let guard = RequestGuard::new(
         ThrottleConfig::new().with_mutation_bytes_per_identity(limit, WINDOW),
         AbuseConfig::default(),
     );
-    SessionManager::new(
+    ManagerBuilder::new(
         materializer,
         NoSnapshot,
         RosterAuth::granting("alice")
             .and("bob")
             .withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
+        NoConnector,
         target,
-        Arc::new(guard),
-        SessionConfig::default(),
     )
+    .with_guard(Arc::new(guard))
+    .build()
 }
 
 async fn expect_applied<T: Transport>(client: &mut T, client_seq: u64, what: &str) {

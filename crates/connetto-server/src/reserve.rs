@@ -85,6 +85,18 @@ impl ReaderReserve {
         self
     }
 
+    /// The configured total the split is expressed against.
+    #[must_use]
+    pub const fn total(&self) -> u32 {
+        self.total
+    }
+
+    /// The share only identified callers may reach.
+    #[must_use]
+    pub const fn reserved(&self) -> u32 {
+        self.reserved
+    }
+
     /// Build the gate enforcing this split.
     ///
     /// # Panics

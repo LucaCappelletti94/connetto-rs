@@ -18,9 +18,9 @@ use connetto_client::{
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
-    AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits,
-    WebSocketTransport, pg_write_target,
+    AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
+    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, WebSocketTransport,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, committed_at};
 use diesel::prelude::*;
@@ -48,25 +48,21 @@ fn manager(fixture: &Fixture) -> Arc<Manager> {
         AbuseConfig::default(),
     ));
     let pool = fixture.admin().clone();
-    SessionManager::with_connector(
-        Materializer::with_read_connector(
-            PG_DDL,
-            RuntimeWritableCatalog::default(),
-            None,
-            None,
-            PgReadConnector::with_session_setup(pool.clone()),
-        )
-        .expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_write_catalog(RuntimeWritableCatalog::default())
+            .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+            .build()
+            .expect("build materializer"),
         PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("snapshot source"),
         // A grouped count is global, so the row policy never sees it.
         RosterAuth::granting("token"),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(pool.clone()),
         pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
-        guard,
-        SessionConfig::default(),
-        None,
     )
+    .with_guard(guard)
+    .build()
 }
 
 /// Serve one session on a fresh localhost listener.

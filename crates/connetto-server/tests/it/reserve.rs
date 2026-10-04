@@ -29,9 +29,9 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, IncomingFrame, Transport};
 use connetto_server::{
-    AbuseConfig, LoopbackTransport, Materializer, PgSnapshotSource, ReaderReserve, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
-    pg_write_target,
+    AbuseConfig, LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PgSnapshotSource,
+    ReaderReserve, RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig,
+    TierLimits, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID, with_user};
 use diesel::prelude::*;
@@ -168,14 +168,15 @@ fn manager_with(
             .with_reserved(RESERVED)
             .gate(),
     );
-    SessionManager::new(
-        Materializer::with_write_catalog(
-            PG_DDL,
-            RuntimeWritableCatalog::builder()
-                .writable("fast_rows")
-                .build(),
-        )
-        .expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_write_catalog(
+                RuntimeWritableCatalog::builder()
+                    .writable("fast_rows")
+                    .build(),
+            )
+            .build()
+            .expect("build materializer"),
         PgSnapshotSource::from_ddl(reader.clone(), PG_DDL).expect("build snapshot source"),
         // The unnamed caller is admitted because this fixture's whole subject is
         // what the reader reserve does to an anonymous mutation: if the policy
@@ -185,10 +186,11 @@ fn manager_with(
             .and_the_unnamed_caller()
             .withholding(WITHHELD_ID),
         authority,
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(reader.clone(), PG_DDL).expect("build write target"),
-        Arc::new(guard),
-        SessionConfig::default(),
     )
+    .with_guard(Arc::new(guard))
+    .build()
 }
 
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {

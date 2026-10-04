@@ -30,9 +30,9 @@
 //! ```
 //!
 //! The demo reads `CONNETTO_DEMO_WS`, the sync WebSocket URL (default
-//! `ws://127.0.0.1:7777/`, and `wss://` for any host but loopback),
+//! `ws://127.0.0.1:7777/sync`, and `wss://` for any host but loopback),
 //! `CONNETTO_DEMO_AUTH_ORIGIN`, the auth server (default
-//! `http://127.0.0.1:18081`), and `CONNETTO_DEMO_PG`, the conninfo the backend
+//! `http://127.0.0.1:7777`), and `CONNETTO_DEMO_PG`, the conninfo the backend
 //! writer buttons use (default `postgres://postgres:postgres@127.0.0.1:55456/postgres`).
 //! A phone runs with no environment of its own, so a build for one can bake
 //! each in as `CONNETTO_DEMO_BUILD_WS`, `CONNETTO_DEMO_BUILD_AUTH_ORIGIN` and
@@ -72,8 +72,8 @@ use tokio::sync::mpsc;
 
 include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 
-const DEFAULT_WS: &str = "ws://127.0.0.1:7777/";
-const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:18081";
+const DEFAULT_WS: &str = "ws://127.0.0.1:7777/sync";
+const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:7777";
 const DEFAULT_PG: &str = "postgres://postgres:postgres@127.0.0.1:55456/postgres";
 const AUTH_PROVIDER: &str = "dev-idp";
 const KEYRING_SERVICE: &str = "connetto-dioxus-demo";
@@ -386,7 +386,7 @@ fn Shell() -> Element {
                     style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
                     h2 { "connetto demo cannot start" }
                     p { style: "color: #a33;", {detail} }
-                    p { "Check that the dev stack is up with CONNETTO_AUTH, CONNETTO_AUTH_BIND, CONNETTO_OIDC_PROVIDERS and the per-provider vars set, and on a phone that adb reverse forwards its ports." }
+                    p { "Check that the dev stack is up with CONNETTO_BIND, CONNETTO_AUTH, the JWT key files, CONNETTO_OIDC_PROVIDERS and the per-provider vars set, and on a phone that adb reverse forwards its ports." }
                     button { onclick: move |_| restart.request(), "Try again" }
                 }
             }

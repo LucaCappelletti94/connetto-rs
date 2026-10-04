@@ -22,7 +22,7 @@ use connetto_client::{
 use connetto_core::schema::SchemaBundle;
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
-    Materializer, PageSpec, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionManager,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
 use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
@@ -170,20 +170,22 @@ async fn spawn_server(
     tokio::task::JoinHandle<()>,
 ) {
     let writable = RuntimeWritableCatalog::builder().writable("orders").build();
-    let materializer =
-        Materializer::with_write_catalog(PG_DDL, writable).expect("build materializer");
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
     let recorder = RecordingSnapshot::default();
     let seen = Arc::clone(&recorder.seen);
-    let manager = SessionManager::new(
+    let manager = ManagerBuilder::new(
         materializer,
         recorder,
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
+        NoConnector,
         pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
-        Arc::new(RequestGuard::default()),
-        SessionConfig::default(),
-    );
+    )
+    .build();
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("addr");
     let serve_manager = manager.clone();

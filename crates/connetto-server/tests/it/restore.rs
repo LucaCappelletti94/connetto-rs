@@ -10,7 +10,6 @@
 //! refresh token from before the restore still works (R70 decisions 4, 5 and 10).
 
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use diesel::sqlite::SqliteConnection;
@@ -18,7 +17,6 @@ use diesel::{Connection, ExpressionMethods, QueryDsl};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use tempfile::TempDir;
 
 use connetto_client::{ReplicaKey, cipher};
 use connetto_test_harness::{Fixture, PUBLICATION, SLOT};
@@ -167,27 +165,6 @@ async fn pool_for(url: &str) -> Pool<AsyncPgConnection> {
         .expect("build pool")
 }
 
-/// A token signing key pair on disk, so an access token outlives the server
-/// restart the way it does in a deployment that supplies its keys.
-fn signing_keys(dir: &TempDir) -> (String, String) {
-    let private = dir.path().join("jwt.pem");
-    let public = dir.path().join("jwt.pub.pem");
-    let run = |args: &[&str]| {
-        let status = Command::new("openssl")
-            .args(args)
-            .status()
-            .expect("run openssl");
-        assert!(status.success(), "openssl {args:?} failed");
-    };
-    let (private, public) = (
-        private.to_string_lossy().into_owned(),
-        public.to_string_lossy().into_owned(),
-    );
-    run(&["genpkey", "-algorithm", "ed25519", "-out", &private]);
-    run(&["pkey", "-in", &private, "-pubout", "-out", &public]);
-    (private, public)
-}
-
 /// Present a refresh token, returning the status and the rotated token.
 async fn refresh(auth_base: &str, token: &str) -> (u16, Option<String>) {
     let response = reqwest::Client::new()
@@ -325,21 +302,12 @@ async fn demonstrate(method: Method) -> Observation {
     let primary_url = fixture.admin_url().to_owned();
     let primary = seeded_primary(&fixture, &primary_url).await;
 
-    let keys = tempfile::tempdir().expect("tempdir");
-    let (private, public) = signing_keys(&keys);
     let auth_stack = build_auth_stack().await;
-    let extra = [
-        ("CONNETTO_JWT_PRIVATE_KEY_FILE", private.as_str()),
-        ("CONNETTO_JWT_PUBLIC_KEY_FILE", public.as_str()),
-        ("CONNETTO_AUTH", "database"),
-    ];
     let authorization = Authorization::provision(&fixture, NO_POLICIES).await;
     let secs = Duration::from_secs(30);
 
     let reader = with_user_url(&primary_url, "app_reader", "app_reader");
     let spawn_on = |database_url: &str, reader: &str, ports: Ports, auth_pairs: &[(&str, &str)]| {
-        let mut envs = auth_pairs.to_vec();
-        envs.extend(extra);
         spawn_server_cfg(
             database_url,
             &ports.bind(),
@@ -347,7 +315,7 @@ async fn demonstrate(method: Method) -> Observation {
             "orders",
             Some(reader),
             &authorization,
-            &envs,
+            auth_pairs,
         )
     };
     let (server, ports) = start_server(&auth_stack, secs, |ports, auth_pairs| {
@@ -524,6 +492,7 @@ async fn authorization_facts_across_a_restore() {
     fixture
         .start_replication(&["docs", "project_members"])
         .await;
+    fixture.provision_auth_tables().await;
     let authorization = Authorization::provision(&fixture, MEMBERSHIP_POLICIES).await;
     let reader = with_user_url(&url, "app_reader", "app_reader");
     let secs = Duration::from_secs(30);

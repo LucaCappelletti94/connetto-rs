@@ -19,9 +19,8 @@ use std::time::Duration;
 use connetto_core::messages::{AggregateUpdate, ControlMessage, SUBSCRIPTION_REFUSED};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
-    AbuseConfig, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
-    pg_write_target,
+    AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
+    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, pool_for, with_user};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
@@ -72,24 +71,20 @@ async fn manager_under(fixture: &Fixture, policy: &str) -> Arc<Manager> {
         AbuseConfig::default(),
     ));
     let admin = fixture.admin().clone();
-    SessionManager::with_connector(
-        Materializer::with_read_connector(
-            PG_DDL,
-            RuntimeWritableCatalog::default(),
-            None,
-            None,
-            PgReadConnector::with_session_setup(reader.clone()),
-        )
-        .expect("build materializer"),
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_write_catalog(RuntimeWritableCatalog::default())
+            .with_read_connector(PgReadConnector::with_session_setup(reader.clone()))
+            .build()
+            .expect("build materializer"),
         PgSnapshotSource::from_ddl(admin.clone(), PG_DDL).expect("snapshot source"),
         RosterAuth::granting_nobody(),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(reader),
         pg_write_target::<ConnettoWatermark>(admin, PG_DDL).expect("build write target"),
-        guard,
-        SessionConfig::default(),
-        None,
     )
+    .with_guard(guard)
+    .build()
 }
 
 /// One in-process client on its own session.

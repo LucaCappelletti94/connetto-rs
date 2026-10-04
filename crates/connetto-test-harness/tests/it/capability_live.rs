@@ -52,7 +52,8 @@ fn ids_in(patchset_zstd: &[u8]) -> Vec<i32> {
     let mut replica = SqliteConnection::establish(":memory:").expect("open replica");
     diesel::RunQueryDsl::execute(diesel::sql_query(REPLICA_DDL), &mut replica)
         .expect("replica ddl");
-    Materializer::new(PG_DDL)
+    Materializer::builder(PG_DDL)
+        .build()
         .expect("applier")
         .apply_diffset(patchset_zstd, &mut replica)
         .expect("apply patchset");
