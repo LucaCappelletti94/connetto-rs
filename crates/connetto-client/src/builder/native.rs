@@ -806,7 +806,8 @@ where
     ///
     /// [`ForgetError::NoReplica`] for a build that kept nothing on the
     /// device, [`ForgetError::Client`] when the unsynced writes cannot be
-    /// read, [`ForgetError::Purge`] when the guard refuses or the wipe fails,
+    /// read or, once the wipe stands, the device key cannot be deleted,
+    /// [`ForgetError::Purge`] when the guard refuses or the wipe fails,
     /// and [`ForgetError::NotRevoked`] when the wipe succeeded but the server
     /// was not reached.
     pub async fn forget_device(&self, force: bool) -> Result<(), ForgetError> {
