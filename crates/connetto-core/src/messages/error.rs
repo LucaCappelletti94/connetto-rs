@@ -85,6 +85,9 @@ pub enum FatalErrorReason {
     },
     /// Session was administratively revoked mid-connection.
     SessionRevoked,
+    /// This device's key was reported lost, so its connections close and
+    /// its sessions are revoked (R74).
+    DeviceRevoked,
     /// A newer connection presented this session's durable handle, so this
     /// older connection is closed. One live connection per session handle,
     /// because the handle keys the per-subscription cursors and the pending

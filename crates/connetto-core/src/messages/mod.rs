@@ -22,7 +22,9 @@ pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
 pub use content::{ContentTicketGrant, ContentTicketRequest, ContentVerb};
 pub use control::{ControlMessage, GateState, PauseCause, SyncStatus, TabIdentity};
 pub use enrolment::{
-    EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest,
+    DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge,
+    EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, RevocationUpdate,
+    RevokeDeviceRequest, SignedList,
 };
 pub use error::{
     CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, FatalError, FatalErrorReason,

@@ -427,3 +427,135 @@ fn a_device_key_that_cannot_sign_builds_no_request() {
     }
     assert!(CertificateRequest::build(&CertificateSigner::new(&Refusing), &[4; 32]).is_err());
 }
+
+/// A certificate for a fresh device key, its serial and its DER.
+fn issued(issuer: &DeviceIssuer, start: SystemTime, serial: u8) -> Vec<u8> {
+    let (_, csr) = device_request(&[serial; 32]);
+    let request = CertificateRequest::parse(&csr).expect("parse");
+    issuer
+        .issue(&request, "alice", start, DAY, [serial; 16])
+        .expect("issue")
+}
+
+#[test]
+fn a_signed_list_verifies_against_its_root_and_names_its_serials() {
+    let start = at(1_800_000_000);
+    let (root, issuer) = authorities(start);
+    let leaf = issued(&issuer, start, 0x81);
+    let revoked = [Revoked {
+        serial: vec![0x81; 16],
+        at: start + DAY / 2,
+    }];
+    let der = issuer
+        .sign_list(7, &revoked, start + DAY / 2, start + 30 * DAY)
+        .expect("sign");
+    let roots = [root.certificate().to_vec()];
+    let list = RevocationList::verify(&der, issuer.certificate(), &roots).expect("verifies");
+    assert_eq!(list.number(), 7);
+    assert_eq!(list.issuer(), issuer.key_id());
+    assert!(
+        list.revokes(&[0x81; 16]),
+        "a high-bit serial matches despite its DER padding"
+    );
+    assert!(!list.revokes(&[0x01; 16]));
+    assert_eq!(list.der(), der.as_slice());
+    verify_chain_to(&leaf, &issuer, &roots);
+}
+
+fn verify_chain_to(leaf: &[u8], issuer: &DeviceIssuer, roots: &[Vec<u8>]) {
+    super::verify_chain(leaf, issuer.certificate(), roots).expect("the leaf chains to the root");
+}
+
+#[test]
+fn a_list_or_chain_from_outside_the_roots_is_refused() {
+    let start = at(1_800_000_000);
+    let (root, issuer) = authorities(start);
+    let (other_root, other_issuer) = authorities(start);
+    let der = other_issuer
+        .sign_list(1, &[], start, start + DAY)
+        .expect("sign");
+    let roots = [root.certificate().to_vec()];
+    assert_eq!(
+        RevocationList::verify(&der, other_issuer.certificate(), &roots),
+        Err(ListError::Untrusted)
+    );
+    assert_eq!(
+        RevocationList::verify(&der, issuer.certificate(), &roots),
+        Err(ListError::BadSignature),
+        "a trusted issuer that did not sign it"
+    );
+    let leaf = issued(&other_issuer, start, 3);
+    assert_eq!(
+        super::verify_chain(&leaf, issuer.certificate(), &roots),
+        Err(ListError::BadSignature)
+    );
+    assert_eq!(
+        super::verify_chain(&leaf, other_issuer.certificate(), &roots),
+        Err(ListError::Untrusted)
+    );
+    assert!(
+        super::verify_chain(
+            &leaf,
+            other_issuer.certificate(),
+            &[other_root.certificate().to_vec()]
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn webpki_refuses_a_certificate_the_list_revokes() {
+    let start = at(1_800_000_000);
+    let (root, issuer) = authorities(start);
+    let revoked_leaf = issued(&issuer, start, 0x11);
+    let kept_leaf = issued(&issuer, start, 0x22);
+    let der = issuer
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: vec![0x11; 16],
+                at: start + DAY / 4,
+            }],
+            start + DAY / 4,
+            start + 30 * DAY,
+        )
+        .expect("sign");
+    let crl = webpki::CertRevocationList::from(
+        webpki::BorrowedCertRevocationList::from_der(&der).expect("webpki parses the list"),
+    );
+    let crls = [&crl];
+    let check = |leaf: &[u8]| {
+        let root_der = rustls_pki_types::CertificateDer::from(root.certificate().to_vec());
+        let anchor = anchor_from_trusted_cert(&root_der).expect("anchor");
+        let leaf_der = rustls_pki_types::CertificateDer::from(leaf.to_vec());
+        let end_entity = EndEntityCert::try_from(&leaf_der).expect("leaf");
+        let intermediates = [rustls_pki_types::CertificateDer::from(
+            issuer.certificate().to_vec(),
+        )];
+        let options = webpki::RevocationOptionsBuilder::new(&crls)
+            .expect("options")
+            .with_status_policy(webpki::UnknownStatusPolicy::Allow)
+            .build();
+        end_entity
+            .verify_for_usage(
+                webpki::ALL_VERIFICATION_ALGS,
+                &[anchor],
+                &intermediates,
+                rustls_pki_types::UnixTime::since_unix_epoch(
+                    at(1_800_000_000)
+                        .duration_since(UNIX_EPOCH)
+                        .expect("after the epoch")
+                        + DAY / 2,
+                ),
+                KeyUsage::client_auth(),
+                Some(options),
+                None,
+            )
+            .map(drop)
+    };
+    assert!(matches!(
+        check(&revoked_leaf),
+        Err(webpki::Error::CertRevoked)
+    ));
+    assert!(check(&kept_leaf).is_ok());
+}

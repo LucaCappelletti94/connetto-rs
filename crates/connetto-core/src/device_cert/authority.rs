@@ -141,6 +141,7 @@ pub fn deployment_of_root(root: &[u8]) -> Result<DeploymentId, RootError> {
 pub struct DeviceIssuer {
     certificate: Vec<u8>,
     key: KeyPair,
+    key_id: KeyId,
     deployment: DeploymentId,
     not_after: SystemTime,
 }
@@ -219,9 +220,11 @@ impl DeviceIssuer {
                 u64::try_from(cert.validity().not_after.timestamp())
                     .map_err(|_| IssuerError::Malformed)?,
             );
+        let key_id = KeyId::of_public_key(cert.public_key().raw);
         Ok(Self {
             certificate,
             key,
+            key_id,
             deployment,
             not_after,
         })
@@ -241,6 +244,17 @@ impl DeviceIssuer {
     #[must_use]
     pub fn certificate(&self) -> &[u8] {
         &self.certificate
+    }
+
+    /// The key identifier its lists are kept under, the SHA-256 of its key.
+    #[must_use]
+    pub const fn key_id(&self) -> KeyId {
+        self.key_id
+    }
+
+    /// The issuer's signing key.
+    pub(super) const fn key(&self) -> &KeyPair {
+        &self.key
     }
 
     /// The deployment the issuer's root names.
@@ -299,7 +313,7 @@ impl DeviceIssuer {
 }
 
 /// `at` truncated to whole seconds, the precision X.509 times carry.
-fn to_time(at: SystemTime) -> Option<OffsetDateTime> {
+pub(super) fn to_time(at: SystemTime) -> Option<OffsetDateTime> {
     let secs = at.duration_since(UNIX_EPOCH).ok()?.as_secs();
     OffsetDateTime::from_unix_timestamp(i64::try_from(secs).ok()?).ok()
 }

@@ -44,8 +44,76 @@ pub struct EnrolGrant {
     pub request_id: String,
     /// The DER chain, the device's certificate first, then its issuer.
     pub chain: Vec<serde_bytes::ByteBuf>,
-    /// The DER revocation lists the device should hold.
-    pub revocation_lists: Vec<serde_bytes::ByteBuf>,
+    /// The revocation lists the device should hold.
+    pub revocation_lists: Vec<SignedList>,
+}
+
+/// A revocation list and the certificate that signed it, a device issuer or,
+/// for a list revoking issuers, the root.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignedList {
+    /// The DER list.
+    #[serde(with = "serde_bytes")]
+    pub list: Vec<u8>,
+    /// The DER certificate of its signer.
+    #[serde(with = "serde_bytes")]
+    pub signer: Vec<u8>,
+}
+
+/// Server hands a device the current revocation lists, after every
+/// handshake and whenever a list changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevocationUpdate {
+    /// One list per issuer.
+    pub lists: Vec<SignedList>,
+}
+
+/// Client asks for its account's devices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicesRequest {
+    /// Client-chosen correlation token, echoed by the answer.
+    pub request_id: String,
+}
+
+/// One enrolled device of the caller's account.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceSummary {
+    /// The device key's identifier, the SHA-256 of its public key.
+    pub key_id: [u8; 32],
+    /// When the key first enrolled, in seconds since the Unix epoch.
+    pub enrolled_at_secs: u64,
+    /// When the key last enrolled or renewed, in seconds since the Unix epoch.
+    pub last_seen_secs: u64,
+    /// When the key was revoked, in seconds since the Unix epoch.
+    pub revoked_at_secs: Option<u64>,
+    /// The application's descriptor as the device last sent it, `MessagePack`.
+    #[serde(with = "serde_bytes")]
+    pub descriptor: Vec<u8>,
+}
+
+/// Server answers with the caller's devices.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicesList {
+    /// Correlation token from the request this answers.
+    pub request_id: String,
+    /// The account's devices, revoked ones included until they are purged.
+    pub devices: Vec<DeviceSummary>,
+}
+
+/// Client reports one of its account's devices lost.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RevokeDeviceRequest {
+    /// Client-chosen correlation token, echoed by the answer.
+    pub request_id: String,
+    /// The device key to revoke.
+    pub key_id: [u8; 32],
+}
+
+/// Server confirms a device is revoked.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceRevokedAck {
+    /// Correlation token from the request this answers.
+    pub request_id: String,
 }
 
 /// Server refuses a challenge or an enrolment.

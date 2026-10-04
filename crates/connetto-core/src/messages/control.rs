@@ -84,7 +84,10 @@ pub struct TabIdentity {
 use super::{
     aggregate::AggregateUpdate,
     content::{ContentTicketGrant, ContentTicketRequest},
-    enrolment::{EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefused, EnrolRequest},
+    enrolment::{
+        DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
+        EnrolGrant, EnrolRefused, EnrolRequest, RevocationUpdate, RevokeDeviceRequest,
+    },
     error::{FatalError, NonFatalError, RateLimited},
     flow::{AckCredits, Ping, Pong},
     handshake::{Handshake, HandshakeAck},
@@ -150,6 +153,16 @@ pub enum ControlMessage {
     EnrolGrant(EnrolGrant),
     /// Server refuses a challenge or an enrolment.
     EnrolRefused(EnrolRefused),
+    /// Server hands a device the current revocation lists.
+    RevocationUpdate(RevocationUpdate),
+    /// Client asks for its account's devices.
+    DevicesRequest(DevicesRequest),
+    /// Server answers with the account's devices.
+    DevicesList(DevicesList),
+    /// Client reports one of its account's devices lost.
+    RevokeDeviceRequest(RevokeDeviceRequest),
+    /// Server confirms the device is revoked.
+    DeviceRevokedAck(DeviceRevokedAck),
 
     /// Client heartbeat probe.
     Ping(Ping),

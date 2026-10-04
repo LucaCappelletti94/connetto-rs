@@ -13,12 +13,14 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, EnrolChallenge,
-        EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError,
-        FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
-        LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-        MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, SnapshotBegin,
-        SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, DeviceRevokedAck,
+        DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
+        EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason,
+        FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch,
+        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
+        NonFatalError, PauseCause, Ping, Pong, RateLimited, RevocationUpdate, RevokeDeviceRequest,
+        SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
+        SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -233,6 +235,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         },
         // SessionManager::close_session, from the auth service's revoke hook.
         FatalErrorReason::SessionRevoked,
+        // DeviceEnrolment::revoke, closing a reported device's connections (R74).
+        FatalErrorReason::DeviceRevoked,
         // SessionManager::register_connection, on a second live handshake.
         FatalErrorReason::ConnectionSuperseded,
         // SessionManager::serve, on a duplicate handshake mid-session.
@@ -257,6 +261,7 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         match reason {
             FatalErrorReason::ProtocolVersionMismatch { .. }
             | FatalErrorReason::SessionRevoked
+            | FatalErrorReason::DeviceRevoked
             | FatalErrorReason::ConnectionSuperseded
             | FatalErrorReason::ProtocolViolation { .. }
             | FatalErrorReason::ServerShuttingDown
@@ -360,7 +365,10 @@ fn enrolment_control_round_trips() {
             serde_bytes::ByteBuf::from(vec![0x30, 0x01]),
             serde_bytes::ByteBuf::from(vec![0x30, 0x02]),
         ],
-        revocation_lists: vec![serde_bytes::ByteBuf::from(vec![0x30, 0x03])],
+        revocation_lists: vec![SignedList {
+            list: vec![0x30, 0x03],
+            signer: vec![0x30, 0x02],
+        }],
     }));
     for reason in every_enrol_refusal() {
         round_trip_control(&ControlMessage::EnrolRefused(EnrolRefused {
@@ -368,6 +376,34 @@ fn enrolment_control_round_trips() {
             reason,
         }));
     }
+    round_trip_control(&ControlMessage::RevocationUpdate(RevocationUpdate {
+        lists: vec![SignedList {
+            list: vec![0x30, 0x04],
+            signer: vec![0x30, 0x05],
+        }],
+    }));
+    round_trip_control(&ControlMessage::DevicesRequest(DevicesRequest {
+        request_id: "devices-1".into(),
+    }));
+    for revoked_at_secs in [None, Some(1_900_000_000)] {
+        round_trip_control(&ControlMessage::DevicesList(DevicesList {
+            request_id: "devices-1".into(),
+            devices: vec![DeviceSummary {
+                key_id: [9; 32],
+                enrolled_at_secs: 1_800_000_000,
+                last_seen_secs: 1_800_086_400,
+                revoked_at_secs,
+                descriptor: vec![0x81, 0xa4],
+            }],
+        }));
+    }
+    round_trip_control(&ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+        request_id: "revoke-1".into(),
+        key_id: [9; 32],
+    }));
+    round_trip_control(&ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
+        request_id: "revoke-1".into(),
+    }));
 }
 
 /// Every [`EnrolRefusal`]. The wildcard-free match stops this file compiling
