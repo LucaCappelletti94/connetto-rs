@@ -148,26 +148,80 @@ pub struct PoolError {
 }
 
 /// The conninfo for the error text and the `Debug` line, its password made
-/// unreadable.
+/// unreadable in a URL's userinfo or query string and in a key-value conninfo.
 fn redact_password(conninfo: &str) -> String {
-    let Some(scheme_end) = conninfo.find("://") else {
-        return conninfo.to_owned();
-    };
-    let Some(at) = conninfo.rfind('@') else {
-        return conninfo.to_owned();
+    if conninfo.contains("://") {
+        redact_query_password(&redact_userinfo(conninfo))
+    } else {
+        redact_key_value_password(conninfo)
+    }
+}
+
+/// A URL with the password in its userinfo replaced.
+fn redact_userinfo(url: &str) -> String {
+    let Some(scheme_end) = url.find("://") else {
+        return url.to_owned();
     };
     let userinfo_start = scheme_end + "://".len();
-    if at < userinfo_start {
-        return conninfo.to_owned();
-    }
-    match conninfo[userinfo_start..at].find(':') {
+    let authority_end = url[userinfo_start..]
+        .find(['/', '?', '#'])
+        .map_or(url.len(), |end| userinfo_start + end);
+    let Some(at) = url[userinfo_start..authority_end].rfind('@') else {
+        return url.to_owned();
+    };
+    let at = userinfo_start + at;
+    match url[userinfo_start..at].find(':') {
         Some(colon) => {
-            let mut redacted = conninfo.to_owned();
+            let mut redacted = url.to_owned();
             redacted.replace_range(userinfo_start + colon + 1..at, "****");
             redacted
         }
-        None => conninfo.to_owned(),
+        None => url.to_owned(),
     }
+}
+
+/// A URL with the value of a `password` query parameter replaced.
+fn redact_query_password(url: &str) -> String {
+    let Some(query_start) = url.find('?') else {
+        return url.to_owned();
+    };
+    let (base, query) = url.split_at(query_start + 1);
+    let query = query
+        .split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((key, _)) if key.eq_ignore_ascii_case("password") => format!("{key}=****"),
+            _ => pair.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}{query}")
+}
+
+/// A key-value conninfo with the value of its `password` key replaced,
+/// quoted or not.
+fn redact_key_value_password(conninfo: &str) -> String {
+    let mut redacted = String::with_capacity(conninfo.len());
+    let mut rest = conninfo;
+    while let Some(start) = rest.find("password") {
+        let (before, from_key) = rest.split_at(start);
+        redacted.push_str(before);
+        let after_key = from_key["password".len()..].trim_start();
+        let Some(value) = after_key.strip_prefix('=') else {
+            redacted.push_str("password");
+            rest = &from_key["password".len()..];
+            continue;
+        };
+        let value = value.trim_start();
+        let end = if let Some(quoted) = value.strip_prefix('\'') {
+            quoted.find('\'').map_or(value.len(), |close| close + 2)
+        } else {
+            value.find(char::is_whitespace).unwrap_or(value.len())
+        };
+        redacted.push_str("password=****");
+        rest = &value[end..];
+    }
+    redacted.push_str(rest);
+    redacted
 }
 
 async fn build_pool(url: &str, size: u32) -> Result<PgPool, PoolError> {
@@ -424,26 +478,29 @@ pub type ChangeStream = Pin<Box<dyn Future<Output = Result<(), ServeError>> + Se
 /// content sweep, shared by the handle's clones and stopped by the last one.
 #[derive(Clone)]
 struct BackgroundTask {
-    task: Arc<tokio::task::JoinHandle<()>>,
+    task: Arc<AbortOnDrop>,
+}
+
+/// The spawned loop, aborted when the last clone sharing it is dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl BackgroundTask {
     /// Own one spawned loop, so its stop follows the handle's clones.
     fn new(task: tokio::task::JoinHandle<()>) -> Self {
         Self {
-            task: Arc::new(task),
+            task: Arc::new(AbortOnDrop(task)),
         }
     }
 
-    /// Stop the loop, idempotent, so an explicit stop and the drop compose.
+    /// Stop the loop now, idempotent, so an explicit stop and the last drop compose.
     fn stop(&self) {
-        self.task.abort();
-    }
-}
-
-impl Drop for BackgroundTask {
-    fn drop(&mut self) {
-        self.stop();
+        self.task.0.abort();
     }
 }
 
@@ -1626,6 +1683,30 @@ mod tests {
             redact_password(&conninfo("owner", PLANTED)),
             conninfo("owner", "****")
         );
+    }
+
+    /// A password in a key-value conninfo, quoted or not, or in a URL's query
+    /// string stays out of the redacted text and the `Debug` line alike.
+    #[test]
+    fn every_conninfo_form_keeps_its_password_out() {
+        for form in [
+            format!("host=localhost user=owner password={PLANTED} dbname=db"),
+            format!("host=localhost password='{PLANTED} with spaces' dbname=db"),
+            format!("postgres://localhost/db?sslmode=disable&password={PLANTED}"),
+            format!("postgresql://owner@localhost/db?password={PLANTED}&sslmode=disable"),
+        ] {
+            let redacted = redact_password(&form);
+            assert!(!redacted.contains(PLANTED), "{form} redacted to {redacted}");
+            assert!(
+                redacted.contains("localhost"),
+                "the target stays named: {redacted}"
+            );
+            let shown = format!("{:?}", Database::new(form.clone(), form.clone()));
+            assert!(
+                !shown.contains(PLANTED),
+                "the Debug line keeps it out: {shown}"
+            );
+        }
     }
 
     /// The settings a deployment hands the builder keep their passwords, key

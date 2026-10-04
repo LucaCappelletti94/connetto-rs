@@ -1876,6 +1876,84 @@ async fn dropping_the_last_handle_stops_the_background_loops() {
     );
 }
 
+/// Dropping one clone of the handle leaves the background loops running while
+/// another clone lives, so the sweep still reclaims a chunk marked deleting.
+#[tokio::test]
+async fn dropping_one_handle_clone_keeps_the_background_loops() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    apply_content_deployment(&pool).await;
+
+    let dir = TempDir::new().expect("a store directory");
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    let fga_url = fixture.fga_url().await.to_owned();
+    let key = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+        .expect("a ticket key")
+        .as_ref()
+        .to_vec();
+    let settings = ContentSettings {
+        base_url: "http://127.0.0.1:8099".to_owned(),
+        ttl: Duration::from_secs(60),
+        read_ceiling: 1 << 20,
+        grace: Duration::ZERO,
+        cadence: Duration::from_millis(100),
+        quota_identity: 0,
+        storage_ceiling: 0,
+        bandwidth_ceiling: 0,
+        bandwidth_window_days: 30,
+        warn_fraction: 0.8,
+        ceiling_refresh: Duration::from_secs(10),
+        owner_pool_size: 2,
+        store: StoreSpec::Fs(dir.path().to_path_buf()),
+        key,
+    };
+    let parts = builder_schema(
+        &fixture,
+        0,
+        &idp,
+        (&fga_url, &store),
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+    )
+    .content(Some(settings))
+    .build()
+    .await
+    .expect("the deployment assembles");
+    drop(parts.handle.clone());
+
+    let hash = "ef".repeat(32);
+    let planted = dir.path().join(&hash[..2]).join(&hash[2..4]).join(&hash);
+    tokio::fs::create_dir_all(planted.parent().expect("the chunk parents"))
+        .await
+        .expect("make the chunk parents");
+    tokio::fs::write(&planted, b"the reclaimable chunk")
+        .await
+        .expect("plant the chunk");
+    exec(
+        &pool,
+        &format!(
+            "INSERT INTO _cfs_chunk_registry (chunk_hash, state) \
+             VALUES (decode('{hash}', 'hex'), 'deleting')"
+        ),
+    )
+    .await;
+    let deadline = Instant::now() + BOUND;
+    while planted.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the sweep stopped when one handle clone was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    drop(parts);
+}
+
 /// The sync adapter over a real listener: a non-connetto frame is skipped and
 /// the handshake that follows still opens, a frame it cannot speak ends the
 /// session with an error the log can name, and a client's close ends the
