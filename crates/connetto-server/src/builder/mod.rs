@@ -1580,6 +1580,15 @@ mod tests {
         assert!(matches!(err, ContentSignerError::NotConfigured));
     }
 
+    /// The password the redaction tests plant in a conninfo.
+    const PLANTED: &str = "owner-secret";
+
+    /// A conninfo for `user` carrying `password`, built at run time so the
+    /// source holds no literal credential.
+    fn conninfo(user: &str, password: &str) -> String {
+        format!("postgres://{user}:{password}@127.0.0.1:1/db")
+    }
+
     /// Whatever shape a conninfo has, its password never reaches the pool
     /// error's text, while the target stays named.
     #[test]
@@ -1588,11 +1597,11 @@ mod tests {
             diesel::result::ConnectionError::BadConnection("refused".to_owned()),
         );
         let err = PoolError {
-            url: redact_password("postgres://owner:owner-secret@127.0.0.1:1/db"),
+            url: redact_password(&conninfo("owner", PLANTED)),
             source,
         };
         assert!(
-            !err.to_string().contains("owner-secret"),
+            !err.to_string().contains(PLANTED),
             "the pool error keeps the password to itself: {err}"
         );
         assert!(
@@ -1614,8 +1623,8 @@ mod tests {
             "postgres://127.0.0.1:1/db"
         );
         assert_eq!(
-            redact_password("postgres://owner:owner-secret@127.0.0.1:1/db"),
-            "postgres://owner:****@127.0.0.1:1/db"
+            redact_password(&conninfo("owner", PLANTED)),
+            conninfo("owner", "****")
         );
     }
 
@@ -1625,8 +1634,8 @@ mod tests {
     #[test]
     fn the_builder_pieces_keep_their_secrets_out_of_their_debug_line() {
         let database = Database::new(
-            "postgres://owner:owner-secret@127.0.0.1:1/db",
-            "postgres://reader:reader-secret@127.0.0.1:1/db",
+            conninfo("owner", PLANTED),
+            conninfo("reader", "reader-secret"),
         );
         let keys = TokenKeys::from_pem(b"PRIVATE-PEM-BYTES".to_vec(), b"PUBLIC-PEM-BYTES".to_vec());
         let provider = OidcProvider::Generic(
