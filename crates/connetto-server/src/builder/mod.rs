@@ -198,7 +198,7 @@ fn redact_query_password(url: &str) -> String {
 }
 
 /// A key-value conninfo with the value of its `password` key replaced,
-/// quoted or not.
+/// quoted or not, with libpq's backslash escapes honoured.
 fn redact_key_value_password(conninfo: &str) -> String {
     let mut redacted = String::with_capacity(conninfo.len());
     let mut rest = conninfo;
@@ -212,16 +212,28 @@ fn redact_key_value_password(conninfo: &str) -> String {
             continue;
         };
         let value = value.trim_start();
-        let end = if let Some(quoted) = value.strip_prefix('\'') {
-            quoted.find('\'').map_or(value.len(), |close| close + 2)
-        } else {
-            value.find(char::is_whitespace).unwrap_or(value.len())
-        };
         redacted.push_str("password=****");
-        rest = &value[end..];
+        rest = &value[key_value_end(value)..];
     }
     redacted.push_str(rest);
     redacted
+}
+
+/// The byte length of the key-value conninfo value `value` opens with.
+fn key_value_end(value: &str) -> usize {
+    let quoted = value.starts_with('\'');
+    let mut chars = value.char_indices().skip(usize::from(quoted));
+    while let Some((at, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '\'' if quoted => return at + 1,
+            c if !quoted && c.is_whitespace() => return at,
+            _ => {}
+        }
+    }
+    value.len()
 }
 
 async fn build_pool(url: &str, size: u32) -> Result<PgPool, PoolError> {
@@ -1685,13 +1697,17 @@ mod tests {
         );
     }
 
-    /// A password in a key-value conninfo, quoted or not, or in a URL's query
-    /// string stays out of the redacted text and the `Debug` line alike.
+    /// A password in a key-value conninfo, quoted or not and with backslash
+    /// escapes, or in a URL's query string stays out of the redacted text and
+    /// the `Debug` line alike.
     #[test]
     fn every_conninfo_form_keeps_its_password_out() {
         for form in [
             format!("host=localhost user=owner password={PLANTED} dbname=db"),
             format!("host=localhost password='{PLANTED} with spaces' dbname=db"),
+            format!(r"host=localhost password='prefix\'{PLANTED}' dbname=db"),
+            format!(r"host=localhost password='prefix\\\'{PLANTED}' dbname=db"),
+            format!(r"host=localhost password=prefix\ {PLANTED} dbname=db"),
             format!("postgres://localhost/db?sslmode=disable&password={PLANTED}"),
             format!("postgresql://owner@localhost/db?password={PLANTED}&sslmode=disable"),
         ] {
