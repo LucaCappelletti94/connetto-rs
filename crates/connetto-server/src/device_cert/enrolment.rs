@@ -312,6 +312,8 @@ pub struct DeviceEnrolment<Id> {
     random: SystemRandom,
     lists: tokio::sync::Mutex<Option<Vec<SignedList>>>,
     revoker: Option<SessionRevoker>,
+    /// The time a certificate is issued at.
+    clock: fn() -> SystemTime,
 }
 
 /// Seconds since the Unix epoch, zero before it.
@@ -330,7 +332,17 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             random: SystemRandom::new(),
             lists: tokio::sync::Mutex::new(None),
             revoker: None,
+            clock: SystemTime::now,
         }
+    }
+
+    /// Issue at the time `clock` reads, so a test stands in for a device
+    /// whose clock differs from the server's.
+    #[cfg(feature = "test-seams")]
+    #[must_use]
+    pub fn with_issue_clock(mut self, clock: fn() -> SystemTime) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Revoke the auth-store session a revoked device last enrolled with
@@ -389,7 +401,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         self.random
             .fill(&mut serial)
             .map_err(|_| EnrolRefusal::IssuerUnavailable)?;
-        let not_before = SystemTime::now();
+        let not_before = (self.clock)();
         let issuer = self.config.issuer();
         let leaf = issuer
             .issue(&csr, &user.to_string(), not_before, lifetime, serial)

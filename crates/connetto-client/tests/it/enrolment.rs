@@ -72,6 +72,9 @@ const APP_LEARNED: &str = "r74-learned";
 const APP_UNTRUSTED: &str = "r74-untrusted";
 const APP_NO_ROOTS: &str = "r74-no-roots";
 const APP_ROTATION: &str = "r74-rotation";
+const APP_CLOCK_BEHIND: &str = "r74-clock-behind";
+const APP_CLOCK_AHEAD: &str = "r74-clock-ahead";
+const APP_LOST_KEY: &str = "r74-lost-key";
 
 /// What the lost-device list shows about these test devices.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -137,6 +140,9 @@ async fn enrolment_phase() {
         "untrusted" => untrusted().await,
         "no-roots" => no_roots().await,
         "rotation" => Box::pin(rotation_withdraws()).await,
+        "clock-behind" => Box::pin(clock_behind()).await,
+        "clock-ahead" => clock_ahead().await,
+        "lost-key" => lost_key().await,
         other => panic!("unknown enrolment phase {other:?}"),
     }
 }
@@ -329,6 +335,26 @@ async fn sync_server_with_manager(
     );
     let (addr, server) = spawn_server(Arc::clone(&manager)).await;
     (addr, server, manager)
+}
+
+/// As [`sync_server`], issuing at the time `clock` reads, which stands in for
+/// a device whose clock differs from the server's.
+async fn skewed_server(
+    fixture: &Fixture,
+    service: &Arc<AuthService<InMemoryAuthStore>>,
+    store: Arc<MemoryEnrolments<String>>,
+    clock: fn() -> SystemTime,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let manager = manager(fixture, service);
+    let enrolment =
+        DeviceEnrolment::new(DeviceCertConfig::new(issuer()), store).with_issue_clock(clock);
+    assert!(
+        manager
+            .install_device_enrolment(Arc::new(enrolment))
+            .is_ok(),
+        "installs once"
+    );
+    spawn_server(manager).await
 }
 
 /// A fresh-login keyring sign-in as `subject`, the services named by `app_id`.
@@ -1400,6 +1426,194 @@ async fn rotation_withdraws() {
         records[1].issuer,
         connetto_core::device_cert::certificate_key_id(new_issuer).expect("key id"),
         "the key re-enrols under the new issuer"
+    );
+    second.close().await;
+}
+
+/// The `ClockOutsideWindow` event the next `within` brings, if any.
+async fn clock_event(
+    events: &mut tokio::sync::broadcast::Receiver<ClientEvent>,
+    within: Duration,
+) -> Option<ClientEvent> {
+    next_event(events, within, |event| {
+        matches!(event, ClientEvent::ClockOutsideWindow { .. })
+    })
+    .await
+}
+
+/// A device whose clock runs behind the server's is told so when its grant
+/// is not yet valid, told again when a restart opens that certificate, and
+/// leaves the state once a server whose clock agrees renews it.
+#[test]
+fn a_clock_behind_the_server_is_told_and_recovers_on_renewal() {
+    run_phase("clock-behind");
+}
+
+async fn clock_behind() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (ahead, _ahead) = skewed_server(&fixture, &service, Arc::clone(&store), || {
+        SystemTime::now() + Duration::from_hours(2)
+    })
+    .await;
+    let dir = tempdir().expect("a data directory");
+
+    let (client, pump) = signed_in(
+        ahead,
+        fresh_login(&base, APP_CLOCK_BEHIND, "enrol-user"),
+        dir.path(),
+    )
+    .connect_with_pump()
+    .await
+    .expect("the signed-in build connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    let told = clock_event(&mut events, BOUND).await;
+    assert!(
+        matches!(told, Some(ClientEvent::ClockOutsideWindow { ahead: false })),
+        "a grant not yet valid says the clock is behind: {told:?}"
+    );
+    let skewed = client
+        .device_certificate()
+        .expect("the grant is kept all the same");
+    client.close().await;
+
+    let (agreeing, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let (second, pump) = signed_in(agreeing, last_used(&base, APP_CLOCK_BEHIND), dir.path())
+        .connect_with_pump()
+        .await
+        .expect("the second build signs back in and connects");
+    let mut events = second.client().events();
+    tokio::spawn(pump);
+    let told = clock_event(&mut events, BOUND).await;
+    assert!(
+        matches!(told, Some(ClientEvent::ClockOutsideWindow { ahead: false })),
+        "a held certificate not yet valid at open says the clock is behind: {told:?}"
+    );
+    let until = Instant::now() + BOUND;
+    let renewed = loop {
+        match second.device_certificate() {
+            Some(cert) if cert.serial() != skewed.serial() => break cert,
+            _ if Instant::now() >= until => panic!("the connection never renewed"),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    assert!(
+        renewed.not_before() <= SystemTime::now(),
+        "the renewal is valid by the local clock"
+    );
+    assert!(
+        clock_event(&mut events, Duration::from_secs(2))
+            .await
+            .is_none(),
+        "a certificate the window holds raises nothing"
+    );
+    second.close().await;
+}
+
+/// A device whose clock runs ahead of the server's is told so when its grant
+/// is already past its end.
+#[test]
+fn a_clock_ahead_of_the_server_is_told() {
+    run_phase("clock-ahead");
+}
+
+async fn clock_ahead() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (behind, _server) = skewed_server(&fixture, &service, store, || {
+        SystemTime::now() - Duration::from_hours(3)
+    })
+    .await;
+    let dir = tempdir().expect("a data directory");
+
+    let (client, pump) = signed_in(
+        behind,
+        fresh_login(&base, APP_CLOCK_AHEAD, "enrol-user"),
+        dir.path(),
+    )
+    .with_certificate_lifetime(Duration::from_hours(1))
+    .connect_with_pump()
+    .await
+    .expect("the signed-in build connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    let told = clock_event(&mut events, BOUND).await;
+    assert!(
+        matches!(told, Some(ClientEvent::ClockOutsideWindow { ahead: true })),
+        "a grant already past its end says the clock is ahead: {told:?}"
+    );
+    client.close().await;
+}
+
+/// A device whose key record is gone enrols again under a fresh key, as a
+/// first enrolment, and drops the certificate of the key it lost (step 8).
+#[test]
+fn a_lost_key_enrols_again_under_a_fresh_key() {
+    run_phase("lost-key");
+}
+
+async fn lost_key() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("a data directory");
+
+    let client = signed_in(
+        addr,
+        fresh_login(&base, APP_LOST_KEY, "enrol-user"),
+        dir.path(),
+    )
+    .connect()
+    .await
+    .expect("the signed-in build connects");
+    let first = wait_for_certificate(&client, BOUND)
+        .await
+        .expect("the enrolment grants");
+    let session = client
+        .session()
+        .expect("a provider build reports its session");
+    let record = device_record(session.user_id());
+    client.close().await;
+    KeyringStore::new(APP_LOST_KEY)
+        .clear(&record)
+        .await
+        .expect("the custody record is cleared");
+
+    let second = signed_in(addr, last_used(&base, APP_LOST_KEY), dir.path())
+        .connect()
+        .await
+        .expect("the second build signs back in and connects");
+    let until = Instant::now() + BOUND;
+    let fresh = loop {
+        match second.device_certificate() {
+            Some(cert) if cert.identity().key() != first.identity().key() => break cert,
+            _ if Instant::now() >= until => panic!("the fresh key never enrolled"),
+            _ => tokio::time::sleep(Duration::from_millis(20)).await,
+        }
+    };
+    let records = wait_for_records(&store, 2, BOUND)
+        .await
+        .expect("the fresh key is recorded");
+    assert_eq!(
+        records.iter().map(|record| record.key).collect::<Vec<_>>(),
+        vec![first.identity().key(), fresh.identity().key()],
+        "the old enrolment stays until it expires, beside the fresh one"
     );
     second.close().await;
 }

@@ -1158,6 +1158,17 @@ pub enum ClientEvent {
     /// refuse it. The certificate is deleted, the key kept, and the device
     /// enrols the key again on its next connection (R74 decision 24).
     CertificateWithdrawn,
+    /// The local clock puts this device's certificate outside its validity
+    /// window, so peers will refuse it until the clock is set right (R74
+    /// decision 29). Raised once on entering the state, when a certificate the
+    /// server just granted is already outside its window or one held at open
+    /// is not yet valid. `ahead` is whether the clock runs ahead of the
+    /// server's.
+    ClockOutsideWindow {
+        /// Whether the local clock is ahead, so the certificate looks expired,
+        /// rather than behind, so it looks not yet valid.
+        ahead: bool,
+    },
 }
 
 /// A primary-key column value carried on a mutation event.

@@ -344,6 +344,9 @@ struct Run<L> {
     kept: HashMap<Vec<u8>, KeptList>,
     /// A certificate the root withdrew, whose key enrols again.
     withdrawn: Option<Withdrawn>,
+    /// Whether the local clock puts the held certificate outside its window
+    /// (decision 29).
+    clock_off: bool,
 }
 
 /// A certificate withdrawn because the root revoked its issuer.
@@ -519,8 +522,16 @@ impl<L: Link> Run<L> {
             .store(held.clone())
             .await
             .map_err(CertificateError::Device)?;
+        let standing = Standing::of(Some(&held), SystemTime::now());
         self.held = Some(held);
         self.publish();
+        // The server just issued it, so a window that does not hold it now
+        // says the local clock is off (lifecycle row "Grant received").
+        match standing {
+            Standing::ClockOff => self.clock_outside(false),
+            Standing::Expired => self.clock_outside(true),
+            _ => self.clock_off = false,
+        }
         Ok(())
     }
 
@@ -642,11 +653,40 @@ impl<L: Link> Run<L> {
         }
     }
 
+    /// Where the held certificate stands, re-evaluating the window: a
+    /// certificate not yet valid enters `ClockOff`, one the window holds
+    /// leaves it, and one expired by a clock already known to run ahead stays
+    /// in it (lifecycle row "Wall clock changes, or the hourly look").
+    fn standing(&mut self, now: SystemTime) -> Standing {
+        match Standing::of(self.held.as_ref(), now) {
+            Standing::ClockOff => {
+                self.clock_outside(false);
+                Standing::ClockOff
+            }
+            Standing::Expired if self.clock_off => Standing::ClockOff,
+            standing => {
+                self.clock_off = false;
+                standing
+            }
+        }
+    }
+
+    /// Enter `ClockOff`, raising `ClockOutsideWindow` once (decision 29).
+    fn clock_outside(&mut self, ahead: bool) {
+        if !self.clock_off {
+            self.clock_off = true;
+            self.link.emit(ClientEvent::ClockOutsideWindow { ahead });
+        }
+    }
+
     /// Act on a live connection as the certificate's standing says
-    /// (lifecycle rows "Connected and signed in" and "Half-life crossed").
-    async fn on_connected(&mut self) {
-        let outcome = match Standing::of(self.held.as_ref(), SystemTime::now()) {
+    /// (lifecycle rows "Connected and signed in", "Half-life crossed" and
+    /// "Wall clock changes, or the hourly look"). The hourly look never
+    /// renews a certificate the local clock puts outside its window.
+    async fn on_connected(&mut self, by_look: bool) {
+        let outcome = match self.standing(SystemTime::now()) {
             Standing::Fresh => return,
+            Standing::ClockOff if by_look => return,
             Standing::NoKey => {
                 let lifetime = self
                     .withdrawn
@@ -680,12 +720,16 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         key: None,
         kept,
         withdrawn: None,
+        clock_off: false,
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
         tracing::warn!(error = %err, "the device key could not be opened");
     }
+    // Lifecycle row "Opened with the replica".
+    run.standing(SystemTime::now());
     let mut due = run.link.connected().await;
+    let mut by_look = false;
     let mut steering = true;
     loop {
         if !run.link.alive() {
@@ -693,8 +737,9 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         }
         if due {
             due = false;
-            run.on_connected().await;
+            run.on_connected(by_look).await;
         }
+        by_look = false;
         let look = next_look(run.held.as_ref(), SystemTime::now());
         tokio::select! {
             () = run.link.ended() => return,
@@ -731,7 +776,10 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     due = run.link.connected().await;
                 }
             }
-            () = tokio::time::sleep(look) => due = run.link.connected().await,
+            () = tokio::time::sleep(look) => {
+                due = run.link.connected().await;
+                by_look = true;
+            }
         }
     }
 }
