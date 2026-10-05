@@ -357,6 +357,7 @@ impl GateController {
     }
 
     fn arm(&self, recheck: Option<Duration>, mechanism: Arc<dyn GateMechanism>, locked: bool) {
+        tracing::debug!(?recheck, locked, "the gate armed");
         let mut state = self.state.lock().expect("the gate state lock");
         state.recheck = recheck;
         state.locked = locked;
@@ -376,6 +377,14 @@ impl GateController {
     /// When the state lock is poisoned.
     pub fn away(&self, at: Moment) {
         let mut state = self.state.lock().expect("the gate state lock");
+        tracing::debug!(
+            ?at,
+            armed = state.mechanism.is_some(),
+            locked = state.locked,
+            prompting = state.prompting,
+            pending = ?state.pending_away,
+            "the gate heard an away"
+        );
         if state.mechanism.is_none() || state.locked {
             return;
         }
@@ -396,6 +405,14 @@ impl GateController {
     /// When the state lock is poisoned.
     pub fn back(&self, at: Moment) -> bool {
         let mut state = self.state.lock().expect("the gate state lock");
+        tracing::debug!(
+            ?at,
+            armed = state.mechanism.is_some(),
+            locked = state.locked,
+            prompting = state.prompting,
+            pending = ?state.pending_away,
+            "the gate heard a return"
+        );
         let mechanism = match state.mechanism.as_ref() {
             Some(m) => Arc::clone(m),
             None => return false,
@@ -503,6 +520,7 @@ impl GateController {
         };
         *ask = None;
         let mut state = self.state.lock().expect("the gate state lock");
+        tracing::debug!(?outcome, "the gate prompt answered");
         state.prompting = false;
         if outcome == GateAskOutcome::Approved {
             state.locked = false;
@@ -516,6 +534,7 @@ impl GateController {
     /// through the sink, and stores the ask's future for the owner to drive. Called
     /// while holding the state lock.
     fn start_prompt(&self, state: &mut GateState, mechanism: &Arc<dyn GateMechanism>) {
+        tracing::debug!("the gate locked and started a prompt");
         state.locked = true;
         state.prompting = true;
         mechanism.lock();

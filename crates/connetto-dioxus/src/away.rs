@@ -78,6 +78,7 @@ where
     use_wry_event_handler(move |event, _target| match away_action(event) {
         AwayAction::Away => {
             let at = Moment::now(&SystemClock);
+            tracing::debug!(?at, ?event, "the platform reported the app going away");
             let client = client.clone();
             spawn(async move {
                 client.away(at).await;
@@ -85,6 +86,7 @@ where
         }
         AwayAction::Back => {
             let at = Moment::now(&SystemClock);
+            tracing::debug!(?at, ?event, "the platform reported the app coming back");
             let client = client.clone();
             spawn(async move {
                 client.back(at).await;

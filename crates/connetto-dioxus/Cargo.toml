@@ -27,12 +27,13 @@ diesel.workspace = true
 # The desktop away/return feeder (R94 step 5) reads tao's lifecycle events,
 # so it pulls dioxus-desktop. Optional, keeping the wasm build clean.
 dioxus-desktop = { version = "0.7.9", optional = true }
+tracing = { version = "0.1", default-features = false, features = ["std"], optional = true }
 
 [features]
 # Feeds the client's away input from tao's Suspended and Resumed events on
 # iOS and Android and from window focus on the desktop (R94 decision 9). Off
 # by default, so the wasm build never pulls the native webview stack.
-desktop = ["dep:dioxus-desktop"]
+desktop = ["dep:dioxus-desktop", "dep:tracing"]
 # Lends the desktop window to connetto's Windows Hello prompt (R53), with the
 # keyring sign-in that takes it.
 hello = ["desktop", "connetto-client/native-auth"]

@@ -59,6 +59,12 @@ const BROWSER_ROLE: &str = "android.app.role.BROWSER";
 const STAY_ON: &str = "stay_on_while_plugged_in";
 /// The global setting that, when nonzero, keeps crash and freeze dialogs off the screen.
 const HIDE_ERROR_DIALOGS: &str = "hide_error_dialogs";
+/// The log targets of the demo's away and return inputs and of its gate,
+/// printed when the proof fails.
+const GATE_TRACE_TARGETS: [&str; 2] = [
+    "\"target\":\"connetto_client::away\"",
+    "\"target\":\"connetto_dioxus::away\"",
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -95,6 +101,15 @@ async fn main() -> Result<()> {
         Err(err) => Err(err),
     };
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
+    if outcome.is_err() {
+        for line in log.lines().filter(|line| {
+            GATE_TRACE_TARGETS
+                .iter()
+                .any(|target| line.contains(target))
+        }) {
+            eprintln!("{line}");
+        }
+    }
     tokio::fs::write(evidence.join("logcat.txt"), log)
         .await
         .context("writing the device log")?;
