@@ -244,8 +244,12 @@ fn publish_export(part: &Path) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
+/// The default log filter. The away and return inputs and the gate's
+/// transitions are on, so a proof that fails at a re-check carries them.
+const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_dioxus::away=debug";
+
 fn main() {
-    connetto_core::logging::init_stdout();
+    connetto_core::logging::init_stdout_with_default(LOG_FILTER);
     // Leaked so it outlives `launch`: every session's tasks run on it for the
     // life of the process.
     let runtime: &'static tokio::runtime::Runtime = Box::leak(Box::new(

@@ -1091,6 +1091,7 @@ dependencies = [
  "dioxus-desktop",
  "dioxus-hooks",
  "dioxus-signals",
+ "tracing",
 ]
 
 [[package]]
