@@ -36,7 +36,9 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
-use connetto_test_harness::stack::{now_millis, repo_path};
+use connetto_test_harness::stack::{
+    demo_has_device_identity, demo_mobile_features, now_millis, repo_path,
+};
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
 
@@ -218,6 +220,13 @@ async fn prove(
     )
     .await?;
     device.screenshot(evidence, "signed-in").await?;
+
+    if demo_has_device_identity() {
+        step("enrol the device");
+        app.wait_for_text("device: certified until", Duration::from_secs(60))
+            .await?;
+        device.screenshot(evidence, "device-certified").await?;
+    }
 
     step("sync a backend write");
     let before = order_count(&stack.pg_url).await?;
@@ -510,7 +519,7 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
             target,
             "--no-default-features",
             "--features",
-            "mobile",
+            demo_mobile_features(),
         ])
         .current_dir(&demo)
         .status()

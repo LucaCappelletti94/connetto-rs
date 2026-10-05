@@ -17,21 +17,9 @@ use diesel_async::RunQueryDsl as _;
 use rcgen::PublicKeyData as _;
 use tokio::net::{TcpListener, TcpStream};
 
-use super::e2e::{PG_SERIAL, exec, mint_token, reset_fixture};
+use super::e2e::{PG_SERIAL, mint_token, reset_fixture};
 use super::enrolment::{device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
-
-/// The default schema's tables, whose descriptor is `()` and so has no columns.
-const DDL: [&str; 3] = [
-    "CREATE TABLE connetto_device_enrolments (\
-     key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
-     enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ)",
-    "CREATE TABLE connetto_device_certificates (\
-     serial BYTEA PRIMARY KEY, \
-     key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
-     issuer BYTEA NOT NULL, expires_at TIMESTAMPTZ NOT NULL)",
-    "CREATE TABLE connetto_device_lists (issuer BYTEA PRIMARY KEY, last_number BIGINT NOT NULL)",
-];
 
 #[derive(QueryableByName)]
 struct Count {
@@ -57,9 +45,7 @@ async fn a_built_server_enrols_a_device_into_the_deployment_tables() {
     let pool = admin_pool(&fixture).await;
     reset_fixture(&pool, &fixture).await;
     fixture.provision_auth_tables().await;
-    for statement in DDL {
-        exec(&pool, statement).await;
-    }
+    connetto_test_harness::stack::provision_enrolment_tables(&fixture).await;
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await

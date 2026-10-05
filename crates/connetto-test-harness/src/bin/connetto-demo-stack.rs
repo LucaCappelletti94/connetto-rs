@@ -15,6 +15,11 @@
 //! `CONNETTO_DEMO_ADB_REVERSE` (comma-separated `device:host` port pairs) and
 //! `CONNETTO_DEMO_ISSUER` set, then stops.
 //!
+//! It mints the demo's device certificate authority under
+//! `target/demo-device-ca` on its first run, serves the issuer from it, and
+//! names the root to the program as `CONNETTO_DEMO_BUILD_DEVICE_ROOT`, which a
+//! demo build with the `device-identity` feature ships (R74 decision 30).
+//!
 //! `CONNETTO_STACK_SYNC_PORT` moves its listener off 7777.
 //! `CONNETTO_STACK_PUBLIC_HOST` puts it on the LAN for a phone that has no
 //! `adb reverse`, binding every interface and naming that host in every
@@ -36,7 +41,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
     Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR, TLS_KEY_VAR,
-    ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
+    demo_device_ca, ensure_server_bin, ports, provision, provision_enrolment_tables, require_free,
+    run_process, spawn_server,
 };
 use connetto_test_harness::{MockOauth, with_host};
 
@@ -85,8 +91,18 @@ async fn main() -> Result<()> {
     }
     let server_bin = ensure_server_bin().await?;
     let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack", running.as_ref()).await?;
+    provision_enrolment_tables(&provisioned.fixture).await;
+    let device_ca = demo_device_ca(std::time::SystemTime::now())?;
     let idp = identity_provider(running, public_host.as_deref(), tls.as_ref()).await?;
     let mut envs = provisioned.server_env(&DEPLOYMENT, &server_bind, &base);
+    envs.push((
+        "CONNETTO_DEVICE_ROOT".to_owned(),
+        device_ca.root.display().to_string(),
+    ));
+    envs.push((
+        "CONNETTO_DEVICE_ISSUER_DIR".to_owned(),
+        device_ca.issuer.display().to_string(),
+    ));
     envs.extend(idp.env_pairs(PROVIDER, &format!("{base}/auth/callback")));
     envs.push((
         "CONNETTO_AUTH_REDIRECT_ALLOWLIST".to_owned(),
@@ -126,6 +142,10 @@ async fn main() -> Result<()> {
         ("CONNETTO_DEMO_PG".to_owned(), pg_url),
         ("CONNETTO_DEMO_ADB_REVERSE".to_owned(), reverse_spec),
         ("CONNETTO_DEMO_ISSUER".to_owned(), idp.issuer().to_owned()),
+        (
+            "CONNETTO_DEMO_BUILD_DEVICE_ROOT".to_owned(),
+            device_ca.root.display().to_string(),
+        ),
     ];
 
     if args.is_empty() {
@@ -135,6 +155,10 @@ async fn main() -> Result<()> {
         for (key, value) in &demo_env[..4] {
             println!("  export {key}={value}");
         }
+        println!();
+        println!("a build with --features device-identity also needs:");
+        let (key, value) = &demo_env[6];
+        println!("  export {key}={value}");
         println!();
         println!("phone:");
         for (device, host) in reverse {

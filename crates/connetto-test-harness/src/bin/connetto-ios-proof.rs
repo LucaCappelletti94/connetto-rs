@@ -39,7 +39,10 @@ use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
 use connetto_test_harness::ios_signing;
 use connetto_test_harness::relay::Relay;
-use connetto_test_harness::stack::{TLS_CERT_VAR, TLS_KEY_VAR, now_millis, repo_path};
+use connetto_test_harness::stack::{
+    TLS_CERT_VAR, TLS_KEY_VAR, demo_has_device_identity, demo_mobile_features, now_millis,
+    repo_path,
+};
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep};
 
@@ -171,6 +174,15 @@ async fn prove(
     let login_prefix = format!("{}/authorize?", stack.issuer);
     let mut app = sign_in(target, &mut inspector, &login_prefix, evidence).await?;
     target.record(&mut app, evidence, "signed-in").await?;
+
+    if demo_has_device_identity() {
+        step("enrol the device");
+        app.wait_for_text("device: certified until", Duration::from_secs(60))
+            .await?;
+        target
+            .record(&mut app, evidence, "device-certified")
+            .await?;
+    }
 
     step("sync a backend write");
     let before = order_count(&stack.pg_url).await?;
@@ -404,7 +416,7 @@ impl Target {
             "--ios",
             "--no-default-features",
             "--features",
-            "mobile",
+            demo_mobile_features(),
         ]);
         match self {
             Self::Simulator { .. } => {

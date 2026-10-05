@@ -55,6 +55,9 @@ manganis = "0.7.10"
 default = ["desktop"]
 desktop = ["dioxus/desktop"]
 mobile = ["dioxus/mobile"]
+# Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
+# names at build time, which `connetto-demo-stack` mints (R74 decision 30).
+device-identity = ["connetto-client/device-identity", "connetto-auth-session/device-identity"]
 
 [dev-dependencies]
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }
