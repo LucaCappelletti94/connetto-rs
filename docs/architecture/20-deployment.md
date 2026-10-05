@@ -17,6 +17,7 @@
 | `_connetto_mutations`, the exactly-once watermark | `ConnettoSchema::Watermark` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
 | `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by `preflight::require` (`Artifact::Table`) when bans are on |
 | The audit table, only under `CONNETTO_AUDIT=database` | `ConnettoSchema::Audit` | Yes | Refused by `preflight::require` (`Artifact::Table`) when the audit is on |
+| `connetto_device_enrolments`, `connetto_device_certificates`, `connetto_device_lists`, only with device identity (R74) | `ConnettoSchema::Enrolments` | Yes | Refused by `preflight::require` (`Artifact::Table`) when device identity is on |
 | The reconnect log, `connetto_oplog`, and its last commit, `connetto_oplog_commit` | `CONNETTO_OPLOG_TABLE`, with `_commit` appended for the second | Yes | Both refused by `preflight::require` (`Artifact::Table`) |
 | `connetto_epoch`, the cluster the deployment last served from | `connetto_server::epoch::EPOCH_DDL` | Yes, which is what lets a restore into another cluster be seen | Refused by `preflight::require` (`Artifact::Table`) |
 | The publication and its previous images | `CONNETTO_PUBLICATION` | Yes | Refused (`Artifact::Publication`, `Artifact::PreviousImages`, and `Artifact::PublishedTable` for every table a policy reads) |
@@ -26,7 +27,7 @@
 | The OpenFGA store | `CONNETTO_FGA_STORE` | Only when OpenFGA's own datastore lives in the same cluster | Refused without the id. A new model loads every fact from Postgres (`ModelState::Written`), an installed one reconciles only its whole-shape regions (`ModelState::Adopted`) |
 | The token signing key pair | `CONNETTO_JWT_PRIVATE_KEY_FILE`, `CONNETTO_JWT_PUBLIC_KEY_FILE` | **No** | Refused. The deployment keeps the pair on disk so a token survives a restart |
 | The content ticket key | `CONNETTO_CONTENT_KEY` | **No** | Refused when `CONNETTO_CONTENT_URL` is set, which is what makes the key required. It is the deployment's own and survives a restart |
-| The device certificate issuer, its key and the root it chains to (R74) | `CONNETTO_DEVICE_ROOT`, `CONNETTO_DEVICE_ISSUER_CERT`, `CONNETTO_DEVICE_ISSUER_KEY`, written by `connetto-ca issuer` | **No** | None named means no issuer. Some but not all named, an issuer the root did not sign, or an expired issuer refuses startup, and one with under sixty days left is logged |
+| The device certificate issuer, its key and the root it chains to (R74) | `CONNETTO_DEVICE_ISSUER_DIR`, the directory `connetto-ca issuer` wrote, and `CONNETTO_DEVICE_ROOT`, its `root.der`, with `CONNETTO_DEVICE_RETIRED_ISSUER_DIRS` and `CONNETTO_DEVICE_ROOT_LIST` for rotated and revoked issuers | **No** | No issuer directory means no device identity, and any other `CONNETTO_DEVICE_*` setting without it refuses startup. An issuer the root did not sign or an expired issuer refuses startup, and one with under sixty days left is logged |
 | The device root key and the root's revocation list (R74) | `root.key.p8e` and `root-list.der` in the operator's `connetto-ca` directory, the key encrypted under a passphrase | **No**, and never on the server | Not read by the server, which ships the root certificate in the applications |
 | Provider client secrets | `CONNETTO_OIDC_<PROVIDER>_CLIENT_SECRET` | **No** | Re-issued by the provider |
 
