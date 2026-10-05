@@ -59,6 +59,9 @@ mod never_synced;
 
 mod offline_start;
 
+#[cfg(feature = "native-auth")]
+mod pump_fault;
+
 mod reconnect_live;
 
 mod residual;
