@@ -1,6 +1,6 @@
 # 19: Device-to-device sync
 
-**Status**: normative for the decisions it records. R74's device identity, enrolment, revocation and issuer rotation are built and marked **Built (R74)**. Every other statement carries **Decided (RN)**, where `RN` is the phase in `plans/master-implementation-plan.md` that builds it. The design was settled and adversarially reviewed on 2026-08-21 and derived into phases R74 to R80 on 2026-08-22. The R25 section of the plan records every decision with its rejected alternatives, and the review that amended the design in place.
+**Status**: normative for the decisions it records. R74's device identity, enrolment, revocation, issuer rotation, the client's half of the clock rule and the lost-key path are built and marked **Built (R74)**. Every other statement carries **Decided (RN)**, where `RN` is the phase in `plans/master-implementation-plan.md` that builds it. The design was settled and adversarially reviewed on 2026-08-21 and derived into phases R74 to R80 on 2026-08-22. The R25 section of the plan records every decision with its rejected alternatives, and the review that amended the design in place.
 
 ---
 
@@ -34,7 +34,9 @@ The lifetime is application-requested per case under a server ceiling and refuse
 
 **Built (R74, 2026-10-05), the enrolment tables.** The server records enrolments in three tables of the deployment's own, named by the `Enrolments` member of its `ConnettoSchema`: one row per device key with its account, session, times and descriptor, one row per issued certificate with its serial, key, issuer and expiry, and one row per issuer holding its last list number, advanced in one atomic upsert so numbers rise across restarts and server instances. The descriptor's columns map the application's own type, which `connetto_schema!` destructures field by field, so a field list that disagrees with it does not compile, and an enrolment whose descriptor does not decode into it is refused with `InvalidRequest`. `ServerBuilder::device_identity` turns enrolment on, requires the three tables at startup and revokes a lost device's session in the auth store. The binary reads the issuer from the directory `connetto-ca issuer` wrote (chapter 20).
 
-**Decided (R74, R76), what the built part waits on.** Attestation waits on the deployment's IANA Private Enterprise Number. Peers exchange lists in R76's link frames through the same intake the server's pushes use, and the clock rule applies on those links.
+**Built (R74, 2026-10-05), the clock rule on the client and the lost-key path.** A client learns its clock is wrong from its own certificate. A certificate the server just granted that the local clock already puts outside its window, or one held at open that is not yet valid by more than five minutes, moves it to `ClockOff` and raises `ClientEvent::ClockOutsideWindow { ahead }` once, the server's issuance serving as the trusted time. While `ClockOff` the hourly look re-evaluates the window and never renews, and a connection still renews once, which leaves the state when the new certificate falls inside the window. A device whose key record is gone opens a fresh key, drops the certificate of the lost one and enrols the fresh key as a first enrolment, and the old enrolment stays until it expires.
+
+**Decided (R74, R76), what the built part waits on.** Attestation waits on the deployment's IANA Private Enterprise Number. Peers exchange lists in R76's link frames through the same intake the server's pushes use, and refuse a peer whose certificate the local clock puts outside its window with the same check (decision 29).
 
 ## One exactly-once domain: the per-device applied frontier
 
