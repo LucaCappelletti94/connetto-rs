@@ -46,6 +46,9 @@ pub enum Recorded {
     Revoked,
     /// The key is enrolled under another account, so nothing was recorded.
     HeldElsewhere,
+    /// The descriptor does not decode into the deployment's descriptor type,
+    /// so nothing was recorded.
+    UnreadableDescriptor,
 }
 
 /// One enrolled device of an account, as the device list shows it.
@@ -414,7 +417,9 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                 revocation_lists: self.lists().await.unwrap_or_default(),
             }),
             Ok(Recorded::Revoked) => Err(EnrolRefusal::Revoked),
-            Ok(Recorded::HeldElsewhere) => Err(EnrolRefusal::InvalidRequest),
+            Ok(Recorded::HeldElsewhere | Recorded::UnreadableDescriptor) => {
+                Err(EnrolRefusal::InvalidRequest)
+            }
             Err(err) => {
                 tracing::warn!(error = %err, "the enrolment table refused a record");
                 Err(EnrolRefusal::IssuerUnavailable)

@@ -434,7 +434,6 @@ pub struct NativeDurable<T: Transport, C, K: StorageMarker, KS> {
 
 /// What a keyring build enrols its device key with (R74).
 #[cfg(feature = "device-identity")]
-#[derive(Default)]
 struct DeviceSetup {
     lifetime: Option<core::time::Duration>,
     descriptor: Vec<u8>,
@@ -442,6 +441,21 @@ struct DeviceSetup {
     roots: Vec<Vec<u8>>,
     #[cfg(target_os = "android")]
     java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+}
+
+#[cfg(feature = "device-identity")]
+impl Default for DeviceSetup {
+    /// No descriptor is `()`, which a deployment naming none decodes.
+    fn default() -> Self {
+        Self {
+            lifetime: None,
+            descriptor: rmp_serde::to_vec_named(&()).unwrap_or_default(),
+            refused: None,
+            roots: Vec::new(),
+            #[cfg(target_os = "android")]
+            java: None,
+        }
+    }
 }
 
 /// The largest descriptor the server accepts.

@@ -11,6 +11,7 @@ mod authority;
 mod certificate;
 mod identity;
 mod key;
+pub mod layout;
 mod request;
 mod revocation;
 

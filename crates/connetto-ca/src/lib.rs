@@ -13,6 +13,9 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+use connetto_core::device_cert::layout::{
+    ISSUER_CERTIFICATE, ISSUER_KEY, ROOT_CERTIFICATE, ROOT_LIST,
+};
 use connetto_core::device_cert::{
     DeploymentId, IssuerError, ListError, RevocationList, Revoked, RootCa, RootError,
     certificate_serial, verify_signer,
@@ -22,16 +25,8 @@ use rand_core::{OsRng, RngCore as _};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
 use zeroize::Zeroizing;
 
-/// The root certificate, the file applications are built with.
-pub const ROOT_CERTIFICATE: &str = "root.der";
 /// The root key, PKCS #8 encrypted under the operator's passphrase.
 pub const ROOT_KEY: &str = "root.key.p8e";
-/// The issuer certificate the server presents.
-pub const ISSUER_CERTIFICATE: &str = "issuer.der";
-/// The issuer key the server holds, plain PKCS #8.
-pub const ISSUER_KEY: &str = "issuer.key";
-/// The root's list of revoked issuers, the file the server publishes.
-pub const ROOT_LIST: &str = "root-list.der";
 
 /// How long a root lasts (R74 decision 14).
 pub const ROOT_VALIDITY: Duration = Duration::from_hours(24 * 365 * 10);

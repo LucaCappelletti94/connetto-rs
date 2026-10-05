@@ -16,11 +16,20 @@ const EXPIRY_WARNING: Duration = Duration::from_hours(24 * 60);
 const CHALLENGE_WINDOW: Duration = Duration::from_secs(60);
 
 mod enrolment;
+mod schema;
 
+#[doc(hidden)]
+pub use connetto_core::device_cert::{KeyId, Revoked};
 pub(crate) use enrolment::PendingChallenge;
 pub use enrolment::{
     Device, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore,
     MemoryEnrolments, Recorded, Revocation, RevokeError, SessionRevoker,
+};
+#[doc(hidden)]
+pub use schema::__key_id;
+pub use schema::{
+    ConnettoEnrolmentSchema, DeviceRow, KeyFacts, NewCertificate, NewEnrolment, Renewal, Statement,
+    pg_enrolment_store,
 };
 
 /// The issuer and the lifetimes it grants.
@@ -31,6 +40,27 @@ pub struct DeviceCertConfig {
     challenge_window: Duration,
     retired: Vec<DeviceIssuer>,
     root_lists: Vec<SignedList>,
+}
+
+impl core::fmt::Debug for DeviceCertConfig {
+    /// Names the issuers by key id, never their private keys.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeviceCertConfig")
+            .field("issuer", &self.issuer.key_id())
+            .field("default_lifetime", &self.default_lifetime)
+            .field("ceiling", &self.ceiling)
+            .field("challenge_window", &self.challenge_window)
+            .field(
+                "retired",
+                &self
+                    .retired
+                    .iter()
+                    .map(DeviceIssuer::key_id)
+                    .collect::<Vec<_>>(),
+            )
+            .field("root_lists", &self.root_lists.len())
+            .finish()
+    }
 }
 
 /// A requested lifetime over the ceiling, refused and never shortened.

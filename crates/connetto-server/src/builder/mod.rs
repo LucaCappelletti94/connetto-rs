@@ -17,7 +17,7 @@ use std::fmt;
 use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use axum::Router;
 use thiserror::Error;
@@ -28,6 +28,9 @@ use crate::audit::{ConnettoAuditSchema, pg_audit_hook};
 use crate::authn::schema::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
 use crate::defaults::ConnettoDefaults;
+use crate::device_cert::{
+    ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, pg_enrolment_store,
+};
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
 use crate::openfga::{Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated};
@@ -368,6 +371,9 @@ pub enum BuildError {
     /// A deployment artifact the server needs is absent.
     #[error(transparent)]
     Preflight(#[from] crate::preflight::PreflightError),
+    /// The device certificate settings cannot issue.
+    #[error("device identity: {0}")]
+    DeviceIdentity(#[source] crate::device_cert::ConfigError),
     /// The JWT keypair failed to load.
     #[error("loading the JWT keypair: {0}")]
     TokenKeys(#[source] crate::authn::token::TokenError),
@@ -623,6 +629,7 @@ pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     writable: RuntimeWritableCatalog,
     second_opinion: bool,
     content: Option<ContentSettings>,
+    device_identity: Option<DeviceCertConfig>,
     resolver: Resolver<D::Id>,
     deployment_schema: PhantomData<fn() -> D>,
 }
@@ -674,6 +681,7 @@ impl ServerBuilder {
             writable: RuntimeWritableCatalog::default(),
             second_opinion: false,
             content: None,
+            device_identity: None,
             resolver: Resolver(Arc::new(DefaultUuidResolver)),
             deployment_schema: PhantomData,
         }
@@ -718,6 +726,7 @@ where
             writable,
             second_opinion,
             content,
+            device_identity,
             resolver: _,
             deployment_schema: _,
         } = self;
@@ -747,6 +756,7 @@ where
             writable,
             second_opinion,
             content,
+            device_identity,
             resolver: Resolver(resolver),
             deployment_schema: PhantomData,
         }
@@ -912,6 +922,16 @@ where
         self
     }
 
+    /// The device certificate issuer and its lifetimes (R74), `None` for a
+    /// deployment without device identity. With one, the deployment's
+    /// enrolment tables are required at startup and every signed-in device
+    /// may enrol its key.
+    #[must_use]
+    pub fn device_identity(mut self, config: Option<DeviceCertConfig>) -> Self {
+        self.device_identity = config;
+        self
+    }
+
     /// Assemble the server from the named collaborators.
     ///
     /// Everything is built, checked and wired here so no setting is applied
@@ -953,6 +973,7 @@ where
             writable,
             second_opinion,
             content,
+            device_identity,
             resolver,
             deployment_schema: _,
         } = self;
@@ -988,8 +1009,19 @@ where
             });
         }
 
+        if let Some(config) = &device_identity
+            && let Some(expiring) = config
+                .check(SystemTime::now())
+                .map_err(BuildError::DeviceIdentity)?
+        {
+            tracing::warn!(
+                days_left = expiring.left.as_secs() / 86_400,
+                "the device certificate issuer expires soon, sign a new one with connetto-ca"
+            );
+        }
+
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
-        require_schema_tables::<D>(&pool, audit, bans).await?;
+        require_schema_tables::<D>(&pool, audit, bans, device_identity.is_some()).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
@@ -1062,6 +1094,9 @@ where
         }
         .build();
         wire_manager(&manager, &service, &guard, &pool, &feed).await?;
+        if let Some(config) = device_identity {
+            install_device_identity::<D>(&manager, &service, &pool, config);
+        }
 
         Ok(assemble_parts(
             Arc::clone(&manager),
@@ -1161,19 +1196,21 @@ where
 }
 
 /// Refuse a deployment missing a table its schema's members name, the auth
-/// and watermark tables always and the ban and audit tables when turned on.
-/// The file member is the file server's preflight to check. Only names are
-/// checked, never columns.
+/// and watermark tables always and the ban, audit and enrolment tables when
+/// turned on. The file member is the file server's preflight to check. Only
+/// names are checked, never columns.
 async fn require_schema_tables<D: ConnettoSchema>(
     pool: &PgPool,
     audit: bool,
     bans: bool,
+    devices: bool,
 ) -> Result<(), BuildError> {
-    let members: [(&[&str], bool); 4] = [
+    let members: [(&[&str], bool); 5] = [
         (<D::Auth as ConnettoStoreSchema>::TABLES, true),
         (<D::Watermark as ConnettoWatermarkSchema>::TABLES, true),
         (<D::Bans as ConnettoBanSchema>::TABLES, bans),
         (<D::Audit as ConnettoAuditSchema>::TABLES, audit),
+        (<D::Enrolments as ConnettoEnrolmentSchema>::TABLES, devices),
     ];
     let required: Vec<Artifact<'_>> = members
         .into_iter()
@@ -1182,6 +1219,29 @@ async fn require_schema_tables<D: ConnettoSchema>(
         .collect();
     preflight::require(pool, &required).await?;
     Ok(())
+}
+
+/// Enrol devices under `config` into the deployment's enrolment tables on the
+/// owner pool, and revoke in the auth store the session a revoked device last
+/// enrolled with, so its live connection closes and it cannot enrol again.
+fn install_device_identity<D: ConnettoSchema>(
+    manager: &ServerManager<D>,
+    service: &Arc<Service<D>>,
+    pool: &PgPool,
+    config: DeviceCertConfig,
+) {
+    let service = Arc::clone(service);
+    let enrolment = DeviceEnrolment::new(config, pg_enrolment_store::<D>(pool.clone()))
+        .with_session_revoker(Arc::new(move |session| {
+            let service = Arc::clone(&service);
+            Box::pin(async move {
+                if let Err(err) = service.revoke(session).await {
+                    tracing::warn!(error = %err, "a revoked device's session was not revoked");
+                }
+            })
+        }));
+    // The manager was built a moment ago, so nothing installed one before.
+    let _ = manager.install_device_enrolment(Arc::new(enrolment));
 }
 
 /// Check what the change stream needs, then set up the reconnect log and the

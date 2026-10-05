@@ -97,6 +97,7 @@ mod app {
         type Watermark = AppWatermark;
         type Audit = ConnettoAudit;
         type Bans = ConnettoBans;
+        type Enrolments = ConnettoEnrolments;
         type Files = connetto_file_server::DefaultFileSchema;
     }
 }
