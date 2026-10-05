@@ -1,0 +1,54 @@
+---
+name: Dejadoc
+
+"on":
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dejadoc:
+    name: Dejadoc ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write # Post duplicate findings as pull request reviews.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: root
+            cwd: .
+          - name: connetto-web
+            cwd: crates/connetto-web
+          - name: wasm-smoke
+            cwd: examples/wasm-smoke
+          - name: dioxus-web-demo
+            cwd: examples/dioxus-web-demo
+          - name: yew-web-demo
+            cwd: examples/yew-web-demo
+          - name: webauthn-unlock
+            cwd: examples/webauthn-unlock
+          - name: dioxus-desktop-demo
+            cwd: examples/dioxus-desktop-demo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - run: rustup default stable
+
+      - uses: LucaCappelletti94/cargo-dejadoc@5825404aa68b6ff7dc1a745ca79343fcdf47221d
+        with:
+          cwd: ${{ matrix.cwd }}
+          pr-number: ${{ github.event.pull_request.number }}
+          functions: true
+          all-targets: true
+          dry-run: ${{ github.event_name == 'workflow_dispatch' }}
