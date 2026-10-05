@@ -18,7 +18,7 @@ use connetto_server::{
     ConnettoReadSetup, ManagerBuilder, Materializer, PageSpec, RuntimeWritableCatalog,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::{Postgres, ScalarFamily, Value as PgValue};
 use subql::reexec::{AsyncConnector, ReadQuery, RowPage, Snapshot as ConnectorRead};
 use subql::{CdcSource, PgCommitPosition, PgLsn, PgSnapshotFence, PgSqliteEmuSource, SourceItem};
@@ -135,7 +135,7 @@ impl SnapshotSource for NoSnapshot {
     }
 }
 
-type Manager = SessionManager<NoSnapshot, RosterAuth, ConnettoWatermark, QueuedConnector>;
+type Manager = SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults, QueuedConnector>;
 
 async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     match transport.recv().await.expect("recv frame") {
@@ -178,7 +178,7 @@ async fn reexec_bootstraps_folds_and_retriggers() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,

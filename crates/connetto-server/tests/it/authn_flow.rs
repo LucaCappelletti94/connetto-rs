@@ -23,7 +23,7 @@ use connetto_server::{
     TokenAuthority, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{
-    ConnettoWatermark, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth, WITHHELD_ID,
+    ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth, WITHHELD_ID,
 };
 use openidconnect::reqwest;
 use serde_json::json;
@@ -114,7 +114,7 @@ fn manager_with(
     authority: Arc<dyn HandshakeAuthority>,
     snapshot: CapturingSnapshot,
     fixture: &Fixture,
-) -> Arc<SessionManager<CapturingSnapshot, RosterAuth, ConnettoWatermark>> {
+) -> Arc<SessionManager<CapturingSnapshot, RosterAuth, ConnettoDefaults>> {
     // Rows come from a snapshot stub, not the change path. The policy is never consulted.
     ManagerBuilder::new(
         Materializer::builder(PG_DDL)
@@ -124,7 +124,7 @@ fn manager_with(
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         authority,
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build()

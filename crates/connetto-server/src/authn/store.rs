@@ -512,6 +512,7 @@ mod db {
     use crate::authn::provider::RetainedProviderToken;
     use crate::authn::schema::{ConnettoStoreSchema, Instant};
     use crate::authn::token::RefreshLifetimes;
+    use crate::schema::ConnettoSchema;
 
     /// The rotation columns a `SELECT ... FOR UPDATE` loads: the typed
     /// `user_id`, the refresh hash, and the two deadlines plus the revoked
@@ -528,19 +529,19 @@ mod db {
     /// across restart and the only variant a promoted standby carries. Identity resolves
     /// through the deployment's [`IdentityResolver`], which owns the users table
     /// the `sessions.user_id` column foreign-keys, so connetto owns no schema.
-    pub struct DbAuthStore<S: ConnettoStoreSchema> {
+    pub struct DbAuthStore<D: ConnettoSchema> {
         pool: Pool<AsyncPgConnection>,
         lifetimes: RefreshLifetimes,
-        resolver: Arc<dyn IdentityResolver<Id = S::Id>>,
+        resolver: Arc<dyn IdentityResolver<Id = <D::Auth as ConnettoStoreSchema>::Id>>,
     }
 
-    impl<S: ConnettoStoreSchema> DbAuthStore<S> {
+    impl<D: ConnettoSchema> DbAuthStore<D> {
         /// Build over a connection pool, resolving identity through `resolver`.
         #[must_use]
         pub fn new(
             pool: Pool<AsyncPgConnection>,
             lifetimes: RefreshLifetimes,
-            resolver: Arc<dyn IdentityResolver<Id = S::Id>>,
+            resolver: Arc<dyn IdentityResolver<Id = <D::Auth as ConnettoStoreSchema>::Id>>,
         ) -> Self {
             Self {
                 pool,
@@ -565,21 +566,21 @@ mod db {
         instant.into()
     }
 
-    impl<S: ConnettoStoreSchema> AuthStore for DbAuthStore<S> {
-        type Id = S::Id;
+    impl<D: ConnettoSchema> AuthStore for DbAuthStore<D> {
+        type Id = <D::Auth as ConnettoStoreSchema>::Id;
 
         async fn create_session(
             &self,
             identity: &ResolvedIdentity,
             now: SystemTime,
-        ) -> Result<IssuedSession<S::Id>, AuthStoreError> {
+        ) -> Result<IssuedSession<<D::Auth as ConnettoStoreSchema>::Id>, AuthStoreError> {
             let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
             let idle = to_instant(now + self.lifetimes.idle_window());
             let absolute = to_instant(now + self.lifetimes.absolute_ceiling());
             let secret = new_refresh_secret();
             let refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
-            let row = S::new_session(
+            let row = <D::Auth as ConnettoStoreSchema>::new_session(
                 session_id,
                 user_id.clone(),
                 refresh_hash,
@@ -588,7 +589,7 @@ mod db {
                 false,
             );
             let mut conn = self.pool.get().await.map_err(backend)?;
-            diesel::insert_into(S::Sessions::default())
+            diesel::insert_into(<D::Auth as ConnettoStoreSchema>::Sessions::default())
                 .values(row)
                 .execute(&mut conn)
                 .await
@@ -609,10 +610,16 @@ mod db {
         ) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             let now = to_instant(now);
-            let base = FilterDsl::filter(S::SessionsQuery::default(), S::session_pk(session_id));
+            let base = FilterDsl::filter(
+                <D::Auth as ConnettoStoreSchema>::SessionsQuery::default(),
+                <D::Auth as ConnettoStoreSchema>::session_pk(session_id),
+            );
             let query = SelectDsl::select(
                 base,
-                (S::Revoked::default(), S::AbsoluteDeadline::default()),
+                (
+                    <D::Auth as ConnettoStoreSchema>::Revoked::default(),
+                    <D::Auth as ConnettoStoreSchema>::AbsoluteDeadline::default(),
+                ),
             );
             let live: Option<(bool, Instant)> =
                 query.first(&mut conn).await.optional().map_err(backend)?;
@@ -623,7 +630,7 @@ mod db {
             &self,
             refresh_token: &str,
             now: SystemTime,
-        ) -> Result<RefreshOutcome<S::Id>, AuthStoreError> {
+        ) -> Result<RefreshOutcome<<D::Auth as ConnettoStoreSchema>::Id>, AuthStoreError> {
             let (session_id, secret) =
                 split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
             let presented_hash = hash_secret(secret).to_vec();
@@ -636,11 +643,12 @@ mod db {
                 conn.transaction::<_, AuthStoreError, _>(async move |conn| {
                     // Lock the row so two concurrent refreshers cannot both
                     // rotate and trip the reuse defense.
-                    let row: Option<SessionRow<S>> = S::session_row_for_update(session_id)
-                        .get_result(conn)
-                        .await
-                        .optional()
-                        .map_err(backend)?;
+                    let row: Option<SessionRow<D::Auth>> =
+                        <D::Auth as ConnettoStoreSchema>::session_row_for_update(session_id)
+                            .get_result(conn)
+                            .await
+                            .optional()
+                            .map_err(backend)?;
                     let (user_id, current_hash, idle_deadline, absolute_deadline, revoked) =
                         row.ok_or(AuthStoreError::NotFound)?;
                     if revoked {
@@ -657,10 +665,14 @@ mod db {
                         return Err(AuthStoreError::Reuse { session_id });
                     }
                     let capped_idle = idle.min(absolute_deadline);
-                    S::rotation_update(session_id, new_hash, capped_idle)
-                        .execute(conn)
-                        .await
-                        .map_err(backend)?;
+                    <D::Auth as ConnettoStoreSchema>::rotation_update(
+                        session_id,
+                        new_hash,
+                        capped_idle,
+                    )
+                    .execute(conn)
+                    .await
+                    .map_err(backend)?;
                     let context = AuthContext { user_id };
                     Ok(RefreshOutcome {
                         session_id,
@@ -672,7 +684,7 @@ mod db {
                 .await
             };
             if matches!(outcome, Err(AuthStoreError::Reuse { .. })) {
-                S::revoke_update(session_id)
+                <D::Auth as ConnettoStoreSchema>::revoke_update(session_id)
                     .execute(&mut conn)
                     .await
                     .map_err(backend)?;
@@ -682,7 +694,7 @@ mod db {
 
         async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            S::revoke_update(session_id)
+            <D::Auth as ConnettoStoreSchema>::revoke_update(session_id)
                 .execute(&mut conn)
                 .await
                 .map_err(backend)?;
@@ -691,7 +703,7 @@ mod db {
 
         async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let revoked = S::revoke_every_update()
+            let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update()
                 .execute(&mut conn)
                 .await
                 .map_err(backend)?;
@@ -711,11 +723,12 @@ mod db {
             // the schema trait: it already selects the refresh hash and the
             // revoked flag, and its row lock serializes a logout against a
             // refresh landing at the same moment.
-            let row: Option<SessionRow<S>> = S::session_row_for_update(session_id)
-                .get_result(&mut conn)
-                .await
-                .optional()
-                .map_err(backend)?;
+            let row: Option<SessionRow<D::Auth>> =
+                <D::Auth as ConnettoStoreSchema>::session_row_for_update(session_id)
+                    .get_result(&mut conn)
+                    .await
+                    .optional()
+                    .map_err(backend)?;
             let Some((_, current_hash, _, _, revoked)) = row else {
                 return Ok(None);
             };
@@ -733,22 +746,24 @@ mod db {
         ) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
             let expires_at = token.expires_at.map(to_instant);
-            let row = S::new_provider_token(
+            let row = <D::Auth as ConnettoStoreSchema>::new_provider_token(
                 session_id,
                 token.issuer.clone(),
                 token.access_token.clone(),
                 token.refresh_token.clone(),
                 expires_at,
             );
-            diesel::insert_into(S::ProviderTokens::default())
+            diesel::insert_into(<D::Auth as ConnettoStoreSchema>::ProviderTokens::default())
                 .values(row)
-                .on_conflict(S::PtSessionId::default())
+                .on_conflict(<D::Auth as ConnettoStoreSchema>::PtSessionId::default())
                 .do_update()
                 .set((
-                    S::PtIssuer::default().eq(token.issuer.clone()),
-                    S::PtAccessToken::default().eq(token.access_token.clone()),
-                    S::PtRefreshToken::default().eq(token.refresh_token.clone()),
-                    S::PtExpiresAt::default().eq(expires_at),
+                    <D::Auth as ConnettoStoreSchema>::PtIssuer::default().eq(token.issuer.clone()),
+                    <D::Auth as ConnettoStoreSchema>::PtAccessToken::default()
+                        .eq(token.access_token.clone()),
+                    <D::Auth as ConnettoStoreSchema>::PtRefreshToken::default()
+                        .eq(token.refresh_token.clone()),
+                    <D::Auth as ConnettoStoreSchema>::PtExpiresAt::default().eq(expires_at),
                 ))
                 .execute(&mut conn)
                 .await
@@ -761,14 +776,17 @@ mod db {
             session_id: SessionId,
         ) -> Result<Option<RetainedProviderToken>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let base = FilterDsl::filter(S::ProviderTokensQuery::default(), S::pt_pk(session_id));
+            let base = FilterDsl::filter(
+                <D::Auth as ConnettoStoreSchema>::ProviderTokensQuery::default(),
+                <D::Auth as ConnettoStoreSchema>::pt_pk(session_id),
+            );
             let query = SelectDsl::select(
                 base,
                 (
-                    S::PtIssuer::default(),
-                    S::PtAccessToken::default(),
-                    S::PtRefreshToken::default(),
-                    S::PtExpiresAt::default(),
+                    <D::Auth as ConnettoStoreSchema>::PtIssuer::default(),
+                    <D::Auth as ConnettoStoreSchema>::PtAccessToken::default(),
+                    <D::Auth as ConnettoStoreSchema>::PtRefreshToken::default(),
+                    <D::Auth as ConnettoStoreSchema>::PtExpiresAt::default(),
                 ),
             );
             let row: Option<(String, String, Option<String>, Option<Instant>)> =

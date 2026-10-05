@@ -23,7 +23,7 @@ use connetto_server::{
     ReconnectPolicy, ResumePoint, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
     TimelineHistory, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::{
     CdcSource, PgChangeEvent, PgCommit, PgCommitPosition, PgLsn, PgSqliteEmuSource, SourceItem,
 };
@@ -143,7 +143,7 @@ fn two_row_transaction() -> (PgChangeEvent, PgChangeEvent, PgCommit) {
     (first, second, commit)
 }
 
-type Manager = SessionManager<EmptySnapshot, RosterAuth, ConnettoWatermark, NoConnector, PgOplog>;
+type Manager = SessionManager<EmptySnapshot, RosterAuth, ConnettoDefaults, NoConnector, PgOplog>;
 
 /// A manager over a fresh log table, and a second handle on that table for the test to read it through.
 async fn manager(fixture: &Fixture) -> (Arc<Manager>, PgOplog) {
@@ -163,7 +163,7 @@ async fn manager(fixture: &Fixture) -> (Arc<Manager>, PgOplog) {
         RosterAuth::granting("alice").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_oplog(PgOplog::new(

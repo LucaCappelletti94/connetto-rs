@@ -3,9 +3,9 @@
 //!
 //! connetto owns no schema. A deployment declares the table (see
 //! `docs/architecture/08-authorization.md`) and implements [`ConnettoAuditSchema`]
-//! for it, by hand or through the
-//! [`connetto_audit_table!`](crate::connetto_audit_table) convenience macro. The
-//! same arrangement as [`ConnettoStoreSchema`](crate::authn::schema::ConnettoStoreSchema)
+//! for it, by hand or through [`connetto_schema!`](crate::connetto_schema), and
+//! names it as the `Audit` member of its
+//! [`ConnettoSchema`](crate::schema::ConnettoSchema). The same arrangement as [`ConnettoStoreSchema`](crate::authn::schema::ConnettoStoreSchema)
 //! and [`ConnettoWatermarkSchema`](crate::watermark_schema::ConnettoWatermarkSchema).
 //!
 //! **This table holds state changes, never denials.** A caller probing keys
@@ -177,6 +177,10 @@ pub trait ConnettoAuditSchema: Send + Sync + 'static {
     /// carries.
     type Id: Clone + core::fmt::Display + Send + Sync + 'static;
 
+    /// The tables this member reads and writes, by name, which startup
+    /// requires to exist (R98 decision 5).
+    const TABLES: &'static [&'static str];
+
     /// The type this table stores a shared row's key as.
     ///
     /// The application's choice, like `Id` beside it, because connetto has no
@@ -216,16 +220,19 @@ pub trait ConnettoAuditSchema: Send + Sync + 'static {
 /// carries an associated statement type and so cannot be a trait object.
 pub type AuditHook<Id> = std::sync::Arc<dyn Fn(AuthEvent<Id>) + Send + Sync>;
 
-/// An [`AuditHook`] that appends through `A` on the given pool.
+/// An [`AuditHook`] that appends through the deployment's audit table, `D`'s
+/// [`Audit`] member, on the given pool.
 ///
 /// The write is spawned, so the producer is never delayed by it, and a failure
 /// is logged rather than propagated: losing an audit row must not fail the
 /// logout, revocation or mint that produced it.
-pub fn pg_audit_hook<A>(pool: Pool<AsyncPgConnection>) -> AuditHook<A::Id>
+///
+/// [`Audit`]: crate::schema::ConnettoSchema::Audit
+pub fn pg_audit_hook<D>(pool: Pool<AsyncPgConnection>) -> AuditHook<D::Id>
 where
-    A: ConnettoAuditSchema,
+    D: crate::schema::ConnettoSchema,
 {
-    std::sync::Arc::new(move |event: AuthEvent<A::Id>| {
+    std::sync::Arc::new(move |event: AuthEvent<D::Id>| {
         let pool = pool.clone();
         let op = event.op;
         tokio::spawn(async move {
@@ -236,7 +243,8 @@ where
                     return;
                 }
             };
-            if let Err(error) = ExecuteDsl::execute(A::audit_insert(event), &mut conn).await {
+            if let Err(error) = ExecuteDsl::execute(D::Audit::audit_insert(event), &mut conn).await
+            {
                 tracing::warn!(%error, op = op.label(), "audit row dropped, insert failed");
             }
         });
@@ -268,6 +276,7 @@ where
 /// );
 /// // now `ConnettoAudit` implements `ConnettoAuditSchema`.
 /// ```
+#[doc(hidden)]
 #[macro_export]
 macro_rules! connetto_audit_table {
     ($id:ty, $id_sql:ty, $pk:ty, $pk_sql:ty $(,)?) => {
@@ -310,6 +319,7 @@ macro_rules! connetto_audit_table {
 
         impl $crate::audit::ConnettoAuditSchema for ConnettoAudit {
             type Id = $id;
+            const TABLES: &'static [&'static str] = &["auth_events"];
             type RowKey = $pk;
             type Insert = diesel::query_builder::InsertStatement<
                 auth_events::table,

@@ -14,6 +14,7 @@ mod content;
 mod ws;
 
 use std::fmt;
+use std::marker::PhantomData;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,19 +24,23 @@ use thiserror::Error;
 use tokio::net::TcpListener;
 use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin, CorsLayer};
 
-use crate::audit::pg_audit_hook;
-use crate::defaults::{ConnettoAudit, ConnettoAuthSchema, ConnettoBans, ConnettoWatermark};
+use crate::audit::{ConnettoAuditSchema, pg_audit_hook};
+use crate::authn::schema::ConnettoStoreSchema;
+use crate::ban::ConnettoBanSchema;
+use crate::defaults::ConnettoDefaults;
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
 use crate::openfga::{Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated};
 use crate::oplog::{OplogConfig, PgOplog};
 use crate::reach::GrantReach;
 use crate::reserve::{ReaderGate, ReaderReserve};
+use crate::schema::ConnettoSchema;
 use crate::session::{
     ReconnectEvent, ReconnectPolicy, ResumePoint, SessionConfig, SessionError, SessionManager,
     StreamCheck, StreamCheckError,
 };
 use crate::throttle::ThrottleConfig;
+use crate::watermark_schema::ConnettoWatermarkSchema;
 use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
@@ -54,10 +59,10 @@ use subql::{ParserDB, PgStreamingCdcSource, PgStreamingConfig};
 
 use crate::{
     AbuseConfig, Artifact, AuthConfig, AuthService, CallerMappings, CookieSameSite, DbAuthStore,
-    DefaultUuidResolver, GenericOidcProvider, OidcProviderConfig, PgReadConnector,
-    PgSnapshotSource, PgWriteTarget, ProviderRegistry, RedirectPolicy, RequestGuard, RlsAuth,
-    RuntimeWritableCatalog, TokenAuthority, auth_router, is_loopback_host, pg_ban_store,
-    pg_write_target, preflight,
+    DefaultUuidResolver, GenericOidcProvider, IdentityResolver, OidcProviderConfig,
+    PgReadConnector, PgSnapshotSource, PgWriteTarget, ProviderRegistry, RedirectPolicy,
+    RequestGuard, RlsAuth, RuntimeWritableCatalog, TokenAuthority, auth_router, is_loopback_host,
+    pg_ban_store, pg_write_target, preflight,
 };
 
 /// The path the sync route answers on.
@@ -71,23 +76,24 @@ pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 pub use content::{ContentBuildError, ContentSettings, StoreSpec};
 
 /// The auth service the assembled server runs, over the database store of
-/// connetto's auth tables.
-type Service = AuthService<DbAuthStore<ConnettoAuthSchema>>;
+/// the deployment's auth tables.
+type Service<D> = AuthService<DbAuthStore<D>>;
 
 /// The Postgres pool every assembled server owns.
 type PgPool = Pool<AsyncPgConnection>;
 
 /// The change-path executor the assembled server serves through.
-type ServerAuth = FgaAuth<String, String, Counted<Channel>>;
+type ServerAuth<Id> = FgaAuth<Id, String, Counted<Channel>>;
 
-/// The concrete session manager the assembled server runs.
-pub type ServerManager = SessionManager<
+/// The concrete session manager the assembled server runs over the
+/// deployment's schema `D`.
+pub type ServerManager<D = ConnettoDefaults> = SessionManager<
     PgSnapshotSource,
-    ServerAuth,
-    ConnettoWatermark,
+    ServerAuth<<D as ConnettoSchema>::Id>,
+    D,
     PgReadConnector,
     PgOplog,
-    String,
+    <D as ConnettoSchema>::Id,
     String,
     ContentSigner,
 >;
@@ -467,7 +473,10 @@ pub enum ServeError {
 }
 
 /// The assembled server, unbound.
-pub struct ServerParts {
+pub struct ServerParts<D = ConnettoDefaults>
+where
+    D: ConnettoSchema,
+{
     /// The merged router, sync route and HTTP routes.
     pub router: Router,
     /// The sync route alone, for a deployment that serves WebSocket traffic
@@ -480,7 +489,7 @@ pub struct ServerParts {
     /// ends with a [`ServeError`] when delivery can no longer be live.
     pub change_stream: ChangeStream,
     /// The shutdown handle.
-    pub handle: ServerHandle,
+    pub handle: ServerHandle<D>,
 }
 
 /// The change-stream future the parts hand over.
@@ -517,14 +526,32 @@ impl BackgroundTask {
 }
 
 /// The shutdown half of a built server.
-#[derive(Clone)]
-pub struct ServerHandle {
-    manager: Arc<ServerManager>,
+pub struct ServerHandle<D = ConnettoDefaults>
+where
+    D: ConnettoSchema,
+{
+    manager: Arc<ServerManager<D>>,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
 }
 
-impl ServerHandle {
+impl<D> Clone for ServerHandle<D>
+where
+    D: ConnettoSchema,
+{
+    fn clone(&self) -> Self {
+        Self {
+            manager: Arc::clone(&self.manager),
+            lag_watch: self.lag_watch.clone(),
+            sweep: self.sweep.clone(),
+        }
+    }
+}
+
+impl<D> ServerHandle<D>
+where
+    D: ConnettoSchema,
+{
     /// Stop the background loops the build started, close every live session
     /// with `ServerShuttingDown` and wait up to [`SHUTDOWN_GRACE`] for their
     /// own close, so the close frame is delivered rather than raced. Returns
@@ -547,7 +574,7 @@ impl ServerHandle {
     }
 }
 
-async fn close_every_session(manager: &Arc<ServerManager>) {
+async fn close_every_session<D: ConnettoSchema>(manager: &Arc<ServerManager<D>>) {
     let told = manager.shutdown().await;
     tracing::info!(closed = told, "closed every session");
     await_sessions_drained(manager).await;
@@ -556,7 +583,7 @@ async fn close_every_session(manager: &Arc<ServerManager>) {
 // The close frame is queued, not sent, and the registry drains at the
 // moment of the close, so the exit waits on the run loops that are still
 // open rather than on the registry.
-async fn await_sessions_drained(manager: &ServerManager) {
+async fn await_sessions_drained<D: ConnettoSchema>(manager: &ServerManager<D>) {
     let poll = async {
         while manager.open_sessions() > 0 {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -567,9 +594,10 @@ async fn await_sessions_drained(manager: &ServerManager) {
     }
 }
 
-/// The one assembly path for the connetto server.
+/// The one assembly path for the connetto server, over the deployment's
+/// schema `D`.
 #[derive(Debug)]
-pub struct ServerBuilder {
+pub struct ServerBuilder<D: ConnettoSchema = ConnettoDefaults> {
     database: Database,
     schema: ServerSchema,
     keys: TokenKeys,
@@ -595,6 +623,18 @@ pub struct ServerBuilder {
     writable: RuntimeWritableCatalog,
     second_opinion: bool,
     content: Option<ContentSettings>,
+    resolver: Resolver<D::Id>,
+    deployment_schema: PhantomData<fn() -> D>,
+}
+
+/// The identity resolver a login maps its verified claims through, opaque to
+/// the builder's `Debug`.
+struct Resolver<Id>(Arc<dyn IdentityResolver<Id = Id>>);
+
+impl<Id> fmt::Debug for Resolver<Id> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Resolver(..)")
+    }
 }
 
 impl ServerBuilder {
@@ -634,7 +674,91 @@ impl ServerBuilder {
             writable: RuntimeWritableCatalog::default(),
             second_opinion: false,
             content: None,
+            resolver: Resolver(Arc::new(DefaultUuidResolver)),
+            deployment_schema: PhantomData,
         }
+    }
+}
+
+impl<D> ServerBuilder<D>
+where
+    D: ConnettoSchema,
+{
+    /// Serve over the deployment's own tables, named by `E`, in place of
+    /// [`ConnettoDefaults`], resolving each login to `E`'s user id through
+    /// `resolver`.
+    #[must_use]
+    pub fn deployment_schema<E: ConnettoSchema>(
+        self,
+        resolver: Arc<dyn IdentityResolver<Id = E::Id>>,
+    ) -> ServerBuilder<E> {
+        let Self {
+            database,
+            schema,
+            keys,
+            openfga,
+            slot,
+            publication,
+            oplog_table,
+            owner_pool_size,
+            slot_lag_watch,
+            oplog_config,
+            reader_reserve,
+            throttle,
+            abuse,
+            audit,
+            bans,
+            oidc_providers,
+            auth_config,
+            redirect_allowlist,
+            cors_origins,
+            cookie_same_site,
+            session_config,
+            reconnect_policy,
+            writable,
+            second_opinion,
+            content,
+            resolver: _,
+            deployment_schema: _,
+        } = self;
+        ServerBuilder {
+            database,
+            schema,
+            keys,
+            openfga,
+            slot,
+            publication,
+            oplog_table,
+            owner_pool_size,
+            slot_lag_watch,
+            oplog_config,
+            reader_reserve,
+            throttle,
+            abuse,
+            audit,
+            bans,
+            oidc_providers,
+            auth_config,
+            redirect_allowlist,
+            cors_origins,
+            cookie_same_site,
+            session_config,
+            reconnect_policy,
+            writable,
+            second_opinion,
+            content,
+            resolver: Resolver(resolver),
+            deployment_schema: PhantomData,
+        }
+    }
+
+    /// Resolve each login's verified claims to the deployment's user id
+    /// through `resolver`, which owns minting and linking rows in the
+    /// deployment's users table. Defaults to [`DefaultUuidResolver`].
+    #[must_use]
+    pub fn identity_resolver(mut self, resolver: Arc<dyn IdentityResolver<Id = D::Id>>) -> Self {
+        self.resolver = Resolver(resolver);
+        self
     }
 
     /// Name the logical replication slot, `pgoutput` plugin.
@@ -802,7 +926,7 @@ impl ServerBuilder {
         clippy::too_many_lines,
         reason = "startup reads as one straight deployment, in the order the checks must run"
     )]
-    pub async fn build(self) -> Result<ServerParts, BuildError> {
+    pub async fn build(self) -> Result<ServerParts<D>, BuildError> {
         let Self {
             database,
             schema,
@@ -829,6 +953,8 @@ impl ServerBuilder {
             writable,
             second_opinion,
             content,
+            resolver,
+            deployment_schema: _,
         } = self;
 
         if oidc_providers.is_empty() {
@@ -863,6 +989,7 @@ impl ServerBuilder {
         }
 
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
+        require_schema_tables::<D>(&pool, audit, bans).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
@@ -876,9 +1003,10 @@ impl ServerBuilder {
         let connector = PgReadConnector::with_session_setup(pool.clone());
         let engine_connector = PgReadConnector::with_session_setup(pool.clone());
         let reader_pool_size = reader_reserve.total();
-        let guard = build_guard(&pool, reader_reserve.gate(), &throttle, abuse, bans);
-        let (service, registry) = build_auth(
+        let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
+        let (service, registry) = build_auth::<D>(
             &pool,
+            resolver.0,
             Arc::clone(&guard),
             audit,
             &oidc_providers,
@@ -886,11 +1014,12 @@ impl ServerBuilder {
             &auth_config,
         )
         .await?;
-        let authority: Arc<dyn HandshakeAuthority> = Arc::new(service.handshake_authority());
+        let authority: Arc<dyn HandshakeAuthority<D::Id>> = Arc::new(service.handshake_authority());
 
         let reader =
-            build_reader_side(&database, reader_pool_size, &schema, &publication, content).await?;
-        let write_side = build_write_side(
+            build_reader_side::<D>(&database, reader_pool_size, &schema, &publication, content)
+                .await?;
+        let write_side = build_write_side::<D>(
             Pools {
                 owner: pool.clone(),
                 reader: reader.pool,
@@ -1031,6 +1160,30 @@ impl ServerBuilder {
     }
 }
 
+/// Refuse a deployment missing a table its schema's members name, the auth
+/// and watermark tables always and the ban and audit tables when turned on.
+/// The file member is the file server's preflight to check. Only names are
+/// checked, never columns.
+async fn require_schema_tables<D: ConnettoSchema>(
+    pool: &PgPool,
+    audit: bool,
+    bans: bool,
+) -> Result<(), BuildError> {
+    let members: [(&[&str], bool); 4] = [
+        (<D::Auth as ConnettoStoreSchema>::TABLES, true),
+        (<D::Watermark as ConnettoWatermarkSchema>::TABLES, true),
+        (<D::Bans as ConnettoBanSchema>::TABLES, bans),
+        (<D::Audit as ConnettoAuditSchema>::TABLES, audit),
+    ];
+    let required: Vec<Artifact<'_>> = members
+        .into_iter()
+        .filter(|(_, used)| *used)
+        .flat_map(|(tables, _)| tables.iter().copied().map(Artifact::Table))
+        .collect();
+    preflight::require(pool, &required).await?;
+    Ok(())
+}
+
 /// Check what the change stream needs, then set up the reconnect log and the
 /// slot watch, handing back the watch's stop handle so a refusal after it
 /// started cannot leave it running. Everything here reads or writes connetto's
@@ -1075,18 +1228,18 @@ async fn prepare_change_log(
 
 /// Build the guard both surfaces share, the request limits and the abuse
 /// thresholds, plus the ban list when asked.
-fn build_guard(
+fn build_guard<D: ConnettoSchema>(
     pool: &PgPool,
     reader_gate: ReaderGate,
     throttle: &ThrottleConfig,
     abuse: AbuseConfig,
     bans: bool,
-) -> Arc<RequestGuard<String>> {
+) -> Arc<RequestGuard<D::Id>> {
     // Bans read and write on the owner pool, because on the reader pool RLS turns an invisible row into zero rows and the fail-closed check never fires.
     let guard = RequestGuard::new(*throttle, abuse).with_reader_gate(reader_gate);
     let guard = if bans {
         tracing::info!("banning identities that cross an abuse threshold");
-        guard.with_bans(pg_ban_store::<ConnettoBans>(pool.clone()))
+        guard.with_bans(pg_ban_store::<D>(pool.clone()))
     } else {
         guard
     };
@@ -1095,25 +1248,16 @@ fn build_guard(
 
 /// Build the auth service and provider registry, the database store and the
 /// persisted keypair.
-async fn build_auth(
+async fn build_auth<D: ConnettoSchema>(
     pool: &PgPool,
-    guard: Arc<RequestGuard<String>>,
+    resolver: Arc<dyn IdentityResolver<Id = D::Id>>,
+    guard: Arc<RequestGuard<D::Id>>,
     audit: bool,
     providers: &[OidcProvider],
     keys: &TokenKeys,
     config: &AuthConfig,
-) -> Result<
-    (
-        Arc<AuthService<DbAuthStore<ConnettoAuthSchema>>>,
-        Arc<ProviderRegistry>,
-    ),
-    BuildError,
-> {
-    let store = DbAuthStore::new(
-        pool.clone(),
-        config.refresh_lifetimes(),
-        Arc::new(DefaultUuidResolver),
-    );
+) -> Result<(Arc<Service<D>>, Arc<ProviderRegistry>), BuildError> {
+    let store = DbAuthStore::<D>::new(pool.clone(), config.refresh_lifetimes(), resolver);
     let authority = TokenAuthority::from_ed_pem(&keys.private, &keys.public, config)
         .map_err(BuildError::TokenKeys)?;
     let http = openidconnect::reqwest::ClientBuilder::new()
@@ -1145,7 +1289,7 @@ async fn build_auth(
     if audit {
         // The same sink on both, because a ban is detected in the guard and
         // every other access change is produced here.
-        let hook = pg_audit_hook::<ConnettoAudit>(pool.clone());
+        let hook = pg_audit_hook::<D>(pool.clone());
         service.guard().set_audit_hook(Arc::clone(&hook));
         service.set_audit_hook(hook);
         tracing::info!("recording access changes to auth_events");
@@ -1155,7 +1299,7 @@ async fn build_auth(
 
 /// The reader pool's three consumers, the pool itself, the file half and the
 /// snapshot source, all built from the same conninfos.
-async fn build_reader_side(
+async fn build_reader_side<D: ConnettoSchema>(
     database: &Database,
     reader_pool_size: u32,
     schema: &ServerSchema,
@@ -1163,7 +1307,7 @@ async fn build_reader_side(
     content: Option<ContentSettings>,
 ) -> Result<ReaderSide, BuildError> {
     let pool = build_pool(&database.reader_url, reader_pool_size).await?;
-    let (signer, file_router, sweep) = content::build(
+    let (signer, file_router, sweep) = content::build::<D>(
         content,
         &database.owner_url,
         &database.reader_url,
@@ -1236,13 +1380,13 @@ fn caller_mapping() -> CallerMappings {
 ///
 /// Two clients over one endpoint, questions through [`Counted`] which is
 /// where the counter lives and the setup calls outside it.
-async fn build_authorization(
+async fn build_authorization<D: ConnettoSchema>(
     owner_pool: &PgPool,
     reader_pool: &PgPool,
     schema: &ServerSchema,
     publication: &str,
     openfga: &OpenFga,
-) -> Result<(ServerAuth, Translator, GrantReach), BuildError> {
+) -> Result<(ServerAuth<D::Id>, Translator, GrantReach), BuildError> {
     let translated =
         Translated::of::<String>(&schema.pg_ddl, &schema.pg_policies, DEFAULT_USER_SETTING)?;
     // A policy reading a table the change stream does not carry never hears
@@ -1312,7 +1456,7 @@ async fn build_authorization(
 /// The manager's write side, the authorization model installed, the
 /// materializer, the second opinion when asked, the upkeep and the write
 /// target.
-async fn build_write_side(
+async fn build_write_side<D: ConnettoSchema>(
     pools: Pools,
     schema: &ServerSchema,
     publication: &str,
@@ -1320,9 +1464,9 @@ async fn build_write_side(
     second_opinion: bool,
     writable: RuntimeWritableCatalog,
     engine_connector: PgReadConnector,
-) -> Result<WriteSide, BuildError> {
+) -> Result<WriteSide<D>, BuildError> {
     let (auth, translator, reach) =
-        build_authorization(&pools.owner, &pools.reader, schema, publication, openfga).await?;
+        build_authorization::<D>(&pools.owner, &pools.reader, schema, publication, openfga).await?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let upkeep_translator = translator.clone();
     let materializer = Materializer::builder(&schema.pg_ddl)
@@ -1334,14 +1478,14 @@ async fn build_write_side(
     // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
     let second = if second_opinion {
         Some(
-            RlsAuth::<String>::from_ddl(pools.reader.clone(), &schema.pg_ddl)
+            RlsAuth::<D::Id, String>::from_ddl(pools.reader.clone(), &schema.pg_ddl)
                 .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
         )
     } else {
         None
     };
     let upkeep = auth.upkeep(reach, upkeep_translator, pools.reader.clone());
-    let write = pg_write_target::<ConnettoWatermark>(pools.reader, &schema.pg_ddl)?;
+    let write = pg_write_target::<D>(pools.reader, &schema.pg_ddl)?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
     let version =
         connetto_schema::translate::<String>(&schema.pg_ddl, &schema.pg_policies)?.version();
@@ -1402,9 +1546,9 @@ fn log_reconnect(event: &ReconnectEvent<'_>) {
 /// Revoke every login session when the feed reads from another cluster, or at
 /// boot when the slot resumed past the reconnect log, then record the cluster
 /// and trim the log (R70 decisions 5, 10 and 18).
-async fn settle_epoch(
-    manager: &ServerManager,
-    service: &Service,
+async fn settle_epoch<D: ConnettoSchema>(
+    manager: &ServerManager<D>,
+    service: &Service<D>,
     pool: &PgPool,
     check: StreamCheck,
     found: crate::epoch::Found,
@@ -1432,10 +1576,10 @@ async fn settle_epoch(
 
 /// The manager's post-boot wiring, the live-close hooks and the epoch
 /// settlement.
-async fn wire_manager(
-    manager: &Arc<ServerManager>,
-    service: &Service,
-    guard: &Arc<RequestGuard<String>>,
+async fn wire_manager<D: ConnettoSchema>(
+    manager: &Arc<ServerManager<D>>,
+    service: &Service<D>,
+    guard: &Arc<RequestGuard<D::Id>>,
     pool: &PgPool,
     feed: &Feed,
 ) -> Result<(), BuildError> {
@@ -1500,20 +1644,20 @@ struct Routes {
 /// The manager's write side, the change-path executor, the materializer, the
 /// second opinion when asked, the upkeep, the write target and the schema
 /// version the sessions advertise.
-struct WriteSide {
-    auth: ServerAuth,
+struct WriteSide<D: ConnettoSchema> {
+    auth: ServerAuth<D::Id>,
     materializer: Materializer<ParserDB, RuntimeWritableCatalog, PgReadConnector>,
-    second: Option<RlsAuth<String>>,
+    second: Option<RlsAuth<D::Id, String>>,
     upkeep: Arc<dyn crate::openfga::StoreUpkeep>,
-    write: PgWriteTarget<ConnettoWatermark>,
+    write: PgWriteTarget<D>,
     version: SchemaVersion,
 }
 
 /// The change-stream future, one reconnecting ingestion that closes every
 /// session before returning a terminal outcome.
-fn change_stream(
-    manager: Arc<ServerManager>,
-    service: Arc<Service>,
+fn change_stream<D: ConnettoSchema>(
+    manager: Arc<ServerManager<D>>,
+    service: Arc<Service<D>>,
     pool: PgPool,
     feed: Feed,
     policy: ReconnectPolicy,
@@ -1587,14 +1731,14 @@ struct StreamWiring {
 }
 
 /// The assembled server's parts, the three routers and the change stream.
-fn assemble_parts(
-    manager: Arc<ServerManager>,
-    service: Arc<Service>,
+fn assemble_parts<D: ConnettoSchema>(
+    manager: Arc<ServerManager<D>>,
+    service: Arc<Service<D>>,
     pool: PgPool,
     registry: Arc<ProviderRegistry>,
     settings: Routes,
     wiring: StreamWiring,
-) -> ServerParts {
+) -> ServerParts<D> {
     let http_routes = auth_router(
         Arc::clone(&service),
         registry,

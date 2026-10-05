@@ -27,7 +27,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SnapshotEstimate,
     SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const PG_DDL: &str =
@@ -151,7 +151,7 @@ async fn snapshot_order_holds_when_the_credit_window_is_closed() {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_session(config)

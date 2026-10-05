@@ -1,13 +1,12 @@
 //! Needs Docker: the fixture starts its own Postgres.
 //!
-//! Exercises the [`ConnettoAuditSchema`] default the `connetto_audit_table!`
-//! macro generates: that a deployment can create the documented table, that
+//! Exercises the [`ConnettoAuditSchema`] default `connetto_schema!`
+//! generates: that a deployment can create the documented table, that
 //! every `op` value survives a round trip through the Postgres enum, and that
 //! the row a share mint names is preserved.
 
 use connetto_core::SessionId;
 use connetto_server::audit::{AUTH_OP_TYPE, AuthEvent, AuthOp, ConnettoAuditSchema};
-use connetto_server::connetto_audit_table;
 use connetto_test_harness::Fixture;
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -21,13 +20,8 @@ use subql::backend::Value;
 static PG_SERIAL: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
-// The reference default schema over `Id = String`, matching `authn_db.rs`.
-connetto_audit_table!(
-    String,
-    diesel::sql_types::Text,
-    uuid::Uuid,
-    diesel::sql_types::Uuid,
-);
+// The default schema over `Id = String`, matching `authn_db.rs`.
+use connetto_server::defaults::{ConnettoAudit, auth_events};
 
 /// Create the deployment-owned audit table. connetto emits no DDL, so the test
 /// owns it, and the SQL mirrors `docs/architecture/08-authorization.md`.

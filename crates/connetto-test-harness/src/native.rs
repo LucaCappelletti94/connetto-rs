@@ -176,7 +176,7 @@ mod tests {
     use super::{NativePrograms, POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
     use crate::Fixture;
     use crate::stack::TempDir;
-    use crate::watermark::_connetto_mutations;
+    use connetto_server::defaults::_connetto_mutations;
 
     /// The directory of the `pg_ctl` on `PATH`, else the newest server
     /// programs of the Debian and Ubuntu layout, which the CI runners ship.

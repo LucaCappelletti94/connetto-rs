@@ -21,7 +21,7 @@ use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, NoConnector, PgSnapshotSource, RequestGuard,
     SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth};
 use pg_walstream::{ChangeEvent, Lsn};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use subql::{PgChangeEvent, PgCommitPosition, PgLsn, PgXid};
@@ -33,7 +33,7 @@ const PG_DDL: &str = "CREATE TABLE things (id INT PRIMARY KEY, body TEXT); \
 
 /// The manager these tests serve: the real Postgres read, a policy the initial
 /// read never consults, and no re-execution connector.
-type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark>;
+type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults>;
 
 /// The read limits one tier gets, as this test wants them.
 fn limits(page_bytes: u64, row_ceiling: u64, timeout: Duration) -> Arc<RequestGuard<String>> {
@@ -62,7 +62,7 @@ fn manager(fixture: &Fixture, guard: Arc<RequestGuard<String>>) -> Arc<Manager> 
         RosterAuth::granting_nobody(),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_guard(guard)
@@ -459,12 +459,12 @@ mod aggregates {
         RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
         pg_write_target,
     };
-    use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
+    use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
     use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
     use tracing::Instrument;
 
     /// A manager whose aggregates read through connetto's own connector.
-    type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
+    type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
     /// One in-process client on its own session, as the row tests do it, over
     /// the manager type that carries a connector.
@@ -506,7 +506,7 @@ mod aggregates {
             RosterAuth::granting_nobody(),
             Arc::new(TestGrantChecker),
             PgReadConnector::with_session_setup(pool.clone()),
-            pg_write_target::<ConnettoWatermark>(pool, PG_DDL).expect("build write target"),
+            pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build write target"),
         )
         .with_guard(guard)
         .build()

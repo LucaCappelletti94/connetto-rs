@@ -15,7 +15,7 @@ use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, NoConnector, RequestGuard, RuntimeWritableCatalog,
     SessionManager, ThrottleConfig, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 
 use super::rls_write_filter::{
     NoSnapshot, PG_DDL, barrier, handshake, insert_changeset, next_control, notes, setup, upload,
@@ -45,7 +45,7 @@ fn incompressible_body(len: usize) -> String {
 fn manager(
     writer_pool: diesel_async::pooled_connection::bb8::Pool<diesel_async::AsyncPgConnection>,
     limit: u64,
-) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoWatermark, connetto_server::NoConnector>> {
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults, connetto_server::NoConnector>> {
     let materializer = Materializer::builder(PG_DDL)
         .with_write_catalog(
             RuntimeWritableCatalog::builder()
@@ -55,7 +55,7 @@ fn manager(
         .build()
         .expect("build materializer");
     let target =
-        pg_write_target::<ConnettoWatermark>(writer_pool, PG_DDL).expect("build write target");
+        pg_write_target::<ConnettoDefaults>(writer_pool, PG_DDL).expect("build write target");
     let guard = RequestGuard::new(
         ThrottleConfig::new().with_mutation_bytes_per_identity(limit, WINDOW),
         AbuseConfig::default(),

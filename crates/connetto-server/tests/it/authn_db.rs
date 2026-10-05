@@ -8,17 +8,15 @@ use std::time::SystemTime;
 
 use connetto_server::{
     AuthConfig, AuthStore, AuthStoreError, DbAuthStore, DefaultUuidResolver, ResolvedIdentity,
-    RetainedProviderToken, connetto_auth_tables,
+    RetainedProviderToken,
 };
 use connetto_test_harness::Fixture;
 use diesel::sql_query;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 
-// The reference default schema over `Id = String` (Text `user_id`): generates
-// `ConnettoAuthSchema` plus the `connetto_sessions`/`connetto_provider_tokens`
-// diesel tables the store queries against.
-connetto_auth_tables!(String, diesel::sql_types::Text);
+// The default schema over `Id = String`, a Text `user_id`.
+use connetto_server::defaults::ConnettoDefaults;
 
 /// Reset the deployment-owned auth tables. connetto emits no DDL, so the test
 /// owns the migration. `CREATE TABLE` and `DROP TABLE` are DDL the typed DSL
@@ -43,7 +41,7 @@ async fn reset_auth_tables(pool: &Pool<AsyncPgConnection>) {
 
 /// Build the database store over the default schema, resolving identity to a
 /// deterministic UUID v5 (the in-memory default resolver, run against Postgres).
-fn build_store(pool: &Pool<AsyncPgConnection>) -> DbAuthStore<ConnettoAuthSchema> {
+fn build_store(pool: &Pool<AsyncPgConnection>) -> DbAuthStore<ConnettoDefaults> {
     DbAuthStore::new(
         pool.clone(),
         AuthConfig::default().refresh_lifetimes(),

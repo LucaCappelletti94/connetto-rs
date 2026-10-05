@@ -13,7 +13,7 @@ use connetto_server::{
     RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, committed_at};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, committed_at};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -22,7 +22,7 @@ use tracing::Instrument;
 
 const DDL: &str = "CREATE TABLE counts (id INT PRIMARY KEY, n INT)";
 
-type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
+type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 fn connect_to(manager: &Arc<Manager>) -> Client {
     let (server_end, client_end) = loopback();
@@ -64,7 +64,7 @@ fn full_manager(
         auth,
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(connector_pool),
-        pg_write_target::<ConnettoWatermark>(write_pool, schema_ddl).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(write_pool, schema_ddl).expect("build write target"),
     )
     .with_guard(guard)
     .build()

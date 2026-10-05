@@ -16,7 +16,7 @@ use connetto_server::{
     ConnettoReadSetup, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
     SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use dioxus::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -304,7 +304,7 @@ async fn use_live_renders_and_follows_cdc() {
         .with_read_connector(connector.clone())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -386,7 +386,7 @@ async fn use_live_fn_follows_a_boxed_row_query() {
     let materializer = Materializer::builder(PG_DDL)
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,

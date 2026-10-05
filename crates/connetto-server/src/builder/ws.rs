@@ -9,6 +9,7 @@ use axum::routing::any;
 use thiserror::Error;
 
 use crate::builder::ServerManager;
+use crate::schema::ConnettoSchema;
 use connetto_core::codec::{
     TAG_BULK, TAG_CONTROL, decode_bulk, decode_control, encode_bulk, encode_control,
 };
@@ -92,7 +93,7 @@ impl Transport for AxumWebSocketTransport {
 
 /// The one sync route: a WebSocket upgrade at [`SYNC_PATH`] that serves one
 /// session over the upgraded socket.
-pub(crate) fn sync_routes(manager: Arc<ServerManager>) -> Router {
+pub(crate) fn sync_routes<D: ConnettoSchema>(manager: Arc<ServerManager<D>>) -> Router {
     Router::new().route(
         SYNC_PATH,
         any(move |ws: WebSocketUpgrade| {

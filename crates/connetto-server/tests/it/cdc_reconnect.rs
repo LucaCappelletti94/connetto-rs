@@ -29,7 +29,7 @@ use connetto_server::{
     SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{
-    ConnettoWatermark, Fixture, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID,
+    ConnettoDefaults, Fixture, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID,
 };
 use diesel::prelude::*;
 use diesel::sql_query;
@@ -173,7 +173,7 @@ async fn cdc_ingest_reconnects_after_walsender_drop() {
         RosterAuth::granting("reader").withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

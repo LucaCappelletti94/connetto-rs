@@ -38,7 +38,7 @@ use connetto_server::{
     RequestGuard, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, ThrottleConfig,
     TierLimits, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const PG_DDL: &str =
@@ -105,7 +105,7 @@ impl SnapshotSource for SeedSnapshot {
     }
 }
 
-type Manager = Arc<SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>>;
+type Manager = Arc<SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults>>;
 
 /// Build a manager whose only unusual setting is the throttle.
 fn manager(fixture: &Fixture, throttle: &ThrottleConfig) -> Manager {
@@ -119,7 +119,7 @@ fn manager(fixture: &Fixture, throttle: &ThrottleConfig) -> Manager {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_guard(Arc::new(RequestGuard::new(
@@ -471,7 +471,7 @@ async fn a_tripped_credential_limit_stops_checking_grants() {
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         Arc::new(CountingAuthority(Arc::clone(&checked))),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_guard(Arc::new(RequestGuard::new(

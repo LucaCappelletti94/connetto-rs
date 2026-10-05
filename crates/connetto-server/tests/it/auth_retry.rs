@@ -22,7 +22,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectEvent, SessionError,
     SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoDefaults, Fixture};
 use subql::backend::Postgres;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource};
@@ -145,7 +145,7 @@ async fn dispatch_event_returns_auth_unavailable_and_holds_cursor() {
         AlwaysErrSee,
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -228,7 +228,7 @@ async fn ingest_emits_auth_retry_events_and_broadcasts_pause_resume() {
         AlwaysErrSee,
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

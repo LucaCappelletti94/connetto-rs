@@ -35,7 +35,7 @@ use connetto_server::{
     SnapshotEstimate, SnapshotPage, SnapshotSource, TimelineHistory, Unseen, loopback,
     pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -189,7 +189,7 @@ async fn expect_idle<T: Transport>(transport: &mut T) {
 /// The emulator stamps monotonic LSNs, which the LSN-keyed oplog relies on.
 async fn drive<A, O>(
     source: &mut PgSqliteEmuSource,
-    manager: &SessionManager<SeedSnapshot, A, ConnettoWatermark, NoConnector, O>,
+    manager: &SessionManager<SeedSnapshot, A, ConnettoDefaults, NoConnector, O>,
     sql: &str,
 ) -> Vec<PgChangeEvent>
 where
@@ -229,7 +229,7 @@ fn cursor_of(event: &PgChangeEvent) -> Cursor {
 /// Open a session on `manager`, send the handshake carrying `resume`, and read
 /// the ack. Returns the client half and the server task handle.
 async fn open_session<A>(
-    manager: &Arc<SessionManager<SeedSnapshot, A, ConnettoWatermark>>,
+    manager: &Arc<SessionManager<SeedSnapshot, A, ConnettoDefaults>>,
     client_id: &str,
     resume: Option<Cursor>,
 ) -> (LoopbackTransport, tokio::task::JoinHandle<()>)
@@ -284,7 +284,7 @@ async fn catchup_within_window_streams_missed_ops() {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -407,7 +407,7 @@ async fn cursor_outside_window_forces_full_resync() {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_oplog(oplog)
@@ -476,7 +476,7 @@ async fn tombstone_replays_the_delete() {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();
@@ -681,7 +681,7 @@ impl Oplog for ScriptedOplog {
 }
 
 type ScriptedManager =
-    SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark, NoConnector, ScriptedOplog>;
+    SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults, NoConnector, ScriptedOplog>;
 
 /// Open a session on the scripted manager, printing the error it ends with, and read the ack.
 async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> LoopbackTransport {
@@ -726,7 +726,7 @@ async fn scripted(
         RosterAuth::granting("client-a"),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_oplog(ScriptedOplog {
@@ -925,7 +925,7 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
 const RESTART_OPLOG: &str = "connetto_oplog_restart";
 
 type RestartManager =
-    SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark, NoConnector, PgOplog>;
+    SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults, NoConnector, PgOplog>;
 
 /// A manager over the existing restart log table, as a restarted process builds it.
 fn restarted_manager(fixture: &Fixture) -> Arc<RestartManager> {
@@ -937,7 +937,7 @@ fn restarted_manager(fixture: &Fixture) -> Arc<RestartManager> {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .with_oplog(PgOplog::new(
@@ -1095,7 +1095,7 @@ impl SnapshotSource for FencedSeed {
     }
 }
 
-type FencedManager = SessionManager<FencedSeed, RosterAuth, ConnettoWatermark>;
+type FencedManager = SessionManager<FencedSeed, RosterAuth, ConnettoDefaults>;
 
 fn fenced_manager(fixture: &Fixture, seed: FencedSeed) -> Arc<FencedManager> {
     ManagerBuilder::new(
@@ -1106,7 +1106,7 @@ fn fenced_manager(fixture: &Fixture, seed: FencedSeed) -> Arc<FencedManager> {
         RosterAuth::granting("client-a").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build()

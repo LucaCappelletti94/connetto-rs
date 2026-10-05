@@ -107,14 +107,14 @@ mod rls {
     /// same RLS context against Postgres, so the database itself rejects a
     /// policy violation, and [`may_write`](RlsAuth::may_write) passes.
     ///
-    /// `Key` is the deployment's share-key type, carried only so the caller
-    /// this binds is the same one every other path carries.
-    pub struct RlsAuth<Key = String> {
+    /// `Id` is the deployment's user id and `Key` its share-key type, carried
+    /// only so the caller this binds is the same one every other path carries.
+    pub struct RlsAuth<Id = String, Key = String> {
         pool: Pool<AsyncPgConnection>,
         catalog: ParserDB,
         /// The setting a policy reads the caller's identity from.
         user_setting: std::sync::Arc<str>,
-        key: PhantomData<Key>,
+        caller: PhantomData<fn() -> (Id, Key)>,
     }
 
     #[derive(QueryableByName)]
@@ -131,7 +131,7 @@ mod rls {
     /// database would have returned for each of them.
     type Question = Option<(String, KeyFilter)>;
 
-    impl<Key> RlsAuth<Key> {
+    impl<Id, Key> RlsAuth<Id, Key> {
         /// Read the caller's identity from `setting` rather than the default.
         ///
         /// The share-key setting has been the application's choice since R4; this
@@ -155,7 +155,7 @@ mod rls {
                 user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
                 pool,
                 catalog,
-                key: PhantomData,
+                caller: PhantomData,
             })
         }
 
@@ -204,13 +204,13 @@ mod rls {
         }
     }
 
-    impl<Key: CapabilityKey> RlsAuth<Key> {
+    impl<Id: core::fmt::Display, Key: CapabilityKey> RlsAuth<Id, Key> {
         /// Ask Postgres whether `caller` can see the row the question names.
         async fn visible(
             &self,
             sql: &str,
             filter: &KeyFilter,
-            caller: &Principal<String, Key>,
+            caller: &Principal<Id, Key>,
         ) -> Result<bool, RlsAuthError> {
             let query = filter.bind(sql_query(sql.to_owned()).into_boxed::<diesel::pg::Pg>());
             let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
@@ -244,7 +244,7 @@ mod rls {
             &self,
             table: &str,
             filter: &KeyFilter,
-            caller: &Principal<String, Key>,
+            caller: &Principal<Id, Key>,
         ) -> Result<bool, RlsAuthError> {
             let sql = format!(
                 "SELECT true AS present FROM {} WHERE {} FOR UPDATE",
@@ -301,8 +301,12 @@ mod rls {
         }
     }
 
-    impl<Key: CapabilityKey> VisibilityPolicy for RlsAuth<Key> {
-        type Watcher = Arc<Principal<String, Key>>;
+    impl<Id, Key> VisibilityPolicy for RlsAuth<Id, Key>
+    where
+        Id: core::fmt::Display + Send + Sync + 'static,
+        Key: CapabilityKey,
+    {
+        type Watcher = Arc<Principal<Id, Key>>;
         type Error = RlsAuthError;
         type Backend = Postgres;
 

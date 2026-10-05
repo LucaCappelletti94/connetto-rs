@@ -24,7 +24,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, SnapshotEstimate, SnapshotPage,
     SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
@@ -125,7 +125,7 @@ async fn arrive(
         RosterAuth::granting_nobody().withholding(WITHHELD_ID),
         authority,
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

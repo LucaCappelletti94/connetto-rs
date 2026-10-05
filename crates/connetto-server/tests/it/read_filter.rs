@@ -29,7 +29,7 @@ use connetto_server::{
     ResumePoint, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
     loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture};
+use connetto_test_harness::{ConnettoDefaults, Fixture};
 use diesel::prelude::*;
 use diesel::sql_query;
 use subql::backend::{Postgres, Value};
@@ -186,7 +186,7 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
 /// The manager, one connected session with a subscription over the whole table,
 /// and the task serving it. Its empty snapshot is drained, so the next frame a
 /// caller reads is whatever the change path decided.
-type Manager = Arc<SessionManager<EmptySnapshot, DenyId2, ConnettoWatermark>>;
+type Manager = Arc<SessionManager<EmptySnapshot, DenyId2, ConnettoDefaults>>;
 
 async fn connected_session(
     fixture: &Fixture,
@@ -205,7 +205,7 @@ async fn connected_session(
         DenyId2,
         Arc::new(TestGrantChecker),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build();

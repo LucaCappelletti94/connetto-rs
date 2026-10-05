@@ -24,7 +24,7 @@ use connetto_server::{
     RuntimeWritableCatalog, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback,
     pg_write_target, split_snapshot_cursor,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::{ExpressionMethods, QueryDsl, Queryable, Selectable, SelectableHelper};
 use diesel::{Connection, SqliteConnection, sql_query};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -393,8 +393,8 @@ async fn async_pg_reexec_bootstraps_min() {
         .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(pool.clone(), AGGS_PG_DDL)
-        .expect("build write target");
+    let target =
+        pg_write_target::<ConnettoDefaults>(pool.clone(), AGGS_PG_DDL).expect("build write target");
     let session = ManagerBuilder::new(
         materializer,
         NoSnapshot,
@@ -908,7 +908,7 @@ async fn async_pg_delta_aggregate_bootstraps_family() {
             .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
             .build()
             .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(
+    let target = pg_write_target::<ConnettoDefaults>(
         pool.clone(),
         "CREATE TABLE agg_family (id INT PRIMARY KEY, amount BIGINT);",
     )

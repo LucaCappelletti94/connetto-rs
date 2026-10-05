@@ -3,9 +3,10 @@
 //!
 //! connetto owns no schema. A deployment declares its own durable mutation
 //! watermark table (see `docs/architecture/11-authentication.md`) and implements
-//! [`ConnettoWatermarkSchema`] for it, either by hand or through the
-//! [`connetto_watermark_table!`](crate::connetto_watermark_table) convenience
-//! macro. [`PgWriteTarget`](crate::write_target::PgWriteTarget)'s `commit` and
+//! [`ConnettoWatermarkSchema`] for it, either by hand or through
+//! [`connetto_schema!`](crate::connetto_schema), and names it as the
+//! `Watermark` member of its [`ConnettoSchema`](crate::schema::ConnettoSchema).
+//! [`PgWriteTarget`](crate::write_target::PgWriteTarget)'s `commit` and
 //! `last_applied` are generic over this trait and keep the dedup decision (the
 //! monotone `GREATEST` advance) themselves; only the mechanical diesel
 //! statements are built in the impl, because the diesel `future` trait solver
@@ -63,6 +64,10 @@ where
     /// target binds as the RLS `app.user_id` GUC during a commit.
     type Id: Clone + core::fmt::Display + Send + Sync + 'static;
 
+    /// The tables this member reads and writes, by name, which startup
+    /// requires to exist (R98 decision 5).
+    const TABLES: &'static [&'static str];
+
     /// The watermark table laundered as an opaque query source for the plain
     /// SELECT (concretely the table, but not declared `Table`/`QueryRelation`).
     type WatermarkQuery: Default + Send;
@@ -102,6 +107,7 @@ where
 /// connetto_server::connetto_watermark_table!(String);
 /// // now `ConnettoWatermark` implements `ConnettoWatermarkSchema`.
 /// ```
+#[doc(hidden)]
 #[macro_export]
 macro_rules! connetto_watermark_table {
     ($id:ty) => {
@@ -132,6 +138,7 @@ macro_rules! connetto_watermark_table {
 
         impl $crate::watermark_schema::ConnettoWatermarkSchema for ConnettoWatermark {
             type Id = $id;
+            const TABLES: &'static [&'static str] = &["_connetto_mutations"];
             type WatermarkQuery = _connetto_mutations::table;
             type LastSeq = _connetto_mutations::last_seq;
             type WmPk = diesel::dsl::Eq<_connetto_mutations::session_id, $crate::SessionId>;

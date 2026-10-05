@@ -24,7 +24,7 @@ use connetto_server::{
     LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
 use diesel::sql_query;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
@@ -139,7 +139,7 @@ struct Order {
     status: Option<String>,
 }
 
-type Manager = SessionManager<SeedSnapshot, RosterAuth, ConnettoWatermark>;
+type Manager = SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults>;
 
 fn test_verifier() -> Arc<dyn HandshakeAuthority> {
     Arc::new(TestGrantChecker)
@@ -170,7 +170,7 @@ fn writable_manager(fixture: &Fixture) -> Arc<Manager> {
         RosterAuth::granting("token").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
     .build()

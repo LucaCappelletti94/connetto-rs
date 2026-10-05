@@ -22,7 +22,7 @@ use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
     RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, pool_for, with_user};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, pool_for, with_user};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
 /// The catalog DDL carries the RLS marker: subql classifies the table from
@@ -35,7 +35,7 @@ const EMU_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT);";
 const QUERY: &str = "SELECT COUNT(*) FROM notes";
 
 /// A manager whose computed reads run as `app_reader`, subject to RLS.
-type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoWatermark, PgReadConnector>;
+type Manager = SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults, PgReadConnector>;
 
 /// The policy every identity-only case installs.
 const OWNER_IS_CALLER: &str = "owner = current_setting('app.user_id', true)";
@@ -81,7 +81,7 @@ async fn manager_under(fixture: &Fixture, policy: &str) -> Arc<Manager> {
         RosterAuth::granting_nobody(),
         Arc::new(TestGrantChecker),
         PgReadConnector::with_session_setup(reader),
-        pg_write_target::<ConnettoWatermark>(admin, PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(admin, PG_DDL).expect("build write target"),
     )
     .with_guard(guard)
     .build()

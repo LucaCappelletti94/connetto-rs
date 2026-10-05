@@ -24,7 +24,7 @@ use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionConfig,
     SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
-use connetto_test_harness::{Client, ConnettoWatermark, Fixture, RosterAuth, WITHHELD_ID};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl;
@@ -253,7 +253,7 @@ async fn write_path_applies_conflicts_and_dedups() {
         .with_write_catalog(writable_catalog())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -378,7 +378,7 @@ async fn write_path_rejects_unauthorized() {
         .with_write_catalog(writable_catalog())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -428,7 +428,7 @@ async fn watermark_survives_reconnect_reusing_session() {
         .with_write_catalog(writable_catalog())
         .build()
         .expect("build materializer");
-    let target = pg_write_target::<ConnettoWatermark>(fixture.admin().clone(), PG_DDL)
+    let target = pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
         .expect("build write target");
     let manager = ManagerBuilder::new(
         materializer,
@@ -560,7 +560,7 @@ async fn single_connection_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
 fn writing_manager(
     pool: &Pool<AsyncPgConnection>,
     config: SessionConfig,
-) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoWatermark>> {
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
     ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .with_write_catalog(writable_catalog())
@@ -570,7 +570,7 @@ fn writing_manager(
         RosterAuth::granting("writer").withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoWatermark>(pool.clone(), PG_DDL).expect("build write target"),
+        pg_write_target::<ConnettoDefaults>(pool.clone(), PG_DDL).expect("build write target"),
     )
     .with_session(config)
     .build()

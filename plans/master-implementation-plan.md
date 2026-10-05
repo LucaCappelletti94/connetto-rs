@@ -172,6 +172,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
 | done | ~~R96~~ | One server builder for programs that embed the server, and R91 builds on it |
 | done | ~~R97~~ | The desktop login tab closes, or the app comes back to the front. Minted from the R53 proof, designed |
+| any | R98 | One schema contract for every deployment-owned table. Needs nothing since R96 merged (2026-10-04). R74 step 3c waits on it |
 | done | ~~R73~~ | Failover verification and the deployment recipe, built ahead of its `last` place at the maintainer's word |
 
 ## Status and blockers
@@ -222,6 +223,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | nothing since R94 (2026-09-30). One decision and one open question in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
+| R98 one schema contract | BUILT 2026-10-04 on `feat/connetto-schema`, every step and proof, not merged | nothing since R96 merged (2026-10-04), whose builder it parameterises | no |
 | R53 Windows gate | **DONE** (2026-10-02) | nothing. `HelloStore` is taken from the upstream branch at `3109f4d` through a pinned patch until released. Fingerprint-change survival unmeasured | no |
 | R26 local data export | **DONE** (2026-08-21) | nothing. The two leftover items travel to `R56`, the key-requirement decision to `R62` | no |
 | R27 membership term in the subscription language | **DONE** (2026-08-18) | nothing | discharged |
@@ -411,6 +413,8 @@ graph TD
   U10[upstream windows-native-keyring-store:<br/>a Windows Hello PRF named store] -.->|patched until released| R53
   R53 --> R97[R97 the desktop login tab]
   R96[R96 one server builder] --> R91
+  R96 --> R98[R98 one schema contract]
+  R98 -.->|step 3c| R74
   R26 --> R56[R56 local data import]
   R54[R54 every demo carries every feature] --> R57[R57 demo gaps from the export audit]
   R58[R58 read ceiling and keyset paging]
@@ -5754,6 +5758,44 @@ The shipped server is configured by environment variables and builds everything 
 ### Done when
 
 The binary, the harness, every test and an embedding program build the server through one builder, the server serves on one port, OpenFGA is the only primary authorization a build can choose, and the chapters describe the builder and the environment contract.
+
+---
+
+## R98: one schema contract for every deployment-owned table
+
+**Status.** BUILT, not merged. **Built (R98, 2026-10-04)** on branch `feat/connetto-schema`, every step and proof. `ConnettoSchema` lives in `crates/connetto-server/src/schema.rs` with the `connetto_schema!` macro, `ConnettoDefaults` in `defaults.rs` is the lib's default schema, and every consumer takes it. `ServerBuilder<D = ConnettoDefaults>` serves any `D::Id`, and `deployment_schema::<D>(resolver)` switches schema and takes the `IdentityResolver` typed by `D::Id` at the same call (decided with the maintainer 2026-10-04, so a missing resolver does not compile), with `identity_resolver` replacing it for the same schema. `RlsAuth` gained the `Id` parameter so the second opinion serves any id. `require_schema_tables` refuses a missing member table at startup. Proof 1 is the `compile_fail` doctest in `schema.rs`, proof 2 is `builder_coverage.rs::a_missing_schema_table_refuses_naming_it`, and proof 3 is `deployment_schema.rs`, its own watermark table and a `uuid::Uuid` id. Minted and designed 2026-10-04 with the maintainer while building R74 step 3, when the enrolment tables would have become a sixth independent schema trait. The working record, with the inventory and the options weighed, is `plans/deployment-schema.md` of the `connetto-rs-r74` worktree.
+
+**Blocked on nothing** since R96 merged (#122, 2026-10-04), whose builder is where the schema is chosen. It waited on R96 by the maintainer's decision of 2026-10-04, since built earlier it would have rewritten every site R96 moved. R74 step 3c, the Postgres enrolment store, waits on this phase and adds its member to it.
+
+### Purpose
+
+connetto emits no server DDL, so each deployment-owned table reaches it through a schema trait and a default macro: `ConnettoStoreSchema`, `ConnettoWatermarkSchema`, `ConnettoAuditSchema`, `ConnettoBanSchema` and `ConnettoFileSchema`. Each server trait declares its own `type Id`, and only the watermark is tied to the session manager's. Only the watermark and the file schema are forced by the types, and the auth, ban and audit tables have no startup check, so a deployment that forgets one fails at first use (chapter 20). The macros are positional and each takes a different argument list.
+
+### Decisions
+
+1. **One umbrella trait names every member** (decided with the maintainer 2026-10-04). `ConnettoSchema` carries `type Id` and one associated type per member, `Auth`, `Watermark`, `Audit`, `Bans` and `Files`, each bound to `Id = Self::Id` where it has one, and R74 adds `Enrolments`. A deployment that omits a member does not compile, and one `Id` holds across all of them. A check at startup only was rejected, since it leaves `Id` agreement a convention, and so was keeping independent traits.
+2. **Each member keeps its own laundered statements.** The diesel solver reasons that shaped each trait still hold, so the umbrella only gathers them.
+3. **One macro with named arguments emits every default.** `connetto_schema!` takes the `Id` and its SQL type, the audit row key, and R74's descriptor fields, and emits every default table, row struct and member impl plus the umbrella impl.
+4. **Every consumer takes the umbrella.** `SessionManager`'s watermark parameter becomes `D: ConnettoSchema` and its `Id` comes from `D::Id`. `DbAuthStore`, `pg_ban_store`, `pg_audit_hook` and the file server read their member through it, and R96's builder takes one type parameter defaulting to the lib's default schema in place of R96 decision 7's per-table defaults.
+5. **Startup refuses a missing table by the names the members report.** Each member reports `const TABLES`, emitted by its macro and written by hand in a custom impl, and the server runs `preflight::require` with `Artifact::Table` for every member it uses. Bans and audit stay optional at runtime and are checked only when on. Nothing checks columns, since R13 deleted a column check against a hardcoded list (`08-authorization.md`), and a name the trait itself reports hardcodes nothing.
+6. **The oplog and the epoch table stay outside the trait.** Their names are runtime configuration and both are already refused when missing.
+
+### Steps
+
+1. `ConnettoSchema`, `const TABLES` on every member, and `connetto_schema!` replacing the per-table macros.
+2. Every consumer, the builder and every test manager moved onto the umbrella.
+3. The startup existence check, and chapter 20's table updated.
+4. Chapters 8, 11 and 20 describe the one contract.
+
+### Proof
+
+1. A deployment schema missing a member fails to compile, shown by a `compile_fail` doctest.
+2. A server started without one of its members' tables refuses to start and names the table, Docker-gated.
+3. A deployment with its own table names and a non-`String` `Id` serves through the builder, Docker-gated.
+
+### Done when
+
+Every deployment-owned table connetto reads through a trait is named by one `ConnettoSchema`, the builder takes it as its one schema parameter, and a missing table refuses startup.
 
 ---
 

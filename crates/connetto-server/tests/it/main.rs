@@ -34,6 +34,8 @@ mod cdc_reconnect;
 
 mod delta_aggregate;
 
+mod deployment_schema;
+
 mod e2e;
 
 mod epoch;
