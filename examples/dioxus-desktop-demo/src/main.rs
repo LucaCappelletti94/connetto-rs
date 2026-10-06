@@ -39,6 +39,12 @@
 //! `CONNETTO_DEMO_BUILD_PG`, which the running environment still overrides. The
 //! names differ from the runtime ones so that a shell pointed at a stack never
 //! bakes its addresses into a build by accident.
+//!
+//! With the `device-identity` feature the demo enrols its device key and shows
+//! the certificate on its `device:` line (R74). The build ships the deployment
+//! root `CONNETTO_DEMO_BUILD_DEVICE_ROOT` names, which the stack mints under
+//! `target/demo-device-ca` and hands the program it runs, and the proofs turn
+//! the feature on whenever it is set.
 //! Its server runs `schema.sql` and `policies.sql`, with `schema.sql`,
 //! `connetto_file_server::DEPLOYMENT_DDL`, `connetto_server::epoch::EPOCH_DDL`,
 //! `roles.sql` and `content.sql` applied in that order, and `orders,photos`
@@ -85,6 +91,11 @@ const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
 /// How long the app may be away before it asks for Face ID, a fingerprint or
 /// the device passcode again, where the platform gates the stored secrets.
 const RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The deployment root this build ships, which every device certificate and
+/// revocation list must chain to (R74 decisions 3 and 30).
+#[cfg(feature = "device-identity")]
+const DEVICE_ROOT: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/device-root.der"));
 
 /// How long a login in the browser tab may take.
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -448,7 +459,7 @@ async fn setup(
 
     // A dropped link redials the same address and resumes, so writes made
     // while offline upload once the server is reachable again.
-    let (native, pump) =
+    let builder =
         NativeClientBuilder::new(server, SyncSchema::new(connetto_schema_bundle::bundle()))
             .with_tuning(SyncTuning::default().with_trim_threshold(5))
             .with_content(ContentPiece::new().with_heal_lost(
@@ -457,15 +468,17 @@ async fn setup(
             ))
             .signed_in(sign_in)
             .durable(data_dir())
-            .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)))
-            .connect_with_pump()
-            .await
-            .map_err(|err| match err {
-                ClientError::Auth(_) => anyhow::anyhow!(
-                    "the server refused the credential; check CONNETTO_AUTH and OIDC settings"
-                ),
-                other => anyhow::anyhow!("opening the encrypted replica: {other}"),
-            })?;
+            .with_gate(Gate::default().with_recheck(Some(RECHECK_AFTER)));
+    #[cfg(feature = "device-identity")]
+    let builder = builder.with_deployment_roots([DEVICE_ROOT.to_vec()]);
+    #[cfg(all(feature = "device-identity", target_os = "android"))]
+    let builder = builder.with_java_access(connetto_auth_session::java_access());
+    let (native, pump) = builder.connect_with_pump().await.map_err(|err| match err {
+        ClientError::Auth(_) => anyhow::anyhow!(
+            "the server refused the credential; check CONNETTO_AUTH and OIDC settings"
+        ),
+        other => anyhow::anyhow!("opening the encrypted replica: {other}"),
+    })?;
     tokio::spawn(pump);
     let client = native.client().clone();
     let content = match native.content() {
@@ -580,6 +593,39 @@ fn status_label(event: &ClientEvent) -> Option<String> {
     }
 }
 
+/// What the device line shows: whether this build has a device identity,
+/// where its key lives, until when its certificate holds and what the device
+/// proved at enrolment (R74).
+#[cfg(feature = "device-identity")]
+fn device_label(native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
+    use connetto_core::device_cert::KeyHome;
+
+    let home = match native.device_key_home() {
+        None => return "opening the device key".to_owned(),
+        Some(KeyHome::SecureEnclave) => "the Secure Enclave",
+        Some(KeyHome::AndroidKeystore { strongbox: true }) => "StrongBox",
+        Some(KeyHome::AndroidKeystore { strongbox: false }) => "the Android Keystore",
+        Some(KeyHome::Tpm) => "the TPM",
+        Some(KeyHome::Software) => "software in the keyring",
+    };
+    match native.device_certificate() {
+        Some(certificate) => {
+            let until = chrono::DateTime::<chrono::Utc>::from(certificate.not_after());
+            format!(
+                "certified until {}, key in {home}, {}",
+                until.format("%Y-%m-%d %H:%M UTC"),
+                certificate.attestation()
+            )
+        }
+        None => format!("enrolling, key in {home}"),
+    }
+}
+
+#[cfg(not(feature = "device-identity"))]
+fn device_label(_native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
+    "no device identity in this build".to_owned()
+}
+
 #[derive(Clone, PartialEq)]
 enum WipeState {
     Idle,
@@ -610,6 +656,7 @@ fn App() -> Element {
     // holds the app locked.
     let mut status: Signal<String> = use_signal(|| "connected".to_owned());
     let mut gate: Signal<&'static str> = use_signal(|| "open");
+    let mut clock: Signal<Option<&'static str>> = use_signal(|| None);
     let event_rx = client.events();
     use_hook(move || {
         spawn(async move {
@@ -619,6 +666,11 @@ fn App() -> Element {
                     ClientEvent::Locked => gate.set("locked, verify it is you to continue"),
                     ClientEvent::UnlockDismissed => gate.set("unlock dismissed, still locked"),
                     ClientEvent::Unlocked => gate.set("open"),
+                    ClientEvent::ClockOutsideWindow { ahead } => clock.set(Some(if ahead {
+                        "the clock runs ahead of the server's, so peers will refuse this device"
+                    } else {
+                        "the clock runs behind the server's, so peers will refuse this device"
+                    })),
                     _ => {}
                 }
                 if let Some(label) = status_label(&event) {
@@ -629,6 +681,24 @@ fn App() -> Element {
     });
     let custody = parts.0.native.custody();
     let unlock_client = client.clone();
+
+    // The device line, read again every second since enrolment runs beside
+    // the pump.
+    let mut device: Signal<String> = use_signal(|| device_label(&parts.0.native));
+    {
+        let parts = parts.clone();
+        use_hook(move || {
+            spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let label = device_label(&parts.0.native);
+                    if *device.peek() != label {
+                        device.set(label);
+                    }
+                }
+            })
+        });
+    }
 
     // Session expiry warning and replica footprint, both refreshed as rows change.
     let mut expiry_warn: Signal<Option<String>> = use_signal(|| None);
@@ -666,6 +736,10 @@ fn App() -> Element {
     let grouped_text = grouped_label(&counts_by_quantity.value().read());
     let grouped_error = counts_by_quantity.error().read().clone();
     let pid = std::process::id();
+    let device_line = match clock() {
+        Some(clock) => clock.to_owned(),
+        None => device(),
+    };
 
     let insert_backend = backend.clone();
     let delete_backend = backend;
@@ -686,6 +760,10 @@ fn App() -> Element {
             p {
                 style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
                 "gate: " {gate}
+            }
+            p {
+                style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
+                "device: " {device_line}
             }
             if gate() != "open" {
                 button {

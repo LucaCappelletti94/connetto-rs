@@ -25,15 +25,20 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use connetto_core::auth::{Principal, Subject};
+use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BulkMessage, CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR,
-    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, FatalError,
+    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, DeviceRevokedAck,
+    DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal, EnrolRefused, FatalError,
     FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch,
     MembershipOpened, MutationApplied, MutationConflict, MutationHeader, MutationPatch,
     MutationReject, MutationRejectReason, NonFatalError, PauseCause, Pong, RateLimited,
-    SUBSCRIPTION_REFUSED, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
+    RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, SignedList, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
 };
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
+
+use crate::device_cert::RevokeError;
 use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
@@ -1384,6 +1389,8 @@ struct SessionState<Id, Key> {
     /// after the frame that crossed it. A caller with no identity has no name
     /// to ban, so closing the socket is the whole outcome.
     closing: bool,
+    /// The enrolment nonce this session was last handed, spent by its next enrolment request.
+    enrol_challenge: Option<crate::device_cert::PendingChallenge>,
 }
 
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
@@ -1466,6 +1473,9 @@ pub struct SessionManager<
     /// Optional like the upkeep. Without one, a move-out escalates to the R7
     /// replace instead of withdrawing incrementally.
     withdrawal_source: OnceLock<Snap>,
+    /// Issues device certificates (R74). Without one, every enrolment is
+    /// refused as [`EnrolRefusal::IssuerUnavailable`].
+    device_enrolment: OnceLock<Arc<crate::device_cert::DeviceEnrolment<Id>>>,
     /// The deployment's content ticket signer, called after a successful
     /// visibility check to mint a signed URL the caller may use at the file
     /// server. Generic rather than boxed so a deployment wires it at compile
@@ -1562,6 +1572,7 @@ where
         upkeep,
         second_opinion: second_opinion.map(OnceLock::from).unwrap_or_default(),
         withdrawal_source: withdrawal_source.map(OnceLock::from).unwrap_or_default(),
+        device_enrolment: OnceLock::new(),
         signer,
         history: parking_lot::RwLock::new(None),
         resume: ResumePoint::default(),
@@ -1613,6 +1624,18 @@ where
     /// The source handed over, when one is already installed.
     pub fn install_withdrawal_source(&self, source: Snap) -> Result<(), Snap> {
         self.withdrawal_source.set(source)
+    }
+
+    /// Enrol devices through `enrolment` (R74), set once after construction.
+    ///
+    /// # Errors
+    ///
+    /// The enrolment handed over, when one is already installed.
+    pub fn install_device_enrolment(
+        &self,
+        enrolment: Arc<crate::device_cert::DeviceEnrolment<Id>>,
+    ) -> Result<(), Arc<crate::device_cert::DeviceEnrolment<Id>>> {
+        self.device_enrolment.set(enrolment)
     }
 
     /// Which refusal a transition failure is.
@@ -3574,7 +3597,9 @@ where
             resume,
             resume_read_budget,
             closing: refused == Reaction::Close,
+            enrol_challenge: None,
         };
+        self.send_revocation_lists(&mut transport, &state).await;
 
         // Every exit breaks with its result rather than returning, so the teardown below always runs.
         let ended: Result<(), SessionError> = loop {
@@ -3809,6 +3834,157 @@ where
             .map_err(transport_err)
     }
 
+    /// Answer a device list request with the caller's devices.
+    async fn handle_devices_request<T: Transport>(
+        &self,
+        transport: &mut T,
+        req: DevicesRequest,
+        state: &SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let request_id = req.request_id;
+        let answer = match self.enrolling(state) {
+            Ok((enrolment, user)) => enrolment.devices(&user).await.map_err(|err| {
+                tracing::warn!(error = %err, "the enrolment table refused a device list");
+                EnrolRefusal::IssuerUnavailable
+            }),
+            Err(refusal) => Err(refusal),
+        };
+        let answer = match answer {
+            Ok(devices) => ControlMessage::DevicesList(DevicesList {
+                request_id,
+                devices,
+            }),
+            Err(reason) => ControlMessage::EnrolRefused(EnrolRefused { request_id, reason }),
+        };
+        transport.send_control(answer).await.map_err(transport_err)
+    }
+
+    /// Revoke one of the caller's devices, answering before its connection closes.
+    async fn handle_revoke_request<T: Transport>(
+        &self,
+        transport: &mut T,
+        req: RevokeDeviceRequest,
+        state: &SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let request_id = req.request_id;
+        let key = KeyId::from_bytes(req.key_id);
+        let revoked = match self.enrolling(state) {
+            Ok((enrolment, user)) => enrolment
+                .revoke(Some(&user), key)
+                .await
+                .map(|revoked| (enrolment, revoked))
+                .map_err(|err| match err {
+                    RevokeError::NotFound => EnrolRefusal::InvalidRequest,
+                    RevokeError::NotInstalled => EnrolRefusal::IssuerUnavailable,
+                    RevokeError::Unavailable(source) => {
+                        tracing::warn!(error = %source, "a device could not be revoked");
+                        EnrolRefusal::IssuerUnavailable
+                    }
+                }),
+            Err(refusal) => Err(refusal),
+        };
+        match revoked {
+            Ok((enrolment, (_, session, lists))) => {
+                transport
+                    .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
+                        request_id,
+                    }))
+                    .await
+                    .map_err(transport_err)?;
+                self.after_revocation(&enrolment, session, lists).await;
+                Ok(())
+            }
+            Err(reason) => transport
+                .send_control(ControlMessage::EnrolRefused(EnrolRefused {
+                    request_id,
+                    reason,
+                }))
+                .await
+                .map_err(transport_err),
+        }
+    }
+
+    /// Hand an identified session the current revocation lists after its
+    /// handshake. A list that cannot be built is logged, and the session
+    /// runs without it until the next change.
+    async fn send_revocation_lists<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &SessionState<Id, Key>,
+    ) {
+        let Ok((enrolment, _)) = self.enrolling(state) else {
+            return;
+        };
+        match enrolment.lists().await {
+            Ok(lists) => {
+                if let Err(err) = transport
+                    .send_control(ControlMessage::RevocationUpdate(RevocationUpdate { lists }))
+                    .await
+                {
+                    tracing::debug!(error = %err, "the revocation lists were not sent");
+                }
+            }
+            Err(err) => tracing::warn!(error = %err, "the revocation lists could not be built"),
+        }
+    }
+
+    /// Close the revoked device's connection, push the new lists to every
+    /// identified connection, and revoke the auth-store session.
+    async fn after_revocation(
+        &self,
+        enrolment: &crate::device_cert::DeviceEnrolment<Id>,
+        session: SessionId,
+        lists: Vec<SignedList>,
+    ) {
+        self.close_session(session, FatalErrorReason::DeviceRevoked)
+            .await;
+        let update = ControlMessage::RevocationUpdate(RevocationUpdate { lists });
+        for live in self.sessions.lock().await.values() {
+            if live.user.is_some() {
+                let _ = live.tx.send(Outbound::Control(update.clone()));
+            }
+        }
+        enrolment.revoke_session(session).await;
+    }
+
+    /// Revoke the device key `key` whoever it belongs to, as the deployment's
+    /// operator, publishing the list and closing its connection and revoking
+    /// its session, repeating the close and revocation when the key is
+    /// already revoked. Answers whether the revocation is new.
+    ///
+    /// # Errors
+    ///
+    /// [`RevokeError::NotFound`] for a key never enrolled,
+    /// [`RevokeError::NotInstalled`] when no enrolment is installed, and
+    /// [`RevokeError::Unavailable`] when the table or the issuer fails.
+    pub async fn revoke_device(&self, key: KeyId) -> Result<bool, RevokeError> {
+        let enrolment = self
+            .device_enrolment
+            .get()
+            .ok_or(RevokeError::NotInstalled)?;
+        let (fresh, session, lists) = enrolment.revoke(None, key).await?;
+        self.after_revocation(enrolment, session, lists).await;
+        Ok(fresh)
+    }
+
+    /// The installed enrolment and the account enrolling, or why this session cannot enrol.
+    fn enrolling(
+        &self,
+        state: &SessionState<Id, Key>,
+    ) -> Result<(Arc<crate::device_cert::DeviceEnrolment<Id>>, Id), EnrolRefusal> {
+        let user = state
+            .principal
+            .identity()
+            .ok_or(EnrolRefusal::Unidentified)?
+            .user_id
+            .clone();
+        let enrolment = self
+            .device_enrolment
+            .get()
+            .ok_or(EnrolRefusal::IssuerUnavailable)?;
+        Ok((Arc::clone(enrolment), user))
+    }
+
     async fn handle_control<T: Transport>(
         &self,
         transport: &mut T,
@@ -3861,6 +4037,48 @@ where
             }
             ControlMessage::ContentTicketRequest(req) => {
                 self.handle_content_ticket(transport, req, state).await
+            }
+            ControlMessage::EnrolChallengeRequest(req) => {
+                let answer = self
+                    .enrolling(state)
+                    .and_then(|(enrolment, _)| enrolment.challenge(&mut state.enrol_challenge));
+                let request_id = req.request_id;
+                let answer = match answer {
+                    Ok((nonce, window)) => ControlMessage::EnrolChallenge(EnrolChallenge {
+                        request_id,
+                        nonce,
+                        expires_in_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+                    }),
+                    Err(reason) => {
+                        ControlMessage::EnrolRefused(EnrolRefused { request_id, reason })
+                    }
+                };
+                transport.send_control(answer).await.map_err(transport_err)
+            }
+            ControlMessage::EnrolRequest(req) => {
+                let request_id = req.request_id.clone();
+                let answer = match self.enrolling(state) {
+                    Ok((enrolment, user)) => {
+                        enrolment
+                            .enrol(&user, state.session_id, &mut state.enrol_challenge, req)
+                            .await
+                    }
+                    Err(refusal) => {
+                        state.enrol_challenge = None;
+                        Err(refusal)
+                    }
+                };
+                let answer = answer.map_or_else(
+                    |reason| ControlMessage::EnrolRefused(EnrolRefused { request_id, reason }),
+                    ControlMessage::EnrolGrant,
+                );
+                transport.send_control(answer).await.map_err(transport_err)
+            }
+            ControlMessage::DevicesRequest(req) => {
+                self.handle_devices_request(transport, req, state).await
+            }
+            ControlMessage::RevokeDeviceRequest(req) => {
+                self.handle_revoke_request(transport, req, state).await
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),

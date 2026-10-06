@@ -203,6 +203,101 @@ pub async fn provision_auth_tables(fixture: &Fixture) {
         .await;
 }
 
+/// The default deployment's enrolment tables, whose descriptor is `()` and so
+/// has no columns of its own (R74).
+pub const ENROLMENT_DDL: [&str; 3] = [
+    "CREATE TABLE connetto_device_enrolments (\
+     key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
+     enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
+     revoked_at TIMESTAMPTZ, attestation TEXT NOT NULL)",
+    "CREATE TABLE connetto_device_certificates (\
+     serial BYTEA PRIMARY KEY, \
+     key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
+     issuer BYTEA NOT NULL, expires_at TIMESTAMPTZ NOT NULL)",
+    "CREATE TABLE connetto_device_lists (issuer BYTEA PRIMARY KEY, last_number BIGINT NOT NULL)",
+];
+
+/// Create [`ENROLMENT_DDL`]'s tables.
+pub async fn provision_enrolment_tables(fixture: &Fixture) {
+    for statement in ENROLMENT_DDL {
+        fixture.exec(statement).await;
+    }
+}
+
+/// The demo's device certificate authority, a root and its current issuer as
+/// `connetto-ca` writes them (R74 decision 30).
+#[derive(Debug)]
+pub struct DemoDeviceCa {
+    /// The root's `root.der`, which a demo build ships.
+    pub root: PathBuf,
+    /// The directory holding the current `issuer.der` and `issuer.key`.
+    pub issuer: PathBuf,
+}
+
+/// The variable naming the deployment root a demo build ships, which the demo
+/// stack sets.
+pub const DEMO_DEVICE_ROOT_VAR: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
+
+/// The demo's build features for a mobile target, with its device identity
+/// when the stack named a deployment root.
+#[must_use]
+pub fn demo_mobile_features() -> &'static str {
+    if std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some() {
+        "mobile,device-identity"
+    } else {
+        "mobile"
+    }
+}
+
+/// Whether the demo under proof was built with its device identity.
+#[must_use]
+pub fn demo_has_device_identity() -> bool {
+    std::env::var_os(DEMO_DEVICE_ROOT_VAR).is_some()
+}
+
+/// Not a secret: the demo's root key only ever signs throwaway issuers.
+const DEMO_CA_PASSPHRASE: &str = "connetto demo stack";
+
+/// The demo's certificate authority under `target/demo-device-ca`, its root
+/// created on the first run and its issuer signed again once it has under
+/// sixty days left at `now`.
+///
+/// # Errors
+///
+/// When the root or the issuer cannot be created, read or signed.
+pub fn demo_device_ca(now: SystemTime) -> Result<DemoDeviceCa> {
+    use connetto_core::device_cert::DeviceIssuer;
+    use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY, ROOT_CERTIFICATE};
+    use connetto_server::device_cert::DeviceCertConfig;
+
+    let dir = target_dir()?.join("demo-device-ca");
+    let root = dir.join(ROOT_CERTIFICATE);
+    let issuer = dir.join("issuer");
+    if !root.exists() {
+        fs::create_dir_all(&dir).context("creating the demo CA directory")?;
+        connetto_ca::init(&dir, DEMO_CA_PASSPHRASE, now).context("creating the demo root")?;
+    }
+    let current = || -> Result<bool> {
+        let read =
+            |path: &Path| fs::read(path).with_context(|| format!("reading {}", path.display()));
+        let issuer = DeviceIssuer::from_pkcs8(
+            read(&issuer.join(ISSUER_CERTIFICATE))?,
+            &read(&issuer.join(ISSUER_KEY))?,
+            &read(&root)?,
+        )?;
+        Ok(matches!(DeviceCertConfig::new(issuer).check(now), Ok(None)))
+    };
+    if !issuer.join(ISSUER_CERTIFICATE).exists() || !current()? {
+        if issuer.exists() {
+            fs::remove_dir_all(&issuer).context("removing the expiring demo issuer")?;
+        }
+        fs::create_dir_all(&issuer).context("creating the demo issuer directory")?;
+        connetto_ca::sign_issuer(&dir, DEMO_CA_PASSPHRASE, &issuer, now)
+            .context("signing the demo issuer")?;
+    }
+    Ok(DemoDeviceCa { root, issuer })
+}
+
 /// Generate the token signing keypair with `openssl` and the content ticket
 /// keypair with `ring`.
 ///

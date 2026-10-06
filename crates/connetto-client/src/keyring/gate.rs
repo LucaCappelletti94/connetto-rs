@@ -584,6 +584,23 @@ mod tests {
     }
 
     #[test]
+    fn a_device_key_stays_ungated_and_never_prompts() {
+        let (gate, fake) = gate(Script::default());
+        let name = crate::device_key_record("\"alice\"");
+        gate.write(&name, "pkcs8").expect("store the device key");
+        assert_eq!(
+            fake.storage_of(&name),
+            Some(Storage::Ungated(NoGate::Offerable))
+        );
+        gate.lock();
+        assert_eq!(
+            gate.read(&name).expect("read while locked").as_deref(),
+            Some("pkcs8")
+        );
+        assert_eq!(fake.prompts(), 0, "the device key signs without a prompt");
+    }
+
+    #[test]
     fn a_launch_prompts_once_at_the_first_gated_read_and_the_ask_then_needs_none() {
         let (gate, fake) = gate(Script::default());
         gate.write(KEY, "key").expect("create raises no prompt");

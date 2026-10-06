@@ -47,6 +47,7 @@ pub mod builder;
 pub mod capability;
 pub mod counters;
 pub mod defaults;
+pub mod device_cert;
 pub mod epoch;
 pub mod fence;
 pub mod guard;

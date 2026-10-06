@@ -39,6 +39,9 @@ postgres-types = ["diesel/postgres_backend"]
 # loopback listener, system browser, OS secure storage for the refresh token,
 # and the HTTP calls to connetto-server's login, token, and refresh endpoints.
 # Native only, never wasm (the browser worker owns token custody there).
+# A device identity key for peer sync (R74): in the security chip, or a
+# software key in the plain secret store where no chip is usable.
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -79,6 +82,10 @@ connetto-core.workspace = true
 # supplies the v4 randomness on wasm32-unknown-unknown (Web Crypto); on
 # native, v4 uses the platform RNG and `js` is inert.
 uuid = { version = "1", default-features = false, features = ["v4", "v5", "js"] }
+# The device descriptor goes to the server in MessagePack (R74).
+rmp-serde = { workspace = true, optional = true }
+# The certificate chain an enrolment grant carries.
+serde_bytes = { workspace = true, optional = true }
 # Local store plus the SQLite session extension: the capture hook for local
 # writes and the native apply for server patches. The third-party-backend
 # feature lets `ConnettoConnection` implement diesel's sealed `Connection`.
@@ -147,6 +154,8 @@ getrandom = { version = "0.3", optional = true }
 # Wiping the transient hex strings that carry key material: the `PRAGMA key`
 # statement built from a ReplicaKey, and the hex a KeyringKeyStore persists.
 zeroize = { version = "1", default-features = false, features = ["alloc"] }
+# The software device key (R74 decision 16), the same ring rustls signs with.
+ring = { version = "0.17", features = ["std"], optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
 connetto-schema = { workspace = true, optional = true }
@@ -180,14 +189,20 @@ apple-native-keyring-store = { version = "1.0.2", features = [
   "protected",
 ], optional = true }
 # The keychain status codes behind a store refusal: a dismissed sheet, no
-# passcode, a missing entitlement.
-security-framework = { version = "3.7", optional = true }
+# passcode, a missing entitlement. `OSX_10_15` reaches the data protection
+# keychain, where the Secure Enclave keeps the device key (R74).
+security-framework = { version = "3.7", features = ["OSX_10_15"], optional = true }
+# The enclave's refusals arrive as `CFError`, which is not `Send`.
+core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
+# App Attest, behind the one crate allowed unsafe code (R74 decision 35).
+connetto-app-attest = { path = "../connetto-app-attest", optional = true }
 apple-native-keyring-store = { version = "1.0.2", features = [
   "protected",
 ], optional = true }
 security-framework = { version = "3.7", optional = true }
+core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
@@ -250,6 +265,7 @@ web-sys = { version = "0.3", features = ["Window", "Performance"] }
 uuid = { version = "1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
+parking_lot = "0.12"
 # The shared fake transport the suites here drive `connect` and `resume` with.
 connetto-core = { workspace = true, features = ["test-support"] }
 # The loop tests run the real server in-process. Its write target is the real
@@ -305,6 +321,7 @@ uuid = { version = "1", features = ["v4", "v5"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+tokio = { version = "1", features = ["test-util"] }
 
 # The fake Secret Service the Linux store tests serve on a peer-to-peer bus.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

@@ -5,6 +5,7 @@
 //! ```text
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack -- <program> [args]
+//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- --mint-device-ca
 //! ```
 //!
 //! Bare, it serves until interrupted and prints the environment a desktop run
@@ -14,6 +15,16 @@
 //! `CONNETTO_DEMO_AUTH_ORIGIN`, `CONNETTO_DEMO_WS`, `CONNETTO_DEMO_PG`,
 //! `CONNETTO_DEMO_ADB_REVERSE` (comma-separated `device:host` port pairs) and
 //! `CONNETTO_DEMO_ISSUER` set, then stops.
+//!
+//! It mints the demo's device certificate authority under
+//! `target/demo-device-ca` on its first run, serves the issuer from it, and
+//! names the root to the program as `CONNETTO_DEMO_BUILD_DEVICE_ROOT`, which a
+//! demo build with the `device-identity` feature ships (R74 decision 30). With
+//! `CONNETTO_IOS_TEAM_ID` set, the server accepts App Attest from the demo's
+//! development builds under that team (R74 decision 32). With
+//! `--mint-device-ca` it only mints that authority, or keeps the one already
+//! there, prints the root's path and exits, so a build can ship the root before
+//! the stack starts.
 //!
 //! `CONNETTO_STACK_SYNC_PORT` moves its listener off 7777.
 //! `CONNETTO_STACK_PUBLIC_HOST` puts it on the LAN for a phone that has no
@@ -35,8 +46,9 @@ use std::ffi::OsString;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
-    Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR, TLS_KEY_VAR,
-    ensure_server_bin, ports, provision, require_free, run_process, spawn_server,
+    DemoDeviceCa, Deployment, PUBLIC_HOST_VAR, RunningServices, SYNC_PORT_VAR, TLS_CERT_VAR,
+    TLS_KEY_VAR, demo_device_ca, ensure_server_bin, ports, provision, provision_enrolment_tables,
+    require_free, run_process, spawn_server,
 };
 use connetto_test_harness::{MockOauth, with_host};
 
@@ -50,6 +62,8 @@ const DEMO_PG_PORT: u16 = 55456;
 /// server lists it by exact match, as RFC 8252 section 7.1 has an operator
 /// register an app's scheme.
 const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
+/// The demo's bundle identifier, the App ID App Attest names after the team.
+const DEMO_BUNDLE: &str = "dev.connetto.dioxusdemo";
 
 const DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../../examples/dioxus-desktop-demo/schema.sql"),
@@ -60,8 +74,22 @@ const DEPLOYMENT: Deployment = Deployment {
     writable: "orders,photos",
 };
 
+/// Mint the demo's device CA, or keep the one already there, and print the
+/// root's path alone, for a build that ships it before the stack starts.
+fn mint_device_ca() -> Result<()> {
+    let device_ca = demo_device_ca(std::time::SystemTime::now())?;
+    println!("{}", device_ca.root.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--mint-device-ca")
+    {
+        return mint_device_ca();
+    }
     connetto_core::logging::init_stdout();
     let plan = Addresses::from_env()?;
     let Addresses {
@@ -85,8 +113,11 @@ async fn main() -> Result<()> {
     }
     let server_bin = ensure_server_bin().await?;
     let provisioned = provision(&DEPLOYMENT, "connetto-demo-stack", running.as_ref()).await?;
+    provision_enrolment_tables(&provisioned.fixture).await;
+    let device_ca = demo_device_ca(std::time::SystemTime::now())?;
     let idp = identity_provider(running, public_host.as_deref(), tls.as_ref()).await?;
     let mut envs = provisioned.server_env(&DEPLOYMENT, &server_bind, &base);
+    envs.extend(device_env(&device_ca));
     envs.extend(idp.env_pairs(PROVIDER, &format!("{base}/auth/callback")));
     envs.push((
         "CONNETTO_AUTH_REDIRECT_ALLOWLIST".to_owned(),
@@ -126,6 +157,10 @@ async fn main() -> Result<()> {
         ("CONNETTO_DEMO_PG".to_owned(), pg_url),
         ("CONNETTO_DEMO_ADB_REVERSE".to_owned(), reverse_spec),
         ("CONNETTO_DEMO_ISSUER".to_owned(), idp.issuer().to_owned()),
+        (
+            "CONNETTO_DEMO_BUILD_DEVICE_ROOT".to_owned(),
+            device_ca.root.display().to_string(),
+        ),
     ];
 
     if args.is_empty() {
@@ -135,6 +170,10 @@ async fn main() -> Result<()> {
         for (key, value) in &demo_env[..4] {
             println!("  export {key}={value}");
         }
+        println!();
+        println!("a build with --features device-identity also needs:");
+        let (key, value) = &demo_env[6];
+        println!("  export {key}={value}");
         println!();
         println!("phone:");
         for (device, host) in reverse {
@@ -148,6 +187,32 @@ async fn main() -> Result<()> {
         run_process(&program, &args, &demo_env).await?;
     }
     Ok(())
+}
+
+/// The server's device identity settings: the demo CA, and App Attest for
+/// the demo's development builds when `CONNETTO_IOS_TEAM_ID` names the team.
+fn device_env(device_ca: &DemoDeviceCa) -> Vec<(String, String)> {
+    let mut envs = vec![
+        (
+            "CONNETTO_DEVICE_ROOT".to_owned(),
+            device_ca.root.display().to_string(),
+        ),
+        (
+            "CONNETTO_DEVICE_ISSUER_DIR".to_owned(),
+            device_ca.issuer.display().to_string(),
+        ),
+    ];
+    if let Ok(team) = std::env::var("CONNETTO_IOS_TEAM_ID") {
+        envs.push((
+            "CONNETTO_DEVICE_APP_ATTEST_APP_IDS".to_owned(),
+            format!("{team}.{DEMO_BUNDLE}"),
+        ));
+        envs.push((
+            "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT".to_owned(),
+            "development".to_owned(),
+        ));
+    }
+    envs
 }
 
 /// The running provider `running` names, or else a container, advertised on

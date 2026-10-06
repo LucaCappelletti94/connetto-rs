@@ -12,6 +12,8 @@ members = [
   "crates/connetto-file-server",
   "crates/connetto-file-client",
   "crates/connetto-auth-session",
+  "crates/connetto-ca",
+  "crates/connetto-app-attest",
   # The documents and the build-time translation every browser demo shares.
   # A member rather than an exclusion, so the root gate lints it with the rest.
   "examples/deployment",
@@ -139,9 +141,9 @@ security-framework = { git = "https://github.com/LucaCappelletti94/rust-security
 # a store the app unlocks once per approval and finds and deletes entries in
 # while locked, and the Android 13 expiry refusal, stacked on upstream main.
 android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "d82b446a99102f44829d17c39671adffba57a64e" }
-# R53, until released: the Windows Hello PRF named store with keyless entry
-# deletion, explicit store discard, and user-scoped locks.
-windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "3109f4d4347bba565cdbb2ae5d0439d5c03fbde6" }
+# R53 and R74, until released: the fork's `future` branch, the sealed and
+# Windows Hello store stack merged with the TPM signing key (upstream #19).
+windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
 # R6 decision 4, until released: a key-only old tuple leaves its non-key
 # cells absent instead of NULL (isdaniel/pg-walstream#121), so a table
 # switched to `REPLICA IDENTITY DEFAULT` mid-run is refused. subql takes

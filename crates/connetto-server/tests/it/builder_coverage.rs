@@ -21,6 +21,7 @@ use connetto_server::builder::{
     BuildError, ContentBuildError, ContentSettings, Database, OidcProvider, OpenFga, ServeError,
     ServerBuilder, ServerParts, ServerSchema, StoreSpec, TokenKeys,
 };
+use connetto_server::device_cert::DeviceCertConfig;
 use connetto_server::{
     AbuseLimits, AuthConfig, ConnectionLimits, OidcProviderConfig, OplogConfig, PersonLimits,
     PreflightError, ReaderReserve, ReconnectPolicy, RuntimeWritableCatalog, SessionConfig,
@@ -1701,7 +1702,10 @@ async fn an_unreachable_authorization_endpoint_refuses_naming_it() {
 
 /// The refusal a build over `fixture` answers once `turn_on` set it up, which
 /// must be a missing artifact.
-async fn missing(fixture: &Fixture, turn_on: fn(ServerBuilder) -> ServerBuilder) -> String {
+async fn missing(
+    fixture: &Fixture,
+    turn_on: impl FnOnce(ServerBuilder) -> ServerBuilder,
+) -> String {
     let (builder, _idp, _keys) = builder_over(fixture, 0).await;
     match refused(turn_on(builder).build().await, "a missing table refuses") {
         BuildError::Preflight(err @ PreflightError::Missing { .. }) => err.to_string(),
@@ -1710,8 +1714,8 @@ async fn missing(fixture: &Fixture, turn_on: fn(ServerBuilder) -> ServerBuilder)
 }
 
 /// A table one of the schema's members names and the deployment never
-/// created refuses the build naming it, the ban and audit tables only when
-/// those are turned on.
+/// created refuses the build naming it, the ban, audit and enrolment tables
+/// only when those are turned on.
 #[tokio::test]
 async fn a_missing_schema_table_refuses_naming_it() {
     let _keyring = isolated_session_keyring();
@@ -1731,6 +1735,15 @@ async fn a_missing_schema_table_refuses_naming_it() {
     assert!(
         audit.starts_with("table auth_events does not exist"),
         "{audit}"
+    );
+    let (_, _, issuer) = super::enrolment::rooted_issuer();
+    let devices = missing(&fixture, move |builder| {
+        builder.device_identity(Some(DeviceCertConfig::new(issuer)))
+    })
+    .await;
+    assert!(
+        devices.starts_with("table connetto_device_enrolments does not exist"),
+        "{devices}"
     );
 
     exec(&pool, "DROP TABLE _connetto_mutations").await;

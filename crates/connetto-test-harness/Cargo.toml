@@ -18,10 +18,13 @@ connetto-core = { workspace = true, features = [
   "native-transport",
   "test-support",
   "logging",
+  "device-cert",
 ] }
 # The harness exercises the real Postgres write and read paths, which
 # connetto-server now compiles unconditionally.
 connetto-server = { path = "../connetto-server", features = ["test-seams"] }
+# The demo stack mints the demo's device certificate authority with the operator tool.
+connetto-ca = { path = "../connetto-ca" }
 # The browser stack's lose-content route finds a file's chunks and deletes them from the store.
 connetto-file-core = { path = "../connetto-file-core" }
 connetto-file-server = { path = "../connetto-file-server" }

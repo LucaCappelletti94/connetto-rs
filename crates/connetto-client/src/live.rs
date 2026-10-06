@@ -2850,6 +2850,113 @@ async fn pump<T, F, S>(
     }
 }
 
+/// The running client as the enrolment task sees it.
+#[cfg(feature = "device-identity")]
+struct EnrolLink<T: Transport> {
+    shared: Arc<Shared<T>>,
+    alive: Weak<ClientToken>,
+}
+
+#[cfg(feature = "device-identity")]
+impl<T> crate::enrolment::Link for EnrolLink<T>
+where
+    T: Transport + Send + 'static,
+    T::Error: core::fmt::Display,
+{
+    fn alive(&self) -> bool {
+        self.alive.strong_count() > 0 && !self.shared.pump_done.done.load(Ordering::Acquire)
+    }
+
+    fn events(&self) -> broadcast::Receiver<ClientEvent> {
+        self.shared.events.subscribe()
+    }
+
+    fn emit(&self, event: ClientEvent) {
+        let _ = self.shared.events.send(event);
+    }
+
+    async fn ended(&self) {
+        loop {
+            let notified = self.shared.pump_done.wake.notified();
+            if self.shared.pump_done.done.load(Ordering::Acquire) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    async fn connected(&self) -> bool {
+        self.shared.lock_interrupting().await.conn.is_connected()
+    }
+
+    async fn ask(
+        &self,
+        request_id: String,
+        msg: connetto_core::messages::ControlMessage,
+    ) -> Result<tokio::sync::oneshot::Receiver<crate::enrolment::Answer>, ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.ask_enrolment(request_id, msg).await
+    }
+
+    async fn store(&self, held: crate::enrolment::Held) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.store_device_certificate(&held)
+    }
+
+    async fn forget(&self) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.delete_device_certificate()
+    }
+
+    async fn store_list(&self, kept: crate::enrolment::KeptList) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.store_revocation_list(&kept)
+    }
+}
+
+#[cfg(feature = "device-identity")]
+impl<T> ConnettoClient<T>
+where
+    T: Transport + Send + 'static,
+    T::Error: core::fmt::Display,
+{
+    /// The certificate the replica holds, read under the state lock and never
+    /// refused by the gate, since it is connetto's own bookkeeping.
+    pub(crate) async fn stored_certificate(
+        &self,
+    ) -> Result<Option<crate::enrolment::Held>, ClientError> {
+        self.shared
+            .lock_interrupting()
+            .await
+            .conn
+            .device_certificate()
+    }
+
+    /// The revocation lists the replica keeps, and the lists the server
+    /// pushes from now on, taken before the pump runs so none is missed.
+    pub(crate) async fn revocation_inbox(
+        &self,
+    ) -> Result<(Vec<crate::enrolment::KeptList>, crate::enrolment::ListInbox), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        let kept = state.conn.revocation_lists()?;
+        Ok((kept, state.conn.subscribe_revocations()))
+    }
+
+    /// The enrolment task beside this client's pump, ending with it.
+    pub(crate) fn enrolment(
+        &self,
+        enroller: crate::enrolment::Enroller,
+    ) -> impl Future<Output = ()> + Send + 'static {
+        crate::enrolment::run(
+            EnrolLink {
+                shared: Arc::clone(&self.shared),
+                alive: Arc::downgrade(&self.token),
+            },
+            enroller,
+        )
+    }
+}
+
 /// The pump's per-iteration control flow.
 enum PumpFlow {
     /// Proceed to the next step.

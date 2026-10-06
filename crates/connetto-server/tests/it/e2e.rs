@@ -458,7 +458,7 @@ impl Authorization {
         }
     }
 
-    fn env_pairs(&self) -> [(&str, &str); 3] {
+    pub(super) fn env_pairs(&self) -> [(&str, &str); 3] {
         [
             ("CONNETTO_PG_POLICIES", self.policies.as_str()),
             ("CONNETTO_FGA_URL", self.endpoint.as_str()),
@@ -1244,7 +1244,7 @@ async fn e2e_unrestricted_table_delivers_without_policy() {
 /// Spawn the server with the given environment, wait up to 30 s for it to exit,
 /// and return its output. Used by startup-refusal tests where the binary exits
 /// before binding its port.
-async fn run_server_exit_output(
+pub(super) async fn run_server_exit_output(
     database_url: &str,
     reader_url: Option<&str>,
     extra_envs: &[(&str, &str)],

@@ -418,10 +418,24 @@ pub(crate) const PENDING_LOGIN_RECORD: &str = "connetto-pending-login";
 /// The one definition of that set, because every store has to agree on it: a
 /// reserved record must never be offered as somebody to sign in as. Collision is
 /// impossible rather than merely unlikely, since an account key is a serialized
-/// id and neither literal is valid JSON.
+/// id and no reserved name is valid JSON.
 #[must_use]
 pub fn is_reserved_record(name: &str) -> bool {
-    name == IDENTITY_RECORD || name == ACCOUNTS_RECORD || name == PENDING_LOGIN_RECORD
+    name == IDENTITY_RECORD
+        || name == ACCOUNTS_RECORD
+        || name == PENDING_LOGIN_RECORD
+        || name.starts_with(DEVICE_KEY_RECORD_PREFIX)
+}
+
+/// The prefix of an account's software device key record (R74 decision 16).
+const DEVICE_KEY_RECORD_PREFIX: &str = "connetto-device-key:";
+
+/// The record holding `account`'s software device key, reserved so it is
+/// never offered as an account and stays outside the unlock gate (R74
+/// decision 11). `account` is the account's replica name, [`replica_db_name`].
+#[must_use]
+pub fn device_key_record(account: &str) -> String {
+    format!("{DEVICE_KEY_RECORD_PREFIX}{account}")
 }
 
 /// Encode `user_id` for [`IDENTITY_RECORD`], and for the credential row itself.
@@ -467,9 +481,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Replica, Tier, replica_db_name};
+    use super::{
+        Replica, Tier, device_key_record, encode_identity, is_reserved_record, replica_db_name,
+    };
     use crate::ClientError;
     use crate::cipher::ReplicaKey;
+
+    #[test]
+    fn a_device_key_record_is_reserved_and_names_its_account() {
+        let alice = encode_identity(&"alice").expect("encode");
+        let bob = encode_identity(&"bob").expect("encode");
+        assert!(is_reserved_record(&device_key_record(&alice)));
+        assert_ne!(device_key_record(&alice), device_key_record(&bob));
+        assert!(!is_reserved_record(&alice));
+    }
 
     #[test]
     fn a_run_with_nothing_at_rest_opens_sqlites_own_memory_database() {

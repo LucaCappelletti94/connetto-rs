@@ -36,6 +36,8 @@ pub mod backoff;
 pub mod codec;
 pub mod cursor;
 pub mod custody;
+#[cfg(feature = "device-cert")]
+pub mod device_cert;
 #[cfg(feature = "env")]
 pub mod env;
 pub mod error;

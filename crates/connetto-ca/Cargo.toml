@@ -1,0 +1,30 @@
+[package]
+name = "connetto-ca"
+description = "The offline ceremonies of a connetto deployment's device certificate authority: creating the root and signing the server's issuer."
+categories = ["authentication", "cryptography", "command-line-utilities"]
+keywords = ["sync", "x509", "certificates", "pki"]
+readme = "README.md"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+connetto-core = { workspace = true, features = ["device-cert"] }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
+# The root key is stored as passphrase-encrypted PKCS #8 (PBES2, scrypt, AES-256-CBC).
+pkcs8 = { version = "0.10", features = ["encryption", "std"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+rpassword = "7"
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -36,7 +36,15 @@ mod delta_aggregate;
 
 mod deployment_schema;
 
+mod device_identity;
+
 mod e2e;
+
+mod enrolment;
+
+mod enrolment_store;
+
+mod revocation;
 
 mod epoch;
 

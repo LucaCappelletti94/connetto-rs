@@ -13,11 +13,14 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError,
+        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, DeviceAttestation,
+        DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge,
+        EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError,
         FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
         LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-        MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, SnapshotBegin,
-        SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, RevocationUpdate,
+        RevokeDeviceRequest, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -232,6 +235,8 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         },
         // SessionManager::close_session, from the auth service's revoke hook.
         FatalErrorReason::SessionRevoked,
+        // DeviceEnrolment::revoke, closing a reported device's connections (R74).
+        FatalErrorReason::DeviceRevoked,
         // SessionManager::register_connection, on a second live handshake.
         FatalErrorReason::ConnectionSuperseded,
         // SessionManager::serve, on a duplicate handshake mid-session.
@@ -256,6 +261,7 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         match reason {
             FatalErrorReason::ProtocolVersionMismatch { .. }
             | FatalErrorReason::SessionRevoked
+            | FatalErrorReason::DeviceRevoked
             | FatalErrorReason::ConnectionSuperseded
             | FatalErrorReason::ProtocolViolation { .. }
             | FatalErrorReason::ServerShuttingDown
@@ -331,4 +337,114 @@ fn bulk_frames_round_trip() {
         99,
         vec![0x77, 0x88],
     )));
+}
+
+#[test]
+fn enrolment_control_round_trips() {
+    round_trip_control(&ControlMessage::EnrolChallengeRequest(
+        EnrolChallengeRequest {
+            request_id: "enrol-1".into(),
+        },
+    ));
+    round_trip_control(&ControlMessage::EnrolChallenge(EnrolChallenge {
+        request_id: "enrol-1".into(),
+        nonce: [7; 32],
+        expires_in_ms: 60_000,
+    }));
+    let attestations = [
+        None,
+        Some(DeviceAttestation::AndroidKeyChain(vec![
+            serde_bytes::ByteBuf::from(vec![0x30, 0x06]),
+            serde_bytes::ByteBuf::from(vec![0x30, 0x07]),
+        ])),
+        Some(DeviceAttestation::AppleAppAttest {
+            key_id: vec![8; 32],
+            attestation: vec![0xa3, 0x63],
+        }),
+    ];
+    for (lifetime_secs, attestation) in [None, Some(86_400)]
+        .into_iter()
+        .flat_map(|lifetime| attestations.iter().map(move |at| (lifetime, at.clone())))
+    {
+        round_trip_control(&ControlMessage::EnrolRequest(EnrolRequest {
+            request_id: "enrol-2".into(),
+            csr: vec![0x30, 0x82, 0x01],
+            lifetime_secs,
+            descriptor: vec![0x93, 0x01, 0x02, 0x03],
+            attestation,
+        }));
+    }
+    round_trip_control(&ControlMessage::EnrolGrant(EnrolGrant {
+        request_id: "enrol-2".into(),
+        chain: vec![
+            serde_bytes::ByteBuf::from(vec![0x30, 0x01]),
+            serde_bytes::ByteBuf::from(vec![0x30, 0x02]),
+        ],
+        revocation_lists: vec![SignedList {
+            list: vec![0x30, 0x03],
+            signer: vec![0x30, 0x02],
+        }],
+    }));
+    for reason in every_enrol_refusal() {
+        round_trip_control(&ControlMessage::EnrolRefused(EnrolRefused {
+            request_id: "enrol-2".into(),
+            reason,
+        }));
+    }
+    round_trip_control(&ControlMessage::RevocationUpdate(RevocationUpdate {
+        lists: vec![SignedList {
+            list: vec![0x30, 0x04],
+            signer: vec![0x30, 0x05],
+        }],
+    }));
+    round_trip_control(&ControlMessage::DevicesRequest(DevicesRequest {
+        request_id: "devices-1".into(),
+    }));
+    for revoked_at_secs in [None, Some(1_900_000_000)] {
+        round_trip_control(&ControlMessage::DevicesList(DevicesList {
+            request_id: "devices-1".into(),
+            devices: vec![DeviceSummary {
+                key_id: [9; 32],
+                enrolled_at_secs: 1_800_000_000,
+                last_seen_secs: 1_800_086_400,
+                revoked_at_secs,
+                descriptor: vec![0x81, 0xa4],
+            }],
+        }));
+    }
+    round_trip_control(&ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+        request_id: "revoke-1".into(),
+        key_id: [9; 32],
+    }));
+    round_trip_control(&ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
+        request_id: "revoke-1".into(),
+    }));
+}
+
+/// Every [`EnrolRefusal`]. The wildcard-free match stops this file compiling
+/// when a variant is added and not listed here.
+fn every_enrol_refusal() -> Vec<EnrolRefusal> {
+    let all = vec![
+        EnrolRefusal::Unidentified,
+        EnrolRefusal::IssuerUnavailable,
+        EnrolRefusal::ChallengeExpired,
+        EnrolRefusal::InvalidRequest,
+        EnrolRefusal::OverCeiling {
+            ceiling_secs: 2_592_000,
+        },
+        EnrolRefusal::Revoked,
+        EnrolRefusal::AttestationRequired,
+    ];
+    for reason in &all {
+        match reason {
+            EnrolRefusal::Unidentified
+            | EnrolRefusal::IssuerUnavailable
+            | EnrolRefusal::ChallengeExpired
+            | EnrolRefusal::InvalidRequest
+            | EnrolRefusal::OverCeiling { .. }
+            | EnrolRefusal::Revoked
+            | EnrolRefusal::AttestationRequired => {}
+        }
+    }
+    all
 }

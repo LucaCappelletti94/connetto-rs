@@ -53,6 +53,10 @@ logging = ["dep:tracing-subscriber"]
 # Off by default for the same reason `logging` is: a library reads no
 # environment and opens no file, so only a program pays for it.
 env = ["dep:thiserror"]
+# Device certificates (R74): the identity a native device proves to its peers,
+# issued by the server and checked by every native side. Native only, since
+# browsers never enrol, so the browser build never links `ring` through it.
+device-cert = ["dep:thiserror", "dep:rcgen", "dep:x509-parser", "dep:time"]
 
 [dependencies]
 serde.workspace = true
@@ -80,6 +84,9 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"
 url = { version = "2", optional = true }
 diesel = { version = "2", default-features = false, features = ["postgres_backend"], optional = true }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "json", "env-filter", "std"], optional = true }
+rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"], optional = true }
+x509-parser = { version = "0.18", features = ["verify"], optional = true }
+time = { version = "0.3", default-features = false, optional = true }
 
 [dev-dependencies]
 serde_json = "1"
@@ -89,3 +96,6 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 # The span-chain case polls a spawned task, so the format test needs a runtime.
 tokio = { version = "1", default-features = false, features = ["rt"] }
+# The device certificate tests check issued chains with the verifier peers use.
+rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "alloc"] }
+rustls-pki-types = "1"

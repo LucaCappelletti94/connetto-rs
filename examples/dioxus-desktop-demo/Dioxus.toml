@@ -8,3 +8,9 @@ identifier = "dev.connetto.dioxusdemo"
 # unlock prompt.
 [permissions]
 biometrics = { description = "Unlock your synced data" }
+
+# App Attest vouches for this build at device enrolment (R74 decisions 32 and
+# 35). The development profile must carry the App Attest capability, which
+# `connetto-ios-signing` writes once it is enabled on the App ID.
+[ios.entitlements]
+"com.apple.developer.devicecheck.appattest-environment" = "development"

@@ -74,19 +74,53 @@
 //!   `CONNETTO_CONTENT_BANDWIDTH_WINDOW_DAYS` (default `30`),
 //!   `CONNETTO_CONTENT_WARN_FRACTION` (default `0.8`) and
 //!   `CONNETTO_CONTENT_CEILING_REFRESH_SECS` (default `10`).
+//! - `CONNETTO_DEVICE_ISSUER_DIR` (unset, devices cannot enrol): a directory
+//!   `connetto-ca issuer` wrote, holding `issuer.der` and `issuer.key` (R74).
+//!   Set, the deployment's enrolment tables are required, and the server
+//!   refuses to start when the root did not sign the issuer or the issuer has
+//!   expired, and warns when it has less than sixty days left. Every other
+//!   `CONNETTO_DEVICE_*` setting is refused without it.
+//! - `CONNETTO_DEVICE_ROOT`: required with the issuer, the path of the
+//!   deployment root's `root.der`.
+//! - `CONNETTO_DEVICE_RETIRED_ISSUER_DIRS`: a comma-separated list of the
+//!   directories of issuers the current one replaced, which keep signing the
+//!   lists of their own certificates until they expire.
+//! - `CONNETTO_DEVICE_ROOT_LIST`: the path of the `root-list.der`
+//!   `connetto-ca revoke-issuer` wrote, published beside the issuers' lists.
+//! - `CONNETTO_DEVICE_CERT_DEFAULT_SECS`: a device certificate's lifetime when
+//!   the application requests none (default 86400).
+//! - `CONNETTO_DEVICE_CERT_CEILING_SECS`: the longest lifetime granted, a
+//!   longer request refused (default 2592000, 30 days).
+//! - `CONNETTO_DEVICE_APP_ATTEST_APP_IDS`: a comma-separated list of the
+//!   App IDs, each `TEAMID.bundle.id`, App Attest vouches for, so an
+//!   attestation that passes Apple's checks for a listed ID in the
+//!   configured environment records `app-attested`.
+//! - `CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT`: the environment the listed
+//!   App IDs attest in, `production` (default) or `development`.
+//! - `CONNETTO_DEVICE_ACCEPTED_ATTESTATION`: the attestation levels the
+//!   deployment accepts, from `chip-proven`, `app-attested` and `unproven`,
+//!   every one by default.
+//! - `CONNETTO_DEVICE_ANDROID_STATUS`: the source of the Android attestation
+//!   status list, a `http` or `https` URL (Google's by default) or a path
+//!   to a local file.
 //!
 //! The process exits `1` when the change stream cannot answer what a row
 //! looked like before it changed, or gives up reconnecting, and returns its
 //! build or HTTP errors as failures.
 
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
+use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY};
+use connetto_core::device_cert::{ATTESTATION_OID_IS_STAND_IN, AttestationLevel, DeviceIssuer};
 use connetto_core::env::{read_ddl, var_or};
+use connetto_core::messages::SignedList;
 use connetto_server::builder::{
     ContentSettings, Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema,
     StoreSpec, TokenKeys,
 };
+use connetto_server::device_cert::{AndroidStatus, AppAttestEnvironment, DeviceCertConfig};
 use connetto_server::{
     AuthConfig, CookieSameSite, OidcProviderConfig, ReaderReserve, RuntimeWritableCatalog,
 };
@@ -347,6 +381,121 @@ async fn content_settings() -> Result<Option<ContentSettings>> {
 ///
 /// When any setting is absent, blank, or names a mode this binary no longer
 /// serves.
+/// `<key>` as whole seconds, `None` when unset or blank.
+fn env_secs(key: &str) -> Result<Option<Duration>> {
+    var_nonempty(key)
+        .map(|text| {
+            text.parse()
+                .map(Duration::from_secs)
+                .with_context(|| format!("parsing {key}: {text:?}"))
+        })
+        .transpose()
+}
+
+/// The device settings `CONNETTO_DEVICE_ISSUER_DIR` turns on.
+const DEVICE_SETTINGS: [&str; 9] = [
+    "CONNETTO_DEVICE_ROOT",
+    "CONNETTO_DEVICE_RETIRED_ISSUER_DIRS",
+    "CONNETTO_DEVICE_ROOT_LIST",
+    "CONNETTO_DEVICE_CERT_DEFAULT_SECS",
+    "CONNETTO_DEVICE_CERT_CEILING_SECS",
+    "CONNETTO_DEVICE_APP_ATTEST_APP_IDS",
+    "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT",
+    "CONNETTO_DEVICE_ACCEPTED_ATTESTATION",
+    "CONNETTO_DEVICE_ANDROID_STATUS",
+];
+
+/// The file at `path`, the error naming `what` it is.
+fn read_file(what: &str, path: &Path) -> Result<Vec<u8>> {
+    std::fs::read(path).with_context(|| format!("reading {what} at {}", path.display()))
+}
+
+/// The issuer `connetto-ca issuer` wrote into `dir`, which `root` signed.
+fn issuer_in(dir: &str, root: &[u8]) -> Result<DeviceIssuer> {
+    let dir = Path::new(dir);
+    let certificate = read_file("the issuer certificate", &dir.join(ISSUER_CERTIFICATE))?;
+    let key = zeroize::Zeroizing::new(read_file("the issuer key", &dir.join(ISSUER_KEY))?);
+    DeviceIssuer::from_pkcs8(certificate, &key, root)
+        .with_context(|| format!("loading the device certificate issuer in {}", dir.display()))
+}
+
+/// The device certificate settings from `CONNETTO_DEVICE_*`, `None` when
+/// `CONNETTO_DEVICE_ISSUER_DIR` is unset, so devices cannot enrol.
+fn device_certs() -> Result<Option<DeviceCertConfig>> {
+    let Some(issuer_dir) = var_nonempty("CONNETTO_DEVICE_ISSUER_DIR") else {
+        if let Some(key) = DEVICE_SETTINGS
+            .into_iter()
+            .find(|key| var_nonempty(key).is_some())
+        {
+            return Err(anyhow!(
+                "{key} is set without CONNETTO_DEVICE_ISSUER_DIR, which turns device identity on"
+            ));
+        }
+        return Ok(None);
+    };
+    let root_path = var_nonempty("CONNETTO_DEVICE_ROOT").ok_or_else(|| {
+        anyhow!(
+            "set CONNETTO_DEVICE_ROOT to the deployment root's root.der, which signed the issuer"
+        )
+    })?;
+    let root = read_file("the deployment root", Path::new(&root_path))?;
+    let mut config = DeviceCertConfig::new(issuer_in(&issuer_dir, &root)?);
+    for dir in comma_list(&var_or("CONNETTO_DEVICE_RETIRED_ISSUER_DIRS", "")) {
+        config = config.with_retired_issuer(issuer_in(&dir, &root)?);
+    }
+    if let Some(path) = var_nonempty("CONNETTO_DEVICE_ROOT_LIST") {
+        config = config.with_root_list(SignedList {
+            list: read_file("the root's list", Path::new(&path))?,
+            signer: root,
+        });
+    }
+    if let Some(lifetime) = env_secs("CONNETTO_DEVICE_CERT_DEFAULT_SECS")? {
+        config = config.with_default_lifetime(lifetime);
+    }
+    if let Some(ceiling) = env_secs("CONNETTO_DEVICE_CERT_CEILING_SECS")? {
+        config = config.with_lifetime_ceiling(ceiling);
+    }
+    if let Some(text) = var_nonempty("CONNETTO_DEVICE_APP_ATTEST_APP_IDS") {
+        let app_ids = comma_list(&text);
+        let name = var_or("CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT", "production");
+        let Some(environment) = AppAttestEnvironment::parse(&name) else {
+            return Err(anyhow!(
+                "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT is {name:?}, expected production or development"
+            ));
+        };
+        config = config.with_app_attest(app_ids, environment);
+    }
+    if let Some(text) = var_nonempty("CONNETTO_DEVICE_ACCEPTED_ATTESTATION") {
+        let mut accepted = Vec::new();
+        for name in comma_list(&text) {
+            match AttestationLevel::parse(&name) {
+                Some(level) => accepted.push(level),
+                None => {
+                    return Err(anyhow!(
+                        "CONNETTO_DEVICE_ACCEPTED_ATTESTATION names {name:?}, expected chip-proven, app-attested or unproven"
+                    ));
+                }
+            }
+        }
+        config = config.with_accepted_attestation(accepted);
+    }
+    if let Some(text) = var_nonempty("CONNETTO_DEVICE_ANDROID_STATUS") {
+        let source = if text.starts_with("http://") || text.starts_with("https://") {
+            AndroidStatus::Url(text)
+        } else {
+            AndroidStatus::File(PathBuf::from(text))
+        };
+        config = config.with_android_status(source);
+    }
+    if ATTESTATION_OID_IS_STAND_IN {
+        tracing::warn!(
+            "the device certificate's attestation extension still stands under the RFC 5612 \
+             documentation number 32473, pending the assignment of connetto's own number"
+        );
+    }
+    Ok(Some(config))
+}
+
 async fn builder_from_env() -> Result<ServerBuilder> {
     let auth = var_or("CONNETTO_AUTH", "");
     match auth.as_str() {
@@ -382,6 +531,7 @@ async fn builder_from_env() -> Result<ServerBuilder> {
     let providers = oidc_providers()?;
     let keys = jwt_keys()?;
     let content = content_settings().await?;
+    let device_identity = device_certs()?;
     let openfga = OpenFga::new(
         var_or("CONNETTO_FGA_URL", "http://127.0.0.1:8081"),
         std::env::var("CONNETTO_FGA_STORE").map_err(|_| {
@@ -405,7 +555,8 @@ async fn builder_from_env() -> Result<ServerBuilder> {
         .cors_origins(comma_list(&var_or("CONNETTO_AUTH_CORS_ORIGINS", "")))
         .cookie_same_site(cookie_same_site()?)
         .writable(writable_catalog())
-        .content(content))
+        .content(content)
+        .device_identity(device_identity))
 }
 
 /// Resolve on the first SIGINT or SIGTERM. On a platform without SIGTERM only

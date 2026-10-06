@@ -31,6 +31,8 @@ use crate::builder::sign_in::{AccountChoice, Keyring};
 use crate::builder::sign_in::{HeldCredential, NativeSignIn, NoKeyring, SignInKind, StorageMarker};
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
+#[cfg(feature = "device-identity")]
+use crate::enrolment::{CertificateError, DeviceKeys, EnrolHandle, Enroller, PlatformKeys};
 use crate::reconnect::ReconnectPolicy;
 #[cfg(feature = "native-auth")]
 use crate::replica::encode_identity;
@@ -38,6 +40,8 @@ use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
 use crate::{ClientError, ConnettoClient, Custody};
+#[cfg(feature = "device-identity")]
+use connetto_core::device_cert::{DeviceCertificate, DeviceDescriptor, KeyHome};
 
 /// The platform transport, a WebSocket over a plain loopback socket or a
 /// TLS stream the platform's trust store verified.
@@ -284,6 +288,8 @@ where
                 session: resolved.provider.map(|(session, _)| session),
                 #[cfg(feature = "native-auth")]
                 teardown: None,
+                #[cfg(feature = "device-identity")]
+                device: None,
             },
             pump,
         ))
@@ -349,6 +355,8 @@ where
             key_store,
             gate: Gate::default(),
             mechanism: None,
+            #[cfg(feature = "device-identity")]
+            device: DeviceSetup::default(),
         }
     }
 }
@@ -401,6 +409,8 @@ where
             key_store,
             gate: Gate::default(),
             mechanism: None,
+            #[cfg(feature = "device-identity")]
+            device: DeviceSetup::default(),
         }
     }
 }
@@ -418,6 +428,131 @@ pub struct NativeDurable<T: Transport, C, K: StorageMarker, KS> {
     key_store: KS,
     gate: Gate,
     mechanism: Option<Arc<dyn GateMechanism>>,
+    #[cfg(feature = "device-identity")]
+    device: DeviceSetup,
+}
+
+/// What a keyring build enrols its device key with (R74).
+#[cfg(feature = "device-identity")]
+struct DeviceSetup {
+    lifetime: Option<core::time::Duration>,
+    descriptor: Vec<u8>,
+    refused: Option<String>,
+    roots: Vec<Vec<u8>>,
+    #[cfg(target_os = "android")]
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+}
+
+#[cfg(feature = "device-identity")]
+impl Default for DeviceSetup {
+    /// No descriptor is `()`, which a deployment naming none decodes.
+    fn default() -> Self {
+        Self {
+            lifetime: None,
+            descriptor: rmp_serde::to_vec_named(&()).unwrap_or_default(),
+            refused: None,
+            roots: Vec::new(),
+            #[cfg(target_os = "android")]
+            java: None,
+        }
+    }
+}
+
+/// The largest descriptor the server accepts.
+#[cfg(feature = "device-identity")]
+const DESCRIPTOR_LIMIT: usize = 4096;
+
+#[cfg(feature = "device-identity")]
+impl DeviceSetup {
+    /// The account's key on this platform's chip, else in the keyring under `service`.
+    fn keys(&self, service: &str, account: &str) -> Result<Arc<dyn DeviceKeys>, ClientError> {
+        if let Some(reason) = &self.refused {
+            return Err(ClientError::DeviceDescriptor(reason.clone()));
+        }
+        if self.roots.is_empty() {
+            return Err(ClientError::MissingDeploymentRoots);
+        }
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        let chip = Arc::new(crate::device_key::SecureEnclave);
+        #[cfg(target_os = "android")]
+        let chip = Arc::new(crate::device_key::AndroidKeystore::new(
+            self.java.clone().ok_or(ClientError::MissingJavaAccess)?,
+        ));
+        #[cfg(target_os = "windows")]
+        let chip = Arc::new(crate::device_key::Tpm);
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "android",
+            target_os = "windows"
+        )))]
+        let chip = Arc::new(crate::device_key::NoChip);
+        Ok(Arc::new(PlatformKeys {
+            chip,
+            records: crate::keyring::Keyring::new(service),
+            service: service.to_owned(),
+            account: account.to_owned(),
+        }))
+    }
+}
+
+#[cfg(feature = "device-identity")]
+impl<T, C, KS> NativeDurable<T, C, Keyring, KS>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+    C: AttachContent<T>,
+    KS: ReplicaKeyStore<Error = ClientError> + Send + Sync + 'static,
+{
+    /// The lifetime this device's certificate is asked for at enrolment and
+    /// renewed at, the server's default (24 hours) unless set. A lifetime over
+    /// the server's ceiling is refused, never shortened.
+    #[must_use]
+    pub fn with_certificate_lifetime(mut self, lifetime: core::time::Duration) -> Self {
+        self.device.lifetime = Some(lifetime);
+        self
+    }
+
+    /// What the lost-device list shows about this device, sent at enrolment
+    /// and every renewal in `MessagePack` of at most 4096 bytes. A descriptor that
+    /// does not serialize or is larger fails the connect.
+    #[must_use]
+    pub fn with_device_descriptor<D: DeviceDescriptor>(mut self, descriptor: &D) -> Self {
+        match rmp_serde::to_vec_named(descriptor) {
+            Ok(bytes) if bytes.len() <= DESCRIPTOR_LIMIT => {
+                self.device.descriptor = bytes;
+                self.device.refused = None;
+            }
+            Ok(bytes) => {
+                self.device.refused = Some(format!(
+                    "{} bytes, over the {DESCRIPTOR_LIMIT} the server accepts",
+                    bytes.len()
+                ));
+            }
+            Err(err) => self.device.refused = Some(err.to_string()),
+        }
+        self
+    }
+
+    /// The DER roots of the deployment, shipped with the application, which
+    /// every certificate this device receives and every revocation list must
+    /// chain to (decisions 3 and 23). A build with a device identity that
+    /// names none fails to connect. Several roots carry a root rollover.
+    #[must_use]
+    pub fn with_deployment_roots(mut self, roots: impl IntoIterator<Item = Vec<u8>>) -> Self {
+        self.device.roots = roots.into_iter().collect();
+        self
+    }
+
+    /// The JNI access the Android Keystore key needs, which an Android build
+    /// with a device identity must hand in (decision 20).
+    /// `connetto_auth_session::java_access()` is one for a Dioxus application.
+    #[cfg(target_os = "android")]
+    #[must_use]
+    pub fn with_java_access(mut self, java: Arc<dyn crate::device_key::JavaAccess>) -> Self {
+        self.device.java = Some(java);
+        self
+    }
 }
 
 /// A data directory, the native place of a durable replica.
@@ -505,7 +640,20 @@ where
     pub async fn connect_with_pump(
         self,
     ) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
-        let (core, resolved, key_store) = self.into_core().await?;
+        #[cfg(feature = "device-identity")]
+        let mut this = self;
+        #[cfg(not(feature = "device-identity"))]
+        let this = self;
+        #[cfg(feature = "device-identity")]
+        let (device, service) = (
+            core::mem::take(&mut this.device),
+            this.storage.device_service().map(str::to_owned),
+        );
+        let (core, resolved, key_store) = this.into_core().await?;
+        #[cfg(feature = "device-identity")]
+        let keys = service
+            .map(|service| device.keys(&service, resolved.credential.replica_name()))
+            .transpose()?;
         #[cfg(feature = "native-auth")]
         let (session, teardown) = {
             let name = resolved.credential.replica_name().to_owned();
@@ -521,6 +669,30 @@ where
         #[cfg(not(feature = "native-auth"))]
         let _ = (resolved, key_store);
         let (core, pump) = core.connect_with_pump().await?;
+        #[cfg(feature = "device-identity")]
+        let (device, pump) = match keys {
+            Some(keys) => {
+                // Read before the pump runs, so a restarted client reports its
+                // certificate from the moment it is handed back.
+                let held = core.client().stored_certificate().await?;
+                let (kept, lists) = core.client().revocation_inbox().await?;
+                let (enroller, handle) = Enroller::new(
+                    keys,
+                    device.lifetime,
+                    device.descriptor,
+                    device.roots,
+                    held,
+                    kept,
+                    lists,
+                );
+                let enrolment = core.client().enrolment(enroller);
+                let pump: CorePump = Box::pin(async move {
+                    tokio::join!(pump, enrolment);
+                });
+                (Some(handle), pump)
+            }
+            None => (None, pump),
+        };
         Ok((
             NativeClient {
                 core,
@@ -528,6 +700,8 @@ where
                 session,
                 #[cfg(feature = "native-auth")]
                 teardown,
+                #[cfg(feature = "device-identity")]
+                device,
             },
             pump,
         ))
@@ -584,6 +758,8 @@ pub struct NativeClient<T: Transport, C = ()> {
     session: Option<NativeSession>,
     #[cfg(feature = "native-auth")]
     teardown: Option<Box<dyn Forget>>,
+    #[cfg(feature = "device-identity")]
+    device: Option<EnrolHandle>,
 }
 
 impl<T, C> NativeClient<T, C>
@@ -612,6 +788,83 @@ where
     /// End the pump and close the transport while the clones stay alive.
     pub async fn close(&self) {
         self.core.close().await;
+    }
+
+    /// Ask the server for a certificate at `lifetime` now, replacing the one
+    /// this device holds, and renew at that lifetime from then on (R74).
+    ///
+    /// # Errors
+    ///
+    /// [`CertificateError::Offline`] with no server reachable,
+    /// [`CertificateError::OverCeiling`] for a lifetime the server refuses,
+    /// [`CertificateError::Revoked`] when this device's key was revoked, which
+    /// deletes it, [`CertificateError::Refused`] for any other refusal, and
+    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    #[cfg(feature = "device-identity")]
+    pub async fn reissue_certificate(
+        &self,
+        lifetime: core::time::Duration,
+    ) -> Result<(), CertificateError> {
+        match &self.device {
+            Some(device) => device.reissue(lifetime).await,
+            None => Err(CertificateError::NoIdentity),
+        }
+    }
+
+    /// The certificate this device holds, `None` before its first enrolment
+    /// and for a build without a device identity (R74).
+    #[cfg(feature = "device-identity")]
+    #[must_use]
+    pub fn device_certificate(&self) -> Option<DeviceCertificate> {
+        self.device.as_ref().and_then(EnrolHandle::certificate)
+    }
+
+    /// The account's devices, for the lost-device list, each descriptor read
+    /// as the application's `D` (R74 step 5).
+    ///
+    /// # Errors
+    ///
+    /// [`CertificateError::Offline`] with no server reachable,
+    /// [`CertificateError::Refused`] for a refusal, and
+    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    #[cfg(feature = "device-identity")]
+    pub async fn devices<D: DeviceDescriptor>(
+        &self,
+    ) -> Result<Vec<crate::enrolment::DeviceEntry<D>>, CertificateError> {
+        match &self.device {
+            Some(device) => device.devices().await,
+            None => Err(CertificateError::NoIdentity),
+        }
+    }
+
+    /// Report the account's device holding `key` lost. The server lists its
+    /// certificates, closes its connections and revokes its sessions, and a
+    /// device reporting itself deletes its own key (R74 step 5).
+    ///
+    /// # Errors
+    ///
+    /// [`CertificateError::Offline`] with no server reachable,
+    /// [`CertificateError::Refused`] for a key that is not the account's, and
+    /// [`CertificateError::NoIdentity`] for a build without a device identity.
+    #[cfg(feature = "device-identity")]
+    pub async fn revoke_device(
+        &self,
+        key: connetto_core::device_cert::KeyId,
+    ) -> Result<(), CertificateError> {
+        match &self.device {
+            Some(device) => device.revoke(key).await,
+            None => Err(CertificateError::NoIdentity),
+        }
+    }
+
+    /// Where this device's key lives, a chip or software in the secret
+    /// store, once it is open, and `None` for a build without a device
+    /// identity (R74 step 2). Reported beside [`custody`](Self::custody) and
+    /// never folded into it, since the key sits outside the unlock gate.
+    #[cfg(feature = "device-identity")]
+    #[must_use]
+    pub fn device_key_home(&self) -> Option<KeyHome> {
+        self.device.as_ref().and_then(EnrolHandle::key_home)
     }
 }
 
@@ -644,7 +897,8 @@ where
     ///
     /// [`ForgetError::NoReplica`] for a build that kept nothing on the
     /// device, [`ForgetError::Client`] when the unsynced writes cannot be
-    /// read, [`ForgetError::Purge`] when the guard refuses or the wipe fails,
+    /// read or, once the wipe stands, the device key cannot be deleted,
+    /// [`ForgetError::Purge`] when the guard refuses or the wipe fails,
     /// and [`ForgetError::NotRevoked`] when the wipe succeeded but the server
     /// was not reached.
     pub async fn forget_device(&self, force: bool) -> Result<(), ForgetError> {
@@ -655,7 +909,17 @@ where
         }
         self.core.close().await;
         self.core.client().release_replica().await?;
-        teardown.forget(&unsynced, force).await
+        let forgotten = teardown.forget(&unsynced, force).await;
+        // The certificate went with the replica, and the key goes once the
+        // wipe stands, whether or not the server heard (lifecycle row
+        // "`forget_device`").
+        #[cfg(feature = "device-identity")]
+        if matches!(forgotten, Ok(()) | Err(ForgetError::NotRevoked(_)))
+            && let Some(device) = &self.device
+        {
+            device.delete_key().await?;
+        }
+        forgotten
     }
 }
 
@@ -804,6 +1068,8 @@ impl<T: Transport, C> NativeClient<T, C> {
             session: None,
             #[cfg(feature = "native-auth")]
             teardown: None,
+            #[cfg(feature = "device-identity")]
+            device: None,
         }
     }
 }

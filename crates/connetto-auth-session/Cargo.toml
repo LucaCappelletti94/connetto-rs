@@ -13,8 +13,15 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# `java_access`, the JNI access an Android build's device key needs (R74).
+device-identity = ["dep:connetto-client"]
+
 [dependencies]
 thiserror.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+connetto-client = { path = "../connetto-client", features = ["device-identity"], optional = true }
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 # `ffi` bundles the Kotlin module or the Swift package into the app and calls

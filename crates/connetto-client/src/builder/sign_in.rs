@@ -466,6 +466,10 @@ pub trait StorageMarker: private::Sealed {
     ///
     /// [`ClientError`] when the platform store cannot be opened.
     fn arm_gate(&self, on: bool) -> Result<Option<Arc<dyn GateMechanism>>, ClientError>;
+    /// The secret-store service a device key lives under, `None` for a build
+    /// with no device identity (R74 decision 21).
+    #[cfg(feature = "device-identity")]
+    fn device_service(&self) -> Option<&str>;
 }
 
 /// The OS keyring names both credential services with the app id.
@@ -507,6 +511,10 @@ impl StorageMarker for Keyring {
         }
         crate::keyring::arm_gate(&self.app_id, on)
     }
+    #[cfg(feature = "device-identity")]
+    fn device_service(&self) -> Option<&str> {
+        Some(&self.app_id)
+    }
 }
 
 /// No keyring. A held credential names no store and a stored sign-in names
@@ -527,6 +535,10 @@ impl StorageMarker for NoKeyring {
 
     fn arm_gate(&self, _on: bool) -> Result<Option<Arc<dyn GateMechanism>>, ClientError> {
         Ok(None)
+    }
+    #[cfg(feature = "device-identity")]
+    fn device_service(&self) -> Option<&str> {
+        None
     }
 }
 
