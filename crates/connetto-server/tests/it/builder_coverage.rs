@@ -1472,12 +1472,17 @@ async fn a_second_boot_reconciles_the_installed_model() {
         .iter()
         .find(|line| {
             line["message"]
-                == "authorization rules already installed, reconciling whole-shape regions"
+                == "authorization rules already installed, the store reconciled with the database"
         })
         .expect("the second boot reconciles rather than reloads");
     assert_eq!(
         adopted["model"], written["model"],
         "the second boot adopts the model the first boot wrote"
+    );
+    assert_eq!(
+        (adopted["added"].as_u64(), adopted["removed"].as_u64()),
+        (Some(0), Some(0)),
+        "a store already equal to the database is left untouched"
     );
 
     // The reconciled store still answers: the owner's session sees the row.
