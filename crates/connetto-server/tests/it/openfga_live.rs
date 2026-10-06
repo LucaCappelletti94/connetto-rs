@@ -28,7 +28,7 @@ use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::counters;
 use connetto_server::openfga::{
-    Counted, FgaAuth, ModelState, ModelSubject, Translated, UpkeepError,
+    Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated, UpkeepError,
 };
 use connetto_server::row_view::ValuesRow;
 use connetto_test_harness::Fixture;
@@ -305,6 +305,53 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
             .expect("reconciled again"),
         (0, 0),
         "a store equal to the database is left untouched"
+    );
+}
+
+/// An adopted boot that cannot read the facts, or cannot read the store,
+/// refuses to start, so a server never serves a store it could not check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adopted_boot_that_cannot_reconcile_refuses() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    provision(&pool).await;
+    let (channel, store) = fixture.fga_store().await;
+
+    let translated =
+        Translated::of::<String>(SCHEMA, &policies(), "app.user_id").expect("translates");
+    let mut setup = OpenFgaServiceClient::new(channel);
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("written");
+    let policy = |store: &str| {
+        OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+            translated.shapes_arc(),
+            setup.clone(),
+            store.to_owned(),
+        )
+        .expect("the index carries what the questions need")
+        .authorization_model_id(model.id().to_owned())
+    };
+
+    let unknown = translated
+        .reconcile_store(&pool, &policy("01JAAAAAAAAAAAAAAAAAAAAAAA"))
+        .await;
+    assert!(
+        matches!(unknown, Err(SetupError::Store(_))),
+        "a store the service does not hold cannot be read: {unknown:?}"
+    );
+
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::sql_query("DROP TABLE r5b_notes CASCADE")
+        .execute(&mut *conn)
+        .await
+        .expect("drop the table");
+    drop(conn);
+    let unreadable = translated.reconcile_store(&pool, &policy(&store)).await;
+    assert!(
+        matches!(unreadable, Err(SetupError::Store(_))),
+        "facts whose query fails cannot be reconciled: {unreadable:?}"
     );
 }
 
