@@ -869,27 +869,28 @@ impl Translated {
         Ok(records.len())
     }
 
-    /// Reconcile every whole-shape materialisation region against the database.
+    /// Make the whole store state exactly what Postgres implies, every keyed
+    /// fact and every whole-shape region, writing only the difference (R70
+    /// decision 6).
     ///
-    /// Each region is read from both Postgres and the OpenFGA store; only the
-    /// diff is written. A region whose tuples are already correct costs a read
-    /// round-trip to both sides with zero writes. A region whose tuples are
-    /// absent or stale is brought up to date.
-    ///
-    /// Call this on every adopted boot to complete a load that a previous boot
-    /// started but did not finish. A boot that ran [`Self::load_into`] fully
-    /// left a correct store, so this becomes a cheap verification pass.
+    /// An adopted boot runs this, so a store restored to another point than
+    /// the database, a load an earlier boot did not finish, and facts a crash
+    /// left behind all come back equal to Postgres. A store already equal costs
+    /// one read of the store and of the facts and writes nothing. Answers how
+    /// many facts were added and how many removed.
     ///
     /// # Errors
     ///
     /// [`SetupError::Unplannable`] when the translation cannot be re-derived,
-    /// and [`SetupError::Store`] when a member query fails or the store refuses
-    /// a write.
-    pub async fn reconcile_materialised<T>(
+    /// and [`SetupError::Store`] when a query fails, a row does not spell a
+    /// valid fact, one fact is stated under two conditions, or the store
+    /// refuses a read or a write. Nothing is written before every difference
+    /// is known, and a retry is safe.
+    pub async fn reconcile_store<T>(
         &self,
         pool: &Pool<AsyncPgConnection>,
         policy: &OpenFgaPolicy<ParserDB, T, ModelSubject<String, String>, Postgres>,
-    ) -> Result<(), SetupError>
+    ) -> Result<(usize, usize), SetupError>
     where
         T: GrpcService<Body> + Clone + Send + Sync + 'static,
         T::Error: Into<StdError>,
@@ -897,7 +898,23 @@ impl Translated {
         <T::ResponseBody as ResponseBody>::Error: Into<StdError> + Send,
         T::Future: Send,
     {
-        materialise_groups(&self.shapes, &self.translator, pool, policy).await
+        let records = self.keyed_records(pool).await?;
+        let outputs = self
+            .translator
+            .translate(self.shapes.catalog())
+            .map_err(|err| SetupError::Unplannable(err.to_string()))?
+            .outputs_accepting_gaps();
+        let replayer = ConnettoReplayer {
+            pool,
+            outputs: &outputs,
+        };
+        let moved = policy
+            .reconcile_store(&records, &replayer)
+            .await
+            .map_err(|err| SetupError::Store(err.to_string()))?;
+        Ok(moved.iter().fold((0, 0), |(added, removed), region| {
+            (added + region.added.len(), removed + region.removed.len())
+        }))
     }
 
     /// The index every reader shares, the translator the materializer's engine
@@ -2261,7 +2278,7 @@ mod tests {
 
     /// A residual-predicate share policy (with an AVG subquery) creates a whole-shape
     /// materialisation region. The region carries the SQL that fills the grants on boot
-    /// and that `reconcile_materialised` re-runs on an adopted boot to recover from a
+    /// and that `reconcile_store` re-runs on an adopted boot to recover from a
     /// previous boot that failed before the materialise pass completed.
     #[test]
     fn a_share_with_a_residual_predicate_has_materialised_regions() {
@@ -2281,7 +2298,7 @@ mod tests {
         assert!(
             !mats.is_empty(),
             "a residual-predicate share must materialise its whole-shape region \
-             so that reconcile_materialised fills it when the previous boot failed"
+             so that reconcile_store fills it when the previous boot failed"
         );
         let item_id = catalog_helpers::table_id::<Postgres, _>(translated.shapes.catalog(), "item")
             .expect("item is in the catalog");

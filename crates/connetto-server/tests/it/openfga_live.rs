@@ -28,7 +28,7 @@ use connetto_core::SessionId;
 use connetto_core::auth::{AuthContext, Principal, Subject, VerifiedSession};
 use connetto_server::counters;
 use connetto_server::openfga::{
-    Counted, FgaAuth, ModelState, ModelSubject, Translated, UpkeepError,
+    Counted, FgaAuth, ModelState, ModelSubject, SetupError, Translated, UpkeepError,
 };
 use connetto_server::row_view::ValuesRow;
 use connetto_test_harness::Fixture;
@@ -200,6 +200,158 @@ async fn unchanged_rules_are_adopted_rather_than_rewritten() {
         ModelState::Adopted(first.id().to_owned()),
         "the same policy text produces the same rules, and a restart that \
          rewrote them would reload every fact in the database behind them"
+    );
+}
+
+/// Every tuple in `store`, as `user relation object`.
+async fn store_tuples(channel: Channel, store: &str) -> Vec<String> {
+    use openfga_client::client::ReadRequest;
+    let mut client = OpenFgaServiceClient::new(channel);
+    let mut found = Vec::new();
+    let mut continuation_token = String::new();
+    loop {
+        let page = client
+            .read(ReadRequest {
+                store_id: store.to_owned(),
+                continuation_token,
+                ..ReadRequest::default()
+            })
+            .await
+            .expect("read the store")
+            .into_inner();
+        found.extend(
+            page.tuples
+                .into_iter()
+                .filter_map(|tuple| tuple.key)
+                .map(|key| format!("{} {} {}", key.user, key.relation, key.object)),
+        );
+        if page.continuation_token.is_empty() {
+            found.sort();
+            return found;
+        }
+        continuation_token = page.continuation_token;
+    }
+}
+
+/// A store left at another point than the database, as a restore of either
+/// one alone leaves it, comes back equal to the database on the next adopted
+/// boot, keyed facts included (R70 decision 6).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    provision(&pool).await;
+    let (channel, store) = fixture.fga_store().await;
+
+    let translated =
+        Translated::of::<String>(SCHEMA, &policies(), "app.user_id").expect("translates");
+    let mut setup = OpenFgaServiceClient::new(channel.clone());
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("written");
+    let loader = OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+        translated.shapes_arc(),
+        setup.clone(),
+        store.clone(),
+    )
+    .expect("the index carries what the questions need")
+    .authorization_model_id(model.id().to_owned());
+    translated.load_into(&pool, &loader).await.expect("loaded");
+    let before = store_tuples(channel.clone(), &store).await;
+    assert!(
+        before.iter().any(|tuple| tuple.contains("bob")),
+        "{before:?}"
+    );
+
+    // The database moves on while the store stays where it was.
+    let mut conn = pool.get().await.expect("a connection");
+    for statement in [
+        "DELETE FROM r5b_notes WHERE id = 2",
+        "INSERT INTO r5b_notes (id, owner) VALUES (3, 'carol')",
+    ] {
+        diesel::sql_query(statement)
+            .execute(&mut *conn)
+            .await
+            .expect("move the database");
+    }
+    drop(conn);
+
+    let adopted = Translated::of::<String>(SCHEMA, &policies(), "app.user_id")
+        .expect("translates")
+        .install_model(&mut setup, &store)
+        .await
+        .expect("adopted");
+    assert_eq!(adopted, ModelState::Adopted(model.id().to_owned()));
+    let (added, removed) = translated
+        .reconcile_store(&pool, &loader)
+        .await
+        .expect("reconciled");
+    assert!(added > 0 && removed > 0, "added {added}, removed {removed}");
+    let reconciled = store_tuples(channel.clone(), &store).await;
+    assert!(
+        reconciled.iter().any(|tuple| tuple.contains("carol")),
+        "the new owner's fact is written: {reconciled:?}"
+    );
+    assert!(
+        !reconciled.iter().any(|tuple| tuple.contains("bob")),
+        "the deleted row's fact is removed: {reconciled:?}"
+    );
+
+    assert_eq!(
+        translated
+            .reconcile_store(&pool, &loader)
+            .await
+            .expect("reconciled again"),
+        (0, 0),
+        "a store equal to the database is left untouched"
+    );
+}
+
+/// An adopted boot that cannot read the facts, or cannot read the store,
+/// refuses to start, so a server never serves a store it could not check.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_adopted_boot_that_cannot_reconcile_refuses() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    provision(&pool).await;
+    let (channel, store) = fixture.fga_store().await;
+
+    let translated =
+        Translated::of::<String>(SCHEMA, &policies(), "app.user_id").expect("translates");
+    let mut setup = OpenFgaServiceClient::new(channel);
+    let model = translated
+        .install_model(&mut setup, &store)
+        .await
+        .expect("written");
+    let policy = |store: &str| {
+        OpenFgaPolicy::<_, _, ModelSubject<String, String>, Postgres>::new(
+            translated.shapes_arc(),
+            setup.clone(),
+            store.to_owned(),
+        )
+        .expect("the index carries what the questions need")
+        .authorization_model_id(model.id().to_owned())
+    };
+
+    let unknown = translated
+        .reconcile_store(&pool, &policy("01JAAAAAAAAAAAAAAAAAAAAAAA"))
+        .await;
+    assert!(
+        matches!(unknown, Err(SetupError::Store(_))),
+        "a store the service does not hold cannot be read: {unknown:?}"
+    );
+
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::sql_query("DROP TABLE r5b_notes CASCADE")
+        .execute(&mut *conn)
+        .await
+        .expect("drop the table");
+    drop(conn);
+    let unreadable = translated.reconcile_store(&pool, &policy(&store)).await;
+    assert!(
+        matches!(unreadable, Err(SetupError::Store(_))),
+        "facts whose query fails cannot be reconciled: {unreadable:?}"
     );
 }
 

@@ -24,7 +24,7 @@
 | The logical replication slot | `CONNETTO_SLOT` | **No**, under every method | Refused (`Artifact::ReplicationSlot`) |
 | The file server's `_cfs_*` tables and functions | `connetto_file_server::DEPLOYMENT_DDL` | Yes | Refused by `connetto_file_server::preflight` |
 | The chunk store | `CONNETTO_CONTENT_STORE`, a `fs:` directory or an `object_store` URL | **No** | Opened by `open_store`, with nothing checked against the manifests |
-| The OpenFGA store | `CONNETTO_FGA_STORE` | Only when OpenFGA's own datastore lives in the same cluster | Refused without the id. A new model loads every fact from Postgres (`ModelState::Written`), an installed one reconciles only its whole-shape regions (`ModelState::Adopted`) |
+| The OpenFGA store | `CONNETTO_FGA_STORE` | Only when OpenFGA's own datastore lives in the same cluster | Refused without the id. A new model loads every fact from Postgres (`ModelState::Written`), an installed one reconciles the whole store against Postgres, writing only the difference (`ModelState::Adopted`) |
 | The token signing key pair | `CONNETTO_JWT_PRIVATE_KEY_FILE`, `CONNETTO_JWT_PUBLIC_KEY_FILE` | **No** | Refused. The deployment keeps the pair on disk so a token survives a restart |
 | The content ticket key | `CONNETTO_CONTENT_KEY` | **No** | Refused when `CONNETTO_CONTENT_URL` is set, which is what makes the key required. It is the deployment's own and survives a restart |
 | Device attestation (R74) | `CONNETTO_DEVICE_ACCEPTED_ATTESTATION`, the levels accepted, all three by default, `CONNETTO_DEVICE_APP_ATTEST_APP_IDS` and `CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT` for Apple's App Attest, and `CONNETTO_DEVICE_ANDROID_STATUS`, a URL or file standing in for Google's attestation status list | **No** | Each refuses startup without `CONNETTO_DEVICE_ISSUER_DIR`. A status list that cannot be fetched is logged, and Android devices record `unproven` until a copy arrives |
@@ -40,7 +40,7 @@
 
 ## What a restore does to connected clients
 
-**Built for rows, logins and the chunk store. Built defective for authorization, whose fix is Decided (R70), not built.** The row and login facts below are asserted by the Docker-gated tests in `crates/connetto-server/tests/it/restore.rs`, green on 2026-09-23, and the authorization facts were observed on 2026-09-22 by a demonstration in the same file that prints what it sees and asserts nothing. In each run a client synced three rows, the deployment took a backup, two more rows reached the client, the database was restored, and one new row was written on the restored server. The same-cluster run drops the slot by hand before restoring, so it covers recreating the slot and not a slot left in place across the restore.
+**Built for rows, logins, authorization and the chunk store.** The row and login facts below are asserted by the Docker-gated tests in `crates/connetto-server/tests/it/restore.rs`, green on 2026-09-23, and the authorization store's by `an_adopted_boot_reconciles_a_store_left_at_another_point` in `crates/connetto-server/tests/it/openfga_live.rs`. In each run a client synced three rows, the deployment took a backup, two more rows reached the client, the database was restored, and one new row was written on the restored server. The same-cluster run drops the slot by hand before restoring, so it covers recreating the slot and not a slot left in place across the restore.
 
 | What a restore rewinds | Point-in-time, onto a new timeline | Dump into a fresh cluster | Dump into the same cluster |
 |---|---|---|---|
@@ -53,7 +53,7 @@
 
 **A rewound auth store would revive rotated refresh tokens**, under every method, because `connetto_sessions` holds the hash that was current at the backup, so a token rotated away after the backup would refresh again. **Built (R70).** The server therefore revokes every session whenever the cluster differs from the one `connetto_epoch` recorded, and at boot whenever the slot resumes past the reconnect log, before the listener opens, and each device logs in again. A running server whose feed reconnects to another cluster revokes at once. The recorded cluster is rewritten and the reconnect log trimmed only after the revocation succeeds, so a revocation that fails meets the same restore at the next try. A failover keeps its primary's identifier and its synced slot, so it logs nobody out.
 
-**A rewound OpenFGA store is not rewound.** A membership granted after the backup and removed by the restore stays in the store after the restored server boots, because an installed model reconciles only its whole-shape regions (`Translated::reconcile_materialised`), so the change path keeps answering for a grant the database no longer holds.
+**Built (R70, 2026-10-06): the OpenFGA store follows the database at every boot.** A boot that finds its rules already installed reconciles the whole store against Postgres through `Translated::reconcile_store`, every keyed fact and every whole-shape region, writing only the difference. A membership granted after the backup and removed by the restore is deleted from the store before the server serves, and a store restored on its own comes back equal to the database. The cost is one read of the store and of the facts on every boot.
 
 **A restore leaves the database and the chunk store disagreeing two ways.** A restored manifest can name chunks the sweep removed after the backup, and a chunk uploaded after the backup is named by no registry row, which the sweep, starting from registry rows, never reaches.
 
@@ -62,8 +62,6 @@
 **Built (R73) for the timeline.** A cursor carries the timeline it was issued on beside its write position. One whose position lies beyond where its timeline ended in the current history takes a full resync, and one at or below that point resumes, so a failover inside the replicated window resyncs nobody (`crates/connetto-server/src/timeline.rs`, `06-reconnect.md`).
 
 **Built (R70) for the cluster.** A cursor also carries the cluster's system identifier, read from the `IDENTIFY_SYSTEM` the timeline read already sends, and one from another cluster takes a full resync with `CursorBeyondHistory`, because a database restored into another cluster starts again at timeline 1 and the timeline check does not see it.
-
-**Decided (R70), not built.** Every boot reconciles the whole authorization store against Postgres.
 
 ---
 

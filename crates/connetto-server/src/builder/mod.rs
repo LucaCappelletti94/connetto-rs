@@ -1501,12 +1501,12 @@ async fn build_authorization<D: ConnettoSchema>(
             );
         }
         ModelState::Adopted(_) => {
-            translated
-                .reconcile_materialised(reader_pool, &loader)
-                .await?;
+            let (added, removed) = translated.reconcile_store(reader_pool, &loader).await?;
             tracing::info!(
                 model = model.id(),
-                "authorization rules already installed, reconciling whole-shape regions"
+                added,
+                removed,
+                "authorization rules already installed, the store reconciled with the database"
             );
         }
     }
