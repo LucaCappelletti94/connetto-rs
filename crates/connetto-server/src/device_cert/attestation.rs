@@ -305,7 +305,7 @@ fn max_age(headers: &reqwest::header::HeaderMap) -> Duration {
         .and_then(|value| {
             value
                 .split(',')
-                .find_map(|part| part.strip_prefix("max-age="))
+                .find_map(|part| part.trim().strip_prefix("max-age="))
                 .and_then(|age| age.parse::<u64>().ok())
         })
         .map_or(REFRESH_DEFAULT, Duration::from_secs)
