@@ -270,7 +270,7 @@ impl StatusList {
                 Some((bytes.to_vec(), period))
             }
             AndroidStatus::File(path) => {
-                let Ok(bytes) = std::fs::read(path) else {
+                let Ok(bytes) = tokio::fs::read(path).await else {
                     tracing::warn!("the attestation status list could not be read");
                     return None;
                 };

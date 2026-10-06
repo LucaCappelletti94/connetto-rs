@@ -85,6 +85,10 @@ jobs:
     name: Lint ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # --all-features turns on the demo's device-identity feature, whose build
+    # embeds a deployment root. These jobs never run the demo, so any file serves.
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
     strategy:
       fail-fast: false
       matrix:
@@ -164,6 +168,10 @@ jobs:
     name: Nightly lint ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # --all-features turns on the demo's device-identity feature, whose build
+    # embeds a deployment root. These jobs never run the demo, so any file serves.
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
     continue-on-error: true
     strategy:
       fail-fast: false
@@ -244,6 +252,10 @@ jobs:
     name: Docs ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # --all-features turns on the demo's device-identity feature, whose build
+    # embeds a deployment root. These jobs never run the demo, so any file serves.
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
     strategy:
       fail-fast: false
       matrix:
@@ -319,6 +331,10 @@ jobs:
     name: Compile ${{ matrix.name }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    # --all-features turns on the demo's device-identity feature, whose build
+    # embeds a deployment root. These jobs never run the demo, so any file serves.
+    env:
+      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
     strategy:
       fail-fast: false
       matrix:
@@ -1058,6 +1074,11 @@ jobs:
           echo "NDK_HOME=$ndk" >> "${GITHUB_ENV}"
           echo "${ANDROID_HOME}/platform-tools" >> "${GITHUB_PATH}"
 
+      # The demo's device CA, which the APK ships and the stack reuses (R74
+      # decision 30).
+      - name: Mint the demo's device CA
+        run: echo "CONNETTO_DEMO_BUILD_DEVICE_ROOT=$(android-bins/connetto-demo-stack --mint-device-ca)" >> "${GITHUB_ENV}"
+
       # The same command the proof runs without --apk, built before the
       # emulator boots so the emulator's time goes to the proof. Line tables
       # keep a panic's file and line and halve the APK and the cached tree.
@@ -1070,7 +1091,7 @@ jobs:
             --android \
             --target x86_64-linux-android \
             --no-default-features \
-            --features mobile
+            --features mobile,device-identity
 
       - uses: ./.github/actions/pull-test-images
 

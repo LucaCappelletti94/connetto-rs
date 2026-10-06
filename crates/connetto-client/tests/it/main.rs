@@ -26,7 +26,8 @@ mod coverage_resync;
 
 mod encrypted_replica;
 
-#[cfg(feature = "device-identity")]
+// Its phases run on Linux's sealed-file keyring, like `linux_custody`.
+#[cfg(all(feature = "device-identity", target_os = "linux"))]
 mod enrolment;
 
 mod full_resync;

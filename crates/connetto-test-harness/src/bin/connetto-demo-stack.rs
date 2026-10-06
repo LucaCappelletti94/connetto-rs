@@ -5,6 +5,7 @@
 //! ```text
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack -- <program> [args]
+//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- --mint-device-ca
 //! ```
 //!
 //! Bare, it serves until interrupted and prints the environment a desktop run
@@ -20,7 +21,10 @@
 //! names the root to the program as `CONNETTO_DEMO_BUILD_DEVICE_ROOT`, which a
 //! demo build with the `device-identity` feature ships (R74 decision 30). With
 //! `CONNETTO_IOS_TEAM_ID` set, the server accepts App Attest from the demo's
-//! development builds under that team (R74 decision 32).
+//! development builds under that team (R74 decision 32). With
+//! `--mint-device-ca` it only mints that authority, or keeps the one already
+//! there, prints the root's path and exits, so a build can ship the root before
+//! the stack starts.
 //!
 //! `CONNETTO_STACK_SYNC_PORT` moves its listener off 7777.
 //! `CONNETTO_STACK_PUBLIC_HOST` puts it on the LAN for a phone that has no
@@ -70,8 +74,22 @@ const DEPLOYMENT: Deployment = Deployment {
     writable: "orders,photos",
 };
 
+/// Mint the demo's device CA, or keep the one already there, and print the
+/// root's path alone, for a build that ships it before the stack starts.
+fn mint_device_ca() -> Result<()> {
+    let device_ca = demo_device_ca(std::time::SystemTime::now())?;
+    println!("{}", device_ca.root.display());
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--mint-device-ca")
+    {
+        return mint_device_ca();
+    }
     connetto_core::logging::init_stdout();
     let plan = Addresses::from_env()?;
     let Addresses {
