@@ -59,6 +59,8 @@ pub struct KeyFacts {
     pub owned: bool,
     /// Whether the key's enrolment is revoked.
     pub revoked: bool,
+    /// The session the enrolment recorded, so a revocation can repeat against it.
+    pub session: SessionId,
 }
 
 /// A key's first enrolment.
@@ -222,7 +224,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
             else {
                 return Ok(Recorded::UnreadableDescriptor);
             };
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
             conn.transaction::<_, diesel::result::Error, _>(async move |c| {
                 let Enrolment {
                     user,
@@ -279,16 +281,16 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                 Ok(Recorded::Granted)
             })
             .await
-            .map_err(EnrolmentError::new)
+            .map_err(EnrolmentError::Query)
         })
     }
 
     fn devices<'a>(&'a self, user: &'a S::Id) -> EnrolmentFuture<'a, Vec<Device>> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
             let rows = S::devices(&mut conn, user)
                 .await
-                .map_err(EnrolmentError::new)?;
+                .map_err(EnrolmentError::Query)?;
             rows.into_iter()
                 .map(|row| {
                     Ok(Device {
@@ -297,7 +299,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                         last_seen: row.last_seen,
                         revoked_at: row.revoked_at,
                         descriptor: rmp_serde::to_vec_named(&row.descriptor)
-                            .map_err(EnrolmentError::new)?,
+                            .map_err(EnrolmentError::Descriptor)?,
                     })
                 })
                 .collect()
@@ -311,37 +313,41 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
         at: SystemTime,
     ) -> EnrolmentFuture<'a, Revocation> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
             conn.transaction::<_, diesel::result::Error, _>(async move |c| {
                 match S::key_facts(c, key, user).await? {
                     None | Some(KeyFacts { owned: false, .. }) => Ok(Revocation::NotFound),
-                    Some(KeyFacts { revoked: true, .. }) => Ok(Revocation::AlreadyRevoked),
+                    Some(KeyFacts {
+                        revoked: true,
+                        session,
+                        ..
+                    }) => Ok(Revocation::AlreadyRevoked { session }),
                     Some(_) => Ok(Revocation::Revoked {
                         session: S::revoke_key(c, key, at).await?,
                     }),
                 }
             })
             .await
-            .map_err(EnrolmentError::new)
+            .map_err(EnrolmentError::Query)
         })
     }
 
     fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
             S::revoked_serials(&mut conn, issuer, now)
                 .await
-                .map_err(EnrolmentError::new)
+                .map_err(EnrolmentError::Query)
         })
     }
 
     fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
             let number = S::next_list_number(&mut conn, issuer)
                 .await
-                .map_err(EnrolmentError::new)?;
-            u64::try_from(number).map_err(EnrolmentError::new)
+                .map_err(EnrolmentError::Query)?;
+            u64::try_from(number).map_err(EnrolmentError::ListNumber)
         })
     }
 
@@ -351,14 +357,14 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
         key: KeyId,
     ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
         Box::pin(async move {
-            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
             match S::stored_attestation(&mut conn, key, user)
                 .await
-                .map_err(EnrolmentError::new)?
+                .map_err(EnrolmentError::Query)?
             {
-                Some(spelled) => AttestationLevel::parse(&spelled).map(Some).ok_or_else(|| {
-                    EnrolmentError::new("the enrolment's stored level is not a level")
-                }),
+                Some(spelled) => AttestationLevel::parse(&spelled)
+                    .map(Some)
+                    .ok_or(EnrolmentError::StoredLevel),
                 None => Ok(None),
             }
         })
@@ -482,31 +488,41 @@ macro_rules! connetto_enrolment_tables {
                         connetto_device_enrolments::table,
                         connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
                     );
-                    let found: Option<(bool, bool)> = match user {
+                    let found: Option<(bool, bool, $crate::SessionId)> = match user {
                         Some(user) => RunQueryDsl::first(
                             QueryDsl::for_update(QueryDsl::select(
                                 keyed,
                                 (
                                     connetto_device_enrolments::user_id.eq(user.clone()),
                                     connetto_device_enrolments::revoked_at.is_not_null(),
+                                    connetto_device_enrolments::session_id,
                                 ),
                             )),
                             conn,
                         )
                         .await
                         .optional()?,
-                        None => RunQueryDsl::first::<bool>(
+                        None => RunQueryDsl::first::<(bool, $crate::SessionId)>(
                             QueryDsl::for_update(QueryDsl::select(
                                 keyed,
-                                connetto_device_enrolments::revoked_at.is_not_null(),
+                                (
+                                    connetto_device_enrolments::revoked_at.is_not_null(),
+                                    connetto_device_enrolments::session_id,
+                                ),
                             )),
                             conn,
                         )
                         .await
                         .optional()?
-                        .map(|revoked| (true, revoked)),
+                        .map(|(revoked, session)| (true, revoked, session)),
                     };
-                    Ok(found.map(|(owned, revoked)| $crate::device_cert::KeyFacts { owned, revoked }))
+                    Ok(found.map(
+                        |(owned, revoked, session)| $crate::device_cert::KeyFacts {
+                            owned,
+                            revoked,
+                            session,
+                        },
+                    ))
                 })
             }
 

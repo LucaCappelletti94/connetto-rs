@@ -1,16 +1,21 @@
 //! Revoking a device and publishing the lists that say so (R74 step 5).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use connetto_core::device_cert::{DeviceCertificate, KeyId, RevocationList};
+use connetto_core::device_cert::{
+    AttestationLevel, DeviceCertificate, KeyId, RevocationList, Revoked,
+};
 use connetto_core::messages::{
     ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolGrant, EnrolRefusal,
     FatalErrorReason, RevocationUpdate, RevokeDeviceRequest, SignedList,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::LoopbackTransport;
-use connetto_server::device_cert::{DeviceCertConfig, DeviceEnrolment, MemoryEnrolments};
+use connetto_server::device_cert::{
+    Device, DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture,
+    EnrolmentStore, MemoryEnrolments, Recorded, Revocation,
+};
 use connetto_test_harness::Fixture;
 use parking_lot::Mutex;
 use rcgen::{KeyPair, PublicKeyData as _};
@@ -61,6 +66,23 @@ fn key_id(key: &KeyPair) -> KeyId {
     KeyId::of_public_key(&key.subject_public_key_info())
 }
 
+/// The reason `client` is closed with, within the bound.
+async fn closed_by(client: &mut LoopbackTransport) -> FatalErrorReason {
+    tokio::time::timeout(BOUND, async {
+        loop {
+            match client.recv().await.expect("recv") {
+                Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
+                    return fatal.reason;
+                }
+                Some(_) => {}
+                None => panic!("closed without a reason"),
+            }
+        }
+    })
+    .await
+    .expect("the session closes within the bound")
+}
+
 /// A manager enrolling into `store` and recording each revoked session.
 async fn revoking_manager(
     fixture: &Fixture,
@@ -73,6 +95,89 @@ async fn revoking_manager(
     let revoked = Arc::new(Mutex::new(Vec::new()));
     let seen = Arc::clone(&revoked);
     let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(store) as _)
+        .with_session_revoker(Arc::new(move |session| {
+            seen.lock().push(session);
+            Box::pin(core::future::ready(()))
+        }));
+    (enrolling_manager(fixture, Some(enrolment)).await, revoked)
+}
+
+/// A store that delegates to `inner` but fails `next_list_number` on the call
+/// after `fail_next` is set, so one publish fails and the next succeeds.
+struct FailingListStore {
+    inner: Arc<MemoryEnrolments<String>>,
+    fail_next: Mutex<bool>,
+}
+
+impl FailingListStore {
+    /// Fail the next `next_list_number` call, so the publish that needs it
+    /// fails.
+    fn fail_next(&self) {
+        *self.fail_next.lock() = true;
+    }
+}
+
+impl EnrolmentStore<String> for FailingListStore {
+    fn record(&self, enrolment: Enrolment<String>) -> EnrolmentFuture<'_, Recorded> {
+        self.inner.record(enrolment)
+    }
+
+    fn devices<'a>(&'a self, user: &'a String) -> EnrolmentFuture<'a, Vec<Device>> {
+        self.inner.devices(user)
+    }
+
+    fn revoke<'a>(
+        &'a self,
+        user: Option<&'a String>,
+        key: KeyId,
+        at: SystemTime,
+    ) -> EnrolmentFuture<'a, Revocation> {
+        self.inner.revoke(user, key, at)
+    }
+
+    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
+        self.inner.revoked_serials(issuer, now)
+    }
+
+    fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64> {
+        let failing = {
+            let mut fail = self.fail_next.lock();
+            if *fail {
+                *fail = false;
+                true
+            } else {
+                false
+            }
+        };
+        if failing {
+            return Box::pin(core::future::ready(Err(EnrolmentError::ListNumber(
+                u64::try_from(i64::MIN).err().unwrap(),
+            ))));
+        }
+        self.inner.next_list_number(issuer)
+    }
+
+    fn stored_attestation<'a>(
+        &'a self,
+        user: &'a String,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
+        self.inner.stored_attestation(user, key)
+    }
+}
+
+/// A manager enrolling into `store` and recording each revoked session.
+async fn failing_manager(
+    fixture: &Fixture,
+    store: Arc<dyn EnrolmentStore<String>>,
+    issuer: connetto_core::device_cert::DeviceIssuer,
+) -> (
+    Arc<super::ticket_shared::TicketManager<super::ticket_shared::OkSigner>>,
+    Arc<Mutex<Vec<connetto_core::SessionId>>>,
+) {
+    let revoked = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&revoked);
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), store)
         .with_session_revoker(Arc::new(move |session| {
             seen.lock().push(session);
             Box::pin(core::future::ready(()))
@@ -249,7 +354,7 @@ async fn only_the_owner_revokes_and_an_unknown_key_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_operator_revokes_any_key_once() {
+async fn the_operator_revokes_any_key_and_a_repeat_republishes() {
     let fixture = Fixture::acquire().await;
     let store = Arc::new(MemoryEnrolments::default());
     let (root, _, issuer) = rooted_issuer();
@@ -259,22 +364,163 @@ async fn the_operator_revokes_any_key_once() {
     let _ = next_lists(&mut watcher).await;
     let key = device_key();
     let cert = enrolled(&mut alice, &key).await;
-    assert!(manager.revoke_device(key_id(&key)).await.expect("revoke"));
-    let pushed = verified(&next_lists(&mut watcher).await, &root);
     assert!(
-        pushed.revokes(cert.serial()),
+        manager
+            .revoke_device(key_id(&key))
+            .await
+            .expect("the first revoke"),
+        "a fresh revoke is new"
+    );
+    let first = verified(&next_lists(&mut watcher).await, &root);
+    assert!(
+        first.revokes(cert.serial()),
         "every identified session hears of it"
     );
-    assert!(
-        !manager.revoke_device(key_id(&key)).await.expect("again"),
-        "a second revoke changes nothing"
+    assert_eq!(
+        revoked_sessions.lock().len(),
+        1,
+        "the fresh revoke revokes the session"
     );
-    assert_eq!(revoked_sessions.lock().len(), 1);
+    assert!(
+        !manager
+            .revoke_device(key_id(&key))
+            .await
+            .expect("the repeat"),
+        "a second revoke answers that nothing is new"
+    );
+    let second = verified(&next_lists(&mut watcher).await, &root);
+    assert!(
+        second.number() > first.number(),
+        "a second revoke still publishes a new list"
+    );
+    assert!(
+        second.revokes(cert.serial()),
+        "the repeat's list revokes the key"
+    );
+    assert_eq!(
+        revoked_sessions.lock().len(),
+        2,
+        "a second revoke still revokes the session"
+    );
     assert!(
         manager
             .revoke_device(KeyId::from_bytes([1; 32]))
             .await
-            .is_err()
+            .is_err(),
+        "an unenrolled key is not a device"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_publish_is_retried_by_the_next_revoke() {
+    let fixture = Fixture::acquire().await;
+    let inner = Arc::new(MemoryEnrolments::default());
+    let failing = Arc::new(FailingListStore {
+        inner: Arc::clone(&inner),
+        fail_next: Mutex::new(false),
+    });
+    let store: Arc<dyn EnrolmentStore<String>> = failing.clone();
+    let (root, _, issuer) = rooted_issuer();
+    let (manager, revoked_sessions) = failing_manager(&fixture, store, issuer).await;
+    let mut alice = connect(&manager, Some("alice")).await;
+    let mut watcher = connect(&manager, Some("bob")).await;
+    let _ = next_lists(&mut watcher).await;
+    let key = device_key();
+    let cert = enrolled(&mut alice, &key).await;
+    // The first revoke records the revocation but the publish fails.
+    failing.fail_next();
+    assert!(
+        manager.revoke_device(key_id(&key)).await.is_err(),
+        "a failed publish is unavailable"
+    );
+    assert!(
+        revoked_sessions.lock().is_empty(),
+        "a failed publish revokes no session"
+    );
+    // The retry publishes, closes the device's connection, and revokes its session.
+    assert!(
+        !manager
+            .revoke_device(key_id(&key))
+            .await
+            .expect("the retry"),
+        "the key is already revoked"
+    );
+    let pushed = verified(&next_lists(&mut watcher).await, &root);
+    assert!(
+        pushed.revokes(cert.serial()),
+        "the retry's list revokes the key"
+    );
+    let closed = closed_by(&mut alice).await;
+    assert_eq!(closed, FatalErrorReason::DeviceRevoked);
+    assert_eq!(
+        revoked_sessions.lock().len(),
+        1,
+        "the retry revokes the device's session"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_owners_second_revoke_still_closes_the_device() {
+    let fixture = Fixture::acquire().await;
+    let inner = Arc::new(MemoryEnrolments::default());
+    let failing = Arc::new(FailingListStore {
+        inner: Arc::clone(&inner),
+        fail_next: Mutex::new(false),
+    });
+    let store: Arc<dyn EnrolmentStore<String>> = failing.clone();
+    let (root, _, issuer) = rooted_issuer();
+    let (manager, revoked_sessions) = failing_manager(&fixture, store, issuer).await;
+    let mut device = connect(&manager, Some("alice")).await;
+    let mut owner = connect(&manager, Some("alice")).await;
+    let mut watcher = connect(&manager, Some("bob")).await;
+    let key = device_key();
+    let cert = enrolled(&mut device, &key).await;
+    let _ = next_lists(&mut watcher).await;
+    // The first revoke answers unavailable because its publish fails.
+    failing.fail_next();
+    let reply = ask(
+        &mut owner,
+        ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+            request_id: "r1".into(),
+            key_id: *key_id(&key).as_bytes(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        reply,
+        refused(EnrolRefusal::IssuerUnavailable, "r1"),
+        "a failed publish leaves the device reachable"
+    );
+    assert!(
+        revoked_sessions.lock().is_empty(),
+        "a failed publish revokes no session"
+    );
+    // The owner's second revoke publishes and closes the device, revoking its session.
+    let reply = ask(
+        &mut owner,
+        ControlMessage::RevokeDeviceRequest(RevokeDeviceRequest {
+            request_id: "r2".into(),
+            key_id: *key_id(&key).as_bytes(),
+        }),
+    )
+    .await;
+    assert_eq!(
+        reply,
+        ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
+            request_id: "r2".into()
+        })
+    );
+    let pushed = verified(&next_lists(&mut watcher).await, &root);
+    assert!(
+        pushed.revokes(cert.serial()),
+        "the second revoke's list revokes the key"
+    );
+    let closed = closed_by(&mut device).await;
+    assert_eq!(closed, FatalErrorReason::DeviceRevoked);
+    assert_eq!(
+        revoked_sessions.lock().len(),
+        1,
+        "the second revoke revokes the device's session"
     );
 }
 

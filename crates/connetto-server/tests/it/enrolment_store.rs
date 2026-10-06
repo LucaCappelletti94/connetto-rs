@@ -258,7 +258,10 @@ async fn a_revoked_key_names_its_session_once_and_never_enrols_again() {
     );
     assert_eq!(
         store.revoke(None, key(1), now).await.expect("again"),
-        Revocation::AlreadyRevoked
+        Revocation::AlreadyRevoked {
+            session: last_session
+        },
+        "a repeat names the same session to close"
     );
     assert_eq!(
         store

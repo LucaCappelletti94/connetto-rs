@@ -539,6 +539,7 @@ where
     manager: Arc<ServerManager<D>>,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
+    status: Option<BackgroundTask>,
 }
 
 impl<D> Clone for ServerHandle<D>
@@ -550,6 +551,7 @@ where
             manager: Arc::clone(&self.manager),
             lag_watch: self.lag_watch.clone(),
             sweep: self.sweep.clone(),
+            status: self.status.clone(),
         }
     }
 }
@@ -568,6 +570,9 @@ where
         }
         if let Some(sweep) = &self.sweep {
             sweep.stop();
+        }
+        if let Some(status) = &self.status {
+            status.stop();
         }
         let told = self.manager.shutdown().await;
         await_sessions_drained(&self.manager).await;
@@ -1094,9 +1099,8 @@ where
         }
         .build();
         wire_manager(&manager, &service, &guard, &pool, &feed).await?;
-        if let Some(config) = device_identity {
-            install_device_identity::<D>(&manager, &service, &pool, config);
-        }
+        let status = device_identity
+            .map(|config| install_device_identity::<D>(&manager, &service, &pool, config));
 
         Ok(assemble_parts(
             Arc::clone(&manager),
@@ -1114,6 +1118,7 @@ where
                 policy: reconnect_policy,
                 lag_watch,
                 sweep,
+                status,
             },
         ))
     }
@@ -1229,11 +1234,11 @@ fn install_device_identity<D: ConnettoSchema>(
     service: &Arc<Service<D>>,
     pool: &PgPool,
     config: DeviceCertConfig,
-) {
+) -> BackgroundTask {
     let service = Arc::clone(service);
-    // The status list's fetch task starts with the server.
+    // The status list's fetch task starts with the server and stops with it.
     let list = StatusList::new(config.android_status().clone());
-    list.spawn();
+    let status = BackgroundTask::new(list.spawn());
     let enrolment = DeviceEnrolment::new(config, pg_enrolment_store::<D>(pool.clone()))
         .with_session_revoker(Arc::new(move |session| {
             let service = Arc::clone(&service);
@@ -1246,6 +1251,7 @@ fn install_device_identity<D: ConnettoSchema>(
     let enrolment = enrolment.with_status_list(list);
     // The manager was built a moment ago, so nothing installed one before.
     let _ = manager.install_device_enrolment(Arc::new(enrolment));
+    status
 }
 
 /// Check what the change stream needs, then set up the reconnect log and the
@@ -1792,6 +1798,7 @@ struct StreamWiring {
     policy: ReconnectPolicy,
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
+    status: Option<BackgroundTask>,
 }
 
 /// The assembled server's parts, the three routers and the change stream.
@@ -1828,6 +1835,7 @@ fn assemble_parts<D: ConnettoSchema>(
             manager,
             lag_watch: wiring.lag_watch,
             sweep: wiring.sweep,
+            status: wiring.status,
         },
     }
 }

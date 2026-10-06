@@ -7,13 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
 use connetto_core::device_cert::{
-    AttestationLevel, CertificateRequest, IssueError, KeyId, Revoked,
+    AttestationLevel, CertificateRequest, IssueError, KeyId, ListError, Revoked,
 };
 use connetto_core::messages::{DeviceSummary, EnrolGrant, EnrolRefusal, EnrolRequest, SignedList};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tokio::time::Instant;
 
-use super::{DeviceCertConfig, StatusList, verify};
+use super::{DeviceCertConfig, LifetimeError, StatusList, verify};
 
 /// The largest descriptor accepted, in bytes.
 const DESCRIPTOR_LIMIT: usize = 4096;
@@ -78,23 +78,37 @@ pub enum Revocation {
         /// The auth-store session the enrolment records.
         session: SessionId,
     },
-    /// Revoked before, so nothing changed.
-    AlreadyRevoked,
+    /// Revoked before, naming the session the enrolment recorded, so the
+    /// revocation can be repeated against it.
+    AlreadyRevoked {
+        /// The auth-store session the enrolment records.
+        session: SessionId,
+    },
     /// No enrolment of that key, for that account when one is named.
     NotFound,
 }
 
-/// The enrolment table could not be reached.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct EnrolmentError(String);
-
-impl EnrolmentError {
-    /// Name a failure.
-    #[must_use]
-    pub fn new(detail: impl core::fmt::Display) -> Self {
-        Self(detail.to_string())
-    }
+/// The enrolment table or the issuer it signs for could not be reached.
+#[derive(Debug, thiserror::Error)]
+pub enum EnrolmentError {
+    /// The connection pool could not hand out a connection.
+    #[error("the enrolment pool is unreachable")]
+    Pool(#[source] diesel_async::pooled_connection::bb8::RunError),
+    /// A statement against the enrolment tables failed.
+    #[error("the enrolment tables refused a statement")]
+    Query(#[source] diesel::result::Error),
+    /// The descriptor would not encode into the tables' columns.
+    #[error("the descriptor could not be encoded")]
+    Descriptor(#[source] rmp_serde::encode::Error),
+    /// A revocation list would not be signed under its issuer.
+    #[error(transparent)]
+    Signing(#[from] ListError),
+    /// An issuer's list number does not fit a CRL Number.
+    #[error("a list number does not fit a CRL Number")]
+    ListNumber(#[source] std::num::TryFromIntError),
+    /// The stored attestation level is not one the server records.
+    #[error("the stored attestation level is not a level")]
+    StoredLevel,
 }
 
 /// The answer to one enrolment-table operation.
@@ -225,7 +239,9 @@ impl<Id: Clone + PartialEq + Send + 'static> MemoryEnrolments<Id> {
         match state.rows.get_mut(&key) {
             Some(row) if user.is_none_or(|user| *user == row.user) => {
                 if row.revoked_at.is_some() {
-                    Revocation::AlreadyRevoked
+                    Revocation::AlreadyRevoked {
+                        session: row.session,
+                    }
                 } else {
                     row.revoked_at = Some(at);
                     Revocation::Revoked {
@@ -323,14 +339,17 @@ pub type SessionRevoker =
     Arc<dyn Fn(SessionId) -> core::pin::Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Why a device could not be revoked.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum RevokeError {
     /// No enrolment of that key, for the caller's account.
     #[error("no such device")]
     NotFound,
+    /// No device enrolment is installed on the server.
+    #[error("no device enrolment is installed")]
+    NotInstalled,
     /// The enrolment table or the issuer failed.
-    #[error("the device could not be revoked: {0}")]
-    Unavailable(String),
+    #[error("the device could not be revoked")]
+    Unavailable(#[source] EnrolmentError),
 }
 
 /// The issuer settings, the table enrolments are recorded in, and the
@@ -454,8 +473,10 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         let lifetime = self
             .config
             .lifetime_for(request.lifetime_secs.map(Duration::from_secs))
-            .map_err(|refused| EnrolRefusal::OverCeiling {
-                ceiling_secs: refused.ceiling.as_secs(),
+            .map_err(|refused| match refused {
+                LifetimeError::OverCeiling { ceiling } => EnrolRefusal::OverCeiling {
+                    ceiling_secs: ceiling.as_secs(),
+                },
             })?;
         let mut serial = [0; 16];
         self.random
@@ -551,9 +572,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             let number = self.store.next_list_number(issuer.key_id()).await?;
             // No list promises a next one later than the longest certificate
             // it could name stays valid.
-            let list = issuer
-                .sign_list(number, &revoked, now, now + self.config.ceiling())
-                .map_err(EnrolmentError::new)?;
+            let list = issuer.sign_list(number, &revoked, now, now + self.config.ceiling())?;
             lists.push(SignedList {
                 list,
                 signer: issuer.certificate().to_vec(),
@@ -564,30 +583,35 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
     }
 
     /// Revoke `key`, `user`'s when one is named, and publish the list that
-    /// says so. The session the key last enrolled with comes back for the
-    /// caller to close, and is revoked in the auth store when a revoker is set.
+    /// says so, repeating the publish when the key is already revoked.
+    /// Answers whether the revocation is new, the session the key last
+    /// enrolled with, and the lists, for the caller to close and push.
     ///
     /// # Errors
     ///
     /// [`RevokeError::NotFound`] for a key not enrolled, or not `user`'s, and
-    /// [`RevokeError::Unavailable`] when the table or the issuer fails.
+    /// [`RevokeError::Unavailable`] when the table or the issuer fails, the
+    /// cached lists dropped so the next handshake or grant rebuilds them.
     pub(crate) async fn revoke(
         &self,
         user: Option<&Id>,
         key: KeyId,
-    ) -> Result<Option<(SessionId, Vec<SignedList>)>, RevokeError> {
-        let unavailable = |err: EnrolmentError| RevokeError::Unavailable(err.to_string());
-        match self
+    ) -> Result<(bool, SessionId, Vec<SignedList>), RevokeError> {
+        let outcome = self
             .store
             .revoke(user, key, SystemTime::now())
             .await
-            .map_err(unavailable)?
-        {
-            Revocation::NotFound => Err(RevokeError::NotFound),
-            Revocation::AlreadyRevoked => Ok(None),
-            Revocation::Revoked { session } => {
-                let lists = self.publish().await.map_err(unavailable)?;
-                Ok(Some((session, lists)))
+            .map_err(RevokeError::Unavailable)?;
+        let (fresh, session) = match outcome {
+            Revocation::NotFound => return Err(RevokeError::NotFound),
+            Revocation::AlreadyRevoked { session } => (false, session),
+            Revocation::Revoked { session } => (true, session),
+        };
+        match self.publish().await {
+            Ok(lists) => Ok((fresh, session, lists)),
+            Err(err) => {
+                *self.lists.lock().await = None;
+                Err(RevokeError::Unavailable(err))
             }
         }
     }

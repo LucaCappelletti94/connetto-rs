@@ -171,41 +171,42 @@ fn authority() -> &'static (Vec<u8>, Vec<u8>, Vec<u8>) {
 /// signed revoking the first issuer.
 struct Rotation((Vec<u8>, Vec<u8>, Vec<u8>), (Vec<u8>, Vec<u8>), Vec<u8>);
 
+static ROTATION: std::sync::LazyLock<Rotation> = std::sync::LazyLock::new(|| {
+    let now = SystemTime::now();
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
+        now - DAY,
+        3650 * DAY,
+    )
+    .expect("root");
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let cert = root
+        .sign_issuer(&key.public_key_der(), now - DAY, 395 * DAY, [1; 16])
+        .expect("issuer");
+    let next_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("next issuer key");
+    let next_cert = root
+        .sign_issuer(&next_key.public_key_der(), now - DAY, 395 * DAY, [2; 16])
+        .expect("next issuer");
+    let root_list = root
+        .sign_list(
+            1,
+            &[connetto_core::device_cert::Revoked {
+                serial: connetto_core::device_cert::certificate_serial(&cert).expect("serial"),
+                at: now,
+            }],
+            now,
+            now + 395 * DAY,
+        )
+        .expect("the root revokes the first issuer");
+    Rotation(
+        (root.certificate().to_vec(), cert, key.serialize_der()),
+        (next_cert, next_key.serialize_der()),
+        root_list,
+    )
+});
+
 fn rotation() -> &'static Rotation {
-    static ROTATION: std::sync::OnceLock<Rotation> = std::sync::OnceLock::new();
-    ROTATION.get_or_init(|| {
-        let now = SystemTime::now();
-        let root = RootCa::create(
-            DeploymentId::from_uuid(uuid::Uuid::from_u128(0x5eed)),
-            now - DAY,
-            3650 * DAY,
-        )
-        .expect("root");
-        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
-        let cert = root
-            .sign_issuer(&key.public_key_der(), now - DAY, 395 * DAY, [1; 16])
-            .expect("issuer");
-        let next_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("next issuer key");
-        let next_cert = root
-            .sign_issuer(&next_key.public_key_der(), now - DAY, 395 * DAY, [2; 16])
-            .expect("next issuer");
-        let root_list = root
-            .sign_list(
-                1,
-                &[connetto_core::device_cert::Revoked {
-                    serial: connetto_core::device_cert::certificate_serial(&cert).expect("serial"),
-                    at: now,
-                }],
-                now,
-                now + 395 * DAY,
-            )
-            .expect("the root revokes the first issuer");
-        Rotation(
-            (root.certificate().to_vec(), cert, key.serialize_der()),
-            (next_cert, next_key.serialize_der()),
-            root_list,
-        )
-    })
+    &ROTATION
 }
 
 /// The second issuer of [`rotation`].

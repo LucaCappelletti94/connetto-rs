@@ -38,7 +38,7 @@ fn a_lifetime_over_the_ceiling_is_refused_never_shortened() {
     assert_eq!(config.lifetime_for(Some(7 * DAY)), Ok(7 * DAY));
     assert_eq!(
         config.lifetime_for(Some(7 * DAY + Duration::from_secs(1))),
-        Err(LifetimeRefused { ceiling: 7 * DAY })
+        Err(LifetimeError::OverCeiling { ceiling: 7 * DAY })
     );
 }
 

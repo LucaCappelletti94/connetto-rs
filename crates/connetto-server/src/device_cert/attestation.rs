@@ -34,6 +34,8 @@ const SOFTWARE: u8 = 0;
 const LIST_AGE: Duration = Duration::from_secs(7 * 86_400);
 /// The refresh period when a response names no `max-age`.
 const REFRESH_DEFAULT: Duration = Duration::from_secs(3_600);
+/// The shortest refresh period, so a source cannot hammer the list.
+const REFRESH_FLOOR: Duration = Duration::from_secs(60);
 /// The bound on one status list fetch.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -297,9 +299,10 @@ fn serial_hex(serial: &[u8]) -> String {
     hex.trim_start_matches('0').to_owned()
 }
 
-/// `max-age` seconds in a `Cache-Control` header, the default when none.
+/// `max-age` seconds in a `Cache-Control` header, the default when none,
+/// floored at the refresh floor.
 fn max_age(headers: &reqwest::header::HeaderMap) -> Duration {
-    headers
+    let period = headers
         .get(reqwest::header::CACHE_CONTROL)
         .and_then(|value| value.to_str().ok())
         .and_then(|value| {
@@ -308,7 +311,8 @@ fn max_age(headers: &reqwest::header::HeaderMap) -> Duration {
                 .find_map(|part| part.trim().strip_prefix("max-age="))
                 .and_then(|age| age.parse::<u64>().ok())
         })
-        .map_or(REFRESH_DEFAULT, Duration::from_secs)
+        .map_or(REFRESH_DEFAULT, Duration::from_secs);
+    period.max(REFRESH_FLOOR)
 }
 
 /// The shape Google's status list takes.
@@ -337,11 +341,35 @@ impl StatusDocument {
     }
 }
 
-/// The evidence names a different key or a different challenge from the
-/// request, so the enrolment is refused as `InvalidRequest`.
-#[derive(Debug, Clone, thiserror::Error)]
-#[error("the attestation is not for this request")]
-pub(crate) struct AttestationMismatch;
+/// The evidence is not for this request, so the enrolment is refused as
+/// `InvalidRequest`, naming the first check that failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum AttestationMismatch {
+    /// The chain's leaf, or the key the description attests, is not the request's key.
+    #[error("the attestation is for a different key")]
+    Key,
+    /// The attestation's challenge is not the fixed one the request signs.
+    #[error("the attestation names a different challenge")]
+    Challenge,
+    /// The App Attest object's CBOR, field layout or authenticator data does not parse.
+    #[error("the App Attest object does not parse")]
+    Object,
+    /// The App Attest chain does not verify to the configured Apple root.
+    #[error("the App Attest chain does not verify to its root")]
+    Chain,
+    /// The App Attest nonce does not match the authenticator data and the request.
+    #[error("the App Attest nonce does not match")]
+    Nonce,
+    /// The App Attest key id, or the authenticator data's credential id, does not match the key.
+    #[error("the App Attest key id does not match the key")]
+    KeyId,
+    /// The App Attest counter is not fresh, the assertion was replayed.
+    #[error("the App Attest counter is not fresh")]
+    Counter,
+    /// The App Attest `aaguid` names an environment no deployment lists.
+    #[error("the App Attest environment is not listed")]
+    Environment,
+}
 
 /// The level the evidence proves, or a refusal when it is not for the
 /// request.
@@ -381,21 +409,42 @@ fn android(
         .first()
         .is_none_or(|leaf| leaf.public_key().raw != spki)
     {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Key);
     }
-    // Only the first attestation extension in the chain can be trusted.
-    let description = certs
+    // The description is trusted only where Google puts it, on the leaf the
+    // device signs with. The one nearest the root says which key is attested,
+    // so a description on any other certificate leaves the leaf's key unproven.
+    let attesting = certs
         .iter()
-        .find_map(|cert| find_extension(cert, KEY_DESCRIPTION))
-        .and_then(|extension| key_description(extension.value));
+        .enumerate()
+        .rev()
+        .find_map(|(position, cert)| find_extension(cert, KEY_DESCRIPTION).map(|_| position));
+    let Some(position) = attesting else {
+        return Ok(record_unproven(
+            "the chain carries no usable key description",
+        ));
+    };
+    if position != 0 {
+        return Ok(record_unproven("the attested key is not the leaf"));
+    }
+    let description = find_extension(
+        certs
+            .first()
+            .expect("a chain that named a key carries a leaf"),
+        KEY_DESCRIPTION,
+    )
+    .and_then(|extension| key_description(extension.value));
     let Some((challenge, level, attested_key)) = description else {
         return Ok(record_unproven(
             "the chain carries no usable key description",
         ));
     };
-    // A chain naming a different key or challenge is a refusal, not a lower level.
-    if challenge != ANDROID_ATTESTATION_CHALLENGE || attested_key.is_some_and(|key| key != spki) {
-        return Err(AttestationMismatch);
+    // A chain naming a different challenge or key is a refusal, not a lower level.
+    if challenge != ANDROID_ATTESTATION_CHALLENGE {
+        return Err(AttestationMismatch::Challenge);
+    }
+    if attested_key.is_some_and(|key| key != spki) {
+        return Err(AttestationMismatch::Key);
     }
     // Every serial against the status list, the copy's age included.
     let Some(list) = status else {
@@ -551,7 +600,7 @@ fn der_children(data: &[u8]) -> Option<Vec<DerField<'_>>> {
 fn der_tlv(data: &[u8]) -> Option<DerField<'_>> {
     let tag = *data.first()?;
     let (length, octets) = der_length(&data[1..])?;
-    let total = 1 + octets + length;
+    let total = 1usize.checked_add(octets)?.checked_add(length)?;
     data.get(..total).map(|_| DerField {
         tag,
         value: &data[1 + octets..total],
@@ -585,19 +634,19 @@ fn apple(
     csr: &[u8],
 ) -> Result<AttestationLevel, AttestationMismatch> {
     let Ok(object) = ciborium::de::from_reader::<ciborium::Value, _>(attestation) else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     };
     let Some(ciborium::Value::Text(fmt)) = object_field(&object, "fmt") else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     };
     if fmt != APP_ATTEST {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     }
     let Some(statement) = object_field(&object, "attStmt") else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     };
     let Some(ciborium::Value::Array(chain)) = object_field(statement, "x5c") else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     };
     let certs: Vec<&[u8]> = chain
         .iter()
@@ -610,40 +659,40 @@ fn apple(
         ciborium::Value::Bytes(bytes) => Some(bytes.as_slice()),
         _ => None,
     }) else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     };
     // The credential certificate leads the chain, up to Apple's root.
     if !app_attest_chain(config, &certs) {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Chain);
     }
     let Some((_, cred_cert)) = certs
         .first()
         .and_then(|bytes| X509Certificate::from_der(bytes).ok())
     else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Chain);
     };
     // Apple's nonce is the SHA-256 of the authenticator data with the client data hash appended.
     let nonce = sha256_concat(auth_data, &sha256(csr));
     if nonce_extension(&cred_cert).is_none_or(|held| held != nonce) {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Nonce);
     }
     // The key id and the authenticator data's credential id both hash the
     // credential key's public part in X9.62 uncompressed point form.
     let Some(point) = x962_point(cred_cert.public_key().raw) else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Key);
     };
     let key_hash = sha256(point);
     if key_hash != key_id {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::KeyId);
     }
     let Some(fields) = auth_data_fields(auth_data) else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Object);
     };
     if fields.credential_id != key_hash {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::KeyId);
     }
     if fields.counter != 0 {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Counter);
     }
     // The `aaguid` says which environment attested, a third value fails.
     let environment = if fields.aaguid == AppAttestEnvironment::Production.aaguid() {
@@ -651,7 +700,7 @@ fn apple(
     } else if fields.aaguid == AppAttestEnvironment::Development.aaguid() {
         AppAttestEnvironment::Development
     } else {
-        return Err(AttestationMismatch);
+        return Err(AttestationMismatch::Environment);
     };
     // The `rpId` hash is the hash of the App ID the object attests.
     let Some(settings) = config.app_attest() else {
@@ -1198,6 +1247,95 @@ mod tests {
     fn a_one_certificate_chain_proves_nothing() {
         let (config, mut chain, leaf) = android_setup(1, Layout::Keymint);
         chain.truncate(1);
+        let level = android(&config, Some(&clean()), chain, &csr(&leaf));
+        assert_eq!(level, AttestationLevel::Unproven);
+    }
+
+    /// An Android chain whose attesting key, one level above the leaf, carries
+    /// the genuine TEE description, and whose leaf for `leaf`'s key carries a
+    /// forged level-1 description, so the attested key is not the leaf.
+    fn forged_leaf_chain(root: &Ca, leaf: &KeyPair) -> Vec<Vec<u8>> {
+        let intermediate = ca("intermediate", Some(root));
+        let attesting_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("attesting key");
+        let mut attesting_params =
+            CertificateParams::new(vec!["attesting".to_owned()]).expect("params");
+        attesting_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        attesting_params.custom_extensions = vec![CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            keymint(1, ANDROID_ATTESTATION_CHALLENGE),
+        )];
+        let attesting_issuer = Issuer::new(
+            CertificateParams::new(vec!["attesting".to_owned()]).expect("params"),
+            &intermediate.key,
+        );
+        let attesting_cert = attesting_params
+            .signed_by(&attesting_key, &attesting_issuer)
+            .expect("attesting");
+        let mut leaf_params = CertificateParams::new(vec!["leaf".to_owned()]).expect("params");
+        leaf_params.custom_extensions = vec![CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            keymint(1, ANDROID_ATTESTATION_CHALLENGE),
+        )];
+        let leaf_issuer = Issuer::new(
+            CertificateParams::new(vec!["attesting".to_owned()]).expect("params"),
+            &attesting_key,
+        );
+        let leaf_cert = leaf_params.signed_by(leaf, &leaf_issuer).expect("leaf");
+        vec![
+            leaf_cert.der().to_vec(),
+            attesting_cert.der().to_vec(),
+            intermediate.cert,
+            root.cert.clone(),
+        ]
+    }
+
+    #[test]
+    fn a_forged_leaf_description_proves_nothing() {
+        let root = ca("attestation root", None);
+        let config = Config::new(issuer()).with_android_roots(vec![root.cert.clone()]);
+        let leaf = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let chain = forged_leaf_chain(&root, &leaf);
+        let level = android(&config, Some(&clean()), chain, &csr(&leaf));
+        assert_eq!(
+            level,
+            AttestationLevel::Unproven,
+            "a description on the attesting key leaves the leaf's key unproven"
+        );
+    }
+
+    /// A long-form DER length of `0xffffffffffffffff`, whose whole-field
+    /// length overflows a `usize`.
+    const OVERFLOWING_LENGTH: [u8; 11] = [
+        0x30, 0x88, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    ];
+
+    #[test]
+    fn an_overflowing_der_length_answers_no_field() {
+        assert!(super::der_tlv(&OVERFLOWING_LENGTH).is_none());
+        assert!(super::key_description(&OVERFLOWING_LENGTH).is_none());
+    }
+
+    #[test]
+    fn an_overflowing_leaf_description_proves_nothing() {
+        let root = ca("attestation root", None);
+        let config = Config::new(issuer()).with_android_roots(vec![root.cert.clone()]);
+        let leaf = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let intermediate = ca("intermediate", Some(&root));
+        let mut params = CertificateParams::new(vec!["leaf".to_owned()]).expect("params");
+        params.custom_extensions = vec![CustomExtension::from_oid_content(
+            &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+            OVERFLOWING_LENGTH.to_vec(),
+        )];
+        let issuer = Issuer::new(
+            CertificateParams::new(vec!["intermediate".to_owned()]).expect("params"),
+            &intermediate.key,
+        );
+        let leaf_cert = params.signed_by(&leaf, &issuer).expect("leaf");
+        let chain = vec![
+            leaf_cert.der().to_vec(),
+            intermediate.cert,
+            root.cert.clone(),
+        ];
         let level = android(&config, Some(&clean()), chain, &csr(&leaf));
         assert_eq!(level, AttestationLevel::Unproven);
     }
@@ -1871,6 +2009,16 @@ mod tests {
             super::max_age(&reqwest::header::HeaderMap::new()),
             super::REFRESH_DEFAULT,
             "no header takes the default"
+        );
+        assert_eq!(
+            super::max_age(&with_cache_control("max-age=0")),
+            super::REFRESH_FLOOR,
+            "a zero age takes the floor"
+        );
+        assert_eq!(
+            super::max_age(&with_cache_control("public, max-age=10")),
+            super::REFRESH_FLOOR,
+            "an age under the floor takes the floor"
         );
     }
 

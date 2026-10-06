@@ -3875,24 +3875,23 @@ where
                 .map(|revoked| (enrolment, revoked))
                 .map_err(|err| match err {
                     RevokeError::NotFound => EnrolRefusal::InvalidRequest,
-                    RevokeError::Unavailable(detail) => {
-                        tracing::warn!(%detail, "a device could not be revoked");
+                    RevokeError::NotInstalled => EnrolRefusal::IssuerUnavailable,
+                    RevokeError::Unavailable(source) => {
+                        tracing::warn!(error = %source, "a device could not be revoked");
                         EnrolRefusal::IssuerUnavailable
                     }
                 }),
             Err(refusal) => Err(refusal),
         };
         match revoked {
-            Ok((enrolment, revoked)) => {
+            Ok((enrolment, (_, session, lists))) => {
                 transport
                     .send_control(ControlMessage::DeviceRevokedAck(DeviceRevokedAck {
                         request_id,
                     }))
                     .await
                     .map_err(transport_err)?;
-                if let Some((session, lists)) = revoked {
-                    self.after_revocation(&enrolment, session, lists).await;
-                }
+                self.after_revocation(&enrolment, session, lists).await;
                 Ok(())
             }
             Err(reason) => transport
@@ -3949,26 +3948,23 @@ where
     }
 
     /// Revoke the device key `key` whoever it belongs to, as the deployment's
-    /// operator, closing its connection, publishing the list and revoking
-    /// its session. Answers whether anything changed.
+    /// operator, publishing the list and closing its connection and revoking
+    /// its session, repeating the close and revocation when the key is
+    /// already revoked. Answers whether the revocation is new.
     ///
     /// # Errors
     ///
     /// [`RevokeError::NotFound`] for a key never enrolled,
-    /// [`RevokeError::Unavailable`] when no enrolment is installed or the
-    /// table or the issuer fails.
+    /// [`RevokeError::NotInstalled`] when no enrolment is installed, and
+    /// [`RevokeError::Unavailable`] when the table or the issuer fails.
     pub async fn revoke_device(&self, key: KeyId) -> Result<bool, RevokeError> {
         let enrolment = self
             .device_enrolment
             .get()
-            .ok_or_else(|| RevokeError::Unavailable("no device enrolment is installed".into()))?;
-        match enrolment.revoke(None, key).await? {
-            Some((session, lists)) => {
-                self.after_revocation(enrolment, session, lists).await;
-                Ok(true)
-            }
-            None => Ok(false),
-        }
+            .ok_or(RevokeError::NotInstalled)?;
+        let (fresh, session, lists) = enrolment.revoke(None, key).await?;
+        self.after_revocation(enrolment, session, lists).await;
+        Ok(fresh)
     }
 
     /// The installed enrolment and the account enrolling, or why this session cannot enrol.

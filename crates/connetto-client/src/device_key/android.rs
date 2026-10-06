@@ -26,10 +26,19 @@ const PURPOSE_SIGN: i32 = 4;
 /// The DER prefix of a P-256 `SubjectPublicKeyInfo` ahead of its point.
 const P256_SPKI_PREFIX_LEN: usize = 26;
 
-/// A refusal from the Java side, kept as the exception's text.
+/// A failure reaching the Android Keystore through the Java VM.
 #[derive(Debug, thiserror::Error)]
-#[error("Android Keystore: {0}")]
-pub struct KeystoreFailure(String);
+pub enum KeystoreFailure {
+    /// A refusal from the Java side, kept as the exception's text, else the JNI error's.
+    #[error("Android Keystore: {0}")]
+    Java(String),
+    /// The process has no reachable Java VM.
+    #[error("Android Keystore: {0}")]
+    NoVm(String),
+    /// The application's JNI access returned without running the body.
+    #[error("Android Keystore: the JNI access ran nothing")]
+    RanNothing,
+}
 
 /// The application's access to the process's Java VM.
 pub trait JavaAccess: Send + Sync {
@@ -271,13 +280,14 @@ impl DeviceKey for KeystoreKey {
                 )?
                 .l()?,
             );
-            let len = env.get_array_length(&chain)?;
-            debug_assert!(len >= 0, "the JNI array length is never negative");
-            let len = len as usize;
-            let mut certificates = Vec::with_capacity(len);
+            let len: jsize = env.get_array_length(&chain)?;
+            // A negative length fits no size, so the call is a JNI failure.
+            let capacity = usize::try_from(len).map_err(|_| {
+                jni::errors::Error::JniCall(jni::errors::JniError::Other(jni::sys::JNI_ERR))
+            })?;
+            let mut certificates = Vec::with_capacity(capacity);
             for index in 0..len {
-                // below the JNI length, which fits in `jsize`.
-                let certificate = env.get_object_array_element(&chain, index as jsize)?;
+                let certificate = env.get_object_array_element(&chain, index)?;
                 let encoded = JByteArray::from(
                     env.call_method(&certificate, "getEncoded", "()[B", &[])?
                         .l()?,
@@ -326,8 +336,8 @@ fn java<T>(
             let Some(body) = body.take() else { return };
             outcome = Some(body(env).map_err(|err| exception_text(env, &err)));
         })
-        .map_err(|err| KeystoreFailure(err.to_string()))?;
-    outcome.unwrap_or_else(|| Err(KeystoreFailure("the JNI access ran nothing".into())))
+        .map_err(|err| KeystoreFailure::NoVm(err.to_string()))?;
+    outcome.unwrap_or_else(|| Err(KeystoreFailure::RanNothing))
 }
 
 /// The pending Java exception's text, cleared, else the JNI error's.
@@ -341,7 +351,7 @@ fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> KeystoreFai
         })
         .and_then(|value| value.l().ok())
         .and_then(|text| env.get_string(&text.into()).ok().map(String::from));
-    KeystoreFailure(text.unwrap_or_else(|| err.to_string()))
+    KeystoreFailure::Java(text.unwrap_or_else(|| err.to_string()))
 }
 
 impl From<KeystoreFailure> for ChipError {

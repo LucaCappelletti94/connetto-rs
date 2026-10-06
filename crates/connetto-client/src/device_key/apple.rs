@@ -17,17 +17,20 @@ const MISSING_ENTITLEMENT: i32 = -34_018;
 
 /// A refusal from the Security framework, kept as its code and description.
 #[derive(Debug, thiserror::Error)]
-#[error("Security framework error {code}: {message}")]
-pub struct EnclaveFailure {
-    /// The `OSStatus` the framework reported.
-    pub code: isize,
-    /// The framework's description.
-    pub message: String,
+pub enum EnclaveFailure {
+    /// The framework's `OSStatus` refusal and its description.
+    #[error("Security framework error {code}: {message}")]
+    SecurityFramework {
+        /// The `OSStatus` the framework reported.
+        code: isize,
+        /// The framework's description.
+        message: String,
+    },
 }
 
 impl From<core_foundation::error::CFError> for EnclaveFailure {
     fn from(err: core_foundation::error::CFError) -> Self {
-        Self {
+        Self::SecurityFramework {
             code: err.code(),
             message: err.description().to_string(),
         }

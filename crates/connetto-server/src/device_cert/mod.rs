@@ -83,12 +83,15 @@ impl core::fmt::Debug for DeviceCertConfig {
     }
 }
 
-/// A requested lifetime over the ceiling, refused and never shortened.
+/// A requested lifetime the server will not grant, refused and never shortened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the lifetime is over the ceiling of {} s", .ceiling.as_secs())]
-pub struct LifetimeRefused {
-    /// The longest lifetime the server grants.
-    pub ceiling: Duration,
+pub enum LifetimeError {
+    /// The request is over the ceiling, which the refusal names.
+    #[error("the lifetime is over the ceiling of {} s", .ceiling.as_secs())]
+    OverCeiling {
+        /// The longest lifetime the server grants.
+        ceiling: Duration,
+    },
 }
 
 /// Settings the server refuses to start with.
@@ -289,10 +292,10 @@ impl DeviceCertConfig {
     ///
     /// # Errors
     ///
-    /// [`LifetimeRefused`] when the request is over the ceiling.
-    pub fn lifetime_for(&self, requested: Option<Duration>) -> Result<Duration, LifetimeRefused> {
+    /// [`LifetimeError`] when the request is over the ceiling.
+    pub fn lifetime_for(&self, requested: Option<Duration>) -> Result<Duration, LifetimeError> {
         match requested {
-            Some(lifetime) if lifetime > self.ceiling => Err(LifetimeRefused {
+            Some(lifetime) if lifetime > self.ceiling => Err(LifetimeError::OverCeiling {
                 ceiling: self.ceiling,
             }),
             Some(lifetime) => Ok(lifetime),
