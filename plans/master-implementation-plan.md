@@ -273,7 +273,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R72 clock discipline (X6) | NOT STARTED | nothing | no |
 | R74 device identity and certificates | IN PROGRESS, everything but step 7's peer half merged (2026-10-06, #130) | an iPhone run for proof 5's Apple half, the IANA PEN before a real deployment, R76 for step 7's peer half and proofs 3, 4 and 6's peer half | no |
 | R75 the per-device applied frontier | NOT STARTED | R74. Touches the R2 watermark contract and the R56 import | no |
-| R76 the peer link | NOT STARTED, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first | nothing for slices 1 to 6, other machines for slice 7 and the home run | no |
+| R76 the peer link | NOT STARTED, sliced into pull requests 2026-10-06 (its section's **Slices**), the Android slices first | nothing for slices 1 to 7, other machines for slice 8 and the home run | no |
 | R77 the peer exchange and provisional tier | NOT STARTED | R75 and R76. The retraction's reason rides on R57 step 8's fix | no |
 | R78 courier recovery | NOT STARTED | R75 and R77 | no |
 | R79 media over the peer link | NOT STARTED | R77, and R64 to R67 for the chunk machinery | no |
@@ -5294,6 +5294,13 @@ The local data plane R25 decided, discovery by gateway-probe first (a hotspot ho
 3. **The beacon is public, and each joining device gets the password through a short exchange in which both sides prove their identity.** The beacon carries the protocol version and the host certificate's fingerprint, as the mDNS TXT record does. A joining device connects to the host over Bluetooth, the two run the same mutual TLS as the Wi-Fi link with the same certificate and revocation-list checks, exchange lists, and only then does the host send `HotspotOffer { ssid, passphrase, security, bssid }`. Apple's Wi-Fi password sharing has the same shape, an identity proof over Bluetooth before the password is sent. A revoked or foreign device is refused. A beacon key the server gives every device was rejected, since a lost device keeps reading beacons until a new key reaches the others online, and so was an unencrypted password in the beacon, which lets any stranger fill and flood the hotspot.
 4. **An unattended run on emi and a recorded home run prove it.** On emi, from `main` on a schedule and never from a pull request, one A35's application starts the hotspot and the other A35 joins through the Android shell (`cmd wifi connect-network`), with permissions granted by adb. Before each peer phase closes, the maintainer runs a recorded session at home across every local machine (pippo on Linux, the Mac, the Windows machine, the iPhone, the iPad and the Galaxy M52), with Windows and Linux each hosting once. Manual home runs alone were rejected, and so was emi as a GitHub self-hosted runner, which GitHub advises against for public repositories.
 
+### Decisions, taken with the maintainer on 2026-10-06
+
+5. **The link lives in its own crate, `connetto-peer`.** It takes the certificate chain, the device key, the deployment roots, the kept lists and the accepted levels as inputs and knows nothing of the replica, and `connetto-client` wires it to the enrolment task behind a `peer` feature. Discovery, hosting and Bluetooth land in the same crate in later slices, so their platform dependencies never reach builds without peers, as `connetto-auth-session` and `connetto-file-client` keep theirs apart. A `peer` module in `connetto-client` was rejected, since every later slice would grow the client's dependencies and feature matrix, and its loopback tests would need a whole client.
+6. **A client listens as soon as it holds a valid certificate, at an address the builder names.** `NativeDurable::with_peer_listener(SocketAddr)` defaults to `0.0.0.0:0`, every interface on a port the system picks, `NativeClient::peer_address()` answers the bound address, and `NativeClient::link_peer(SocketAddr)` dials. A new grant swaps the certificate the listener presents and keeps its port, so an advertised address stays right. A fixed default port was rejected, since two applications or two clients on one machine would collide, and so was a listener the application starts, which leaves the restart after every grant to each application.
+7. **A link pings every 15 seconds, closes after 45 seconds of silence, and two devices keep one link.** Any frame counts as a sign of life, measured on a monotonic clock, and a silent link closes with `PeerLost`. When a second link to the same device key completes, the link dialled by the device with the lower key ID stays and the other closes with `Duplicate`, so both ends close the same one, and of two links the same device dialled the newer stays. TCP keepalive alone was rejected, since Android and iOS need not honour short keepalive settings and a stalled peer application stays unseen, and so were duplicate links, which leave R77 to choose between them.
+8. **A peer refuses a certificate whose attestation level is outside its own accepted set.** `NativeDurable::with_peer_accepted_attestation` takes the set, all three levels by default as on the server (R74 decision 33), and a refused peer closes with `AttestationRefused`. A set narrowed in an application update then takes effect at once. Relying on the server's enrolment gate alone was rejected, since certificates issued before an operator narrows the set stay valid for up to the ceiling.
+
 ### Design
 
 - **The Bluetooth exchange.** The host serves through the platform's server role (`BluetoothGattServer` on Android, `GattServiceProvider` on Windows, BlueZ through `bluer` on Linux, `CBPeripheralManager` in the foreground on iPhone and iPad), Android's and Apple's in platform plugins on the `connetto-auth-session` pattern. The joiner writes to one characteristic and reads notifications on another. Frames are length-prefixed and split to the negotiated packet size, and rustls runs over that stream through `read_tls` and `write_tls`, which take any reader and writer. An A35 supports 16 advertising sets and 1,650 bytes of advertising data, measured.
@@ -5301,6 +5308,33 @@ The local data plane R25 decided, discovery by gateway-probe first (a hotspot ho
 - **Hosting permissions.** Android needs `CHANGE_WIFI_STATE`, `NEARBY_WIFI_DEVICES`, `BLUETOOTH_ADVERTISE` and `BLUETOOTH_CONNECT`. pippo's NetworkManager answers `no` to `wifi.share.protected` outside a desktop session, measured, so a refused hotspot maps to a typed error naming the permission. A host keeps its hotspot credentials in memory only, for the life of the hotspot.
 - **Revocation lists on the link.** Each side sends its CRL Numbers per issuer as the first frames inside the established TLS session and then any list the other lacks (R74). A live link whose peer the new list revokes closes with a typed reason.
 - **Discovery networks.** emi's eduroam put the two A35s in separate subnets, measured, so they reach each other by direct connection and never by mDNS. Devices on such a network meet through a hotspot.
+- **The link.** TLS 1.3 alone over TCP with rustls and ring, each side presenting its leaf and issuer and signing through the device key, which signs ECDSA P-256 SHA-256 in DER exactly as TLS 1.3's `ecdsa_secp256r1_sha256` needs. Both verifiers wrap webpki over the deployment roots and the kept lists, checking the whole chain against them with unknown status allowed and list expiry ignored (R74), at the local time and, when that fails on validity alone, five minutes either side. They then require the R74 certificate profile, an attestation level in the accepted set, and a device key other than the device's own. The dialled name is ignored, since a device's identity is its URI. TCP connect and the handshake are bounded at 10 seconds each.
+- **Frames.** A 4-byte big-endian length, then a MessagePack `PeerFrame` as `connetto-core::codec` encodes the server protocol, at most 4 MiB, a longer one closing the link with `Protocol`. `Hello { version, numbers }` goes first from each side, `numbers` the CRL Number kept per issuer key, then `List` carries each list the other side's numbers lack, and `Ping` and `Pong` keep it alive. A received list goes to the client's one intake (R74 decision 22), and every list the intake keeps, from the server or from a peer, comes back to the link, which forwards it to every link whose numbers lack it and closes every link it revokes.
+- **Events.** `ClientEvent::PeerLinked { peer }` once a link survives decision 7, `PeerUnlinked { peer, reason }` when it closes, `CertificateExpired` on a refused `link_peer`, and `PeerListenFailed` when the listener cannot bind. A refused inbound handshake is logged and raises nothing, since any scanner on the network could cause one.
+
+The link against the device's standing (R74's lifecycle table), the one place a peer event meets a situation. `Serving` is R74's `Fresh` or `Aging`, and `Idle` is `NoKey` or a build without a device identity.
+
+| Event | Idle | Serving | Expired | ClockOff |
+| --- | --- | --- | --- | --- |
+| Standing becomes `Fresh` or `Aging` | bind the listener | swap the presented certificate, keep the port and every link | bind the listener | bind the listener |
+| Standing becomes `Expired` | not applicable | close every link with `CertificateExpired`, close the listener | not applicable | close the listener |
+| Standing becomes `ClockOff` | not applicable | close every link with `ClockOutsideWindow`, close the listener | close nothing more | not applicable |
+| Certificate withdrawn or device revoked | not applicable | close every link with `Withdrawn` or `Revoked`, close the listener | become Idle | become Idle |
+| `link_peer` | refuse with `NoIdentity` | dial, handshake, `Hello` | refuse with `CertificateExpired` and emit it | refuse with `ClockOutsideWindow`, the event already raised |
+| Inbound connection | none arrives | handshake | none arrives | none arrives |
+| Handshake verified | not applicable | send `Hello`, emit `PeerLinked` once decision 7 keeps the link | not applicable | not applicable |
+| Peer refused by chain, list, window, level or own key | not applicable | close, `link_peer` answers the reason, an inbound one is logged | not applicable | not applicable |
+| `Hello` received | not applicable | send each kept list the peer lacks, another version closes with `UnsupportedVersion` | not applicable | not applicable |
+| `List` received | not applicable | hand it to the intake | not applicable | not applicable |
+| Newer list kept, from the server or a peer | keep it | keep it, forward it to links lacking it, close links it revokes with `PeerRevoked` | keep it | keep it |
+| Second link to one device key | not applicable | keep one by decision 7, close the other with `Duplicate` | not applicable | not applicable |
+| 15 seconds since the last `Ping` | not applicable | `Ping` the link | not applicable | not applicable |
+| 45 seconds without a frame | not applicable | close with `PeerLost` | not applicable | not applicable |
+| `Ping` received | not applicable | `Pong` | not applicable | not applicable |
+| Peer closes, I/O fails, or a frame is malformed or too long | not applicable | close with `Closed` or `Protocol`, emit `PeerUnlinked` | not applicable | not applicable |
+| Server connection lost | nothing | nothing, links continue | nothing | nothing |
+| Listener bind fails | not applicable | emit `PeerListenFailed`, keep dialling, bind again at the next standing change | not applicable | not applicable |
+| Client closed | nothing | close every link with `Closed`, close the listener | nothing | nothing |
 
 ### Steps
 
@@ -5315,15 +5349,16 @@ The local data plane R25 decided, discovery by gateway-probe first (a hotspot ho
 
 ### Slices
 
-One pull request each, in this order, each green and useful on its own (2026-10-06). Slices 1 to 6 need only the two A35s on emi beside CI, and slice 7 needs the other machines.
+One pull request each, in this order, each green and useful on its own (2026-10-06). Slices 1 to 7 need only the two A35s on emi beside CI, and slice 8 needs the other machines.
 
-1. **The link on loopback** (steps 2 and R74 step 7's peer half). Mutual TLS over TCP between two native clients, each verifying the other's chain against its built-in roots and kept lists, the clock rule refusing a peer outside the window with `ClockOutsideWindow` or `CertificateExpired`, the per-issuer CRL Numbers as the first frames and any missing list after, and a live link closing when a new list revokes its peer. Proven in CI on loopback, which carries R74's proofs 3, 4 and 6's peer half.
-2. **Discovery** (step 1). The gateway probe and `mdns-sd` under `_connetto-peer._tcp.local`, the TXT record carrying the protocol version and the certificate fingerprint only, each found peer handed to slice 1's link. Proven on loopback in CI and between the two A35s on one network.
-3. **Android hosting and joining** (step 3's Android part and step 6's Wi-Fi permissions). `startLocalOnlyHotspot` from the application through a platform plugin on the `connetto-auth-session` pattern, the typed refusal naming a missing permission, joining through the platform's network request, and the demo showing its peers. Proven on emi, one A35 hosting and the other joining through `cmd wifi connect-network`.
-4. **The Bluetooth beacon and exchange on Android** (step 4's Android part and step 6's Bluetooth permissions). `BluetoothGattServer` as host, the joiner over btleplug, rustls over the framed characteristics, and `HotspotOffer` only after both sides proved their identity. Proven on emi between the two A35s.
-5. **The text and QR fallback** (step 5). The `WIFI:` payload and its text form, the text path proven on emi and the camera scan left to the home run.
-6. **The unattended emi run** (step 7's first half). A schedule on emi running slices 3 to 5 from `main`, never from a pull request, with its evidence kept on emi.
-7. **Every other machine** (step 3, 4 and 6 for Windows, Linux, macOS, iPhone and iPad, and step 7's home run). Split further when it starts.
+1. **The `connetto-peer` link on loopback** (step 2, decisions 5, 7 and 8). The crate alone, its verifiers, frames, list forwarding, ping and duplicate rule, taking its certificate, key, roots, lists and clock as inputs. Proven in CI on loopback with certificates minted in the test, which carries R74's proof 4 and proof 6's refusal with a clock set outside the window.
+2. **The client's peer link** (R74 step 7's peer half, decision 6). The `peer` feature, the builder setters, the table above against the enrolment task's standing, the events, and received lists through the one intake. Proven in CI against the real server, which carries R74's proof 3, three clients and a server stopped before the reported device dials.
+3. **Discovery** (step 1). The gateway probe and `mdns-sd` under `_connetto-peer._tcp.local`, the TXT record carrying the protocol version and the certificate fingerprint only, each found peer handed to slice 2's link. Proven on loopback in CI and between the two A35s on one network.
+4. **Android hosting and joining** (step 3's Android part and step 6's Wi-Fi permissions). `startLocalOnlyHotspot` from the application through a platform plugin on the `connetto-auth-session` pattern, the typed refusal naming a missing permission, joining through the platform's network request, and the demo showing its peers. Proven on emi, one A35 hosting and the other joining through `cmd wifi connect-network`.
+5. **The Bluetooth beacon and exchange on Android** (step 4's Android part and step 6's Bluetooth permissions). `BluetoothGattServer` as host, the joiner over btleplug, rustls over the framed characteristics, and `HotspotOffer` only after both sides proved their identity. Proven on emi between the two A35s.
+6. **The text and QR fallback** (step 5). The `WIFI:` payload and its text form, the text path proven on emi and the camera scan left to the home run.
+7. **The unattended emi run** (step 7's first half). A schedule on emi running slices 4 to 6 from `main`, never from a pull request, with its evidence kept on emi.
+8. **Every other machine** (step 3, 4 and 6 for Windows, Linux, macOS, iPhone and iPad, and step 7's home run). Split further when it starts.
 
 ### Done when
 
