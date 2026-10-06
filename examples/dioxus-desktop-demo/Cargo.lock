@@ -1113,6 +1113,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-app-attest"
+version = "0.0.0"
+dependencies = [
+ "base64 0.22.1",
+ "block2",
+ "objc2-device-check",
+ "objc2-foundation",
+ "parking_lot",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "connetto-auth-session"
 version = "0.0.0"
 dependencies = [
@@ -1146,6 +1158,7 @@ dependencies = [
  "apple-native-keyring-store",
  "base64 0.22.1",
  "chacha20poly1305",
+ "connetto-app-attest",
  "connetto-core",
  "connetto-schema",
  "core-foundation",
@@ -5360,6 +5373,17 @@ checksum = "e022c9d066895efa1345f8e33e584b9f958da2fd4cd116792e15e07e4720a807"
 dependencies = [
  "bitflags 2.13.2",
  "objc2-core-foundation",
+]
+
+[[package]]
+name = "objc2-device-check"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac508663f8dc531bc227c1e5bc75d8d847b5f1850baee828fd263b8ff353176d"
+dependencies = [
+ "block2",
+ "objc2",
+ "objc2-foundation",
 ]
 
 [[package]]

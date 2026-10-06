@@ -41,7 +41,7 @@ postgres-types = ["diesel/postgres_backend"]
 # Native only, never wasm (the browser worker owns token custody there).
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
-device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes"]
+device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -196,6 +196,8 @@ security-framework = { version = "3.7", features = ["OSX_10_15"], optional = tru
 core-foundation = { version = "0.10", optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
+# App Attest, behind the one crate allowed unsafe code (R74 decision 35).
+connetto-app-attest = { path = "../connetto-app-attest", optional = true }
 apple-native-keyring-store = { version = "1.0.2", features = [
   "protected",
 ], optional = true }

@@ -322,5 +322,43 @@ async fn blocking<T: Send + 'static>(
         .map_err(ClientError::DeviceChip)
 }
 
+/// The App Attest evidence for `csr` on iOS and iPadOS, whatever key the
+/// device holds, `None` where App Attest is unsupported (decisions 13 and 35).
+/// Any other App Attest failure fails the enrolment, so the next connection
+/// tries again rather than recording `unproven` for good.
+#[cfg(target_os = "ios")]
+pub(crate) fn app_attestation(
+    csr: &[u8],
+) -> Result<Option<connetto_core::messages::DeviceAttestation>, DeviceKeyError> {
+    use sha2::Digest as _;
+
+    let hash: [u8; 32] = sha2::Sha256::digest(csr).into();
+    match connetto_app_attest::attest(&hash) {
+        Ok(Some(attested)) => Ok(Some(
+            connetto_core::messages::DeviceAttestation::AppleAppAttest {
+                key_id: attested.key_id,
+                attestation: attested.attestation,
+            },
+        )),
+        Ok(None) => {
+            tracing::info!("App Attest is unsupported here, so the device stays unproven");
+            Ok(None)
+        }
+        Err(err) => Err(DeviceKeyError::Platform(Box::new(err))),
+    }
+}
+
+/// No App Attest outside iOS and iPadOS.
+#[cfg(not(target_os = "ios"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "one signature on every target, and only iOS can fail"
+)]
+pub(crate) fn app_attestation(
+    _csr: &[u8],
+) -> Result<Option<connetto_core::messages::DeviceAttestation>, DeviceKeyError> {
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests;

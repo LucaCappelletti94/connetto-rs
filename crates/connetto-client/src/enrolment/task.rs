@@ -442,14 +442,16 @@ impl<L: Link> Run<L> {
         } else {
             let key = Arc::clone(&key);
             let csr = csr.clone();
-            tokio::task::spawn_blocking(move || key.attestation(&csr))
-                .await
-                .map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
-                .and_then(|attested| {
-                    attested
-                        .map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
-                })
-                .map_err(Failed::Device)?
+            tokio::task::spawn_blocking(move || match key.attestation(&csr)? {
+                Some(own) => Ok(Some(own)),
+                None => crate::device_key::app_attestation(&csr),
+            })
+            .await
+            .map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
+            .and_then(|attested| {
+                attested.map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
+            })
+            .map_err(Failed::Device)?
         };
         let id = request_id();
         let asked = self
