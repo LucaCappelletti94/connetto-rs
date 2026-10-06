@@ -1,12 +1,4 @@
-//! The offline ceremonies of a connetto deployment's device certificate
-//! authority (R74).
-//!
-//! [`init`] creates the root, which names a fresh deployment UUID and whose
-//! key is stored encrypted under the operator's passphrase. [`sign_issuer`]
-//! signs the yearly issuer the server holds. [`revoke_issuer`] adds an issuer
-//! to the root's one numbered list, which the server publishes beside its
-//! issuers' lists. The root never runs on the server, so this crate is a tool
-//! for the operator's offline machine.
+#![doc = include_str!("../README.md")]
 
 use std::fs::OpenOptions;
 use std::io::Write as _;

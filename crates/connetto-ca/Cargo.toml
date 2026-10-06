@@ -3,6 +3,7 @@ name = "connetto-ca"
 description = "The offline ceremonies of a connetto deployment's device certificate authority: creating the root and signing the server's issuer."
 categories = ["authentication", "cryptography", "command-line-utilities"]
 keywords = ["sync", "x509", "certificates", "pki"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

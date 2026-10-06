@@ -3,6 +3,7 @@ name = "connetto-app-attest"
 description = "Apple App Attest for connetto's device enrolment, the workspace's one crate allowed unsafe code, every call serialised behind one process-wide lock."
 categories = ["authentication", "os::macos-apis"]
 keywords = ["sync", "app-attest", "devicecheck", "ios"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
