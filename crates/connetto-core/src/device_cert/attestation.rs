@@ -4,14 +4,9 @@
 /// The certificate extension carrying the attestation level, non-critical,
 /// whose value is the DER `UTF8String` of [`AttestationLevel::as_str`].
 ///
-/// It stands under RFC 5612's documentation enterprise number 32473 until
-/// IANA assigns connetto's own, which replaces it before any real deployment
+/// It is the first arc under connetto's IANA Private Enterprise Number, 67105
 /// (decision 10).
-pub const ATTESTATION_EXTENSION: &[u64] = &[1, 3, 6, 1, 4, 1, 32473, 1];
-
-/// Whether [`ATTESTATION_EXTENSION`] still stands under the documentation
-/// number rather than connetto's assigned one.
-pub const ATTESTATION_OID_IS_STAND_IN: bool = true;
+pub const ATTESTATION_EXTENSION: &[u64] = &[1, 3, 6, 1, 4, 1, 67105, 1];
 
 /// The fixed attestation challenge the Android device key is created with
 /// (R74 decision 31), which the server checks its attestation chain for.
