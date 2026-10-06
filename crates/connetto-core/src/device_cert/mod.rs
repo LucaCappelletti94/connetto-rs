@@ -16,10 +16,7 @@ pub mod layout;
 mod request;
 mod revocation;
 
-pub use attestation::{
-    ANDROID_ATTESTATION_CHALLENGE, ATTESTATION_EXTENSION, ATTESTATION_OID_IS_STAND_IN,
-    AttestationLevel,
-};
+pub use attestation::{ANDROID_ATTESTATION_CHALLENGE, ATTESTATION_EXTENSION, AttestationLevel};
 pub use authority::{DeviceIssuer, IssueError, IssuerError, RootCa, RootError, deployment_of_root};
 pub use certificate::{DeviceCertificate, ProfileError};
 pub use identity::{DeploymentId, DeviceIdentity, IdentityError, KeyId};
