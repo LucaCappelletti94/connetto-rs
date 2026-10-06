@@ -129,6 +129,15 @@ tower-http = { version = "0.6", default-features = false, features = ["cors"] }
 connetto-file-server = { path = "../connetto-file-server", optional = true }
 axum-extra = { version = "0.12.6", default-features = false, features = ["cookie"] }
 time = { version = "0.3.55", default-features = false }
+# Device attestation (R74 step 4): x509-parser verifies the Android chain's
+# signatures and Apple's `x5c`, reqwest fetches Google's status list, pem
+# reads the bundled attestation roots, ciborium decodes the App Attest
+# object, and serde_bytes names the attestation chain's byte strings.
+x509-parser = { version = "0.18", default-features = false, features = ["verify"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+pem = "3"
+ciborium = "0.2"
+serde_bytes = { version = "0.11", features = ["std"] }
 
 [features]
 default = ["content"]

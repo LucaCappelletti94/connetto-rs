@@ -319,6 +319,7 @@ uuid = { version = "1", features = ["v4", "v5"] }
 rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
+tokio = { version = "1", features = ["test-util"] }
 
 # The fake Secret Service the Linux store tests serve on a peer-to-peer bus.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

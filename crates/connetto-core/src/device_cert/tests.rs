@@ -137,7 +137,14 @@ fn an_issued_certificate_carries_exactly_the_profile() {
     let request = CertificateRequest::parse(&csr).expect("parse the request");
     assert_eq!(request.challenge(), &[7; 32]);
     let leaf = issuer
-        .issue(&request, "c0ffee-42", start, DAY, [9; 16])
+        .issue(
+            &request,
+            "c0ffee-42",
+            start,
+            DAY,
+            [9; 16],
+            AttestationLevel::ChipProven,
+        )
         .expect("issue");
 
     let cert = DeviceCertificate::parse(&leaf).expect("the leaf meets the profile");
@@ -149,6 +156,7 @@ fn an_issued_certificate_carries_exactly_the_profile() {
     assert_eq!(cert.not_before(), start);
     assert_eq!(cert.not_after(), start + DAY);
     assert_eq!(cert.serial(), &[9; 16]);
+    assert_eq!(cert.attestation(), AttestationLevel::ChipProven);
 
     verify_chain(
         &root,
@@ -183,7 +191,14 @@ fn fields_the_request_asks_for_are_ignored() {
         .to_vec();
     let request = CertificateRequest::parse(&csr).expect("parse the request");
     let leaf = issuer
-        .issue(&request, "acct", start, DAY, [3; 16])
+        .issue(
+            &request,
+            "acct",
+            start,
+            DAY,
+            [3; 16],
+            AttestationLevel::Unproven,
+        )
         .expect("issue");
     assert!(DeviceCertificate::parse(&leaf).is_ok());
 }
@@ -231,7 +246,14 @@ fn a_certificate_outliving_its_issuer_is_not_issued() {
     let request = CertificateRequest::parse(&csr).expect("parse");
     assert_eq!(
         issuer
-            .issue(&request, "acct", start + YEAR, 31 * DAY, [3; 16])
+            .issue(
+                &request,
+                "acct",
+                start + YEAR,
+                31 * DAY,
+                [3; 16],
+                AttestationLevel::Unproven
+            )
             .err(),
         Some(IssueError::OutlivesIssuer)
     );
@@ -401,7 +423,14 @@ fn a_device_key_requests_a_certificate_naming_it() {
     let csr = CertificateRequest::build(&CertificateSigner::new(&key), &[4; 32]).expect("build");
     let request = CertificateRequest::parse(&csr).expect("the request verifies");
     let leaf = issuer
-        .issue(&request, "acct", start, DAY, [5; 16])
+        .issue(
+            &request,
+            "acct",
+            start,
+            DAY,
+            [5; 16],
+            AttestationLevel::Unproven,
+        )
         .expect("issue");
     let cert = DeviceCertificate::parse(&leaf).expect("profile");
     assert_eq!(cert.identity().key(), key_id(&key));
@@ -433,7 +462,14 @@ fn issued(issuer: &DeviceIssuer, start: SystemTime, serial: u8) -> Vec<u8> {
     let (_, csr) = device_request(&[serial; 32]);
     let request = CertificateRequest::parse(&csr).expect("parse");
     issuer
-        .issue(&request, "alice", start, DAY, [serial; 16])
+        .issue(
+            &request,
+            "alice",
+            start,
+            DAY,
+            [serial; 16],
+            AttestationLevel::Unproven,
+        )
         .expect("issue")
 }
 

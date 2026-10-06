@@ -14,7 +14,8 @@
 //!     session_id UUID NOT NULL,
 //!     enrolled_at TIMESTAMPTZ NOT NULL,
 //!     last_seen TIMESTAMPTZ NOT NULL,
-//!     revoked_at TIMESTAMPTZ
+//!     revoked_at TIMESTAMPTZ,
+//!     attestation TEXT NOT NULL
 //!     -- then one column per descriptor field
 //! );
 //! CREATE TABLE connetto_device_certificates (
@@ -36,7 +37,7 @@ use std::sync::Arc;
 use std::time::SystemTime;
 
 use connetto_core::SessionId;
-use connetto_core::device_cert::{DeviceDescriptor, KeyId, Revoked};
+use connetto_core::device_cert::{AttestationLevel, DeviceDescriptor, KeyId, Revoked};
 use diesel::QueryResult;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection};
@@ -73,6 +74,8 @@ pub struct NewEnrolment<'a, Id, D> {
     pub at: SystemTime,
     /// The descriptor the device sent.
     pub descriptor: D,
+    /// The attestation level the enrolment proved, which a renewal keeps.
+    pub attestation: AttestationLevel,
 }
 
 /// A renewal of a key already enrolled under the same account.
@@ -181,6 +184,14 @@ pub trait ConnettoEnrolmentSchema: Send + Sync + 'static {
     /// Advance `issuer`'s list number, answering the new one, which is 1 for an
     /// issuer with none yet.
     fn next_list_number(conn: &mut AsyncPgConnection, issuer: KeyId) -> Statement<'_, i64>;
+
+    /// The attestation level the key's first enrolment under `user` recorded,
+    /// `None` when the key has no enrolment under `user`.
+    fn stored_attestation<'c>(
+        conn: &'c mut AsyncPgConnection,
+        key: KeyId,
+        user: &'c Self::Id,
+    ) -> Statement<'c, Option<String>>;
 }
 
 /// An [`EnrolmentStore`] over the deployment's enrolment tables, `D`'s
@@ -222,6 +233,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                     expires_at,
                     session,
                     descriptor: _,
+                    attestation,
                 } = enrolment;
                 let mut facts = S::key_facts(c, key, Some(&user)).await?;
                 if facts.is_none() {
@@ -231,6 +243,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                         session,
                         at: issued_at,
                         descriptor: descriptor.clone(),
+                        attestation,
                     };
                     // A concurrent first enrolment of the same key inserted
                     // its row between the read and the insert.
@@ -331,6 +344,25 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
             u64::try_from(number).map_err(EnrolmentError::new)
         })
     }
+
+    fn stored_attestation<'a>(
+        &'a self,
+        user: &'a S::Id,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
+        Box::pin(async move {
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::new)?;
+            match S::stored_attestation(&mut conn, key, user)
+                .await
+                .map_err(EnrolmentError::new)?
+            {
+                Some(spelled) => AttestationLevel::parse(&spelled).map(Some).ok_or_else(|| {
+                    EnrolmentError::new("the enrolment's stored level is not a level")
+                }),
+                None => Ok(None),
+            }
+        })
+    }
 }
 
 /// A key id read back from its `BYTEA` column.
@@ -390,6 +422,8 @@ macro_rules! connetto_enrolment_tables {
                 last_seen -> diesel::sql_types::Timestamptz,
                 /// When it was revoked.
                 revoked_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                /// The attestation level the first enrolment recorded.
+                attestation -> diesel::sql_types::Text,
                 $( $field -> $field_sql, )*
             }
         }
@@ -489,6 +523,7 @@ macro_rules! connetto_enrolment_tables {
                         session,
                         at,
                         descriptor,
+                        attestation,
                     } = enrolment;
                     let $($shape)* = descriptor;
                     let at = $crate::ban::Instant::from(at);
@@ -499,6 +534,7 @@ macro_rules! connetto_enrolment_tables {
                             connetto_device_enrolments::session_id.eq(session),
                             connetto_device_enrolments::enrolled_at.eq(at),
                             connetto_device_enrolments::last_seen.eq(at),
+                            connetto_device_enrolments::attestation.eq(attestation.as_str()),
                             $( connetto_device_enrolments::$field.eq($field), )*
                         ))
                         .on_conflict_do_nothing()
@@ -683,6 +719,34 @@ macro_rules! connetto_enrolment_tables {
                         .returning(connetto_device_lists::last_number)
                         .get_result(conn)
                         .await
+                })
+            }
+
+            fn stored_attestation<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                key: $crate::device_cert::KeyId,
+                user: &'c Self::Id,
+            ) -> $crate::device_cert::Statement<'c, Option<String>> {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let keyed = QueryDsl::filter(
+                        connetto_device_enrolments::table,
+                        connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
+                    );
+                    let stored: Option<(String,)> = RunQueryDsl::first(
+                        QueryDsl::select(
+                            QueryDsl::filter(
+                                keyed,
+                                connetto_device_enrolments::user_id.eq(user.clone()),
+                            ),
+                            (connetto_device_enrolments::attestation,),
+                        ),
+                        conn,
+                    )
+                    .await
+                    .optional()?;
+                    Ok(stored.map(|(spelled,)| spelled))
                 })
             }
         }

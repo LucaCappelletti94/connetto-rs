@@ -1169,6 +1169,11 @@ pub enum ClientEvent {
         /// rather than behind, so it looks not yet valid.
         ahead: bool,
     },
+    /// The deployment's accepted attestation levels exclude this device's, so
+    /// its enrolment is refused. A device holding a certificate keeps it
+    /// until it expires, and the device asks again only on its next
+    /// connection, since its level cannot change (R74 decision 33).
+    AttestationRequired,
 }
 
 /// A primary-key column value carried on a mutation event.

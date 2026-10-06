@@ -91,24 +91,36 @@
 //!   the application requests none (default 86400).
 //! - `CONNETTO_DEVICE_CERT_CEILING_SECS`: the longest lifetime granted, a
 //!   longer request refused (default 2592000, 30 days).
+//! - `CONNETTO_DEVICE_APP_ATTEST_APP_IDS`: a comma-separated list of the
+//!   App IDs, each `TEAMID.bundle.id`, App Attest vouches for, so an
+//!   attestation that passes Apple's checks for a listed ID in the
+//!   configured environment records `app-attested`.
+//! - `CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT`: the environment the listed
+//!   App IDs attest in, `production` (default) or `development`.
+//! - `CONNETTO_DEVICE_ACCEPTED_ATTESTATION`: the attestation levels the
+//!   deployment accepts, from `chip-proven`, `app-attested` and `unproven`,
+//!   every one by default.
+//! - `CONNETTO_DEVICE_ANDROID_STATUS`: the source of the Android attestation
+//!   status list, a `http` or `https` URL (Google's by default) or a path
+//!   to a local file.
 //!
 //! The process exits `1` when the change stream cannot answer what a row
 //! looked like before it changed, or gives up reconnecting, and returns its
 //! build or HTTP errors as failures.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
-use connetto_core::device_cert::DeviceIssuer;
 use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY};
+use connetto_core::device_cert::{ATTESTATION_OID_IS_STAND_IN, AttestationLevel, DeviceIssuer};
 use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::SignedList;
 use connetto_server::builder::{
     ContentSettings, Database, OidcProvider, OpenFga, ServeError, ServerBuilder, ServerSchema,
     StoreSpec, TokenKeys,
 };
-use connetto_server::device_cert::DeviceCertConfig;
+use connetto_server::device_cert::{AndroidStatus, AppAttestEnvironment, DeviceCertConfig};
 use connetto_server::{
     AuthConfig, CookieSameSite, OidcProviderConfig, ReaderReserve, RuntimeWritableCatalog,
 };
@@ -381,12 +393,16 @@ fn env_secs(key: &str) -> Result<Option<Duration>> {
 }
 
 /// The device settings `CONNETTO_DEVICE_ISSUER_DIR` turns on.
-const DEVICE_SETTINGS: [&str; 5] = [
+const DEVICE_SETTINGS: [&str; 9] = [
     "CONNETTO_DEVICE_ROOT",
     "CONNETTO_DEVICE_RETIRED_ISSUER_DIRS",
     "CONNETTO_DEVICE_ROOT_LIST",
     "CONNETTO_DEVICE_CERT_DEFAULT_SECS",
     "CONNETTO_DEVICE_CERT_CEILING_SECS",
+    "CONNETTO_DEVICE_APP_ATTEST_APP_IDS",
+    "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT",
+    "CONNETTO_DEVICE_ACCEPTED_ATTESTATION",
+    "CONNETTO_DEVICE_ANDROID_STATUS",
 ];
 
 /// The file at `path`, the error naming `what` it is.
@@ -438,6 +454,44 @@ fn device_certs() -> Result<Option<DeviceCertConfig>> {
     }
     if let Some(ceiling) = env_secs("CONNETTO_DEVICE_CERT_CEILING_SECS")? {
         config = config.with_lifetime_ceiling(ceiling);
+    }
+    if let Some(text) = var_nonempty("CONNETTO_DEVICE_APP_ATTEST_APP_IDS") {
+        let app_ids = comma_list(&text);
+        let name = var_or("CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT", "production");
+        let Some(environment) = AppAttestEnvironment::parse(&name) else {
+            return Err(anyhow!(
+                "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT is {name:?}, expected production or development"
+            ));
+        };
+        config = config.with_app_attest(app_ids, environment);
+    }
+    if let Some(text) = var_nonempty("CONNETTO_DEVICE_ACCEPTED_ATTESTATION") {
+        let mut accepted = Vec::new();
+        for name in comma_list(&text) {
+            match AttestationLevel::parse(&name) {
+                Some(level) => accepted.push(level),
+                None => {
+                    return Err(anyhow!(
+                        "CONNETTO_DEVICE_ACCEPTED_ATTESTATION names {name:?}, expected chip-proven, app-attested or unproven"
+                    ));
+                }
+            }
+        }
+        config = config.with_accepted_attestation(accepted);
+    }
+    if let Some(text) = var_nonempty("CONNETTO_DEVICE_ANDROID_STATUS") {
+        let source = if text.starts_with("http://") || text.starts_with("https://") {
+            AndroidStatus::Url(text)
+        } else {
+            AndroidStatus::File(PathBuf::from(text))
+        };
+        config = config.with_android_status(source);
+    }
+    if ATTESTATION_OID_IS_STAND_IN {
+        tracing::warn!(
+            "the device certificate's attestation extension still stands under the RFC 5612 \
+             documentation number 32473, pending the assignment of connetto's own number"
+        );
     }
     Ok(Some(config))
 }

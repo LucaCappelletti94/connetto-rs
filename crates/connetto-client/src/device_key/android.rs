@@ -8,9 +8,14 @@
 
 use std::sync::Arc;
 
-use connetto_core::device_cert::{DeviceKey, DeviceKeyError, KeyHome};
+use connetto_core::device_cert::{
+    ANDROID_ATTESTATION_CHALLENGE, DeviceKey, DeviceKeyError, KeyHome,
+};
+use connetto_core::messages::DeviceAttestation;
 use jni::JNIEnv;
-use jni::objects::{GlobalRef, JByteArray, JObject, JValue};
+use jni::objects::{GlobalRef, JByteArray, JObject, JObjectArray, JValue};
+use jni::sys::jsize;
+use serde_bytes::ByteBuf;
 
 use super::{ChipError, ChipKeys};
 use crate::ClientError;
@@ -44,6 +49,8 @@ pub(crate) struct AndroidKeystore {
 /// A P-256 key the Android Keystore holds and never releases.
 pub struct KeystoreKey {
     java: Arc<dyn JavaAccess>,
+    /// The alias the Keystore holds the key under.
+    alias: String,
     private: GlobalRef,
     point: [u8; 65],
 }
@@ -109,6 +116,7 @@ impl ChipKeys for AndroidKeystore {
                 .ok_or_else(|| ChipError::Unavailable("the Keystore key is not P-256".into()))?;
             Ok(KeystoreKey {
                 java: Arc::clone(&self.java),
+                alias: label.to_string(),
                 private,
                 point,
             })
@@ -154,6 +162,13 @@ impl ChipKeys for AndroidKeystore {
                     "setDigests",
                     "([Ljava/lang/String;)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
                     &[JValue::Object(&digests)],
+                )?;
+                let challenge = env.byte_array_from_slice(ANDROID_ATTESTATION_CHALLENGE)?;
+                env.call_method(
+                    &builder,
+                    "setAttestationChallenge",
+                    "([B)Landroid/security/keystore/KeyGenParameterSpec$Builder;",
+                    &[JValue::Object(&challenge)],
                 )?;
                 let spec = env
                     .call_method(
@@ -241,6 +256,40 @@ impl DeviceKey for KeystoreKey {
 
     fn home(&self) -> KeyHome {
         KeyHome::AndroidKeystore { strongbox: false }
+    }
+
+    fn attestation(&self, _csr: &[u8]) -> Result<Option<DeviceAttestation>, DeviceKeyError> {
+        let chain = java(&*self.java, |env| {
+            let store = loaded_keystore(env)?;
+            let alias = env.new_string(&self.alias)?;
+            let chain = JObjectArray::from(
+                env.call_method(
+                    &store,
+                    "getCertificateChain",
+                    "(Ljava/lang/String;)[Ljava/security/cert/Certificate;",
+                    &[JValue::Object(&alias)],
+                )?
+                .l()?,
+            );
+            let len = env.get_array_length(&chain)?;
+            debug_assert!(len >= 0, "the JNI array length is never negative");
+            let len = len as usize;
+            let mut certificates = Vec::with_capacity(len);
+            for index in 0..len {
+                // below the JNI length, which fits in `jsize`.
+                let certificate = env.get_object_array_element(&chain, index as jsize)?;
+                let encoded = JByteArray::from(
+                    env.call_method(&certificate, "getEncoded", "()[B", &[])?
+                        .l()?,
+                );
+                certificates.push(env.convert_byte_array(&encoded)?);
+            }
+            Ok(certificates)
+        })
+        .map_err(|err| DeviceKeyError::Platform(Box::new(err)))?;
+        Ok(Some(DeviceAttestation::AndroidKeyChain(
+            chain.into_iter().map(ByteBuf::from).collect(),
+        )))
     }
 }
 

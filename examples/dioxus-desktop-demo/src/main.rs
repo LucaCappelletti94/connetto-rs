@@ -594,7 +594,8 @@ fn status_label(event: &ClientEvent) -> Option<String> {
 }
 
 /// What the device line shows: whether this build has a device identity,
-/// where its key lives and until when its certificate holds (R74).
+/// where its key lives, until when its certificate holds and what the device
+/// proved at enrolment (R74).
 #[cfg(feature = "device-identity")]
 fn device_label(native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
     use connetto_core::device_cert::KeyHome;
@@ -611,8 +612,9 @@ fn device_label(native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
         Some(certificate) => {
             let until = chrono::DateTime::<chrono::Utc>::from(certificate.not_after());
             format!(
-                "certified until {}, key in {home}",
-                until.format("%Y-%m-%d %H:%M UTC")
+                "certified until {}, key in {home}, {}",
+                until.format("%Y-%m-%d %H:%M UTC"),
+                certificate.attestation()
             )
         }
         None => format!("enrolling, key in {home}"),

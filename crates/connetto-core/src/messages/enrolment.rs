@@ -35,6 +35,29 @@ pub struct EnrolRequest {
     /// The application's device descriptor, `MessagePack`, at most 4096 bytes.
     #[serde(with = "serde_bytes")]
     pub descriptor: Vec<u8>,
+    /// The platform's evidence about the device, sent while the device holds
+    /// no certificate. The server reads it on a key's first enrolment only
+    /// (R74 decision 13).
+    pub attestation: Option<DeviceAttestation>,
+}
+
+/// A platform's evidence about a device, which the server verifies (R74 step 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceAttestation {
+    /// The Android Keystore's attestation chain of the device key, DER, the
+    /// key's own certificate first, created with the fixed challenge
+    /// `connetto device key` (decision 31).
+    AndroidKeyChain(Vec<serde_bytes::ByteBuf>),
+    /// An Apple App Attest attestation whose client data hash is the SHA-256
+    /// of the request's `csr`.
+    AppleAppAttest {
+        /// The App Attest key's identifier, the SHA-256 of its public key.
+        #[serde(with = "serde_bytes")]
+        key_id: Vec<u8>,
+        /// The CBOR attestation object `DCAppAttestService` returned.
+        #[serde(with = "serde_bytes")]
+        attestation: Vec<u8>,
+    },
 }
 
 /// Server hands back the device's certificate.
@@ -143,4 +166,7 @@ pub enum EnrolRefusal {
     },
     /// The device key's enrolment was revoked.
     Revoked,
+    /// The device's attestation level is outside the set the deployment
+    /// accepts (R74 decision 33).
+    AttestationRequired,
 }

@@ -1,14 +1,15 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256, SanType, SerialNumber,
-    SubjectPublicKeyInfo,
+    BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
+    SanType, SerialNumber, SubjectPublicKeyInfo,
 };
 use time::OffsetDateTime;
 use x509_parser::certificate::X509Certificate;
 use x509_parser::prelude::FromDer;
 
+use super::attestation::{ATTESTATION_EXTENSION, AttestationLevel};
 use super::identity::{DeploymentId, DeviceIdentity, KeyId};
 use super::request::CertificateRequest;
 
@@ -275,7 +276,7 @@ impl DeviceIssuer {
     }
 
     /// Issue the device certificate for `request`, naming `account`, valid from
-    /// `not_before` for `lifetime`.
+    /// `not_before` for `lifetime`, recording `attestation`.
     ///
     /// # Errors
     ///
@@ -288,6 +289,7 @@ impl DeviceIssuer {
         not_before: SystemTime,
         lifetime: Duration,
         serial: [u8; 16],
+        attestation: AttestationLevel,
     ) -> Result<Vec<u8>, IssueError> {
         let identity = DeviceIdentity::new(
             self.deployment,
@@ -313,6 +315,10 @@ impl DeviceIssuer {
         params.not_before = to_time(not_before).ok_or(IssueError::Validity)?;
         params.not_after = to_time(not_after).ok_or(IssueError::Validity)?;
         params.serial_number = Some(SerialNumber::from_slice(&serial));
+        params.custom_extensions = vec![CustomExtension::from_oid_content(
+            ATTESTATION_EXTENSION,
+            attestation.extension_value(),
+        )];
         Ok(params.signed_by(&public, &signer)?.der().to_vec())
     }
 }

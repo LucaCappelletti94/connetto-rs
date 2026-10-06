@@ -29,7 +29,7 @@ use crate::authn::schema::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
-    ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, pg_enrolment_store,
+    ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, StatusList, pg_enrolment_store,
 };
 use crate::manager_builder::ManagerBuilder;
 use crate::materializer::Materializer;
@@ -1231,6 +1231,9 @@ fn install_device_identity<D: ConnettoSchema>(
     config: DeviceCertConfig,
 ) {
     let service = Arc::clone(service);
+    // The status list's fetch task starts with the server.
+    let list = StatusList::new(config.android_status().clone());
+    list.spawn();
     let enrolment = DeviceEnrolment::new(config, pg_enrolment_store::<D>(pool.clone()))
         .with_session_revoker(Arc::new(move |session| {
             let service = Arc::clone(&service);
@@ -1240,6 +1243,7 @@ fn install_device_identity<D: ConnettoSchema>(
                 }
             })
         }));
+    let enrolment = enrolment.with_status_list(list);
     // The manager was built a moment ago, so nothing installed one before.
     let _ = manager.install_device_enrolment(Arc::new(enrolment));
 }

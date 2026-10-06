@@ -20,7 +20,9 @@ use connetto_client::{
     KeyringKeyStore, KeyringStore, NativeClient, NativeClientBuilder, NativeDurable,
     REPLICA_PREFIX, SyncStatus, device_key_record, replica_db_name,
 };
-use connetto_core::device_cert::{DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome, RootCa};
+use connetto_core::device_cert::{
+    AttestationLevel, DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome, RootCa,
+};
 use connetto_core::messages::EnrolRefusal;
 use connetto_core::traits::{HandshakeAuthority, RefreshTokenStore};
 use connetto_server::device_cert::{
@@ -74,6 +76,7 @@ const APP_NO_ROOTS: &str = "r74-no-roots";
 const APP_ROTATION: &str = "r74-rotation";
 const APP_CLOCK_BEHIND: &str = "r74-clock-behind";
 const APP_CLOCK_AHEAD: &str = "r74-clock-ahead";
+const APP_ATTESTATION: &str = "r74-attestation";
 const APP_LOST_KEY: &str = "r74-lost-key";
 
 /// What the lost-device list shows about these test devices.
@@ -142,6 +145,7 @@ async fn enrolment_phase() {
         "rotation" => Box::pin(rotation_withdraws()).await,
         "clock-behind" => Box::pin(clock_behind()).await,
         "clock-ahead" => clock_ahead().await,
+        "attestation" => attestation().await,
         "lost-key" => lost_key().await,
         other => panic!("unknown enrolment phase {other:?}"),
     }
@@ -1615,5 +1619,70 @@ async fn lost_key() {
         vec![first.identity().key(), fresh.identity().key()],
         "the old enrolment stays until it expires, beside the fresh one"
     );
+    second.close().await;
+}
+
+/// A deployment that accepts only chip-proven evidence refuses a device whose
+/// key offers no attestation, says so, holds no certificate and records
+/// nothing, and the device asks again only on its next connection
+/// (decision 33).
+#[test]
+fn a_refused_attestation_is_raised_and_the_device_asks_again_on_the_next_connection() {
+    run_phase("attestation");
+}
+
+async fn attestation() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let config =
+        DeviceCertConfig::new(issuer()).with_accepted_attestation([AttestationLevel::ChipProven]);
+    let (addr, _server) = sync_server(&fixture, &service, config, Arc::clone(&store)).await;
+    let dir = tempdir().expect("a data directory");
+
+    let (client, pump) = signed_in(
+        addr,
+        fresh_login(&base, APP_ATTESTATION, "enrol-user"),
+        dir.path(),
+    )
+    .connect_with_pump()
+    .await
+    .expect("the signed-in build connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::AttestationRequired
+        ),)
+        .await
+        .is_some(),
+        "the refusal is raised"
+    );
+    assert!(
+        client.device_certificate().is_none(),
+        "the device holds no certificate"
+    );
+    assert!(store.records().is_empty(), "the server recorded nothing");
+    client.close().await;
+
+    // The next connection over the same dir asks again, and is refused again.
+    let (second, pump) = signed_in(addr, last_used(&base, APP_ATTESTATION), dir.path())
+        .connect_with_pump()
+        .await
+        .expect("the second build signs back in and connects");
+    let mut events = second.client().events();
+    tokio::spawn(pump);
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::AttestationRequired
+        ),)
+        .await
+        .is_some(),
+        "the next connection asks again"
+    );
+    assert!(second.device_certificate().is_none());
+    assert_eq!(store.records(), Vec::new());
     second.close().await;
 }

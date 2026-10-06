@@ -13,14 +13,14 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, DeviceRevokedAck,
-        DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest,
-        EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason,
-        FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch,
-        MutationConflict, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-        NonFatalError, PauseCause, Ping, Pong, RateLimited, RevocationUpdate, RevokeDeviceRequest,
-        SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
-        SubscriptionSpec, Unsubscribe,
+        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, DeviceAttestation,
+        DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge,
+        EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError,
+        FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
+        LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
+        MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, RevocationUpdate,
+        RevokeDeviceRequest, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
+        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -351,12 +351,27 @@ fn enrolment_control_round_trips() {
         nonce: [7; 32],
         expires_in_ms: 60_000,
     }));
-    for lifetime_secs in [None, Some(86_400)] {
+    let attestations = [
+        None,
+        Some(DeviceAttestation::AndroidKeyChain(vec![
+            serde_bytes::ByteBuf::from(vec![0x30, 0x06]),
+            serde_bytes::ByteBuf::from(vec![0x30, 0x07]),
+        ])),
+        Some(DeviceAttestation::AppleAppAttest {
+            key_id: vec![8; 32],
+            attestation: vec![0xa3, 0x63],
+        }),
+    ];
+    for (lifetime_secs, attestation) in [None, Some(86_400)]
+        .into_iter()
+        .flat_map(|lifetime| attestations.iter().map(move |at| (lifetime, at.clone())))
+    {
         round_trip_control(&ControlMessage::EnrolRequest(EnrolRequest {
             request_id: "enrol-2".into(),
             csr: vec![0x30, 0x82, 0x01],
             lifetime_secs,
             descriptor: vec![0x93, 0x01, 0x02, 0x03],
+            attestation,
         }));
     }
     round_trip_control(&ControlMessage::EnrolGrant(EnrolGrant {
@@ -418,6 +433,7 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
             ceiling_secs: 2_592_000,
         },
         EnrolRefusal::Revoked,
+        EnrolRefusal::AttestationRequired,
     ];
     for reason in &all {
         match reason {
@@ -426,7 +442,8 @@ fn every_enrol_refusal() -> Vec<EnrolRefusal> {
             | EnrolRefusal::ChallengeExpired
             | EnrolRefusal::InvalidRequest
             | EnrolRefusal::OverCeiling { .. }
-            | EnrolRefusal::Revoked => {}
+            | EnrolRefusal::Revoked
+            | EnrolRefusal::AttestationRequired => {}
         }
     }
     all

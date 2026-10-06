@@ -1,6 +1,7 @@
 use rcgen::{PKCS_ECDSA_P256_SHA256, PublicKeyData, SignatureAlgorithm, SigningKey};
 
 use super::identity::KeyId;
+use crate::messages::DeviceAttestation;
 
 /// The DER prefix of a P-256 `SubjectPublicKeyInfo` ahead of its 65-byte point.
 const P256_SPKI_PREFIX: [u8; 26] = [
@@ -22,6 +23,17 @@ pub trait DeviceKey: Send + Sync {
 
     /// Where the key lives.
     fn home(&self) -> KeyHome;
+
+    /// The platform's evidence about this key, sent while the device holds
+    /// no certificate (R74 step 4), `None` where the platform offers none.
+    /// `csr` is the DER request the evidence binds to.
+    ///
+    /// # Errors
+    ///
+    /// [`DeviceKeyError`] when the platform cannot produce its evidence.
+    fn attestation(&self, _csr: &[u8]) -> Result<Option<DeviceAttestation>, DeviceKeyError> {
+        Ok(None)
+    }
 }
 
 /// Where a device key lives (R74 decisions 6 and 16).

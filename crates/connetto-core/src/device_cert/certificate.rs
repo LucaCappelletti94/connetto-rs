@@ -6,6 +6,7 @@ use x509_parser::oid_registry::{OID_EC_P256, OID_KEY_TYPE_EC_PUBLIC_KEY};
 use x509_parser::prelude::FromDer;
 use x509_parser::x509::SubjectPublicKeyInfo;
 
+use super::attestation::{ATTESTATION_EXTENSION, AttestationLevel};
 use super::identity::{DeviceIdentity, IdentityError, KeyId};
 
 /// A device certificate whose profile has been checked.
@@ -18,6 +19,7 @@ pub struct DeviceCertificate {
     not_before: SystemTime,
     not_after: SystemTime,
     serial: Vec<u8>,
+    attestation: AttestationLevel,
 }
 
 /// How a certificate departs from the device profile.
@@ -53,6 +55,9 @@ pub enum ProfileError {
     /// A critical extension outside the profile.
     #[error("a critical extension outside the profile")]
     UnknownCriticalExtension,
+    /// The attestation extension is critical or names no level.
+    #[error("the attestation extension is critical or names no level")]
+    Attestation,
 }
 
 impl DeviceCertificate {
@@ -75,8 +80,21 @@ impl DeviceCertificate {
         }
 
         let mut identity = None;
+        let mut attestation = AttestationLevel::Unproven;
         let (mut key_usage, mut extended_key_usage) = (false, false);
         for extension in cert.extensions() {
+            if extension
+                .oid
+                .iter()
+                .is_some_and(|arcs| arcs.eq(ATTESTATION_EXTENSION.iter().copied()))
+            {
+                if extension.critical {
+                    return Err(ProfileError::Attestation);
+                }
+                attestation = AttestationLevel::from_extension_value(extension.value)
+                    .ok_or(ProfileError::Attestation)?;
+                continue;
+            }
             match extension.parsed_extension() {
                 ParsedExtension::BasicConstraints(constraints) => {
                     if constraints.ca {
@@ -136,7 +154,15 @@ impl DeviceCertificate {
             not_before: from_timestamp(validity.not_before.timestamp())?,
             not_after: from_timestamp(validity.not_after.timestamp())?,
             serial,
+            attestation,
         })
+    }
+
+    /// What the device proved at its first enrolment, `Unproven` for a
+    /// certificate without the attestation extension.
+    #[must_use]
+    pub const fn attestation(&self) -> AttestationLevel {
+        self.attestation
     }
 
     /// The device the certificate names.

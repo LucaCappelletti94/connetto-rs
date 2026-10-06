@@ -5,17 +5,24 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use connetto_core::device_cert::{
-    CertificateRequest, DeploymentId, DeviceCertificate, DeviceIssuer, KeyId, RootCa,
+    ANDROID_ATTESTATION_CHALLENGE, AttestationLevel, CertificateRequest, DeploymentId,
+    DeviceCertificate, DeviceIssuer, KeyId, RootCa,
 };
 use connetto_core::messages::{
-    ControlMessage, EnrolChallenge, EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused,
-    EnrolRequest,
+    ControlMessage, DeviceAttestation, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
+    EnrolRefusal, EnrolRefused, EnrolRequest,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_server::device_cert::{DeviceCertConfig, DeviceEnrolment, MemoryEnrolments};
+use connetto_server::device_cert::{
+    AndroidStatus, DeviceCertConfig, DeviceEnrolment, MemoryEnrolments, StatusList,
+};
 use connetto_server::{AbuseConfig, LoopbackTransport, RequestGuard, ThrottleConfig, loopback};
 use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID};
-use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
+use rcgen::{
+    BasicConstraints, CertificateParams, CustomExtension, IsCa, Issuer, KeyPair,
+    PKCS_ECDSA_P256_SHA256, PublicKeyData as _,
+};
+use serde_bytes::ByteBuf;
 
 use super::ticket_shared::{
     OkSigner, TicketManager, build_manager_with_guard, do_handshake_anon, do_handshake_with,
@@ -160,6 +167,17 @@ pub(super) async fn enrol(
     lifetime_secs: Option<u64>,
     descriptor: Vec<u8>,
 ) -> ControlMessage {
+    enrol_attested(client, key, nonce, lifetime_secs, descriptor, None).await
+}
+
+pub(super) async fn enrol_attested(
+    client: &mut LoopbackTransport,
+    key: &KeyPair,
+    nonce: [u8; 32],
+    lifetime_secs: Option<u64>,
+    descriptor: Vec<u8>,
+    attestation: Option<DeviceAttestation>,
+) -> ControlMessage {
     ask(
         client,
         ControlMessage::EnrolRequest(EnrolRequest {
@@ -167,6 +185,7 @@ pub(super) async fn enrol(
             csr: CertificateRequest::build(key, &nonce).expect("csr"),
             lifetime_secs,
             descriptor,
+            attestation,
         }),
     )
     .await
@@ -181,6 +200,88 @@ pub(super) fn refused(reason: EnrolRefusal, request_id: &str) -> ControlMessage 
 
 pub(super) fn device_key() -> KeyPair {
     KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key")
+}
+
+/// One DER tag-length-value in the short form the fixtures take.
+fn der_tl(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![
+        tag,
+        u8::try_from(content.len()).expect("the fixture stays short"),
+    ];
+    out.extend_from_slice(content);
+    out
+}
+
+/// A `KeyMint` `KeyDescription` the server parses: the version leads, the
+/// security level is second, the fixed challenge is fifth.
+fn keymint_description(level: u8) -> Vec<u8> {
+    let children = [
+        der_tl(0x02, &[0x00, 0x01, 0xF4]),
+        der_tl(0x0A, &[level]),
+        der_tl(0x04, b""),
+        der_tl(0x30, &[0x01, 0x01, 0xFF]),
+        der_tl(0x04, ANDROID_ATTESTATION_CHALLENGE),
+    ];
+    der_tl(0x30, &children.concat())
+}
+
+/// A chip-proven Android attestation for `key`: the attestation root's DER,
+/// the chain (leaf first), and a clean status list to check it against.
+pub(super) fn chip_attestation(key: &KeyPair) -> (Vec<u8>, Vec<Vec<u8>>, StatusList) {
+    let root_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("attestation root key");
+    let mut root_params =
+        CertificateParams::new(vec!["attestation root".to_owned()]).expect("root params");
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let root_cert = root_params
+        .self_signed(&root_key)
+        .expect("attestation root");
+
+    let intermediate_key =
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("intermediate key");
+    let mut intermediate_params =
+        CertificateParams::new(vec!["attestation intermediate".to_owned()])
+            .expect("intermediate params");
+    intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let root_issuer = Issuer::new(
+        CertificateParams::new(vec!["attestation root".to_owned()]).expect("root params"),
+        &root_key,
+    );
+    let intermediate_cert = intermediate_params
+        .signed_by(&intermediate_key, &root_issuer)
+        .expect("intermediate");
+
+    let mut leaf_params = CertificateParams::new(vec!["device".to_owned()]).expect("leaf params");
+    leaf_params.custom_extensions = vec![CustomExtension::from_oid_content(
+        &[1, 3, 6, 1, 4, 1, 11129, 2, 1, 17],
+        keymint_description(1),
+    )];
+    let intermediate_issuer = Issuer::new(
+        CertificateParams::new(vec!["attestation intermediate".to_owned()])
+            .expect("intermediate params"),
+        &intermediate_key,
+    );
+    let leaf_cert = leaf_params
+        .signed_by(key, &intermediate_issuer)
+        .expect("leaf");
+
+    let file = tempfile::NamedTempFile::new().expect("a status list file");
+    std::fs::write(file.path(), r#"{"entries": {}}"#).expect("a clean status list");
+    let status = StatusList::new(AndroidStatus::File(file.path().to_path_buf()));
+
+    (
+        root_cert.der().to_vec(),
+        vec![
+            leaf_cert.der().to_vec(),
+            intermediate_cert.der().to_vec(),
+            root_cert.der().to_vec(),
+        ],
+        status,
+    )
+}
+
+/// The attestation a chain enrolment sends, the leaf's certificate first.
+pub(super) fn android_evidence(chain: Vec<Vec<u8>>) -> DeviceAttestation {
+    DeviceAttestation::AndroidKeyChain(chain.into_iter().map(ByteBuf::from).collect())
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -392,6 +493,7 @@ async fn a_malformed_request_or_oversized_descriptor_is_refused() {
             csr: b"not a request".to_vec(),
             lifetime_secs: None,
             descriptor: Vec::new(),
+            attestation: None,
         }),
     )
     .await;
@@ -401,4 +503,54 @@ async fn a_malformed_request_or_oversized_descriptor_is_refused() {
     let reply = enrol(&mut client, &device_key(), handed, None, vec![0; 4097]).await;
     assert_eq!(reply, refused(EnrolRefusal::InvalidRequest, "e"));
     assert_eq!(store.records(), Vec::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_renewal_keeps_the_attestation_level_the_first_enrolment_recorded() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (_, issuer) = issuer();
+    let key = device_key();
+    let (root, chain, status) = chip_attestation(&key);
+    let config = DeviceCertConfig::new(issuer)
+        .with_android_roots(vec![root])
+        .with_accepted_attestation([AttestationLevel::ChipProven]);
+    let manager = enrolling_manager(
+        &fixture,
+        Some(DeviceEnrolment::new(config, Arc::clone(&store) as _).with_status_list(status)),
+    )
+    .await;
+    let mut client = connect(&manager, Some("alice")).await;
+
+    // The first enrolment: a chip-proven chain records `chip-proven`.
+    let handed = nonce(&mut client).await;
+    let reply = enrol_attested(
+        &mut client,
+        &key,
+        handed,
+        None,
+        vec![],
+        Some(android_evidence(chain)),
+    )
+    .await;
+    let ControlMessage::EnrolGrant(EnrolGrant {
+        request_id,
+        chain: granted,
+        ..
+    }) = reply
+    else {
+        panic!("expected a grant, got {reply:?}");
+    };
+    assert_eq!(request_id, "e");
+    let leaf = DeviceCertificate::parse(&granted[0]).expect("the leaf meets the profile");
+    assert_eq!(leaf.attestation(), AttestationLevel::ChipProven);
+
+    // A renewal without any attestation keeps the recorded level.
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![]).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain: renewed, .. }) = reply else {
+        panic!("a renewal keeps the stored level, got {reply:?}");
+    };
+    let renewed = DeviceCertificate::parse(&renewed[0]).expect("the renewal meets the profile");
+    assert_eq!(renewed.attestation(), AttestationLevel::ChipProven);
 }

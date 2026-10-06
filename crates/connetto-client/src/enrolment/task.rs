@@ -347,6 +347,9 @@ struct Run<L> {
     /// Whether the local clock puts the held certificate outside its window
     /// (decision 29).
     clock_off: bool,
+    /// Whether the deployment refused the device's attestation level, so it
+    /// asks again only on its next connection (decision 33).
+    attestation_refused: bool,
 }
 
 /// A certificate withdrawn because the root revoked its issuer.
@@ -432,6 +435,22 @@ impl<L: Link> Run<L> {
             built.map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
         })
         .map_err(Failed::Device)?;
+        // The evidence is sent only while the device holds no certificate
+        // (decision 13), computed off the async runtime as the CSR is.
+        let attestation = if self.held.is_some() {
+            None
+        } else {
+            let key = Arc::clone(&key);
+            let csr = csr.clone();
+            tokio::task::spawn_blocking(move || key.attestation(&csr))
+                .await
+                .map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
+                .and_then(|attested| {
+                    attested
+                        .map_err(|err| ClientError::DeviceChip(ChipError::Failed(Box::new(err))))
+                })
+                .map_err(Failed::Device)?
+        };
         let id = request_id();
         let asked = self
             .link
@@ -442,6 +461,7 @@ impl<L: Link> Run<L> {
                     csr,
                     lifetime_secs: lifetime.map(|lifetime| lifetime.as_secs()),
                     descriptor: self.enroller.descriptor.clone(),
+                    attestation,
                 }),
             )
             .await
@@ -482,6 +502,14 @@ impl<L: Link> Run<L> {
             Err(Failed::Refused(EnrolRefusal::Revoked)) => {
                 self.revoked().await;
                 Err(CertificateError::Revoked)
+            }
+            Err(Failed::Refused(EnrolRefusal::AttestationRequired)) if renewal => {
+                // The level cannot change, so the device asks again only on
+                // its next connection, keeping any certificate it holds
+                // (lifecycle row "Refused as attestation required").
+                self.attestation_refused = true;
+                self.link.emit(ClientEvent::AttestationRequired);
+                Err(CertificateError::Refused(EnrolRefusal::AttestationRequired))
             }
             Err(failed) => Err(failed.into()),
         }
@@ -684,6 +712,12 @@ impl<L: Link> Run<L> {
     /// "Wall clock changes, or the hourly look"). The hourly look never
     /// renews a certificate the local clock puts outside its window.
     async fn on_connected(&mut self, by_look: bool) {
+        // A refused level cannot change, so a refused device asks again only
+        // on its next connection, never on the hourly look (lifecycle row
+        // "Refused as attestation required").
+        if self.attestation_refused {
+            return;
+        }
         let outcome = match self.standing(SystemTime::now()) {
             Standing::Fresh => return,
             Standing::ClockOff if by_look => return,
@@ -721,6 +755,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         kept,
         withdrawn: None,
         clock_off: false,
+        attestation_refused: false,
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
@@ -745,6 +780,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             () = run.link.ended() => return,
             event = events.recv() => match event {
                 Ok(ClientEvent::SyncStatus(SyncStatus::Connected)) | Err(RecvError::Lagged(_)) => {
+                    run.attestation_refused = false;
                     due = true;
                 }
                 Ok(ClientEvent::ServerClosed { reason: FatalErrorReason::DeviceRevoked }) => {

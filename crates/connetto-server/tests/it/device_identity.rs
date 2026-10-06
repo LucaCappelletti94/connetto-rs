@@ -3,28 +3,43 @@
 //! A server the builder assembles with device identity enrols a signed-in
 //! device into the deployment's own enrolment tables (R74 step 3).
 
-use connetto_core::device_cert::{CertificateRequest, KeyId};
+use chrono::Utc;
+use connetto_core::device_cert::{AttestationLevel, CertificateRequest, DeviceCertificate, KeyId};
 use connetto_core::messages::{
     ControlMessage, DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
-    EnrolRequest,
+    EnrolRefusal, EnrolRequest,
 };
 use connetto_core::traits::Transport;
 use connetto_server::WebSocketTransport;
-use connetto_server::device_cert::DeviceCertConfig;
+use connetto_server::device_cert::{AndroidStatus, DeviceCertConfig};
 use connetto_test_harness::{Fixture, isolated_session_keyring};
 use diesel::QueryableByName;
+use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl as _};
 use diesel_async::RunQueryDsl as _;
 use rcgen::PublicKeyData as _;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::e2e::{PG_SERIAL, mint_token, reset_fixture};
-use super::enrolment::{device_key, rooted_issuer};
+use super::enrolment::{android_evidence, chip_attestation, device_key, rooted_issuer};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
 
 #[derive(QueryableByName)]
 struct Count {
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     n: i64,
+}
+
+// The deployment's enrolment table as this test reads and seeds it.
+diesel::table! {
+    connetto_device_enrolments (key_id) {
+        key_id -> Binary,
+        user_id -> Text,
+        session_id -> Uuid,
+        enrolled_at -> Timestamptz,
+        last_seen -> Timestamptz,
+        revoked_at -> Nullable<Timestamptz>,
+        attestation -> Text,
+    }
 }
 
 /// The next control frame that is not a pushed revocation list.
@@ -35,6 +50,42 @@ async fn reply(client: &mut WebSocketTransport<TcpStream>) -> ControlMessage {
             other => return other,
         }
     }
+}
+
+/// A fresh enrolment nonce the server hands to the session.
+async fn challenge_nonce(client: &mut WebSocketTransport<TcpStream>) -> [u8; 32] {
+    client
+        .send_control(ControlMessage::EnrolChallengeRequest(
+            EnrolChallengeRequest {
+                request_id: "c".into(),
+            },
+        ))
+        .await
+        .expect("ask for a challenge");
+    let ControlMessage::EnrolChallenge(EnrolChallenge { nonce, .. }) = reply(client).await else {
+        panic!("the server handed no challenge");
+    };
+    nonce
+}
+
+/// Enrol `key` with `attestation` against the challenge `nonce` carries.
+async fn enrol_request(
+    client: &mut WebSocketTransport<TcpStream>,
+    key: &rcgen::KeyPair,
+    nonce: [u8; 32],
+    attestation: Option<connetto_core::messages::DeviceAttestation>,
+) -> ControlMessage {
+    client
+        .send_control(ControlMessage::EnrolRequest(EnrolRequest {
+            request_id: "e".into(),
+            csr: CertificateRequest::build(key, &nonce).expect("csr"),
+            lifetime_secs: None,
+            descriptor: rmp_serde::to_vec_named(&()).expect("encode"),
+            attestation,
+        }))
+        .await
+        .expect("enrol");
+    reply(client).await
 }
 
 #[tokio::test]
@@ -85,6 +136,7 @@ async fn a_built_server_enrols_a_device_into_the_deployment_tables() {
             csr: CertificateRequest::build(&key, &nonce).expect("csr"),
             lifetime_secs: None,
             descriptor: rmp_serde::to_vec_named(&()).expect("encode"),
+            attestation: None,
         }))
         .await
         .expect("enrol");
@@ -139,6 +191,122 @@ async fn a_built_server_enrols_a_device_into_the_deployment_tables() {
         }
         other => panic!("the device list answered {other:?}"),
     }
+    stream.abort();
+    http.abort();
+}
+
+#[tokio::test]
+async fn a_chip_proven_enrolment_records_its_level_and_a_renewal_keeps_it() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    reset_fixture(&pool, &fixture).await;
+    fixture.provision_auth_tables().await;
+    connetto_test_harness::stack::provision_enrolment_tables(&fixture).await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let (builder, _idp, _keys) = builder_over(&fixture, port).await;
+    let (_, _, issuer) = rooted_issuer();
+    let key = device_key();
+    let (root, chain, _) = chip_attestation(&key);
+    let list = tempfile::NamedTempFile::new().expect("a status list file");
+    std::fs::write(list.path(), r#"{"entries": {}}"#).expect("a clean status list");
+    let config = DeviceCertConfig::new(issuer)
+        .with_android_roots(vec![root])
+        .with_android_status(AndroidStatus::File(list.path().to_path_buf()))
+        .with_accepted_attestation([AttestationLevel::ChipProven]);
+    let parts = builder
+        .device_identity(Some(config))
+        .build()
+        .await
+        .expect("the deployment with device identity assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    let base = format!("http://127.0.0.1:{port}");
+    wait_ready(&base).await;
+
+    let (token, user_id) = mint_token(&base).await;
+    let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
+
+    // A key whose stored level the deployment does not accept: renewing it is
+    // refused, no attestation sent to try again.
+    let seeded = device_key();
+    let mut conn = pool.get().await.expect("a connection");
+    diesel::insert_into(connetto_device_enrolments::table)
+        .values((
+            connetto_device_enrolments::key_id.eq(KeyId::of_public_key(
+                &seeded.subject_public_key_info(),
+            )
+            .as_bytes()
+            .to_vec()),
+            connetto_device_enrolments::user_id.eq(&user_id),
+            connetto_device_enrolments::session_id.eq(uuid::Uuid::nil()),
+            connetto_device_enrolments::enrolled_at.eq(Utc::now()),
+            connetto_device_enrolments::last_seen.eq(Utc::now()),
+            connetto_device_enrolments::attestation.eq(AttestationLevel::Unproven.as_str()),
+        ))
+        .execute(&mut conn)
+        .await
+        .expect("seed the stored level");
+    let nonce = challenge_nonce(&mut client).await;
+    let reply = enrol_request(&mut client, &seeded, nonce, None).await;
+    match reply {
+        ControlMessage::EnrolRefused(refused) => {
+            assert_eq!(refused.reason, EnrolRefusal::AttestationRequired);
+        }
+        other => panic!("a stored unproven renewal was answered {other:?}"),
+    }
+
+    // A fresh key that attests nothing: the deployment accepts only
+    // chip-proven keys, so the enrolment is refused.
+    let nonce = challenge_nonce(&mut client).await;
+    let reply = enrol_request(&mut client, &device_key(), nonce, None).await;
+    match reply {
+        ControlMessage::EnrolRefused(refused) => {
+            assert_eq!(refused.reason, EnrolRefusal::AttestationRequired);
+        }
+        other => panic!("an unattested enrolment was answered {other:?}"),
+    }
+
+    // A fresh key with a chip-proven chain: granted, and recorded as
+    // `chip-proven` in the deployment's own table.
+    let nonce = challenge_nonce(&mut client).await;
+    let reply = enrol_request(&mut client, &key, nonce, Some(android_evidence(chain))).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain: granted, .. }) = reply else {
+        panic!("the chip enrolment answered no grant");
+    };
+    let leaf = DeviceCertificate::parse(&granted[0]).expect("the leaf meets the profile");
+    assert_eq!(leaf.attestation(), AttestationLevel::ChipProven);
+    let stored: Option<String> = connetto_device_enrolments::table
+        .select(connetto_device_enrolments::attestation)
+        .filter(connetto_device_enrolments::user_id.eq(&user_id))
+        .filter(
+            connetto_device_enrolments::key_id.eq(KeyId::of_public_key(
+                &key.subject_public_key_info(),
+            )
+            .as_bytes()
+            .to_vec()),
+        )
+        .first(&mut conn)
+        .await
+        .optional()
+        .expect("read the stored level");
+    assert_eq!(stored.as_deref(), Some("chip-proven"));
+
+    // A renewal of the chip key that attests nothing: the recorded level
+    // stands and the enrolment is still granted.
+    let nonce = challenge_nonce(&mut client).await;
+    let reply = enrol_request(&mut client, &key, nonce, None).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain: renewed, .. }) = reply else {
+        panic!("the renewal answered no grant");
+    };
+    let renewed = DeviceCertificate::parse(&renewed[0]).expect("the renewal meets the profile");
+    assert_eq!(renewed.attestation(), AttestationLevel::ChipProven);
+
     stream.abort();
     http.abort();
 }

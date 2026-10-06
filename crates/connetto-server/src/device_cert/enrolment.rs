@@ -6,12 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
-use connetto_core::device_cert::{CertificateRequest, IssueError, KeyId, Revoked};
+use connetto_core::device_cert::{
+    AttestationLevel, CertificateRequest, IssueError, KeyId, Revoked,
+};
 use connetto_core::messages::{DeviceSummary, EnrolGrant, EnrolRefusal, EnrolRequest, SignedList};
 use ring::rand::{SecureRandom as _, SystemRandom};
 use tokio::time::Instant;
 
-use super::DeviceCertConfig;
+use super::{DeviceCertConfig, StatusList, verify};
 
 /// The largest descriptor accepted, in bytes.
 const DESCRIPTOR_LIMIT: usize = 4096;
@@ -35,6 +37,8 @@ pub struct Enrolment<Id> {
     pub session: SessionId,
     /// The application's device descriptor, as sent.
     pub descriptor: Vec<u8>,
+    /// The attestation level the first enrolment recorded, which renewals keep.
+    pub attestation: AttestationLevel,
 }
 
 /// What recording an enrolment found.
@@ -123,6 +127,14 @@ pub trait EnrolmentStore<Id>: Send + Sync + 'static {
     /// The next CRL Number of the issuer `issuer`, above every number handed
     /// out before, across restarts.
     fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64>;
+
+    /// The level the key's first enrolment under `user` recorded, `None`
+    /// when the key has no enrolment under `user`.
+    fn stored_attestation<'a>(
+        &'a self,
+        user: &'a Id,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<AttestationLevel>>;
 }
 
 #[derive(Debug)]
@@ -133,6 +145,7 @@ struct Row<Id> {
     revoked_at: Option<SystemTime>,
     session: SessionId,
     descriptor: Vec<u8>,
+    attestation: AttestationLevel,
 }
 
 #[derive(Debug)]
@@ -199,6 +212,7 @@ impl<Id: Clone + PartialEq + Send + 'static> MemoryEnrolments<Id> {
                     revoked_at: None,
                     session: enrolment.session,
                     descriptor: enrolment.descriptor.clone(),
+                    attestation: enrolment.attestation,
                 },
             );
         }
@@ -280,6 +294,21 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
         let number = *number;
         Box::pin(core::future::ready(Ok(number)))
     }
+
+    fn stored_attestation<'a>(
+        &'a self,
+        user: &'a Id,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
+        let stored = self
+            .state
+            .lock()
+            .rows
+            .get(&key)
+            .filter(|row| row.user == *user)
+            .map(|row| row.attestation);
+        Box::pin(core::future::ready(Ok(stored)))
+    }
 }
 
 /// A nonce handed to a session, spent by the next enrolment request whatever its outcome.
@@ -312,6 +341,8 @@ pub struct DeviceEnrolment<Id> {
     random: SystemRandom,
     lists: tokio::sync::Mutex<Option<Vec<SignedList>>>,
     revoker: Option<SessionRevoker>,
+    /// The attestation status list an Android chain's serials are checked against.
+    status: Option<StatusList>,
     /// The time a certificate is issued at.
     clock: fn() -> SystemTime,
 }
@@ -333,6 +364,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             lists: tokio::sync::Mutex::new(None),
             revoker: None,
             clock: SystemTime::now,
+            status: None,
         }
     }
 
@@ -351,6 +383,14 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
     #[must_use]
     pub fn with_session_revoker(mut self, revoker: SessionRevoker) -> Self {
         self.revoker = Some(revoker);
+        self
+    }
+
+    /// The attestation status list an Android chain's serials are checked
+    /// against, fetched by the task the builder starts.
+    #[must_use]
+    pub fn with_status_list(mut self, list: StatusList) -> Self {
+        self.status = Some(list);
         self
     }
 
@@ -391,6 +431,26 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         if live.is_none() {
             return Err(EnrolRefusal::ChallengeExpired);
         }
+        let key = KeyId::of_public_key(csr.public_key());
+        // The level the first enrolment recorded stands, whatever a renewal sends.
+        let level = match self.store.stored_attestation(user, key).await {
+            Ok(Some(stored)) => stored,
+            Ok(None) => verify(
+                &self.config,
+                self.status.as_ref(),
+                request.attestation.as_ref(),
+                &request.csr,
+                csr.public_key(),
+            )
+            .map_err(|_| EnrolRefusal::InvalidRequest)?,
+            Err(err) => {
+                tracing::warn!(error = %err, "the enrolment table refused the stored level");
+                return Err(EnrolRefusal::IssuerUnavailable);
+            }
+        };
+        if !self.config.accepted_attestation().contains(&level) {
+            return Err(EnrolRefusal::AttestationRequired);
+        }
         let lifetime = self
             .config
             .lifetime_for(request.lifetime_secs.map(Duration::from_secs))
@@ -404,7 +464,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         let not_before = (self.clock)();
         let issuer = self.config.issuer();
         let leaf = issuer
-            .issue(&csr, &user.to_string(), not_before, lifetime, serial)
+            .issue(&csr, &user.to_string(), not_before, lifetime, serial, level)
             .map_err(|err| match err {
                 IssueError::Identity(_) => EnrolRefusal::Unidentified,
                 IssueError::OutlivesIssuer | IssueError::Validity | IssueError::Sign(_) => {
@@ -414,13 +474,14 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             })?;
         let enrolment = Enrolment {
             user: user.clone(),
-            key: KeyId::of_public_key(csr.public_key()),
+            key,
             serial,
             issuer: issuer.key_id(),
             issued_at: not_before,
             expires_at: not_before + lifetime,
             session,
             descriptor: request.descriptor,
+            attestation: level,
         };
         match self.store.record(enrolment).await {
             Ok(Recorded::Granted) => Ok(EnrolGrant {

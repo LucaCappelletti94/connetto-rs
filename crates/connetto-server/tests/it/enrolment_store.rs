@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use connetto_core::SessionId;
-use connetto_core::device_cert::KeyId;
+use connetto_core::device_cert::{AttestationLevel, KeyId};
 use connetto_server::device_cert::{
     Enrolment, EnrolmentStore, Recorded, Revocation, pg_enrolment_store,
 };
@@ -45,7 +45,7 @@ const DDL: [&str; 3] = [
     "CREATE TABLE connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, \
-     name TEXT NOT NULL, model TEXT)",
+     attestation TEXT NOT NULL, name TEXT NOT NULL, model TEXT)",
     "CREATE TABLE connetto_device_certificates (\
      serial BYTEA PRIMARY KEY, \
      key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
@@ -87,6 +87,7 @@ fn enrolment(
     serial: u8,
     issuer: KeyId,
     at: SystemTime,
+    attestation: AttestationLevel,
 ) -> Enrolment<String> {
     Enrolment {
         user: user.to_owned(),
@@ -97,6 +98,7 @@ fn enrolment(
         expires_at: at + HOUR,
         session: session(u128::from(serial)),
         descriptor: phone(&format!("{user} {serial}")),
+        attestation,
     }
 }
 
@@ -117,14 +119,28 @@ async fn a_key_enrols_renews_and_lists_its_typed_descriptor() {
 
     assert_eq!(
         store
-            .record(enrolment("alice", key(1), 1, issuer, first))
+            .record(enrolment(
+                "alice",
+                key(1),
+                1,
+                issuer,
+                first,
+                AttestationLevel::Unproven
+            ))
             .await
             .expect("first"),
         Recorded::Granted
     );
     assert_eq!(
         store
-            .record(enrolment("alice", key(1), 2, issuer, later))
+            .record(enrolment(
+                "alice",
+                key(1),
+                2,
+                issuer,
+                later,
+                AttestationLevel::Unproven
+            ))
             .await
             .expect("renewal"),
         Recorded::Granted
@@ -166,13 +182,27 @@ async fn a_key_held_by_one_account_is_refused_to_another() {
     let store = store(&fixture).await;
     let now = SystemTime::now();
     store
-        .record(enrolment("alice", key(1), 1, key(9), now))
+        .record(enrolment(
+            "alice",
+            key(1),
+            1,
+            key(9),
+            now,
+            AttestationLevel::Unproven,
+        ))
         .await
         .expect("alice");
 
     assert_eq!(
         store
-            .record(enrolment("bob", key(1), 2, key(9), now))
+            .record(enrolment(
+                "bob",
+                key(1),
+                2,
+                key(9),
+                now,
+                AttestationLevel::Unproven
+            ))
             .await
             .expect("bob"),
         Recorded::HeldElsewhere
@@ -200,11 +230,19 @@ async fn a_revoked_key_names_its_session_once_and_never_enrols_again() {
     let fixture = Fixture::acquire().await;
     let store = store(&fixture).await;
     let now = SystemTime::now();
-    let first = enrolment("alice", key(1), 1, key(9), now);
-    let last_session = enrolment("alice", key(1), 2, key(9), now).session;
+    let first = enrolment("alice", key(1), 1, key(9), now, AttestationLevel::Unproven);
+    let last_session =
+        enrolment("alice", key(1), 2, key(9), now, AttestationLevel::Unproven).session;
     store.record(first).await.expect("first");
     store
-        .record(enrolment("alice", key(1), 2, key(9), now))
+        .record(enrolment(
+            "alice",
+            key(1),
+            2,
+            key(9),
+            now,
+            AttestationLevel::Unproven,
+        ))
         .await
         .expect("renewal");
 
@@ -224,7 +262,14 @@ async fn a_revoked_key_names_its_session_once_and_never_enrols_again() {
     );
     assert_eq!(
         store
-            .record(enrolment("alice", key(1), 3, key(9), now))
+            .record(enrolment(
+                "alice",
+                key(1),
+                3,
+                key(9),
+                now,
+                AttestationLevel::Unproven
+            ))
             .await
             .expect("after"),
         Recorded::Revoked
@@ -243,10 +288,17 @@ async fn a_list_names_every_unexpired_serial_of_its_issuer_for_a_revoked_key() {
     let (issuer, other) = (key(9), key(8));
     let long_ago = now - 2 * HOUR;
     for record in [
-        enrolment("alice", key(1), 1, issuer, now),
-        enrolment("alice", key(1), 2, issuer, long_ago),
-        enrolment("alice", key(1), 3, other, now),
-        enrolment("alice", key(2), 4, issuer, now),
+        enrolment("alice", key(1), 1, issuer, now, AttestationLevel::Unproven),
+        enrolment(
+            "alice",
+            key(1),
+            2,
+            issuer,
+            long_ago,
+            AttestationLevel::Unproven,
+        ),
+        enrolment("alice", key(1), 3, other, now, AttestationLevel::Unproven),
+        enrolment("alice", key(2), 4, issuer, now, AttestationLevel::Unproven),
     ] {
         assert_eq!(
             store.record(record).await.expect("record"),
@@ -291,7 +343,14 @@ async fn list_numbers_rise_per_issuer_from_one() {
 async fn a_descriptor_of_another_shape_is_refused_and_recorded_nowhere() {
     let fixture = Fixture::acquire().await;
     let store = store(&fixture).await;
-    let mut record = enrolment("alice", key(1), 1, key(9), SystemTime::now());
+    let mut record = enrolment(
+        "alice",
+        key(1),
+        1,
+        key(9),
+        SystemTime::now(),
+        AttestationLevel::Unproven,
+    );
     record.descriptor = rmp_serde::to_vec_named(&("a tuple", 7_u8)).expect("encode");
 
     assert_eq!(
