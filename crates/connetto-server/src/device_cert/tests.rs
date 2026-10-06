@@ -77,3 +77,42 @@ fn an_issuer_near_its_end_warns_sixty_days_ahead() {
         }))
     );
 }
+
+/// An issuer and the PKCS #8 bytes of its key, so a render is checked
+/// against the secret.
+fn issuer_and_secret(valid_for: Duration) -> (DeviceIssuer, Vec<u8>) {
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(7)),
+        start(),
+        3650 * DAY,
+    )
+    .expect("root");
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let secret = key.serialize_der();
+    let cert = root
+        .sign_issuer(&key.subject_public_key_info(), start(), valid_for, [1; 16])
+        .expect("issuer");
+    let issuer = DeviceIssuer::new(cert, key, root.certificate()).expect("load");
+    (issuer, secret)
+}
+
+/// The issuer's key rides in logs through any `Debug` render, so the render
+/// carries neither the PKCS #8 bytes nor their hex.
+#[test]
+fn a_debug_render_carries_no_private_key() {
+    let (issuer, secret) = issuer_and_secret(395 * DAY);
+    let (retired, retired_secret) = issuer_and_secret(395 * DAY);
+    let config = DeviceCertConfig::new(issuer).with_retired_issuer(retired);
+    let debug = format!("{config:?}");
+    for secret in [secret, retired_secret] {
+        let hex = format!("{secret:x?}");
+        assert!(!debug.contains(&hex), "the render carries the key's hex");
+        assert!(
+            !debug
+                .as_bytes()
+                .windows(secret.len())
+                .any(|window| window == secret.as_slice()),
+            "the render carries the key's bytes"
+        );
+    }
+}

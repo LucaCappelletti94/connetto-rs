@@ -23,8 +23,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use super::task::next_look;
 use super::{
-    Answer, CERTIFICATE_DDL, DeviceKeys, Enroller, Held, Intake, KeptList, Link, ListInbox,
-    Standing, TOLERANCE, delete, intake, load, run, store,
+    Answer, CERTIFICATE_DDL, CertificateError, DeviceKeys, Enroller, Held, Intake, KeptList, Link,
+    ListInbox, Standing, TOLERANCE, delete, intake, load, run, store,
 };
 use crate::ClientError;
 use crate::ClientEvent;
@@ -368,6 +368,21 @@ struct FakeState {
     serials: u64,
 }
 
+/// How the fake link drives one enrolment.
+#[derive(Clone, Copy)]
+enum Ask {
+    /// Grant the enrolment.
+    Grant,
+    /// Refuse the enrolment with this reason.
+    Refused(EnrolRefusal),
+    /// The enrolment goes out and no answer comes.
+    Silent,
+    /// The message is lost on the wire.
+    Lost,
+    /// The transport reports a protocol violation.
+    Violated,
+}
+
 /// A link the run drives, answering enrolment as configured and recording
 /// what it sees.
 struct FakeLink {
@@ -376,7 +391,7 @@ struct FakeLink {
     end: watch::Receiver<()>,
     issuer: Arc<DeviceIssuer>,
     certificate: Vec<u8>,
-    grant: bool,
+    ask: Ask,
 }
 
 impl Link for FakeLink {
@@ -411,43 +426,55 @@ impl Link for FakeLink {
         let state = Arc::clone(&self.state);
         let issuer = Arc::clone(&self.issuer);
         let certificate = self.certificate.clone();
-        let grant = self.grant;
+        let ask = self.ask;
         Box::pin(async move {
-            let (tx, rx) = oneshot::channel();
-            match msg {
-                ControlMessage::EnrolChallengeRequest(_) => {
+            match (ask, msg) {
+                (Ask::Lost, _) => Err(ClientError::NotConnected),
+                (Ask::Violated, _) => Err(ClientError::Protocol("the fake transport fails".into())),
+                (_, ControlMessage::EnrolChallengeRequest(_)) => {
+                    let (tx, rx) = oneshot::channel();
                     let _ = tx.send(Answer::Challenge([7; 32]));
+                    Ok(rx)
                 }
-                ControlMessage::EnrolRequest(request) => {
+                (_, ControlMessage::EnrolRequest(request)) => {
+                    let (tx, rx) = oneshot::channel();
                     let mut state = state.lock();
                     state.requests.push(request.attestation);
-                    let answer = if grant {
-                        let request =
-                            CertificateRequest::parse(&request.csr).expect("the csr parses");
-                        let mut serial = [0u8; 16];
-                        serial[..8].copy_from_slice(&state.serials.to_be_bytes());
-                        state.serials += 1;
-                        let leaf = issuer
-                            .issue(
-                                &request,
-                                "alice",
-                                SystemTime::now(),
-                                12 * HOUR,
-                                serial,
-                                AttestationLevel::Unproven,
-                            )
-                            .expect("the grant issues");
-                        Answer::Grant(vec![leaf, certificate], Vec::new())
-                    } else {
-                        Answer::Refused(EnrolRefusal::AttestationRequired)
+                    let answer = match ask {
+                        Ask::Refused(refusal) => Answer::Refused(refusal),
+                        Ask::Silent => {
+                            // The request went out and no answer comes.
+                            drop(tx);
+                            return Ok(rx);
+                        }
+                        _ => {
+                            let request =
+                                CertificateRequest::parse(&request.csr).expect("the csr parses");
+                            let mut serial = [0u8; 16];
+                            serial[..8].copy_from_slice(&state.serials.to_be_bytes());
+                            state.serials += 1;
+                            let leaf = issuer
+                                .issue(
+                                    &request,
+                                    "alice",
+                                    SystemTime::now(),
+                                    12 * HOUR,
+                                    serial,
+                                    AttestationLevel::Unproven,
+                                )
+                                .expect("the grant issues");
+                            Answer::Grant(vec![leaf, certificate], Vec::new())
+                        }
                     };
                     let _ = tx.send(answer);
+                    Ok(rx)
                 }
                 _ => {
+                    let (tx, rx) = oneshot::channel();
                     let _ = tx.send(Answer::Refused(EnrolRefusal::InvalidRequest));
+                    Ok(rx)
                 }
             }
-            Ok(rx)
         })
     }
 
@@ -585,7 +612,7 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         end: end_rx,
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
-        grant: false,
+        ask: Ask::Refused(EnrolRefusal::AttestationRequired),
     };
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -662,7 +689,7 @@ async fn a_renewal_sends_no_attestation() {
         end: end_rx,
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
-        grant: true,
+        ask: Ask::Grant,
     };
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -689,6 +716,268 @@ async fn a_renewal_sends_no_attestation() {
             "the renewal replaces the certificate"
         );
     }
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A reissue refused as revoked deletes the device's key, says so, and the
+/// caller gets the revocation.
+#[tokio::test]
+async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Refused(EnrolRefusal::Revoked),
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| !state.lock().requests.is_empty()).await;
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(outcome, Err(CertificateError::Revoked)),
+        "the caller gets the revocation"
+    );
+    {
+        let state = state.lock();
+        assert!(
+            state
+                .emitted
+                .iter()
+                .any(|event| matches!(event, ClientEvent::DeviceRevoked)),
+            "the device says its key went"
+        );
+        assert!(state.stored.is_empty(), "a revoked device stores nothing");
+    }
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A reissue refused over the ceiling keeps the ceiling the server named, so
+/// the caller can shorten its request.
+#[tokio::test]
+async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Refused(EnrolRefusal::OverCeiling { ceiling_secs: 600 }),
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| state.lock().requests.len() >= 2).await;
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(CertificateError::OverCeiling { ceiling })
+                if ceiling == Duration::from_secs(600)
+        ),
+        "the caller gets the ceiling the server named"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A reissue refused for any other reason keeps that reason, so the caller
+/// knows what to act on.
+#[tokio::test]
+async fn a_reissue_refused_for_another_reason_reports_that_reason() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Refused(EnrolRefusal::ChallengeExpired),
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| !state.lock().requests.is_empty()).await;
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(CertificateError::Refused(EnrolRefusal::ChallengeExpired))
+        ),
+        "the refusal keeps its reason"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A reissue the server never answers is offline, so the caller learns there
+/// is no server and asks again when there is.
+#[tokio::test]
+async fn a_reissue_with_no_answer_is_offline() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Silent,
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| !state.lock().requests.is_empty()).await;
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(outcome, Err(CertificateError::Offline)),
+        "no answer reads as no server"
+    );
+    assert_eq!(
+        state.lock().requests.len(),
+        2,
+        "the request went out once per enrolment"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A reissue lost on the wire is offline, the same read as a server that
+/// never answers.
+#[tokio::test]
+async fn a_reissue_lost_on_the_wire_is_offline() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(outcome, Err(CertificateError::Offline)),
+        "a lost message reads as no server"
+    );
+    assert!(
+        state.lock().requests.is_empty(),
+        "nothing reached the server"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A reissue the transport reports as a protocol violation keeps its device
+/// kind, so the caller acts on the device and not the server.
+#[tokio::test]
+async fn a_reissue_violating_the_protocol_is_a_device_error() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Violated,
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root],
+        None,
+        Vec::new(),
+        inbox(),
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    let outcome = handle.reissue(HOUR).await;
+    assert!(
+        matches!(
+            outcome,
+            Err(CertificateError::Device(ClientError::Protocol(_)))
+        ),
+        "a device failure keeps its device kind"
+    );
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");

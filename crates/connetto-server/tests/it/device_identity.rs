@@ -396,3 +396,67 @@ async fn the_binary_turns_device_identity_on_from_the_issuer_directory() {
         "{stderr}"
     );
 }
+
+/// A device setting the binary cannot use refuses boot naming the setting it
+/// choked on, every refusal before the server binds.
+#[tokio::test]
+async fn the_binary_refuses_unusable_device_settings() {
+    use super::e2e::{build_auth_stack, run_server_exit_output, with_user_url};
+
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let url = fixture.admin_url().to_owned();
+    let reader_url = with_user_url(&url, "app_reader", "app_reader");
+    let auth_stack = build_auth_stack().await;
+    let auth_env = auth_stack.env_pairs("http://127.0.0.1:0");
+    let base: Vec<(&str, &str)> = auth_env
+        .iter()
+        .map(|(key, value)| (key.as_str(), value.as_str()))
+        .collect();
+    let ca = tempfile::TempDir::new().expect("ca dir");
+    let (root, issuer_dir) = ca_output(ca.path());
+    let (root, issuer_dir) = (root.display().to_string(), issuer_dir.display().to_string());
+    let missing = |name: &str| ca.path().join(name).display().to_string();
+    let retired_dir = missing("no-such-issuer");
+    let root_list = missing("no-such-list");
+    let cases: Vec<(Vec<(&str, &str)>, &str)> = vec![
+        (
+            vec![("CONNETTO_DEVICE_ACCEPTED_ATTESTATION", "chip-proven,bogus")],
+            "CONNETTO_DEVICE_ACCEPTED_ATTESTATION names \"bogus\"",
+        ),
+        (
+            vec![
+                ("CONNETTO_DEVICE_APP_ATTEST_APP_IDS", "TEAMID.bundle.id"),
+                ("CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT", "staging"),
+            ],
+            "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT is \"staging\"",
+        ),
+        (
+            vec![("CONNETTO_DEVICE_CERT_CEILING_SECS", "soon")],
+            "parsing CONNETTO_DEVICE_CERT_CEILING_SECS",
+        ),
+        (
+            vec![("CONNETTO_DEVICE_RETIRED_ISSUER_DIRS", &retired_dir)],
+            "reading the issuer certificate",
+        ),
+        (
+            vec![("CONNETTO_DEVICE_ROOT_LIST", &root_list)],
+            "reading the root's list",
+        ),
+    ];
+
+    for (extra, expected) in cases {
+        let mut envs = base.clone();
+        envs.push(("CONNETTO_DEVICE_ROOT", root.as_str()));
+        envs.push(("CONNETTO_DEVICE_ISSUER_DIR", issuer_dir.as_str()));
+        envs.extend(extra);
+        let output = run_server_exit_output(&url, Some(&reader_url), &envs).await;
+        assert!(!output.status.success(), "{expected} refuses");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(expected),
+            "the refusal names the setting, got: {stderr}"
+        );
+    }
+}

@@ -794,8 +794,8 @@ mod tests {
     use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
     use super::{
-        AndroidStatus, AppAttestEnvironment, SerialStatus, StatusCache, StatusList, serial_hex,
-        verify,
+        AndroidStatus, AppAttestEnvironment, SerialCheck, SerialStatus, StatusCache, StatusList,
+        serial_hex, verify,
     };
 
     type Config = super::super::DeviceCertConfig;
@@ -1153,6 +1153,55 @@ mod tests {
         );
     }
 
+    /// A chain with no key description at all, leaf first.
+    fn chain_without_description(root: &Ca, leaf: &KeyPair) -> Vec<Vec<u8>> {
+        let intermediate = ca("intermediate", Some(root));
+        let params = CertificateParams::new(vec!["leaf".to_owned()]).expect("params");
+        let issuer = Issuer::new(
+            CertificateParams::new(vec!["intermediate".to_owned()]).expect("params"),
+            &intermediate.key,
+        );
+        let leaf_cert = params.signed_by(leaf, &issuer).expect("leaf");
+        vec![
+            leaf_cert.der().to_vec(),
+            intermediate.cert,
+            root.cert.clone(),
+        ]
+    }
+
+    #[test]
+    fn an_unparseable_chain_proves_nothing() {
+        let (config, _chain, leaf) = android_setup(1, Layout::Keymint);
+        let chain = vec![b"not a certificate".to_vec(), b"still not".to_vec()];
+        let level = android(&config, Some(&clean()), chain, &csr(&leaf));
+        assert_eq!(level, AttestationLevel::Unproven);
+    }
+
+    #[test]
+    fn a_chain_without_a_key_description_proves_nothing() {
+        let root = ca("attestation root", None);
+        let config = Config::new(issuer()).with_android_roots(vec![root.cert.clone()]);
+        let leaf = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("leaf key");
+        let chain = chain_without_description(&root, &leaf);
+        let level = android(&config, Some(&clean()), chain, &csr(&leaf));
+        assert_eq!(level, AttestationLevel::Unproven);
+    }
+
+    #[test]
+    fn an_unknown_security_level_proves_nothing() {
+        let (config, chain, leaf) = android_setup(3, Layout::Keymint);
+        let level = android(&config, Some(&clean()), chain, &csr(&leaf));
+        assert_eq!(level, AttestationLevel::Unproven);
+    }
+
+    #[test]
+    fn a_one_certificate_chain_proves_nothing() {
+        let (config, mut chain, leaf) = android_setup(1, Layout::Keymint);
+        chain.truncate(1);
+        let level = android(&config, Some(&clean()), chain, &csr(&leaf));
+        assert_eq!(level, AttestationLevel::Unproven);
+    }
+
     /// One App Attest object and its key, over `root`.
     fn apple(
         root: &Ca,
@@ -1223,6 +1272,114 @@ mod tests {
                 environment,
             );
         (config, root)
+    }
+
+    /// An attestation object with the given `fmt`, `x5c` and `authData`, the
+    /// field absent where its part is `None`.
+    fn object(
+        fmt: ciborium::Value,
+        x5c: Option<ciborium::Value>,
+        auth_data: Option<ciborium::Value>,
+    ) -> ciborium::Value {
+        let mut statement = Vec::new();
+        if let Some(x5c) = x5c {
+            statement.push((ciborium::Value::Text("x5c".to_owned()), x5c));
+        }
+        if let Some(auth_data) = auth_data {
+            statement.push((ciborium::Value::Text("authData".to_owned()), auth_data));
+        }
+        ciborium::Value::Map(vec![
+            (ciborium::Value::Text("fmt".to_owned()), fmt),
+            (
+                ciborium::Value::Text("attStmt".to_owned()),
+                ciborium::Value::Map(statement),
+            ),
+        ])
+    }
+
+    /// The object's bytes, CBOR.
+    fn encode(object: &ciborium::Value) -> Vec<u8> {
+        let mut cbor = Vec::new();
+        ciborium::ser::into_writer(&object, &mut cbor).expect("cbor");
+        cbor
+    }
+
+    /// A valid object's `x5c` and `authData`, decoded.
+    fn parts(attestation: &[u8]) -> (ciborium::Value, ciborium::Value) {
+        let decoded: ciborium::Value = ciborium::de::from_reader(attestation).expect("cbor");
+        let statement = super::object_field(&decoded, "attStmt").expect("attStmt");
+        (
+            super::object_field(statement, "x5c").expect("x5c").clone(),
+            super::object_field(statement, "authData")
+                .expect("authData")
+                .clone(),
+        )
+    }
+
+    /// The `x5c` chain's certificates, credential first.
+    fn certificates(x5c: &ciborium::Value) -> Vec<Vec<u8>> {
+        let ciborium::Value::Array(entries) = x5c else {
+            panic!("the fixture's x5c is an array")
+        };
+        entries
+            .iter()
+            .map(|entry| match entry {
+                ciborium::Value::Bytes(bytes) => bytes.clone(),
+                _ => panic!("the fixture's x5c is byte strings"),
+            })
+            .collect()
+    }
+
+    /// The authenticator data with `app_id`'s hash, `counter`, `aaguid` and
+    /// `credential_id`, the key's own hash where the last is `None`.
+    fn auth_data(
+        app_id: &str,
+        counter: u32,
+        aaguid: [u8; 16],
+        credential_id: Option<Vec<u8>>,
+        key: &KeyPair,
+    ) -> Vec<u8> {
+        [
+            super::sha256(app_id.as_bytes()),
+            counter.to_be_bytes().to_vec(),
+            aaguid.to_vec(),
+            32u16.to_be_bytes().to_vec(),
+            credential_id.unwrap_or_else(|| super::sha256(key.public_key_raw())),
+            vec![7u8; 77],
+        ]
+        .concat()
+    }
+
+    /// One App Attest object over `root` carrying `auth_data` as-is, the
+    /// credential certificate's nonce matching it.
+    fn apple_auth_data(
+        root: &Ca,
+        auth_data: Vec<u8>,
+        key: &KeyPair,
+        key_id: Vec<u8>,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        let intermediate = ca("intermediate", Some(root));
+        let csr = csr(key);
+        let nonce = super::sha256_concat(&auth_data, &super::sha256(&csr));
+        let mut params = CertificateParams::new(vec!["credential".to_owned()]).expect("params");
+        params.custom_extensions = vec![CustomExtension::from_oid_content(
+            super::NONCE,
+            der_tl(0x30, &der_tl(0x04, &nonce)),
+        )];
+        let issuer = Issuer::new(
+            CertificateParams::new(vec!["intermediate".to_owned()]).expect("params"),
+            &intermediate.key,
+        );
+        let cred_cert = params.signed_by(key, &issuer).expect("credential");
+        let object = object(
+            ciborium::Value::Text("apple-appattest".to_owned()),
+            Some(ciborium::Value::Array(vec![
+                ciborium::Value::Bytes(cred_cert.der().to_vec()),
+                ciborium::Value::Bytes(intermediate.cert),
+            ])),
+            Some(ciborium::Value::Bytes(auth_data)),
+        );
+        (encode(&object), key_id, csr)
     }
 
     #[test]
@@ -1453,5 +1610,407 @@ mod tests {
             .is_err(),
             "a wrong fmt"
         );
+    }
+
+    #[test]
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one broken object per refusal reason, each asserted on its own"
+    )]
+    fn a_mangled_app_attestation_object_is_a_refusal() {
+        let (config, root) = apple_setup(&["TEAMID.bundle.id"], AppAttestEnvironment::Production);
+        let (valid, key_id, req) = apple(
+            &root,
+            "TEAMID.bundle.id",
+            0,
+            AppAttestEnvironment::Production.aaguid(),
+            None,
+            None,
+        );
+        let (x5c, auth_data) = parts(&valid);
+        let certs = certificates(&x5c);
+        assert_eq!(certs.len(), 2, "the fixture's x5c carries two certificates");
+        let (cred, intermediate) = (certs[0].clone(), certs[1].clone());
+        let fmt = ciborium::Value::Text("apple-appattest".to_owned());
+        let refuse = |name: &str, attestation: Vec<u8>| {
+            assert!(
+                verify(
+                    &config,
+                    None,
+                    Some(&DeviceAttestation::AppleAppAttest {
+                        key_id: key_id.clone(),
+                        attestation
+                    }),
+                    &req,
+                    &[]
+                )
+                .is_err(),
+                "{name}"
+            );
+        };
+        // A `fmt` that is not a text.
+        refuse(
+            "a fmt that is not a text",
+            encode(&object(
+                ciborium::Value::Integer(ciborium::value::Integer::from(1u64)),
+                Some(x5c.clone()),
+                Some(auth_data.clone()),
+            )),
+        );
+        // No `attStmt` at all.
+        refuse(
+            "no attStmt",
+            encode(&ciborium::Value::Map(vec![(
+                ciborium::Value::Text("fmt".to_owned()),
+                fmt.clone(),
+            )])),
+        );
+        // No `x5c`.
+        refuse(
+            "no x5c",
+            encode(&object(fmt.clone(), None, Some(auth_data.clone()))),
+        );
+        // No `authData`.
+        refuse(
+            "no authData",
+            encode(&object(fmt.clone(), Some(x5c.clone()), None)),
+        );
+        // A credential certificate that does not parse.
+        refuse(
+            "an unparseable credential certificate",
+            encode(&object(
+                fmt.clone(),
+                Some(ciborium::Value::Array(vec![
+                    ciborium::Value::Bytes(b"not a certificate".to_vec()),
+                    ciborium::Value::Bytes(intermediate.clone()),
+                ])),
+                Some(auth_data.clone()),
+            )),
+        );
+        // An empty `x5c`.
+        refuse(
+            "an empty x5c",
+            encode(&object(
+                fmt.clone(),
+                Some(ciborium::Value::Array(Vec::new())),
+                Some(auth_data.clone()),
+            )),
+        );
+        // An intermediate the next certificate did not sign.
+        let foreign = ca("a different apple root", None);
+        refuse(
+            "an intermediate the next certificate did not sign",
+            encode(&object(
+                fmt,
+                Some(ciborium::Value::Array(vec![
+                    ciborium::Value::Bytes(cred),
+                    ciborium::Value::Bytes(intermediate),
+                    ciborium::Value::Bytes(foreign.cert),
+                ])),
+                Some(auth_data),
+            )),
+        );
+        // A configured Apple root that does not parse.
+        let (valid, key_id, req) = apple(
+            &root,
+            "TEAMID.bundle.id",
+            0,
+            AppAttestEnvironment::Production.aaguid(),
+            None,
+            None,
+        );
+        let config = Config::new(issuer()).with_apple_root(b"not a root".to_vec());
+        assert!(
+            verify(
+                &config,
+                None,
+                Some(&DeviceAttestation::AppleAppAttest {
+                    key_id,
+                    attestation: valid
+                }),
+                &req,
+                &[]
+            )
+            .is_err(),
+            "a root that does not parse"
+        );
+    }
+
+    #[test]
+    fn a_mismatched_app_attest_auth_data_is_a_refusal() {
+        let (config, root) = apple_setup(&["TEAMID.bundle.id"], AppAttestEnvironment::Production);
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("credential key");
+        let key_id = super::sha256(key.public_key_raw());
+        let refuse = |name: &str, attestation: Vec<u8>, key_id: Vec<u8>, csr: Vec<u8>| {
+            assert!(
+                verify(
+                    &config,
+                    None,
+                    Some(&DeviceAttestation::AppleAppAttest {
+                        key_id,
+                        attestation
+                    }),
+                    &csr,
+                    &[]
+                )
+                .is_err(),
+                "{name}"
+            );
+        };
+        // An `authData` too short to carry its fields.
+        let (attestation, attested_key_id, csr) =
+            apple_auth_data(&root, vec![7u8; 100], &key, key_id.clone());
+        refuse(
+            "an authData too short to carry its fields",
+            attestation,
+            attested_key_id,
+            csr,
+        );
+        // A credential id that is not the key's hash.
+        let (attestation, attested_key_id, csr) = apple_auth_data(
+            &root,
+            auth_data(
+                "TEAMID.bundle.id",
+                0,
+                AppAttestEnvironment::Production.aaguid(),
+                Some(vec![3u8; 32]),
+                &key,
+            ),
+            &key,
+            key_id.clone(),
+        );
+        refuse(
+            "a credential id that is not the key's hash",
+            attestation,
+            attested_key_id,
+            csr,
+        );
+
+        // A credential id length the layout does not carry.
+        let mut auth = auth_data(
+            "TEAMID.bundle.id",
+            0,
+            AppAttestEnvironment::Production.aaguid(),
+            None,
+            &key,
+        );
+        auth[52..54].copy_from_slice(&16u16.to_be_bytes());
+        let (attestation, attested_key_id, csr) =
+            apple_auth_data(&root, auth, &key, key_id.clone());
+        refuse(
+            "a credential id length the layout does not carry",
+            attestation,
+            attested_key_id,
+            csr,
+        );
+        // An `aaguid` no environment claims.
+        let (attestation, attested_key_id, csr) = apple_auth_data(
+            &root,
+            auth_data("TEAMID.bundle.id", 0, [7u8; 16], None, &key),
+            &key,
+            key_id,
+        );
+        refuse(
+            "an aaguid no environment claims",
+            attestation,
+            attested_key_id,
+            csr,
+        );
+    }
+
+    /// The header map one refresh-period case answers with.
+    fn with_cache_control(value: &str) -> reqwest::header::HeaderMap {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::CACHE_CONTROL,
+            value.parse().expect("a cache-control value"),
+        );
+        headers
+    }
+
+    /// The refresh period one status list source answers, fifteen minutes.
+    #[expect(
+        clippy::duration_suboptimal_units,
+        reason = "the larger-unit `Duration` constructors are not yet stable"
+    )]
+    const REFRESH_PERIOD: Duration = Duration::from_secs(900);
+    /// The period Google's live header answers, one day.
+    #[expect(
+        clippy::duration_suboptimal_units,
+        reason = "the larger-unit `Duration` constructors are not yet stable"
+    )]
+    const ONE_DAY: Duration = Duration::from_secs(86_400);
+
+    #[test]
+    fn the_refresh_period_reads_max_age_from_cache_control() {
+        assert_eq!(
+            super::max_age(&with_cache_control("max-age=900")),
+            REFRESH_PERIOD
+        );
+        assert_eq!(
+            super::max_age(&with_cache_control("public, max-age=86400")),
+            ONE_DAY,
+            "Google's live header"
+        );
+        assert_eq!(
+            super::max_age(&with_cache_control("public,max-age=120")),
+            Duration::from_secs(120),
+            "a max-age after other directives"
+        );
+        assert_eq!(
+            super::max_age(&with_cache_control("no-store")),
+            super::REFRESH_DEFAULT,
+            "directives without a max-age take the default"
+        );
+        assert_eq!(
+            super::max_age(&with_cache_control("max-age=soon")),
+            super::REFRESH_DEFAULT,
+            "an unparsable age takes the default"
+        );
+        assert_eq!(
+            super::max_age(&reqwest::header::HeaderMap::new()),
+            super::REFRESH_DEFAULT,
+            "no header takes the default"
+        );
+    }
+
+    /// The answer one status list source case serves.
+    async fn source_answer(
+        axum::extract::State(body): axum::extract::State<
+            std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+        >,
+    ) -> axum::response::Response {
+        match body.lock().clone() {
+            Some(body) => axum::response::Response::builder()
+                .status(axum::http::StatusCode::OK)
+                .header(axum::http::header::CACHE_CONTROL, "max-age=900")
+                .body(axum::body::Body::from(body))
+                .expect("a response"),
+            None => axum::response::Response::builder()
+                .status(axum::http::StatusCode::INTERNAL_SERVER_ERROR)
+                .body(axum::body::Body::from("not a status list"))
+                .expect("a response"),
+        }
+    }
+
+    /// A local source for the status list, its good body swappable to a
+    /// failure.
+    struct Source {
+        url: String,
+        body: std::sync::Arc<parking_lot::Mutex<Option<String>>>,
+        #[expect(
+            dead_code,
+            reason = "the handle is never read, and it is dropped last, keeping the source serving"
+        )]
+        serve: tokio::task::JoinHandle<()>,
+    }
+
+    /// The source on a local socket serving `body`, revoked serial `65`.
+    async fn status_source(body: String) -> Source {
+        let store = std::sync::Arc::new(parking_lot::Mutex::new(Some(body)));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let url = format!(
+            "http://{}/status",
+            listener.local_addr().expect("an address")
+        );
+        let router = axum::Router::new()
+            .route("/status", axum::routing::get(source_answer))
+            .with_state(store.clone());
+        let serve = tokio::spawn(async move {
+            axum::serve(listener, router).await.expect("serve");
+        });
+        Source {
+            url,
+            body: store,
+            serve,
+        }
+    }
+
+    const REVOKED: &str = r#"{"entries": {"65": {"status": "REVOKED"}}}"#;
+
+    #[tokio::test]
+    async fn a_fetched_status_list_answers_its_revoked_serials() {
+        let source = status_source(REVOKED.to_owned()).await;
+        let list = StatusList::new(AndroidStatus::Url(source.url));
+        assert_eq!(
+            list.fetch().await,
+            REFRESH_PERIOD,
+            "the next refresh waits the response's max-age"
+        );
+        assert_eq!(
+            list.serial(&[0x65]),
+            SerialCheck::Bad(SerialStatus::Revoked)
+        );
+        assert_eq!(list.serial(&[0x66]), SerialCheck::Clean);
+    }
+
+    #[tokio::test]
+    async fn a_failed_refetch_keeps_the_last_good_copy() {
+        let source = status_source(REVOKED.to_owned()).await;
+        let list = StatusList::new(AndroidStatus::Url(source.url));
+        assert_eq!(list.fetch().await, REFRESH_PERIOD);
+        *source.body.lock() = None;
+        assert_eq!(
+            list.fetch().await,
+            REFRESH_PERIOD,
+            "a failed refetch keeps the last period"
+        );
+        assert_eq!(
+            list.serial(&[0x65]),
+            SerialCheck::Bad(SerialStatus::Revoked),
+            "the last good copy still answers"
+        );
+        assert_eq!(list.serial(&[0x66]), SerialCheck::Clean);
+    }
+
+    #[test]
+    fn a_missing_status_file_answers_no_copy() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let list = StatusList::new(AndroidStatus::File(dir.path().join("status.json")));
+        assert_eq!(list.serial(&[0x65]), SerialCheck::NoCopy);
+    }
+
+    #[test]
+    fn a_local_status_file_answers_its_serials() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, REVOKED).expect("write the status file");
+        let list = StatusList::new(AndroidStatus::File(path));
+        assert_eq!(
+            list.serial(&[0x65]),
+            SerialCheck::Bad(SerialStatus::Revoked),
+            "the file loads at construction, no fetch in flight"
+        );
+        assert_eq!(list.serial(&[0x66]), SerialCheck::Clean);
+    }
+
+    #[tokio::test]
+    async fn the_spawned_fetcher_refetches_the_source_at_startup() {
+        let dir = tempfile::tempdir().expect("a directory");
+        let path = dir.path().join("status.json");
+        std::fs::write(&path, REVOKED).expect("write the status file");
+        let list = StatusList::new(AndroidStatus::File(path.clone()));
+        assert_eq!(
+            list.serial(&[0x65]),
+            SerialCheck::Bad(SerialStatus::Revoked)
+        );
+        // The deployment's list revokes a different serial.
+        std::fs::write(&path, r#"{"entries": {"66": {"status": "REVOKED"}}}"#)
+            .expect("rewrite the status file");
+        let handle = list.spawn();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if list.serial(&[0x66]) == SerialCheck::Bad(SerialStatus::Revoked) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the fetcher never refetched the source"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        handle.abort();
     }
 }
