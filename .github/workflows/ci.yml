@@ -709,6 +709,7 @@ jobs:
               -p connetto-file-core
               -p connetto-file-server
               -p connetto-file-client
+              -p connetto-peer
             bins: ''
     steps:
       - uses: actions/checkout@v7
