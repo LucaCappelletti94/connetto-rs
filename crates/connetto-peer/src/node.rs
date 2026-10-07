@@ -475,7 +475,9 @@ pub(crate) fn client_config_for(
 ) -> Arc<ClientConfig> {
     let verifier = verifier_for(trust, clock, own_key, crls);
     Arc::new(
-        ClientConfig::builder_with_protocol_versions(&[&version::TLS13])
+        ClientConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&version::TLS13])
+            .expect("ring speaks TLS 1.3")
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
             .with_client_cert_resolver(Arc::new(IdentityClientCert::new(
@@ -496,13 +498,21 @@ pub(crate) fn server_config_for(
 ) -> Arc<ServerConfig> {
     let verifier = verifier_for(trust, clock, own_key, crls);
     Arc::new(
-        ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
+        ServerConfig::builder_with_provider(ring_provider())
+            .with_protocol_versions(&[&version::TLS13])
+            .expect("ring speaks TLS 1.3")
             .with_client_cert_verifier(Arc::new(verifier))
             .with_cert_resolver(Arc::new(IdentityServerCert::new(
                 presented(identity),
                 Arc::clone(&identity.key),
             ))),
     )
+}
+
+/// The ring provider, named outright so a build that also enables another
+/// rustls provider never leaves the choice to the process default.
+fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
 }
 
 /// The verifier a standalone config carries, on its own key and CRL lock.
