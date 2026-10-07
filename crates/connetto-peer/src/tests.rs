@@ -386,8 +386,7 @@ async fn raw_peer_connect(
         .into()
 }
 
-// --- Proof 1 ---
-
+/// Proof 1.
 #[tokio::test]
 async fn two_nodes_link_and_a_kept_list_reaches_the_other() {
     let now = whole_second();
@@ -447,8 +446,7 @@ async fn two_nodes_link_and_a_kept_list_reaches_the_other() {
     b.stop(CloseReason::Closed);
 }
 
-// --- Proof 2 ---
-
+/// Proof 2.
 #[tokio::test]
 async fn a_foreign_root_is_refused_both_directions() {
     let now = whole_second();
@@ -513,8 +511,7 @@ async fn a_foreign_root_is_refused_both_directions() {
     dialer.stop(CloseReason::Closed);
 }
 
-// --- Proof 3, R74 proof 4 ---
-
+/// Proof 3, R74 proof 4.
 #[tokio::test]
 async fn a_root_list_revoking_an_issuer_closes_and_refuses() {
     let now = whole_second();
@@ -624,8 +621,7 @@ async fn a_root_list_revoking_an_issuer_closes_and_refuses() {
     b.stop(CloseReason::Closed);
 }
 
-// --- Proof 4 ---
-
+/// Proof 4.
 #[tokio::test]
 async fn a_leaf_list_closes_its_link_and_forwards_to_a_third() {
     let now = whole_second();
@@ -730,8 +726,7 @@ async fn a_leaf_list_closes_its_link_and_forwards_to_a_third() {
     c.stop(CloseReason::Closed);
 }
 
-// --- Proof 5, R74 proof 6 ---
-
+/// Proof 5, R74 proof 6.
 #[tokio::test]
 async fn a_clock_outside_the_window_refuses_and_a_small_skew_links() {
     let now = whole_second();
@@ -827,8 +822,7 @@ async fn a_clock_outside_the_window_refuses_and_a_small_skew_links() {
     tolerant_node.stop(CloseReason::Closed);
 }
 
-// --- Proof 6 ---
-
+/// Proof 6.
 #[tokio::test]
 async fn an_unaccepted_attestation_level_is_refused() {
     let now = whole_second();
@@ -921,8 +915,7 @@ async fn an_unaccepted_attestation_level_is_refused() {
     strict_b.stop(CloseReason::Closed);
 }
 
-// --- Proof 7 ---
-
+/// Proof 7.
 #[tokio::test]
 async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
     let now = whole_second();
@@ -1040,8 +1033,7 @@ async fn a_silent_peer_closes_with_peer_lost_and_pings_keep_a_link() {
     bob_node.stop(CloseReason::Closed);
 }
 
-// --- Proof 8 ---
-
+/// Proof 8.
 #[tokio::test]
 async fn two_devices_dialing_each_other_keep_one_link_each() {
     let now = whole_second();
@@ -1127,8 +1119,7 @@ async fn two_devices_dialing_each_other_keep_one_link_each() {
     b.stop(CloseReason::Closed);
 }
 
-// --- Proof 9 ---
-
+/// Proof 9.
 #[tokio::test]
 async fn serving_again_with_a_new_certificate_keeps_port_and_link() {
     let now = whole_second();

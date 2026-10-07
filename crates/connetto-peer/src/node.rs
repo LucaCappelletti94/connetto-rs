@@ -154,22 +154,22 @@ struct ListenerSlot {
 #[derive(Clone)]
 pub struct Node {
     state: Arc<NodeState>,
-    /// A lifetime token. Its strong count is the number of `Node` handles.
-    lifetime: Arc<()>,
+    /// Shared by every handle, so its drop runs once, with the last one.
+    _lifetime: Arc<Lifetime>,
+}
+
+/// Closes the listener and every link when the last `Node` handle drops.
+struct Lifetime(Arc<NodeState>);
+
+impl Drop for Lifetime {
+    fn drop(&mut self) {
+        stop_state(&self.0, CloseReason::Closed);
+    }
 }
 
 impl fmt::Debug for Node {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.state.fmt(f)
-    }
-}
-
-impl Drop for Node {
-    /// Close the listener and every link when the last handle drops.
-    fn drop(&mut self) {
-        if Arc::strong_count(&self.lifetime) == 1 {
-            self.stop(CloseReason::Closed);
-        }
     }
 }
 
@@ -205,25 +205,26 @@ impl Node {
         let lists = Arc::new(RwLock::new(Vec::new()));
         let crls = Arc::new(RwLock::new(Arc::from(Vec::<Crl>::new().into_boxed_slice())));
         let verifier = PeerVerifier::new(&trust, clock, Arc::clone(&own_key), Arc::clone(&crls));
+        let state = Arc::new(NodeState {
+            trust,
+            root_key_ids,
+            verifier,
+            own_key,
+            identity: RwLock::new(None),
+            lists,
+            crls,
+            links: Mutex::new(HashMap::new()),
+            listener: RwLock::new(None),
+            serving: AtomicBool::new(false),
+            dial_count: Mutex::new(0),
+            next_seq: Mutex::new(0),
+            events,
+            ping_every: liveness.ping_every,
+            silence_limit: liveness.silence_limit,
+        });
         Self {
-            state: Arc::new(NodeState {
-                trust,
-                root_key_ids,
-                verifier,
-                own_key,
-                identity: RwLock::new(None),
-                lists,
-                crls,
-                links: Mutex::new(HashMap::new()),
-                listener: RwLock::new(None),
-                serving: AtomicBool::new(false),
-                dial_count: Mutex::new(0),
-                next_seq: Mutex::new(0),
-                events,
-                ping_every: liveness.ping_every,
-                silence_limit: liveness.silence_limit,
-            }),
-            lifetime: Arc::new(()),
+            _lifetime: Arc::new(Lifetime(Arc::clone(&state))),
+            state,
         }
     }
 
@@ -262,37 +263,7 @@ impl Node {
 
     /// Close every link with `reason` and drop the listener.
     pub fn stop(&self, reason: CloseReason) {
-        if let Some(slot) = self.state.listener.write().take() {
-            let _ = slot.stop.send(true);
-        }
-        let drained: Vec<SlotState> = {
-            let mut links = self.state.links.lock();
-            self.state.serving.store(false, Ordering::Release);
-            links.drain().map(|(_, slot_state)| slot_state).collect()
-        };
-        for slot_state in drained {
-            match slot_state {
-                SlotState::Live(slot) => {
-                    let _ = slot.command.send(LinkCommand::Close(reason));
-                    if let Some(task) = slot.task {
-                        task.abort();
-                    }
-                    self.state
-                        .events
-                        .send(PeerEvent::Unlinked {
-                            peer: slot.peer,
-                            reason,
-                        })
-                        .ok();
-                }
-                SlotState::AwaitingKeeper(peer) => {
-                    self.state
-                        .events
-                        .send(PeerEvent::Unlinked { peer, reason })
-                        .ok();
-                }
-            }
-        }
+        stop_state(&self.state, reason);
     }
 
     /// The bound address, while the node serves.
@@ -359,7 +330,7 @@ impl Node {
             .clone();
         let mut tls = tls;
         let (peer_numbers, _peer_dial) = exchange_hello(&mut tls, &self.state, dial).await?;
-        register_link(
+        let registered = register_link(
             &self.state,
             Handshaken {
                 peer: peer.clone(),
@@ -371,7 +342,11 @@ impl Node {
             },
             tls,
         );
-        Ok(peer)
+        if registered {
+            Ok(peer)
+        } else {
+            Err(LinkError::NotServing)
+        }
     }
 
     /// Keep `list`, signed by `signer`, and forward it to the links that
@@ -444,6 +419,38 @@ impl Node {
                         number: kept.number,
                     });
                 }
+            }
+        }
+    }
+}
+
+/// Close every link with `reason` and drop the listener.
+fn stop_state(state: &NodeState, reason: CloseReason) {
+    if let Some(slot) = state.listener.write().take() {
+        let _ = slot.stop.send(true);
+    }
+    let drained: Vec<SlotState> = {
+        let mut links = state.links.lock();
+        state.serving.store(false, Ordering::Release);
+        links.drain().map(|(_, slot_state)| slot_state).collect()
+    };
+    for slot_state in drained {
+        match slot_state {
+            SlotState::Live(slot) => {
+                let _ = slot.command.send(LinkCommand::Close(reason));
+                if let Some(task) = slot.task {
+                    task.abort();
+                }
+                state
+                    .events
+                    .send(PeerEvent::Unlinked {
+                        peer: slot.peer,
+                        reason,
+                    })
+                    .ok();
+            }
+            SlotState::AwaitingKeeper(peer) => {
+                state.events.send(PeerEvent::Unlinked { peer, reason }).ok();
             }
         }
     }
@@ -650,7 +657,8 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, identity: Identity) {
         }
     };
     let dialer = peer.key();
-    register_link(
+    // An inbound link a stop dropped needs no answer, the dialer sees the close.
+    let _ = register_link(
         &state,
         Handshaken {
             peer,
@@ -755,12 +763,13 @@ struct Handshaken {
 }
 
 /// Register a completed link under the duplicate rule, spawning its frame
-/// task on a kept link and dropping a losing one without an event.
+/// task on a kept link and dropping a losing one without an event. Answers
+/// `false` when the node stopped before the link could register.
 fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     state: &Arc<NodeState>,
     handshaken: Handshaken,
     tls: S,
-) {
+) -> bool {
     let Handshaken {
         peer,
         leaf,
@@ -784,7 +793,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let mut links = state.links.lock();
         // A stop may have landed between the dial and the registration.
         if !state.serving.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         let fresh = links.get(&peer_key).is_none();
         let keep_new = match links.get(&peer_key) {
@@ -853,4 +862,5 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let _ = tokio::time::timeout(WRITE_BOUND, write_frame(&mut tls, &close)).await;
         });
     }
+    true
 }
