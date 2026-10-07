@@ -1581,6 +1581,8 @@ async fn a_stale_or_unverified_list_is_neither_kept_nor_forwarded() {
     let (forged, forged_signer) = foreign.issuer_list(&foreign_issuer, 9, &[], now);
     a.keep_list(forged, forged_signer);
     a.keep_list(vec![0x30, 0x00], signer.clone());
+    let (unsigned, _) = deployment.issuer_list(&issuer, 3, &[], now);
+    a.keep_list(unsigned, vec![0x30, 0x00]);
     no_events(&mut b_rx, Duration::from_millis(500)).await;
 
     // A peer linking afterwards learns the newer list, the one alpha kept.
@@ -1627,4 +1629,89 @@ async fn a_dial_nobody_answers_or_without_an_identity_fails_typed() {
         a.link(closed).await,
         Err(LinkError::Unreachable(_))
     ));
+}
+
+#[tokio::test]
+async fn a_peer_speaking_another_version_is_refused_both_ways() {
+    let now = whole_second();
+    let deployment = Deployment::new(15, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let future = deployment.device(
+        &issuer,
+        "future",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // A dialler speaking version 2 never links, and the host closes on it.
+    let mut raw = raw_peer_connect(deployment.root_der(), &future, host_addr).await;
+    let hello = PeerFrame::Hello {
+        version: 2,
+        dial: 1,
+        numbers: Vec::new(),
+    };
+    write_frame(&mut raw, &hello)
+        .await
+        .expect("the hello writes");
+    let mut ended = false;
+    for _ in 0..3 {
+        match time::timeout(Duration::from_secs(10), read_frame(&mut raw))
+            .await
+            .expect("the host answers or closes")
+        {
+            Ok(Some(PeerFrame::Hello { .. })) => {}
+            Ok(None) | Err(_) => {
+                ended = true;
+                break;
+            }
+            Ok(Some(other)) => panic!("the host sent {other:?} to a refused peer"),
+        }
+    }
+    assert!(ended, "the host closes on a peer of another version");
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+
+    // A listener speaking version 2 answers the dial with its version.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("a loopback port");
+    let future_addr = listener.local_addr().expect("its address");
+    let crls = Arc::new(parking_lot::RwLock::new(Arc::from(
+        Vec::<crate::verify::Crl>::new().into_boxed_slice(),
+    )));
+    let config = crate::node::server_config_for(
+        &trust_root(deployment.root_der()),
+        Arc::new(SystemClock),
+        Some(future.key_id()),
+        crls,
+        &future.identity(),
+    );
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("the dial arrives");
+        let mut tls = tokio_rustls::TlsAcceptor::from(config)
+            .accept(tcp)
+            .await
+            .expect("the handshake completes");
+        write_frame(&mut tls, &hello)
+            .await
+            .expect("the hello writes");
+        let _ = read_frame(&mut tls).await;
+    });
+    assert!(matches!(
+        host_node.link(future_addr).await,
+        Err(LinkError::UnsupportedVersion { their: 2 })
+    ));
+    server.await.expect("the listener task ends");
 }
