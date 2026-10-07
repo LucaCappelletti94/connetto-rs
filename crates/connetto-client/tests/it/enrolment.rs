@@ -1330,7 +1330,8 @@ async fn untrusted() {
     client.close().await;
 }
 
-/// A build with a device identity and no roots does not connect.
+/// A build with a device identity and no roots, or a root that is not a
+/// certificate, does not connect.
 #[test]
 fn a_build_without_roots_refuses_to_connect() {
     run_phase("no-roots");
@@ -1347,6 +1348,17 @@ async fn no_roots() {
     assert!(matches!(
         refused,
         Err(connetto_client::ClientError::MissingDeploymentRoots)
+    ));
+    let malformed =
+        NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+            .signed_in(fresh_login(&base, APP_NO_ROOTS, "enrol-user"))
+            .durable(dir.path())
+            .with_deployment_roots([root(), vec![0x30, 0x00]])
+            .connect()
+            .await;
+    assert!(matches!(
+        malformed,
+        Err(connetto_client::ClientError::InvalidDeploymentRoot { index: 1 })
     ));
 }
 

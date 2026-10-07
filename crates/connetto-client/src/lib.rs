@@ -251,6 +251,14 @@ pub enum ClientError {
         "the device identity needs its deployment roots: call NativeDurable::with_deployment_roots"
     )]
     MissingDeploymentRoots,
+    /// A deployment root the application named is not a certificate holding
+    /// a key.
+    #[cfg(feature = "device-identity")]
+    #[error("deployment root {index} is not a certificate holding a key")]
+    InvalidDeploymentRoot {
+        /// The root's position among the roots given to `with_deployment_roots`.
+        index: usize,
+    },
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///

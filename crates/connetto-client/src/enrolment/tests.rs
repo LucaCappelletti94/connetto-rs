@@ -171,18 +171,19 @@ async fn a_fresh_certificate_is_looked_at_again_at_half_life_or_within_the_hour(
     );
     assert_eq!(next_look(None, start), HOUR);
     assert_eq!(
-        next_look(Some(&short), start + 3 * HOUR),
-        HOUR + TOLERANCE,
+        next_look(Some(&short), start + 3 * HOUR + HOUR / 2),
+        HOUR / 2 + TOLERANCE,
         "an aging one wakes at its expiry plus the tolerance"
     );
-    // The expiry wake of a long certificate is never capped by the hourly
-    // look, and a not-yet-valid one wakes at its window's open (decision 9).
+    // An aging certificate far from its expiry is still looked at within
+    // the hour, so a failed renewal is retried and a jumped clock caught,
+    // and a not-yet-valid one wakes at its window's open (decision 9).
     let long_aging = held(start, 30 * 24 * HOUR).await;
     let at = start + 15 * 24 * HOUR + HOUR;
     assert_eq!(
         next_look(Some(&long_aging), at),
-        (15 * 24 - 1) * HOUR + TOLERANCE,
-        "the expiry wake is not capped by the hourly look"
+        HOUR,
+        "an aging certificate is looked at again within the hour"
     );
     let behind = held(at + 10 * MINUTE, 12 * HOUR).await;
     assert_eq!(
@@ -1064,8 +1065,6 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
     run.await.expect("the run ends");
 }
 
-// --- The peer link the task drives (R76) ---
-
 /// A peer node the run drives, on the suite's root and a loopback port (R76).
 #[cfg(feature = "peer")]
 fn peer(authority: &Authority) -> Peer {
@@ -1078,7 +1077,8 @@ fn peer(authority: &Authority) -> Peer {
             },
             Arc::new(connetto_peer::SystemClock),
             tx,
-        ),
+        )
+        .expect("the roots hold keys"),
         listen: "127.0.0.1:0".parse().expect("a loopback address"),
         events: rx,
     }
@@ -1104,7 +1104,8 @@ fn far_peer(
         },
         Arc::new(connetto_peer::SystemClock),
         tx,
-    );
+    )
+    .expect("the roots hold keys");
     let key: Arc<dyn DeviceKey> = Arc::new(key);
     node.serve(
         std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
