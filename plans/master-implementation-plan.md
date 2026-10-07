@@ -5281,7 +5281,7 @@ A write applied through any path is refused by every other path, proven three wa
 
 **Status.** NOT STARTED, its hosting, joining, Bluetooth and proof questions decided with the maintainer on 2026-10-02 (below).
 
-**Blocked on** R74.
+**Blocked on** nothing for slices 1 to 7, since R74 merged its device identity as #130, and on the other machines for slice 8 and the home run. R74's open iPhone run blocks no slice.
 
 ### Purpose
 
