@@ -81,6 +81,57 @@ pub(crate) async fn read_frame<R: AsyncRead + Unpin>(
     Ok(Some(frame))
 }
 
+/// Frames read off a stream across calls, keeping a partly arrived frame
+/// when a `select!` drops the read, so a frame loop never loses its place.
+#[derive(Debug, Default)]
+pub(crate) struct FrameReader {
+    /// The bytes read and not yet decoded.
+    pending: Vec<u8>,
+}
+
+impl FrameReader {
+    /// The next frame, or `None` when the link ends cleanly between frames.
+    /// Dropping the future before it completes loses no bytes.
+    pub(crate) async fn next<R: AsyncRead + Unpin>(
+        &mut self,
+        rd: &mut R,
+    ) -> Result<Option<PeerFrame>, FrameError> {
+        let mut chunk = [0u8; 16 * 1024];
+        loop {
+            if let Some(frame) = self.decode()? {
+                return Ok(Some(frame));
+            }
+            let read = rd.read(&mut chunk).await.map_err(FrameError::Io)?;
+            if read == 0 {
+                return if self.pending.is_empty() {
+                    Ok(None)
+                } else {
+                    Err(FrameError::Io(io::ErrorKind::UnexpectedEof.into()))
+                };
+            }
+            self.pending.extend_from_slice(&chunk[..read]);
+        }
+    }
+
+    /// Decode one whole frame from the pending bytes, if they hold one.
+    fn decode(&mut self) -> Result<Option<PeerFrame>, FrameError> {
+        let Some(len) = self.pending.first_chunk::<4>() else {
+            return Ok(None);
+        };
+        let len = u32::from_be_bytes(*len);
+        if len > MAX_FRAME_LEN {
+            return Err(FrameError::TooLong);
+        }
+        let end = 4 + usize::try_from(len).expect("a u32 length fits a usize");
+        if self.pending.len() < end {
+            return Ok(None);
+        }
+        let frame = rmp_serde::from_slice(&self.pending[4..end]).map_err(|_| FrameError::Malformed);
+        self.pending.drain(..end);
+        frame.map(Some)
+    }
+}
+
 /// Write one frame.
 pub(crate) async fn write_frame<W: AsyncWrite + Unpin>(
     wr: &mut W,

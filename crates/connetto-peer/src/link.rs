@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::error::CloseReason;
 use crate::event::PeerEvent;
-use crate::frame::{FrameError, PeerFrame, read_frame, write_frame};
+use crate::frame::{FrameError, FrameReader, PeerFrame, write_frame};
 use crate::node::{HELLO_TIMEOUT, LinkCommand, NodeState, WRITE_BOUND};
 
 /// Drive the link's frames until it closes, emitting the close once.
@@ -27,6 +27,7 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mut ping = tokio::time::interval(ping_every);
     ping.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut last_seen = tokio::time::Instant::now();
+    let mut reader = FrameReader::default();
     loop {
         let silence = tokio::time::sleep_until(last_seen + silence_limit);
         let close = tokio::select! {
@@ -35,7 +36,7 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 Ok(()) => None,
                 Err(_) => Some(CloseReason::Closed),
             },
-            frame = read_frame(&mut io) => match frame {
+            frame = reader.next(&mut io) => match frame {
                 Err(err) => Some(match err {
                     FrameError::TooLong | FrameError::Malformed => CloseReason::Protocol,
                     FrameError::Io(_) => CloseReason::Closed,
