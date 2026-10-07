@@ -78,6 +78,12 @@ const APP_CLOCK_BEHIND: &str = "r74-clock-behind";
 const APP_CLOCK_AHEAD: &str = "r74-clock-ahead";
 const APP_ATTESTATION: &str = "r74-attestation";
 const APP_LOST_KEY: &str = "r74-lost-key";
+#[cfg(feature = "peer")]
+const APP_PEER_A: &str = "r76-peer-a";
+#[cfg(feature = "peer")]
+const APP_PEER_B: &str = "r76-peer-b";
+#[cfg(feature = "peer")]
+const APP_PEER_C: &str = "r76-peer-c";
 
 /// What the lost-device list shows about these test devices.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -135,10 +141,10 @@ async fn enrolment_phase() {
         "cap" => cap().await,
         "revoke" => Box::pin(revoke()).await,
         "spectator" => spectator().await,
-        "restart" => restart().await,
+        "restart" => Box::pin(restart()).await,
         "offline" => offline().await,
         "forget" => forget().await,
-        "report" => report().await,
+        "report" => Box::pin(report()).await,
         "learned" => learned_at_connect().await,
         "untrusted" => untrusted().await,
         "no-roots" => no_roots().await,
@@ -146,7 +152,9 @@ async fn enrolment_phase() {
         "clock-behind" => Box::pin(clock_behind()).await,
         "clock-ahead" => clock_ahead().await,
         "attestation" => attestation().await,
-        "lost-key" => lost_key().await,
+        "lost-key" => Box::pin(lost_key()).await,
+        #[cfg(feature = "peer")]
+        "peer" => Box::pin(peer_report()).await,
         other => panic!("unknown enrolment phase {other:?}"),
     }
 }
@@ -1686,4 +1694,182 @@ async fn attestation() {
     assert!(second.device_certificate().is_none());
     assert_eq!(store.records(), Vec::new());
     second.close().await;
+}
+
+/// A device reported lost through the peer link is refused by a peer that
+/// learned the report from a peer, with the server out of the loop for both
+/// (R76 proof 3).
+#[cfg(feature = "peer")]
+#[test]
+fn a_reported_device_is_refused_by_a_peer_that_learned_it_from_a_peer() {
+    run_phase("peer");
+}
+
+#[cfg(feature = "peer")]
+#[expect(
+    clippy::too_many_lines,
+    reason = "one scenario per assertion, in the order the revocation crosses the links"
+)]
+async fn peer_report() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, server) = sync_server(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let (dir_a, dir_b, dir_c) = (
+        tempdir().expect("a dir"),
+        tempdir().expect("b dir"),
+        tempdir().expect("c dir"),
+    );
+    let listener = "127.0.0.1:0".parse().expect("loopback");
+    let a = signed_in(
+        addr,
+        fresh_login(&base, APP_PEER_A, "peer-user"),
+        dir_a.path(),
+    )
+    .with_peer_listener(listener)
+    .connect()
+    .await
+    .expect("a connects");
+    let b = signed_in(
+        addr,
+        fresh_login(&base, APP_PEER_B, "peer-user"),
+        dir_b.path(),
+    )
+    .with_peer_listener(listener)
+    .connect()
+    .await
+    .expect("b connects");
+    let c = signed_in(
+        addr,
+        fresh_login(&base, APP_PEER_C, "peer-user"),
+        dir_c.path(),
+    )
+    .with_peer_listener(listener)
+    .connect()
+    .await
+    .expect("c connects");
+    let a_cert = wait_for_certificate(&a, BOUND).await.expect("a enrols");
+    let b_cert = wait_for_certificate(&b, BOUND).await.expect("b enrols");
+    let c_cert = wait_for_certificate(&c, BOUND).await.expect("c enrols");
+
+    // B and C go offline.
+    b.close().await;
+    c.close().await;
+    drop(b);
+    drop(c);
+
+    // A reports C. A is the only connected session, so it alone gets the push.
+    a.revoke_device(c_cert.identity().key())
+        .await
+        .expect("a reports c");
+    assert!(
+        wait_for_listed(&a, c_cert.serial(), BOUND).await,
+        "a keeps a list naming c"
+    );
+
+    // The server stops.
+    server.abort();
+
+    // B signs back in silently, with no server, and links a.
+    let (b2, b2_pump) = signed_in(addr, last_used(&base, APP_PEER_B), dir_b.path())
+        .with_peer_listener(listener)
+        .connect_with_pump()
+        .await
+        .expect("b reopens");
+    tokio::spawn(b2_pump);
+    let mut a_events = a.client().events();
+    let mut a_addr = None;
+    let until = Instant::now() + BOUND;
+    while Instant::now() < until && a_addr.is_none() {
+        a_addr = a.peer_address();
+        if a_addr.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let a_addr = a_addr.expect("a serves its peer listener");
+    let mut b_serving = None;
+    let until = Instant::now() + BOUND;
+    while Instant::now() < until && b_serving.is_none() {
+        b_serving = b2.peer_address();
+        if b_serving.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let linked = b2.link_peer(a_addr).await.expect("b links a");
+    assert_eq!(
+        linked.key(),
+        a_cert.identity().key(),
+        "the link answers a's identity"
+    );
+    assert!(
+        next_event(&mut a_events, BOUND, |event| {
+            matches!(
+                event,
+                ClientEvent::PeerLinked { peer } if peer.key() == b_cert.identity().key()
+            )
+        })
+        .await
+        .is_some(),
+        "a sees b linked"
+    );
+    assert!(
+        wait_for_listed(&b2, c_cert.serial(), BOUND).await,
+        "b keeps the list it learned only from a"
+    );
+
+    // C reopens with the server still down and dials b, whose handshake
+    // refuses it, since b learned c's revocation from a.
+    let (c2, c2_pump) = signed_in(addr, last_used(&base, APP_PEER_C), dir_c.path())
+        .with_peer_listener(listener)
+        .connect_with_pump()
+        .await
+        .expect("c reopens");
+    tokio::spawn(c2_pump);
+    let mut b_events = b2.client().events();
+    let mut b_addr = None;
+    let until = Instant::now() + BOUND;
+    while Instant::now() < until && b_addr.is_none() {
+        b_addr = b2.peer_address();
+        if b_addr.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let b_addr = b_addr.expect("b serves its peer listener");
+    let mut c_serving = None;
+    let until = Instant::now() + BOUND;
+    while Instant::now() < until && c_serving.is_none() {
+        c_serving = c2.peer_address();
+        if c_serving.is_none() {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+    let refused = c2
+        .link_peer(b_addr)
+        .await
+        .expect_err("the reported device is refused");
+    assert!(
+        matches!(refused, connetto_client::PeerError::Link(_)),
+        "the refusal is a dial refusal, got {refused:?}"
+    );
+    let until = Instant::now() + Duration::from_secs(3);
+    let mut linked_c = false;
+    while Instant::now() < until {
+        if let Ok(event) = b_events.try_recv() {
+            linked_c |= matches!(
+                event,
+                ClientEvent::PeerLinked { peer } if peer.key() == c_cert.identity().key()
+            );
+        }
+    }
+    assert!(!linked_c, "b never links c");
+
+    a.close().await;
+    b2.close().await;
+    c2.close().await;
 }

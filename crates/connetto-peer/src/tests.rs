@@ -23,7 +23,6 @@ use crate::{
     CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, Refusal, SystemClock, Trust,
 };
 
-const HOUR: Duration = Duration::from_secs(3600);
 const DAY: Duration = Duration::from_hours(24);
 
 /// A device key held in memory, standing in for a chip.
@@ -1167,7 +1166,7 @@ async fn serving_again_with_a_new_certificate_keeps_port_and_link() {
 
     // Alice renews, a new serial and window on the same key, and serves
     // again. The port and the live link stay.
-    let renewed = deployment.reissue(&issuer, &alice, now + HOUR, DAY, [17; 16]);
+    let renewed = deployment.reissue(&issuer, &alice, now, DAY, [17; 16]);
     let served = a
         .serve(SocketAddr::from(([127, 0, 0, 1], 0)), renewed.identity())
         .expect("the re-serve keeps the listener");
@@ -1773,4 +1772,334 @@ async fn a_large_frame_arriving_between_pings_reaches_the_node_whole() {
         );
     }
     drain.abort();
+}
+
+// --- Part A: the peer certificate deadline and the renewal frame ---
+
+#[tokio::test]
+async fn a_link_closes_when_its_peer_certificate_passes_its_deadline() {
+    let now = whole_second();
+    let deployment = Deployment::new(16, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    // Bob's certificate ended 296 seconds ago, inside the five-minute
+    // tolerance, so the handshake accepts it and Alice's deadline for the
+    // link lands four seconds out.
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now - Duration::from_secs(400),
+        Duration::from_secs(104),
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let b_addr = serve(&b, &bob);
+    serve(&a, &alice);
+    assert_eq!(a.link(b_addr).await.ok(), Some(bob.identity.clone()));
+    assert!(matches!(
+        next_events(&mut a_rx, 1).await.as_slice(),
+        [PeerEvent::Linked { .. }]
+    ));
+    assert!(matches!(
+        next_events(&mut b_rx, 1).await.as_slice(),
+        [PeerEvent::Linked { .. }]
+    ));
+
+    // Alice closes at Bob's deadline, and Bob sees the link end.
+    assert_eq!(
+        await_event(&mut a_rx, Duration::from_secs(15), |event| {
+            matches!(event, PeerEvent::Unlinked { .. })
+        })
+        .await,
+        PeerEvent::Unlinked {
+            peer: bob.identity.clone(),
+            reason: CloseReason::PeerExpired
+        }
+    );
+    assert_eq!(
+        await_event(&mut b_rx, Duration::from_secs(10), |event| {
+            matches!(event, PeerEvent::Unlinked { .. })
+        })
+        .await,
+        PeerEvent::Unlinked {
+            peer: alice.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_renewal_certificate_keeps_the_link_past_the_old_deadline() {
+    let now = whole_second();
+    let deployment = Deployment::new(17, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    // Bob's certificate ended 296 seconds ago, inside the five-minute
+    // tolerance, so the handshake accepts it and Alice's deadline for the
+    // link lands four seconds out.
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now - Duration::from_secs(400),
+        Duration::from_secs(104),
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let b_addr = serve(&b, &bob);
+    serve(&a, &alice);
+    assert_eq!(a.link(b_addr).await.ok(), Some(bob.identity.clone()));
+    assert!(matches!(
+        next_events(&mut a_rx, 1).await.as_slice(),
+        [PeerEvent::Linked { .. }]
+    ));
+    assert!(matches!(
+        next_events(&mut b_rx, 1).await.as_slice(),
+        [PeerEvent::Linked { .. }]
+    ));
+
+    // Bob renews on the same key and serves again, so Alice receives the
+    // renewed chain and moves the link's deadline a day out.
+    let renewed = deployment.reissue(&issuer, &bob, now, DAY, [17; 16]);
+    let served = b
+        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), renewed.identity())
+        .expect("the re-serve keeps the listener");
+    assert_eq!(served, b_addr);
+
+    // Past the old deadline, the link is still up and still carries frames.
+    no_events(&mut a_rx, Duration::from_secs(7)).await;
+    let (list, signer) = deployment.issuer_list(&issuer, 1, &[], now);
+    a.keep_list(list.clone(), signer.clone());
+    assert_eq!(
+        next_events(&mut b_rx, 1).await,
+        vec![PeerEvent::ListReceived { list, signer }]
+    );
+}
+
+#[tokio::test]
+async fn a_certificate_for_another_key_closes_with_protocol() {
+    let now = whole_second();
+    let deployment = Deployment::new(18, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let carol = deployment.device(
+        &issuer,
+        "carol",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+
+    let b_addr = serve(&b, &bob);
+    let _ = serve(&a, &alice);
+    let peer = a.link(b_addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+    assert_eq!(
+        next_events(&mut a_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: bob.identity.clone()
+        }]
+    );
+    assert_eq!(
+        next_events(&mut b_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: alice.identity.clone()
+        }]
+    );
+
+    // Bob serves again with a certificate for Carol's key, so the renewed
+    // chain names a different key than the link proved.
+    let served = b
+        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), carol.identity())
+        .expect("the re-serve keeps the listener");
+    assert_eq!(served, b_addr);
+
+    // Alice closes the link with Protocol.
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Protocol,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: bob.identity.clone(),
+            reason: CloseReason::Protocol
+        }
+    );
+    // Bob sees the dropped stream.
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Closed,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: alice.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
+}
+
+#[tokio::test]
+async fn a_revoked_renewed_chain_closes_with_peer_revoked() {
+    let now = whole_second();
+    let deployment = Deployment::new(19, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+
+    let b_addr = serve(&b, &bob);
+    let _ = serve(&a, &alice);
+    let peer = a.link(b_addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+    assert_eq!(
+        next_events(&mut a_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: bob.identity.clone()
+        }]
+    );
+    assert_eq!(
+        next_events(&mut b_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: alice.identity.clone()
+        }]
+    );
+
+    // Bob renews with a new serial, and Alice keeps a list revoking that
+    // serial. Bob's current chain is unrevoked, so the link stays.
+    let renewed = deployment.reissue(&issuer, &bob, now, DAY, [17; 16]);
+    let (list, signer) = deployment.issuer_list(
+        &issuer,
+        1,
+        &[Revoked {
+            serial: renewed.serial.clone(),
+            at: now,
+        }],
+        now,
+    );
+    a.keep_list(list.clone(), signer.clone());
+
+    // Bob serves the renewed certificate. Alice verifies the renewed chain
+    // and finds the serial revoked, so the link closes with PeerRevoked.
+    let served = b
+        .serve(SocketAddr::from(([127, 0, 0, 1], 0)), renewed.identity())
+        .expect("the re-serve keeps the listener");
+    assert_eq!(served, b_addr);
+
+    let event = await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::PeerRevoked,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: bob.identity.clone(),
+            reason: CloseReason::PeerRevoked
+        }
+    );
+    // Bob sees the dropped stream.
+    let event = await_event(&mut b_rx, Duration::from_secs(10), |event| {
+        matches!(
+            event,
+            PeerEvent::Unlinked {
+                reason: CloseReason::Closed,
+                ..
+            }
+        )
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: alice.identity.clone(),
+            reason: CloseReason::Closed
+        }
+    );
+
+    a.stop(CloseReason::Closed);
+    b.stop(CloseReason::Closed);
 }
