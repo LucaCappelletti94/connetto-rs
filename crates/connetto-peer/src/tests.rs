@@ -54,7 +54,7 @@ impl DeviceKey for Device {
 }
 
 /// An issuer beside the certificate and key it signs with.
-struct Issuer {
+pub(crate) struct Issuer {
     /// The issuer certificate, DER.
     certificate: Vec<u8>,
     /// The signing key, for the lists it signs.
@@ -65,13 +65,13 @@ struct Issuer {
 
 /// A deployment a test mints: one root and the issuers and devices it
 /// signs.
-struct Deployment {
+pub(crate) struct Deployment {
     root: RootCa,
 }
 
 impl Deployment {
     /// Mint a root for deployment `id`, valid around `now`.
-    fn new(id: u128, now: SystemTime) -> Self {
+    pub(crate) fn new(id: u128, now: SystemTime) -> Self {
         let root = RootCa::create(
             DeploymentId::from_uuid(uuid::Uuid::from_u128(id)),
             now - 10 * DAY,
@@ -82,12 +82,12 @@ impl Deployment {
     }
 
     /// The root's DER, what a device is built with.
-    fn root_der(&self) -> Vec<u8> {
+    pub(crate) fn root_der(&self) -> Vec<u8> {
         self.root.certificate().to_vec()
     }
 
     /// Sign one more issuer, valid around `now`.
-    fn add_issuer(&self, now: SystemTime, serial: [u8; 16]) -> Issuer {
+    pub(crate) fn add_issuer(&self, now: SystemTime, serial: [u8; 16]) -> Issuer {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the issuer key");
         let holder = Device(Arc::new(key));
         let stored = rustls_pki_types::PrivatePkcs8KeyDer::from(holder.0.serialize_der());
@@ -108,7 +108,7 @@ impl Deployment {
 
     /// A device certificate under `issuer`, valid from `not_before` for `lifetime`.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    fn device(
+    pub(crate) fn device(
         &self,
         issuer: &Issuer,
         account: &str,
@@ -140,7 +140,7 @@ impl Deployment {
 
     /// Reissue the device `peer` under `issuer`, a new serial and window.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    fn reissue(
+    pub(crate) fn reissue(
         &self,
         issuer: &Issuer,
         peer: &Peer,
@@ -201,24 +201,24 @@ impl Deployment {
 }
 
 /// A device certificate beside the key that signs for it.
-struct Peer {
+pub(crate) struct Peer {
     /// The key, held in memory.
     key: Device,
     /// What the certificate names.
-    identity: DeviceIdentity,
+    pub(crate) identity: DeviceIdentity,
     /// The serial a list names the leaf by.
     serial: Vec<u8>,
     /// The attestation level the leaf records.
     level: AttestationLevel,
     /// The leaf, DER.
-    leaf: Vec<u8>,
+    pub(crate) leaf: Vec<u8>,
     /// The issuer certificate, DER.
     issuer: Vec<u8>,
 }
 
 impl Peer {
     /// The presented identity the node serves and dials with.
-    fn identity(&self) -> Identity {
+    pub(crate) fn identity(&self) -> Identity {
         Identity {
             certificate: self.leaf.clone(),
             issuer: self.issuer.clone(),
@@ -269,7 +269,7 @@ fn node_on(
 }
 
 /// A node on one deployment root and the system clock.
-fn node(root_der: Vec<u8>, events: mpsc::UnboundedSender<PeerEvent>) -> Node {
+pub(crate) fn node(root_der: Vec<u8>, events: mpsc::UnboundedSender<PeerEvent>) -> Node {
     node_on(vec![root_der], all_levels(), Arc::new(SystemClock), events)
 }
 
@@ -293,7 +293,7 @@ fn node_liveness(
 }
 
 /// An event channel pair.
-fn events() -> (
+pub(crate) fn events() -> (
     mpsc::UnboundedSender<PeerEvent>,
     mpsc::UnboundedReceiver<PeerEvent>,
 ) {
@@ -301,7 +301,7 @@ fn events() -> (
 }
 
 /// The whole second the wall clock stands on, as X.509 carries time.
-fn whole_second() -> SystemTime {
+pub(crate) fn whole_second() -> SystemTime {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("after the epoch")
@@ -310,7 +310,7 @@ fn whole_second() -> SystemTime {
 }
 
 /// Serve `peer` on loopback, answering the bound address.
-fn serve(node: &Node, peer: &Peer) -> SocketAddr {
+pub(crate) fn serve(node: &Node, peer: &Peer) -> SocketAddr {
     node.serve(SocketAddr::from(([127, 0, 0, 1], 0)), peer.identity())
         .expect("the listener binds")
 }

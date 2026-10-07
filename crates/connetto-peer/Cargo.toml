@@ -15,6 +15,12 @@ homepage.workspace = true
 [lints]
 workspace = true
 
+[features]
+default = []
+# The mDNS advertisement and browse beside the policy that dials what they
+# find, and the leaf fingerprint the TXT record carries (R76 slice 3).
+discovery = ["dep:mdns-sd", "dep:ring"]
+
 [dependencies]
 connetto-core = { workspace = true, features = ["device-cert"] }
 # TLS 1.3 only, over the ring provider: the device key signs
@@ -41,6 +47,9 @@ serde.workspace = true
 serde_bytes.workspace = true
 rmp-serde.workspace = true
 thiserror.workspace = true
+# The advertisement and the fingerprint hash, behind the discovery feature.
+mdns-sd = { version = "0.21", optional = true }
+ring = { version = "0.17", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
 
 [dev-dependencies]
@@ -49,4 +58,7 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
 # `time::pause` drives the 15/45 s liveness clocks in the proofs.
 tokio = { version = "1", default-features = false, features = ["test-util"] }
+# The loopback multicast probe the discovery proofs run before they trust
+# the interface.
+socket2 = "0.6"
 uuid = { version = "1", default-features = false }

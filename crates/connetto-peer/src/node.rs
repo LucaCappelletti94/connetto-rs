@@ -29,6 +29,9 @@ use crate::identity::{Clock, Identity, Trust};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
 use crate::verify::{Crl, KeptList, PeerVerifier};
 
+#[cfg(feature = "discovery")]
+use crate::fingerprint::Fingerprint;
+
 /// The time a dial gives its connect.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// The time a dial gives the handshake.
@@ -85,6 +88,10 @@ pub(crate) struct NodeState {
     pub(crate) events: mpsc::UnboundedSender<PeerEvent>,
     pub(crate) ping_every: Duration,
     pub(crate) silence_limit: Duration,
+    /// The leaf fingerprints the links carry, per peer key, for discovery's
+    /// mapping of the node's events to its instances.
+    #[cfg(feature = "discovery")]
+    pub(crate) peer_fingerprints: Mutex<HashMap<KeyId, Fingerprint>>,
 }
 
 /// One entry per peer, under the node's single links lock.
@@ -235,6 +242,8 @@ impl Node {
             events,
             ping_every: liveness.ping_every,
             silence_limit: liveness.silence_limit,
+            #[cfg(feature = "discovery")]
+            peer_fingerprints: Mutex::new(HashMap::new()),
         });
         Ok(Self {
             _lifetime: Arc::new(Lifetime(Arc::clone(&state))),
@@ -287,9 +296,13 @@ impl Node {
     /// Hand the node's current chain to the live links, which verify it as at
     /// a handshake and move their expiry deadline.
     fn renew_links(&self) {
-        let identity_slot = self.state.identity.read();
-        let held = identity_slot.as_ref().expect("serving holds an identity");
+        // The links lock first, then the identity, the order a registration
+        // takes too, so a link registering during the swap is never missed.
         let links = self.state.links.lock();
+        let identity_slot = self.state.identity.read();
+        let Some(held) = identity_slot.as_ref() else {
+            return;
+        };
         for slot_state in links.values() {
             if let SlotState::Live(slot) = slot_state {
                 let _ = slot.command.send(LinkCommand::Certificate {
@@ -309,6 +322,18 @@ impl Node {
     #[must_use]
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.state.listener.read().as_ref().map(|slot| slot.addr)
+    }
+
+    /// The fingerprint the live link to `peer` carries, for discovery's
+    /// mapping of the node's events to its instances.
+    #[cfg(feature = "discovery")]
+    #[must_use]
+    pub fn peer_fingerprint(&self, peer: &DeviceIdentity) -> Option<Fingerprint> {
+        self.state
+            .peer_fingerprints
+            .lock()
+            .get(&peer.key())
+            .copied()
     }
 
     /// Dial `addr`, answering the peer's identity once the link is live.
@@ -378,6 +403,7 @@ impl Node {
                 numbers: peer_numbers,
                 dialer: key_id(&*identity.key),
                 dial,
+                presented: identity.certificate.clone(),
             },
             tls,
         )?;
@@ -706,6 +732,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, identity: Identity) {
             numbers: peer_numbers,
             dialer,
             dial,
+            presented: identity.certificate.clone(),
         },
         tls,
     );
@@ -799,6 +826,22 @@ struct Handshaken {
     dialer: KeyId,
     /// The dialer's dial counter.
     dial: u64,
+    /// The leaf this node presented at the handshake, DER.
+    presented: Vec<u8>,
+}
+
+/// Send `slot` the presented chain when a renewal swapped it since the
+/// handshake presented `presented`, the chain the link would have had from
+/// the swap. Called under the links lock, the order `renew_links` takes.
+fn catch_up_renewal(state: &NodeState, slot: &LinkSlot, presented: &[u8]) {
+    if let Some(held) = state.identity.read().as_ref()
+        && held.certificate != presented
+    {
+        let _ = slot.command.send(LinkCommand::Certificate {
+            leaf: held.certificate.clone(),
+            issuer: held.issuer.clone(),
+        });
+    }
 }
 
 /// Register a completed link under the duplicate rule, spawning its frame
@@ -821,6 +864,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         numbers,
         dialer,
         dial,
+        presented,
     } = handshaken;
     let peer = &peer;
     let peer_key = peer.key();
@@ -856,6 +900,10 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
         };
         if keep_new {
+            // Discovery maps the node's events to instances by the peer's
+            // leaf, which the slot records.
+            #[cfg(feature = "discovery")]
+            let fingerprint = Fingerprint::of(&leaf);
             // Close the losing link, if the new one keeps the slot. Its frame
             // task sends the `Close` frame and exits on the command.
             if let Some(SlotState::Live(existing)) = links.get(&peer_key) {
@@ -874,7 +922,10 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 command: cmd_tx,
                 task: None,
             };
+            catch_up_renewal(state, &slot, &presented);
             links.insert(peer_key, SlotState::Live(slot));
+            #[cfg(feature = "discovery")]
+            state.peer_fingerprints.lock().insert(peer_key, fingerprint);
             if fresh {
                 state
                     .events
