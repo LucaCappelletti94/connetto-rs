@@ -38,7 +38,7 @@ let trust = Trust {
     roots: Vec::new(),
     accepted: Default::default(),
 };
-let node = Node::new(trust, Arc::new(SystemClock), events);
+let node = Node::new(trust, Arc::new(SystemClock), events).expect("no roots to check");
 let identity = Identity {
     certificate: Vec::new(),
     issuer: Vec::new(),

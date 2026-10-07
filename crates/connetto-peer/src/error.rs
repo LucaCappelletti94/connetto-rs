@@ -4,6 +4,20 @@ use connetto_core::device_cert::AttestationLevel;
 use rustls::AlertDescription;
 use serde::{Deserialize, Serialize};
 
+/// Why a trust cannot build a node.
+#[derive(Debug, thiserror::Error)]
+pub enum TrustError {
+    /// A deployment root does not parse as a certificate holding a key.
+    #[error("deployment root {index} does not parse as a certificate holding a key")]
+    Root {
+        /// The root's position in the trust.
+        index: usize,
+        /// Why it does not parse.
+        #[source]
+        source: connetto_core::device_cert::ListError,
+    },
+}
+
 /// Why a link closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CloseReason {

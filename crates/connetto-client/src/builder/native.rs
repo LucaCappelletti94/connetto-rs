@@ -490,6 +490,13 @@ impl DeviceSetup {
         if self.roots.is_empty() {
             return Err(ClientError::MissingDeploymentRoots);
         }
+        if let Some(index) = self
+            .roots
+            .iter()
+            .position(|root| connetto_core::device_cert::certificate_key_id(root).is_err())
+        {
+            return Err(ClientError::InvalidDeploymentRoot { index });
+        }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let chip = Arc::new(crate::device_key::SecureEnclave);
         #[cfg(target_os = "android")]
@@ -726,7 +733,12 @@ where
                         },
                         Arc::new(connetto_peer::SystemClock),
                         peer_events,
-                    ),
+                    )
+                    .map_err(
+                        |connetto_peer::TrustError::Root { index, .. }| {
+                            ClientError::InvalidDeploymentRoot { index }
+                        },
+                    )?,
                     listen: device.peer_listen,
                     events: peer_events_rx,
                 };

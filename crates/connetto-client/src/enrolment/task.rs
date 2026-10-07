@@ -387,9 +387,13 @@ pub(super) fn next_look(held: Option<&Held>, now: SystemTime) -> Duration {
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),
-        // The expiry wake must reach the exact moment, so a link never
-        // outlives the window by the look's slack (R76 decision 9).
-        Standing::Aging => (end + TOLERANCE).duration_since(now).unwrap_or_default(),
+        // The expiry wake reaches the exact moment, so a link never outlives
+        // the window by the look's slack (R76 decision 9), and the hourly look
+        // still retries a renewal and catches a jumped clock.
+        Standing::Aging => (end + TOLERANCE)
+            .duration_since(now)
+            .unwrap_or_default()
+            .min(RECHECK),
         Standing::ClockOff => (start - TOLERANCE)
             .duration_since(now)
             .unwrap_or_default()

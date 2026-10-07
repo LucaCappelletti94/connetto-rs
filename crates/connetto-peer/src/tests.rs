@@ -265,7 +265,7 @@ fn node_on(
     clock: Arc<dyn crate::Clock>,
     events: mpsc::UnboundedSender<PeerEvent>,
 ) -> Node {
-    Node::new(Trust { roots, accepted }, clock, events)
+    Node::new(Trust { roots, accepted }, clock, events).expect("the roots hold keys")
 }
 
 /// A node on one deployment root and the system clock.
@@ -289,6 +289,7 @@ fn node_liveness(
         events,
         liveness,
     )
+    .expect("the roots hold keys")
 }
 
 /// An event channel pair.
@@ -1774,8 +1775,6 @@ async fn a_large_frame_arriving_between_pings_reaches_the_node_whole() {
     drain.abort();
 }
 
-// --- Part A: the peer certificate deadline and the renewal frame ---
-
 #[tokio::test]
 async fn a_link_closes_when_its_peer_certificate_passes_its_deadline() {
     let now = whole_second();
@@ -2102,4 +2101,54 @@ async fn a_revoked_renewed_chain_closes_with_peer_revoked() {
 
     a.stop(CloseReason::Closed);
     b.stop(CloseReason::Closed);
+}
+
+#[tokio::test]
+async fn a_root_without_a_key_refuses_the_node() {
+    let (tx, _rx) = events();
+    let refused = Node::new(
+        Trust {
+            roots: vec![vec![0x30, 0x00]],
+            accepted: all_levels(),
+        },
+        Arc::new(SystemClock),
+        tx,
+    );
+    assert!(matches!(
+        refused,
+        Err(crate::TrustError::Root { index: 0, .. })
+    ));
+}
+
+#[tokio::test]
+async fn a_stopped_node_dials_nobody() {
+    let now = whole_second();
+    let deployment = Deployment::new(19, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, _a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    serve(&a, &alpha);
+    let b_addr = serve(&b, &beta);
+
+    a.stop(CloseReason::Withdrawn);
+    assert!(matches!(a.link(b_addr).await, Err(LinkError::NotServing)));
+    no_events(&mut b_rx, Duration::from_millis(500)).await;
 }
