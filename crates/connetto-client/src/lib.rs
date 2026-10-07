@@ -211,6 +211,9 @@ pub enum ClientError {
     /// meets this keeps working and retries when a transport arrives.
     #[error("not connected: this operation needs a server")]
     NotConnected,
+    /// The client's pump stopped on a fault no reconnect can cure, named here.
+    #[error("the client stopped: {0}")]
+    Stopped(String),
     /// Acquiring or refreshing the access token failed.
     #[error("authentication error: {0}")]
     Auth(String),
@@ -1097,6 +1100,13 @@ pub enum ClientEvent {
     ServerClosed {
         /// Why the server closed the session.
         reason: FatalErrorReason,
+    },
+    /// The pump stopped on a fault no reconnect can cure, and said which.
+    /// [`Closed`](Self::Closed) follows, and every live handle's `changed`
+    /// returns [`ClientError::Stopped`] from then on.
+    Stopped {
+        /// The fault, as text.
+        detail: String,
     },
     /// The connection closed.
     Closed,
