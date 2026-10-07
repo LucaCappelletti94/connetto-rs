@@ -1715,3 +1715,71 @@ async fn a_peer_speaking_another_version_is_refused_both_ways() {
     ));
     server.await.expect("the listener task ends");
 }
+
+#[tokio::test]
+async fn a_large_frame_arriving_between_pings_reaches_the_node_whole() {
+    let now = whole_second();
+    let deployment = Deployment::new(16, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let sender = deployment.device(
+        &issuer,
+        "sender",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    // Pings every millisecond, so ticks keep landing while a large frame is
+    // still arriving.
+    let host_node = node_liveness(
+        deployment.root_der(),
+        h_tx,
+        Liveness {
+            ping_every: Duration::from_millis(1),
+            silence_limit: DAY,
+        },
+    );
+    let host_addr = serve(&host_node, &host);
+    let raw = raw_linked(deployment.root_der(), &sender, host_addr).await;
+    assert!(matches!(
+        next_events(&mut h_rx, 1).await.as_slice(),
+        [PeerEvent::Linked { .. }]
+    ));
+
+    // The host's pings are drained so its writes never stall.
+    let (mut reader, mut writer) = tokio::io::split(raw);
+    let drain =
+        tokio::spawn(async move { while let Ok(Some(_)) = read_frame(&mut reader).await {} });
+    let list: Vec<u8> = (0..3 * 1024 * 1024_u32)
+        .map(|i| u8::try_from(i % 251).expect("below 251"))
+        .collect();
+    let frame = PeerFrame::List {
+        list: serde_bytes::ByteBuf::from(list.clone()),
+        signer: serde_bytes::ByteBuf::from(vec![7; 16]),
+    };
+    for _ in 0..3 {
+        write_frame(&mut writer, &frame)
+            .await
+            .expect("the frame writes");
+    }
+    for _ in 0..3 {
+        let event = await_event(&mut h_rx, Duration::from_secs(10), |_| true).await;
+        assert_eq!(
+            event,
+            PeerEvent::ListReceived {
+                list: list.clone(),
+                signer: vec![7; 16]
+            }
+        );
+    }
+    drain.abort();
+}
