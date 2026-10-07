@@ -1329,3 +1329,302 @@ async fn dropping_the_last_node_closes_the_listener_and_links() {
         "the listener should be closed after the node drops"
     );
 }
+
+/// A raw peer that completed the handshake and its `Hello` with the node at
+/// `addr`.
+async fn raw_linked(
+    root_der: Vec<u8>,
+    peer: &Peer,
+    addr: SocketAddr,
+) -> tokio_rustls::TlsStream<tokio::net::TcpStream> {
+    let mut raw = raw_peer_connect(root_der, peer, addr).await;
+    let hello = PeerFrame::Hello {
+        version: 1,
+        dial: 1,
+        numbers: Vec::new(),
+    };
+    write_frame(&mut raw, &hello)
+        .await
+        .expect("the hello writes");
+    let answer = time::timeout(crate::node::HELLO_TIMEOUT, read_frame(&mut raw))
+        .await
+        .expect("the node answers within the bound")
+        .expect("a frame arrives");
+    assert!(matches!(answer, Some(PeerFrame::Hello { .. })));
+    raw
+}
+
+#[tokio::test]
+async fn an_oversized_or_misplaced_frame_closes_with_protocol() {
+    use tokio::io::AsyncWriteExt;
+
+    let now = whole_second();
+    let deployment = Deployment::new(10, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let large = deployment.device(
+        &issuer,
+        "large",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let again = deployment.device(
+        &issuer,
+        "again",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // A length past the ceiling closes before any body is read.
+    let mut raw = raw_linked(deployment.root_der(), &large, host_addr).await;
+    raw.write_all(&(crate::frame::MAX_FRAME_LEN + 1).to_be_bytes())
+        .await
+        .expect("the length writes");
+    raw.flush().await.expect("the length flushes");
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: large.identity.clone(),
+            reason: CloseReason::Protocol
+        }
+    );
+
+    // A second `Hello` on a live link breaks the protocol too.
+    let mut raw = raw_linked(deployment.root_der(), &again, host_addr).await;
+    let hello = PeerFrame::Hello {
+        version: 1,
+        dial: 2,
+        numbers: Vec::new(),
+    };
+    write_frame(&mut raw, &hello)
+        .await
+        .expect("the hello writes");
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: again.identity.clone(),
+            reason: CloseReason::Protocol
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_duplicate_close_holds_the_peer_until_the_bound_or_a_stop() {
+    let now = whole_second();
+    let deployment = Deployment::new(11, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let gone = deployment.device(
+        &issuer,
+        "gone",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let held = deployment.device(
+        &issuer,
+        "held",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // A peer announcing a duplicate close whose kept link never arrives is
+    // reported gone only once the hello bound runs out.
+    let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
+    assert_eq!(
+        next_events(&mut h_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: gone.identity.clone()
+        }]
+    );
+    let close = PeerFrame::Close {
+        reason: CloseReason::Duplicate,
+    };
+    write_frame(&mut raw, &close)
+        .await
+        .expect("the close writes");
+    drop(raw);
+    time::pause();
+    let started = time::Instant::now();
+    let event = await_event(&mut h_rx, Duration::from_secs(60), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Unlinked {
+            peer: gone.identity.clone(),
+            reason: CloseReason::Duplicate
+        }
+    );
+    assert!(
+        started.elapsed() >= crate::node::HELLO_TIMEOUT,
+        "the peer stays reported linked for the hello bound"
+    );
+    time::resume();
+
+    // A stop during the wait reports the held peer with the stop's reason.
+    let mut raw = raw_linked(deployment.root_der(), &held, host_addr).await;
+    assert_eq!(
+        next_events(&mut h_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: held.identity.clone()
+        }]
+    );
+    write_frame(&mut raw, &close)
+        .await
+        .expect("the close writes");
+    drop(raw);
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+    host_node.stop(CloseReason::Withdrawn);
+    assert_eq!(
+        next_events(&mut h_rx, 1).await,
+        vec![PeerEvent::Unlinked {
+            peer: held.identity.clone(),
+            reason: CloseReason::Withdrawn
+        }]
+    );
+}
+
+#[tokio::test]
+async fn a_stale_or_unverified_list_is_neither_kept_nor_forwarded() {
+    let now = whole_second();
+    let deployment = Deployment::new(12, now);
+    let foreign = Deployment::new(13, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let foreign_issuer = foreign.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let gamma = deployment.device(
+        &issuer,
+        "gamma",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, _a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let a_addr = serve(&a, &alpha);
+    let b_addr = serve(&b, &beta);
+    a.link(b_addr).await.expect("the link opens");
+    assert!(matches!(
+        next_events(&mut b_rx, 1).await.as_slice(),
+        [PeerEvent::Linked { .. }]
+    ));
+
+    let (newer, signer) = deployment.issuer_list(&issuer, 2, &[], now);
+    a.keep_list(newer.clone(), signer.clone());
+    assert_eq!(
+        next_events(&mut b_rx, 1).await,
+        vec![PeerEvent::ListReceived {
+            list: newer.clone(),
+            signer: signer.clone()
+        }]
+    );
+
+    // A lower number, a list under a foreign root, and bytes that are no
+    // list at all reach nobody.
+    let (older, _) = deployment.issuer_list(&issuer, 1, &[], now);
+    a.keep_list(older, signer.clone());
+    let (forged, forged_signer) = foreign.issuer_list(&foreign_issuer, 9, &[], now);
+    a.keep_list(forged, forged_signer);
+    a.keep_list(vec![0x30, 0x00], signer.clone());
+    no_events(&mut b_rx, Duration::from_millis(500)).await;
+
+    // A peer linking afterwards learns the newer list, the one alpha kept.
+    let (c_tx, mut c_rx) = events();
+    let c = node(deployment.root_der(), c_tx);
+    serve(&c, &gamma);
+    c.link(a_addr).await.expect("the link opens");
+    let event = await_event(&mut c_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::ListReceived { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::ListReceived {
+            list: newer,
+            signer
+        }
+    );
+}
+
+#[tokio::test]
+async fn a_dial_nobody_answers_or_without_an_identity_fails_typed() {
+    let now = whole_second();
+    let deployment = Deployment::new(14, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, _a_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let closed = {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
+        probe.local_addr().expect("its address")
+    };
+
+    assert!(matches!(a.link(closed).await, Err(LinkError::NotServing)));
+    serve(&a, &alpha);
+    assert!(matches!(
+        a.link(closed).await,
+        Err(LinkError::Unreachable(_))
+    ));
+}
