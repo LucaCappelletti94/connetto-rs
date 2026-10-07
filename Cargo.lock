@@ -1184,6 +1184,7 @@ dependencies = [
  "chrono",
  "connetto-app-attest",
  "connetto-core",
+ "connetto-peer",
  "connetto-schema",
  "connetto-server",
  "connetto-test-harness",

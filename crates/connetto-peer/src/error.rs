@@ -17,6 +17,8 @@ pub enum CloseReason {
     Duplicate,
     /// A kept list revoked the peer's chain.
     PeerRevoked,
+    /// The peer's certificate passed its expiry plus the tolerance.
+    PeerExpired,
     /// The peer speaks a different frame version.
     UnsupportedVersion,
     /// The peer's chain is outside its validity window.

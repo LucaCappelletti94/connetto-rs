@@ -41,6 +41,14 @@ pub enum PeerFrame {
         /// The reason the sender closes with.
         reason: CloseReason,
     },
+    /// The renewed chain a grant replaced, which the sender hands to every
+    /// live link still holding the old one (decision 10).
+    Certificate {
+        /// The renewed leaf, DER.
+        leaf: ByteBuf,
+        /// The leaf's issuer certificate, DER.
+        issuer: ByteBuf,
+    },
     /// A liveness probe.
     Ping,
     /// The answer to a liveness probe.
