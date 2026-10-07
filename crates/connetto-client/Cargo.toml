@@ -162,8 +162,9 @@ ring = { version = "0.17", features = ["std"], optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
 connetto-schema = { workspace = true, optional = true }
-# The peer link the device serves and dials (R76).
-connetto-peer = { path = "../connetto-peer", optional = true }
+# The peer link the device serves and dials (R76). Its discovery feature is
+# on, so a peer build always browses and autolinks what it finds (R76 slice 3).
+connetto-peer = { path = "../connetto-peer", optional = true, features = ["discovery"] }
 # The page codec, one per target, both selected here rather than by a feature
 # because `ReplicaCipher::Encrypted` cannot be honest without it: in a SQLite
 # with no codec, `PRAGMA key` is an unrecognised pragma that succeeds silently
@@ -327,6 +328,9 @@ rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["test-util"] }
+# The loopback multicast probe the discovery proofs run before they trust the
+# interface, the same probe the peer crate's proofs use.
+socket2 = "0.6"
 
 # The fake Secret Service the Linux store tests serve on a peer-to-peer bus.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

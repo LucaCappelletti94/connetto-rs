@@ -450,6 +450,8 @@ struct DeviceSetup {
     refused: Option<String>,
     roots: Vec<Vec<u8>>,
     #[cfg(feature = "peer")]
+    peer_autolink: bool,
+    #[cfg(feature = "peer")]
     peer_listen: SocketAddr,
     #[cfg(feature = "peer")]
     peer_accepted: Vec<AttestationLevel>,
@@ -466,6 +468,8 @@ impl Default for DeviceSetup {
             descriptor: rmp_serde::to_vec_named(&()).unwrap_or_default(),
             refused: None,
             roots: Vec::new(),
+            #[cfg(feature = "peer")]
+            peer_autolink: true,
             #[cfg(feature = "peer")]
             peer_listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             #[cfg(feature = "peer")]
@@ -575,6 +579,15 @@ where
     #[must_use]
     pub fn with_peer_listener(mut self, listen: SocketAddr) -> Self {
         self.device.peer_listen = listen;
+        self
+    }
+
+    /// Whether this device dials the peers discovery finds, on by default
+    /// (R76 decision 12).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_autolink(mut self, autolink: bool) -> Self {
+        self.device.peer_autolink = autolink;
         self
     }
 
@@ -725,22 +738,32 @@ where
                 #[cfg(feature = "peer")]
                 let (peer_events, peer_events_rx) = mpsc::unbounded_channel();
                 #[cfg(feature = "peer")]
+                let node = connetto_peer::Node::new(
+                    connetto_peer::Trust {
+                        roots: device.roots.clone(),
+                        accepted: device.peer_accepted,
+                    },
+                    Arc::new(connetto_peer::SystemClock),
+                    peer_events,
+                )
+                .map_err(|connetto_peer::TrustError::Root { index, .. }| {
+                    ClientError::InvalidDeploymentRoot { index }
+                })?;
+                #[cfg(feature = "peer")]
+                let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
                 let peer = Peer {
-                    node: connetto_peer::Node::new(
-                        connetto_peer::Trust {
-                            roots: device.roots.clone(),
-                            accepted: device.peer_accepted,
-                        },
-                        Arc::new(connetto_peer::SystemClock),
-                        peer_events,
-                    )
-                    .map_err(
-                        |connetto_peer::TrustError::Root { index, .. }| {
-                            ClientError::InvalidDeploymentRoot { index }
-                        },
-                    )?,
+                    node: node.clone(),
+                    discovery: connetto_peer::Discovery::new(
+                        node,
+                        device.peer_autolink,
+                        discovery_events,
+                    ),
                     listen: device.peer_listen,
                     events: peer_events_rx,
+                    discovery_events: discovery_events_rx,
+                    #[cfg(all(feature = "peer", target_os = "android"))]
+                    java: device.java.clone(),
                 };
                 let (enroller, handle) = Enroller::new(
                     keys,

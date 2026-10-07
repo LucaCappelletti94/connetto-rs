@@ -25,6 +25,10 @@ jobs:
   coverage:
     name: Coverage ${{ matrix.name }}
     runs-on: ubuntu-latest
+    # The discovery proofs fail here, never skip, when loopback multicast is
+    # missing (R76 slice 3).
+    env:
+      CONNETTO_REQUIRE_MULTICAST: "1"
     timeout-minutes: 90
     # Neither a fork's pull request nor a Dependabot run can read
     # CODECOV_TOKEN, so the upload runs for same-repo branches and main only.

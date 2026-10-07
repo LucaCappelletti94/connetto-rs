@@ -90,6 +90,8 @@ pub mod harden;
 mod keyring;
 pub mod live;
 mod memory_stores;
+#[cfg(all(feature = "peer", target_os = "android"))]
+mod multicast;
 pub mod reconnect;
 pub mod replica;
 mod subscriptions;
@@ -1234,6 +1236,20 @@ pub enum ClientEvent {
         address: SocketAddr,
         /// Why the bind failed.
         error: String,
+    },
+    /// Discovery found a peer instance at `address` (R76).
+    #[cfg(feature = "peer")]
+    PeerFound {
+        /// The resolved address to dial.
+        address: SocketAddr,
+        /// The instance's leaf fingerprint.
+        fingerprint: connetto_peer::Fingerprint,
+    },
+    /// Discovery lost a peer instance (R76).
+    #[cfg(feature = "peer")]
+    PeerGone {
+        /// The instance's leaf fingerprint.
+        fingerprint: connetto_peer::Fingerprint,
     },
 }
 

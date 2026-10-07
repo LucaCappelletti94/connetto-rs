@@ -33,6 +33,8 @@ use crate::ClientEvent;
 #[cfg(feature = "peer")]
 use crate::PeerError;
 use crate::device_key::{KeyRecords, OpenedKey, open_software_key};
+#[cfg(feature = "peer")]
+use socket2::{Domain, SockAddr, Socket, Type};
 
 const HOUR: Duration = Duration::from_hours(1);
 const MINUTE: Duration = Duration::from_mins(1);
@@ -1065,23 +1067,128 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
     run.await.expect("the run ends");
 }
 
+/// A loopback port the discovery's mDNS daemon binds, free at the probe.
+#[cfg(feature = "peer")]
+fn fresh_mdns_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("the loopback binds")
+        .local_addr()
+        .expect("the bound address")
+        .port()
+}
+
+/// A loopback multicast round-trip, answered when the host lets it through.
+///
+/// Binds a datagram socket to the loopback, joins the mDNS group there, and
+/// asks a second socket, pointed at the loopback, to multicast to it.
+#[cfg(feature = "peer")]
+fn loopback_multicast() -> bool {
+    let works = probe_loopback_multicast();
+    assert!(
+        works || std::env::var_os("CONNETTO_REQUIRE_MULTICAST").is_none(),
+        "CONNETTO_REQUIRE_MULTICAST is set and the loopback multicast probe failed"
+    );
+    works
+}
+
+/// Whether a datagram sent to the mDNS group over the loopback comes back.
+#[cfg(feature = "peer")]
+fn probe_loopback_multicast() -> bool {
+    let group = std::net::Ipv4Addr::new(224, 0, 0, 251);
+    let lo = std::net::Ipv4Addr::LOCALHOST;
+    let receiver = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!("the mDNS probe will not open a socket: {err}");
+            return false;
+        }
+    };
+    // Bound to every address, since a socket bound to the loopback's unicast
+    // address never receives a datagram sent to the group.
+    let bind = SockAddr::from(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::UNSPECIFIED,
+        0,
+    ));
+    if let Err(err) = receiver.bind(&bind) {
+        eprintln!("the mDNS probe will not bind the loopback: {err}");
+        return false;
+    }
+    let Some(addr) = receiver
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_socket_ipv4())
+    else {
+        eprintln!("the mDNS probe will not read its bound address");
+        return false;
+    };
+    let port = addr.port();
+    if let Err(err) = receiver.join_multicast_v4(&group, &lo) {
+        eprintln!("the mDNS probe will not join the group on the loopback: {err}");
+        return false;
+    }
+    let _ = receiver.set_read_timeout(Some(Duration::from_secs(3)));
+    let sender = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!("the mDNS probe will not open a sender: {err}");
+            return false;
+        }
+    };
+    if let Err(err) = sender.set_multicast_if_v4(&lo) {
+        eprintln!("the mDNS probe will not point the sender at the loopback: {err}");
+        return false;
+    }
+    let target = SockAddr::from(std::net::SocketAddrV4::new(group, port));
+    if let Err(err) = sender.send_to(b"connetto", &target) {
+        eprintln!("the mDNS probe will not multicast to the loopback: {err}");
+        return false;
+    }
+    let mut buf = vec![std::mem::MaybeUninit::uninit(); 32];
+    match receiver.recv(buf.as_mut_slice()) {
+        Ok(n) if n > 0 => true,
+        Ok(_) => {
+            eprintln!("the mDNS probe multicast no datagram to the loopback");
+            false
+        }
+        Err(err) => {
+            eprintln!("the mDNS probe heard nothing on the loopback: {err}");
+            false
+        }
+    }
+}
+
+/// A peer node the run drives, on the suite's root and a loopback port (R76),
+/// whose discovery autolinks `autolink` on the mDNS `port`.
+#[cfg(feature = "peer")]
+fn peer_with(authority: &Authority, autolink: bool, port: u16) -> Peer {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let node = connetto_peer::Node::new(
+        connetto_peer::Trust {
+            roots: vec![authority.root.clone()],
+            accepted: AttestationLevel::ALL.to_vec(),
+        },
+        Arc::new(connetto_peer::SystemClock),
+        tx,
+    )
+    .expect("the roots hold keys");
+    let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+    Peer {
+        node: node.clone(),
+        discovery: connetto_peer::Discovery::new(node, autolink, discovery_events)
+            .with_mdns_port(port)
+            .loopback_only(),
+        listen: "127.0.0.1:0".parse().expect("a loopback address"),
+        events: rx,
+        discovery_events: discovery_events_rx,
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        java: None,
+    }
+}
+
 /// A peer node the run drives, on the suite's root and a loopback port (R76).
 #[cfg(feature = "peer")]
 fn peer(authority: &Authority) -> Peer {
-    let (tx, rx) = mpsc::unbounded_channel();
-    Peer {
-        node: connetto_peer::Node::new(
-            connetto_peer::Trust {
-                roots: vec![authority.root.clone()],
-                accepted: AttestationLevel::ALL.to_vec(),
-            },
-            Arc::new(connetto_peer::SystemClock),
-            tx,
-        )
-        .expect("the roots hold keys"),
-        listen: "127.0.0.1:0".parse().expect("a loopback address"),
-        events: rx,
-    }
+    peer_with(authority, true, fresh_mdns_port())
 }
 
 /// A second node holding its own identity under the same root, served on a
@@ -1756,4 +1863,218 @@ async fn a_stale_peer_list_changes_nothing() {
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
+}
+
+/// Whether `state` has reported the instance `fingerprint` found (R76).
+#[cfg(feature = "peer")]
+fn reports_found(state: &Arc<Mutex<FakeState>>, fingerprint: connetto_peer::Fingerprint) -> bool {
+    state.lock().emitted.iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::PeerFound {
+                fingerprint: found,
+                ..
+            } if *found == fingerprint
+        )
+    })
+}
+
+/// Whether `state` has reported a peer link (R76).
+#[cfg(feature = "peer")]
+fn reports_linked(state: &Arc<Mutex<FakeState>>) -> bool {
+    state
+        .lock()
+        .emitted
+        .iter()
+        .any(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+}
+
+/// Two clients on loopback discover each other through mDNS and autolink with
+/// no `link_peer` call, each reporting the other found (R76 proof 4).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn two_clients_discover_each_other_and_autolink() {
+    if !loopback_multicast() {
+        eprintln!("the host will not multicast on the loopback, so the discovery proof skips");
+        return;
+    }
+    eprintln!("R76-PROOF-RAN two_clients_discover_each_other_and_autolink");
+    let (key_a, der_a) = attesting_key();
+    let (key_b, der_b) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, [5; 16]);
+    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, [6; 16]);
+    let fp_a = connetto_peer::Fingerprint::of(&held_a.certificate);
+    let fp_b = connetto_peer::Fingerprint::of(&held_b.certificate);
+    let port = fresh_mdns_port();
+    let peer_a = peer_with(&authority, true, port);
+    let peer_b = peer_with(&authority, true, port);
+    let issuer = Arc::new(authority.issuer);
+    let state_a = Arc::new(Mutex::new(FakeState::default()));
+    let (events_a, _events_a) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let state_b = Arc::new(Mutex::new(FakeState::default()));
+    let (events_b, _events_b) = broadcast::channel(64);
+    let (fin_tx, fin_rx) = watch::channel(());
+    let link_a = FakeLink {
+        state: Arc::clone(&state_a),
+        events: events_a,
+        end: end_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate.clone(),
+        ask: Ask::Lost,
+        gate: None,
+    };
+    let link_b = FakeLink {
+        state: Arc::clone(&state_b),
+        events: events_b,
+        end: fin_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+    };
+    let (enroller_a, _handle_a) = Enroller::new(
+        Arc::new(RunKeys { der: der_a }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_a),
+        Vec::new(),
+        inbox(),
+        peer_a,
+    );
+    let (enroller_b, _handle_b) = Enroller::new(
+        Arc::new(RunKeys { der: der_b }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_b),
+        Vec::new(),
+        inbox(),
+        peer_b,
+    );
+    let run_a = tokio::spawn(run(link_a, enroller_a));
+    let run_b = tokio::spawn(run(link_b, enroller_b));
+
+    poll_until(|| reports_found(&state_a, fp_b)).await;
+    poll_until(|| reports_found(&state_b, fp_a)).await;
+    poll_until(|| reports_linked(&state_a)).await;
+    poll_until(|| reports_linked(&state_b)).await;
+
+    end_tx.send(()).expect("the run ends");
+    fin_tx.send(()).expect("the run ends");
+    run_a.await.expect("the run ends");
+    run_b.await.expect("the run ends");
+}
+
+/// Two clients on loopback with autolink off report each other found and link
+/// only the one that calls `link_peer` (R76 proof 4).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn clients_without_autolink_report_and_link_only_on_the_call() {
+    if !loopback_multicast() {
+        eprintln!("the host will not multicast on the loopback, so the discovery proof skips");
+        return;
+    }
+    eprintln!("R76-PROOF-RAN clients_without_autolink_report_and_link_only_on_the_call");
+    let (key_a, der_a) = attesting_key();
+    let (key_b, der_b) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, [5; 16]);
+    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, [6; 16]);
+    let fp_a = connetto_peer::Fingerprint::of(&held_a.certificate);
+    let fp_b = connetto_peer::Fingerprint::of(&held_b.certificate);
+    let port = fresh_mdns_port();
+    let peer_a = peer_with(&authority, false, port);
+    let peer_b = peer_with(&authority, false, port);
+    let issuer = Arc::new(authority.issuer);
+    let state_a = Arc::new(Mutex::new(FakeState::default()));
+    let (events_a, _events_a) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let state_b = Arc::new(Mutex::new(FakeState::default()));
+    let (events_b, _events_b) = broadcast::channel(64);
+    let (fin_tx, fin_rx) = watch::channel(());
+    let link_a = FakeLink {
+        state: Arc::clone(&state_a),
+        events: events_a,
+        end: end_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate.clone(),
+        ask: Ask::Lost,
+        gate: None,
+    };
+    let link_b = FakeLink {
+        state: Arc::clone(&state_b),
+        events: events_b,
+        end: fin_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+    };
+    let (enroller_a, handle_a) = Enroller::new(
+        Arc::new(RunKeys { der: der_a }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_a),
+        Vec::new(),
+        inbox(),
+        peer_a,
+    );
+    let (enroller_b, _handle_b) = Enroller::new(
+        Arc::new(RunKeys { der: der_b }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_b),
+        Vec::new(),
+        inbox(),
+        peer_b,
+    );
+    let run_a = tokio::spawn(run(link_a, enroller_a));
+    let run_b = tokio::spawn(run(link_b, enroller_b));
+
+    poll_until(|| reports_found(&state_a, fp_b)).await;
+    poll_until(|| reports_found(&state_b, fp_a)).await;
+    // Seconds past the find, and nothing dials itself.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    {
+        let (a, b) = (state_a.lock(), state_b.lock());
+        assert!(
+            a.emitted
+                .iter()
+                .all(|event| !matches!(event, ClientEvent::PeerLinked { .. })),
+            "autolink off dials nothing"
+        );
+        assert!(
+            b.emitted
+                .iter()
+                .all(|event| !matches!(event, ClientEvent::PeerLinked { .. })),
+            "autolink off dials nothing"
+        );
+    }
+    let address = state_a
+        .lock()
+        .emitted
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::PeerFound {
+                address,
+                fingerprint,
+            } if *fingerprint == fp_b => Some(*address),
+            _ => None,
+        })
+        .expect("the found report carries the other's address");
+    handle_a.link_peer(address).await.expect("the call links");
+    poll_until(|| reports_linked(&state_a)).await;
+    poll_until(|| reports_linked(&state_b)).await;
+
+    end_tx.send(()).expect("the run ends");
+    fin_tx.send(()).expect("the run ends");
+    run_a.await.expect("the run ends");
+    run_b.await.expect("the run ends");
 }
