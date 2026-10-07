@@ -1367,6 +1367,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "connetto-peer"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "parking_lot",
+ "rcgen 0.14.10",
+ "rmp-serde",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "serde",
+ "serde_bytes",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "connetto-schema"
 version = "0.0.0"
 dependencies = [
