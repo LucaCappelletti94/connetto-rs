@@ -86,6 +86,8 @@ pub mod dsl;
 mod enrolment;
 mod grant_expiry;
 pub mod harden;
+#[cfg(feature = "peer")]
+mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
@@ -98,6 +100,8 @@ mod subscriptions;
 
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
+#[cfg(feature = "peer")]
+pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError};
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
@@ -1251,6 +1255,12 @@ pub enum ClientEvent {
         /// The instance's leaf fingerprint.
         fingerprint: connetto_peer::Fingerprint,
     },
+    /// The device's hotspot stopped hosting, by the system or the user (R76).
+    #[cfg(feature = "peer")]
+    HotspotStopped,
+    /// The device left its joined hotspot (R76).
+    #[cfg(feature = "peer")]
+    HotspotLeft,
 }
 
 /// A primary-key column value carried on a mutation event.

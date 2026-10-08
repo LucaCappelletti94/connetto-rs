@@ -6,6 +6,8 @@
 
 The mutual TLS link between certified devices. A `Node` presents one device's certificate and key and dials or accepts other certified devices over TLS 1.3. Every chain verifies against the roots the deployment ships, the attestation levels the device accepts, and the revocation lists it keeps, behind the wall clock a `Clock` supplies. Links carry a small frame protocol for liveness pings and revocation lists the peer lacks, close under the silence bound, and a deterministic duplicate rule keeps one link per peer key when both sides dial at once.
 
+The dials' sockets pass through the `SocketPrep` the node carries before their connect, set at runtime with `set_socket_prep`, so a joined network can bind them to itself.
+
 ```rust
 use std::net::SocketAddr;
 use std::sync::Arc;

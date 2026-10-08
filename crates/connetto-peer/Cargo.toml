@@ -51,6 +51,9 @@ thiserror.workspace = true
 mdns-sd = { version = "0.21", optional = true }
 ring = { version = "0.17", optional = true }
 tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The dial sockets take their domain here and hand a `SockRef` to the
+# socket prep before their connect.
+socket2 = "0.6"
 
 [dev-dependencies]
 # The proofs mint roots, issuers, lists and device certificates through the
@@ -58,7 +61,4 @@ tracing = { version = "0.1", default-features = false, features = ["std"] }
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
 # `time::pause` drives the 15/45 s liveness clocks in the proofs.
 tokio = { version = "1", default-features = false, features = ["test-util"] }
-# The loopback multicast probe the discovery proofs run before they trust
-# the interface.
-socket2 = "0.6"
 uuid = { version = "1", default-features = false }

@@ -130,6 +130,8 @@ tokio = { version = "1", default-features = false, features = [
   "macros",
 ] }
 thiserror.workspace = true
+# The hotspot machine's answer, waited on by the API methods (R76).
+parking_lot = "0.12"
 # Binary error handling (connetto-client bin).
 anyhow.workspace = true
 # Structured logging (R12). The facade only: a library emits and installs no
@@ -248,6 +250,10 @@ android-native-keyring-store = { version = "1.0.0", optional = true }
 jni = { version = "0.21", optional = true }
 # The API level, since the gated store needs Android 11.
 android_system_properties = { version = "0.1.6", optional = true }
+# The dial socket the joined network binds, through the hotspot plugin (R76).
+socket2 = "0.6"
+# The joined network's subnet, the targets its bind admits (R76).
+ipnet = "2.12"
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
@@ -271,7 +277,6 @@ web-sys = { version = "0.3", features = ["Window", "Performance"] }
 uuid = { version = "1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
-parking_lot = "0.12"
 # The shared fake transport the suites here drive `connect` and `resume` with.
 connetto-core = { workspace = true, features = ["test-support"] }
 # The loop tests run the real server in-process. Its write target is the real

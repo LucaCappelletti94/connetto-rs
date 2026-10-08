@@ -3,8 +3,9 @@
     Merged into the demo's generated manifest. It turns off cloud backup and
     device-to-device transfer, because the replica and the credential records
     are encrypted with a Keystore key that never leaves the phone, so a copy on
-    another device cannot be read. It also declares the permission the peer
-    discovery's multicast lock needs.
+    another device cannot be read. The peer link's and hotspot's Wi-Fi
+    permissions live in `connetto-peer-android`'s manifest, which the build
+    merges in.
 
     This module is a stand-in awaiting the proper home in Dioxus. dx 0.7.10
     parses but never applies `[android.raw] application_attrs` and
@@ -13,7 +14,6 @@
     and its declaration in src/main.rs are deleted.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <application
         android:allowBackup="false"
         android:dataExtractionRules="@xml/connetto_demo_data_extraction_rules" />
