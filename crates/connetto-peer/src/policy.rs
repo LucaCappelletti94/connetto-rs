@@ -47,8 +47,6 @@ pub(crate) struct Instance {
     wait: Duration,
     /// When the pending retry is due, on a monotonic clock.
     retry_at: Option<Instant>,
-    /// Whether a dial is in flight.
-    dialing: bool,
     /// The instance's place in the find order, for the bound's eviction.
     seq: u64,
 }
@@ -88,8 +86,9 @@ pub(crate) struct Policy {
     instances: BTreeMap<Fingerprint, Instance>,
     /// The next instance's place in the find order.
     next_seq: u64,
-    /// The instances the bound evicted while dialing, until their dials end.
-    orphaned: BTreeSet<Fingerprint>,
+    /// The dials running at once, keyed by fingerprint, freed only at the
+    /// dial's outcome, whatever its instance did meanwhile.
+    in_flight: BTreeSet<Fingerprint>,
 }
 
 /// A close reason that bars the instance until its fingerprint changes.
@@ -109,7 +108,7 @@ impl Policy {
             autolink,
             instances: BTreeMap::new(),
             next_seq: 0,
-            orphaned: BTreeSet::new(),
+            in_flight: BTreeSet::new(),
         }
     }
 
@@ -129,7 +128,7 @@ impl Policy {
         // not carry, without an event, or takes nothing when every tracked
         // instance carries a link.
         if fresh && self.instances.len() >= MAX_INSTANCES {
-            let Some((oldest, evicted)) = self
+            let Some((oldest, _evicted)) = self
                 .instances
                 .iter()
                 .filter(|(_, entry)| entry.state != InstanceState::Linked)
@@ -138,20 +137,13 @@ impl Policy {
                 return actions;
             };
             let oldest = *oldest;
-            // The evicted instance's dial keeps running until it ends, so it
-            // holds its place until then.
-            if evicted.dialing {
-                self.orphaned.insert(oldest);
-            }
             self.instances.remove(&oldest);
         }
         let seq = self.next_seq;
         if fresh {
             self.next_seq += 1;
         }
-        let capacity = MAX_DIALS
-            .saturating_sub(self.in_flight())
-            .saturating_sub(self.orphaned.len());
+        let capacity = MAX_DIALS.saturating_sub(self.in_flight.len());
         let entry = self.instances.entry(fp).or_insert_with(|| Instance {
             name: name.to_string(),
             state: InstanceState::New,
@@ -159,7 +151,6 @@ impl Policy {
             reported: BTreeSet::new(),
             wait: FIRST_WAIT,
             retry_at: None,
-            dialing: false,
             seq,
         });
         // A re-advertisement under a fresh name reports the peer again.
@@ -173,8 +164,12 @@ impl Policy {
             actions.push(Action::Found(addr));
         }
         entry.addresses.insert(addr);
-        if entry.state == InstanceState::New && self.autolink && !entry.dialing && capacity > 0 {
-            entry.dialing = true;
+        if entry.state == InstanceState::New
+            && self.autolink
+            && capacity > 0
+            && !self.in_flight.contains(&fp)
+        {
+            self.in_flight.insert(fp);
             actions.push(Action::Dial);
         }
         actions
@@ -193,7 +188,6 @@ impl Policy {
         if let Some(entry) = self.instances.get_mut(&fp) {
             entry.state = InstanceState::Linked;
             entry.retry_at = None;
-            entry.dialing = false;
             entry.wait = FIRST_WAIT;
         }
         Vec::new()
@@ -210,7 +204,6 @@ impl Policy {
             if bars(reason) {
                 entry.state = InstanceState::Barred;
                 entry.retry_at = None;
-                entry.dialing = false;
             } else if entry.state == InstanceState::Linked {
                 entry.state = InstanceState::Waiting;
                 entry.wait = FIRST_WAIT;
@@ -219,7 +212,6 @@ impl Policy {
                 } else {
                     None
                 };
-                entry.dialing = false;
             }
         }
         Vec::new()
@@ -257,10 +249,9 @@ impl Policy {
                     }
                 }
             }
-            entry.dialing = false;
         }
-        // The dial's result frees the place its eviction held.
-        self.orphaned.remove(&fp);
+        // The outcome frees the dial's place, whatever its instance did.
+        self.in_flight.remove(&fp);
         Vec::new()
     }
 
@@ -270,55 +261,42 @@ impl Policy {
             if entry.state == InstanceState::Waiting {
                 entry.state = InstanceState::New;
                 entry.retry_at = None;
-                entry.dialing = false;
                 entry.wait = FIRST_WAIT;
             }
         }
         vec![Action::Browse]
     }
 
-    /// The instances whose dial starts now, the bound of running dials held,
-    /// marked as dialing.
+    /// The instances whose dial starts now, the bound of running dials held.
     pub(crate) fn due(&mut self, now: Instant) -> Vec<Fingerprint> {
-        let capacity = MAX_DIALS
-            .saturating_sub(self.in_flight())
-            .saturating_sub(self.orphaned.len());
+        let capacity = MAX_DIALS.saturating_sub(self.in_flight.len());
         if capacity == 0 {
             return Vec::new();
         }
         // The due instances in the order they were found, the oldest first.
-        let due = self
+        let mut due = self
             .instances
             .iter()
-            .filter(|(_, entry)| {
+            .filter(|(fp, entry)| {
+                if self.in_flight.contains(fp) {
+                    return false;
+                }
                 // A fresh found dials when its turn comes, the bound allowing.
                 match entry.state {
-                    InstanceState::New => self.autolink && !entry.dialing,
-                    InstanceState::Waiting => {
-                        entry.retry_at.is_some_and(|at| at <= now) && !entry.dialing
-                    }
+                    InstanceState::New => self.autolink,
+                    InstanceState::Waiting => entry.retry_at.is_some_and(|at| at <= now),
                     InstanceState::Linked | InstanceState::Barred => false,
                 }
             })
             .map(|(fp, entry)| (entry.seq, *fp))
             .collect::<Vec<_>>();
+        due.sort_unstable_by_key(|(seq, _)| *seq);
         let mut started = Vec::new();
         for (_, fp) in due.into_iter().take(capacity) {
-            self.instances
-                .get_mut(&fp)
-                .expect("the due instance is tracked")
-                .dialing = true;
+            self.in_flight.insert(fp);
             started.push(fp);
         }
         started
-    }
-
-    /// The dials the policy let run, the instances it marked as dialing.
-    fn in_flight(&self) -> usize {
-        self.instances
-            .values()
-            .filter(|entry| entry.dialing)
-            .count()
     }
 
     /// The next retry deadline, for the proofs.
@@ -787,6 +765,96 @@ mod tests {
         // A running dial ends, and the queued retry takes its turn.
         policy.dial_result(due_at, fp_at(2), DialOutcome::Linked);
         assert_eq!(policy.due(due_at), vec![fp_at(1)]);
+    }
+
+    /// Decision 13. A queued dial starts when a running dial ends, and a
+    /// removal, a link, an unlink or an address change meanwhile never frees
+    /// the slot before the outcome, nor starts a second dial.
+    #[test]
+    fn a_running_dial_holds_its_slot_until_its_outcome() {
+        let bound = u16::try_from(MAX_DIALS).expect("the dial bound holds a u16");
+        let queue = |policy: &mut Policy| {
+            assert_eq!(
+                policy.found("n", fp_at(bound + 1), addr_at(bound + 1)),
+                vec![Action::Found(addr_at(bound + 1))],
+                "the running dial holds its slot"
+            );
+            assert!(policy.due(now()).is_empty(), "the bound still holds");
+        };
+        let settle = |policy: &mut Policy| {
+            policy.dial_result(now(), fp_at(3), DialOutcome::Linked);
+            assert_eq!(policy.due(now()), vec![fp_at(bound + 1)]);
+        };
+        // The instance is removed while its dial runs.
+        let mut policy = autolink();
+        for i in 1..=bound {
+            policy.found("n", fp_at(i), addr_at(i));
+        }
+        assert_eq!(policy.removed(fp_at(3)), vec![Action::Gone]);
+        queue(&mut policy);
+        settle(&mut policy);
+        // An inbound link lands while the dial runs.
+        let mut policy = autolink();
+        for i in 1..=bound {
+            policy.found("n", fp_at(i), addr_at(i));
+        }
+        policy.linked(fp_at(3));
+        assert_eq!(policy.state(&fp_at(3)), Some(InstanceState::Linked));
+        queue(&mut policy);
+        settle(&mut policy);
+        // A barred close lands while the dial runs.
+        let mut policy = autolink();
+        for i in 1..=bound {
+            policy.found("n", fp_at(i), addr_at(i));
+        }
+        policy.linked(fp_at(3));
+        policy.unlinked(now(), fp_at(3), CloseReason::PeerRevoked);
+        assert_eq!(policy.state(&fp_at(3)), Some(InstanceState::Barred));
+        queue(&mut policy);
+        settle(&mut policy);
+        // The local addresses change while a waiting retry's dial runs.
+        let mut policy = autolink();
+        policy.found("n", PEER, ADDR);
+        policy.dial_result(now(), PEER, DialOutcome::Unreachable);
+        let due_at = now() + FIRST_WAIT;
+        assert_eq!(policy.due(due_at), vec![PEER], "the retry dials");
+        assert_eq!(policy.addresses_changed(), vec![Action::Browse]);
+        assert_eq!(policy.state(&PEER), Some(InstanceState::New));
+        assert_eq!(
+            policy.found("n", PEER, ADDR2),
+            vec![Action::Found(ADDR2)],
+            "no second dial for a running one"
+        );
+        assert!(
+            policy.due(due_at).is_empty(),
+            "the running dial holds its slot"
+        );
+        policy.dial_result(due_at, PEER, DialOutcome::Unreachable);
+        assert_eq!(policy.state(&PEER), Some(InstanceState::Waiting));
+        assert_eq!(policy.next_retry(), Some(due_at + FIRST_WAIT));
+    }
+
+    /// Decision 13. Queued dials start oldest first, by the find's order,
+    /// whatever the fingerprints order.
+    #[test]
+    fn queued_dials_start_oldest_first_not_by_fingerprint() {
+        let mut policy = autolink();
+        let bound = u16::try_from(MAX_DIALS).expect("the dial bound holds a u16");
+        for i in 1..=bound {
+            policy.found("n", fp_at(i), addr_at(i));
+        }
+        // The older instance carries the higher fingerprint.
+        let older = fp_at(bound + 2);
+        let younger = fp_at(bound + 1);
+        policy.found("n", older, addr_at(bound + 2));
+        policy.found("n", younger, addr_at(bound + 1));
+        assert!(policy.due(now()).is_empty(), "the bound holds while full");
+        policy.dial_result(now(), fp_at(1), DialOutcome::Linked);
+        assert_eq!(
+            policy.due(now()),
+            vec![older],
+            "the older instance starts, not the lower fingerprint"
+        );
     }
 
     /// Decision 13. A find beyond the bound evicts the oldest instance not

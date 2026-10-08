@@ -44,6 +44,9 @@ pub(crate) const WRITE_BOUND: Duration = Duration::from_secs(10);
 pub(crate) const PING_EVERY: Duration = Duration::from_secs(15);
 /// The silence that takes a link down.
 pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(45);
+/// The inbound handshakes the listener runs at once, the unauthenticated
+/// network's bound on its sockets.
+const MAX_INBOUND_HANDSHAKES: usize = 16;
 const DIAL_NAME: &str = "connetto-peer";
 
 /// The links' liveness bounds, the ping pace and the silence that takes a
@@ -628,16 +631,15 @@ fn map_tls(err: io::Error) -> LinkError {
 }
 
 /// A frame failure as the dial's typed error, surfacing the peer's TLS
-/// alert when it reaches the dial on the first read.
+/// alert when it reaches the dial on the first read, and a plain I/O
+/// failure as `Unreachable`.
 fn map_frame(err: FrameError) -> LinkError {
     let message = err.to_string();
     match err {
-        FrameError::Io(io_err) => {
-            if let Ok(rustls_err) = io_err.downcast::<rustls::Error>() {
-                return map_rustls(rustls_err);
-            }
-            LinkError::Protocol(message)
-        }
+        FrameError::Io(io_err) => match io_err.downcast::<rustls::Error>() {
+            Ok(rustls_err) => map_rustls(rustls_err),
+            Err(io_err) => LinkError::Unreachable(io_err),
+        },
         _ => LinkError::Protocol(message),
     }
 }
@@ -648,6 +650,7 @@ async fn accept_loop(
     listener: TcpListener,
     mut stop: watch::Receiver<bool>,
 ) {
+    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_INBOUND_HANDSHAKES));
     loop {
         tokio::select! {
             _ = stop.changed() => return,
@@ -656,8 +659,15 @@ async fn accept_loop(
                     Ok(pair) => pair,
                     Err(err) => {
                         debug!(%err, "the accept failed");
+                        // A descriptor shortage stays ready, so the loop
+                        // backs off before the next poll.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                         continue;
                     }
+                };
+                let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                    drop(tcp);
+                    continue;
                 };
                 let identity = state.identity.read().clone();
                 let Some(identity) = identity else {
@@ -665,7 +675,10 @@ async fn accept_loop(
                     continue;
                 };
                 let state = Arc::clone(&state);
-                tokio::spawn(inbound(state, tcp, identity));
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    inbound(state, tcp, identity).await;
+                });
             }
         }
     }
@@ -766,12 +779,13 @@ async fn exchange_hello<S: AsyncRead + AsyncWrite + Unpin>(
     let frame = tokio::time::timeout(HELLO_TIMEOUT, read_frame(io))
         .await
         .map_err(|_| LinkError::Timeout)?
-        .map_err(map_frame)?;
-    let Some(PeerFrame::Hello {
+        .map_err(map_frame)?
+        .ok_or_else(|| LinkError::Unreachable(io::ErrorKind::UnexpectedEof.into()))?;
+    let PeerFrame::Hello {
         version,
         dial: peer_dial,
         numbers,
-    }) = frame
+    } = frame
     else {
         return Err(LinkError::Protocol(
             "the peer's first frame is not a hello".into(),
