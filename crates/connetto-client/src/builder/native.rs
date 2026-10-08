@@ -1090,7 +1090,7 @@ where
     #[expect(
         clippy::unused_async,
         clippy::unused_async_trait_impl,
-        reason = "uniform awaited hotspot API; the command send is synchronous"
+        reason = "uniform awaited hotspot API, the command send is synchronous"
     )]
     pub async fn stop_hotspot(&self) {
         if let Some(device) = &self.device {
@@ -1125,7 +1125,7 @@ where
     #[expect(
         clippy::unused_async,
         clippy::unused_async_trait_impl,
-        reason = "uniform awaited hotspot API; the command send is synchronous"
+        reason = "uniform awaited hotspot API, the command send is synchronous"
     )]
     pub async fn leave_hotspot(&self) {
         if let Some(device) = &self.device {

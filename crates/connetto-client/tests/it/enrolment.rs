@@ -1745,6 +1745,7 @@ async fn peer_report() {
         dir_a.path(),
     )
     .with_peer_listener(listener)
+    .with_peer_autolink(false)
     .connect()
     .await
     .expect("a connects");
@@ -1754,6 +1755,7 @@ async fn peer_report() {
         dir_b.path(),
     )
     .with_peer_listener(listener)
+    .with_peer_autolink(false)
     .connect()
     .await
     .expect("b connects");
@@ -1763,6 +1765,7 @@ async fn peer_report() {
         dir_c.path(),
     )
     .with_peer_listener(listener)
+    .with_peer_autolink(false)
     .connect()
     .await
     .expect("c connects");
@@ -1791,6 +1794,7 @@ async fn peer_report() {
     // B signs back in silently, with no server, and links a.
     let (b2, b2_pump) = signed_in(addr, last_used(&base, APP_PEER_B), dir_b.path())
         .with_peer_listener(listener)
+        .with_peer_autolink(false)
         .connect_with_pump()
         .await
         .expect("b reopens");
@@ -1839,6 +1843,7 @@ async fn peer_report() {
     // refuses it, since b learned c's revocation from a.
     let (c2, c2_pump) = signed_in(addr, last_used(&base, APP_PEER_C), dir_c.path())
         .with_peer_listener(listener)
+        .with_peer_autolink(false)
         .connect_with_pump()
         .await
         .expect("c reopens");

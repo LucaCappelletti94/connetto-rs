@@ -144,7 +144,7 @@ pub enum JoinError {
     not(any(target_os = "android", test)),
     expect(
         dead_code,
-        reason = "the Android backend and the proofs construct these standings; a non-Android build reads them through the tables only"
+        reason = "the Android backend and the proofs construct these standings, a non-Android build reads them through the tables only"
     )
 )]
 #[derive(Clone)]
@@ -171,7 +171,7 @@ pub(crate) enum HostStatus {
     not(any(target_os = "android", test)),
     expect(
         dead_code,
-        reason = "the Android backend and the proofs construct these standings; a non-Android build reads them through the tables only"
+        reason = "the Android backend and the proofs construct these standings, a non-Android build reads them through the tables only"
     )
 )]
 #[derive(Clone)]
@@ -361,22 +361,23 @@ impl Machine {
                 HostState::Hosting { .. } => self.backend.stop_host(),
             },
             Command::Join { offer, reply } => {
+                // The earlier request cancelled, the joined network
+                // released and its bind stopped, before the new request
+                // goes to the tables.
+                match core::mem::replace(&mut self.join, JoinState::Idle) {
+                    JoinState::Idle => {}
+                    JoinState::Requesting { reply: old, .. } => {
+                        self.backend.leave_join();
+                        let _ = old.send(Err(JoinError::Declined));
+                    }
+                    JoinState::Joined => {
+                        self.backend.leave_join();
+                        (self.bind)(None);
+                    }
+                }
                 if let Err(err) = self.backend.request_join(&offer) {
                     let _ = reply.send(Err(err));
                 } else {
-                    // The earlier request cancelled, the joined network
-                    // released, before the new request goes to the tables.
-                    match core::mem::replace(&mut self.join, JoinState::Idle) {
-                        JoinState::Idle => {}
-                        JoinState::Requesting { reply: old, .. } => {
-                            self.backend.leave_join();
-                            let _ = old.send(Err(JoinError::Declined));
-                        }
-                        JoinState::Joined => {
-                            self.backend.leave_join();
-                            (self.bind)(None);
-                        }
-                    }
                     self.join = JoinState::Requesting {
                         offer,
                         reply,
@@ -952,7 +953,8 @@ mod tests {
     }
 
     /// The join row `join_hotspot | Requesting | cancel the earlier request,
-    /// request this one`.
+    /// request this one`, the earlier release standing before the new
+    /// request.
     #[test]
     fn a_join_cancels_the_earlier_request() {
         let mut h = Harness::new(true);
@@ -966,8 +968,11 @@ mod tests {
             offer: Harness::offer(HotspotSecurity::Wpa2, Some(54321)),
             reply: second,
         });
-        assert_eq!(h.backend.counted("request_join"), 2);
-        assert_eq!(h.backend.counted("leave_join"), 1);
+        assert_eq!(
+            h.backend.calls.lock().as_slice(),
+            &["request_join", "leave_join", "request_join"],
+            "the earlier request stands released before the new one goes"
+        );
         assert_eq!(first_answer.try_recv().unwrap(), Err(JoinError::Declined));
         assert!(second_answer.try_recv().is_err());
     }
@@ -1122,10 +1127,55 @@ mod tests {
             offer: Harness::offer(HotspotSecurity::Wpa2, Some(54321)),
             reply,
         });
-        assert_eq!(h.backend.counted("request_join"), 2);
-        assert_eq!(h.backend.counted("leave_join"), 1);
+        assert_eq!(
+            h.backend.calls.lock().as_slice(),
+            &["request_join", "leave_join", "request_join"],
+            "the network stands released before the new request goes"
+        );
         assert_eq!(*h.binds.lock().last().unwrap(), None);
         assert!(answer.try_recv().is_err());
+    }
+
+    /// The join row `join_hotspot | Requesting | cancel the earlier request,
+    /// request this one`, with a request that refuses at once. The earlier
+    /// release still stands before it, the error answers, and the side
+    /// stands idle.
+    #[test]
+    fn a_refused_join_request_leaves_the_side_idle() {
+        let mut h = Harness::new(true);
+        let (first, mut first_answer) = oneshot::channel();
+        h.machine.handle(Command::Join {
+            offer: Harness::offer(HotspotSecurity::Wpa2, Some(54321)),
+            reply: first,
+        });
+        *h.backend.join_request.lock() =
+            Err(JoinError::MissingPermission("NEARBY_WIFI_DEVICES".into()));
+        let (second, mut second_answer) = oneshot::channel();
+        h.machine.handle(Command::Join {
+            offer: Harness::offer(HotspotSecurity::Wpa2, Some(54321)),
+            reply: second,
+        });
+        assert_eq!(
+            h.backend.calls.lock().as_slice(),
+            &["request_join", "leave_join", "request_join"],
+            "the earlier request stands released before the refused one"
+        );
+        assert_eq!(first_answer.try_recv().unwrap(), Err(JoinError::Declined));
+        assert_eq!(
+            second_answer.try_recv().unwrap(),
+            Err(JoinError::MissingPermission("NEARBY_WIFI_DEVICES".into()))
+        );
+        // The side stands idle, so a good request still goes to the tables.
+        *h.backend.join_request.lock() = Ok(());
+        let (third, mut third_answer) = oneshot::channel();
+        h.machine.handle(Command::Join {
+            offer: Harness::offer(HotspotSecurity::Wpa2, Some(54321)),
+            reply: third,
+        });
+        assert!(
+            third_answer.try_recv().is_err(),
+            "the good request is in flight"
+        );
     }
 
     /// The runner answers a command through its channel and ends with it.
