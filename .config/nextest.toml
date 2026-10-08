@@ -24,6 +24,10 @@ docker = { max-threads = 4 }
 # so the group exists only to keep the plain-cargo path calm and stays
 # serialized out of caution rather than need.
 keyring = { max-threads = 1 }
+# Every mDNS discovery proof binds the loopback multicast group and drives a
+# real daemon. Concurrent proofs contend for the loopback, and that stalls a
+# link renewal past its bound, so the proofs serialize.
+discovery = { max-threads = 1 }
 
 [[profile.default.overrides]]
 filter = 'test(secret_stores::) | test(teardown::) | test(e2e::) | test(revocation::)'
@@ -60,3 +64,13 @@ filter = 'package(connetto-file-server) & (test(serve::) | test(sweep::) | test(
 test-group = 'docker'
 threads-required = 2
 slow-timeout = { period = "120s", terminate-after = 5 }
+
+[[profile.default.overrides]]
+filter = '''
+test(two_nodes_discover_each_other_and_autolink)
+| test(a_renewal_re_registers_under_a_new_fingerprint)
+| test(a_stopped_discovery_serves_again)
+| test(two_clients_discover_each_other_and_autolink)
+| test(clients_without_autolink_report_and_link_only_on_the_call)
+'''
+test-group = 'discovery'

@@ -14,6 +14,8 @@ use crate::{ClientError, ConnettoConnection, SuspendedCapture};
 
 mod task;
 
+#[cfg(feature = "peer")]
+pub(crate) use task::Peer;
 pub use task::{CertificateError, DeviceEntry};
 pub(crate) use task::{DeviceKeys, EnrolHandle, Enroller, Link, PlatformKeys, run};
 #[cfg(test)]
@@ -137,17 +139,23 @@ pub(crate) enum Standing {
 
 impl Standing {
     pub(crate) fn of(held: Option<&Held>, now: SystemTime) -> Self {
-        let Some(held) = held else {
+        Self::of_leaf(held.map(|held| &held.leaf), now)
+    }
+
+    /// Where a bare certificate stands at `now`, for a caller that holds
+    /// only the parsed leaf (R76).
+    pub(crate) fn of_leaf(leaf: Option<&DeviceCertificate>, now: SystemTime) -> Self {
+        let Some(leaf) = leaf else {
             return Self::NoKey;
         };
-        let (start, end) = (held.leaf.not_before(), held.leaf.not_after());
+        let (start, end) = (leaf.not_before(), leaf.not_after());
         if now + TOLERANCE < start {
             return Self::ClockOff;
         }
         if now > end + TOLERANCE {
             return Self::Expired;
         }
-        if now >= half_life(held) {
+        if now >= half_life_leaf(leaf) {
             Self::Aging
         } else {
             Self::Fresh
@@ -157,7 +165,12 @@ impl Standing {
 
 /// The moment `held` crosses half its lifetime.
 pub(crate) fn half_life(held: &Held) -> SystemTime {
-    let (start, end) = (held.leaf.not_before(), held.leaf.not_after());
+    half_life_leaf(&held.leaf)
+}
+
+/// The moment `leaf` crosses half its validity.
+pub(crate) fn half_life_leaf(leaf: &DeviceCertificate) -> SystemTime {
+    let (start, end) = (leaf.not_before(), leaf.not_after());
     start + end.duration_since(start).unwrap_or_default() / 2
 }
 

@@ -681,6 +681,10 @@ jobs:
   rust-tests:
     name: Rust tests ${{ matrix.name }}
     runs-on: ubuntu-latest
+    # The discovery proofs fail here, never skip, when loopback multicast is
+    # missing (R76 slice 3).
+    env:
+      CONNETTO_REQUIRE_MULTICAST: "1"
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -709,6 +713,7 @@ jobs:
               -p connetto-file-core
               -p connetto-file-server
               -p connetto-file-client
+              -p connetto-peer
             bins: ''
     steps:
       - uses: actions/checkout@v7
