@@ -125,18 +125,21 @@ async fn main() -> Result<()> {
                 None => build_apk(&device.rust_target().await?).await?,
             };
             let outcome = prove(&device, &apk, &stack, &evidence, unlock).await;
-            match peer_serial {
-                Some(serial) => peer_proof(
-                    &device,
-                    &Device::new(serial),
-                    &apk,
-                    &stack,
-                    &evidence,
-                    unlock,
-                )
-                .await
-                .and(outcome),
-                None => outcome,
+            // The peer proof runs only on a proved phone, and a failed
+            // proof keeps its own error.
+            match (peer_serial, outcome) {
+                (Some(serial), Ok(())) => {
+                    peer_proof(
+                        &device,
+                        &Device::new(serial),
+                        &apk,
+                        &stack,
+                        &evidence,
+                        unlock,
+                    )
+                    .await
+                }
+                (_, outcome) => outcome,
             }
         }
         Err(err) => Err(err),
@@ -421,7 +424,7 @@ async fn read_hotspot_offer(app: &mut PageSession) -> Result<HotspotOfferLines> 
             return Ok(offer);
         }
         if Instant::now() >= deadline {
-            bail!("the offer's lines never finished showing; the page shows:\n{page}");
+            bail!("the offer's lines never finished showing, the page shows:\n{page}");
         }
         sleep(Duration::from_millis(500)).await;
     }
@@ -443,11 +446,11 @@ async fn peer_proof(
     if !demo_has_device_identity() {
         bail!("the peer proof needs a demo build with its device identity");
     }
-    // The joiner's usual network, which the cleanup must bring it back to.
-    let usual_ssid = joiner.current_ssid().await?;
-
     step("prepare the peer phone");
     let (stay_on, previous_role) = prepare_joiner(joiner, &unlock).await?;
+    // The joiner's usual network, read after the wireless reconnect, which
+    // the cleanup must bring it back to.
+    let usual_ssid = joiner.current_ssid().await?;
     let result = run_peer_proof(
         host,
         joiner,
@@ -625,7 +628,7 @@ async fn host_and_link(
     {
         let peer_page = peer_app.page_text().await.unwrap_or_default();
         bail!(
-            "the first phone never named the second as linked; the second phone shows:\n{peer_page}"
+            "the first phone never named the second as linked, the second phone shows:\n{peer_page}"
         );
     }
     peer_app
@@ -644,15 +647,26 @@ async fn host_and_link(
 }
 
 /// The page's own peer identity, `account/key prefix`, from its listening
-/// line.
+/// line, which the wait polls until the line carries it.
 async fn own_identity(app: &mut PageSession) -> Result<String> {
-    app.wait_for_text(" as ", Duration::from_secs(30)).await?;
-    let page = app.page_text().await?;
-    page.lines()
-        .find_map(|line| line.strip_prefix("peer: listening on "))
-        .and_then(|rest| rest.split_once(" as "))
-        .map(|(_, identity)| identity.trim().to_owned())
-        .ok_or_else(|| anyhow!("the page names no peer identity"))
+    // The peer panel updates the listening line on its own poll, which the
+    // device label does not wait for, so the wait polls the line itself.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = app.page_text().await?;
+        if let Some(identity) = page
+            .lines()
+            .find_map(|line| line.strip_prefix("peer: listening on "))
+            .and_then(|rest| rest.split_once(" as "))
+            .map(|(_, identity)| identity.trim().to_owned())
+        {
+            return Ok(identity);
+        }
+        if Instant::now() >= deadline {
+            bail!("the page names no peer identity");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 /// Sign the joiner in as its own account and wait for it to connect and

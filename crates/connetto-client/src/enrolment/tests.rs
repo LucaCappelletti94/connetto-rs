@@ -1277,14 +1277,48 @@ async fn far_closes(
 ) -> Vec<connetto_peer::CloseReason> {
     let until = Instant::now() + bound;
     let mut reasons = Vec::new();
-    while Instant::now() < until {
-        match tokio::time::timeout(Duration::from_millis(50), rx.recv()).await {
-            Ok(Some(connetto_peer::PeerEvent::Unlinked { reason, .. })) => reasons.push(reason),
-            Ok(_) => {}
-            Err(_) => break,
+    loop {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // The drain waits out the whole bound, so a close that arrives
+        // after a long gap still lands.
+        let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else {
+            // The bound ran out or the sender dropped, so nothing else is
+            // in time.
+            break;
+        };
+        if let connetto_peer::PeerEvent::Unlinked { reason, .. } = event {
+            reasons.push(reason);
         }
     }
     reasons
+}
+
+/// The far drain runs for the whole bound, so a close that arrives after a
+/// long gap still lands.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn far_closes_drains_for_the_whole_bound() {
+    use connetto_core::device_cert::{DeploymentId, DeviceIdentity, KeyId};
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let peer = DeviceIdentity::new(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(1)),
+        "peer",
+        KeyId::from_bytes([1; 32]),
+    )
+    .expect("an identity holds");
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = tx.send(connetto_peer::PeerEvent::Unlinked {
+            peer,
+            reason: connetto_peer::CloseReason::Closed,
+        });
+    });
+    let reasons = far_closes(&mut rx, Duration::from_secs(3)).await;
+    late.await.expect("the sender ends");
+    assert_eq!(reasons, [connetto_peer::CloseReason::Closed]);
 }
 
 /// The open of a fresh device serves the peer listener (R76 proof 1).

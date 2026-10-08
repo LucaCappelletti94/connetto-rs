@@ -39,11 +39,10 @@ pub(crate) struct Instance {
     /// registration.
     name: String,
     state: InstanceState,
-    /// The resolved addresses, dialled `IPv4` first.
+    /// The addresses the last resolve reported it at, dialled `IPv4`
+    /// first, and the ones already reported as found, which a resolve
+    /// replaces with its own.
     addresses: std::collections::BTreeSet<SocketAddr>,
-    /// The addresses already reported as found.
-    reported: std::collections::BTreeSet<SocketAddr>,
-    /// The current backoff step, while a retry is pending.
     wait: Duration,
     /// When the pending retry is due, on a monotonic clock.
     retry_at: Option<Instant>,
@@ -117,8 +116,14 @@ impl Policy {
         self.own = own;
     }
 
-    /// The instance `name`, carrying `fp`, was found or resolved at `addr`.
-    pub(crate) fn found(&mut self, name: &str, fp: Fingerprint, addr: SocketAddr) -> Vec<Action> {
+    /// The instance `name`, carrying `fp`, was found or resolved at
+    /// `addrs`, the addresses of one resolve.
+    pub(crate) fn found(
+        &mut self,
+        name: &str,
+        fp: Fingerprint,
+        addrs: &[SocketAddr],
+    ) -> Vec<Action> {
         if fp == self.own {
             return Vec::new();
         }
@@ -148,22 +153,26 @@ impl Policy {
             name: name.to_string(),
             state: InstanceState::New,
             addresses: BTreeSet::new(),
-            reported: BTreeSet::new(),
             wait: FIRST_WAIT,
             retry_at: None,
             seq,
         });
-        // A re-advertisement under a fresh name reports the peer again.
+        // A re-advertisement under a fresh name reports the peer again, so
+        // the addresses it carried stand to be reported anew.
         if entry.name != name {
             entry.name = name.to_string();
-            entry.reported.clear();
+            entry.addresses.clear();
         }
-        // The address reports once, and the instance dials once from new,
-        // while the bound of running dials holds room.
-        if entry.reported.insert(addr) {
-            actions.push(Action::Found(addr));
+        // A resolve replaces the instance's address set with the addresses
+        // it resolved at, so a set never grows past one resolve, and an
+        // address reports once per resolve.
+        let resolved: BTreeSet<SocketAddr> = addrs.iter().copied().collect();
+        for addr in &resolved {
+            if !entry.addresses.contains(addr) {
+                actions.push(Action::Found(*addr));
+            }
         }
-        entry.addresses.insert(addr);
+        entry.addresses = resolved;
         if entry.state == InstanceState::New
             && self.autolink
             && capacity > 0
@@ -364,11 +373,14 @@ mod tests {
     #[test]
     fn the_own_fingerprint_is_ignored() {
         let mut policy = autolink();
-        assert!(policy.found("n", OWN, ADDR).is_empty(), "a self is ignored");
+        assert!(
+            policy.found("n", OWN, &[ADDR]).is_empty(),
+            "a self is ignored"
+        );
         assert_eq!(policy.state(&OWN), None);
         // A renewal moves the own fingerprint, and the new one is ignored too.
         policy.set_own(RENEWED);
-        assert_eq!(policy.found("n", RENEWED, ADDR), Vec::new());
+        assert_eq!(policy.found("n", RENEWED, &[ADDR]), Vec::new());
         assert!(policy.removed(OWN).is_empty(), "a self never reports gone");
     }
 
@@ -376,7 +388,7 @@ mod tests {
     #[test]
     fn a_found_instance_is_reported_and_dialled() {
         let mut policy = autolink();
-        let actions = policy.found("n", PEER, ADDR);
+        let actions = policy.found("n", PEER, &[ADDR]);
         assert_eq!(
             actions,
             vec![Action::Found(ADDR), Action::Dial],
@@ -384,13 +396,17 @@ mod tests {
         );
         assert_eq!(policy.state(&PEER), Some(InstanceState::New));
         // A repeated resolve of the same address reports nothing and dials
-        // nothing, and a second address reports only itself.
-        assert_eq!(policy.found("n", PEER, ADDR), Vec::<Action>::new());
-        assert_eq!(policy.found("n", PEER, ADDR2), vec![Action::Found(ADDR2)]);
+        // nothing, and a resolve at a second address reports only that
+        // address and stands alone in the instance's set.
+        assert_eq!(policy.found("n", PEER, &[ADDR]), Vec::<Action>::new());
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            vec![Action::Found(ADDR2)]
+        );
         assert_eq!(
             policy.addresses(&PEER),
-            vec![ADDR, ADDR2],
-            "every resolved address is kept"
+            vec![ADDR2],
+            "the resolve's addresses stand alone"
         );
     }
 
@@ -398,13 +414,13 @@ mod tests {
     #[test]
     fn a_linked_instance_is_not_redialled() {
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         assert_eq!(policy.state(&PEER), Some(InstanceState::Linked));
         // The browse keeps resolving it, and nothing dials.
-        assert_eq!(policy.found("n", PEER, ADDR), Vec::<Action>::new());
+        assert_eq!(policy.found("n", PEER, &[ADDR]), Vec::<Action>::new());
         assert_eq!(
-            policy.found("n", PEER, ADDR2),
+            policy.found("n", PEER, &[ADDR2]),
             vec![Action::Found(ADDR2)],
             "a new address reports while linked"
         );
@@ -414,7 +430,7 @@ mod tests {
     #[test]
     fn an_unreachable_dial_backs_off_to_the_cap() {
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         // The first dial ends, and the retry is due after the first wait.
         let mut due_at = now();
         policy.dial_result(due_at, PEER, DialOutcome::Unreachable);
@@ -436,20 +452,24 @@ mod tests {
     fn a_refused_instance_is_barred_until_its_fingerprint_changes() {
         let mut policy = autolink();
         // A dial the peer refuses.
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Refused);
         assert_eq!(policy.state(&PEER), Some(InstanceState::Barred));
-        assert!(!policy.found("n", PEER, ADDR).contains(&Action::Found(ADDR)));
         assert!(
-            !policy.found("n", PEER, ADDR2).contains(&Action::Dial),
+            !policy
+                .found("n", PEER, &[ADDR])
+                .contains(&Action::Found(ADDR))
+        );
+        assert!(
+            !policy.found("n", PEER, &[ADDR2]).contains(&Action::Dial),
             "a barred instance never dials"
         );
         // A dial of the renewed fingerprint starts clean.
-        let actions = policy.found("n", RENEWED, ADDR);
+        let actions = policy.found("n", RENEWED, &[ADDR]);
         assert_eq!(actions, vec![Action::Found(ADDR), Action::Dial]);
         // A live link the kept list revokes, the other bar reasons included.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         for reason in [
             CloseReason::PeerRevoked,
@@ -457,7 +477,7 @@ mod tests {
             CloseReason::Protocol,
         ] {
             let mut policy = autolink();
-            policy.found("n", PEER, ADDR);
+            policy.found("n", PEER, &[ADDR]);
             policy.dial_result(now(), PEER, DialOutcome::Linked);
             policy.unlinked(now(), PEER, reason);
             assert_eq!(
@@ -481,7 +501,7 @@ mod tests {
             CloseReason::Duplicate,
         ] {
             let mut policy = autolink();
-            policy.found("n", PEER, ADDR);
+            policy.found("n", PEER, &[ADDR]);
             policy.dial_result(now(), PEER, DialOutcome::Linked);
             policy.unlinked(now(), PEER, reason);
             assert_eq!(
@@ -500,14 +520,14 @@ mod tests {
     fn a_removal_drops_the_retry_and_keeps_the_live_link() {
         // The retry, dropped with the entry.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Unreachable);
         assert_eq!(policy.removed(PEER), vec![Action::Gone]);
         assert_eq!(policy.state(&PEER), None);
         assert!(policy.next_retry().is_none());
         // The live link: the entry goes, the link is the node's, untouched.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         assert_eq!(policy.removed(PEER), vec![Action::Gone]);
         assert_eq!(policy.state(&PEER), None);
@@ -520,20 +540,20 @@ mod tests {
     fn a_local_address_change_resets_the_waiting() {
         // The waiting entry, dropped to new with its retry.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Unreachable);
         assert_eq!(policy.addresses_changed(), vec![Action::Browse]);
         assert_eq!(policy.state(&PEER), Some(InstanceState::New));
         assert!(policy.next_retry().is_none());
         // The linked entry, the link stays.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         policy.addresses_changed();
         assert_eq!(policy.state(&PEER), Some(InstanceState::Linked));
         // The barred entry, the bar stays.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Refused);
         policy.addresses_changed();
         assert_eq!(policy.state(&PEER), Some(InstanceState::Barred));
@@ -549,7 +569,7 @@ mod tests {
         ] {
             let (state, wait) = start;
             let mut policy = autolink();
-            policy.found("n", PEER, ADDR);
+            policy.found("n", PEER, &[ADDR]);
             match state {
                 InstanceState::New | InstanceState::Linked => {}
                 InstanceState::Waiting => {
@@ -585,9 +605,9 @@ mod tests {
         // The standing leaves, the runner drops the policy, and the instances
         // go with it. The proof holds the whole table at once and drops it.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Unreachable);
-        policy.found("n", OTHER, ADDR2);
+        policy.found("n", OTHER, &[ADDR2]);
         policy.set_own(OWN);
         drop(policy);
     }
@@ -597,7 +617,7 @@ mod tests {
     fn autolink_off_reports_but_never_dials() {
         let mut policy = Policy::new(OWN, false);
         assert_eq!(
-            policy.found("n", PEER, ADDR),
+            policy.found("n", PEER, &[ADDR]),
             vec![Action::Found(ADDR)],
             "the found peer reports"
         );
@@ -610,7 +630,10 @@ mod tests {
         assert_eq!(policy.due(now() + Duration::from_secs(3600)), Vec::new());
         // The dial results the table removes never arrive, and the browse
         // keeps reporting new addresses.
-        assert_eq!(policy.found("n", PEER, ADDR2), vec![Action::Found(ADDR2)]);
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            vec![Action::Found(ADDR2)]
+        );
     }
 
     /// The table's found row, column by column.
@@ -619,26 +642,35 @@ mod tests {
         // New, dial.
         let mut policy = autolink();
         assert_eq!(
-            policy.found("n", PEER, ADDR),
+            policy.found("n", PEER, &[ADDR]),
             vec![Action::Found(ADDR), Action::Dial]
         );
         // Linked, no dial.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
-        assert_eq!(policy.found("n", PEER, ADDR2), vec![Action::Found(ADDR2)]);
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            vec![Action::Found(ADDR2)]
+        );
         // Waiting, keep the retry.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Unreachable);
         let retry = policy.next_retry();
-        assert_eq!(policy.found("n", PEER, ADDR2), vec![Action::Found(ADDR2)]);
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            vec![Action::Found(ADDR2)]
+        );
         assert_eq!(policy.next_retry(), retry, "the retry is kept");
         // Barred, no dial.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Refused);
-        assert_eq!(policy.found("n", PEER, ADDR2), vec![Action::Found(ADDR2)]);
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            vec![Action::Found(ADDR2)]
+        );
     }
 
     /// A re-advertisement under a fresh name, same fingerprint and address,
@@ -647,19 +679,25 @@ mod tests {
     fn a_fresh_name_readvertised_reports_the_peer_again() {
         let mut policy = autolink();
         assert_eq!(
-            policy.found("old", PEER, ADDR),
+            policy.found("old", PEER, &[ADDR]),
             vec![Action::Found(ADDR), Action::Dial]
         );
         // The same name resolves again, nothing reports.
-        assert_eq!(policy.found("old", PEER, ADDR), Vec::<Action>::new());
+        assert_eq!(policy.found("old", PEER, &[ADDR]), Vec::<Action>::new());
         // A fresh name, same fingerprint and address, reports again while
         // the first dial is still in flight, so no second dial starts.
-        assert_eq!(policy.found("fresh", PEER, ADDR), vec![Action::Found(ADDR)]);
+        assert_eq!(
+            policy.found("fresh", PEER, &[ADDR]),
+            vec![Action::Found(ADDR)]
+        );
         // A linked peer re-advertised reports without a dial.
         let mut policy = autolink();
-        policy.found("old", PEER, ADDR);
+        policy.found("old", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
-        assert_eq!(policy.found("fresh", PEER, ADDR), vec![Action::Found(ADDR)]);
+        assert_eq!(
+            policy.found("fresh", PEER, &[ADDR]),
+            vec![Action::Found(ADDR)]
+        );
         assert_eq!(policy.state(&PEER), Some(InstanceState::Linked));
     }
 
@@ -669,12 +707,12 @@ mod tests {
     fn the_dial_rows_hold() {
         // A dial from a new instance lands linked.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         assert_eq!(policy.state(&PEER), Some(InstanceState::Linked));
         // A dial from the waiting, the backoff doubling.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Unreachable);
         let due = now() + Duration::from_secs(5);
         let _ = policy.due(due);
@@ -687,7 +725,7 @@ mod tests {
     #[test]
     fn a_dial_result_never_demotes_a_live_link() {
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         // The other addresses gave up, or the peer refused them, after the
         // inbound link landed.
@@ -697,7 +735,7 @@ mod tests {
         assert_eq!(policy.state(&PEER), Some(InstanceState::Linked));
         // A bar, set by the close, is sticky under the late dial result.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
         policy.unlinked(now(), PEER, CloseReason::PeerRevoked);
         policy.dial_result(now(), PEER, DialOutcome::Linked);
@@ -726,14 +764,14 @@ mod tests {
         for i in 1..=bound {
             assert!(
                 policy
-                    .found("n", fp_at(i), addr_at(i))
+                    .found("n", fp_at(i), &[addr_at(i)])
                     .contains(&Action::Dial),
                 "a running dial starts"
             );
         }
         let queued = fp_at(bound + 1);
         assert_eq!(
-            policy.found("n", queued, addr_at(bound + 1)),
+            policy.found("n", queued, &[addr_at(bound + 1)]),
             vec![Action::Found(addr_at(bound + 1))],
             "the dial behind the bound is queued"
         );
@@ -751,11 +789,11 @@ mod tests {
     fn a_queued_retry_takes_its_turn_when_a_running_dial_ends() {
         let mut policy = autolink();
         // The retry's deadline passes while the bound of dials runs.
-        policy.found("n", fp_at(1), addr_at(1));
+        policy.found("n", fp_at(1), &[addr_at(1)]);
         policy.dial_result(now(), fp_at(1), DialOutcome::Unreachable);
         let bound = u16::try_from(MAX_DIALS).expect("the dial bound holds a u16");
         for i in 2..=bound + 1 {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         let due_at = now() + FIRST_WAIT;
         assert!(
@@ -775,7 +813,7 @@ mod tests {
         let bound = u16::try_from(MAX_DIALS).expect("the dial bound holds a u16");
         let queue = |policy: &mut Policy| {
             assert_eq!(
-                policy.found("n", fp_at(bound + 1), addr_at(bound + 1)),
+                policy.found("n", fp_at(bound + 1), &[addr_at(bound + 1)]),
                 vec![Action::Found(addr_at(bound + 1))],
                 "the running dial holds its slot"
             );
@@ -788,7 +826,7 @@ mod tests {
         // The instance is removed while its dial runs.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         assert_eq!(policy.removed(fp_at(3)), vec![Action::Gone]);
         queue(&mut policy);
@@ -796,7 +834,7 @@ mod tests {
         // An inbound link lands while the dial runs.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         policy.linked(fp_at(3));
         assert_eq!(policy.state(&fp_at(3)), Some(InstanceState::Linked));
@@ -805,7 +843,7 @@ mod tests {
         // A barred close lands while the dial runs.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         policy.linked(fp_at(3));
         policy.unlinked(now(), fp_at(3), CloseReason::PeerRevoked);
@@ -814,14 +852,14 @@ mod tests {
         settle(&mut policy);
         // The local addresses change while a waiting retry's dial runs.
         let mut policy = autolink();
-        policy.found("n", PEER, ADDR);
+        policy.found("n", PEER, &[ADDR]);
         policy.dial_result(now(), PEER, DialOutcome::Unreachable);
         let due_at = now() + FIRST_WAIT;
         assert_eq!(policy.due(due_at), vec![PEER], "the retry dials");
         assert_eq!(policy.addresses_changed(), vec![Action::Browse]);
         assert_eq!(policy.state(&PEER), Some(InstanceState::New));
         assert_eq!(
-            policy.found("n", PEER, ADDR2),
+            policy.found("n", PEER, &[ADDR2]),
             vec![Action::Found(ADDR2)],
             "no second dial for a running one"
         );
@@ -841,13 +879,13 @@ mod tests {
         let mut policy = autolink();
         let bound = u16::try_from(MAX_DIALS).expect("the dial bound holds a u16");
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         // The older instance carries the higher fingerprint.
         let older = fp_at(bound + 2);
         let younger = fp_at(bound + 1);
-        policy.found("n", older, addr_at(bound + 2));
-        policy.found("n", younger, addr_at(bound + 1));
+        policy.found("n", older, &[addr_at(bound + 2)]);
+        policy.found("n", younger, &[addr_at(bound + 1)]);
         assert!(policy.due(now()).is_empty(), "the bound holds while full");
         policy.dial_result(now(), fp_at(1), DialOutcome::Linked);
         assert_eq!(
@@ -866,10 +904,10 @@ mod tests {
         // The oldest tracked instance, not linked, is evicted.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         assert_eq!(
-            policy.found("n", beyond, addr_at(bound + 1)),
+            policy.found("n", beyond, &[addr_at(bound + 1)]),
             vec![Action::Found(addr_at(bound + 1))],
             "the find reports, without an eviction event"
         );
@@ -881,11 +919,11 @@ mod tests {
         // A linked instance is kept, and its successor is evicted.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         policy.dial_result(now(), fp_at(1), DialOutcome::Linked);
         assert_eq!(
-            policy.found("n", beyond, addr_at(bound + 1)),
+            policy.found("n", beyond, &[addr_at(bound + 1)]),
             vec![Action::Found(addr_at(bound + 1)), Action::Dial],
             "the evicted dial still holds one place"
         );
@@ -898,13 +936,13 @@ mod tests {
         // A bound full of linked instances takes no find.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         for i in 1..=bound {
             policy.dial_result(now(), fp_at(i), DialOutcome::Linked);
         }
         assert!(
-            policy.found("n", beyond, addr_at(bound + 1)).is_empty(),
+            policy.found("n", beyond, &[addr_at(bound + 1)]).is_empty(),
             "a bound full of links takes no find"
         );
         assert_eq!(policy.state(&beyond), None);
@@ -912,13 +950,38 @@ mod tests {
         // A find of a tracked instance takes no eviction.
         let mut policy = autolink();
         for i in 1..=bound {
-            policy.found("n", fp_at(i), addr_at(i));
+            policy.found("n", fp_at(i), &[addr_at(i)]);
         }
         assert_eq!(
-            policy.found("n", fp_at(1), addr_at(bound + 1)),
+            policy.found("n", fp_at(1), &[addr_at(bound + 1)]),
             vec![Action::Found(addr_at(bound + 1))],
             "a tracked instance re-found takes no eviction"
         );
         assert_eq!(policy.state(&fp_at(2)), Some(InstanceState::New));
+    }
+
+    /// A resolve replaces the instance's address set with the addresses it
+    /// resolved at, so a set never grows past one resolve.
+    #[test]
+    fn a_resolve_replaces_the_instance_addresses() {
+        let mut policy = autolink();
+        policy.found("n", PEER, &[ADDR]);
+        // A second resolve at a different address replaces the first.
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            vec![Action::Found(ADDR2)],
+            "the new address reports once"
+        );
+        assert_eq!(
+            policy.addresses(&PEER),
+            vec![ADDR2],
+            "the resolve's addresses stand alone"
+        );
+        // A repeated resolve of the same set reports nothing.
+        assert_eq!(
+            policy.found("n", PEER, &[ADDR2]),
+            Vec::<Action>::new(),
+            "a repeat reports nothing"
+        );
     }
 }

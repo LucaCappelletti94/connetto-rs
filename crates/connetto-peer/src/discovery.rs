@@ -290,6 +290,8 @@ async fn serve_round(
     } else {
         warn!("the advertisement will not register, so the browse alone serves");
     }
+    // The round's retry timers, one per fingerprint, ending with it.
+    let mut retry_timers: HashMap<Fingerprint, tokio::task::JoinHandle<()>> = HashMap::new();
     let re_browse = {
         loop {
             tokio::select! {
@@ -316,14 +318,14 @@ async fn serve_round(
                                 None => policy.linked(fp),
                                 Some(reason) => policy.unlinked(Instant::now(), fp, reason),
                             };
-                            arm_retry(commands_tx, policy, fp);
+                            arm_retry(&mut retry_timers, commands_tx, policy, fp);
                         }
                         // The dial's truth is the link's, so a late outcome
                         // lands on the state the machine holds.
                         Command::DialOutcome { fp, outcome } => {
                             let now = Instant::now();
                             policy.dial_result(now, fp, outcome);
-                            arm_retry(commands_tx, policy, fp);
+                            arm_retry(&mut retry_timers, commands_tx, policy, fp);
                             // The ended dial frees its place, and the due
                             // dials take their turn.
                             for queued in policy.due(now) {
@@ -355,10 +357,7 @@ async fn serve_round(
                                 .iter()
                                 .map(|ip| SocketAddr::new(ip.to_ip_addr(), resolved.port))
                                 .collect();
-                            let mut actions = Vec::new();
-                            for address in addresses {
-                                actions.append(&mut policy.found(&name, fp, address));
-                            }
+                            let actions = policy.found(&name, fp, &addresses);
                             apply(&actions, fp, node, commands_tx, events, policy);
                         }
                         ServiceEvent::ServiceRemoved(_service_type, fullname) => {
@@ -366,8 +365,8 @@ async fn serve_round(
                                 continue;
                             };
                             // The peer may have re-advertised under a fresh
-                            // name before this goodbye; only the last name's
-                            // removal reports the peer gone.
+                            // name before this goodbye, so only the last
+                            // name's removal reports the peer gone.
                             let last_name = !names.values().any(|still| *still == fp);
                             let actions = if last_name {
                                 policy.removed(fp)
@@ -401,6 +400,10 @@ async fn serve_round(
             }
         }
     };
+    // The round ends, so its timers go with it.
+    for (_, timer) in retry_timers.drain() {
+        timer.abort();
+    }
     if let Some(fullname) = registered {
         let _ = daemon.unregister(&fullname);
     }
@@ -476,21 +479,40 @@ fn apply(
     }
 }
 
-/// The timer that wakes the runner when the instance's retry is due. A
-/// replacement deadline leaves the old timer behind, and the late wake finds
-/// the dial already in flight.
-fn arm_retry(commands_tx: &mpsc::WeakUnboundedSender<Command>, policy: &Policy, fp: Fingerprint) {
-    if let Some(at) = policy.retry_at(&fp) {
-        let commands_tx = commands_tx.clone();
-        let at = tokio::time::Instant::from_std(at);
-        tokio::spawn(async move {
-            tokio::time::sleep_until(at).await;
-            // The driver is gone, so the timer it served is done.
-            let Some(commands_tx) = commands_tx.upgrade() else {
-                return;
-            };
-            let _ = commands_tx.send(Command::RetryDue);
-        });
+/// The retry timer one outcome arms, one per fingerprint and owned by the
+/// round. A replacement deadline aborts the earlier timer, the drop of the
+/// retry aborts it, and the round's end aborts the rest.
+fn arm_retry(
+    timers: &mut HashMap<Fingerprint, tokio::task::JoinHandle<()>>,
+    commands_tx: &mpsc::WeakUnboundedSender<Command>,
+    policy: &Policy,
+    fp: Fingerprint,
+) {
+    match policy.retry_at(&fp) {
+        Some(at) => {
+            if let Some(earlier) = timers.remove(&fp) {
+                earlier.abort();
+            }
+            let commands_tx = commands_tx.clone();
+            let at = tokio::time::Instant::from_std(at);
+            timers.insert(
+                fp,
+                tokio::spawn(async move {
+                    tokio::time::sleep_until(at).await;
+                    // The driver is gone, so the timer it served is done.
+                    let Some(commands_tx) = commands_tx.upgrade() else {
+                        return;
+                    };
+                    let _ = commands_tx.send(Command::RetryDue);
+                }),
+            );
+        }
+        // The retry dropped, so the timer that served it goes with it.
+        None => {
+            if let Some(earlier) = timers.remove(&fp) {
+                earlier.abort();
+            }
+        }
     }
 }
 
@@ -607,5 +629,45 @@ mod tests {
             None,
             "a non-hex value is refused"
         );
+    }
+
+    /// The retry timer stands one per fingerprint. A replacement deadline
+    /// aborts the earlier timer, and the round's end aborts the rest.
+    #[tokio::test]
+    async fn a_replaced_retry_timer_aborts_its_predecessor() {
+        use super::{Command, arm_retry};
+        use crate::policy::{DialOutcome, FIRST_WAIT, Policy};
+        use std::collections::HashMap;
+        use std::time::{Duration, Instant};
+        use tokio::sync::mpsc;
+
+        tokio::time::pause();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Command>();
+        let weak = tx.downgrade();
+        let fp = Fingerprint::new([1; 32]);
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], 443));
+        let mut policy = Policy::new(Fingerprint::new([0; 32]), true);
+        policy.found("n", fp, &[addr]);
+        // The dial ends unreachable, so the first retry is due after the
+        // first wait, and the next outcome moves the deadline.
+        policy.dial_result(Instant::now(), fp, DialOutcome::Unreachable);
+        let mut timers: HashMap<Fingerprint, tokio::task::JoinHandle<()>> = HashMap::new();
+        arm_retry(&mut timers, &weak, &policy, fp);
+        assert_eq!(timers.len(), 1, "one timer stands for the instance");
+        policy.dial_result(Instant::now(), fp, DialOutcome::Unreachable);
+        arm_retry(&mut timers, &weak, &policy, fp);
+        assert_eq!(timers.len(), 1, "the replacement stands alone");
+        // The earlier deadline passes, and its aborted timer wakes nothing.
+        tokio::time::advance(FIRST_WAIT + Duration::from_millis(10)).await;
+        tokio::task::yield_now().await;
+        assert!(rx.try_recv().is_err(), "the aborted timer woke late");
+        // The replacement deadline passes, and its timer wakes once.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            matches!(rx.try_recv().ok(), Some(Command::RetryDue)),
+            "the replacement wakes its dial"
+        );
+        assert!(rx.try_recv().is_err(), "one wake per timer");
     }
 }

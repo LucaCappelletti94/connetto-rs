@@ -59,6 +59,9 @@ class HotspotPlugin {
         private var hostPassphrase: String? = null
         private var hostSecurity: Int = SECURITY_WPA2
         private var hostFailure: String? = null
+        // The host request each callback stands tagged with, so a stale
+        // callback is told from the current one.
+        private var hostRequest: Long = 0
         private var reservation: WifiManager.LocalOnlyHotspotReservation? = null
 
         private var joinState: Int = JOIN_IDLE
@@ -93,11 +96,18 @@ class HotspotPlugin {
                 }
                 hostState = HOST_PENDING
                 val wifi = context.getSystemService(Context.WIFI_SERVICE) as WifiManager
+                hostRequest += 1
+                val request = hostRequest
                 val callback = object : WifiManager.LocalOnlyHotspotCallback() {
                     @Suppress("DEPRECATION")
                     override fun onStarted(started: WifiManager.LocalOnlyHotspotReservation) {
                         synchronized(lock) {
-                            if (hostState != HOST_PENDING) return
+                            // The request stands stopped or replaced, so
+                            // the hotspot it started goes with it.
+                            if (request != hostRequest || hostState != HOST_PENDING) {
+                                started.close()
+                                return
+                            }
                             reservation = started
                             val config =
                                 runCatching { started.getSoftApConfiguration() }
@@ -127,6 +137,7 @@ class HotspotPlugin {
 
                     override fun onStopped() {
                         synchronized(lock) {
+                            if (request != hostRequest) return
                             if (hostState == HOST_STARTED) {
                                 hostState = HOST_STOPPED
                             }
@@ -135,6 +146,7 @@ class HotspotPlugin {
 
                     override fun onFailed(status: Int) {
                         synchronized(lock) {
+                            if (request != hostRequest) return
                             if (hostState != HOST_PENDING) return
                             hostState = HOST_FAILED
                             hostFailure = when (status) {
@@ -207,7 +219,6 @@ class HotspotPlugin {
                         synchronized(lock) {
                             if (joinState != JOIN_PENDING) return
                             joinNetwork = network
-                            joinCallback = this
                         }
                     }
 
@@ -226,7 +237,12 @@ class HotspotPlugin {
 
                     override fun onUnavailable() {
                         synchronized(lock) {
-                            if (joinState == JOIN_PENDING) joinState = JOIN_UNAVAILABLE
+                            if (joinState != JOIN_PENDING) return
+                            joinState = JOIN_UNAVAILABLE
+                            // The platform dropped the request, so the
+                            // callback stands unregistered.
+                            joinCallback = null
+                            joinNetwork = null
                         }
                     }
 
@@ -241,6 +257,9 @@ class HotspotPlugin {
                 }
                 try {
                     cm.requestNetwork(request, callback, timeoutMs.toInt())
+                    // The request stands registered, so a later leave or
+                    // join unregisters it.
+                    joinCallback = callback
                     joinState = JOIN_PENDING
                 } catch (e: Exception) {
                     joinState = JOIN_UNAVAILABLE

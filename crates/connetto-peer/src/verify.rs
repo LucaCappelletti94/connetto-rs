@@ -128,11 +128,15 @@ impl PeerVerifier {
         let mut first: Option<webpki::Error> = None;
         let mut fatal: Option<webpki::Error> = None;
         for attempt in attempts {
-            let time = UnixTime::since_unix_epoch(
-                attempt
-                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
-                    .expect("the clock stands after the epoch"),
-            );
+            // An attempt before the epoch stands in no representable time,
+            // so it skips.
+            let Some(secs) = attempt
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                .ok()
+            else {
+                continue;
+            };
+            let time = UnixTime::since_unix_epoch(secs);
             match leaf.verify_for_usage(
                 self.algs.all,
                 anchors,
@@ -173,9 +177,12 @@ impl PeerVerifier {
                 }
             }
         }
-        Err(classify(
-            &fatal.or(first).expect("every attempt records its error"),
-        ))
+        match fatal.or(first) {
+            Some(err) => Err(classify(&err)),
+            // Every attempt stood before the epoch, so the chain is
+            // refused, not the verifier.
+            None => Err(Refusal::Profile),
+        }
     }
 }
 

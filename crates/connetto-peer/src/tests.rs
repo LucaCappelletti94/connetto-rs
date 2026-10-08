@@ -262,6 +262,16 @@ impl crate::Clock for ShiftedClock {
     }
 }
 
+/// A clock fixed at a moment, for the epoch proofs.
+#[derive(Debug)]
+struct FixedClock(SystemTime);
+
+impl crate::Clock for FixedClock {
+    fn now(&self) -> SystemTime {
+        self.0
+    }
+}
+
 /// A trust over `roots` accepting `accepted`, behind `clock`.
 fn node_on(
     roots: Vec<Vec<u8>>,
@@ -824,6 +834,98 @@ async fn a_clock_outside_the_window_refuses_and_a_small_skew_links() {
     honest_node.stop(CloseReason::Closed);
     skewed_node.stop(CloseReason::Closed);
     tolerant_node.stop(CloseReason::Closed);
+}
+
+/// A clock standing seconds after the epoch skips the attempt before the
+/// epoch and refuses with a typed reason, and a clock standing before the
+/// epoch, where no attempt is representable, refuses the chain.
+#[tokio::test]
+async fn a_clock_at_the_epoch_refuses_without_a_panic() {
+    let now = whole_second();
+    let deployment = Deployment::new(22, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+
+    let honest = deployment.device(
+        &issuer,
+        "honest",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let early = deployment.device(
+        &issuer,
+        "early",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let pre = deployment.device(
+        &issuer,
+        "pre",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (o_tx, mut o_rx) = events();
+    let honest_node = node(deployment.root_der(), o_tx);
+    // The early node's clock stands ten seconds after the epoch, so its
+    // minus-tolerance attempt stands before the epoch.
+    let (s_tx, mut s_rx) = events();
+    let early_node = node_on(
+        vec![deployment.root_der()],
+        all_levels(),
+        Arc::new(FixedClock(SystemTime::UNIX_EPOCH + Duration::from_secs(10))),
+        s_tx,
+    );
+    // The pre node's clock stands ten minutes before the epoch, so no
+    // attempt of its verifier is representable.
+    let (p_tx, mut p_rx) = events();
+    let pre_node = node_on(
+        vec![deployment.root_der()],
+        all_levels(),
+        Arc::new(FixedClock(
+            SystemTime::UNIX_EPOCH - Duration::from_secs(600),
+        )),
+        p_tx,
+    );
+
+    let honest_addr = serve(&honest_node, &honest);
+    serve(&early_node, &early);
+    serve(&pre_node, &pre);
+
+    // The early clock's dial meets the refusal its verifier stands, with the
+    // attempt before the epoch skipped.
+    let err = early_node
+        .link(honest_addr)
+        .await
+        .expect_err("refused by the early clock");
+    assert!(
+        matches!(err, LinkError::Refused(Refusal::NotYetValid)),
+        "got {err:?}"
+    );
+
+    // The pre clock's dial meets the refusal no representable attempt leaves.
+    let err = pre_node
+        .link(honest_addr)
+        .await
+        .expect_err("refused by the pre clock");
+    assert!(
+        matches!(err, LinkError::Refused(Refusal::Profile)),
+        "got {err:?}"
+    );
+
+    // No events on either side for the refused handshakes.
+    no_events(&mut o_rx, Duration::from_secs(1)).await;
+    no_events(&mut s_rx, Duration::from_secs(1)).await;
+    no_events(&mut p_rx, Duration::from_secs(1)).await;
+
+    honest_node.stop(CloseReason::Closed);
+    early_node.stop(CloseReason::Closed);
+    pre_node.stop(CloseReason::Closed);
 }
 
 /// Proof 6.

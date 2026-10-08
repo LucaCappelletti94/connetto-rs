@@ -388,11 +388,20 @@ impl connetto_peer::SocketPrep for JoinedBind {
             return Ok(());
         }
         let fd = sock.as_fd().as_raw_fd();
-        call(&*self.java, |env| {
+        let bound = call(&*self.java, |env| {
             let class = plugin(env)?;
-            env.call_static_method(class, "bindSocket", "(I)Z", &[JValue::from(fd)])?;
-            Ok(())
+            let bound = env
+                .call_static_method(class, "bindSocket", "(I)Z", &[JValue::from(fd)])?
+                .z()?;
+            Ok(bound)
         })
-        .map_err(|failure| std::io::Error::new(std::io::ErrorKind::Other, failure.to_string()))
+        .map_err(|failure| std::io::Error::new(std::io::ErrorKind::Other, failure.to_string()))?;
+        if !bound {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "the joined network will not take the dial's socket",
+            ));
+        }
+        Ok(())
     }
 }
