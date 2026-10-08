@@ -530,7 +530,7 @@ type IssuerBytes = (Vec<u8>, Vec<u8>);
 /// A root and two issuers it signed, each as its certificate and PKCS #8 key,
 /// so a test loads one issuer into two configurations.
 fn root_and_two_issuers() -> (connetto_core::device_cert::RootCa, IssuerBytes, IssuerBytes) {
-    use connetto_core::device_cert::{DeploymentId, RootCa};
+    use connetto_core::device_cert::{CertificateSerial, DeploymentId, RootCa};
     let now = std::time::SystemTime::now();
     let day = Duration::from_hours(24);
     let root = RootCa::create(
@@ -546,7 +546,7 @@ fn root_and_two_issuers() -> (connetto_core::device_cert::RootCa, IssuerBytes, I
                 &key.subject_public_key_info(),
                 now - day,
                 395 * day,
-                [serial; 16],
+                CertificateSerial::new([serial; 16]).expect("the serial is positive"),
             )
             .expect("issuer");
         (cert, key.serialize_der())

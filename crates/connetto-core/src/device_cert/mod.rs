@@ -15,6 +15,7 @@ mod key;
 pub mod layout;
 mod request;
 mod revocation;
+mod serial;
 
 pub use attestation::{
     ANDROID_ATTESTATION_CHALLENGE, ATTESTATION_EXTENSION, ATTESTATION_OID_IS_STAND_IN,
@@ -29,6 +30,7 @@ pub use revocation::{
     ListError, RevocationList, Revoked, certificate_key_id, certificate_serial, verify_chain,
     verify_signer,
 };
+pub use serial::CertificateSerial;
 
 /// What an application tells the lost-device list about a device, a tuple or a
 /// struct it defines, sent at enrolment in `MessagePack` of at most 4096 bytes.

@@ -1,5 +1,6 @@
 #![doc = include_str!("../README.md")]
 
+use std::convert::Infallible;
 use std::fs::OpenOptions;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -9,8 +10,8 @@ use connetto_core::device_cert::layout::{
     ISSUER_CERTIFICATE, ISSUER_KEY, ROOT_CERTIFICATE, ROOT_LIST,
 };
 use connetto_core::device_cert::{
-    DeploymentId, IssuerError, ListError, RevocationList, Revoked, RootCa, RootError,
-    certificate_serial, verify_signer,
+    CertificateSerial, DeploymentId, IssuerError, ListError, RevocationList, Revoked, RootCa,
+    RootError, certificate_serial, verify_signer,
 };
 use pkcs8::{EncryptedPrivateKeyInfo, PrivateKeyInfo};
 use rand_core::{OsRng, RngCore as _};
@@ -99,6 +100,11 @@ pub fn init(dir: &Path, passphrase: &str, now: SystemTime) -> Result<DeploymentI
 /// [`CaError::Passphrase`] when the passphrase does not open the root key,
 /// [`CaError::Exists`] when `out_dir` already holds an issuer, or the error
 /// of a step that failed.
+///
+/// # Panics
+///
+/// When the system source refuses a serial draw, which the OS source does
+/// not.
 pub fn sign_issuer(
     ca_dir: &Path,
     passphrase: &str,
@@ -110,8 +116,11 @@ pub fn sign_issuer(
     refuse_existing(&[&certificate_path, &key_path])?;
     let root = open_root(ca_dir, passphrase)?;
     let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256)?;
-    let mut serial = [0_u8; 16];
-    OsRng.fill_bytes(&mut serial);
+    let serial = CertificateSerial::random(|bytes: &mut [u8]| -> Result<(), Infallible> {
+        OsRng.fill_bytes(bytes);
+        Ok(())
+    })
+    .expect("the system source draws a serial");
     let certificate = root.sign_issuer(
         &issuer_key.subject_public_key_info(),
         now,
