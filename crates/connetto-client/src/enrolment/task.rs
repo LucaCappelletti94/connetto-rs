@@ -2,7 +2,7 @@
 //! one line of R74's lifecycle table per branch.
 
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -269,6 +269,10 @@ pub(crate) struct Enroller {
     commands: mpsc::UnboundedReceiver<Command>,
     published: watch::Sender<Option<DeviceCertificate>>,
     home: watch::Sender<Option<KeyHome>>,
+    /// Whether the local clock puts the held certificate outside its window
+    /// (decision 29), shared with the handle so a dial reads the standing the
+    /// task does (R76).
+    clock_off: Arc<AtomicBool>,
     #[cfg(feature = "peer")]
     peer: Option<Peer>,
 }
@@ -279,6 +283,10 @@ pub(crate) struct EnrolHandle {
     commands: mpsc::UnboundedSender<Command>,
     published: watch::Receiver<Option<DeviceCertificate>>,
     home: watch::Receiver<Option<KeyHome>>,
+    #[cfg(feature = "peer")]
+    /// The task's clock-off latch, its dials refusing by the window while it
+    /// is set (R76).
+    clock_off: Arc<AtomicBool>,
     #[cfg(feature = "peer")]
     peer: connetto_peer::Node,
 }
@@ -309,6 +317,7 @@ impl Enroller {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
         let (home, homed) = watch::channel(None);
+        let clock_off = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "peer")]
         let peer_node = peer.node.clone();
         (
@@ -323,6 +332,7 @@ impl Enroller {
                 commands,
                 published,
                 home,
+                clock_off: Arc::clone(&clock_off),
                 #[cfg(feature = "peer")]
                 peer: Some(peer),
             },
@@ -331,6 +341,8 @@ impl Enroller {
                 commands: sender,
                 published: observed,
                 home: homed,
+                #[cfg(feature = "peer")]
+                clock_off,
                 #[cfg(feature = "peer")]
                 peer: peer_node,
             },
@@ -399,6 +411,9 @@ impl EnrolHandle {
         let held = self.published.borrow().clone();
         match Standing::of_leaf(held.as_ref(), SystemTime::now()) {
             Standing::NoKey => Err(PeerError::NoIdentity),
+            Standing::Expired if self.clock_off.load(Ordering::Acquire) => {
+                Err(PeerError::ClockOutsideWindow)
+            }
             Standing::Expired => {
                 let _ = self.commands.send(Command::CertificateExpired);
                 Err(PeerError::CertificateExpired)
@@ -494,9 +509,6 @@ struct Run<L> {
     kept: HashMap<Vec<u8>, KeptList>,
     /// A certificate the root withdrew, whose key enrols again.
     withdrawn: Option<Withdrawn>,
-    /// Whether the local clock puts the held certificate outside its window
-    /// (decision 29).
-    clock_off: bool,
     /// Whether the deployment refused the device's attestation level, so it
     /// asks again only on its next connection (decision 33).
     attestation_refused: bool,
@@ -732,7 +744,7 @@ impl<L: Link> Run<L> {
         match standing {
             Standing::ClockOff => self.clock_outside(false),
             Standing::Expired => self.clock_outside(true),
-            _ => self.clock_off = false,
+            _ => self.enroller.clock_off.store(false, Ordering::Release),
         }
         #[cfg(feature = "peer")]
         self.peer_transition(standing).await;
@@ -873,9 +885,11 @@ impl<L: Link> Run<L> {
                 self.clock_outside(false);
                 Standing::ClockOff
             }
-            Standing::Expired if self.clock_off => Standing::ClockOff,
+            Standing::Expired if self.enroller.clock_off.load(Ordering::Acquire) => {
+                Standing::ClockOff
+            }
             standing => {
-                self.clock_off = false;
+                self.enroller.clock_off.store(false, Ordering::Release);
                 standing
             }
         }
@@ -883,8 +897,7 @@ impl<L: Link> Run<L> {
 
     /// Enter `ClockOff`, raising `ClockOutsideWindow` once (decision 29).
     fn clock_outside(&mut self, ahead: bool) {
-        if !self.clock_off {
-            self.clock_off = true;
+        if !self.enroller.clock_off.swap(true, Ordering::Release) {
             self.link.emit(ClientEvent::ClockOutsideWindow { ahead });
         }
     }
@@ -1042,7 +1055,6 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         key: None,
         kept,
         withdrawn: None,
-        clock_off: false,
         attestation_refused: false,
         #[cfg(feature = "peer")]
         peer: peer.node,

@@ -1622,6 +1622,135 @@ async fn a_dial_nobody_answers_or_without_an_identity_fails_typed() {
     ));
 }
 
+/// A peer that closes the link before its hello is unreachable, not a
+/// protocol break.
+#[tokio::test]
+async fn a_peer_that_closes_before_its_hello_is_unreachable() {
+    let now = whole_second();
+    let deployment = Deployment::new(20, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let peer = deployment.device(
+        &issuer,
+        "peer",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let dialer = deployment.device(
+        &issuer,
+        "dialer",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    // A raw server on the peer's identity, completing the handshake and
+    // closing before the peer's hello.
+    let crls = Arc::new(parking_lot::RwLock::new(Arc::from(
+        Vec::<crate::verify::Crl>::new().into_boxed_slice(),
+    )));
+    let config = crate::node::server_config_for(
+        &trust_root(deployment.root_der()),
+        Arc::new(SystemClock),
+        Some(peer.key_id()),
+        crls,
+        &peer.identity(),
+    );
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the loopback binds");
+    let addr = listener.local_addr().expect("its address");
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("the dialer connects");
+        let tls = acceptor.accept(tcp).await.expect("the handshake completes");
+        drop(tls);
+    });
+    let (d_tx, _d_rx) = events();
+    let dialer_node = node(deployment.root_der(), d_tx);
+    let _served = serve(&dialer_node, &dialer);
+    let err = dialer_node
+        .link(addr)
+        .await
+        .expect_err("the hello never comes");
+    assert!(
+        matches!(err, LinkError::Unreachable(_)),
+        "a closed peer is unreachable, got {err:?}"
+    );
+}
+
+/// Decision 13. The listener runs at most 16 inbound handshakes at once and
+/// closes a connection beyond that at accept, and a real peer links after
+/// the stalled ones give up their sockets.
+#[tokio::test]
+async fn a_seventeenth_inbound_connection_is_closed_at_accept() {
+    use tokio::io::AsyncReadExt;
+
+    let now = whole_second();
+    let deployment = Deployment::new(21, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let peer = deployment.device(
+        &issuer,
+        "peer",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // Sixteen connections that send nothing, each holding an inbound
+    // handshake for the ten-second bound.
+    let mut stalled = Vec::with_capacity(16);
+    for _ in 0..16 {
+        stalled.push(
+            tokio::net::TcpStream::connect(host_addr)
+                .await
+                .expect("it connects"),
+        );
+    }
+    // The seventeenth gets closed at accept, at once.
+    let mut seventeenth = tokio::net::TcpStream::connect(host_addr)
+        .await
+        .expect("it connects");
+    let mut eof = [0u8; 8];
+    assert_eq!(
+        time::timeout(Duration::from_secs(5), seventeenth.read(&mut eof))
+            .await
+            .expect("the close is readable within the bound")
+            .expect("a close ends the read"),
+        0,
+        "the seventeenth connection is closed at accept"
+    );
+    // The stalled handshakes give up their sockets, and a real peer links.
+    drop(stalled);
+    // A bound for the stalled handshakes to notice the close and free their
+    // places.
+    time::sleep(Duration::from_secs(1)).await;
+    let _raw = raw_linked(deployment.root_der(), &peer, host_addr).await;
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Linked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Linked {
+            peer: peer.identity.clone()
+        }
+    );
+}
+
 #[tokio::test]
 async fn a_peer_speaking_another_version_is_refused_both_ways() {
     let now = whole_second();

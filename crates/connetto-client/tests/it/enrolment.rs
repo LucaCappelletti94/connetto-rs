@@ -1869,17 +1869,17 @@ async fn peer_report() {
         matches!(refused, connetto_client::PeerError::Link(_)),
         "the refusal is a dial refusal, got {refused:?}"
     );
-    let until = Instant::now() + Duration::from_secs(3);
-    let mut linked_c = false;
-    while Instant::now() < until {
-        if let Ok(event) = b_events.try_recv() {
-            linked_c |= matches!(
+    assert!(
+        next_event(&mut b_events, Duration::from_secs(3), |event| {
+            matches!(
                 event,
                 ClientEvent::PeerLinked { peer } if peer.key() == c_cert.identity().key()
-            );
-        }
-    }
-    assert!(!linked_c, "b never links c");
+            )
+        })
+        .await
+        .is_none(),
+        "b never links c"
+    );
 
     a.close().await;
     b2.close().await;

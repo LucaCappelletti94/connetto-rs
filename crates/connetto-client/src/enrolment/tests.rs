@@ -425,6 +425,9 @@ struct FakeLink {
     ask: Ask,
     /// A grant answer waits on it first, so a test holds the renewal open.
     gate: Option<Arc<tokio::sync::Notify>>,
+    /// A granted leaf's `not_before`, so a test's clock can stand past
+    /// `not_after` when the grant lands.
+    grant_from: Option<SystemTime>,
 }
 
 impl Link for FakeLink {
@@ -497,7 +500,7 @@ impl Link for FakeLink {
                                 .issue(
                                     &request,
                                     "alice",
-                                    SystemTime::now(),
+                                    self.grant_from.unwrap_or_else(SystemTime::now),
                                     12 * HOUR,
                                     serial,
                                     AttestationLevel::Unproven,
@@ -660,6 +663,7 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::AttestationRequired),
         gate: None,
+        grant_from: None,
     };
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -742,6 +746,7 @@ async fn a_renewal_sends_no_attestation() {
         certificate: authority.certificate,
         ask: Ask::Grant,
         gate: None,
+        grant_from: None,
     };
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -794,6 +799,7 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::Revoked),
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -849,6 +855,7 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::OverCeiling { ceiling_secs: 600 }),
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -897,6 +904,7 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::ChallengeExpired),
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -944,6 +952,7 @@ async fn a_reissue_with_no_answer_is_offline() {
         certificate: authority.certificate,
         ask: Ask::Silent,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -993,6 +1002,7 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1040,6 +1050,7 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
         certificate: authority.certificate,
         ask: Ask::Violated,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1265,6 +1276,7 @@ async fn a_fresh_device_serves_its_peer_listener_at_open() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1307,6 +1319,7 @@ async fn an_expired_device_refuses_to_link_and_raises_the_event() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1367,6 +1380,7 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1416,6 +1430,79 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
     run.await.expect("the run ends");
 }
 
+/// A grant the local clock already puts past `not_after` lands the task in
+/// the window refusal, so a dial is refused by the window, not the expiry,
+/// and no expiry event joins the task's own (R76 proof 3).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_grant_past_its_window_refuses_the_dial_as_a_window() {
+    let (_, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    // The server just granted it, so a window that does not hold it now says
+    // the local clock runs ahead of `not_after`.
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: Some(now - 13 * HOUR),
+    };
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        peer,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| !state.lock().stored.is_empty()).await;
+    let err = handle
+        .link_peer("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect_err("the window refuses the dial");
+    assert!(
+        matches!(err, PeerError::ClockOutsideWindow),
+        "the refusal names the window, got {err:?}"
+    );
+    // The window event is the task's own, raised once at the grant.
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ClockOutsideWindow { ahead: true }))
+    })
+    .await;
+    assert!(
+        state
+            .lock()
+            .emitted
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::CertificateExpired)),
+        "a window refusal is not an expiry"
+    );
+    assert!(
+        handle.peer_address().is_none(),
+        "nothing serves a window-out identity"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
 /// The refusal of a device that holds no certificate (R76 proof 4).
 #[cfg(feature = "peer")]
 #[tokio::test]
@@ -1435,6 +1522,7 @@ async fn a_certificate_less_device_refuses_to_link() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1498,6 +1586,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1592,6 +1681,7 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
         certificate: authority.certificate,
         ask: Ask::Grant,
         gate: Some(gate.clone()),
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1694,6 +1784,7 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1820,6 +1911,7 @@ async fn a_stale_peer_list_changes_nothing() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1925,6 +2017,7 @@ async fn two_clients_discover_each_other_and_autolink() {
         certificate: authority.certificate.clone(),
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let link_b = FakeLink {
         state: Arc::clone(&state_b),
@@ -1934,6 +2027,7 @@ async fn two_clients_discover_each_other_and_autolink() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller_a, _handle_a) = Enroller::new(
         Arc::new(RunKeys { der: der_a }),
@@ -1973,6 +2067,10 @@ async fn two_clients_discover_each_other_and_autolink() {
 /// only the one that calls `link_peer` (R76 proof 4).
 #[cfg(feature = "peer")]
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the two reports and the call's one link are one scenario, in the order discovery crosses them"
+)]
 async fn clients_without_autolink_report_and_link_only_on_the_call() {
     if !loopback_multicast() {
         eprintln!("the host will not multicast on the loopback, so the discovery proof skips");
@@ -2005,6 +2103,7 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         certificate: authority.certificate.clone(),
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let link_b = FakeLink {
         state: Arc::clone(&state_b),
@@ -2014,6 +2113,7 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         certificate: authority.certificate,
         ask: Ask::Lost,
         gate: None,
+        grant_from: None,
     };
     let (enroller_a, handle_a) = Enroller::new(
         Arc::new(RunKeys { der: der_a }),
