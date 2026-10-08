@@ -315,7 +315,7 @@ async fn a_chip_proven_enrolment_records_its_level_and_a_renewal_keeps_it() {
 /// operator copies it to the server: `root.der` beside an issuer directory.
 fn ca_output(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
     use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY, ROOT_CERTIFICATE};
-    use connetto_core::device_cert::{DeploymentId, RootCa};
+    use connetto_core::device_cert::{CertificateSerial, DeploymentId, RootCa};
     use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
     use std::time::{Duration, SystemTime};
 
@@ -333,7 +333,7 @@ fn ca_output(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) 
             &key.subject_public_key_info(),
             now - day,
             395 * day,
-            [2; 16],
+            CertificateSerial::new([2; 16]).expect("the serial is positive"),
         )
         .expect("issuer");
     let issuer_dir = dir.join("issuer-2026");

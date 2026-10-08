@@ -1,6 +1,6 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use connetto_core::device_cert::{DeploymentId, DeviceIssuer, RootCa};
+use connetto_core::device_cert::{CertificateSerial, DeploymentId, DeviceIssuer, RootCa};
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
 
 use super::*;
@@ -21,7 +21,12 @@ fn issuer(valid_for: Duration) -> DeviceIssuer {
     .expect("root");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let cert = root
-        .sign_issuer(&key.subject_public_key_info(), start(), valid_for, [1; 16])
+        .sign_issuer(
+            &key.subject_public_key_info(),
+            start(),
+            valid_for,
+            CertificateSerial::new([1; 16]).expect("the serial is positive"),
+        )
         .expect("issuer");
     DeviceIssuer::new(cert, key, root.certificate()).expect("load")
 }
@@ -90,7 +95,12 @@ fn issuer_and_secret(valid_for: Duration) -> (DeviceIssuer, Vec<u8>) {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let secret = key.serialize_der();
     let cert = root
-        .sign_issuer(&key.subject_public_key_info(), start(), valid_for, [1; 16])
+        .sign_issuer(
+            &key.subject_public_key_info(),
+            start(),
+            valid_for,
+            CertificateSerial::new([1; 16]).expect("the serial is positive"),
+        )
         .expect("issuer");
     let issuer = DeviceIssuer::new(cert, key, root.certificate()).expect("load");
     (issuer, secret)
@@ -114,5 +124,32 @@ fn a_debug_render_carries_no_private_key() {
                 .any(|window| window == secret.as_slice()),
             "the render carries the key's bytes"
         );
+    }
+}
+
+#[test]
+fn a_thousand_random_serials_read_back_as_issued() {
+    use connetto_core::device_cert::{AttestationLevel, CertificateRequest, DeviceCertificate};
+    use ring::rand::{SecureRandom, SystemRandom};
+    let issuer = issuer(30 * DAY);
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key");
+    let csr = CertificateRequest::build(&key, &[7; 32]).expect("the request builds");
+    let request = CertificateRequest::parse(&csr).expect("the request parses");
+    let random = SystemRandom::new();
+    for _ in 0..1000 {
+        let serial =
+            CertificateSerial::random(|bytes| SecureRandom::fill(&random, bytes)).expect("a draw");
+        let leaf = issuer
+            .issue(
+                &request,
+                "alice",
+                start(),
+                DAY,
+                serial,
+                AttestationLevel::Unproven,
+            )
+            .expect("issued");
+        let parsed = DeviceCertificate::parse(&leaf).expect("the profile");
+        assert_eq!(parsed.serial(), serial.as_bytes().as_slice());
     }
 }

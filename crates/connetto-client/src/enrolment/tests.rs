@@ -7,9 +7,9 @@ use std::time::{Instant, SystemTime};
 
 use base64::Engine as _;
 use connetto_core::device_cert::{
-    AttestationLevel, CertificateRequest, CertificateSigner, DeploymentId, DeviceCertificate,
-    DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RevocationList, Revoked, RootCa,
-    public_key_info,
+    AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
+    DeviceCertificate, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RevocationList, Revoked,
+    RootCa, public_key_info,
 };
 use connetto_core::messages::{ControlMessage, DeviceAttestation, EnrolRefusal, SyncStatus};
 use diesel::Connection as _;
@@ -84,7 +84,7 @@ async fn held(not_before: SystemTime, lifetime: Duration) -> Held {
             &public_key_info(&issuer_key.key),
             not_before - 10 * HOUR,
             400 * 24 * HOUR,
-            [2; 16],
+            CertificateSerial::new([2; 16]).expect("the serial is positive"),
         )
         .expect("issuer");
     let issuer = DeviceIssuer::from_pkcs8(issuer_der.clone(), &issuer_pkcs8, root.certificate())
@@ -98,7 +98,7 @@ async fn held(not_before: SystemTime, lifetime: Duration) -> Held {
             "alice",
             not_before,
             lifetime,
-            [3; 16],
+            CertificateSerial::new([3; 16]).expect("the serial is positive"),
             AttestationLevel::Unproven,
         )
         .expect("issue");
@@ -220,7 +220,7 @@ async fn a_lower_number_never_replaces_a_higher_and_an_equal_one_with_other_cont
             &public_key_info(&issuer_key.key),
             start - HOUR,
             400 * 24 * HOUR,
-            [4; 16],
+            CertificateSerial::new([4; 16]).expect("the serial is positive"),
         )
         .expect("issuer");
     let issuer =
@@ -450,9 +450,11 @@ impl Link for FakeLink {
                         _ => {
                             let request =
                                 CertificateRequest::parse(&request.csr).expect("the csr parses");
-                            let mut serial = [0u8; 16];
-                            serial[..8].copy_from_slice(&state.serials.to_be_bytes());
+                            let mut bytes = [0x21_u8; 16];
+                            bytes[8..].copy_from_slice(&state.serials.to_be_bytes());
                             state.serials += 1;
+                            let serial =
+                                CertificateSerial::new(bytes).expect("the serial is positive");
                             let leaf = issuer
                                 .issue(
                                     &request,
@@ -532,7 +534,7 @@ async fn authority(not_before: SystemTime) -> Authority {
             &public_key_info(&issuer_key.key),
             not_before - 10 * HOUR,
             400 * 24 * HOUR,
-            [2; 16],
+            CertificateSerial::new([2; 16]).expect("the serial is positive"),
         )
         .expect("the issuer signs");
     let issuer = DeviceIssuer::from_pkcs8(certificate.clone(), &issuer_pkcs8, root.certificate())
@@ -551,7 +553,7 @@ fn issue_for(
     key: &dyn DeviceKey,
     not_before: SystemTime,
     lifetime: Duration,
-    serial: [u8; 16],
+    serial: CertificateSerial,
 ) -> Held {
     let csr =
         CertificateRequest::build(&CertificateSigner::new(key), &[1; 32]).expect("the csr builds");
@@ -678,7 +680,13 @@ async fn a_renewal_sends_no_attestation() {
     let (key, der) = attesting_key();
     let now = SystemTime::now();
     let authority = authority(now).await;
-    let held = issue_for(&authority, &key, now - 6 * HOUR, 12 * HOUR, [3; 16]);
+    let held = issue_for(
+        &authority,
+        &key,
+        now - 6 * HOUR,
+        12 * HOUR,
+        CertificateSerial::new([3; 16]).expect("the serial is positive"),
+    );
     let old_serial = held.leaf.serial().to_vec();
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);

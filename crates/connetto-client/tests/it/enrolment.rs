@@ -21,7 +21,8 @@ use connetto_client::{
     REPLICA_PREFIX, SyncStatus, device_key_record, replica_db_name,
 };
 use connetto_core::device_cert::{
-    AttestationLevel, DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome, RootCa,
+    AttestationLevel, CertificateSerial, DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome,
+    RootCa,
 };
 use connetto_core::messages::EnrolRefusal;
 use connetto_core::traits::{HandshakeAuthority, RefreshTokenStore};
@@ -181,11 +182,21 @@ static ROTATION: std::sync::LazyLock<Rotation> = std::sync::LazyLock::new(|| {
     .expect("root");
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let cert = root
-        .sign_issuer(&key.public_key_der(), now - DAY, 395 * DAY, [1; 16])
+        .sign_issuer(
+            &key.public_key_der(),
+            now - DAY,
+            395 * DAY,
+            CertificateSerial::new([1; 16]).expect("the serial is positive"),
+        )
         .expect("issuer");
     let next_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("next issuer key");
     let next_cert = root
-        .sign_issuer(&next_key.public_key_der(), now - DAY, 395 * DAY, [2; 16])
+        .sign_issuer(
+            &next_key.public_key_der(),
+            now - DAY,
+            395 * DAY,
+            CertificateSerial::new([2; 16]).expect("the serial is positive"),
+        )
         .expect("next issuer");
     let root_list = root
         .sign_list(
