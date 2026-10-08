@@ -30,7 +30,7 @@ fn authorities(start: SystemTime) -> (RootCa, DeviceIssuer) {
             &issuer_key.subject_public_key_info(),
             start,
             YEAR + 30 * DAY,
-            [2; 16],
+            serial(2),
         )
         .expect("sign the issuer");
     let issuer =
@@ -43,6 +43,11 @@ fn device_request(nonce: &[u8; 32]) -> (KeyPair, Vec<u8>) {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key");
     let csr = CertificateRequest::build(&key, nonce).expect("build the request");
     (key, csr)
+}
+
+/// A serial for tests, all sixteen octets `byte`.
+fn serial(byte: u8) -> CertificateSerial {
+    CertificateSerial::new([byte; 16]).expect("the test serial is positive")
 }
 
 fn verify_chain(
@@ -142,7 +147,7 @@ fn an_issued_certificate_carries_exactly_the_profile() {
             "c0ffee-42",
             start,
             DAY,
-            [9; 16],
+            serial(9),
             AttestationLevel::ChipProven,
         )
         .expect("issue");
@@ -175,6 +180,37 @@ fn an_issued_certificate_carries_exactly_the_profile() {
 }
 
 #[test]
+fn a_serial_the_integer_cannot_carry_is_refused() {
+    assert!(CertificateSerial::new([0x00; 16]).is_none());
+    assert!(CertificateSerial::new([0x80; 16]).is_none());
+    assert!(CertificateSerial::new([0xFF; 16]).is_none());
+    assert_eq!(serial(0x01).as_bytes(), [0x01; 16]);
+    assert_eq!(serial(0x7F).as_bytes(), [0x7F; 16]);
+}
+
+#[test]
+fn boundary_serials_read_back_as_issued() {
+    let start = at(1_800_000_000);
+    let (_, issuer) = authorities(start);
+    let (_, csr) = device_request(&[7; 32]);
+    let request = CertificateRequest::parse(&csr).expect("parse");
+    for serial in [serial(0x01), serial(0x7F)] {
+        let leaf = issuer
+            .issue(
+                &request,
+                "acct",
+                start,
+                DAY,
+                serial,
+                AttestationLevel::Unproven,
+            )
+            .expect("issue");
+        let cert = DeviceCertificate::parse(&leaf).expect("the profile");
+        assert_eq!(cert.serial(), serial.as_bytes().as_slice());
+    }
+}
+
+#[test]
 fn fields_the_request_asks_for_are_ignored() {
     let start = at(1_800_000_000);
     let (_, issuer) = authorities(start);
@@ -196,7 +232,7 @@ fn fields_the_request_asks_for_are_ignored() {
             "acct",
             start,
             DAY,
-            [3; 16],
+            serial(3),
             AttestationLevel::Unproven,
         )
         .expect("issue");
@@ -251,7 +287,7 @@ fn a_certificate_outliving_its_issuer_is_not_issued() {
                 "acct",
                 start + YEAR,
                 31 * DAY,
-                [3; 16],
+                serial(3),
                 AttestationLevel::Unproven
             )
             .err(),
@@ -266,7 +302,12 @@ fn an_issuer_the_root_did_not_sign_is_refused() {
     let other = RootCa::create(deployment(), start, 10 * YEAR).expect("other root");
     let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let issuer_cert = other
-        .sign_issuer(&issuer_key.subject_public_key_info(), start, YEAR, [2; 16])
+        .sign_issuer(
+            &issuer_key.subject_public_key_info(),
+            start,
+            YEAR,
+            serial(2),
+        )
         .expect("sign");
     assert_eq!(
         DeviceIssuer::new(issuer_cert, issuer_key, root.certificate()).err(),
@@ -356,7 +397,12 @@ fn a_root_reloaded_from_its_parts_signs_issuers_the_issuer_accepts() {
     let root = RootCa::from_parts(created.certificate().to_vec(), key).expect("reload the root");
     let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let issuer_cert = root
-        .sign_issuer(&issuer_key.subject_public_key_info(), start, YEAR, [2; 16])
+        .sign_issuer(
+            &issuer_key.subject_public_key_info(),
+            start,
+            YEAR,
+            serial(2),
+        )
         .expect("sign the issuer");
     assert!(DeviceIssuer::new(issuer_cert, issuer_key, created.certificate()).is_ok());
 }
@@ -378,7 +424,12 @@ fn an_issuer_loads_from_its_stored_pkcs8_key() {
     let root = RootCa::create(deployment(), start, 10 * YEAR).expect("root");
     let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let issuer_cert = root
-        .sign_issuer(&issuer_key.subject_public_key_info(), start, YEAR, [2; 16])
+        .sign_issuer(
+            &issuer_key.subject_public_key_info(),
+            start,
+            YEAR,
+            serial(2),
+        )
         .expect("sign");
     assert!(
         DeviceIssuer::from_pkcs8(
@@ -428,7 +479,7 @@ fn a_device_key_requests_a_certificate_naming_it() {
             "acct",
             start,
             DAY,
-            [5; 16],
+            serial(5),
             AttestationLevel::Unproven,
         )
         .expect("issue");
@@ -467,7 +518,7 @@ fn issued(issuer: &DeviceIssuer, start: SystemTime, serial: u8) -> Vec<u8> {
             "alice",
             start,
             DAY,
-            [serial; 16],
+            CertificateSerial::new([serial; 16]).expect("the test serial is positive"),
             AttestationLevel::Unproven,
         )
         .expect("issue")
@@ -477,7 +528,7 @@ fn issued(issuer: &DeviceIssuer, start: SystemTime, serial: u8) -> Vec<u8> {
 fn a_signed_list_verifies_against_its_root_and_names_its_serials() {
     let start = at(1_800_000_000);
     let (root, issuer) = authorities(start);
-    let leaf = issued(&issuer, start, 0x81);
+    let leaf = issued(&issuer, start, 0x11);
     let revoked = [Revoked {
         serial: vec![0x81; 16],
         at: start + DAY / 2,

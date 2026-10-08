@@ -32,7 +32,7 @@ pub use connetto_core::device_cert::{KeyId, Revoked};
 pub(crate) use enrolment::PendingChallenge;
 pub use enrolment::{
     Device, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore,
-    MemoryEnrolments, Recorded, Revocation, RevokeError, SessionRevoker,
+    MemoryEnrolments, RandomSource, Recorded, Revocation, RevokeError, SessionRevoker,
 };
 #[doc(hidden)]
 pub use schema::__key_id;
