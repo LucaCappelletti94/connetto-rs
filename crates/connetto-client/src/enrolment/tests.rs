@@ -665,6 +665,8 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -675,6 +677,8 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -748,6 +752,8 @@ async fn a_renewal_sends_no_attestation() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -758,6 +764,8 @@ async fn a_renewal_sends_no_attestation() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -801,6 +809,8 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -811,6 +821,8 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -857,6 +869,8 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -867,6 +881,8 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -906,6 +922,8 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -916,6 +934,8 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -954,6 +974,8 @@ async fn a_reissue_with_no_answer_is_offline() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -964,6 +986,8 @@ async fn a_reissue_with_no_answer_is_offline() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1004,6 +1028,8 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1014,6 +1040,8 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1052,6 +1080,8 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1062,6 +1092,8 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
         inbox(),
         #[cfg(feature = "peer")]
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1198,6 +1230,8 @@ async fn a_fresh_device_serves_its_peer_listener_at_open() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1207,6 +1241,8 @@ async fn a_fresh_device_serves_its_peer_listener_at_open() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1241,6 +1277,8 @@ async fn an_expired_device_refuses_to_link_and_raises_the_event() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1250,6 +1288,8 @@ async fn an_expired_device_refuses_to_link_and_raises_the_event() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1302,6 +1342,8 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1311,6 +1353,8 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1376,6 +1420,8 @@ async fn a_grant_past_its_window_refuses_the_dial_as_a_window() {
         gate: None,
         grant_from: Some(now - 13 * HOUR),
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1385,6 +1431,8 @@ async fn a_grant_past_its_window_refuses_the_dial_as_a_window() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1444,6 +1492,8 @@ async fn a_certificate_less_device_refuses_to_link() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1453,6 +1503,8 @@ async fn a_certificate_less_device_refuses_to_link() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1508,6 +1560,8 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1517,6 +1571,8 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1603,6 +1659,8 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
         gate: Some(gate.clone()),
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1612,6 +1670,8 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1706,6 +1766,8 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1715,6 +1777,8 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
         Vec::new(),
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1833,6 +1897,8 @@ async fn a_stale_peer_list_changes_nothing() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1842,6 +1908,8 @@ async fn a_stale_peer_list_changes_nothing() {
         vec![kept],
         inbox(),
         peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1949,6 +2017,8 @@ async fn two_clients_discover_each_other_and_autolink() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller_a, _handle_a) = Enroller::new(
         Arc::new(RunKeys { der: der_a }),
         Some(HOUR),
@@ -1958,7 +2028,11 @@ async fn two_clients_discover_each_other_and_autolink() {
         Vec::new(),
         inbox(),
         peer_a,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller_b, _handle_b) = Enroller::new(
         Arc::new(RunKeys { der: der_b }),
         Some(HOUR),
@@ -1968,6 +2042,8 @@ async fn two_clients_discover_each_other_and_autolink() {
         Vec::new(),
         inbox(),
         peer_b,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run_a = tokio::spawn(run(link_a, enroller_a));
     let run_b = tokio::spawn(run(link_b, enroller_b));
@@ -2035,6 +2111,8 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         gate: None,
         grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller_a, handle_a) = Enroller::new(
         Arc::new(RunKeys { der: der_a }),
         Some(HOUR),
@@ -2044,7 +2122,11 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         Vec::new(),
         inbox(),
         peer_a,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller_b, _handle_b) = Enroller::new(
         Arc::new(RunKeys { der: der_b }),
         Some(HOUR),
@@ -2054,6 +2136,8 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         Vec::new(),
         inbox(),
         peer_b,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run_a = tokio::spawn(run(link_a, enroller_a));
     let run_b = tokio::spawn(run(link_b, enroller_b));

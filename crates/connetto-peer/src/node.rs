@@ -16,8 +16,9 @@ use parking_lot::{Mutex, RwLock};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ServerConfig, version};
 use serde_bytes::ByteBuf;
+use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
@@ -68,6 +69,17 @@ impl Default for Liveness {
     }
 }
 
+/// Prepares the node's dial sockets before their connect, the one hook a
+/// joined network uses to bind them to itself.
+pub trait SocketPrep: Send + Sync {
+    /// Prepare the unbound dial socket `sock` for a dial to `target`.
+    ///
+    /// # Errors
+    ///
+    /// When the socket cannot be prepared for the target's network.
+    fn prepare(&self, sock: SockRef<'_>, target: SocketAddr) -> io::Result<()>;
+}
+
 /// The node's shared state, behind an `Arc` for its tasks.
 pub(crate) struct NodeState {
     trust: Trust,
@@ -91,6 +103,9 @@ pub(crate) struct NodeState {
     pub(crate) events: mpsc::UnboundedSender<PeerEvent>,
     pub(crate) ping_every: Duration,
     pub(crate) silence_limit: Duration,
+    /// The prep every dial socket passes through before its connect, set at
+    /// runtime while the joined network comes and goes.
+    socket_prep: RwLock<Option<Arc<dyn SocketPrep>>>,
     /// The leaf fingerprints the links carry, per peer key, for discovery's
     /// mapping of the node's events to its instances.
     #[cfg(feature = "discovery")]
@@ -245,6 +260,7 @@ impl Node {
             events,
             ping_every: liveness.ping_every,
             silence_limit: liveness.silence_limit,
+            socket_prep: RwLock::new(None),
             #[cfg(feature = "discovery")]
             peer_fingerprints: Mutex::new(HashMap::new()),
         });
@@ -321,6 +337,12 @@ impl Node {
         stop_state(&self.state, reason);
     }
 
+    /// Prepare the dials' sockets through `prep` before their connect, or
+    /// stop preparing them with `None`.
+    pub fn set_socket_prep(&self, prep: Option<Arc<dyn SocketPrep>>) {
+        *self.state.socket_prep.write() = prep;
+    }
+
     /// The bound address, while the node serves.
     #[must_use]
     pub fn local_addr(&self) -> Option<SocketAddr> {
@@ -361,7 +383,16 @@ impl Node {
             *dial_count += 1;
             *dial_count
         };
-        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        let socket = match addr {
+            SocketAddr::V4(_) => TcpSocket::new_v4(),
+            SocketAddr::V6(_) => TcpSocket::new_v6(),
+        }
+        .map_err(LinkError::Unreachable)?;
+        if let Some(prep) = self.state.socket_prep.read().as_ref() {
+            prep.prepare(SockRef::from(&socket), addr)
+                .map_err(LinkError::Unreachable)?;
+        }
+        let tcp = tokio::time::timeout(CONNECT_TIMEOUT, socket.connect(addr))
             .await
             .map_err(|_| LinkError::Timeout)?
             .map_err(LinkError::Unreachable)?;

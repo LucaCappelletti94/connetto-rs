@@ -1,0 +1,23 @@
+[package]
+name = "connetto-peer-android"
+description = "The Android permissions the connetto peer link asks for, and the bundled Kotlin module that hosts and joins the local-only hotspot behind the peer link."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror.workspace = true
+
+[target.'cfg(target_os = "android")'.dependencies]
+# `ffi` builds and bundles the Kotlin module this crate names, and
+# `android::with_activity` reaches the Activity, without code of our own
+# touching raw JNI pointers.
+manganis = "0.7.10"

@@ -47,6 +47,8 @@ use crate::teardown::content_dir;
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
 use crate::{ClientError, ConnettoClient, Custody};
 #[cfg(feature = "peer")]
+use crate::{ClientEvent, HotspotError, HotspotOffer, JoinError};
+#[cfg(feature = "peer")]
 use connetto_core::device_cert::AttestationLevel;
 #[cfg(feature = "device-identity")]
 use connetto_core::device_cert::{DeviceCertificate, DeviceDescriptor, KeyHome};
@@ -696,6 +698,10 @@ where
     ///
     /// [`ClientError`] on a sign-in, key, dial, database, or handshake
     /// failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the device-identity, native-auth and peer seams each add their cfg-forked block"
+    )]
     pub async fn connect_with_pump(
         self,
     ) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
@@ -738,6 +744,8 @@ where
                 #[cfg(feature = "peer")]
                 let (peer_events, peer_events_rx) = mpsc::unbounded_channel();
                 #[cfg(feature = "peer")]
+                let (hotspot_tx, hotspot_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
                 let node = connetto_peer::Node::new(
                     connetto_peer::Trust {
                         roots: device.roots.clone(),
@@ -751,6 +759,8 @@ where
                 })?;
                 #[cfg(feature = "peer")]
                 let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
+                let peer_node = node.clone();
                 #[cfg(feature = "peer")]
                 let peer = Peer {
                     node: node.clone(),
@@ -775,8 +785,72 @@ where
                     lists,
                     #[cfg(feature = "peer")]
                     peer,
+                    #[cfg(feature = "peer")]
+                    hotspot_tx,
                 );
                 let enrolment = core.client().enrolment(enroller);
+                #[cfg(feature = "peer")]
+                let hotspot_runner = {
+                    let backend: Arc<dyn crate::hotspot::HotspotBackend> = {
+                        #[cfg(target_os = "android")]
+                        {
+                            match device.java.clone() {
+                                Some(java) => {
+                                    Arc::new(crate::hotspot::AndroidHotspotBackend::new(java))
+                                }
+                                None => Arc::new(crate::hotspot::UnsupportedBackend),
+                            }
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            Arc::new(crate::hotspot::UnsupportedBackend)
+                        }
+                    };
+                    let port_node = peer_node.clone();
+                    #[cfg(target_os = "android")]
+                    let bind_node = peer_node.clone();
+                    let dial_handle = handle.clone();
+                    let event_sender = core.client().event_sender();
+                    #[cfg(target_os = "android")]
+                    let bind = {
+                        let java = device.java.clone();
+                        Arc::new(
+                            move |subnet: Option<(std::net::Ipv4Addr, u8)>| match subnet {
+                                Some(subnet) => {
+                                    if let Some(java) = &java {
+                                        bind_node.set_socket_prep(Some(Arc::new(
+                                            crate::hotspot::JoinedBind::new(java.clone(), subnet),
+                                        )));
+                                    }
+                                }
+                                None => bind_node.set_socket_prep(None),
+                            },
+                        )
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let bind = Arc::new(|_| {});
+                    let machine = crate::hotspot::Machine::new(
+                        backend,
+                        device.peer_autolink,
+                        Arc::new(move || port_node.local_addr().map(|addr| addr.port())),
+                        bind,
+                        Arc::new(move |addr: SocketAddr| {
+                            let handle = dial_handle.clone();
+                            tokio::spawn(async move {
+                                let _ = handle.link_peer(addr).await;
+                            });
+                        }),
+                        Arc::new(move |event: ClientEvent| {
+                            let _ = event_sender.send(event);
+                        }),
+                    );
+                    crate::hotspot::run(machine, hotspot_rx)
+                };
+                #[cfg(feature = "peer")]
+                let pump: CorePump = Box::pin(async move {
+                    tokio::join!(pump, enrolment, hotspot_runner);
+                });
+                #[cfg(not(feature = "peer"))]
                 let pump: CorePump = Box::pin(async move {
                     tokio::join!(pump, enrolment);
                 });
@@ -987,6 +1061,75 @@ where
         match &self.device {
             Some(device) => device.link_peer(addr).await,
             None => Err(PeerError::NoIdentity),
+        }
+    }
+
+    /// Host this device's hotspot, answering its details or the reason it
+    /// will not, within the machine's bound (R76).
+    ///
+    /// # Errors
+    ///
+    /// [`HotspotError::Unsupported`] on a system without a hotspot or for a
+    /// build without a device identity, [`HotspotError::MissingPermission`]
+    /// with a permission the device has not granted, the mapped failure from
+    /// the device's Wi-Fi manager, and [`HotspotError::TimedOut`] when the
+    /// hotspot does not start within its bound.
+    #[cfg(feature = "peer")]
+    pub async fn host_hotspot(&self) -> Result<HotspotOffer, HotspotError> {
+        match &self.device {
+            Some(device) => device.host_hotspot().await,
+            None => Err(HotspotError::Unsupported),
+        }
+    }
+
+    /// Stop hosting, or cancel the pending request (R76).
+    ///
+    /// A no-op on a system without a hotspot or for a build without a device
+    /// identity.
+    #[cfg(feature = "peer")]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "uniform awaited hotspot API; the command send is synchronous"
+    )]
+    pub async fn stop_hotspot(&self) {
+        if let Some(device) = &self.device {
+            device.stop_hotspot();
+        }
+    }
+
+    /// Join `offer`'s network, answering its gateway or the reason it will
+    /// not, within the machine's bound (R76).
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::Unsupported`] on a system without a hotspot or for a
+    /// build without a device identity, [`JoinError::MissingPermission`]
+    /// with a permission the device has not granted,
+    /// [`JoinError::Declined`] when the network is not available, and
+    /// [`JoinError::TimedOut`] when the network does not answer within its
+    /// bound.
+    #[cfg(feature = "peer")]
+    pub async fn join_hotspot(&self, offer: &HotspotOffer) -> Result<std::net::IpAddr, JoinError> {
+        match &self.device {
+            Some(device) => device.join_hotspot(offer).await,
+            None => Err(JoinError::Unsupported),
+        }
+    }
+
+    /// Leave the joined network, or cancel the pending request (R76).
+    ///
+    /// A no-op on a system without a hotspot or for a build without a device
+    /// identity.
+    #[cfg(feature = "peer")]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "uniform awaited hotspot API; the command send is synchronous"
+    )]
+    pub async fn leave_hotspot(&self) {
+        if let Some(device) = &self.device {
+            device.leave_hotspot();
         }
     }
 }

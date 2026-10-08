@@ -45,6 +45,9 @@
 //! root `CONNETTO_DEMO_BUILD_DEVICE_ROOT` names, which the stack mints under
 //! `target/demo-device-ca` and hands the program it runs, and the proofs turn
 //! the feature on whenever it is set.
+//!
+//! With the `peer` feature the demo shows its peer panel (R76): its peer
+//! listener, its linked peers, and the hotspot it hosts or joins.
 //! Its server runs `schema.sql` and `policies.sql`, with `schema.sql`,
 //! `connetto_file_server::DEPLOYMENT_DDL`, `connetto_server::epoch::EPOCH_DDL`,
 //! `roles.sql` and `content.sql` applied in that order, and `orders,photos`
@@ -633,6 +636,302 @@ enum WipeState {
     Error(String),
 }
 
+/// The line a linked peer takes in the panel, its account and the head of
+/// its key.
+#[cfg(feature = "peer")]
+fn linked_line(peer: &connetto_core::device_cert::DeviceIdentity) -> String {
+    format!("linked: {}", short_identity(peer))
+}
+
+/// A device identity as `account/key prefix`, what the panel names devices
+/// by, its own included.
+#[cfg(feature = "peer")]
+fn short_identity(identity: &connetto_core::device_cert::DeviceIdentity) -> String {
+    let key = identity.key().to_string();
+    let prefix = key.get(..8).unwrap_or_default();
+    format!("{}/{prefix}", identity.account())
+}
+
+/// The offer's port line, `none` while the device does not serve its peer.
+#[cfg(feature = "peer")]
+fn port_line(port: Option<u16>) -> String {
+    port.map_or_else(|| "none".to_owned(), |port| port.to_string())
+}
+
+/// The offer this device hosts, as the lines the panel shows it, the
+/// passphrase copied out of the offer before it zeroizes its.
+#[cfg(feature = "peer")]
+#[derive(Clone, Debug)]
+struct OfferLines {
+    /// The hotspot's ssid.
+    ssid: String,
+    /// The hotspot's passphrase.
+    passphrase: String,
+    /// The device's peer port, present while it serves it.
+    port: Option<u16>,
+}
+
+/// The peer and hotspot panel (R76 slice 4): the device's peer listener, its
+/// linked peers, the hotspot it hosts with the offer shown as plain lines,
+/// and the form that joins a hotspot another device hosted.
+#[cfg(feature = "peer")]
+#[component]
+fn PeerPanel(parts: SessionParts) -> Element {
+    use connetto_client::{HotspotError, HotspotOffer, HotspotSecurity, JoinError};
+
+    // The listener's port, read again every second, since the listener opens
+    // beside the pump the way enrolment does.
+    let mut peer_port: Signal<Option<u16>> = use_signal(|| None);
+    {
+        let parts = parts.clone();
+        use_hook(move || {
+            spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    let port = parts.0.native.peer_address().map(|address| address.port());
+                    if *peer_port.peek() != port {
+                        peer_port.set(port);
+                    }
+                }
+            })
+        });
+    }
+
+    // One line per linked peer, what the link's events name the peer as.
+    let peers: Signal<Vec<String>> = use_signal(Vec::new);
+    // The offer this device hosts, as its plain lines, until the hotspot
+    // stops.
+    let offer: Signal<Option<OfferLines>> = use_signal(|| None);
+    // The last hotspot or join outcome, `idle` before the first.
+    let outcome: Signal<String> = use_signal(|| "idle".to_owned());
+    // A permission a host or join named as missing, which the panel asks for
+    // on the UI thread, where the platform's prompt wants to be asked from.
+    let missing: Signal<Option<String>> = use_signal(|| None);
+    // The join form, the host's offer read off its lines or typed over.
+    let mut join_ssid: Signal<String> = use_signal(String::new);
+    let mut join_passphrase: Signal<String> = use_signal(String::new);
+    let mut join_port: Signal<String> = use_signal(String::new);
+
+    // The link's and the hotspot's events, which the panel owns.
+    let client = parts.0.client.clone();
+    let event_rx = client.events();
+    {
+        let mut peers = peers;
+        let mut offer = offer;
+        let mut outcome = outcome;
+        use_hook(move || {
+            spawn(async move {
+                let mut rx = event_rx;
+                while let Ok(event) = rx.recv().await {
+                    match event {
+                        ClientEvent::PeerLinked { peer } => {
+                            let line = linked_line(&peer);
+                            let mut held = peers.peek().clone();
+                            if !held
+                                .iter()
+                                .any(|held_line| held_line.as_str() == line.as_str())
+                            {
+                                held.push(line);
+                                peers.set(held);
+                            }
+                        }
+                        ClientEvent::PeerUnlinked { peer, .. } => {
+                            let line = linked_line(&peer);
+                            let mut held = peers.peek().clone();
+                            held.retain(|held_line| held_line.as_str() != line.as_str());
+                            peers.set(held);
+                        }
+                        ClientEvent::HotspotStopped => {
+                            offer.set(None);
+                            outcome.set("stopped by the system or the user".to_owned());
+                        }
+                        ClientEvent::HotspotLeft => {
+                            outcome.set("the joined network was lost".to_owned());
+                        }
+                        _ => {}
+                    }
+                }
+            })
+        });
+    }
+
+    // The platform's permission prompt wants the UI thread, so the panel
+    // fires it there when a host or join named a missing permission.
+    let mut missing_effect = missing;
+    use_effect(move || {
+        if missing_effect().is_some() {
+            #[cfg(target_os = "android")]
+            connetto_peer_android::request_peer_permissions();
+            missing_effect.set(None);
+        }
+    });
+
+    let host_parts = parts.clone();
+    let host_offer = offer;
+    let host_outcome = outcome;
+    let host_missing = missing;
+    let stop_parts = parts.clone();
+    let stop_offer = offer;
+    let stop_outcome = outcome;
+    let join_parts = parts.clone();
+    let mut join_outcome = outcome;
+    let join_missing = missing;
+    let leave_parts = parts.clone();
+    let leave_outcome = outcome;
+
+    let me = parts
+        .0
+        .native
+        .device_certificate()
+        .map(|certificate| short_identity(certificate.identity()));
+    let peer_line = match (peer_port(), me) {
+        (Some(port), Some(me)) => format!("peer: listening on {port} as {me}"),
+        _ => "peer: not serving".to_owned(),
+    };
+    let peers = peers();
+    let offer = offer();
+    let outcome = outcome();
+
+    rsx! {
+        div {
+            style: "font-family: monospace; font-size: 0.85em; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 8px 12px; margin-bottom: 12px; line-height: 1.5;",
+            p { {peer_line} }
+            for line in peers.iter().cloned() {
+                p { {line} }
+            }
+            if let Some(offer) = offer {
+                p { "hotspot ssid: " {offer.ssid.clone()} }
+                p { "hotspot passphrase: " {offer.passphrase.clone()} }
+                p { "hotspot port: " {port_line(offer.port)} }
+            }
+            p { "hotspot: " {outcome} }
+            button {
+                onclick: move |_| {
+                    let parts = host_parts.clone();
+                    let mut offer = host_offer;
+                    let mut outcome = host_outcome;
+                    let mut missing = host_missing;
+                    spawn(async move {
+                        outcome.set("asking for the hotspot".to_owned());
+                        let result = parts.0.native.host_hotspot().await;
+                        match result {
+                            Ok(details) => {
+                                offer.set(Some(OfferLines {
+                                    ssid: details.ssid.clone(),
+                                    passphrase: details.passphrase.clone(),
+                                    port: details.port,
+                                }));
+                                outcome.set("hosting".to_owned());
+                            }
+                            Err(err) => {
+                                if let HotspotError::MissingPermission(name) = &err {
+                                    missing.set(Some(name.clone()));
+                                }
+                                outcome.set(err.to_string());
+                            }
+                        }
+                    });
+                },
+                "Host a hotspot"
+            }
+            button {
+                onclick: move |_| {
+                    let parts = stop_parts.clone();
+                    let mut offer = stop_offer;
+                    let mut outcome = stop_outcome;
+                    spawn(async move {
+                        parts.0.native.stop_hotspot().await;
+                        offer.set(None);
+                        outcome.set("stopped".to_owned());
+                    });
+                },
+                "Stop the hotspot"
+            }
+            input {
+                r#type: "text",
+                name: "ssid",
+                placeholder: "the offer's ssid",
+                value: "{join_ssid}",
+                oninput: move |event| join_ssid.set(event.value()),
+                style: "font-family: monospace;",
+            }
+            input {
+                r#type: "text",
+                name: "passphrase",
+                placeholder: "the offer's passphrase",
+                value: "{join_passphrase}",
+                oninput: move |event| join_passphrase.set(event.value()),
+                style: "font-family: monospace;",
+            }
+            input {
+                r#type: "text",
+                name: "port",
+                placeholder: "the offer's port",
+                value: "{join_port}",
+                oninput: move |event| join_port.set(event.value()),
+                style: "font-family: monospace;",
+            }
+            button {
+                onclick: move |_| {
+                    let ssid = join_ssid.peek().trim().to_owned();
+                    let passphrase = join_passphrase.peek().clone();
+                    let port_text = join_port.peek().trim().to_owned();
+                    if ssid.is_empty() || passphrase.is_empty() {
+                        join_outcome.set("the ssid and the passphrase need filling".to_owned());
+                        return;
+                    }
+                    let port = match port_text.as_str() {
+                        "" => None,
+                        text => match text.parse::<u16>() {
+                            Ok(port) => Some(port),
+                            Err(_) => {
+                                join_outcome.set("the port is not a number".to_owned());
+                                return;
+                            }
+                        },
+                    };
+                    let offer = HotspotOffer::new(
+                        ssid,
+                        passphrase,
+                        HotspotSecurity::Wpa2,
+                        port,
+                    );
+                    let parts = join_parts.clone();
+                    let mut outcome = join_outcome;
+                    let mut missing = join_missing;
+                    spawn(async move {
+                        outcome.set("joining the hotspot".to_owned());
+                        let gateway = parts.0.native.join_hotspot(&offer).await;
+                        match gateway {
+                            Ok(gateway) => {
+                                outcome.set(format!("joined through the gateway {gateway}"))
+                            }
+                            Err(err) => {
+                                if let JoinError::MissingPermission(name) = &err {
+                                    missing.set(Some(name.clone()));
+                                }
+                                outcome.set(err.to_string());
+                            }
+                        }
+                    });
+                },
+                "Join the hotspot"
+            }
+            button {
+                onclick: move |_| {
+                    let parts = leave_parts.clone();
+                    let mut outcome = leave_outcome;
+                    spawn(async move {
+                        parts.0.native.leave_hotspot().await;
+                        outcome.set("left".to_owned());
+                    });
+                },
+                "Leave the hotspot"
+            }
+        }
+    }
+}
+
 #[component]
 fn App() -> Element {
     let client = use_context::<ConnettoClient<Ws>>();
@@ -736,6 +1035,11 @@ fn App() -> Element {
     let grouped_text = grouped_label(&counts_by_quantity.value().read());
     let grouped_error = counts_by_quantity.error().read().clone();
     let pid = std::process::id();
+    // The peer and hotspot panel, on the builds that carry the peer link.
+    #[cfg(feature = "peer")]
+    let peer_panel: Option<Element> = Some(rsx! { PeerPanel { parts: parts.clone() } });
+    #[cfg(not(feature = "peer"))]
+    let peer_panel: Option<Element> = None;
     let device_line = match clock() {
         Some(clock) => clock.to_owned(),
         None => device(),
@@ -764,6 +1068,9 @@ fn App() -> Element {
             p {
                 style: "font-family: monospace; font-size: 0.85em; color: #555; margin: 0 0 8px 0;",
                 "device: " {device_line}
+            }
+            if let Some(peer_panel) = peer_panel {
+                {peer_panel}
             }
             if gate() != "open" {
                 button {
