@@ -759,6 +759,30 @@ async fn restore_joiner_networks(
     }
 }
 
+/// Turn a phone's Bluetooth off and hold until the platform reports it off,
+/// which every run ends with.
+async fn bluetooth_off(device: &Device) -> Result<()> {
+    device
+        .adb(&["shell", "cmd", "bluetooth_manager", "disable"])
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let on = device
+            .adb(&["shell", "settings", "get", "global", "bluetooth_on"])
+            .await?;
+        if on.trim() == "0" {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "{} never turned its Bluetooth off after it was disabled",
+                device.serial
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
 /// Turn a phone's Bluetooth on and hold until the platform reports it on.
 async fn bluetooth_on(device: &Device) -> Result<()> {
     device
@@ -812,10 +836,8 @@ async fn bluetooth_proof(host: &Device, evidence: &Path) -> Result<()> {
         bail!("the bluetooth proof needs a demo build with its device identity");
     }
     let result = run_bluetooth_proof(host, evidence).await;
-    let _ = host
-        .adb(&["shell", "cmd", "bluetooth_manager", "disable"])
-        .await;
-    result
+    let off = bluetooth_off(host).await;
+    result.and(off)
 }
 
 /// The walk itself: turn Bluetooth on, grant its permissions, host, read the
