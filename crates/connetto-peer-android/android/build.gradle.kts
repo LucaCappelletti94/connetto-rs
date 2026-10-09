@@ -29,3 +29,9 @@ android {
 tasks.withType<AbstractArchiveTask>().configureEach {
     archiveBaseName.set("dx-native-connetto-peer")
 }
+
+dependencies {
+    // The Activity result registry the Bluetooth prompt answers through,
+    // which the application's AppCompat already brings.
+    compileOnly("androidx.activity:activity:1.8.0")
+}

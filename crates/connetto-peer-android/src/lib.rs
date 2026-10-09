@@ -11,7 +11,10 @@
 mod android;
 
 #[cfg(target_os = "android")]
-pub use android::{VmError, java_vm, request_peer_permissions, use_application_class_loader};
+pub use android::{
+    VmError, java_vm, request_peer_permissions, start_bluetooth_prompt,
+    use_application_class_loader,
+};
 /// The jni btleplug links, whose virtual machine [`java_vm`] answers.
 #[cfg(target_os = "android")]
 pub use jni;
