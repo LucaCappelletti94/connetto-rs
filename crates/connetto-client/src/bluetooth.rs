@@ -741,8 +741,9 @@ impl Machine {
         }
     }
 
-    /// The platform's one action, started for the waiting calls.
-    fn start_prompt_action(&mut self) {
+    /// Start the platform's one action for the waiting calls, answering
+    /// whether it started.
+    fn start_prompt_action(&mut self) -> bool {
         let waiters = core::mem::take(&mut self.action_waiters);
         if let Err(failure) = self.readiness.prompt() {
             // The action will not start, so the waiters answer with the
@@ -756,13 +757,14 @@ impl Machine {
                 };
                 Self::answer_pending(pending, err);
             }
-            let _ = failure;
-            return;
+            tracing::warn!(%failure, "the Bluetooth action did not start");
+            return false;
         }
         self.prompting = Some(PromptBatch {
             pending: waiters,
             deadline: tokio::time::Instant::now() + PROMPT_BOUND,
         });
+        true
     }
 
     /// The standing's error, with no action asked.
@@ -1492,7 +1494,16 @@ impl Machine {
                 }
             }
             Some(BeaconDecision::StartAction) if self.prompting.is_none() => {
-                self.start_prompt_action();
+                // An action that will not start answers the beacon with its
+                // block, so the hotspot's caller is not held.
+                if !self.start_prompt_action()
+                    && let Some(hosted) = self.hosted.as_mut()
+                {
+                    hosted.beacon = Some(BeaconResolution::Refusal {
+                        state,
+                        outcome: Some(PromptOutcome::Blocked),
+                    });
+                }
             }
             _ => {}
         }
@@ -1947,6 +1958,8 @@ mod tests {
         missing: Mutex<Vec<String>>,
         prompt_calls: Mutex<usize>,
         outcome: Mutex<Option<PromptOutcome>>,
+        /// Whether the platform's action refuses to start.
+        blocked: Mutex<bool>,
     }
 
     impl FakeReadiness {
@@ -1956,6 +1969,7 @@ mod tests {
                 missing: Mutex::new(Vec::new()),
                 prompt_calls: Mutex::new(0),
                 outcome: Mutex::new(None),
+                blocked: Mutex::new(false),
             }
         }
     }
@@ -1971,6 +1985,9 @@ mod tests {
 
         fn prompt(&self) -> Result<(), BluetoothError> {
             *self.prompt_calls.lock() += 1;
+            if *self.blocked.lock() {
+                return Err(BluetoothError::Failed("the action is blocked".into()));
+            }
             Ok(())
         }
 
@@ -2489,6 +2506,28 @@ mod tests {
         assert!(matches!(
             beacon,
             Err(BluetoothError::Off(PromptOutcome::Declined))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_host_hotspot_whose_action_will_not_start_answers_blocked_at_once() {
+        let mut h = Harness::new(BluetoothState::Off);
+        *h.readiness.blocked.lock() = true;
+        let (offer_tx, offer_rx) = oneshot::channel();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.machine.hosted(offer_rx, reply_tx);
+        let _ = offer_tx.send(Ok(offer()));
+        h.tick(Some(&offer()));
+        h.tick(Some(&offer()));
+        // The action was tried once, and its refusal answers the caller.
+        assert_eq!(*h.readiness.prompt_calls.lock(), 1);
+        let Hosted { beacon, .. } = reply_rx
+            .try_recv()
+            .expect("the caller is answered")
+            .expect("the hotspot started");
+        assert!(matches!(
+            beacon,
+            Err(BluetoothError::Off(PromptOutcome::Blocked))
         ));
     }
 
