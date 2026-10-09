@@ -669,6 +669,20 @@ struct OfferLines {
     passphrase: String,
     /// The device's peer port, present while it serves it.
     port: Option<u16>,
+    /// The offer as one `WIFI:` payload, which the panel also draws as a QR
+    /// code (R76 decision 23).
+    payload: String,
+}
+
+/// The payload as an SVG QR code, `None` where it does not fit one.
+#[cfg(feature = "peer")]
+fn payload_qr(payload: &str) -> Option<String> {
+    let code = qrcode::QrCode::new(payload.as_bytes()).ok()?;
+    Some(
+        code.render::<qrcode::render::svg::Color<'_>>()
+            .min_dimensions(200, 200)
+            .build(),
+    )
 }
 
 /// The host's beacon standing as the panel's line.
@@ -742,6 +756,8 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let mut join_ssid: Signal<String> = use_signal(String::new);
     let mut join_passphrase: Signal<String> = use_signal(String::new);
     let mut join_port: Signal<String> = use_signal(String::new);
+    // A pasted or scanned `WIFI:` payload (R76 decision 24).
+    let mut join_payload: Signal<String> = use_signal(String::new);
 
     // The link's and the hotspot's events, which the panel owns.
     let client = parts.0.client.clone();
@@ -820,6 +836,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let mut join_outcome = outcome;
     let join_missing = missing;
     let leave_parts = parts.clone();
+    let payload_parts = parts.clone();
+    let payload_outcome = outcome;
+    let payload_missing = missing;
     let leave_outcome = outcome;
     let bt_parts = parts.clone();
     let bt_outcome = outcome;
@@ -857,6 +876,10 @@ fn PeerPanel(parts: SessionParts) -> Element {
                 p { "hotspot ssid: " {offer.ssid.clone()} }
                 p { "hotspot passphrase: " {offer.passphrase.clone()} }
                 p { "hotspot port: " {port_line(offer.port)} }
+                p { "hotspot payload: " {offer.payload.clone()} }
+                if let Some(svg) = payload_qr(&offer.payload) {
+                    div { dangerous_inner_html: svg }
+                }
             }
             p { "hotspot: " {outcome} }
             button {
@@ -874,6 +897,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
                                     ssid: hosted.offer.ssid.clone(),
                                     passphrase: hosted.offer.passphrase.clone(),
                                     port: hosted.offer.port,
+                                    payload: hosted.offer.to_wifi_payload().to_string(),
                                 }));
                                 outcome.set(match hosted.beacon {
                                     Ok(()) => "hosting".to_owned(),
@@ -987,6 +1011,42 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     });
                 },
                 "Join the hotspot"
+            }
+            input {
+                name: "payload",
+                placeholder: "WIFI: payload",
+                value: "{join_payload}",
+                oninput: move |event| join_payload.set(event.value()),
+                style: "font-family: monospace;",
+            }
+            button {
+                onclick: move |_| {
+                    let mut outcome = payload_outcome;
+                    let offer = match HotspotOffer::from_wifi_payload(join_payload.peek().trim()) {
+                        Ok(offer) => offer,
+                        Err(err) => {
+                            outcome.set(err.to_string());
+                            return;
+                        }
+                    };
+                    let parts = payload_parts.clone();
+                    let mut missing = payload_missing;
+                    spawn(async move {
+                        outcome.set("joining the hotspot".to_owned());
+                        match parts.0.native.join_hotspot(&offer).await {
+                            Ok(gateway) => {
+                                outcome.set(format!("joined through the gateway {gateway}"));
+                            }
+                            Err(err) => {
+                                if let JoinError::MissingPermission(name) = &err {
+                                    missing.set(Some(name.clone()));
+                                }
+                                outcome.set(err.to_string());
+                            }
+                        }
+                    });
+                },
+                "Join from the payload"
             }
             button {
                 onclick: move |_| {
