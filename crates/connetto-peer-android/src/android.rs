@@ -13,16 +13,17 @@ extern "Kotlin" {
     pub type BluetoothPlugin;
 }
 
-/// The plugin's class, reached through the application's class loader, since
-/// a thread Dioxus attached to the VM cannot find app classes with
+/// The plugins' classes, reached through the application's class loader,
+/// since a thread Dioxus attached to the VM cannot find app classes with
 /// `FindClass`.
-const PLUGIN_CLASS: &str = "dev.connetto.peer.HotspotPlugin";
+const HOTSPOT_PLUGIN: &str = "dev.connetto.peer.HotspotPlugin";
+const BLUETOOTH_PLUGIN: &str = "dev.connetto.peer.BluetoothPlugin";
 
 /// Ask the operating system for the peer link's permissions, from the plugin
 /// standing behind the Activity (R76).
 pub fn request_peer_permissions() {
     let _ = with_activity(|env, activity| {
-        let class = plugin(env).ok()?;
+        let class = plugin(env, HOTSPOT_PLUGIN).ok()?;
         env.call_static_method(
             class,
             "requestPermissions",
@@ -34,8 +35,8 @@ pub fn request_peer_permissions() {
     });
 }
 
-/// The bundled plugin's class, loaded on the Activity's class loader.
-fn plugin<'local>(env: &mut JNIEnv<'local>) -> Result<JClass<'local>, JniError> {
+/// A bundled plugin's class, loaded on the Activity's class loader.
+fn plugin<'local>(env: &mut JNIEnv<'local>, name: &str) -> Result<JClass<'local>, JniError> {
     let application = env
         .call_static_method(
             "android/app/ActivityThread",
@@ -52,7 +53,7 @@ fn plugin<'local>(env: &mut JNIEnv<'local>) -> Result<JClass<'local>, JniError> 
             &[],
         )?
         .l()?;
-    let name = env.new_string(PLUGIN_CLASS)?;
+    let name = env.new_string(name)?;
     let class = env
         .call_method(
             &class_loader,
@@ -62,6 +63,33 @@ fn plugin<'local>(env: &mut JNIEnv<'local>) -> Result<JClass<'local>, JniError> 
         )?
         .l()?;
     Ok(JClass::from(class))
+}
+
+/// Start the platform's action that brings Bluetooth to `Ready`, the
+/// permission prompt or the enable dialog, from the application's Activity
+/// (R76 decision 21), answering whether it started.
+///
+/// # Errors
+///
+/// [`VmError::NoActivity`] before the application's Activity stands, and
+/// [`VmError::Jni`] when the plugin's call fails.
+pub fn start_bluetooth_prompt() -> Result<bool, VmError> {
+    with_activity(|env, activity| {
+        Some((|| {
+            let class = plugin(env, BLUETOOTH_PLUGIN)?;
+            let code = env
+                .call_static_method(
+                    class,
+                    "prompt",
+                    "(Landroid/app/Activity;)I",
+                    &[JValue::Object(activity)],
+                )?
+                .i()?;
+            Ok::<_, JniError>(code == 0)
+        })())
+    })
+    .ok_or(VmError::NoActivity)?
+    .map_err(VmError::from)
 }
 
 /// Why btleplug's virtual machine is not at hand.
