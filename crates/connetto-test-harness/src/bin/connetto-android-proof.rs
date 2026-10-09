@@ -50,6 +50,13 @@
 //! With `--payload` and `--peer-serial`, the second phone joins through the
 //! first one's `WIFI:` payload pasted into its join form, the first phone's
 //! Bluetooth left off as a host whose beacon is down (R76 slice 7).
+//!
+//! With `--every-join` and `--peer-serial`, one run builds and signs both
+//! phones in once and then makes every join in turn, the form, the beacon and
+//! the payload, bringing the phones back to rest after each, recording a
+//! failed join and going on, and writing `summary.txt` beside the evidence
+//! (R76 decision 4). This is the run to make whenever two phones are at hand
+//! and before a peer phase closes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -131,6 +138,7 @@ async fn main() -> Result<()> {
         peer_serial,
         bluetooth,
         payload,
+        every_join,
     } = cli_arguments()?;
     let device = Device::pick(serial).await?;
     let evidence = repo_path(&["target", "android-proof"])?.join(format!(
@@ -160,27 +168,26 @@ async fn main() -> Result<()> {
                 Some(apk) => apk,
                 None => build_apk(&device.rust_target().await?).await?,
             };
+            let started = Instant::now();
             let outcome = prove(&device, &apk, &stack, &evidence, unlock).await;
+            let proved = (
+                started.elapsed(),
+                outcome.as_ref().map_err(|err| format!("{err:#}")).map(drop),
+            );
             // The peer proof runs only on a proved phone, and a failed
             // proof keeps its own error.
             match (bluetooth, peer_serial, outcome) {
                 (true, None, Ok(())) => bluetooth_proof(&device, &evidence).await,
-                (bluetooth, Some(serial), Ok(())) => {
-                    let join_by = match (bluetooth, payload) {
-                        (true, _) => JoinBy::Beacon,
-                        (false, true) => JoinBy::Payload,
-                        (false, false) => JoinBy::Form,
-                    };
-                    peer_proof(
-                        &device,
-                        &Device::new(serial),
-                        &apk,
-                        &stack,
-                        &evidence,
+                (_, Some(serial), Ok(())) => {
+                    let joins = JoinBy::chosen(every_join, bluetooth, payload);
+                    let joiner = Device::new(serial);
+                    let run = PeerRun {
+                        apk: &apk,
+                        stack: &stack,
+                        evidence: &evidence,
                         unlock,
-                        join_by,
-                    )
-                    .await
+                    };
+                    joins_with_summary(&device, &joiner, &run, joins, &proved).await
                 }
                 (_, _, outcome) => outcome,
             }
@@ -475,6 +482,50 @@ async fn read_hotspot_offer(app: &mut PageSession) -> Result<HotspotOfferLines> 
     }
 }
 
+/// What every join of a run shares: the build, the stack, the evidence
+/// folder and the unlock.
+struct PeerRun<'a> {
+    apk: &'a Path,
+    stack: &'a Stack,
+    evidence: &'a Path,
+    unlock: Unlock<'a>,
+}
+
+/// Make the joins, write the summary, and fail when any join failed.
+async fn joins_with_summary(
+    host: &Device,
+    joiner: &Device,
+    run: &PeerRun<'_>,
+    joins: &[JoinBy],
+    proved: &(Duration, Result<(), String>),
+) -> Result<()> {
+    let reports = peer_proof(
+        host,
+        joiner,
+        run.apk,
+        run.stack,
+        run.evidence,
+        run.unlock,
+        joins,
+    )
+    .await;
+    let summary = summary(&commit().await, proved, reports.as_deref());
+    eprintln!("{summary}");
+    tokio::fs::write(run.evidence.join("summary.txt"), &summary)
+        .await
+        .context("writing the summary")?;
+    let failed: Vec<&str> = reports?
+        .iter()
+        .filter(|report| report.outcome.is_err())
+        .map(|report| report.join.name())
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("the {} join failed", failed.join(", ")))
+    }
+}
+
 /// How the second phone learns the hotspot the first one hosts.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JoinBy {
@@ -485,6 +536,37 @@ enum JoinBy {
     /// The first phone's `WIFI:` payload pasted into the second's join form
     /// (R76 decision 24).
     Payload,
+}
+
+impl JoinBy {
+    /// Every join, in the order `--every-join` runs them (R76 decision 4).
+    const EVERY: [Self; 3] = [Self::Form, Self::Beacon, Self::Payload];
+
+    /// The joins the command line asks for.
+    const fn chosen(every_join: bool, bluetooth: bool, payload: bool) -> &'static [Self] {
+        match (every_join, bluetooth, payload) {
+            (true, ..) => &Self::EVERY,
+            (false, true, _) => &[Self::Beacon],
+            (false, false, true) => &[Self::Payload],
+            (false, false, false) => &[Self::Form],
+        }
+    }
+
+    /// The join's name in the summary and the screenshots.
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Form => "form",
+            Self::Beacon => "beacon",
+            Self::Payload => "payload",
+        }
+    }
+}
+
+/// One join's result, for the run's summary.
+struct JoinReport {
+    join: JoinBy,
+    took: Duration,
+    outcome: Result<()>,
 }
 
 /// The two-phone peer proof (R76 slice 4): `host` hosts a hotspot from the
@@ -499,8 +581,8 @@ async fn peer_proof(
     stack: &Stack,
     evidence: &Path,
     unlock: Unlock<'_>,
-    join_by: JoinBy,
-) -> Result<()> {
+    joins: &[JoinBy],
+) -> Result<Vec<JoinReport>> {
     if !demo_has_device_identity() {
         bail!("the peer proof needs a demo build with its device identity");
     }
@@ -517,15 +599,9 @@ async fn peer_proof(
         evidence,
         &unlock,
         usual_ssid.as_ref(),
-        join_by,
+        joins,
     )
     .await;
-    let mut bluetooth = Ok(());
-    if join_by == JoinBy::Beacon {
-        for phone in [host, joiner] {
-            bluetooth = bluetooth.and(bluetooth_off(phone).await);
-        }
-    }
 
     // The joiner's log for the record, and its state, which the run leaves
     // as it found it.
@@ -553,7 +629,10 @@ async fn peer_proof(
     let _ = joiner.adb(&["forward", "--remove-all"]).await;
     let _ = joiner.adb(&["reverse", "--remove-all"]).await;
     let _ = joiner.adb(&["shell", "am", "force-stop", PACKAGE]).await;
-    result.and(restore_role).and(restore_stay).and(bluetooth)
+    let reports = result?;
+    restore_role?;
+    restore_stay?;
+    Ok(reports)
 }
 
 /// Reconnect a wireless joiner over `adb connect`, hold it awake and
@@ -589,12 +668,11 @@ async fn prepare_joiner(
     Ok((stay_on, previous_role))
 }
 
-/// The walk itself: install and sign in the joiner, host on the first phone,
-/// join from the second, link, end the link, and bring the joiner back to
-/// its usual network.
+/// The walk itself: install and sign in the joiner once, then each join in
+/// turn, every one recorded, with the phones brought back to rest after each.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two phones, the build, the stack, the evidence, the unlock, the joiner's network and the join's route are each the walk's own"
+    reason = "the two phones, the build, the stack, the evidence, the unlock, the joiner's network and the joins are each the walk's own"
 )]
 async fn run_peer_proof(
     host: &Device,
@@ -604,8 +682,8 @@ async fn run_peer_proof(
     evidence: &Path,
     unlock: &Unlock<'_>,
     usual_ssid: Option<&String>,
-    join_by: JoinBy,
-) -> Result<()> {
+    joins: &[JoinBy],
+) -> Result<Vec<JoinReport>> {
     joiner
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
         .await?;
@@ -614,93 +692,132 @@ async fn run_peer_proof(
     for (device_port, host_port) in &stack.reverse {
         joiner.reverse(*device_port, *host_port).await?;
     }
+    // The users granted the peer link's permissions before, so only the
+    // Bluetooth enable dialog stands between a beacon and the radio.
     for phone in [host, joiner] {
-        phone
-            .adb(&[
-                "shell",
-                "pm",
-                "grant",
-                PACKAGE,
-                "android.permission.NEARBY_WIFI_DEVICES",
-            ])
-            .await?;
-    }
-    if join_by == JoinBy::Payload {
-        // The host's user granted Bluetooth before, so only the enable
-        // dialog stands between its beacon and the radio.
-        for permission in BT_PERMISSIONS {
-            host.adb(&["shell", "pm", "grant", PACKAGE, permission])
+        for permission in BT_PERMISSIONS
+            .iter()
+            .copied()
+            .chain(["android.permission.NEARBY_WIFI_DEVICES"])
+        {
+            phone
+                .adb(&["shell", "pm", "grant", PACKAGE, permission])
                 .await?;
-        }
-    }
-    if join_by == JoinBy::Beacon {
-        step("turn Bluetooth on and grant its permissions on both phones");
-        for phone in [host, joiner] {
-            bluetooth_on(phone).await?;
-            for permission in BT_PERMISSIONS {
-                phone
-                    .adb(&["shell", "pm", "grant", PACKAGE, permission])
-                    .await?;
-            }
         }
     }
 
     let mut peer_app = sign_in_joiner(joiner, stack, evidence, unlock).await?;
-
     let mut app = host.app().await?;
     app.wait_for_text("device: certified until", Duration::from_secs(60))
         .await?;
-
     let host_identity = own_identity(&mut app).await?;
     let joiner_identity = own_identity(&mut peer_app).await?;
 
-    step("host a hotspot on the first phone");
+    let mut reports = Vec::with_capacity(joins.len());
+    for &join in joins {
+        let started = Instant::now();
+        let outcome = one_join(
+            host,
+            joiner,
+            &mut app,
+            &mut peer_app,
+            evidence,
+            (&host_identity, &joiner_identity),
+            usual_ssid,
+            join,
+        )
+        .await;
+        if let Err(err) = &outcome {
+            eprintln!("the {} join failed: {err:#}", join.name());
+            let _ = host
+                .screenshot(evidence, &format!("{}-failure-host", join.name()))
+                .await;
+            let _ = joiner
+                .screenshot(evidence, &format!("{}-failure-peer", join.name()))
+                .await;
+        }
+        reports.push(JoinReport {
+            join,
+            took: started.elapsed(),
+            outcome,
+        });
+    }
+    Ok(reports)
+}
+
+/// One join, from a hotspot hosted on the first phone to the link's end, and
+/// the phones back at rest whatever happened.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two phones, their pages, the evidence, both identities, the joiner's network and the join are each the step's own"
+)]
+async fn one_join(
+    host: &Device,
+    joiner: &Device,
+    app: &mut PageSession,
+    peer_app: &mut PageSession,
+    evidence: &Path,
+    identities: (&str, &str),
+    usual_ssid: Option<&String>,
+    join: JoinBy,
+) -> Result<()> {
+    if join == JoinBy::Beacon {
+        step("turn Bluetooth on on both phones");
+        for phone in [host, joiner] {
+            bluetooth_on(phone).await?;
+        }
+    }
+    step(&format!(
+        "host a hotspot on the first phone for the {} join",
+        join.name()
+    ));
     // An A35 refuses to start an access point while its own station sits on
     // a 5 GHz channel, measured on eduroam, so the host leaves its network,
     // as a host in the field has none. Its server path stays on USB.
     host.adb(&["shell", "svc", "wifi", "disable"]).await?;
     sleep(Duration::from_secs(5)).await;
-    let hosted = host_and_link(
-        host,
-        joiner,
-        &mut app,
-        &mut peer_app,
-        evidence,
-        &host_identity,
-        &joiner_identity,
-        join_by,
-    )
-    .await;
+    let hosted = host_and_link(host, joiner, app, peer_app, evidence, identities, join).await;
+    // Back to rest whatever happened, so the next join starts clean: the
+    // pages' own leave and stop, the host's Wi-Fi, Bluetooth off, and the
+    // joiner on its usual network.
+    if hosted.is_err() {
+        let _ = peer_app.click("Leave the hotspot").await;
+        let _ = app.click("Stop the hotspot").await;
+    }
     let restored = host
         .adb(&["shell", "svc", "wifi", "enable"])
         .await
         .map(drop);
+    let mut bluetooth = Ok(());
+    for phone in [host, joiner] {
+        bluetooth = bluetooth.and(bluetooth_off(phone).await);
+    }
     let offer_ssid = hosted?;
     restored?;
-
+    bluetooth?;
     restore_joiner_networks(host, joiner, &offer_ssid, usual_ssid).await?;
-    joiner.screenshot(evidence, "peer-clean").await?;
+    joiner
+        .screenshot(evidence, &format!("{}-peer-clean", join.name()))
+        .await?;
     Ok(())
 }
 
 /// Host on the first phone, join from the second, link, and end the link,
 /// answering the hotspot's ssid for the cleanup.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "the two phones, their pages, the evidence, both identities and the join's route are each the walk's own"
-)]
 async fn host_and_link(
     host: &Device,
     joiner: &Device,
     app: &mut PageSession,
     peer_app: &mut PageSession,
     evidence: &Path,
-    host_identity: &str,
-    joiner_identity: &str,
+    (host_identity, joiner_identity): (&str, &str),
     join_by: JoinBy,
 ) -> Result<String> {
+    let shot = |name: &str| format!("{}-{name}", join_by.name());
     app.click("Host a hotspot").await?;
-    if join_by == JoinBy::Payload {
+    // Without the beacon the host's Bluetooth stays off, so hosting opens
+    // the system's enable dialog, which the host's user declines.
+    if join_by != JoinBy::Beacon {
         step("decline Bluetooth on the first phone");
         host.tap_dialog_button(&DENY_BUTTONS, "the Bluetooth enable dialog's refusal")
             .await?;
@@ -708,7 +825,7 @@ async fn host_and_link(
             .await?;
     }
     let offer = read_hotspot_offer(app).await?;
-    host.screenshot(evidence, "host-offer").await?;
+    host.screenshot(evidence, &shot("host-offer")).await?;
 
     match join_by {
         JoinBy::Form => {
@@ -756,7 +873,7 @@ async fn host_and_link(
             if nearby.len() != 1 {
                 bail!("the second phone sees other hosts than the first: {nearby:?}");
             }
-            joiner.screenshot(evidence, "peer-nearby").await?;
+            joiner.screenshot(evidence, &shot("peer-nearby")).await?;
             peer_app.click("Join the nearby host").await?;
         }
     }
@@ -781,15 +898,15 @@ async fn host_and_link(
     peer_app
         .wait_for_text(&format!("linked: {host_identity}"), Duration::from_secs(30))
         .await?;
-    host.screenshot(evidence, "peer-linked").await?;
-    joiner.screenshot(evidence, "peer-linked").await?;
+    host.screenshot(evidence, &shot("host-linked")).await?;
+    joiner.screenshot(evidence, &shot("peer-linked")).await?;
 
     step("leave the hotspot on the second phone");
     peer_app.click("Leave the hotspot").await?;
     step("stop the hotspot on the first phone");
     app.click("Stop the hotspot").await?;
     wait_link_ends(app, peer_app).await?;
-    host.screenshot(evidence, "peer-unlinked").await?;
+    host.screenshot(evidence, &shot("host-unlinked")).await?;
     Ok(offer.ssid)
 }
 
@@ -1191,6 +1308,9 @@ struct Arguments {
     /// The two-phone join through the host's pasted `WIFI:` payload, with
     /// `--peer-serial`.
     payload: bool,
+    /// Every two-phone join in one run, with `--peer-serial` (R76 decision
+    /// 4).
+    every_join: bool,
 }
 
 fn cli_arguments() -> Result<Arguments> {
@@ -1205,6 +1325,10 @@ fn cli_arguments() -> Result<Arguments> {
             arguments.payload = true;
             continue;
         }
+        if arg == "--every-join" {
+            arguments.every_join = true;
+            continue;
+        }
         let value = args.next().ok_or_else(|| anyhow!("{arg} needs a value"))?;
         match arg.as_str() {
             "--serial" => arguments.serial = Some(value),
@@ -1217,7 +1341,68 @@ fn cli_arguments() -> Result<Arguments> {
     if arguments.payload && arguments.peer_serial.is_none() {
         bail!("--payload needs --peer-serial");
     }
+    if arguments.every_join && arguments.peer_serial.is_none() {
+        bail!("--every-join needs --peer-serial");
+    }
+    if arguments.every_join && (arguments.bluetooth || arguments.payload) {
+        bail!("--every-join runs every join, so --bluetooth and --payload name none");
+    }
     Ok(arguments)
+}
+
+/// The commit the run built, marked `-dirty` over local changes, and
+/// `unknown` where git does not answer.
+async fn commit() -> String {
+    let Ok(root) = repo_path(&[]) else {
+        return "unknown".to_owned();
+    };
+    match Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["describe", "--always", "--dirty", "--abbrev=40"])
+        .output()
+        .await
+    {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_owned()
+        }
+        _ => "unknown".to_owned(),
+    }
+}
+
+/// The run's summary: the commit, the single-phone proof, and each join with
+/// its time and, where it failed, why.
+fn summary(
+    commit: &str,
+    (proof_took, proof): &(Duration, Result<(), String>),
+    joins: Result<&[JoinReport], &anyhow::Error>,
+) -> String {
+    let line = |name: &str, took: Duration, outcome: Result<(), String>| match outcome {
+        Ok(()) => format!("{name}: passed in {}s\n", took.as_secs()),
+        Err(err) => format!("{name}: failed in {}s: {err}\n", took.as_secs()),
+    };
+    let mut text = format!("commit: {commit}\n");
+    text += &line("single-phone proof", *proof_took, proof.clone());
+    match joins {
+        Ok(reports) => {
+            for report in reports {
+                text += &line(
+                    &format!("{} join", report.join.name()),
+                    report.took,
+                    report
+                        .outcome
+                        .as_ref()
+                        .map(drop)
+                        .map_err(|err| format!("{err:#}")),
+                );
+            }
+        }
+        Err(err) => {
+            use std::fmt::Write as _;
+            let _ = writeln!(text, "joins: not run, the setup failed: {err:#}");
+        }
+    }
+    text
 }
 
 /// Comma-separated `device:host` port pairs.
@@ -1806,6 +1991,39 @@ fn saved_network_id(listing: &str, ssid: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_summary_names_every_step_and_why_a_join_failed() {
+        use std::time::Duration;
+        let reports = [
+            super::JoinReport {
+                join: super::JoinBy::Form,
+                took: Duration::from_secs(201),
+                outcome: Ok(()),
+            },
+            super::JoinReport {
+                join: super::JoinBy::Beacon,
+                took: Duration::from_secs(95),
+                outcome: Err(anyhow::anyhow!(
+                    "the second phone never saw the first phone's beacon"
+                )),
+            },
+        ];
+        assert_eq!(
+            super::summary("c0626b2", &(Duration::from_secs(180), Ok(())), Ok(&reports)),
+            "commit: c0626b2\n\
+             single-phone proof: passed in 180s\n\
+             form join: passed in 201s\n\
+             beacon join: failed in 95s: the second phone never saw the first phone's beacon\n"
+        );
+        let setup = anyhow::anyhow!("adb install exited with 1");
+        assert_eq!(
+            super::summary("c0626b2", &(Duration::from_secs(180), Ok(())), Err(&setup)),
+            "commit: c0626b2\n\
+             single-phone proof: passed in 180s\n\
+             joins: not run, the setup failed: adb install exited with 1\n"
+        );
+    }
+
     /// The demo's set and service as an A35 on Android 15 dumps them.
     const BEACON_DUMP: &str = "    dev.connetto.dioxusdemo
      Advertising ID                                     : 3
