@@ -410,6 +410,9 @@ pub struct Dispatched {
     /// because a relationship row moved, never because a row it reads changed
     /// (R27). Empty for every event until a membership term is registered.
     pub narrowings: Vec<TermMove>,
+    /// What the oplog keeps for this event, its compressed patch included, or
+    /// `None` when the event's table is absent from the catalog.
+    pub record: Option<ChangeRecord>,
 }
 
 /// One server-computed result movement, ready to frame on the wire.
@@ -1203,13 +1206,17 @@ where
         }
     }
 
-    /// Dispatch one CDC event into row patches and computed-result changes.
+    /// Dispatch one CDC event into row patches, computed-result changes and the
+    /// record the oplog keeps.
     ///
-    /// Row notifications fold once into a compressed patchset shared across the
-    /// matched consumers. Everything the engine's tiers produced (fold deltas,
-    /// replaced extremes, re-read row answers, keyed row changes) arrives
-    /// already resolved: the engine drove its connector for every read this
-    /// event required, each bounded by its registration's budget.
+    /// The event folds once into a compressed patchset, shared across the
+    /// matched consumers and kept in the record, so a catchup sends the same
+    /// bytes later instead of folding it again. It is built whenever the event
+    /// is logged, matched or not, since the consumer that needs it may be away.
+    /// Everything the engine's tiers produced (fold deltas, replaced extremes,
+    /// re-read row answers, keyed row changes) arrives already resolved: the
+    /// engine drove its connector for every read this event required, each
+    /// bounded by its registration's budget.
     ///
     /// # Errors
     ///
@@ -1266,8 +1273,9 @@ where
         consumers.extend_from_slice(engine.deleted());
         consumers.sort_unstable();
         consumers.dedup();
-        let patches = if consumers.is_empty() {
-            Vec::new()
+        let identity = self.event_identity(event);
+        let (patches, record) = if consumers.is_empty() && identity.is_none() {
+            (Vec::new(), None)
         } else {
             let built =
                 pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
@@ -1288,7 +1296,7 @@ where
             // supported pointer width, and a counter saturates rather than
             // panics regardless.
             let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-            consumers
+            let patches = consumers
                 .into_iter()
                 .map(|consumer_id| {
                     let leaving = departing.contains(&consumer_id);
@@ -1304,7 +1312,10 @@ where
                         departure: leaving && departure.is_some(),
                     }
                 })
-                .collect()
+                .collect();
+            let record =
+                identity.map(|(table, pk)| ChangeRecord::new(table, pk, event.clone(), payload));
+            (patches, record)
         };
 
         let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
@@ -1313,6 +1324,7 @@ where
             patches,
             computed,
             narrowings,
+            record,
         })
     }
 
@@ -1415,62 +1427,79 @@ where
             .collect()
     }
 
-    /// Build the oplog record for a dispatched CDC event.
+    /// Build the oplog record for a CDC event, encoding its patch.
     ///
-    /// Resolves the table name and a stable primary-key encoding from the
-    /// catalog once, so the oplog and the catchup auth filter carry them without
-    /// a second catalog pass. Returns `None` when the event's table is absent
-    /// from the catalog. Call only after
-    /// [`dispatch`](Self::dispatch) has accepted the event, which guarantees it
-    /// is a row event.
-    #[must_use]
-    pub fn oplog_record(&self, event: &PgChangeEvent) -> Option<ChangeRecord> {
-        let (table, pk) = self.event_identity(event)?;
-        Some(ChangeRecord::new(table, pk, event.clone()))
-    }
-
-    /// The catchup payload for one consumer, and whether it is a departure.
-    ///
-    /// `None` when the event never matched this consumer. Replaces asking for
-    /// the matched set and the payload separately, which took two engine calls
-    /// and could not tell a departure from a removal because the merged list
-    /// does not carry the distinction.
-    ///
-    /// Runs the same predicate matching the live path uses, but only through
-    /// the core engine, so it folds no aggregates and fires no re-execution
-    /// triggers. A departure is recomputed here rather than stored: matching is
-    /// a pure function of the event's row images, so replay reaches the same
-    /// three lists the live path did and classifies the same way. Live and replay
-    /// therefore cannot disagree, whatever either can determine.
+    /// The record [`dispatch`](Self::dispatch) logs, for a caller that logs an
+    /// event without dispatching it. Resolves the table name and a stable
+    /// primary-key encoding from the catalog once, so the oplog and the catchup
+    /// auth filter carry them without a second catalog pass. `Ok(None)` when the
+    /// event's table is absent from the catalog.
     ///
     /// # Errors
     ///
-    /// [`MaterializerError::Dispatch`] when the event cannot be matched,
-    /// [`MaterializerError::Emit`] when it cannot be folded, and
+    /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
-    pub fn replay_patch(
+    pub fn oplog_record(
+        &self,
+        event: &PgChangeEvent,
+    ) -> Result<Option<ChangeRecord>, MaterializerError> {
+        let Some((table, pk)) = self.event_identity(event) else {
+            return Ok(None);
+        };
+        Ok(Some(ChangeRecord::new(
+            table,
+            pk,
+            event.clone(),
+            self.encode_patch(event)?,
+        )))
+    }
+
+    /// Whether a logged event reaches one consumer on replay, and if so
+    /// whether as a departure.
+    ///
+    /// `None` when the event never matched this consumer, `Some(true)` when an
+    /// update moved the row out of its window. Runs the same predicate matching
+    /// the live path uses, but only through the core engine, so it folds no
+    /// aggregates and fires no re-execution triggers. A departure is recomputed
+    /// here rather than stored: matching is a pure function of the event's row
+    /// images, so replay reaches the same three lists the live path did and
+    /// classifies the same way.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Dispatch`] when the event cannot be matched.
+    pub fn replay_match(
         &mut self,
         event: &PgChangeEvent,
         consumer_id: u64,
-    ) -> Result<Option<(Vec<u8>, bool)>, MaterializerError> {
-        let (matched, departing) = {
-            let notifs = self.engine.match_rows(event)?;
-            let departing = matches!(event.kind(), EventKind::Update)
-                && notifs.deleted().contains(&consumer_id);
-            let matched = notifs.inserted().contains(&consumer_id)
-                || notifs.updated().contains(&consumer_id)
-                || notifs.deleted().contains(&consumer_id);
-            (matched, departing)
-        };
-        if !matched {
-            return Ok(None);
-        }
+    ) -> Result<Option<bool>, MaterializerError> {
+        let notifs = self.engine.match_rows(event)?;
+        let departing =
+            matches!(event.kind(), EventKind::Update) && notifs.deleted().contains(&consumer_id);
+        let matched = notifs.inserted().contains(&consumer_id)
+            || notifs.updated().contains(&consumer_id)
+            || notifs.deleted().contains(&consumer_id);
+        Ok(matched.then_some(departing))
+    }
+
+    /// The compressed departure notice for the row `event` moved out of a
+    /// window, the same bytes the live path sends a departing consumer.
+    ///
+    /// [`None`] when the event folds to no operation.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Emit`] when the event cannot be folded, and
+    /// [`MaterializerError::Compression`] on a compression failure.
+    pub fn departure_notice(
+        &self,
+        event: &PgChangeEvent,
+    ) -> Result<Option<Vec<u8>>, MaterializerError> {
         let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
-        if departing && let Some(notice) = Self::departure_patchset(&built) {
-            return Ok(Some((compress(&notice)?, true)));
-        }
-        Ok(Some((compress(&built.build())?, false)))
+        Ok(Self::departure_patchset(&built)
+            .map(|bytes| compress(&bytes))
+            .transpose()?)
     }
 
     /// Fold one event into a compressed patchset, the catchup delivery payload.
@@ -2274,11 +2303,26 @@ fn column_name_at<DB: DatabaseLike>(
 
 /// Zstd-compress a raw bulk payload at the materializer's standard level.
 ///
+/// Reuses one compression context per thread. A fresh context clears its
+/// tables on every call, which on a patch-sized payload costs about fifteen
+/// times the compression itself.
+///
 /// # Errors
 ///
 /// Propagates the underlying [`std::io::Error`].
 pub(crate) fn compress(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    zstd::encode_all(bytes, ZSTD_LEVEL)
+    thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    crate::counters::add(&crate::counters::PATCH_COMPRESSIONS, 1);
+    COMPRESSOR.with_borrow_mut(|slot| {
+        let compressor = match slot {
+            Some(compressor) => compressor,
+            None => slot.insert(zstd::bulk::Compressor::new(ZSTD_LEVEL)?),
+        };
+        compressor.compress(bytes)
+    })
 }
 
 /// Zstd-decompress a bulk payload.

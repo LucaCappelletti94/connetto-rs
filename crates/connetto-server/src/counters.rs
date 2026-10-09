@@ -21,9 +21,9 @@ use std::time::Instant;
 
 use tokio::sync::{Mutex, MutexGuard};
 
-/// Materializer mutex acquisitions on the dispatch path: the `dispatch` and
-/// `oplog_record` takes once per event, plus the `advance_cursor` take once
-/// per delivered subscriber per event. Counted by [`timed_lock`], which is the
+/// Materializer mutex acquisitions on the dispatch path: the `dispatch` take
+/// once per event, plus the `advance_cursor` take once per delivered
+/// subscriber per event. Counted by [`timed_lock`], which is the
 /// only way the dispatch path takes that lock, so this and
 /// [`MATERIALIZER_LOCK_WAIT_NANOS`] always describe the same set of
 /// acquisitions.
@@ -80,6 +80,15 @@ pub static CURSOR_REWINDS: AtomicU64 = AtomicU64::new(0);
 /// counter beside a log line rather than a client-visible signal.
 pub static TIER_TRANSITIONS: AtomicU64 = AtomicU64::new(0);
 
+/// Patchsets compressed for the wire, wherever: the row payload one event
+/// dispatches, plus its departure notice when a consumer departs, the payload
+/// of an event logged without dispatch, the catchup's on-demand folds (a
+/// departure notice, a withdrawal), one per snapshot page delivered, and the
+/// membership move's page and its move-out deletes. A catchup that resends
+/// logged changes compresses nothing, the stored payload riding as it was
+/// logged.
+pub static PATCH_COMPRESSIONS: AtomicU64 = AtomicU64::new(0);
+
 /// Increment `counter` by `n`, relaxed.
 #[inline]
 pub fn add(counter: &AtomicU64, n: u64) {
@@ -134,6 +143,8 @@ pub struct CountersSnapshot {
     pub visibility_disagreements: u64,
     /// [`CURSOR_REWINDS`] at the reading.
     pub cursor_rewinds: u64,
+    /// [`PATCH_COMPRESSIONS`] at the reading.
+    pub patch_compressions: u64,
 }
 
 impl CountersSnapshot {
@@ -150,6 +161,7 @@ impl CountersSnapshot {
             visibility_disagreements: self.visibility_disagreements
                 - earlier.visibility_disagreements,
             cursor_rewinds: self.cursor_rewinds - earlier.cursor_rewinds,
+            patch_compressions: self.patch_compressions - earlier.patch_compressions,
         }
     }
 }
@@ -165,6 +177,7 @@ pub fn snapshot() -> CountersSnapshot {
         authorization_calls: AUTHORIZATION_CALLS.load(Ordering::Relaxed),
         visibility_disagreements: VISIBILITY_DISAGREEMENTS.load(Ordering::Relaxed),
         cursor_rewinds: CURSOR_REWINDS.load(Ordering::Relaxed),
+        patch_compressions: PATCH_COMPRESSIONS.load(Ordering::Relaxed),
     }
 }
 

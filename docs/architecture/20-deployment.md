@@ -18,7 +18,7 @@
 | `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by `preflight::require` (`Artifact::Table`) when bans are on |
 | The audit table, only under `CONNETTO_AUDIT=database` | `ConnettoSchema::Audit` | Yes | Refused by `preflight::require` (`Artifact::Table`) when the audit is on |
 | `connetto_device_enrolments`, `connetto_device_certificates`, `connetto_device_lists`, only with device identity (R74) | `ConnettoSchema::Enrolments` | Yes | Refused by `preflight::require` (`Artifact::Table`) when device identity is on |
-| The reconnect log, `connetto_oplog`, and its last commit, `connetto_oplog_commit` | `CONNETTO_OPLOG_TABLE`, with `_commit` appended for the second | Yes | Both refused by `preflight::require` (`Artifact::Table`) |
+| The reconnect log, `connetto_oplog`, and its last commit, `connetto_oplog_commit` | `CONNETTO_OPLOG_TABLE`, with `_commit` appended for the second | Yes | Both refused by `preflight::require` (`Artifact::Table`), and a log table that predates the compressed patch is refused naming the absent `payload` column (`Artifact::TableColumn`) |
 | `connetto_epoch`, the cluster the deployment last served from | `connetto_server::epoch::EPOCH_DDL` | Yes, which is what lets a restore into another cluster be seen | Refused by `preflight::require` (`Artifact::Table`) |
 | The publication and its previous images | `CONNETTO_PUBLICATION` | Yes | Refused (`Artifact::Publication`, `Artifact::PreviousImages`, and `Artifact::PublishedTable` for every table a policy reads) |
 | The logical replication slot | `CONNETTO_SLOT` | **No**, under every method | Refused (`Artifact::ReplicationSlot`) |

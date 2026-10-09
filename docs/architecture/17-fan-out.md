@@ -161,11 +161,11 @@ Sending the header and the body as separate WebSocket continuation fragments wou
 
 ## Catchup
 
-**The one finding from part A with no home in the plan, and this chapter is its home.** `SessionManager::catch_up_row` in `crates/connetto-server/src/session.rs` calls `Materializer::encode_patch` per record per subscription, which rebuilds the patchset from the stored event and re-compresses it, for bytes that were already built when the change was live. No studied system does this, and the closest comparable one does the exact inverse: ElectricSQL encodes each shape log line once at append time and never again.
+**The one finding from part A with no home in the plan, and this chapter is its home.** A change's patch depends on the change alone, so building it again per record per subscription at catchup repeats work the live path already did. No studied system does that, and the closest comparable one does the exact inverse: ElectricSQL encodes each shape log line once at append time and never again.
 
-**Decided (R16 part B): the oplog stores the prepared compressed patch beside the event, and catchup streams the stored bytes.** `encode_patch` leaves the catchup path. This is the inversion, applied.
+**Built (2026-10-06): the oplog stores the compressed patch beside the event, and catchup sends the stored bytes.** `Materializer::dispatch` folds each logged event once, and `SessionManager::catch_up_row` asks the match and the visibility question first and builds nothing for a record its caller may not see. This is the inversion, applied.
 
-**The event stays. Storing the patch instead of it does not work**, because catchup needs the structured event twice per record and neither use is the one being replaced: `Materializer::match_row_consumers` decides whether the subscription matches, and `EventRow::current` supplies the post-image for the visibility question.
+**The event stays. Storing the patch instead of it does not work**, because catchup needs the structured event twice per record and neither use is the one being replaced: `Materializer::replay_match` decides whether the subscription matches, and `EventRow::current` supplies the post-image for the visibility question.
 
 **So oplog storage grows on both backends, and the process record said otherwise.** `plans/fanout-architecture-decisions.md` expected Postgres storage to fall, reasoning that `PgOplog::append` writes `serde_json::to_vec(record.event())` and would write compressed bytes instead. That describes replacing the event, which the paragraph above rules out. The Postgres row keeps its JSON event and gains a patch column, and `InMemoryOplog` keeps its `ChangeEvent` and gains the patch on the heap.
 
@@ -175,21 +175,11 @@ Sending the header and the body as separate WebSocket continuation fragments wou
 
 **Not the client replica.** `15-replica-retention.md` opens by disclaiming the server oplog, and this section constrains nothing in that chapter. The two share a word and nothing else.
 
-### The subscription must outlive its socket
+### The patch does not wait for a subscriber
 
-**Decided (R16 part B), and the previous decision does not work without it.** `Materializer::dispatch` builds a payload only when at least one consumer matches, the oplog appends unconditionally, and teardown destroys the subscription the instant the socket closes. So a change arriving while a client is briefly offline matches nothing live, is appended with no payload, and that client is exactly who will ask for it. A subscription therefore outlives its socket by the same window the log retains, then expires. The predicate and its binding stay in the dispatch set, matching changes still build a payload, and no fallback rebuild path is needed.
+**Built (2026-10-06), decided with the maintainer the same day.** `Materializer::dispatch` folds every event it logs into its patch, whether or not a connected subscription matches it, because a change arriving while its only reader is offline matches nothing live and that reader is exactly who will ask for it. The fold costs one patch build and one compression per logged event, about a microsecond with the reused compression context, against a per-event floor of 2.5 ms. A subscription is destroyed with its socket, and who receives a logged change is decided at reconnect, by the subscriptions the client declares again.
 
-Today the two lifetimes contradict each other: the log promises a delta for a client that was away, while the subscription defining what that delta is was destroyed the moment it left.
-
-**It needs nothing upstream.** `subql` already models the distinction as `SubscriptionScope::{Durable, Session}` (verified in `src/types.rs` at the pinned revision, `Durable` persisting until explicitly unregistered and `Session` auto-removed when the session ends), and connetto uses neither, so every subscription is implicitly durable and connetto destroys it by hand. The lifetime policy is entirely connetto's.
-
-Three consequences, none optional:
-
-- **Teardown splits.** `remove_route` and `unregister` happen together at three sites in `SessionManager` today: connection teardown, an explicit unsubscribe, and a failed subscribe. The route must still drop immediately, and only the subscription defers.
-- **An expiry sweeper**, keyed to the retention window, which does not exist.
-- **A registry cap**, because the registry is uncapped and retained subscriptions make a disconnect storm unbounded. `subql`'s `max_subscriptions` defaults to `None`, documented as growing unbounded, and connetto never calls `with_max_subscriptions`. `EvictionPolicy::EvictBySession` is the policy to evaluate if connetto starts declaring a scope.
-
-A retained registration produces a `MatchedPatch` on every matching event, discarded immediately by the route lookup miss. With the payload shared that is a refcount bump rather than a copy. Retained state is one parameter binding per recently-disconnected subscriber, sharing one compiled predicate, because `subql` separates the two.
+**So catchup needs no subscription kept after its socket closes**, and with it no split teardown, no expiry sweeper keyed to the retention window and no registry cap. A closed app's queries kept to decide whom to wake by push (R101) are a separate decision with a separate purpose.
 
 ### What catchup does not get
 
@@ -203,7 +193,7 @@ A retained registration produces a `MatchedPatch` on every matching event, disca
 
 **Decided (R16 part B): hoisting the per-subscriber cursor advance out of the fan-out loop is worth nothing, and is not carried as a live improvement.** R0 measured zero lock wait at both subscriber counts, and the 2026-08-16 remeasurement reads zero again after R5b. That is structural: only the change-ingest task takes the lock while delivery runs, so the `3 + K` acquisitions per event cannot contend. R14 owned the hoist as a guard against introducing contention where there was none, and **R14 was dropped on 2026-08-16**, so no phase carries it.
 
-**One case the measurement does not cover, stated so it is not read as more than it is.** `catch_up_row` takes the lock from a session task rather than from the ingest task, three times per replayed record. R0's fixture measures a steady-state dispatch window after routes have settled, with no client catching up, so a catchup storm concurrent with live dispatch is the one shape where the lock could contend and no number exists for it. The stored patch removes one of the three takes, which is a reason to prefer it and not a reason to claim a measurement.
+**One case the measurement does not cover, stated so it is not read as more than it is.** `catch_up_row` takes the lock from a session task rather than from the ingest task, once per replayed record to match it, once more per delivered record to advance its cursor, and on demand for a departure notice or a withdrawal. R0's fixture measures a steady-state dispatch window after routes have settled, with no client catching up, so a catchup storm concurrent with live dispatch is the one shape where the lock could contend, and this chapter carries no number for it.
 
 **Sharding or removing the mutex is declined**, for now with no evidence behind it. Convex shards across a fixed manager count and ElectricSQL and Supabase run a process per shape or topic. Revisit if a measurement of concurrent catchup and dispatch shows contention.
 

@@ -2135,7 +2135,7 @@ where
         // decision 2), never a change-stream teardown. Each pass ends at most
         // one subscription, so the loop terminates.
         let mut unknown_attempts: HashMap<SubscriptionId, u32> = HashMap::new();
-        let dispatched = loop {
+        let mut dispatched = loop {
             let outcome = {
                 counters::timed_lock(&self.materializer)
                     .await
@@ -2176,13 +2176,10 @@ where
         };
 
         // Record the event in the oplog before fan-out. The append is per event,
-        // not per consumer, since reconnect catchup re-filters per client.
-        let record = {
-            counters::timed_lock(&self.materializer)
-                .await
-                .oplog_record(event)
-        };
-        if let Some(record) = record {
+        // not per consumer, since reconnect catchup re-filters per client, and
+        // the record carries the patch dispatch built so catchup never folds
+        // the event again.
+        if let Some(record) = dispatched.record.take() {
             self.oplog.append(record).await.map_err(oplog_err)?;
         }
 
@@ -5223,13 +5220,13 @@ where
                 if replay.fence.seen(record.position()) != Seen::Missed {
                     continue;
                 }
-                let replayed = {
+                let matched = {
                     self.materializer
                         .lock()
                         .await
-                        .replay_patch(record.event(), replay.consumer_id)?
+                        .replay_match(record.event(), replay.consumer_id)?
                 };
-                let Some((payload, _departure)) = replayed else {
+                let Some(departing) = matched else {
                     continue;
                 };
                 if record.event().kind() == EventKind::Truncate {
@@ -5237,7 +5234,7 @@ where
                     break;
                 }
                 if let Some(payload) = self
-                    .replay_payload(transport, record.event(), &watchers, &mut verdicts, payload)
+                    .replay_payload(transport, &record, departing, &watchers, &mut verdicts)
                     .await?
                 {
                     payloads.push(payload);
@@ -5587,13 +5584,13 @@ where
             if ceiling.is_none_or(|ceiling| record.position() > ceiling) {
                 continue;
             }
-            let replayed = {
+            let matched = {
                 self.materializer
                     .lock()
                     .await
-                    .replay_patch(record.event(), reg.consumer_id)?
+                    .replay_match(record.event(), reg.consumer_id)?
             };
-            let Some((payload, _departure)) = replayed else {
+            let Some(departing) = matched else {
                 continue;
             };
             // The `Some` above is what says this subscription reads the truncated
@@ -5611,7 +5608,7 @@ where
                     .await;
             }
             let Some(payload) = self
-                .replay_payload(transport, record.event(), &watchers, &mut verdicts, payload)
+                .replay_payload(transport, &record, departing, &watchers, &mut verdicts)
                 .await?
             else {
                 continue;
@@ -5679,26 +5676,28 @@ where
         Ok(entries)
     }
 
-    /// What one replayed event delivers to this caller, or [`None`] when it
+    /// What one replayed record delivers to this caller, or [`None`] when it
     /// delivers nothing (R6, the two-check form on the catchup path).
     ///
-    /// `built` is the payload the materializer folded for this record, which is
-    /// R44's marked departure notice when the row left this subscription's
-    /// window.
+    /// Asked before anything is built, so a record this caller may not see
+    /// costs the visibility question and nothing else. A delivered record goes
+    /// out as the patch logged with it, or as R44's marked departure notice
+    /// when `departing` says the row left this subscription's window.
     ///
     /// # Errors
     ///
     /// [`SessionError::ChangeStreamUnusable`] when the stream cannot report the
     /// previous version at all, and [`SessionError::Materializer`] when the
-    /// withdrawal cannot be folded.
+    /// departure notice or the withdrawal cannot be folded.
     async fn replay_payload<T: Transport>(
         &self,
         transport: &mut T,
-        event: &PgChangeEvent,
+        record: &ChangeRecord,
+        departing: bool,
         watchers: &[Arc<Principal<Id, Key>>],
         verdicts: &mut Transitions,
-        built: Vec<u8>,
     ) -> Result<Option<Vec<u8>>, SessionError> {
+        let event = record.event();
         // A truncate never reaches here: `catch_up_row` turns one into a
         // replacement before asking anything about it (R48).
         debug_assert_ne!(event.kind(), EventKind::Truncate);
@@ -5755,10 +5754,16 @@ where
         // (R6 decision 6).
         match verdicts.get().first().copied().unwrap_or_default() {
             Transition::Nothing => Ok(None),
-            Transition::Deliver => Ok(Some(built)),
+            Transition::Deliver if departing => {
+                let notice = { self.materializer.lock().await.departure_notice(event)? };
+                Ok(Some(notice.unwrap_or_else(|| record.payload().to_vec())))
+            }
+            Transition::Deliver => Ok(Some(record.payload().to_vec())),
             // A replayed delete's own patch already is the withdrawal, as on the
             // live path, so only an update pays a second fold.
-            Transition::Withdraw if event.kind() == EventKind::Delete => Ok(Some(built)),
+            Transition::Withdraw if event.kind() == EventKind::Delete => {
+                Ok(Some(record.payload().to_vec()))
+            }
             Transition::Withdraw => {
                 let withdrawal = { self.materializer.lock().await.withdrawal_patch(event)? };
                 let withdrawal = withdrawal.ok_or_else(|| {

@@ -1284,6 +1284,10 @@ async fn prepare_change_log(
             Artifact::ReplicationSlot(slot),
             Artifact::Publication(publication),
             Artifact::Table(oplog_table),
+            Artifact::TableColumn {
+                table: oplog_table,
+                column: "payload",
+            },
             Artifact::Table(&commit_table),
             Artifact::PreviousImages { publication },
         ],

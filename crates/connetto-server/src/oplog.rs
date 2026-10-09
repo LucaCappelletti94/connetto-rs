@@ -93,16 +93,18 @@ impl OplogConfig {
 
 /// One change retained in the oplog, keyed by its commit position.
 ///
-/// The [`PgChangeEvent`] is the source of truth replayed on catchup: catchup runs
-/// it back through the same matching and patchset encoding the live path uses.
-/// The table name and primary-key bytes are resolved once at append time (they
-/// need the catalog, which the oplog impls do not carry) so the auth read filter
-/// on the catchup path has them without a second catalog pass.
+/// The [`PgChangeEvent`] is what catchup matches and asks the visibility
+/// question about, and `payload` is the compressed patch built once when the
+/// change was dispatched, which catchup sends as it is. The table name and
+/// primary-key bytes are resolved once at append time (they need the catalog,
+/// which the oplog impls do not carry) so the auth read filter on the catchup
+/// path has them without a second catalog pass.
 #[derive(Debug, Clone)]
 pub struct ChangeRecord {
     table: String,
     pk: Vec<u8>,
     event: PgChangeEvent,
+    payload: Vec<u8>,
 }
 
 impl ChangeRecord {
@@ -111,13 +113,20 @@ impl ChangeRecord {
     /// `event` must be a row DML event (Insert, Update, Delete, or Truncate);
     /// the dispatch path only appends such events, since a non-row event never
     /// reaches a successful dispatch. [`op`](Self::op) and
-    /// [`is_tombstone`](Self::is_tombstone) rely on that invariant.
+    /// [`is_tombstone`](Self::is_tombstone) rely on that invariant. `payload`
+    /// is the event's compressed patch, the bytes the live path sends.
     #[must_use]
-    pub fn new(table: impl Into<String>, pk: Vec<u8>, event: PgChangeEvent) -> Self {
+    pub fn new(
+        table: impl Into<String>,
+        pk: Vec<u8>,
+        event: PgChangeEvent,
+        payload: Vec<u8>,
+    ) -> Self {
         Self {
             table: table.into(),
             pk,
             event,
+            payload,
         }
     }
 
@@ -144,6 +153,12 @@ impl ChangeRecord {
     #[must_use]
     pub const fn event(&self) -> &PgChangeEvent {
         &self.event
+    }
+
+    /// The event's compressed patch, built once when it was dispatched.
+    #[must_use]
+    pub fn payload(&self) -> &[u8] {
+        &self.payload
     }
 
     /// Whether this record is a delete tombstone.
@@ -607,8 +622,9 @@ mod pg {
     /// The log is a single table, which a promoted standby carries with every
     /// other table. The row image plus routing metadata
     /// (`table_name`, `op`, `pk`, `is_tombstone`) are stored as typed columns for
-    /// indexing and observability, and the decoded change is stored as a
-    /// serialized blob beside its position so catchup replays it losslessly.
+    /// indexing and observability, the decoded change is stored as a
+    /// serialized blob beside its position so catchup matches it losslessly,
+    /// and the compressed patch is stored beside it so catchup sends it as is.
     pub struct PgOplog {
         pool: Pool<diesel_async::AsyncPgConnection>,
         table: String,
@@ -630,6 +646,8 @@ mod pg {
         pk: Vec<u8>,
         #[diesel(sql_type = Binary)]
         event: Vec<u8>,
+        #[diesel(sql_type = Binary)]
+        payload: Vec<u8>,
     }
 
     /// The recorded commit, read back from the companion table.
@@ -735,6 +753,7 @@ mod pg {
                      pk BYTEA NOT NULL, \
                      is_tombstone BOOLEAN NOT NULL, \
                      event BYTEA NOT NULL, \
+                     payload BYTEA NOT NULL, \
                      appended_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
                      PRIMARY KEY (commit_lsn, xid, ordinal))",
                 table = quote_ident(&self.table),
@@ -766,6 +785,7 @@ mod pg {
                 row.table_name,
                 row.pk,
                 PgChangeEvent::new(change, position),
+                row.payload,
             ))
         }
 
@@ -836,8 +856,8 @@ mod pg {
             let (commit_lsn, xid, ordinal) = position_to_i64(record.position())?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "INSERT INTO {table} (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event) \
-                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (commit_lsn, xid, ordinal) DO NOTHING",
+                "INSERT INTO {table} (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event, payload) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (commit_lsn, xid, ordinal) DO NOTHING",
                 table = quote_ident(&self.table),
             );
             sql_query(sql)
@@ -849,6 +869,7 @@ mod pg {
                 .bind::<Binary, _>(record.pk().to_vec())
                 .bind::<Bool, _>(record.is_tombstone())
                 .bind::<Binary, _>(event_bytes)
+                .bind::<Binary, _>(record.payload().to_vec())
                 .execute(&mut *conn)
                 .await?;
             self.prune().await
@@ -861,7 +882,7 @@ mod pg {
             let (commit_lsn, xid, ordinal) = position_to_i64(after)?;
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, xid, ordinal, table_name, pk, event FROM {table} \
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload FROM {table} \
                  WHERE (commit_lsn, xid, ordinal) > ($1, $2, $3) ORDER BY commit_lsn, xid, ordinal",
                 table = quote_ident(&self.table),
             );
@@ -887,7 +908,7 @@ mod pg {
             };
             let mut conn = self.pool.get().await.map_err(pool_err)?;
             let sql = format!(
-                "SELECT commit_lsn, xid, ordinal, table_name, pk, event FROM {table} \
+                "SELECT commit_lsn, xid, ordinal, table_name, pk, event, payload FROM {table} \
                  WHERE xid = ANY($1) OR (xid >= $2 AND xid < $3) OR xid < $4 \
                  ORDER BY commit_lsn, xid, ordinal",
                 table = quote_ident(&self.table),
@@ -1069,6 +1090,7 @@ mod tests {
             "orders",
             id.to_be_bytes().to_vec(),
             PgChangeEvent::new(change, position),
+            Vec::new(),
         )
     }
 
