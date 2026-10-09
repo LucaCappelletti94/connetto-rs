@@ -2,7 +2,6 @@ package dev.connetto.peer
 
 import android.Manifest
 import android.app.Activity
-import android.app.Application
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
@@ -21,7 +20,12 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.ParcelUuid
+import androidx.activity.ComponentActivity
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
 import java.util.Base64
 import java.util.UUID
 
@@ -48,6 +52,9 @@ class BluetoothPlugin {
         // turn its notifications on.
         private val CCC_UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
+        // The main thread, where the prompt's dialogs open.
+        private val handler = Handler(Looper.getMainLooper())
+
         // The ATT packet size a connection has before any exchange.
         private const val DEFAULT_MTU = 23
 
@@ -71,10 +78,9 @@ class BluetoothPlugin {
         private const val OK = 0
         private const val FAILED = 1
 
-        private const val PERMISSION_REQUEST = 2001
-        private const val PENDING_NONE = 0
-        private const val PENDING_PERMISSIONS = 1
-        private const val PENDING_ENABLE = 2
+        // The keys the prompt's dialogs register their answers under.
+        private const val PERMISSIONS_KEY = "dev.connetto.peer.bluetooth-permissions"
+        private const val ENABLE_KEY = "dev.connetto.peer.bluetooth-enable"
 
         // The event lines' codes.
         private const val EVENT_CONNECTED = 1
@@ -85,9 +91,6 @@ class BluetoothPlugin {
         private val lock = Any()
 
         private var cachedContext: Context? = null
-        private var callbacksRegistered = false
-        private var resumedActivity: Activity? = null
-        private var pendingPrompt = PENDING_NONE
         private var promptOutcome = OUTCOME_IN_FLIGHT
 
         private var advertising = false
@@ -116,35 +119,65 @@ class BluetoothPlugin {
             synchronized(lock) { missingPermissionsLocked().joinToString("\n") }
 
         @JvmStatic
-        fun prompt(): Int = synchronized(lock) {
+        fun prompt(activity: Activity): Int = synchronized(lock) {
             promptOutcome = OUTCOME_IN_FLIGHT
             val adapter = adapter() ?: return PROMPT_BLOCKED
-            registerLifecycleLocked()
             val missing = missingPermissionsLocked()
             if (missing.isEmpty() && adapter.isEnabled) {
                 promptOutcome = OUTCOME_NOT_ASKED
                 return PROMPT_STARTED
             }
-            val activity = resumedActivity ?: run {
+            // The dialogs answer through the Activity's result registry,
+            // which the application's AppCompat Activity carries.
+            val component = activity as? ComponentActivity ?: run {
                 promptOutcome = OUTCOME_BLOCKED
                 return PROMPT_BLOCKED
             }
-            if (missing.isNotEmpty()) {
-                activity.requestPermissions(missing.toTypedArray(), PERMISSION_REQUEST)
-                pendingPrompt = PENDING_PERMISSIONS
-                return PROMPT_STARTED
+            // The dialogs open from the main thread, which the caller may
+            // not be on.
+            handler.post {
+                try {
+                    if (missing.isNotEmpty()) {
+                        askPermissions(component, missing)
+                    } else {
+                        askEnable(component)
+                    }
+                } catch (e: Exception) {
+                    synchronized(lock) { promptOutcome = OUTCOME_BLOCKED }
+                }
             }
-            return try {
-                activity.startActivityForResult(
-                    Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE),
-                    PERMISSION_REQUEST
-                )
-                pendingPrompt = PENDING_ENABLE
-                PROMPT_STARTED
-            } catch (e: Exception) {
-                promptOutcome = OUTCOME_BLOCKED
-                PROMPT_BLOCKED
+            PROMPT_STARTED
+        }
+
+        private fun askPermissions(activity: ComponentActivity, missing: List<String>) {
+            var launcher: ActivityResultLauncher<Array<String>>? = null
+            launcher = activity.activityResultRegistry.register(
+                PERMISSIONS_KEY,
+                ActivityResultContracts.RequestMultiplePermissions()
+            ) { granted ->
+                launcher?.unregister()
+                synchronized(lock) {
+                    promptOutcome =
+                        if (granted.values.all { it }) OUTCOME_NOT_ASKED else OUTCOME_DECLINED
+                }
             }
+            launcher.launch(missing.toTypedArray())
+        }
+
+        private fun askEnable(activity: ComponentActivity) {
+            var launcher: ActivityResultLauncher<Intent>? = null
+            launcher = activity.activityResultRegistry.register(
+                ENABLE_KEY,
+                ActivityResultContracts.StartActivityForResult()
+            ) { result ->
+                launcher?.unregister()
+                synchronized(lock) {
+                    promptOutcome =
+                        if (result.resultCode == Activity.RESULT_OK) OUTCOME_NOT_ASKED
+                        else OUTCOME_DECLINED
+                }
+            }
+            launcher.launch(Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE))
         }
 
         @JvmStatic
@@ -263,39 +296,6 @@ class BluetoothPlugin {
                     context.checkSelfPermission(it) != PackageManager.PERMISSION_GRANTED
                 }
                 .map { it.substringAfterLast('.') }
-        }
-
-        private fun registerLifecycleLocked() {
-            if (callbacksRegistered) return
-            val application = context()?.applicationContext as? Application ?: return
-            application.registerActivityLifecycleCallbacks(lifecycleCallbacks)
-            callbacksRegistered = true
-        }
-
-        private val lifecycleCallbacks = object : Application.ActivityLifecycleCallbacks {
-            override fun onActivityResumed(activity: Activity) {
-                synchronized(lock) {
-                    resumedActivity = activity
-                    if (pendingPrompt == PENDING_NONE) return
-                    pendingPrompt = PENDING_NONE
-                    val ready = missingPermissionsLocked().isEmpty() &&
-                        adapter()?.isEnabled == true
-                    promptOutcome =
-                        if (ready) OUTCOME_NOT_ASKED else OUTCOME_DECLINED
-                }
-            }
-
-            override fun onActivityDestroyed(activity: Activity) {
-                synchronized(lock) {
-                    if (resumedActivity === activity) resumedActivity = null
-                }
-            }
-
-            override fun onActivityCreated(activity: Activity, savedInstanceState: android.os.Bundle?) {}
-            override fun onActivityStarted(activity: Activity) {}
-            override fun onActivityPaused(activity: Activity) {}
-            override fun onActivityStopped(activity: Activity) {}
-            override fun onActivitySaveInstanceState(activity: Activity, outState: android.os.Bundle) {}
         }
 
         private val advertiseCallback = object : AdvertiseCallback() {

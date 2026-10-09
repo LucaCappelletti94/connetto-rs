@@ -64,18 +64,14 @@ impl ReadinessBackend for AndroidBluetoothBackend {
     }
 
     fn prompt(&self) -> Result<(), BluetoothError> {
-        let started = call(&*self.java, |env| {
-            let class = plugin(env, PLUGIN_CLASS)?;
-            int(env, &class, "prompt")
-        })
-        .map_err(|failure| BluetoothError::Failed(failure.to_string()))?;
-        match started {
-            0 => Ok(()),
-            // The action is blocked, so the call's rows stand on the
-            // standing's own reason.
-            _ => Err(BluetoothError::Failed(
+        // The dialogs open from the application's Activity, which only the
+        // Android glue can reach.
+        match connetto_peer_android::start_bluetooth_prompt() {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(BluetoothError::Failed(
                 "the prompt action is blocked".into(),
             )),
+            Err(err) => Err(BluetoothError::Failed(err.to_string())),
         }
     }
 

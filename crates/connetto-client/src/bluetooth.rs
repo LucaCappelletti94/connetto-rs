@@ -28,9 +28,13 @@ use crate::hotspot::{
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_os = "android")]
+mod central;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::AndroidBluetoothBackend;
+#[cfg(target_os = "android")]
+pub(crate) use central::BtleplugCentral;
 
 /// The pace of the machine's look while an exchange runs.
 const FAST_TICK: Duration = Duration::from_millis(20);
@@ -200,10 +204,10 @@ pub enum PeripheralEvent {
 
 /// An event the joiner's central reports (R76).
 #[cfg_attr(
-    not(test),
+    not(any(test, target_os = "android")),
     expect(
         dead_code,
-        reason = "the central's backend arrives with btleplug (R76 decision 20), so only the proofs construct these events"
+        reason = "btleplug's central runs on Android only until R76's slice 8, so elsewhere only the proofs construct these events"
     )
 )]
 #[derive(Clone, Debug)]
@@ -214,8 +218,8 @@ pub enum CentralEvent {
         host: HostId,
         /// The beacon's service data.
         service_data: Vec<u8>,
-        /// The signal's strength.
-        rssi: i16,
+        /// The signal's strength, where the platform reports one.
+        rssi: Option<i16>,
     },
     /// The host connected, with the negotiated packet size.
     Connected {
@@ -1160,31 +1164,31 @@ impl Machine {
                                     HostRecord {
                                         prefix: beacon.prefix,
                                         last_seen: now,
-                                        rssi: Some(rssi),
+                                        rssi,
                                         tried: false,
                                     },
                                 );
                                 (self.emit)(ClientEvent::HostNearby {
                                     host,
                                     prefix: beacon.prefix,
-                                    rssi: Some(rssi),
+                                    rssi,
                                 });
                             }
                             // A known prefix refreshes its signal.
                             Some(record) if record.prefix == beacon.prefix => {
                                 record.last_seen = now;
-                                record.rssi = Some(rssi);
+                                record.rssi = rssi;
                             }
                             // A new prefix is a new host, untried again.
                             Some(record) => {
                                 record.prefix = beacon.prefix;
                                 record.last_seen = now;
-                                record.rssi = Some(rssi);
+                                record.rssi = rssi;
                                 record.tried = false;
                                 (self.emit)(ClientEvent::HostNearby {
                                     host,
                                     prefix: beacon.prefix,
-                                    rssi: Some(rssi),
+                                    rssi,
                                 });
                             }
                         }
@@ -2220,7 +2224,7 @@ mod tests {
             self.central.push(CentralEvent::Seen {
                 host,
                 service_data: Beacon::of(host_fp).to_service_data().to_vec(),
-                rssi,
+                rssi: Some(rssi),
             });
         }
 
@@ -2722,7 +2726,7 @@ mod tests {
         pair.joiner_central.push(CentralEvent::Seen {
             host: device,
             service_data: Beacon::of(&pair.host_fp).to_service_data().to_vec(),
-            rssi: -40,
+            rssi: Some(-40),
         });
         pair.joiner.tick(None, false);
         let (join_tx, mut join_rx) = oneshot::channel();

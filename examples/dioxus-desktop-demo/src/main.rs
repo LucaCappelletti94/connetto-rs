@@ -735,6 +735,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     // A permission a host or join named as missing, which the panel asks for
     // on the UI thread, where the platform's prompt wants to be asked from.
     let missing: Signal<Option<String>> = use_signal(|| None);
+    // The hosts whose beacons this device sees, with their prefixes and
+    // signals, as the scan reports them.
+    let nearby: Signal<Vec<NearbyHost>> = use_signal(Vec::new);
     // The join form, the host's offer read off its lines or typed over.
     let mut join_ssid: Signal<String> = use_signal(String::new);
     let mut join_passphrase: Signal<String> = use_signal(String::new);
@@ -747,6 +750,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
         let mut peers = peers;
         let mut offer = offer;
         let mut outcome = outcome;
+        let mut nearby = nearby;
         use_hook(move || {
             spawn(async move {
                 let mut rx = event_rx;
@@ -775,6 +779,17 @@ fn PeerPanel(parts: SessionParts) -> Element {
                         }
                         ClientEvent::HotspotLeft => {
                             outcome.set("the joined network was lost".to_owned());
+                        }
+                        ClientEvent::HostNearby { host, prefix, rssi } => {
+                            let mut held = nearby.peek().clone();
+                            held.retain(|known| known.host != host);
+                            held.push(NearbyHost { host, prefix, rssi });
+                            nearby.set(held);
+                        }
+                        ClientEvent::HostGone { host } => {
+                            let mut held = nearby.peek().clone();
+                            held.retain(|known| known.host != host);
+                            nearby.set(held);
                         }
                         _ => {}
                     }
@@ -808,6 +823,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let leave_outcome = outcome;
     let bt_parts = parts.clone();
     let bt_outcome = outcome;
+    let nearby_parts = parts.clone();
+    let nearby_outcome = outcome;
+    let nearby_hosts = nearby;
 
     let me = parts
         .0
@@ -819,6 +837,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
         _ => "peer: not serving".to_owned(),
     };
     let peers = peers();
+    let nearby_lines: Vec<String> = nearby().iter().map(NearbyHost::line).collect();
     let offer = offer();
     let outcome = outcome();
 
@@ -829,6 +848,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
             p { {bluetooth_line()} }
             p { {beacon_line()} }
             for line in peers.iter().cloned() {
+                p { {line} }
+            }
+            for line in nearby_lines {
                 p { {line} }
             }
             if let Some(offer) = offer {
@@ -977,7 +999,61 @@ fn PeerPanel(parts: SessionParts) -> Element {
                 },
                 "Leave the hotspot"
             }
+            button {
+                onclick: move |_| {
+                    let strongest = nearby_hosts
+                        .peek()
+                        .iter()
+                        .max_by_key(|known| (known.rssi.unwrap_or(i16::MIN), known.host))
+                        .map(|known| known.host);
+                    let mut outcome = nearby_outcome;
+                    // One nearby join at a time, so its outcome is the one shown.
+                    if *outcome.peek() == "joining the nearby host" {
+                        return;
+                    }
+                    let Some(host) = strongest else {
+                        outcome.set("no host is nearby".to_owned());
+                        return;
+                    };
+                    let parts = nearby_parts.clone();
+                    spawn(async move {
+                        outcome.set("joining the nearby host".to_owned());
+                        match parts.0.native.join_nearby(&host).await {
+                            Ok(gateway) => {
+                                outcome.set(format!("joined through the gateway {gateway}"));
+                            }
+                            Err(err) => outcome.set(err.to_string()),
+                        }
+                    });
+                },
+                "Join the nearby host"
+            }
         }
+    }
+}
+
+/// A host whose beacon this device sees (R76).
+#[cfg(feature = "peer")]
+#[derive(Clone, PartialEq)]
+struct NearbyHost {
+    host: connetto_client::HostId,
+    prefix: [u8; 8],
+    rssi: Option<i16>,
+}
+
+#[cfg(feature = "peer")]
+impl NearbyHost {
+    /// The panel's line, `nearby: <prefix>` with the signal where known.
+    fn line(&self) -> String {
+        use std::fmt::Write as _;
+        let mut line = String::from("nearby: ");
+        for byte in self.prefix {
+            let _ = write!(line, "{byte:02x}");
+        }
+        if let Some(rssi) = self.rssi {
+            let _ = write!(line, " at {rssi} dBm");
+        }
+        line
     }
 }
 
