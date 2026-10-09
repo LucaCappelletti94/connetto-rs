@@ -4488,13 +4488,24 @@ where
     ) -> Result<(SqliteRegistration, std::sync::Arc<[MemberTable]>), SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
+        // The rule's caller-reading term only describes when the caller is stated.
+        let subscriber = state
+            .principal
+            .identity()
+            .map(|identity| PgValue::String(identity.user_id.to_string()));
+        let subjects: Vec<PgValue<Postgres>> = state
+            .principal
+            .capabilities()
+            .iter()
+            .map(|subject| PgValue::String(subject.key().to_string()))
+            .collect();
         // Describing asks the plain compiler, which refuses shapes the
         // re-execution wrapper goes on to accept (a `MAX` aggregate, say), so
         // a refusal here is not one: registration below is the authority and
         // re-raises anything genuinely refused, term problems included, since
         // subql describes and registers through one compile path.
         let terms = materializer
-            .describe_terms(consumer_id, &pg_sql, &sub.spec.binds)
+            .describe_terms(consumer_id, &pg_sql, &sub.spec.binds, subscriber, subjects)
             .unwrap_or_default();
         let seed = self.seed_for_terms(&terms, state).await?;
         let member_tables = Self::member_tables_of(&terms);

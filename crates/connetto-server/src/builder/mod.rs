@@ -303,6 +303,13 @@ impl ServerSchema {
             pg_policies: pg_policies.into(),
         }
     }
+
+    /// The one catalog the engine classifies, the policies beside the DDL,
+    /// because a folded read rule reads the policy text the engine must hold.
+    #[must_use]
+    pub fn catalog(&self) -> String {
+        format!("{}\n{}", self.pg_ddl, self.pg_policies)
+    }
 }
 
 /// The persisted JWT keypair, both halves PKCS8 PEM Ed25519.
@@ -1539,7 +1546,7 @@ async fn build_write_side<D: ConnettoSchema>(
         build_authorization::<D>(&pools.owner, &pools.reader, schema, publication, openfga).await?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let upkeep_translator = translator.clone();
-    let materializer = Materializer::builder(&schema.pg_ddl)
+    let materializer = Materializer::builder(&schema.catalog())
         .with_write_catalog(writable)
         .with_translator(translator)
         .with_caller(caller_mapping())

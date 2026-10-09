@@ -76,6 +76,8 @@ mod read_ceiling;
 
 mod read_filter;
 
+mod read_rule_fold;
+
 mod reconnect;
 
 mod reexec;

@@ -635,7 +635,10 @@ impl Translated {
                 q.description.as_ref().map(|d| Enumeration {
                     description: d,
                     sql: &q.sql,
-                    condition: q.condition.as_deref(),
+                    condition: q
+                        .condition
+                        .as_ref()
+                        .map(rls2fga::types::ConditionName::as_str),
                 })
             })
             .collect();

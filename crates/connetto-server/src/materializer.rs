@@ -1861,6 +1861,11 @@ where
     /// the seed query answered is the subquery's own text rather than SQL
     /// rebuilt from resolved names (R63).
     ///
+    /// `subscriber` and `subjects` state the caller the registration will
+    /// carry, because a complete classified read rule describes one more
+    /// caller-reading term than the filter names, and with the caller unstated
+    /// the rule keeps query-only matching.
+    ///
     /// # Errors
     ///
     /// [`MaterializerError::Register`] for whatever `register` would answer
@@ -1871,8 +1876,16 @@ where
         consumer_id: u64,
         pg_sql: &str,
         binds: &[BindValue],
+        subscriber: Option<PgValue<Postgres>>,
+        subjects: Vec<PgValue<Postgres>>,
     ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
-        let request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        let mut request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        if subscriber.is_some() || !subjects.is_empty() {
+            if let Some(subscriber) = subscriber {
+                request = request.subscriber(subscriber);
+            }
+            request = request.subjects(subjects);
+        }
         self.engine
             .describe_terms(&request)
             .map_err(MaterializerError::Register)
@@ -2469,7 +2482,10 @@ mod membership_term_tests {
     use super::*;
     use crate::openfga::Translated;
     use connetto_core::auth::DEFAULT_USER_SETTING;
+    use std::sync::Arc;
     use subql::term::TermDescription;
+
+    use subql::{ChangeEvent, PgCommitPosition, PgLsn, PgXid};
 
     /// The motivating pair: a guarded table filtered through a membership.
     const SCHEMA: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\nCREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
@@ -2518,7 +2534,7 @@ mod membership_term_tests {
             "the mapping must rewrite the caller, got {pg_sql}"
         );
         let terms = mat
-            .describe_terms(1, &pg_sql, &[])
+            .describe_terms(1, &pg_sql, &[], None, Vec::new())
             .expect("the canonical shape describes");
         let [term] = terms.as_slice() else {
             panic!("one canonical term describes, got {terms:?}");
@@ -2636,17 +2652,230 @@ mod membership_term_tests {
     fn a_non_canonical_shape_describes_no_term() {
         let mat = materializer(Some(mapping()));
         assert!(
-            mat.describe_terms(1, "SELECT * FROM docs WHERE project_id > 5", &[])
-                .expect("a literal comparison is an ordinary predicate")
-                .is_empty(),
+            mat.describe_terms(
+                1,
+                "SELECT * FROM docs WHERE project_id > 5",
+                &[],
+                None,
+                Vec::new()
+            )
+            .expect("a literal comparison is an ordinary predicate")
+            .is_empty(),
             "a comparison against a literal is not a membership subquery"
         );
         let joined = "SELECT * FROM docs WHERE project_id IN (SELECT pm.project_id FROM project_members pm JOIN docs d ON d.project_id = pm.project_id WHERE pm.user_id = current_setting('app.user_id', true))";
-        let described = mat.describe_terms(1, joined, &[]);
+        let described = mat.describe_terms(1, joined, &[], None, Vec::new());
         assert!(
             matches!(described, Err(MaterializerError::Register(_))),
             "a subquery joining a second table is outside the shape subql compiles, \
              so it is refused rather than described, got {described:?}"
         );
+    }
+    /// The catalog every connetto table carries, identity or subject set on
+    /// one column, beside the query the caller sends, which names no term.
+    const OWN_DDL: &str =
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, owner TEXT NOT NULL, label TEXT NOT NULL);";
+    const OWN_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;\n\
+         CREATE POLICY items_p ON items FOR ALL USING (\n\
+         owner = current_setting('app.user_id', true)\n\
+         OR owner = ANY(string_to_array(current_setting('app.subjects', true), ','))\n\
+         );";
+    const OWN_QUERY: &str = "SELECT * FROM items";
+
+    fn own_materializer() -> Materializer {
+        let translated = Translated::of::<String>(OWN_DDL, OWN_POLICIES, DEFAULT_USER_SETTING)
+            .expect("the own-shape policy translates");
+        let (_, translator, _) = translated.into_parts();
+        let catalog = format!("{OWN_DDL}\n{OWN_POLICIES}");
+        Materializer::builder(&catalog)
+            .with_translator(translator)
+            .with_caller(CallerMappings {
+                identity: SessionVariableMapping::current_setting(
+                    DEFAULT_USER_SETTING,
+                    "current_app_user",
+                ),
+                subjects: Some(
+                    SessionVariableMapping::current_setting(
+                        connetto_core::auth::DEFAULT_SUBJECTS_SETTING,
+                        "current_app_subjects",
+                    )
+                    .holding_set(','),
+                ),
+            })
+            .build()
+            .expect("the catalog parses")
+    }
+
+    /// The rule's term seeds the caller the session will state, so the seam
+    /// registers the way `register_subscription` does once the rule's term
+    /// describes.
+    fn own_registration(
+        mat: &mut Materializer,
+        consumer_id: u64,
+        identity: &str,
+        keys: &[&str],
+    ) -> Registration {
+        let subscriber = PgValue::String(identity.to_owned());
+        let subjects: Vec<PgValue<Postgres>> = keys
+            .iter()
+            .map(|key| PgValue::String((*key).to_owned()))
+            .collect();
+        let terms = mat
+            .describe_terms(
+                consumer_id,
+                OWN_QUERY,
+                &[],
+                Some(subscriber.clone()),
+                subjects.clone(),
+            )
+            .expect("the rule's term describes");
+        let seed = TermSeed {
+            subscriber: Some(subscriber),
+            subjects,
+            term_values: Vec::new(),
+        };
+        let registration = mat
+            .register_translated(
+                consumer_id,
+                OWN_QUERY,
+                &[],
+                Some(seed),
+                ReadBudget::new(core::time::Duration::from_secs(5)),
+                None,
+            )
+            .expect("the registration folds the rule");
+        assert!(
+            !terms.is_empty(),
+            "the rule describes its caller-reading term"
+        );
+        registration
+    }
+
+    fn own_event(owner: &str) -> PgChangeEvent {
+        let mut data = pg_walstream::RowData::with_capacity(3);
+        data.push(Arc::from("id"), pg_walstream::ColumnValue::text("1"));
+        data.push(Arc::from("owner"), pg_walstream::ColumnValue::text(owner));
+        data.push(Arc::from("label"), pg_walstream::ColumnValue::text("x"));
+        let change = ChangeEvent::insert("public", "items", 0, data, pg_walstream::Lsn::new(1));
+        PgChangeEvent::new(change, PgCommitPosition::new(PgLsn(1), PgXid(1), 1))
+    }
+
+    /// A query naming no caller term still folds the table's rule, and the
+    /// dispatch then reaches only the callers the row admits. Against the
+    /// engine without the fold the same registration is one shared predicate
+    /// every insert matches, so every consumer below receives.
+    #[tokio::test]
+    async fn a_read_rule_folds_into_a_plain_query() {
+        let mut mat = own_materializer();
+        let registration = own_registration(&mut mat, 1, "alice", &["team:a"]);
+        assert!(matches!(registration, Registration::Row(_)));
+        let registration = own_registration(&mut mat, 2, "bob", &[]);
+        assert!(matches!(registration, Registration::Row(_)));
+
+        let dispatched = mat
+            .dispatch(&own_event("alice"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [1], "the row admits alice alone");
+
+        let dispatched = mat
+            .dispatch(&own_event("team:a"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [1], "the row names a subject only alice holds");
+
+        let dispatched = mat
+            .dispatch(&own_event("bob"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [2], "the row names bob's identity");
+
+        let dispatched = mat
+            .dispatch(&own_event("carol"))
+            .await
+            .expect("the dispatch runs");
+        assert!(
+            dispatched.patches.is_empty(),
+            "the row admits no registered caller"
+        );
+    }
+
+    /// The storm cell's exact subscription, a plain filter that names no caller
+    /// term, registered the way `register_subscription` seeds a caller-identity
+    /// term. The folded rule must still reach only the caller the row admits,
+    /// which is what narrows the catch-up walk the storm is built of.
+    #[tokio::test]
+    async fn a_plain_filtered_query_folds_the_read_rule() {
+        const QUERY: &str = "SELECT * FROM items WHERE id > 0";
+        let mut mat = own_materializer();
+        for (consumer_id, identity) in [(1, "user-0"), (2, "user-1")] {
+            let subscriber = PgValue::String(identity.to_owned());
+            let terms = mat
+                .describe_terms(
+                    consumer_id,
+                    QUERY,
+                    &[],
+                    Some(subscriber.clone()),
+                    Vec::new(),
+                )
+                .expect("the rule's term describes");
+            assert!(
+                !terms.is_empty(),
+                "the rule describes its caller-reading term"
+            );
+            let seed = TermSeed {
+                subscriber: Some(subscriber),
+                subjects: Vec::new(),
+                term_values: Vec::new(),
+            };
+            let registration = mat
+                .register_translated(
+                    consumer_id,
+                    QUERY,
+                    &[],
+                    Some(seed),
+                    ReadBudget::new(core::time::Duration::from_secs(5)),
+                    None,
+                )
+                .expect("the registration folds the rule");
+            assert!(matches!(registration, Registration::Row(_)));
+        }
+
+        let dispatched = mat
+            .dispatch(&own_event("user-0"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [1], "the row admits user-0 alone");
+
+        let dispatched = mat
+            .dispatch(&own_event("user-1"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [2], "the row admits user-1 alone");
     }
 }
