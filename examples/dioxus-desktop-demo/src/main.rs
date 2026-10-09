@@ -1004,9 +1004,13 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     let strongest = nearby_hosts
                         .peek()
                         .iter()
-                        .max_by_key(|known| known.rssi.unwrap_or(i16::MIN))
+                        .max_by_key(|known| (known.rssi.unwrap_or(i16::MIN), known.host))
                         .map(|known| known.host);
                     let mut outcome = nearby_outcome;
+                    // One nearby join at a time, so its outcome is the one shown.
+                    if *outcome.peek() == "joining the nearby host" {
+                        return;
+                    }
                     let Some(host) = strongest else {
                         outcome.set("no host is nearby".to_owned());
                         return;
