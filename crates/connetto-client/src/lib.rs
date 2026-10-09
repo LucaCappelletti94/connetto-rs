@@ -107,7 +107,7 @@ pub use bluetooth::{
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
-pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError};
+pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError, WifiPayloadError};
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 

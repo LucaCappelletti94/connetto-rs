@@ -46,6 +46,10 @@
 //! `--peer-serial` as well, the second phone finds the first one's beacon and
 //! joins through the exchange behind it in place of the join form (R76 slice
 //! 6), and both phones end with their Bluetooth off.
+//!
+//! With `--payload` and `--peer-serial`, the second phone joins through the
+//! first one's `WIFI:` payload pasted into its join form, the first phone's
+//! Bluetooth left off as a host whose beacon is down (R76 slice 7).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,6 +95,16 @@ const PEER_USER: &str = "bob";
 /// the locales the proof phones run, which the driver taps in place of the
 /// user (R76 decision 16).
 const CONNECT_BUTTONS: [&str; 3] = ["Connect", "Connetti", "Verbinden"];
+/// The Bluetooth enable dialog's refusal in the runner's locales, which a
+/// host whose beacon stays down taps (R76 decision 21).
+const DENY_BUTTONS: [&str; 6] = [
+    "Deny",
+    "Don't allow",
+    "Rifiuta",
+    "Non consentire",
+    "Ablehnen",
+    "Nicht zulassen",
+];
 /// The silence a link gets to end after the phones leave the hotspot, on
 /// either side.
 const LINK_END_BOUND: Duration = Duration::from_secs(120);
@@ -116,6 +130,7 @@ async fn main() -> Result<()> {
         unlock_pin,
         peer_serial,
         bluetooth,
+        payload,
     } = cli_arguments()?;
     let device = Device::pick(serial).await?;
     let evidence = repo_path(&["target", "android-proof"])?.join(format!(
@@ -151,10 +166,10 @@ async fn main() -> Result<()> {
             match (bluetooth, peer_serial, outcome) {
                 (true, None, Ok(())) => bluetooth_proof(&device, &evidence).await,
                 (bluetooth, Some(serial), Ok(())) => {
-                    let join_by = if bluetooth {
-                        JoinBy::Beacon
-                    } else {
-                        JoinBy::Form
+                    let join_by = match (bluetooth, payload) {
+                        (true, _) => JoinBy::Beacon,
+                        (false, true) => JoinBy::Payload,
+                        (false, false) => JoinBy::Form,
                     };
                     peer_proof(
                         &device,
@@ -438,6 +453,8 @@ struct HotspotOfferLines {
     passphrase: String,
     /// The host's peer port.
     port: u16,
+    /// The offer as one `WIFI:` payload, where the page shows it.
+    payload: Option<String>,
 }
 
 /// The offer a hosting phone shows, its lines read off the page, bounded.
@@ -465,6 +482,9 @@ enum JoinBy {
     Form,
     /// The first phone's Bluetooth beacon and the exchange behind it (R76).
     Beacon,
+    /// The first phone's `WIFI:` payload pasted into the second's join form
+    /// (R76 decision 24).
+    Payload,
 }
 
 /// The two-phone peer proof (R76 slice 4): `host` hosts a hotspot from the
@@ -605,6 +625,14 @@ async fn run_peer_proof(
             ])
             .await?;
     }
+    if join_by == JoinBy::Payload {
+        // The host's user granted Bluetooth before, so only the enable
+        // dialog stands between its beacon and the radio.
+        for permission in BT_PERMISSIONS {
+            host.adb(&["shell", "pm", "grant", PACKAGE, permission])
+                .await?;
+        }
+    }
     if join_by == JoinBy::Beacon {
         step("turn Bluetooth on and grant its permissions on both phones");
         for phone in [host, joiner] {
@@ -672,6 +700,13 @@ async fn host_and_link(
     join_by: JoinBy,
 ) -> Result<String> {
     app.click("Host a hotspot").await?;
+    if join_by == JoinBy::Payload {
+        step("decline Bluetooth on the first phone");
+        host.tap_dialog_button(&DENY_BUTTONS, "the Bluetooth enable dialog's refusal")
+            .await?;
+        app.wait_for_text("hosting, the beacon is off", Duration::from_secs(30))
+            .await?;
+    }
     let offer = read_hotspot_offer(app).await?;
     host.screenshot(evidence, "host-offer").await?;
 
@@ -682,6 +717,23 @@ async fn host_and_link(
             peer_app.set_input("passphrase", &offer.passphrase).await?;
             peer_app.set_input("port", &offer.port.to_string()).await?;
             peer_app.click("Join the hotspot").await?;
+        }
+        JoinBy::Payload => {
+            let payload = offer
+                .payload
+                .as_deref()
+                .context("the host shows no WIFI: payload")?;
+            step("paste the payload on the second phone");
+            peer_app.set_input("payload", payload).await?;
+            peer_app.click("Join from the payload").await?;
+            if peer_app
+                .wait_for_text("joining the hotspot", Duration::from_secs(10))
+                .await
+                .is_err()
+            {
+                let page = peer_app.page_text().await.unwrap_or_default();
+                bail!("the second phone did not take the payload, its page shows:\n{page}");
+            }
         }
         JoinBy::Beacon => {
             let beacon = read_beacon(app).await?;
@@ -1136,6 +1188,9 @@ struct Arguments {
     /// The Bluetooth beacon proof, host-side alone, and the beacon join with
     /// `--peer-serial`.
     bluetooth: bool,
+    /// The two-phone join through the host's pasted `WIFI:` payload, with
+    /// `--peer-serial`.
+    payload: bool,
 }
 
 fn cli_arguments() -> Result<Arguments> {
@@ -1144,6 +1199,10 @@ fn cli_arguments() -> Result<Arguments> {
     while let Some(arg) = args.next() {
         if arg == "--bluetooth" {
             arguments.bluetooth = true;
+            continue;
+        }
+        if arg == "--payload" {
+            arguments.payload = true;
             continue;
         }
         let value = args.next().ok_or_else(|| anyhow!("{arg} needs a value"))?;
@@ -1463,6 +1522,13 @@ impl Device {
     /// Tap the system's network-approval dialog button, in the user's place
     /// (R76 decision 16), waiting for it to show.
     async fn tap_connect_button(&self) -> Result<()> {
+        self.tap_dialog_button(&CONNECT_BUTTONS, "the network approval's connect button")
+            .await
+    }
+
+    /// Tap the system's dialog button `labels` name in one of the runner's
+    /// locales, waiting for it to show.
+    async fn tap_dialog_button(&self, labels: &[&str], what: &str) -> Result<()> {
         let locale = self
             .adb(&["shell", "getprop", "persist.sys.locale"])
             .await?;
@@ -1471,7 +1537,7 @@ impl Device {
         loop {
             // A dump can crash while the screen changes under it, so a failed
             // one waits for the next look.
-            match self.connect_button_bounds().await {
+            match self.dialog_button_bounds(labels).await {
                 Ok(Some((left, top, right, bottom))) => {
                     self.adb(&[
                         "shell",
@@ -1488,17 +1554,18 @@ impl Device {
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "the network approval's connect button never showed on {} (locale {locale})",
-                    self.serial
+                    "{what} never showed on {} (locale {})",
+                    self.serial,
+                    locale.trim()
                 );
             }
             sleep(Duration::from_secs(2)).await;
         }
     }
 
-    /// The bounds of the approval dialog's connect button, or none while the
-    /// dialog is not up, matched by the localized "Connect" text.
-    async fn connect_button_bounds(&self) -> Result<Option<(i32, i32, i32, i32)>> {
+    /// The bounds of a system dialog's button, or none while the dialog is
+    /// not up, matched by the localized texts `labels` name.
+    async fn dialog_button_bounds(&self, labels: &[&str]) -> Result<Option<(i32, i32, i32, i32)>> {
         self.adb(&["shell", "uiautomator", "dump", "/sdcard/connetto-ui.xml"])
             .await?;
         let xml = self
@@ -1508,7 +1575,7 @@ impl Device {
             let Some(text) = attribute(node, "text") else {
                 continue;
             };
-            if !CONNECT_BUTTONS.contains(&text.as_str()) {
+            if !labels.contains(&text.as_str()) {
                 continue;
             }
             let Some(clickable) = attribute(node, "clickable") else {
@@ -1519,7 +1586,7 @@ impl Device {
             }
             let bounds = attribute(node, "bounds")
                 .and_then(|bounds| parse_bounds(&bounds))
-                .ok_or_else(|| anyhow!("the connect button {text:?} has no bounds"))?;
+                .ok_or_else(|| anyhow!("the dialog button {text:?} has no bounds"))?;
             return Ok(Some(bounds));
         }
         Ok(None)
@@ -1706,6 +1773,7 @@ fn parse_offer_lines(page: &str) -> Option<HotspotOfferLines> {
         ssid,
         passphrase,
         port: port.parse::<u16>().ok()?,
+        payload: line("hotspot payload: "),
     })
 }
 
@@ -1868,11 +1936,16 @@ echo "adb: device offline" >&2; exit 1"#,
             hotspot ssid: My Hotspot\n\
             hotspot passphrase: s3cr3t pass\n\
             hotspot port: 41234\n\
+            hotspot payload: WIFI:T:WPA;S:My Hotspot;P:s3cr3t pass;X:41234;;\n\
             hotspot: hosting\n";
         let offer = parse_offer_lines(page).expect("all three lines are there");
         assert_eq!(offer.ssid, "My Hotspot");
         assert_eq!(offer.passphrase, "s3cr3t pass");
         assert_eq!(offer.port, 41234);
+        assert_eq!(
+            offer.payload.as_deref(),
+            Some("WIFI:T:WPA;S:My Hotspot;P:s3cr3t pass;X:41234;;")
+        );
         assert!(parse_offer_lines("hotspot ssid: only\n").is_none());
         assert!(parse_offer_lines("hotspot port: none\n").is_none());
     }

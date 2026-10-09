@@ -8,6 +8,8 @@ license = "MIT"
 publish = false
 
 [dependencies]
+# The hosted hotspot's `WIFI:` payload drawn as a QR code (R76 decision 23).
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"], optional = true }
 # Startup failures are reported in the window rather than aborting the process, so
 # the whole setup path is fallible.
 anyhow = "1"
@@ -63,7 +65,7 @@ mobile = ["dioxus/mobile"]
 device-identity = ["connetto-client/device-identity", "connetto-auth-session/device-identity"]
 # The peer link and the hotspot it hosts and joins (R76): the device identity
 # the link proves with, and the demo's peer panel.
-peer = ["connetto-client/peer"]
+peer = ["connetto-client/peer", "dep:qrcode"]
 
 [dev-dependencies]
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }
