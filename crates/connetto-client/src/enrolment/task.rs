@@ -23,13 +23,15 @@ use connetto_core::messages::{
     EnrolRequest, FatalErrorReason, RevokeDeviceRequest, SignedList, SyncStatus,
 };
 #[cfg(feature = "peer")]
-use connetto_peer::{CloseReason, DiscoveryEvent, LinkError, PeerEvent};
+use connetto_peer::{CloseReason, DiscoveryEvent, EXCHANGE_BOUND, LinkError, PeerEvent};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use super::{Answer, Held, KeptList, Standing, TOLERANCE, half_life};
 #[cfg(feature = "peer")]
 use crate::PeerError;
+#[cfg(feature = "peer")]
+use crate::bluetooth::{BluetoothError, HostId, JoinNearbyError, PROMPT_BOUND};
 use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
 #[cfg(feature = "peer")]
 use crate::hotspot::{HOST_BOUND, HotspotError, HotspotOffer, JOIN_BOUND, JoinError, MARGIN};
@@ -276,6 +278,10 @@ pub(crate) struct Enroller {
     /// task does (R76).
     clock_off: Arc<AtomicBool>,
     #[cfg(feature = "peer")]
+    /// The fingerprint the device serves, its standing the peer node
+    /// reports (R76).
+    peer_serving: watch::Sender<Option<connetto_peer::Fingerprint>>,
+    #[cfg(feature = "peer")]
     peer: Option<Peer>,
 }
 
@@ -295,6 +301,12 @@ pub(crate) struct EnrolHandle {
     #[cfg(feature = "peer")]
     /// The hotspot machine's commands, until it ends with the client (R76).
     hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
+    #[cfg(feature = "peer")]
+    /// The Bluetooth machine's commands, until it ends with the client (R76).
+    bluetooth: mpsc::UnboundedSender<crate::bluetooth::Command>,
+    #[cfg(feature = "peer")]
+    /// The fingerprint the device serves, once it serves (R76).
+    peer_serving: watch::Receiver<Option<connetto_peer::Fingerprint>>,
 }
 
 impl Enroller {
@@ -307,7 +319,7 @@ impl Enroller {
         feature = "peer",
         expect(
             clippy::too_many_arguments,
-            reason = "the peer node and its hotspot channel join the seven enrolment inputs and a config struct would hide the same arity behind another type"
+            reason = "the peer node and its hotspot and Bluetooth channels join the seven enrolment inputs and a config struct would hide the same arity behind another type"
         )
     )]
     pub(crate) fn new(
@@ -320,6 +332,7 @@ impl Enroller {
         lists: super::ListInbox,
         #[cfg(feature = "peer")] peer: Peer,
         #[cfg(feature = "peer")] hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
+        #[cfg(feature = "peer")] bluetooth: mpsc::UnboundedSender<crate::bluetooth::Command>,
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
@@ -327,6 +340,8 @@ impl Enroller {
         let clock_off = Arc::new(AtomicBool::new(false));
         #[cfg(feature = "peer")]
         let peer_node = peer.node.clone();
+        #[cfg(feature = "peer")]
+        let (peer_serving, peer_serving_rx) = watch::channel(None);
         (
             Self {
                 keys: Arc::clone(&keys),
@@ -341,6 +356,8 @@ impl Enroller {
                 home,
                 clock_off: Arc::clone(&clock_off),
                 #[cfg(feature = "peer")]
+                peer_serving,
+                #[cfg(feature = "peer")]
                 peer: Some(peer),
             },
             EnrolHandle {
@@ -354,6 +371,10 @@ impl Enroller {
                 peer: peer_node,
                 #[cfg(feature = "peer")]
                 hotspot,
+                #[cfg(feature = "peer")]
+                bluetooth,
+                #[cfg(feature = "peer")]
+                peer_serving: peer_serving_rx,
             },
         )
     }
@@ -436,16 +457,16 @@ impl EnrolHandle {
         }
     }
 
-    /// Host this device's hotspot, answered with its details or the reason
-    /// it will not, within the machine's bound (R76).
+    /// Host this device's hotspot, its beacon's outcome beside the offer,
+    /// within the machines' bounds (R76).
     #[cfg(feature = "peer")]
-    pub(crate) async fn host_hotspot(&self) -> Result<HotspotOffer, HotspotError> {
+    pub(crate) async fn host_hotspot(&self) -> Result<crate::bluetooth::Hosted, HotspotError> {
         let (reply, answer) = oneshot::channel();
-        self.hotspot
-            .send(crate::hotspot::Command::Host(reply))
+        self.bluetooth
+            .send(crate::bluetooth::Command::Host(reply))
             .map_err(|_| HotspotError::Failed)?;
-        match tokio::time::timeout(HOST_BOUND + MARGIN, answer).await {
-            Ok(Ok(offer)) => offer,
+        match tokio::time::timeout(HOST_BOUND + PROMPT_BOUND + MARGIN, answer).await {
+            Ok(Ok(hosted)) => hosted,
             Ok(Err(_)) => Err(HotspotError::Failed),
             Err(_) => Err(HotspotError::TimedOut),
         }
@@ -482,6 +503,85 @@ impl EnrolHandle {
     #[cfg(feature = "peer")]
     pub(crate) fn leave_hotspot(&self) {
         let _ = self.hotspot.send(crate::hotspot::Command::Leave);
+    }
+
+    /// Enable Bluetooth, the platform's action inside the call, within the
+    /// machine's bound (R76 decision 21).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn enable_bluetooth(&self) -> Result<(), BluetoothError> {
+        let (reply, answer) = oneshot::channel();
+        self.bluetooth
+            .send(crate::bluetooth::Command::Enable(reply))
+            .map_err(|_| BluetoothError::Failed("the client is gone".into()))?;
+        match tokio::time::timeout(PROMPT_BOUND + MARGIN, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(BluetoothError::Failed("the client is gone".into())),
+            Err(_) => Err(BluetoothError::TimedOut),
+        }
+    }
+
+    /// Join the nearby host's hotspot through the exchange, within the
+    /// machines' bounds (R76 decision 19).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn join_nearby(
+        &self,
+        host: &HostId,
+    ) -> Result<std::net::IpAddr, JoinNearbyError> {
+        let (reply, answer) = oneshot::channel();
+        self.bluetooth
+            .send(crate::bluetooth::Command::JoinNearby { host: *host, reply })
+            .map_err(|_| JoinNearbyError::Join(JoinError::Failed))?;
+        match tokio::time::timeout(EXCHANGE_BOUND + JOIN_BOUND + MARGIN, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(JoinNearbyError::Join(JoinError::Failed)),
+            Err(_) => Err(JoinNearbyError::Join(JoinError::TimedOut)),
+        }
+    }
+
+    /// Fetch the nearby host's offer through the exchange, within the
+    /// machine's bound (R76 decision 19).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn fetch_offer(&self, host: &HostId) -> Result<HotspotOffer, BluetoothError> {
+        let (reply, answer) = oneshot::channel();
+        self.bluetooth
+            .send(crate::bluetooth::Command::Fetch { host: *host, reply })
+            .map_err(|_| BluetoothError::Failed("the client is gone".into()))?;
+        match tokio::time::timeout(EXCHANGE_BOUND + MARGIN, answer).await {
+            Ok(Ok(answer)) => answer,
+            Ok(Err(_)) => Err(BluetoothError::Failed("the client is gone".into())),
+            Err(_) => Err(BluetoothError::TimedOut),
+        }
+    }
+
+    /// The scan's standing, at run time (R76 decision 19).
+    #[cfg(feature = "peer")]
+    pub(crate) fn set_hotspot_scan(&self, scan: bool) {
+        let _ = self
+            .bluetooth
+            .send(crate::bluetooth::Command::SetScan(scan));
+    }
+
+    /// The autojoin's standing, at run time, implying the scan (R76 decision
+    /// 19).
+    #[cfg(feature = "peer")]
+    pub(crate) fn set_hotspot_autojoin(&self, autojoin: bool) {
+        let _ = self
+            .bluetooth
+            .send(crate::bluetooth::Command::SetAutojoin(autojoin));
+    }
+
+    /// The prompt's standing, at run time (R76 decision 21).
+    #[cfg(feature = "peer")]
+    pub(crate) fn set_bluetooth_prompt(&self, prompt: bool) {
+        let _ = self
+            .bluetooth
+            .send(crate::bluetooth::Command::SetPrompt(prompt));
+    }
+
+    /// The fingerprint the device serves, once it serves (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn peer_serving_fingerprint(&self) -> Option<connetto_peer::Fingerprint> {
+        *self.peer_serving.borrow()
     }
 }
 
@@ -1005,6 +1105,7 @@ impl<L: Link> Run<L> {
             Ok(key) => key,
             Err(err) => {
                 tracing::warn!(error = %err, "the device key could not be opened, so the peer link waits");
+                self.enroller.peer_serving.send_replace(None);
                 return;
             }
         };
@@ -1026,10 +1127,12 @@ impl<L: Link> Run<L> {
                         ),
                     }
                 }
+                self.enroller.peer_serving.send_replace(Some(fingerprint));
                 self.discovery.serve(bound.port(), fingerprint);
             }
             Err(err) => {
                 tracing::warn!(error = %err, "the peer listener could not bind");
+                self.enroller.peer_serving.send_replace(None);
                 self.link.emit(ClientEvent::PeerListenFailed {
                     address: self.peer_listen,
                     error: err.to_string(),
@@ -1043,6 +1146,7 @@ impl<L: Link> Run<L> {
     #[cfg(feature = "peer")]
     fn peer_stop(&mut self, reason: CloseReason) {
         self.peer_standing = Standing::NoKey;
+        self.enroller.peer_serving.send_replace(None);
         #[cfg(all(feature = "peer", target_os = "android"))]
         {
             self.multicast = None;
