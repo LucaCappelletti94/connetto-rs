@@ -49,6 +49,18 @@ pub enum PeerFrame {
         /// The leaf's issuer certificate, DER.
         issuer: ByteBuf,
     },
+    /// The hotspot details the host hands the joiner in the Bluetooth
+    /// exchange, once both have proved their identity (R76 slice 5).
+    Offer {
+        /// The hosted network's name.
+        ssid: String,
+        /// The hosted network's passphrase.
+        passphrase: String,
+        /// The security the network carries, 0 for WPA2 and 1 for WPA3.
+        security: u8,
+        /// The host's peer port, while the host serves.
+        port: Option<u16>,
+    },
     /// A liveness probe.
     Ping,
     /// The answer to a liveness probe.

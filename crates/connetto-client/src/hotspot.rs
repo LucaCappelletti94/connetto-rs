@@ -8,21 +8,19 @@
 //! backend reaches the bundled plugin through the application's JNI access.
 
 use std::fmt;
-use std::future::Future;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(test)]
 use parking_lot::Mutex;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use zeroize::Zeroize;
 
 use crate::ClientEvent;
 
 #[cfg(target_os = "android")]
-mod android;
+pub(crate) mod android;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::{AndroidHotspotBackend, JoinedBind};
@@ -34,7 +32,7 @@ pub(crate) const JOIN_BOUND: Duration = Duration::from_secs(60);
 /// The margin the API methods give the machine past its bound.
 pub(crate) const MARGIN: Duration = Duration::from_secs(5);
 /// The pace of the machine's look at the backend's outcome.
-const TICK: Duration = Duration::from_millis(250);
+pub(crate) const TICK: Duration = Duration::from_millis(250);
 
 /// The security a hotspot's Wi-Fi carries.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -289,7 +287,7 @@ type SubnetBind = Arc<dyn Fn(Option<(Ipv4Addr, u8)>) + Send + Sync>;
 
 /// The hotspot machine, one per client (R76).
 pub(crate) struct Machine {
-    backend: Arc<dyn HotspotBackend>,
+    pub(crate) backend: Arc<dyn HotspotBackend>,
     autolink: bool,
     /// The peer port the device serves, from its listener's standing.
     peer_port: Arc<dyn Fn() -> Option<u16> + Send + Sync>,
@@ -324,6 +322,19 @@ impl Machine {
             host: HostState::Off,
             join: JoinState::Idle,
         }
+    }
+
+    /// The offer the host side holds, while it hosts.
+    pub(crate) fn hosting_offer(&self) -> Option<HotspotOffer> {
+        match &self.host {
+            HostState::Hosting { offer } => Some(offer.clone()),
+            _ => None,
+        }
+    }
+
+    /// Whether the join side stands Joined.
+    pub(crate) fn joined(&self) -> bool {
+        matches!(self.join, JoinState::Joined)
     }
 
     /// Take `command` and steer the tables to their rows.
@@ -538,66 +549,7 @@ impl Machine {
         self.host = HostState::Off;
         self.join = JoinState::Idle;
     }
-
-    /// The loop's end, its channel closed.
-    async fn run(mut self, mut commands: mpsc::UnboundedReceiver<Command>) {
-        loop {
-            let (command, tick) = tokio::select! {
-                command = commands.recv() => (command, false),
-                () = tokio::time::sleep(TICK) => (None, true),
-            };
-            let closed = command.is_none() && !tick;
-            if let Some(command) = command {
-                self.handle(command);
-            }
-            if tick {
-                self.tick();
-            }
-            // A closed channel reports `None` where a tick does too.
-            if closed {
-                self.close();
-                break;
-            }
-        }
-    }
 }
-
-/// The machine's loop beside the client's pump, ending with it (R76).
-pub(crate) struct Runner {
-    future: Pin<Box<dyn Future<Output = ()> + Send>>,
-    backend: Arc<dyn HotspotBackend>,
-}
-
-impl Future for Runner {
-    type Output = ();
-
-    fn poll(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<()> {
-        self.future.as_mut().poll(cx)
-    }
-}
-
-impl Drop for Runner {
-    fn drop(&mut self) {
-        // A dropped client leaves the machine unpollable, so the tables'
-        // "Client closed" rows apply here, where they are no-ops on the
-        // backend's own standing.
-        self.backend.stop_host();
-        self.backend.leave_join();
-    }
-}
-
-/// The machine beside the client's pump, the backend's stop and leave
-/// applying to a dropped client (R76).
-pub(crate) fn run(machine: Machine, commands: mpsc::UnboundedReceiver<Command>) -> Runner {
-    let backend = Arc::clone(&machine.backend);
-    Runner {
-        future: Box::pin(async move {
-            machine.run(commands).await;
-        }),
-        backend,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,58 +1128,6 @@ mod tests {
             third_answer.try_recv().is_err(),
             "the good request is in flight"
         );
-    }
-
-    /// The runner answers a command through its channel and ends with it.
-    #[tokio::test]
-    async fn the_runner_answers_a_host_and_ends_with_its_channel() {
-        tokio::time::pause();
-        let backend: Arc<FakeBackend> = Arc::new(FakeBackend::new());
-        let machine = Machine::new(
-            Arc::clone(&backend) as Arc<dyn HotspotBackend>,
-            true,
-            Arc::new(|| Some(54321)),
-            Arc::new(|_| {}),
-            Arc::new(|_| {}),
-            Arc::new(|_| {}),
-        );
-        let (tx, rx) = mpsc::unbounded_channel();
-        let runner = run(machine, rx);
-        let joined = tokio::spawn(async move {
-            runner.await;
-        });
-        let (reply, mut answer) = oneshot::channel();
-        tx.send(Command::Host(reply)).unwrap();
-        // The loop's ticks, with the started outcome between them.
-        for _ in 0..8 {
-            tokio::time::advance(Duration::from_millis(100)).await;
-            tokio::task::yield_now().await;
-        }
-        backend.started(HotspotSecurity::Wpa2);
-        for _ in 0..8 {
-            tokio::time::advance(Duration::from_millis(100)).await;
-            tokio::task::yield_now().await;
-        }
-        // The answer was sent by then, so the take gets it at once.
-        let answer = answer.try_recv().unwrap();
-        assert_eq!(
-            answer,
-            Ok(HotspotOffer::new(
-                "hotspot",
-                "secret",
-                HotspotSecurity::Wpa2,
-                Some(54321)
-            ))
-        );
-        drop(tx);
-        for _ in 0..8 {
-            tokio::time::advance(Duration::from_millis(100)).await;
-            tokio::task::yield_now().await;
-        }
-        tokio::time::timeout(Duration::from_millis(1000), joined)
-            .await
-            .expect("the loop ends with its channel")
-            .expect("the loop task ends");
     }
 
     /// The offer's debug form hides its passphrase.

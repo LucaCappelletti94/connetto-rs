@@ -14,7 +14,7 @@ use connetto_core::device_cert::{
 };
 use parking_lot::{Mutex, RwLock};
 use rustls::pki_types::{CertificateDer, ServerName};
-use rustls::{ClientConfig, ServerConfig, version};
+use rustls::{AlertDescription, ClientConfig, ServerConfig, version};
 use serde_bytes::ByteBuf;
 use socket2::SockRef;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -23,8 +23,12 @@ use tokio::sync::{mpsc, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
 
+#[cfg(feature = "bluetooth")]
+use crate::error::ExchangeError;
 use crate::error::{CloseReason, LinkError, Refusal, TrustError};
 use crate::event::PeerEvent;
+#[cfg(feature = "bluetooth")]
+use crate::exchange::OfferFrame;
 use crate::frame::{FrameError, PROTOCOL_VERSION, PeerFrame, read_frame, write_frame};
 use crate::identity::{Clock, Identity, Trust};
 use crate::signer::{IdentityClientCert, IdentityServerCert};
@@ -48,7 +52,7 @@ pub(crate) const SILENCE_LIMIT: Duration = Duration::from_secs(45);
 /// The inbound handshakes the listener runs at once, the unauthenticated
 /// network's bound on its sockets.
 const MAX_INBOUND_HANDSHAKES: usize = 16;
-const DIAL_NAME: &str = "connetto-peer";
+pub(crate) const DIAL_NAME: &str = "connetto-peer";
 
 /// The links' liveness bounds, the ping pace and the silence that takes a
 /// link down.
@@ -82,14 +86,14 @@ pub trait SocketPrep: Send + Sync {
 
 /// The node's shared state, behind an `Arc` for its tasks.
 pub(crate) struct NodeState {
-    trust: Trust,
+    pub(crate) trust: Trust,
     root_key_ids: Vec<KeyId>,
     pub(crate) verifier: PeerVerifier,
-    own_key: Arc<RwLock<Option<KeyId>>>,
+    pub(crate) own_key: Arc<RwLock<Option<KeyId>>>,
     identity: RwLock<Option<Identity>>,
     lists: Arc<RwLock<Vec<KeptList>>>,
     /// The kept CRLs, a snapshot swapped by `keep_list`.
-    crls: Arc<RwLock<Arc<[Crl]>>>,
+    pub(crate) crls: Arc<RwLock<Arc<[Crl]>>>,
     /// The live links and the peers awaiting their keeper, under one lock so
     /// a close and a registration never race.
     pub(crate) links: Mutex<HashMap<KeyId, SlotState>>,
@@ -444,6 +448,52 @@ impl Node {
         Ok(peer)
     }
 
+    /// Run the Bluetooth exchange as the host over `io`, handing the
+    /// joiner `offer` once it proves its identity, and answer the joiner's
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// [`ExchangeError`] when the node does not serve, the identity proof
+    /// fails, a frame breaks the protocol, or the exchange runs out of its
+    /// bound.
+    #[cfg(feature = "bluetooth")]
+    pub async fn offer_over<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        io: S,
+        offer: OfferFrame,
+    ) -> Result<DeviceIdentity, ExchangeError> {
+        let identity = self
+            .state
+            .identity
+            .read()
+            .clone()
+            .ok_or(ExchangeError::NotServing)?;
+        crate::exchange::offer_exchange(&self.state, io, &identity, &offer).await
+    }
+
+    /// Run the Bluetooth exchange as the joiner over `io`, answering the
+    /// host's identity and its offer.
+    ///
+    /// # Errors
+    ///
+    /// [`ExchangeError`] when the node does not serve, the identity proof
+    /// fails, a frame breaks the protocol, or the exchange runs out of its
+    /// bound.
+    #[cfg(feature = "bluetooth")]
+    pub async fn fetch_over<S: AsyncRead + AsyncWrite + Unpin + Send>(
+        &self,
+        io: S,
+    ) -> Result<(DeviceIdentity, OfferFrame), ExchangeError> {
+        let identity = self
+            .state
+            .identity
+            .read()
+            .clone()
+            .ok_or(ExchangeError::NotServing)?;
+        crate::exchange::fetch_exchange(&self.state, io, &identity).await
+    }
+
     /// Keep `list`, signed by `signer`, and forward it to the links that
     /// lack it.
     ///
@@ -638,41 +688,89 @@ fn presented(identity: &Identity) -> Vec<CertificateDer<'static>> {
     ]
 }
 
-/// A rustls failure as the dial's typed error, the peer's alert first and
-/// the own verifier's typed refusal second.
-fn map_rustls(err: rustls::Error) -> LinkError {
+/// A handshake or frame failure the dial and the exchange each map to
+/// their typed error.
+pub(crate) enum Failure {
+    /// The own verifier refused the peer's chain, with the reason.
+    Refused(Refusal),
+    /// The peer's TLS alert refused, with its description.
+    RefusedByPeer(AlertDescription),
+    /// A frame broke the protocol, with its message.
+    Protocol(String),
+    /// A TLS failure without a typed reason.
+    Tls(rustls::Error),
+    /// A plain I/O failure.
+    Io(io::Error),
+}
+
+impl From<Failure> for LinkError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Refused(refusal) => LinkError::Refused(refusal),
+            Failure::RefusedByPeer(alert) => LinkError::RefusedByPeer(alert),
+            Failure::Protocol(message) => LinkError::Protocol(message),
+            Failure::Tls(source) => LinkError::Tls(source),
+            Failure::Io(source) => LinkError::Unreachable(source),
+        }
+    }
+}
+
+#[cfg(feature = "bluetooth")]
+impl From<Failure> for ExchangeError {
+    fn from(failure: Failure) -> Self {
+        match failure {
+            Failure::Refused(refusal) => ExchangeError::Refused(refusal),
+            Failure::RefusedByPeer(alert) => ExchangeError::RefusedByPeer(alert),
+            Failure::Protocol(message) => ExchangeError::Protocol(message),
+            Failure::Tls(source) => ExchangeError::Tls(source),
+            Failure::Io(source) => ExchangeError::Io(source),
+        }
+    }
+}
+
+/// A rustls failure as a classification, the peer's alert first and the
+/// own verifier's typed refusal second.
+pub(crate) fn classify_rustls(err: rustls::Error) -> Failure {
     if let rustls::Error::AlertReceived(alert) = err {
-        return LinkError::RefusedByPeer(alert);
+        return Failure::RefusedByPeer(alert);
     }
     if let rustls::Error::InvalidCertificate(rustls::CertificateError::Other(inner)) = &err
-        && let Some(refusal) = inner.0.downcast_ref::<crate::error::Refusal>()
+        && let Some(refusal) = inner.0.downcast_ref::<Refusal>()
     {
-        return LinkError::Refused(*refusal);
+        return Failure::Refused(*refusal);
     }
-    LinkError::Tls(err)
+    Failure::Tls(err)
+}
+
+/// A connect or handshake failure as a classification, a plain I/O failure
+/// as `Io`.
+pub(crate) fn classify_io(err: io::Error) -> Failure {
+    match err.downcast::<rustls::Error>() {
+        Ok(err) => classify_rustls(err),
+        Err(err) => Failure::Io(err),
+    }
+}
+
+/// A frame failure as a classification, surfacing the peer's TLS alert when
+/// it reaches the reader on the first read.
+pub(crate) fn classify_frame(err: FrameError) -> Failure {
+    match err {
+        FrameError::Io(io_err) => classify_io(io_err),
+        FrameError::TooLong | FrameError::Malformed => Failure::Protocol(err.to_string()),
+    }
 }
 
 /// A connect or handshake failure as the dial's typed error, a plain I/O
 /// failure as `Unreachable`.
 fn map_tls(err: io::Error) -> LinkError {
-    match err.downcast::<rustls::Error>() {
-        Ok(err) => map_rustls(err),
-        Err(err) => LinkError::Unreachable(err),
-    }
+    classify_io(err).into()
 }
 
 /// A frame failure as the dial's typed error, surfacing the peer's TLS
 /// alert when it reaches the dial on the first read, and a plain I/O
 /// failure as `Unreachable`.
 fn map_frame(err: FrameError) -> LinkError {
-    let message = err.to_string();
-    match err {
-        FrameError::Io(io_err) => match io_err.downcast::<rustls::Error>() {
-            Ok(rustls_err) => map_rustls(rustls_err),
-            Err(io_err) => LinkError::Unreachable(io_err),
-        },
-        _ => LinkError::Protocol(message),
-    }
+    classify_frame(err).into()
 }
 
 /// The accept loop, until stopped.
@@ -787,7 +885,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, identity: Identity) {
 /// # Errors
 ///
 /// [`LinkError`] for a timeout, a broken frame, or a different version.
-async fn exchange_hello<S: AsyncRead + AsyncWrite + Unpin>(
+pub(crate) async fn exchange_hello<S: AsyncRead + AsyncWrite + Unpin>(
     io: &mut S,
     state: &NodeState,
     dial: u64,

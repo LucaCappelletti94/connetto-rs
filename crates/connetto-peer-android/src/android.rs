@@ -9,6 +9,7 @@ use manganis::jni::objects::{JClass, JValue};
 #[manganis::ffi("android")]
 extern "Kotlin" {
     pub type HotspotPlugin;
+    pub type BluetoothPlugin;
 }
 
 /// The plugin's class, reached through the application's class loader, since

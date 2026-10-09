@@ -32,6 +32,14 @@ impl Fingerprint {
     pub const fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }
+
+    /// The first 8 bytes, what the beacon advertises (R76 decision 18).
+    #[must_use]
+    pub fn prefix(&self) -> [u8; 8] {
+        let mut out = [0u8; 8];
+        out.copy_from_slice(&self.0[..8]);
+        out
+    }
 }
 
 impl fmt::Display for Fingerprint {

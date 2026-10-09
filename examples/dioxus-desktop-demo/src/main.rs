@@ -671,6 +671,22 @@ struct OfferLines {
     port: Option<u16>,
 }
 
+/// The host's beacon standing as the panel's line.
+#[cfg(feature = "peer")]
+fn format_beacon(state: connetto_client::BeaconState) -> String {
+    match state {
+        connetto_client::BeaconState::Advertising { prefix } => {
+            let mut line = String::from("beacon: advertising ");
+            for byte in prefix {
+                use std::fmt::Write as _;
+                let _ = write!(line, "{byte:02x}");
+            }
+            line
+        }
+        connetto_client::BeaconState::Off { reason } => format!("beacon: off ({reason})"),
+    }
+}
+
 /// The peer and hotspot panel (R76 slice 4): the device's peer listener, its
 /// linked peers, the hotspot it hosts with the offer shown as plain lines,
 /// and the form that joins a hotspot another device hosted.
@@ -682,6 +698,10 @@ fn PeerPanel(parts: SessionParts) -> Element {
     // The listener's port, read again every second, since the listener opens
     // beside the pump the way enrolment does.
     let mut peer_port: Signal<Option<u16>> = use_signal(|| None);
+    // The Bluetooth standing and the host's beacon, read on the same pace.
+    let mut bluetooth_line: Signal<String> = use_signal(|| "bluetooth: unsupported".to_owned());
+    let mut beacon_line: Signal<String> =
+        use_signal(|| "beacon: off (no bluetooth on this system)".to_owned());
     {
         let parts = parts.clone();
         use_hook(move || {
@@ -691,6 +711,14 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     let port = parts.0.native.peer_address().map(|address| address.port());
                     if *peer_port.peek() != port {
                         peer_port.set(port);
+                    }
+                    let state = format!("bluetooth: {}", parts.0.native.bluetooth_state());
+                    if *bluetooth_line.peek() != state {
+                        bluetooth_line.set(state);
+                    }
+                    let line = format_beacon(parts.0.native.beacon_state());
+                    if *beacon_line.peek() != line {
+                        beacon_line.set(line);
                     }
                 }
             })
@@ -778,6 +806,8 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let join_missing = missing;
     let leave_parts = parts.clone();
     let leave_outcome = outcome;
+    let bt_parts = parts.clone();
+    let bt_outcome = outcome;
 
     let me = parts
         .0
@@ -796,6 +826,8 @@ fn PeerPanel(parts: SessionParts) -> Element {
         div {
             style: "font-family: monospace; font-size: 0.85em; color: #333; border: 1px solid #ccc; border-radius: 4px; padding: 8px 12px; margin-bottom: 12px; line-height: 1.5;",
             p { {peer_line} }
+            p { {bluetooth_line()} }
+            p { {beacon_line()} }
             for line in peers.iter().cloned() {
                 p { {line} }
             }
@@ -815,13 +847,16 @@ fn PeerPanel(parts: SessionParts) -> Element {
                         outcome.set("asking for the hotspot".to_owned());
                         let result = parts.0.native.host_hotspot().await;
                         match result {
-                            Ok(details) => {
+                            Ok(hosted) => {
                                 offer.set(Some(OfferLines {
-                                    ssid: details.ssid.clone(),
-                                    passphrase: details.passphrase.clone(),
-                                    port: details.port,
+                                    ssid: hosted.offer.ssid.clone(),
+                                    passphrase: hosted.offer.passphrase.clone(),
+                                    port: hosted.offer.port,
                                 }));
-                                outcome.set("hosting".to_owned());
+                                outcome.set(match hosted.beacon {
+                                    Ok(()) => "hosting".to_owned(),
+                                    Err(err) => format!("hosting, the beacon is off: {err}"),
+                                });
                             }
                             Err(err) => {
                                 if let HotspotError::MissingPermission(name) = &err {
@@ -833,6 +868,20 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     });
                 },
                 "Host a hotspot"
+            }
+            button {
+                onclick: move |_| {
+                    let parts = bt_parts.clone();
+                    let mut outcome = bt_outcome;
+                    spawn(async move {
+                        outcome.set("turning on bluetooth".to_owned());
+                        match parts.0.native.enable_bluetooth().await {
+                            Ok(()) => outcome.set("bluetooth is on".to_owned()),
+                            Err(err) => outcome.set(err.to_string()),
+                        }
+                    });
+                },
+                "Turn on Bluetooth"
             }
             button {
                 onclick: move |_| {

@@ -180,7 +180,7 @@ impl Deployment {
 
     /// An issuer-signed list `number` revoking `revoked`, dated at `now`.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    fn issuer_list(
+    pub(crate) fn issuer_list(
         &self,
         issuer: &Issuer,
         number: u64,
@@ -231,7 +231,7 @@ impl Peer {
     }
 
     /// The key id, what the duplicate rule compares.
-    fn key_id(&self) -> connetto_core::device_cert::KeyId {
+    pub(crate) fn key_id(&self) -> connetto_core::device_cert::KeyId {
         key_id(&self.key)
     }
 }
@@ -2488,4 +2488,62 @@ async fn a_refusing_prep_refuses_the_dial_as_unreachable() {
         b.link(a_addr).await.expect("the link completes"),
         alice.identity
     );
+}
+
+/// Reproduction, on the plain link path: two devices from two different
+/// issuers of one deployment link while the dialer holds a list signed by
+/// its own issuer. The issuers share a subject DN, so webpki treats the
+/// kept list as authoritative for the peer's leaf and fails its signature
+/// against the peer's issuer key. Failing first: once the verifier
+/// disambiguates lists by the issuer's key, not its DN, the link completes.
+#[tokio::test]
+async fn a_kept_list_from_a_dn_sibling_issuer_does_not_refuse_the_link() {
+    let now = whole_second();
+    let deployment = Deployment::new(1, now);
+    // Two issuers under one deployment: the same subject DN, different keys
+    // and serials.
+    let issuer_a = deployment.add_issuer(now, [1; 16]);
+    let issuer_b = deployment.add_issuer(now, [2; 16]);
+    let alice = deployment.device(
+        &issuer_a,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer_b,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    // The dialer keeps a list signed by its own issuer, a sibling of the
+    // peer's issuer under the same root, and the link completes.
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    serve(&a, &alice);
+    let b_addr = serve(&b, &bob);
+    let (list, signer) = deployment.issuer_list(&issuer_a, 1, &[], now);
+    a.keep_list(list, signer);
+    let peer = a.link(b_addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+
+    // Control: the root's list names only the root's DN, so it applies to the
+    // peer's issuer, not the peer's leaf, and verifies under the root's key.
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    serve(&a, &alice);
+    let b_addr = serve(&b, &bob);
+    let (list, signer) = deployment.root_list(1, &[], now);
+    a.keep_list(list, signer);
+    let peer = a.link(b_addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
 }
