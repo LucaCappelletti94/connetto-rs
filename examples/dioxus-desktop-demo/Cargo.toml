@@ -50,6 +50,9 @@ connetto-dioxus = { path = "../../crates/connetto-dioxus", features = ["desktop"
 [target.'cfg(target_os = "android")'.dependencies]
 # Bundles `android/`, the manifest that turns off backup and device transfer.
 manganis = "0.7.10"
+# The peer link's and hotspot's Kotlin plugin, and its Wi-Fi permissions the
+# build merges into the app's manifest.
+connetto-peer-android = { path = "../../crates/connetto-peer-android" }
 
 [features]
 default = ["desktop"]
@@ -58,6 +61,9 @@ mobile = ["dioxus/mobile"]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
 # names at build time, which `connetto-demo-stack` mints (R74 decision 30).
 device-identity = ["connetto-client/device-identity", "connetto-auth-session/device-identity"]
+# The peer link and the hotspot it hosts and joins (R76): the device identity
+# the link proves with, and the demo's peer panel.
+peer = ["connetto-client/peer"]
 
 [dev-dependencies]
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }

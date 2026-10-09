@@ -6,6 +6,8 @@
 //! platform's runtime owns. Everything the build composes rides the core.
 
 use std::fmt::Display;
+#[cfg(feature = "peer")]
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +18,8 @@ use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
 use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
 
 use crate::GateMechanism;
+#[cfg(feature = "peer")]
+use crate::PeerError;
 use crate::TransportFactory;
 #[cfg(feature = "native-auth")]
 use crate::auth::{KeyringKeyStore, NativeAuthenticator, remembered_account};
@@ -31,6 +35,8 @@ use crate::builder::sign_in::{AccountChoice, Keyring};
 use crate::builder::sign_in::{HeldCredential, NativeSignIn, NoKeyring, SignInKind, StorageMarker};
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
+#[cfg(feature = "peer")]
+use crate::enrolment::Peer;
 #[cfg(feature = "device-identity")]
 use crate::enrolment::{CertificateError, DeviceKeys, EnrolHandle, Enroller, PlatformKeys};
 use crate::reconnect::ReconnectPolicy;
@@ -40,8 +46,14 @@ use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
 use crate::{ClientError, ConnettoClient, Custody};
+#[cfg(feature = "peer")]
+use crate::{ClientEvent, HotspotError, HotspotOffer, JoinError};
+#[cfg(feature = "peer")]
+use connetto_core::device_cert::AttestationLevel;
 #[cfg(feature = "device-identity")]
 use connetto_core::device_cert::{DeviceCertificate, DeviceDescriptor, KeyHome};
+#[cfg(feature = "peer")]
+use tokio::sync::mpsc;
 
 /// The platform transport, a WebSocket over a plain loopback socket or a
 /// TLS stream the platform's trust store verified.
@@ -439,6 +451,12 @@ struct DeviceSetup {
     descriptor: Vec<u8>,
     refused: Option<String>,
     roots: Vec<Vec<u8>>,
+    #[cfg(feature = "peer")]
+    peer_autolink: bool,
+    #[cfg(feature = "peer")]
+    peer_listen: SocketAddr,
+    #[cfg(feature = "peer")]
+    peer_accepted: Vec<AttestationLevel>,
     #[cfg(target_os = "android")]
     java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
@@ -452,6 +470,12 @@ impl Default for DeviceSetup {
             descriptor: rmp_serde::to_vec_named(&()).unwrap_or_default(),
             refused: None,
             roots: Vec::new(),
+            #[cfg(feature = "peer")]
+            peer_autolink: true,
+            #[cfg(feature = "peer")]
+            peer_listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            #[cfg(feature = "peer")]
+            peer_accepted: AttestationLevel::ALL.to_vec(),
             #[cfg(target_os = "android")]
             java: None,
         }
@@ -471,6 +495,13 @@ impl DeviceSetup {
         }
         if self.roots.is_empty() {
             return Err(ClientError::MissingDeploymentRoots);
+        }
+        if let Some(index) = self
+            .roots
+            .iter()
+            .position(|root| connetto_core::device_cert::certificate_key_id(root).is_err())
+        {
+            return Err(ClientError::InvalidDeploymentRoot { index });
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let chip = Arc::new(crate::device_key::SecureEnclave);
@@ -541,6 +572,36 @@ where
     #[must_use]
     pub fn with_deployment_roots(mut self, roots: impl IntoIterator<Item = Vec<u8>>) -> Self {
         self.device.roots = roots.into_iter().collect();
+        self
+    }
+
+    /// The address this device's peer listener binds, every interface on a
+    /// system-chosen port by default (R76 decision 6).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_listener(mut self, listen: SocketAddr) -> Self {
+        self.device.peer_listen = listen;
+        self
+    }
+
+    /// Whether this device dials the peers discovery finds, on by default
+    /// (R76 decision 12).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_autolink(mut self, autolink: bool) -> Self {
+        self.device.peer_autolink = autolink;
+        self
+    }
+
+    /// The attestation levels this device accepts from its peers, all three
+    /// by default (R76 decision 8).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_accepted_attestation(
+        mut self,
+        accepted: impl IntoIterator<Item = AttestationLevel>,
+    ) -> Self {
+        self.device.peer_accepted = accepted.into_iter().collect();
         self
     }
 
@@ -637,6 +698,10 @@ where
     ///
     /// [`ClientError`] on a sign-in, key, dial, database, or handshake
     /// failure.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the device-identity, native-auth and peer seams each add their cfg-forked block"
+    )]
     pub async fn connect_with_pump(
         self,
     ) -> Result<(NativeClient<T, C::Handle>, CorePump), ClientError> {
@@ -676,6 +741,40 @@ where
                 // certificate from the moment it is handed back.
                 let held = core.client().stored_certificate().await?;
                 let (kept, lists) = core.client().revocation_inbox().await?;
+                #[cfg(feature = "peer")]
+                let (peer_events, peer_events_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
+                let (hotspot_tx, hotspot_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
+                let node = connetto_peer::Node::new(
+                    connetto_peer::Trust {
+                        roots: device.roots.clone(),
+                        accepted: device.peer_accepted,
+                    },
+                    Arc::new(connetto_peer::SystemClock),
+                    peer_events,
+                )
+                .map_err(|connetto_peer::TrustError::Root { index, .. }| {
+                    ClientError::InvalidDeploymentRoot { index }
+                })?;
+                #[cfg(feature = "peer")]
+                let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
+                let peer_node = node.clone();
+                #[cfg(feature = "peer")]
+                let peer = Peer {
+                    node: node.clone(),
+                    discovery: connetto_peer::Discovery::new(
+                        node,
+                        device.peer_autolink,
+                        discovery_events,
+                    ),
+                    listen: device.peer_listen,
+                    events: peer_events_rx,
+                    discovery_events: discovery_events_rx,
+                    #[cfg(all(feature = "peer", target_os = "android"))]
+                    java: device.java.clone(),
+                };
                 let (enroller, handle) = Enroller::new(
                     keys,
                     device.lifetime,
@@ -684,8 +783,74 @@ where
                     held,
                     kept,
                     lists,
+                    #[cfg(feature = "peer")]
+                    peer,
+                    #[cfg(feature = "peer")]
+                    hotspot_tx,
                 );
                 let enrolment = core.client().enrolment(enroller);
+                #[cfg(feature = "peer")]
+                let hotspot_runner = {
+                    let backend: Arc<dyn crate::hotspot::HotspotBackend> = {
+                        #[cfg(target_os = "android")]
+                        {
+                            match device.java.clone() {
+                                Some(java) => {
+                                    Arc::new(crate::hotspot::AndroidHotspotBackend::new(java))
+                                }
+                                None => Arc::new(crate::hotspot::UnsupportedBackend),
+                            }
+                        }
+                        #[cfg(not(target_os = "android"))]
+                        {
+                            Arc::new(crate::hotspot::UnsupportedBackend)
+                        }
+                    };
+                    let port_node = peer_node.clone();
+                    #[cfg(target_os = "android")]
+                    let bind_node = peer_node.clone();
+                    let dial_handle = handle.clone();
+                    let event_sender = core.client().event_sender();
+                    #[cfg(target_os = "android")]
+                    let bind = {
+                        let java = device.java.clone();
+                        Arc::new(
+                            move |subnet: Option<(std::net::Ipv4Addr, u8)>| match subnet {
+                                Some(subnet) => {
+                                    if let Some(java) = &java {
+                                        bind_node.set_socket_prep(Some(Arc::new(
+                                            crate::hotspot::JoinedBind::new(java.clone(), subnet),
+                                        )));
+                                    }
+                                }
+                                None => bind_node.set_socket_prep(None),
+                            },
+                        )
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let bind = Arc::new(|_| {});
+                    let machine = crate::hotspot::Machine::new(
+                        backend,
+                        device.peer_autolink,
+                        Arc::new(move || port_node.local_addr().map(|addr| addr.port())),
+                        bind,
+                        Arc::new(move |addr: SocketAddr| {
+                            let handle = dial_handle.clone();
+                            tokio::spawn(async move {
+                                let _ = handle.link_peer(addr).await;
+                            });
+                        }),
+                        Arc::new(move |event: ClientEvent| {
+                            let _ = event_sender.send(event);
+                        }),
+                    );
+                    crate::hotspot::run(machine, hotspot_rx)
+                };
+                #[cfg(feature = "peer")]
+                let pump: CorePump = Box::pin(async move {
+                    tokio::join!(pump, enrolment, hotspot_runner);
+                });
+                #[cfg(not(feature = "peer"))]
                 let pump: CorePump = Box::pin(async move {
                     tokio::join!(pump, enrolment);
                 });
@@ -865,6 +1030,107 @@ where
     #[must_use]
     pub fn device_key_home(&self) -> Option<KeyHome> {
         self.device.as_ref().and_then(EnrolHandle::key_home)
+    }
+
+    /// The address this device's peer listener binds, once the device's
+    /// standing serves it, and `None` before that or for a build without a
+    /// device identity (R76).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn peer_address(&self) -> Option<SocketAddr> {
+        self.device.as_ref().and_then(EnrolHandle::peer_address)
+    }
+
+    /// Dial `addr`, refusing by this device's standing before any socket
+    /// opens and handing back the peer's identity once the link is live
+    /// (R76).
+    ///
+    /// # Errors
+    ///
+    /// [`PeerError::NoIdentity`] with no key or certificate, or a build
+    /// without a device identity, [`PeerError::CertificateExpired`] with a
+    /// certificate past its expiry, which also raises
+    /// `ClientEvent::CertificateExpired`, [`PeerError::ClockOutsideWindow`]
+    /// with the local clock outside the certificate's window, and
+    /// [`PeerError::Link`] for a failed dial.
+    #[cfg(feature = "peer")]
+    pub async fn link_peer(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<connetto_core::device_cert::DeviceIdentity, PeerError> {
+        match &self.device {
+            Some(device) => device.link_peer(addr).await,
+            None => Err(PeerError::NoIdentity),
+        }
+    }
+
+    /// Host this device's hotspot, answering its details or the reason it
+    /// will not, within the machine's bound (R76).
+    ///
+    /// # Errors
+    ///
+    /// [`HotspotError::Unsupported`] on a system without a hotspot or for a
+    /// build without a device identity, [`HotspotError::MissingPermission`]
+    /// with a permission the device has not granted, the mapped failure from
+    /// the device's Wi-Fi manager, and [`HotspotError::TimedOut`] when the
+    /// hotspot does not start within its bound.
+    #[cfg(feature = "peer")]
+    pub async fn host_hotspot(&self) -> Result<HotspotOffer, HotspotError> {
+        match &self.device {
+            Some(device) => device.host_hotspot().await,
+            None => Err(HotspotError::Unsupported),
+        }
+    }
+
+    /// Stop hosting, or cancel the pending request (R76).
+    ///
+    /// A no-op on a system without a hotspot or for a build without a device
+    /// identity.
+    #[cfg(feature = "peer")]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "uniform awaited hotspot API, the command send is synchronous"
+    )]
+    pub async fn stop_hotspot(&self) {
+        if let Some(device) = &self.device {
+            device.stop_hotspot();
+        }
+    }
+
+    /// Join `offer`'s network, answering its gateway or the reason it will
+    /// not, within the machine's bound (R76).
+    ///
+    /// # Errors
+    ///
+    /// [`JoinError::Unsupported`] on a system without a hotspot or for a
+    /// build without a device identity, [`JoinError::MissingPermission`]
+    /// with a permission the device has not granted,
+    /// [`JoinError::Declined`] when the network is not available, and
+    /// [`JoinError::TimedOut`] when the network does not answer within its
+    /// bound.
+    #[cfg(feature = "peer")]
+    pub async fn join_hotspot(&self, offer: &HotspotOffer) -> Result<std::net::IpAddr, JoinError> {
+        match &self.device {
+            Some(device) => device.join_hotspot(offer).await,
+            None => Err(JoinError::Unsupported),
+        }
+    }
+
+    /// Leave the joined network, or cancel the pending request (R76).
+    ///
+    /// A no-op on a system without a hotspot or for a build without a device
+    /// identity.
+    #[cfg(feature = "peer")]
+    #[expect(
+        clippy::unused_async,
+        clippy::unused_async_trait_impl,
+        reason = "uniform awaited hotspot API, the command send is synchronous"
+    )]
+    pub async fn leave_hotspot(&self) {
+        if let Some(device) = &self.device {
+            device.leave_hotspot();
+        }
     }
 }
 

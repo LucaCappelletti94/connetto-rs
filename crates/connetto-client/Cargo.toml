@@ -42,6 +42,9 @@ postgres-types = ["diesel/postgres_backend"]
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
 device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
+# The peer link (R76): the device serves its identity to other devices over
+# a second, server-independent channel, and dials them.
+peer = ["device-identity", "dep:connetto-peer"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -127,6 +130,8 @@ tokio = { version = "1", default-features = false, features = [
   "macros",
 ] }
 thiserror.workspace = true
+# The hotspot machine's answer, waited on by the API methods (R76).
+parking_lot = "0.12"
 # Binary error handling (connetto-client bin).
 anyhow.workspace = true
 # Structured logging (R12). The facade only: a library emits and installs no
@@ -159,6 +164,9 @@ ring = { version = "0.17", features = ["std"], optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
 connetto-schema = { workspace = true, optional = true }
+# The peer link the device serves and dials (R76). Its discovery feature is
+# on, so a peer build always browses and autolinks what it finds (R76 slice 3).
+connetto-peer = { path = "../connetto-peer", optional = true, features = ["discovery"] }
 # The page codec, one per target, both selected here rather than by a feature
 # because `ReplicaCipher::Encrypted` cannot be honest without it: in a SQLite
 # with no codec, `PRAGMA key` is an unrecognised pragma that succeeds silently
@@ -242,6 +250,10 @@ android-native-keyring-store = { version = "1.0.0", optional = true }
 jni = { version = "0.21", optional = true }
 # The API level, since the gated store needs Android 11.
 android_system_properties = { version = "0.1.6", optional = true }
+# The dial socket the joined network binds, through the hotspot plugin (R76).
+socket2 = "0.6"
+# The joined network's subnet, the targets its bind admits (R76).
+ipnet = "2.12"
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
@@ -265,7 +277,6 @@ web-sys = { version = "0.3", features = ["Window", "Performance"] }
 uuid = { version = "1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
-parking_lot = "0.12"
 # The shared fake transport the suites here drive `connect` and `resume` with.
 connetto-core = { workspace = true, features = ["test-support"] }
 # The loop tests run the real server in-process. Its write target is the real
@@ -322,6 +333,9 @@ rcgen = "0.13"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12"] }
 tokio = { version = "1", features = ["test-util"] }
+# The loopback multicast probe the discovery proofs run before they trust the
+# interface, the same probe the peer crate's proofs use.
+socket2 = "0.6"
 
 # The fake Secret Service the Linux store tests serve on a peer-to-peer bus.
 [target.'cfg(target_os = "linux")'.dev-dependencies]

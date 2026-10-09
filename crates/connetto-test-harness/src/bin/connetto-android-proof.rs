@@ -8,7 +8,8 @@
 //! ```text
 //! cargo build -p connetto-test-harness --bin connetto-android-proof
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
-//!   target/debug/connetto-android-proof [--serial SERIAL] [--apk PATH] [--unlock-pin PIN]
+//!   target/debug/connetto-android-proof [--serial SERIAL] [--apk PATH] \
+//!     [--unlock-pin PIN] [--peer-serial SECOND]
 //! ```
 //!
 //! The demo keeps its secrets behind the Keystore gate (R52), so each launch
@@ -29,6 +30,14 @@
 //! The offline step restarts the host's adb server, which drops every other
 //! session's forwards and reverses on this machine too. A wireless serial
 //! (`host:port`) is reconnected after the restart.
+//!
+//! With `--peer-serial` a second attached phone joins the proof. The main
+//! phone hosts a hotspot from the demo and the second signs in as its own
+//! account and joins it through the demo's join form, the driver tapping the
+//! system's approval in place of the user (R76 decision 16). Each phone's
+//! server path stays over `adb reverse`, so the joiner reaches the server
+//! while it is off its usual Wi-Fi. The proof ends with both phones back on
+//! their usual networks.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -67,6 +76,16 @@ const GATE_TRACE_TARGETS: [&str; 2] = [
     "\"target\":\"connetto_client::away\"",
     "\"target\":\"connetto_dioxus::away\"",
 ];
+/// The second phone's account in the peer proof, so each page's `linked:`
+/// line names the other phone unambiguously.
+const PEER_USER: &str = "bob";
+/// The localized texts of the system's network-approval dialog button, for
+/// the locales the proof phones run, which the driver taps in place of the
+/// user (R76 decision 16).
+const CONNECT_BUTTONS: [&str; 3] = ["Connect", "Connetti", "Verbinden"];
+/// The silence a link gets to end after the phones leave the hotspot, on
+/// either side.
+const LINK_END_BOUND: Duration = Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,6 +94,7 @@ async fn main() -> Result<()> {
         serial,
         apk,
         unlock_pin,
+        peer_serial,
     } = cli_arguments()?;
     let device = Device::pick(serial).await?;
     let evidence = repo_path(&["target", "android-proof"])?.join(format!(
@@ -99,7 +119,29 @@ async fn main() -> Result<()> {
         pin: unlock_pin.as_deref(),
     };
     let outcome = match device.hide_error_dialogs().await {
-        Ok(()) => prove(&device, apk, &stack, &evidence, unlock).await,
+        Ok(()) => {
+            let apk = match apk {
+                Some(apk) => apk,
+                None => build_apk(&device.rust_target().await?).await?,
+            };
+            let outcome = prove(&device, &apk, &stack, &evidence, unlock).await;
+            // The peer proof runs only on a proved phone, and a failed
+            // proof keeps its own error.
+            match (peer_serial, outcome) {
+                (Some(serial), Ok(())) => {
+                    peer_proof(
+                        &device,
+                        &Device::new(serial),
+                        &apk,
+                        &stack,
+                        &evidence,
+                        unlock,
+                    )
+                    .await
+                }
+                (_, outcome) => outcome,
+            }
+        }
         Err(err) => Err(err),
     };
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
@@ -176,15 +218,11 @@ impl Stack {
 
 async fn prove(
     device: &Device,
-    apk: Option<PathBuf>,
+    apk: &Path,
     stack: &Stack,
     evidence: &Path,
     unlock: Unlock<'_>,
 ) -> Result<()> {
-    let apk = match apk {
-        Some(apk) => apk,
-        None => build_apk(&device.rust_target().await?).await?,
-    };
     // A paused charge ends a `usb` stay-on, and a sleeping screen locks the phone.
     device
         .adb(&["shell", "svc", "power", "stayon", "true"])
@@ -208,7 +246,7 @@ async fn prove(
     device.launch().await?;
     let mut tab = device.login_tab(&stack.issuer).await?;
     device.screenshot(evidence, "login-page").await?;
-    submit_login(&mut tab).await?;
+    submit_login(&mut tab, USER).await?;
     drop(tab);
     unlock.approve(device, evidence, "launch-unlock").await?;
     let mut app = device.app().await?;
@@ -322,7 +360,7 @@ async fn sign_in_across_a_killed_process(
             );
         }
     }
-    submit_login(&mut tab).await?;
+    submit_login(&mut tab, USER).await?;
     drop(tab);
     unlock.approve(device, evidence, "restart-unlock").await?;
     let deadline = Instant::now() + Duration::from_secs(60);
@@ -362,6 +400,344 @@ async fn recheck_after_time_away(
     app.wait_for_text("gate: open", Duration::from_secs(30))
         .await?;
     device.screenshot(evidence, "unlocked").await
+}
+
+/// The offer a hosting phone shows, its lines read off the page.
+struct HotspotOfferLines {
+    /// The hotspot's ssid.
+    ssid: String,
+    /// The hotspot's passphrase.
+    passphrase: String,
+    /// The host's peer port.
+    port: u16,
+}
+
+/// The offer a hosting phone shows, its lines read off the page, bounded.
+async fn read_hotspot_offer(app: &mut PageSession) -> Result<HotspotOfferLines> {
+    app.wait_for_text("hotspot ssid: ", Duration::from_secs(45))
+        .await
+        .context("the host never showed its offer")?;
+    let deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let page = app.page_text().await?;
+        if let Some(offer) = parse_offer_lines(&page) {
+            return Ok(offer);
+        }
+        if Instant::now() >= deadline {
+            bail!("the offer's lines never finished showing, the page shows:\n{page}");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The two-phone peer proof (R76 slice 4): `host` hosts a hotspot from the
+/// demo and `joiner` signs in as its own account and joins it, the driver
+/// tapping the system's approval in place of the user (decision 16), until
+/// both pages name the other as linked. It ends with both phones back on
+/// their usual networks.
+async fn peer_proof(
+    host: &Device,
+    joiner: &Device,
+    apk: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    unlock: Unlock<'_>,
+) -> Result<()> {
+    if !demo_has_device_identity() {
+        bail!("the peer proof needs a demo build with its device identity");
+    }
+    step("prepare the peer phone");
+    let (stay_on, previous_role) = prepare_joiner(joiner, &unlock).await?;
+    // The joiner's usual network, read after the wireless reconnect, which
+    // the cleanup must bring it back to.
+    let usual_ssid = joiner.current_ssid().await?;
+    let result = run_peer_proof(
+        host,
+        joiner,
+        apk,
+        stack,
+        evidence,
+        &unlock,
+        usual_ssid.as_ref(),
+    )
+    .await;
+
+    // The joiner's log for the record, and its state, which the run leaves
+    // as it found it.
+    let log = joiner.adb(&["logcat", "-d"]).await.unwrap_or_default();
+    tokio::fs::write(evidence.join("peer-logcat.txt"), log)
+        .await
+        .context("writing the peer phone's log")?;
+    let restore_role = match &previous_role {
+        Some(holder) => joiner.set_browser_role_holder(holder).await,
+        None => joiner
+            .adb(&[
+                "shell",
+                "cmd",
+                "role",
+                "remove-role-holder",
+                BROWSER_ROLE,
+                BROWSER,
+            ])
+            .await
+            .map(drop),
+    };
+    let restore_stay = joiner
+        .restore_global_setting(STAY_ON, stay_on.as_deref())
+        .await;
+    let _ = joiner.adb(&["forward", "--remove-all"]).await;
+    let _ = joiner.adb(&["reverse", "--remove-all"]).await;
+    let _ = joiner.adb(&["shell", "am", "force-stop", PACKAGE]).await;
+    result.and(restore_role).and(restore_stay)
+}
+
+/// Reconnect a wireless joiner over `adb connect`, hold it awake and
+/// unlocked, and take the browser role the login tab wants, keeping the
+/// stay-on and role state the run restores.
+async fn prepare_joiner(
+    joiner: &Device,
+    unlock: &Unlock<'_>,
+) -> Result<(Option<String>, Option<String>)> {
+    // A wireless joiner lost its transport when the single-phone proof
+    // restarted the host's adb server.
+    if joiner.serial.contains(':') {
+        let status = Command::new("adb")
+            .args(["connect", &joiner.serial])
+            .status()
+            .await
+            .context("starting adb")?;
+        if !status.success() {
+            bail!("adb connect {} exited with {status}", joiner.serial);
+        }
+    }
+    joiner.adb(&["wait-for-device"]).await?;
+    let stay_on = joiner.global_setting(STAY_ON).await?;
+    let previous_role = joiner.browser_role_holder().await?;
+    joiner
+        .adb(&["shell", "svc", "power", "stayon", "true"])
+        .await?;
+    joiner
+        .adb(&["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
+        .await?;
+    unlock.dismiss_keyguard(joiner).await?;
+    joiner.set_browser_role_holder(BROWSER).await?;
+    Ok((stay_on, previous_role))
+}
+
+/// The walk itself: install and sign in the joiner, host on the first phone,
+/// join from the second, link, end the link, and bring the joiner back to
+/// its usual network.
+async fn run_peer_proof(
+    host: &Device,
+    joiner: &Device,
+    apk: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    unlock: &Unlock<'_>,
+    usual_ssid: Option<&String>,
+) -> Result<()> {
+    joiner
+        .adb(&["install", "-r", "-t", &apk.display().to_string()])
+        .await?;
+    joiner.adb(&["shell", "pm", "clear", PACKAGE]).await?;
+    joiner.adb(&["reverse", "--remove-all"]).await?;
+    for (device_port, host_port) in &stack.reverse {
+        joiner.reverse(*device_port, *host_port).await?;
+    }
+    for phone in [host, joiner] {
+        phone
+            .adb(&[
+                "shell",
+                "pm",
+                "grant",
+                PACKAGE,
+                "android.permission.NEARBY_WIFI_DEVICES",
+            ])
+            .await?;
+    }
+
+    let mut peer_app = sign_in_joiner(joiner, stack, evidence, unlock).await?;
+
+    let mut app = host.app().await?;
+    app.wait_for_text("device: certified until", Duration::from_secs(60))
+        .await?;
+
+    let host_identity = own_identity(&mut app).await?;
+    let joiner_identity = own_identity(&mut peer_app).await?;
+
+    step("host a hotspot on the first phone");
+    // An A35 refuses to start an access point while its own station sits on
+    // a 5 GHz channel, measured on eduroam, so the host leaves its network,
+    // as a host in the field has none. Its server path stays on USB.
+    host.adb(&["shell", "svc", "wifi", "disable"]).await?;
+    sleep(Duration::from_secs(5)).await;
+    let hosted = host_and_link(
+        host,
+        joiner,
+        &mut app,
+        &mut peer_app,
+        evidence,
+        &host_identity,
+        &joiner_identity,
+    )
+    .await;
+    let restored = host
+        .adb(&["shell", "svc", "wifi", "enable"])
+        .await
+        .map(drop);
+    let offer_ssid = hosted?;
+    restored?;
+
+    restore_joiner_networks(host, joiner, &offer_ssid, usual_ssid).await?;
+    joiner.screenshot(evidence, "peer-clean").await?;
+    Ok(())
+}
+
+/// Host on the first phone, join from the second, link, and end the link,
+/// answering the hotspot's ssid for the cleanup.
+async fn host_and_link(
+    host: &Device,
+    joiner: &Device,
+    app: &mut PageSession,
+    peer_app: &mut PageSession,
+    evidence: &Path,
+    host_identity: &str,
+    joiner_identity: &str,
+) -> Result<String> {
+    app.click("Host a hotspot").await?;
+    let offer = read_hotspot_offer(app).await?;
+    host.screenshot(evidence, "host-offer").await?;
+
+    step("fill the join form on the second phone");
+    peer_app.set_input("ssid", &offer.ssid).await?;
+    peer_app.set_input("passphrase", &offer.passphrase).await?;
+    peer_app.set_input("port", &offer.port.to_string()).await?;
+    peer_app.click("Join the hotspot").await?;
+
+    step("approve the network on the second phone");
+    joiner.tap_connect_button().await?;
+
+    step("link through the hotspot");
+    if app
+        .wait_for_text(
+            &format!("linked: {joiner_identity}"),
+            Duration::from_secs(90),
+        )
+        .await
+        .is_err()
+    {
+        let peer_page = peer_app.page_text().await.unwrap_or_default();
+        bail!(
+            "the first phone never named the second as linked, the second phone shows:\n{peer_page}"
+        );
+    }
+    peer_app
+        .wait_for_text(&format!("linked: {host_identity}"), Duration::from_secs(30))
+        .await?;
+    host.screenshot(evidence, "peer-linked").await?;
+    joiner.screenshot(evidence, "peer-linked").await?;
+
+    step("leave the hotspot on the second phone");
+    peer_app.click("Leave the hotspot").await?;
+    step("stop the hotspot on the first phone");
+    app.click("Stop the hotspot").await?;
+    wait_link_ends(app, peer_app).await?;
+    host.screenshot(evidence, "peer-unlinked").await?;
+    Ok(offer.ssid)
+}
+
+/// The page's own peer identity, `account/key prefix`, from its listening
+/// line, which the wait polls until the line carries it.
+async fn own_identity(app: &mut PageSession) -> Result<String> {
+    // The peer panel updates the listening line on its own poll, which the
+    // device label does not wait for, so the wait polls the line itself.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = app.page_text().await?;
+        if let Some(identity) = page
+            .lines()
+            .find_map(|line| line.strip_prefix("peer: listening on "))
+            .and_then(|rest| rest.split_once(" as "))
+            .map(|(_, identity)| identity.trim().to_owned())
+        {
+            return Ok(identity);
+        }
+        if Instant::now() >= deadline {
+            bail!("the page names no peer identity");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// Sign the joiner in as its own account and wait for it to connect and
+/// certify, leaving its app page open.
+async fn sign_in_joiner(
+    joiner: &Device,
+    stack: &Stack,
+    evidence: &Path,
+    unlock: &Unlock<'_>,
+) -> Result<PageSession> {
+    step("sign in the peer phone");
+    joiner.launch().await?;
+    let mut tab = joiner.login_tab(&stack.issuer).await?;
+    joiner.screenshot(evidence, "peer-login-page").await?;
+    submit_login(&mut tab, PEER_USER).await?;
+    drop(tab);
+    unlock
+        .approve(joiner, evidence, "peer-launch-unlock")
+        .await?;
+    let mut peer_app = joiner.app().await?;
+    peer_app
+        .wait_for_text("status: connected", Duration::from_secs(90))
+        .await?;
+    peer_app
+        .wait_for_text("device: certified until", Duration::from_secs(60))
+        .await?;
+    joiner.screenshot(evidence, "peer-signed-in").await?;
+    Ok(peer_app)
+}
+
+/// Wait for both pages to drop their linked lines, which the leave and stop
+/// end the link.
+async fn wait_link_ends(app: &mut PageSession, peer_app: &mut PageSession) -> Result<()> {
+    let deadline = Instant::now() + LINK_END_BOUND;
+    loop {
+        let host_page = app.page_text().await?;
+        let peer_page = peer_app.page_text().await?;
+        if !host_page.contains("linked: ") && !peer_page.contains("linked: ") {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the link did not end after the phones left the hotspot");
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Forget the hotspot's saved profile on both phones, best effort, and wait
+/// for the joiner to fall back to its usual network.
+async fn restore_joiner_networks(
+    host: &Device,
+    joiner: &Device,
+    ssid: &str,
+    usual_ssid: Option<&String>,
+) -> Result<()> {
+    step("clean up the networks");
+    // A saved profile the platform may have kept, best effort.
+    for phone in [host, joiner] {
+        phone.forget_network(ssid).await?;
+    }
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let current = joiner.current_ssid().await?;
+        if current.as_deref() == usual_ssid.map(String::as_str) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the peer phone is back on {current:?}, not {usual_ssid:?}");
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// Who answers the platform's unlock prompt.
@@ -433,10 +809,10 @@ impl Unlock<'_> {
 /// Type the dev user into the identity provider's form and submit it. Trusted
 /// input is a user gesture, so the browser follows the final redirect into the
 /// app, which is the path a real tap takes.
-async fn submit_login(tab: &mut PageSession) -> Result<()> {
+async fn submit_login(tab: &mut PageSession, user: &str) -> Result<()> {
     tab.evaluate("document.querySelector('input[name=username]').focus()")
         .await?;
-    tab.call("Input.insertText", serde_json::json!({ "text": USER }))
+    tab.call("Input.insertText", serde_json::json!({ "text": user }))
         .await?;
     for kind in ["keyDown", "keyUp"] {
         tab.call(
@@ -465,6 +841,7 @@ struct Arguments {
     serial: Option<String>,
     apk: Option<PathBuf>,
     unlock_pin: Option<String>,
+    peer_serial: Option<String>,
 }
 
 fn cli_arguments() -> Result<Arguments> {
@@ -476,6 +853,7 @@ fn cli_arguments() -> Result<Arguments> {
             "--serial" => arguments.serial = Some(value),
             "--apk" => arguments.apk = Some(PathBuf::from(value)),
             "--unlock-pin" => arguments.unlock_pin = Some(value),
+            "--peer-serial" => arguments.peer_serial = Some(value),
             other => bail!("unknown argument {other}"),
         }
     }
@@ -765,6 +1143,90 @@ impl Device {
         .map(drop)
     }
 
+    /// The ssid the device is connected to, which its `dumpsys wifi` names,
+    /// and `None` while it names none.
+    async fn current_ssid(&self) -> Result<Option<String>> {
+        let dump = self.adb(&["shell", "dumpsys", "wifi"]).await?;
+        Ok(parse_current_ssid(&dump))
+    }
+
+    /// Forget a saved network profile by its ssid, best effort, since the
+    /// platform's one-shot request keeps none of its own.
+    async fn forget_network(&self, ssid: &str) -> Result<()> {
+        let listing = self.adb(&["shell", "cmd", "wifi", "list-networks"]).await?;
+        let Some(id) = saved_network_id(&listing, ssid) else {
+            return Ok(());
+        };
+        self.adb(&["shell", "cmd", "wifi", "forget-network", &id])
+            .await
+            .map(drop)
+    }
+
+    /// Tap the system's network-approval dialog button, in the user's place
+    /// (R76 decision 16), waiting for it to show.
+    async fn tap_connect_button(&self) -> Result<()> {
+        let locale = self
+            .adb(&["shell", "getprop", "persist.sys.locale"])
+            .await?;
+        eprintln!("{} runs locale {}", self.serial, locale.trim());
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            // A dump can crash while the screen changes under it, so a failed
+            // one waits for the next look.
+            match self.connect_button_bounds().await {
+                Ok(Some((left, top, right, bottom))) => {
+                    self.adb(&[
+                        "shell",
+                        "input",
+                        "tap",
+                        &left.midpoint(right).to_string(),
+                        &top.midpoint(bottom).to_string(),
+                    ])
+                    .await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("{} gave no UI dump, looking again: {err:#}", self.serial),
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "the network approval's connect button never showed on {} (locale {locale})",
+                    self.serial
+                );
+            }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    /// The bounds of the approval dialog's connect button, or none while the
+    /// dialog is not up, matched by the localized "Connect" text.
+    async fn connect_button_bounds(&self) -> Result<Option<(i32, i32, i32, i32)>> {
+        self.adb(&["shell", "uiautomator", "dump", "/sdcard/connetto-ui.xml"])
+            .await?;
+        let xml = self
+            .adb(&["shell", "cat", "/sdcard/connetto-ui.xml"])
+            .await?;
+        for node in xml.split("<node ") {
+            let Some(text) = attribute(node, "text") else {
+                continue;
+            };
+            if !CONNECT_BUTTONS.contains(&text.as_str()) {
+                continue;
+            }
+            let Some(clickable) = attribute(node, "clickable") else {
+                continue;
+            };
+            if clickable != "true" {
+                continue;
+            }
+            let bounds = attribute(node, "bounds")
+                .and_then(|bounds| parse_bounds(&bounds))
+                .ok_or_else(|| anyhow!("the connect button {text:?} has no bounds"))?;
+            return Ok(Some(bounds));
+        }
+        Ok(None)
+    }
+
     async fn launch(&self) -> Result<()> {
         self.adb(&[
             "shell",
@@ -929,13 +1391,57 @@ fn parse_bounds(text: &str) -> Option<(i32, i32, i32, i32)> {
     }
 }
 
+/// The offer's lines off a page's text, all three present and the port a
+/// number, or none while they are not.
+fn parse_offer_lines(page: &str) -> Option<HotspotOfferLines> {
+    let line = |label: &str| -> Option<String> {
+        page.lines()
+            .find_map(|line| line.strip_prefix(label).map(|rest| rest.trim().to_owned()))
+    };
+    let ssid = line("hotspot ssid: ")?;
+    let passphrase = line("hotspot passphrase: ")?;
+    let port = line("hotspot port: ")?;
+    if port == "none" {
+        return None;
+    }
+    Some(HotspotOfferLines {
+        ssid,
+        passphrase,
+        port: port.parse::<u16>().ok()?,
+    })
+}
+
+/// The ssid a `dumpsys wifi` names as the connected one, absent while it
+/// names `<unknown>` or no line at all.
+fn parse_current_ssid(dump: &str) -> Option<String> {
+    dump.lines().find_map(|line| {
+        let ssid = line
+            .strip_prefix("mWifiInfo SSID: \"")?
+            .split('"')
+            .next()?
+            .to_owned();
+        (ssid != "<unknown>" && !ssid.is_empty()).then_some(ssid)
+    })
+}
+
+/// The id of the saved network with `ssid` in a `cmd wifi list-networks`
+/// listing, the ssid's spaces making the first and last fields the only
+/// safe cuts.
+fn saved_network_id(listing: &str, ssid: &str) -> Option<String> {
+    listing.lines().skip(1).find_map(|line| {
+        let (id, rest) = line.split_once(char::is_whitespace)?;
+        let (name, _security) = rest.trim_start().rsplit_once(char::is_whitespace)?;
+        (name.trim() == ssid).then(|| id.to_owned())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::Device;
+    use super::{Device, parse_current_ssid, parse_offer_lines, saved_network_id};
 
     /// A stand-in `adb` that runs `body` with `$state` naming a scratch directory.
     fn fake_adb(dir: &Path, body: &str) -> PathBuf {
@@ -1009,5 +1515,41 @@ echo "adb: device offline" >&2; exit 1"#,
         let calls = calls(dir.path());
         assert!(!calls.contains("reconnect"), "{calls}");
         assert_eq!(calls.matches("shell true").count(), 1, "{calls}");
+    }
+
+    #[test]
+    fn the_offer_lines_are_read_off_the_page() {
+        let page = "\npeer: listening on 41234\n\
+            hotspot ssid: My Hotspot\n\
+            hotspot passphrase: s3cr3t pass\n\
+            hotspot port: 41234\n\
+            hotspot: hosting\n";
+        let offer = parse_offer_lines(page).expect("all three lines are there");
+        assert_eq!(offer.ssid, "My Hotspot");
+        assert_eq!(offer.passphrase, "s3cr3t pass");
+        assert_eq!(offer.port, 41234);
+        assert!(parse_offer_lines("hotspot ssid: only\n").is_none());
+        assert!(parse_offer_lines("hotspot port: none\n").is_none());
+    }
+
+    #[test]
+    fn the_connected_ssid_is_read_and_unknown_is_none() {
+        let dump = "mWifiInfo SSID: \"eduroam\", BSSID: aa:bb:cc:dd:ee:ff\n";
+        assert_eq!(parse_current_ssid(dump), Some("eduroam".to_owned()));
+        let unknown = "mWifiInfo SSID: \"<unknown>\", BSSID: <none>\n";
+        assert_eq!(parse_current_ssid(unknown), None);
+        assert_eq!(parse_current_ssid("no wifi line\n"), None);
+    }
+
+    #[test]
+    fn the_saved_network_id_is_found_by_its_ssid_with_spaces() {
+        let listing = "Network Id      SSID                         Security type\n\
+            0            Agy Centre Open                  open\n\
+            1            AmadeusWiFree                    wpa2-psk\n";
+        assert_eq!(
+            saved_network_id(listing, "Agy Centre Open"),
+            Some("0".to_owned())
+        );
+        assert_eq!(saved_network_id(listing, "Absent"), None);
     }
 }

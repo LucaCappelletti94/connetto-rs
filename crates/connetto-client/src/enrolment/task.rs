@@ -2,13 +2,18 @@
 //! one line of R74's lifecycle table per branch.
 
 use core::pin::Pin;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::sync::Arc;
 use std::time::SystemTime;
 
 use std::collections::HashMap;
 
+#[cfg(feature = "peer")]
+use std::net::SocketAddr;
+
+#[cfg(feature = "peer")]
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::{
     CertificateRequest, CertificateSigner, DeviceCertificate, DeviceDescriptor, DeviceKey, KeyHome,
     KeyId, RevocationList, certificate_key_id, certificate_serial, key_id, verify_chain,
@@ -17,11 +22,19 @@ use connetto_core::messages::{
     ControlMessage, DeviceSummary, DevicesRequest, EnrolChallengeRequest, EnrolRefusal,
     EnrolRequest, FatalErrorReason, RevokeDeviceRequest, SignedList, SyncStatus,
 };
+#[cfg(feature = "peer")]
+use connetto_peer::{CloseReason, DiscoveryEvent, LinkError, PeerEvent};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::{Answer, Held, KeptList, Standing, half_life};
+use super::{Answer, Held, KeptList, Standing, TOLERANCE, half_life};
+#[cfg(feature = "peer")]
+use crate::PeerError;
 use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
+#[cfg(feature = "peer")]
+use crate::hotspot::{HOST_BOUND, HotspotError, HotspotOffer, JOIN_BOUND, JoinError, MARGIN};
+#[cfg(all(feature = "peer", target_os = "android"))]
+use crate::multicast::MulticastLock;
 use crate::{ClientError, ClientEvent};
 
 /// How long one answer is waited for.
@@ -167,6 +180,83 @@ enum Command {
         key: KeyId,
         reply: oneshot::Sender<Result<(), CertificateError>>,
     },
+    /// `link_peer` refused as expired, so the task raises the event (R76).
+    #[cfg(feature = "peer")]
+    CertificateExpired,
+}
+
+/// The peer node the task drives, the listener address it binds and the
+/// node's link events (R76).
+#[cfg(feature = "peer")]
+pub(crate) struct Peer {
+    /// The node presenting this device's identity.
+    pub(crate) node: connetto_peer::Node,
+    /// The discovery driver, browsing and dialing what it finds (R76).
+    pub(crate) discovery: connetto_peer::Discovery,
+    /// The address the listener binds.
+    pub(crate) listen: SocketAddr,
+    /// The node's link events, until the task reads them.
+    pub(crate) events: mpsc::UnboundedReceiver<PeerEvent>,
+    /// Discovery's events, until the task reads them.
+    pub(crate) discovery_events: mpsc::UnboundedReceiver<connetto_peer::DiscoveryEvent>,
+    /// The application's JNI access, for the multicast lock the browse holds
+    /// (R76).
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    pub(crate) java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+}
+
+/// The next peer-link event, or nothing when the build has no peer link (R76).
+#[cfg(feature = "peer")]
+type NextPeerEvent = Option<connetto_peer::PeerEvent>;
+#[cfg(not(feature = "peer"))]
+type NextPeerEvent = core::convert::Infallible;
+
+/// The peer link's event receiver, empty when the build has no peer link
+/// (R76).
+struct PeerEvents {
+    #[cfg(feature = "peer")]
+    rx: mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
+}
+
+impl PeerEvents {
+    /// The next event, or a future that never resolves without the peer link.
+    async fn next(&mut self) -> NextPeerEvent {
+        #[cfg(feature = "peer")]
+        {
+            self.rx.recv().await
+        }
+        #[cfg(not(feature = "peer"))]
+        {
+            core::future::pending().await
+        }
+    }
+}
+
+/// The next discovery event, or nothing when the build has no peer link
+/// (R76).
+#[cfg(feature = "peer")]
+type NextDiscoveryEvent = Option<connetto_peer::DiscoveryEvent>;
+#[cfg(not(feature = "peer"))]
+type NextDiscoveryEvent = core::convert::Infallible;
+
+/// Discovery's event receiver, empty when the build has no peer link (R76).
+struct DiscoveryEvents {
+    #[cfg(feature = "peer")]
+    rx: mpsc::UnboundedReceiver<connetto_peer::DiscoveryEvent>,
+}
+
+impl DiscoveryEvents {
+    /// The next event, or a future that never resolves without the peer link.
+    async fn next(&mut self) -> NextDiscoveryEvent {
+        #[cfg(feature = "peer")]
+        {
+            self.rx.recv().await
+        }
+        #[cfg(not(feature = "peer"))]
+        {
+            core::future::pending().await
+        }
+    }
 }
 
 /// The task's half the builder hands to the client.
@@ -181,21 +271,45 @@ pub(crate) struct Enroller {
     commands: mpsc::UnboundedReceiver<Command>,
     published: watch::Sender<Option<DeviceCertificate>>,
     home: watch::Sender<Option<KeyHome>>,
+    /// Whether the local clock puts the held certificate outside its window
+    /// (decision 29), shared with the handle so a dial reads the standing the
+    /// task does (R76).
+    clock_off: Arc<AtomicBool>,
+    #[cfg(feature = "peer")]
+    peer: Option<Peer>,
 }
 
 /// The application's half, held by the native client.
+#[derive(Clone)]
 pub(crate) struct EnrolHandle {
     keys: Arc<dyn DeviceKeys>,
     commands: mpsc::UnboundedSender<Command>,
     published: watch::Receiver<Option<DeviceCertificate>>,
     home: watch::Receiver<Option<KeyHome>>,
+    #[cfg(feature = "peer")]
+    /// The task's clock-off latch, its dials refusing by the window while it
+    /// is set (R76).
+    clock_off: Arc<AtomicBool>,
+    #[cfg(feature = "peer")]
+    peer: connetto_peer::Node,
+    #[cfg(feature = "peer")]
+    /// The hotspot machine's commands, until it ends with the client (R76).
+    hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
 }
 
 impl Enroller {
     /// A task enrolling `keys` at `lifetime`, the server's default when
     /// `None`, sending `descriptor`, verifying against `roots`, starting
     /// from the certificate `held` and the lists `kept` the replica holds and
-    /// taking pushed `lists`, and the handle that steers it.
+    /// taking pushed `lists`, steering the peer node `peer` (R76), and the
+    /// handle that steers it.
+    #[cfg_attr(
+        feature = "peer",
+        expect(
+            clippy::too_many_arguments,
+            reason = "the peer node and its hotspot channel join the seven enrolment inputs and a config struct would hide the same arity behind another type"
+        )
+    )]
     pub(crate) fn new(
         keys: Arc<dyn DeviceKeys>,
         lifetime: Option<Duration>,
@@ -204,10 +318,15 @@ impl Enroller {
         held: Option<Held>,
         kept: Vec<KeptList>,
         lists: super::ListInbox,
+        #[cfg(feature = "peer")] peer: Peer,
+        #[cfg(feature = "peer")] hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
         let (home, homed) = watch::channel(None);
+        let clock_off = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "peer")]
+        let peer_node = peer.node.clone();
         (
             Self {
                 keys: Arc::clone(&keys),
@@ -220,12 +339,21 @@ impl Enroller {
                 commands,
                 published,
                 home,
+                clock_off: Arc::clone(&clock_off),
+                #[cfg(feature = "peer")]
+                peer: Some(peer),
             },
             EnrolHandle {
                 keys,
                 commands: sender,
                 published: observed,
                 home: homed,
+                #[cfg(feature = "peer")]
+                clock_off,
+                #[cfg(feature = "peer")]
+                peer: peer_node,
+                #[cfg(feature = "peer")]
+                hotspot,
             },
         )
     }
@@ -276,16 +404,110 @@ impl EnrolHandle {
     pub(crate) async fn delete_key(&self) -> Result<(), ClientError> {
         self.keys.delete().await
     }
+
+    /// Where the device's peer listener binds, once the task serves (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn peer_address(&self) -> Option<SocketAddr> {
+        self.peer.local_addr()
+    }
+
+    /// Dial `addr`, refusing by the device's standing before any socket
+    /// opens and handing back the peer's identity once the link is live
+    /// (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn link_peer(&self, addr: SocketAddr) -> Result<DeviceIdentity, PeerError> {
+        // A copy, so no watch guard is held across the dial.
+        let held = self.published.borrow().clone();
+        match Standing::of_leaf(held.as_ref(), SystemTime::now()) {
+            Standing::NoKey => Err(PeerError::NoIdentity),
+            Standing::Expired if self.clock_off.load(Ordering::Acquire) => {
+                Err(PeerError::ClockOutsideWindow)
+            }
+            Standing::Expired => {
+                let _ = self.commands.send(Command::CertificateExpired);
+                Err(PeerError::CertificateExpired)
+            }
+            Standing::ClockOff => Err(PeerError::ClockOutsideWindow),
+            Standing::Fresh | Standing::Aging => match self.peer.link(addr).await {
+                Ok(peer) => Ok(peer),
+                Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
+                Err(err) => Err(PeerError::Link(err)),
+            },
+        }
+    }
+
+    /// Host this device's hotspot, answered with its details or the reason
+    /// it will not, within the machine's bound (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn host_hotspot(&self) -> Result<HotspotOffer, HotspotError> {
+        let (reply, answer) = oneshot::channel();
+        self.hotspot
+            .send(crate::hotspot::Command::Host(reply))
+            .map_err(|_| HotspotError::Failed)?;
+        match tokio::time::timeout(HOST_BOUND + MARGIN, answer).await {
+            Ok(Ok(offer)) => offer,
+            Ok(Err(_)) => Err(HotspotError::Failed),
+            Err(_) => Err(HotspotError::TimedOut),
+        }
+    }
+
+    /// Stop hosting, or cancel the pending request (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn stop_hotspot(&self) {
+        let _ = self.hotspot.send(crate::hotspot::Command::StopHost);
+    }
+
+    /// Join `offer`'s network, answered with its gateway, within the
+    /// machine's bound (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn join_hotspot(
+        &self,
+        offer: &HotspotOffer,
+    ) -> Result<std::net::IpAddr, JoinError> {
+        let (reply, answer) = oneshot::channel();
+        self.hotspot
+            .send(crate::hotspot::Command::Join {
+                offer: offer.clone(),
+                reply,
+            })
+            .map_err(|_| JoinError::Failed)?;
+        match tokio::time::timeout(JOIN_BOUND + MARGIN, answer).await {
+            Ok(Ok(gateway)) => gateway,
+            Ok(Err(_)) => Err(JoinError::Failed),
+            Err(_) => Err(JoinError::TimedOut),
+        }
+    }
+
+    /// Leave the joined network, or cancel the pending request (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn leave_hotspot(&self) {
+        let _ = self.hotspot.send(crate::hotspot::Command::Leave);
+    }
 }
 
 /// How long to sleep before looking at `held` again.
 pub(super) fn next_look(held: Option<&Held>, now: SystemTime) -> Duration {
-    match (Standing::of(held, now), held) {
-        (Standing::Fresh, Some(held)) => half_life(held)
+    let Some(held) = held else {
+        return RECHECK;
+    };
+    let (start, end) = (held.leaf.not_before(), held.leaf.not_after());
+    match Standing::of(Some(held), now) {
+        Standing::Fresh => half_life(held)
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),
-        _ => RECHECK,
+        // The expiry wake reaches the exact moment, so a link never outlives
+        // the window by the look's slack (R76 decision 9), and the hourly look
+        // still retries a renewal and catches a jumped clock.
+        Standing::Aging => (end + TOLERANCE)
+            .duration_since(now)
+            .unwrap_or_default()
+            .min(RECHECK),
+        Standing::ClockOff => (start - TOLERANCE)
+            .duration_since(now)
+            .unwrap_or_default()
+            .min(RECHECK),
+        Standing::Expired | Standing::NoKey => RECHECK,
     }
 }
 
@@ -344,12 +566,31 @@ struct Run<L> {
     kept: HashMap<Vec<u8>, KeptList>,
     /// A certificate the root withdrew, whose key enrols again.
     withdrawn: Option<Withdrawn>,
-    /// Whether the local clock puts the held certificate outside its window
-    /// (decision 29).
-    clock_off: bool,
     /// Whether the deployment refused the device's attestation level, so it
     /// asks again only on its next connection (decision 33).
     attestation_refused: bool,
+    /// The peer node the task drives, its listener address and the standing
+    /// it last acted on (R76).
+    #[cfg(feature = "peer")]
+    peer: connetto_peer::Node,
+    #[cfg(feature = "peer")]
+    peer_listen: SocketAddr,
+    #[cfg(feature = "peer")]
+    peer_standing: Standing,
+    /// The peer link's events, until the task ends them (R76).
+    peer_events: PeerEvents,
+    /// The discovery driver, behind the peer link (R76).
+    #[cfg(feature = "peer")]
+    discovery: connetto_peer::Discovery,
+    /// Discovery's events, until the task ends them (R76).
+    discovery_events: DiscoveryEvents,
+    /// The application's JNI access, for the multicast lock the browse holds
+    /// (R76).
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    java: Option<Arc<dyn crate::device_key::JavaAccess>>,
+    /// The multicast lock the browse holds, until the standing leaves (R76).
+    #[cfg(all(feature = "peer", target_os = "android"))]
+    multicast: Option<MulticastLock>,
 }
 
 /// A certificate withdrawn because the root revoked its issuer.
@@ -560,8 +801,10 @@ impl<L: Link> Run<L> {
         match standing {
             Standing::ClockOff => self.clock_outside(false),
             Standing::Expired => self.clock_outside(true),
-            _ => self.clock_off = false,
+            _ => self.enroller.clock_off.store(false, Ordering::Release),
         }
+        #[cfg(feature = "peer")]
+        self.peer_transition(standing).await;
         Ok(())
     }
 
@@ -576,6 +819,8 @@ impl<L: Link> Run<L> {
         self.withdrawn = Some(Withdrawn { lifetime });
         self.publish();
         self.link.emit(ClientEvent::CertificateWithdrawn);
+        #[cfg(feature = "peer")]
+        self.peer_stop(CloseReason::Withdrawn);
     }
 
     /// Delete the key and certificate of a revoked device and say so
@@ -592,6 +837,8 @@ impl<L: Link> Run<L> {
         self.held = None;
         self.publish();
         self.link.emit(ClientEvent::DeviceRevoked);
+        #[cfg(feature = "peer")]
+        self.peer_stop(CloseReason::Revoked);
     }
 
     /// Keep each verified list newer than the one kept from its signer, and
@@ -634,6 +881,8 @@ impl<L: Link> Run<L> {
                 tracing::warn!(error = %err, "a revocation list could not be kept");
                 continue;
             }
+            #[cfg(feature = "peer")]
+            self.peer.keep_list(kept.list.clone(), kept.signer.clone());
             self.kept.insert(signer_key, kept);
             let own = self.held.as_ref().is_some_and(|held| {
                 certificate_key_id(&held.issuer).is_ok_and(|issuer| issuer == list.issuer())
@@ -693,9 +942,11 @@ impl<L: Link> Run<L> {
                 self.clock_outside(false);
                 Standing::ClockOff
             }
-            Standing::Expired if self.clock_off => Standing::ClockOff,
+            Standing::Expired if self.enroller.clock_off.load(Ordering::Acquire) => {
+                Standing::ClockOff
+            }
             standing => {
-                self.clock_off = false;
+                self.enroller.clock_off.store(false, Ordering::Release);
                 standing
             }
         }
@@ -703,10 +954,101 @@ impl<L: Link> Run<L> {
 
     /// Enter `ClockOff`, raising `ClockOutsideWindow` once (decision 29).
     fn clock_outside(&mut self, ahead: bool) {
-        if !self.clock_off {
-            self.clock_off = true;
+        if !self.enroller.clock_off.swap(true, Ordering::Release) {
             self.link.emit(ClientEvent::ClockOutsideWindow { ahead });
         }
+    }
+
+    /// Re-evaluate the standing of the held certificate and let the peer link
+    /// cross the row the standing crossed (R76).
+    #[cfg(feature = "peer")]
+    async fn stand_by(&mut self) -> Standing {
+        let standing = self.standing(SystemTime::now());
+        self.peer_transition(standing).await;
+        standing
+    }
+
+    /// Re-evaluate the standing of the held certificate, in a build without
+    /// the peer link.
+    #[cfg(not(feature = "peer"))]
+    fn stand_by(&mut self) -> std::future::Ready<Standing> {
+        std::future::ready(self.standing(SystemTime::now()))
+    }
+
+    /// Serve or stop the peer listener as the standing the task crossed says
+    /// (R76).
+    #[cfg(feature = "peer")]
+    async fn peer_transition(&mut self, after: Standing) {
+        let before = self.peer_standing;
+        self.peer_standing = after;
+        match (before, after) {
+            (_, Standing::Fresh | Standing::Aging) => self.peer_serve().await,
+            (Standing::Fresh | Standing::Aging, Standing::Expired) => {
+                self.peer_stop(CloseReason::CertificateExpired);
+            }
+            (Standing::Fresh | Standing::Aging, Standing::ClockOff) => {
+                self.peer_stop(CloseReason::ClockOutsideWindow);
+            }
+            _ => {}
+        }
+    }
+
+    /// Bind the peer listener and present the held identity, keeping the port
+    /// and the live links when the identity changes (R76).
+    #[cfg(feature = "peer")]
+    async fn peer_serve(&mut self) {
+        let (certificate, issuer) = match &self.held {
+            Some(held) => (held.certificate.clone(), held.issuer.clone()),
+            None => return,
+        };
+        let key = match self.key().await {
+            Ok(key) => key,
+            Err(err) => {
+                tracing::warn!(error = %err, "the device key could not be opened, so the peer link waits");
+                return;
+            }
+        };
+        let fingerprint = connetto_peer::Fingerprint::of(&certificate);
+        let identity = connetto_peer::Identity {
+            certificate,
+            issuer,
+            key,
+        };
+        match self.peer.serve(self.peer_listen, identity) {
+            Ok(bound) => {
+                #[cfg(all(feature = "peer", target_os = "android"))]
+                if let Some(java) = self.java.clone() {
+                    match MulticastLock::acquire(java) {
+                        Ok(lock) => self.multicast = Some(lock),
+                        Err(err) => tracing::warn!(
+                            error = %err,
+                            "the multicast lock will not hold, so the browse holds none"
+                        ),
+                    }
+                }
+                self.discovery.serve(bound.port(), fingerprint);
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "the peer listener could not bind");
+                self.link.emit(ClientEvent::PeerListenFailed {
+                    address: self.peer_listen,
+                    error: err.to_string(),
+                });
+            }
+        }
+    }
+
+    /// Close every peer link with `reason` and take the listener, which is a
+    /// no-op when the node serves nothing (R76).
+    #[cfg(feature = "peer")]
+    fn peer_stop(&mut self, reason: CloseReason) {
+        self.peer_standing = Standing::NoKey;
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        {
+            self.multicast = None;
+        }
+        self.discovery.stop();
+        self.peer.stop(reason);
     }
 
     /// Act on a live connection as the certificate's standing says
@@ -720,7 +1062,7 @@ impl<L: Link> Run<L> {
         if self.attestation_refused {
             return;
         }
-        let outcome = match self.standing(SystemTime::now()) {
+        let outcome = match self.stand_by().await {
             Standing::Fresh => return,
             Standing::ClockOff if by_look => return,
             Standing::NoKey => {
@@ -742,13 +1084,27 @@ impl<L: Link> Run<L> {
 }
 
 /// Run the enrolment task until the client ends.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the select's arms are the whole loop and splitting them would scatter the task's lifecycle"
+)]
 pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
     let mut events = link.events();
     let held = enroller.held.take();
-    let kept = core::mem::take(&mut enroller.kept)
+    #[cfg(feature = "peer")]
+    let peer = enroller
+        .peer
+        .take()
+        .expect("a peer build hands the task its node");
+    let kept: HashMap<Vec<u8>, KeptList> = core::mem::take(&mut enroller.kept)
         .into_iter()
         .map(|kept| (kept.signer_key.clone(), kept))
         .collect();
+    // The lists the replica keeps at open, for the node's handshakes (R76).
+    #[cfg(feature = "peer")]
+    for kept in kept.values() {
+        peer.node.keep_list(kept.list.clone(), kept.signer.clone());
+    }
     let mut run = Run {
         link,
         enroller,
@@ -756,21 +1112,42 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         key: None,
         kept,
         withdrawn: None,
-        clock_off: false,
         attestation_refused: false,
+        #[cfg(feature = "peer")]
+        peer: peer.node,
+        #[cfg(feature = "peer")]
+        peer_listen: peer.listen,
+        #[cfg(feature = "peer")]
+        peer_standing: Standing::NoKey,
+        #[cfg(feature = "peer")]
+        peer_events: PeerEvents { rx: peer.events },
+        #[cfg(feature = "peer")]
+        discovery: peer.discovery,
+        #[cfg(feature = "peer")]
+        discovery_events: DiscoveryEvents {
+            rx: peer.discovery_events,
+        },
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        java: peer.java,
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        multicast: None,
+        #[cfg(not(feature = "peer"))]
+        peer_events: PeerEvents {},
+        #[cfg(not(feature = "peer"))]
+        discovery_events: DiscoveryEvents {},
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
         tracing::warn!(error = %err, "the device key could not be opened");
     }
     // Lifecycle row "Opened with the replica".
-    run.standing(SystemTime::now());
+    let _ = run.stand_by().await;
     let mut due = run.link.connected().await;
     let mut by_look = false;
     let mut steering = true;
     loop {
         if !run.link.alive() {
-            return;
+            break;
         }
         if due {
             due = false;
@@ -779,7 +1156,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         by_look = false;
         let look = next_look(run.held.as_ref(), SystemTime::now());
         tokio::select! {
-            () = run.link.ended() => return,
+            () = run.link.ended() => break,
             event = events.recv() => match event {
                 Ok(ClientEvent::SyncStatus(SyncStatus::Connected)) | Err(RecvError::Lagged(_)) => {
                     run.attestation_refused = false;
@@ -789,7 +1166,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     run.revoked().await;
                 }
                 Ok(_) => {}
-                Err(RecvError::Closed) => return,
+                Err(RecvError::Closed) => break,
             },
             command = run.enroller.commands.recv(), if steering => match command {
                 Some(Command::Reissue { lifetime, reply }) => {
@@ -806,6 +1183,10 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 Some(Command::Revoke { key, reply }) => {
                     let _ = reply.send(run.revoke(key).await);
                 }
+                #[cfg(feature = "peer")]
+                Some(Command::CertificateExpired) => {
+                    run.link.emit(ClientEvent::CertificateExpired);
+                }
                 None => steering = false,
             },
             Some(lists) = run.enroller.lists.recv() => {
@@ -814,10 +1195,52 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     due = run.link.connected().await;
                 }
             }
+            peer = run.peer_events.next() => {
+                #[cfg(feature = "peer")]
+                if let Some(event) = peer {
+                    run.discovery.on_node_event(&event);
+                    match event {
+                        PeerEvent::Linked { peer } => {
+                            run.link.emit(ClientEvent::PeerLinked { peer });
+                        }
+                        PeerEvent::Unlinked { peer, reason } => {
+                            run.link.emit(ClientEvent::PeerUnlinked { peer, reason });
+                        }
+                        PeerEvent::ListReceived { list, signer } => {
+                            run.take_lists(vec![SignedList { list, signer }]).await;
+                            if run.withdrawn.is_some() {
+                                due = run.link.connected().await;
+                            }
+                        }
+                    }
+                }
+                #[cfg(not(feature = "peer"))]
+                match peer {}
+            },
+            discovery = run.discovery_events.next() => {
+                #[cfg(feature = "peer")]
+                if let Some(event) = discovery {
+                    match event {
+                        DiscoveryEvent::Found { address, fingerprint } => {
+                            run.link
+                                .emit(ClientEvent::PeerFound { address, fingerprint });
+                        }
+                        DiscoveryEvent::Gone { fingerprint } => {
+                            run.link.emit(ClientEvent::PeerGone { fingerprint });
+                        }
+                    }
+                }
+                #[cfg(not(feature = "peer"))]
+                match discovery {}
+            },
             () = tokio::time::sleep(look) => {
+                let _ = run.stand_by().await;
                 due = run.link.connected().await;
                 by_look = true;
             }
         }
     }
+    // The task is done, so the peer link ends with it (R76).
+    #[cfg(feature = "peer")]
+    run.peer_stop(CloseReason::Closed);
 }

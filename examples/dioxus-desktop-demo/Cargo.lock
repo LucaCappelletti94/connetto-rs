@@ -1160,12 +1160,14 @@ dependencies = [
  "chacha20poly1305",
  "connetto-app-attest",
  "connetto-core",
+ "connetto-peer",
  "connetto-schema",
  "core-foundation",
  "diesel",
  "diesel-sqlite-session",
  "futures-util",
  "getrandom 0.3.4",
+ "ipnet",
  "jni 0.21.1",
  "js-sys",
  "keyring-core",
@@ -1173,6 +1175,7 @@ dependencies = [
  "linux-keyutils-keyring-store",
  "oo7",
  "open",
+ "parking_lot",
  "reqwest 0.12.28",
  "ring",
  "rmp-serde",
@@ -1182,6 +1185,7 @@ dependencies = [
  "serde_bytes",
  "serde_json",
  "sha2 0.10.9",
+ "socket2",
  "sqlite-diff-rs",
  "sqlite-wasm-rs",
  "sqlparser",
@@ -1252,6 +1256,7 @@ dependencies = [
  "connetto-dioxus",
  "connetto-file-client",
  "connetto-file-server",
+ "connetto-peer-android",
  "connetto-schema",
  "connetto-server",
  "connetto-test-harness",
@@ -1324,6 +1329,35 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "connetto-peer"
+version = "0.0.0"
+dependencies = [
+ "connetto-core",
+ "mdns-sd",
+ "parking_lot",
+ "ring",
+ "rmp-serde",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "serde",
+ "serde_bytes",
+ "socket2",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-rustls",
+ "tracing",
+]
+
+[[package]]
+name = "connetto-peer-android"
+version = "0.0.0"
+dependencies = [
+ "manganis",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2929,6 +2963,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
+]
+
+[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3973,6 +4018,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4892,6 +4947,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdns-sd"
+version = "0.21.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "127d3355da0615643c88c885e29a1ccb29ca4b1ca1f2e44b3caed2e728a796aa"
+dependencies = [
+ "fastrand",
+ "flume",
+ "if-addrs",
+ "log",
+ "mio",
+ "socket-pktinfo",
+ "socket2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4985,6 +5055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4b18443e9c262bfe8fa82f51666e2642c53393f7e5c27b3e1aeab922cff5b9d8"
 dependencies = [
  "libc",
+ "log",
  "wasi 0.11.1+wasi-snapshot-preview1",
  "windows-sys 0.61.2",
 ]
@@ -7972,6 +8043,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "socket-pktinfo"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "612942246d0cc239cfd83af1dfd39be47f649208a3524e5e9da651910128e0ac"
+dependencies = [
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8012,6 +8094,9 @@ name = "spin"
 version = "0.9.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+dependencies = [
+ "lock_api",
+]
 
 [[package]]
 name = "spki"

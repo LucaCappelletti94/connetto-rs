@@ -21,6 +21,8 @@ use ring::signature::{ECDSA_P256_SHA256_ASN1_SIGNING, EcdsaKeyPair, KeyPair as _
 use serde_bytes::ByteBuf;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
+#[cfg(feature = "peer")]
+use super::Peer;
 use super::task::next_look;
 use super::{
     Answer, CERTIFICATE_DDL, CertificateError, DeviceKeys, Enroller, Held, Intake, KeptList, Link,
@@ -28,9 +30,14 @@ use super::{
 };
 use crate::ClientError;
 use crate::ClientEvent;
+#[cfg(feature = "peer")]
+use crate::PeerError;
 use crate::device_key::{KeyRecords, OpenedKey, open_software_key};
+#[cfg(feature = "peer")]
+use socket2::{Domain, SockAddr, Socket, Type};
 
 const HOUR: Duration = Duration::from_hours(1);
+const MINUTE: Duration = Duration::from_mins(1);
 
 #[derive(Default)]
 struct Memory(Mutex<HashMap<String, String>>);
@@ -166,9 +173,31 @@ async fn a_fresh_certificate_is_looked_at_again_at_half_life_or_within_the_hour(
     );
     assert_eq!(next_look(None, start), HOUR);
     assert_eq!(
-        next_look(Some(&short), start + 3 * HOUR),
+        next_look(Some(&short), start + 3 * HOUR + HOUR / 2),
+        HOUR / 2 + TOLERANCE,
+        "an aging one wakes at its expiry plus the tolerance"
+    );
+    // An aging certificate far from its expiry is still looked at within
+    // the hour, so a failed renewal is retried and a jumped clock caught,
+    // and a not-yet-valid one wakes at its window's open (decision 9).
+    let long_aging = held(start, 30 * 24 * HOUR).await;
+    let at = start + 15 * 24 * HOUR + HOUR;
+    assert_eq!(
+        next_look(Some(&long_aging), at),
         HOUR,
-        "an aging one is retried hourly"
+        "an aging certificate is looked at again within the hour"
+    );
+    let behind = held(at + 10 * MINUTE, 12 * HOUR).await;
+    assert_eq!(
+        next_look(Some(&behind), at),
+        5 * MINUTE,
+        "a not-yet-valid one wakes at its window's open"
+    );
+    let far_behind = held(at + 2 * HOUR, 12 * HOUR).await;
+    assert_eq!(
+        next_look(Some(&far_behind), at),
+        HOUR,
+        "the window's open is never slept past the hourly look"
     );
 }
 
@@ -365,6 +394,8 @@ struct FakeState {
     emitted: Vec<ClientEvent>,
     /// The certificates the run stored.
     stored: Vec<Held>,
+    /// The lists the run stored.
+    lists: Vec<KeptList>,
     serials: u64,
 }
 
@@ -392,6 +423,11 @@ struct FakeLink {
     issuer: Arc<DeviceIssuer>,
     certificate: Vec<u8>,
     ask: Ask,
+    /// A grant answer waits on it first, so a test holds the renewal open.
+    gate: Option<Arc<tokio::sync::Notify>>,
+    /// A granted leaf's `not_before`, so a test's clock can stand past
+    /// `not_after` when the grant lands.
+    grant_from: Option<SystemTime>,
 }
 
 impl Link for FakeLink {
@@ -427,6 +463,7 @@ impl Link for FakeLink {
         let issuer = Arc::clone(&self.issuer);
         let certificate = self.certificate.clone();
         let ask = self.ask;
+        let gate = self.gate.clone();
         Box::pin(async move {
             match (ask, msg) {
                 (Ask::Lost, _) => Err(ClientError::NotConnected),
@@ -438,8 +475,10 @@ impl Link for FakeLink {
                 }
                 (_, ControlMessage::EnrolRequest(request)) => {
                     let (tx, rx) = oneshot::channel();
-                    let mut state = state.lock();
-                    state.requests.push(request.attestation);
+                    {
+                        let mut state = state.lock();
+                        state.requests.push(request.attestation);
+                    }
                     let answer = match ask {
                         Ask::Refused(refusal) => Answer::Refused(refusal),
                         Ask::Silent => {
@@ -448,8 +487,12 @@ impl Link for FakeLink {
                             return Ok(rx);
                         }
                         _ => {
+                            if let Some(gate) = &gate {
+                                gate.notified().await;
+                            }
                             let request =
                                 CertificateRequest::parse(&request.csr).expect("the csr parses");
+                            let mut state = state.lock();
                             let mut serial = [0u8; 16];
                             serial[..8].copy_from_slice(&state.serials.to_be_bytes());
                             state.serials += 1;
@@ -457,7 +500,7 @@ impl Link for FakeLink {
                                 .issue(
                                     &request,
                                     "alice",
-                                    SystemTime::now(),
+                                    self.grant_from.unwrap_or_else(SystemTime::now),
                                     12 * HOUR,
                                     serial,
                                     AttestationLevel::Unproven,
@@ -494,8 +537,12 @@ impl Link for FakeLink {
         })
     }
 
-    fn store_list(&self, _kept: KeptList) -> impl Future<Output = Result<(), ClientError>> + Send {
-        Box::pin(async { Ok(()) })
+    fn store_list(&self, kept: KeptList) -> impl Future<Output = Result<(), ClientError>> + Send {
+        let state = Arc::clone(&self.state);
+        Box::pin(async move {
+            state.lock().lists.push(kept);
+            Ok(())
+        })
     }
 }
 
@@ -606,6 +653,8 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
     let (events, _events_rx) = broadcast::channel(64);
     let events_tx = events.clone();
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -613,15 +662,23 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::AttestationRequired),
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -683,6 +740,8 @@ async fn a_renewal_sends_no_attestation() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -690,15 +749,23 @@ async fn a_renewal_sends_no_attestation() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         Some(held),
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -730,6 +797,8 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -737,15 +806,23 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::Revoked),
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -780,6 +857,8 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -787,15 +866,23 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::OverCeiling { ceiling_secs: 600 }),
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -823,6 +910,8 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -830,15 +919,23 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Refused(EnrolRefusal::ChallengeExpired),
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -865,6 +962,8 @@ async fn a_reissue_with_no_answer_is_offline() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -872,15 +971,23 @@ async fn a_reissue_with_no_answer_is_offline() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Silent,
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -909,6 +1016,8 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -916,15 +1025,23 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -951,6 +1068,8 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -958,15 +1077,23 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
         issuer: Arc::new(authority.issuer),
         certificate: authority.certificate,
         ask: Ask::Violated,
+        gate: None,
+        grant_from: None,
     };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
         Vec::new(),
-        vec![authority.root],
+        vec![authority.root.clone()],
         None,
         Vec::new(),
         inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -981,4 +1108,1191 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
+}
+
+/// A loopback port the discovery's mDNS daemon binds, free at the probe.
+#[cfg(feature = "peer")]
+fn fresh_mdns_port() -> u16 {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .expect("the loopback binds")
+        .local_addr()
+        .expect("the bound address")
+        .port()
+}
+
+/// A loopback multicast round-trip, answered when the host lets it through.
+///
+/// Binds a datagram socket to the loopback, joins the mDNS group there, and
+/// asks a second socket, pointed at the loopback, to multicast to it.
+#[cfg(feature = "peer")]
+fn loopback_multicast() -> bool {
+    let works = probe_loopback_multicast();
+    assert!(
+        works || std::env::var_os("CONNETTO_REQUIRE_MULTICAST").is_none(),
+        "CONNETTO_REQUIRE_MULTICAST is set and the loopback multicast probe failed"
+    );
+    works
+}
+
+/// Whether a datagram sent to the mDNS group over the loopback comes back.
+#[cfg(feature = "peer")]
+fn probe_loopback_multicast() -> bool {
+    let group = std::net::Ipv4Addr::new(224, 0, 0, 251);
+    let lo = std::net::Ipv4Addr::LOCALHOST;
+    let receiver = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!("the mDNS probe will not open a socket: {err}");
+            return false;
+        }
+    };
+    // Bound to every address, since a socket bound to the loopback's unicast
+    // address never receives a datagram sent to the group.
+    let bind = SockAddr::from(std::net::SocketAddrV4::new(
+        std::net::Ipv4Addr::UNSPECIFIED,
+        0,
+    ));
+    if let Err(err) = receiver.bind(&bind) {
+        eprintln!("the mDNS probe will not bind the loopback: {err}");
+        return false;
+    }
+    let Some(addr) = receiver
+        .local_addr()
+        .ok()
+        .and_then(|addr| addr.as_socket_ipv4())
+    else {
+        eprintln!("the mDNS probe will not read its bound address");
+        return false;
+    };
+    let port = addr.port();
+    if let Err(err) = receiver.join_multicast_v4(&group, &lo) {
+        eprintln!("the mDNS probe will not join the group on the loopback: {err}");
+        return false;
+    }
+    let _ = receiver.set_read_timeout(Some(Duration::from_secs(3)));
+    let sender = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
+        Ok(socket) => socket,
+        Err(err) => {
+            eprintln!("the mDNS probe will not open a sender: {err}");
+            return false;
+        }
+    };
+    if let Err(err) = sender.set_multicast_if_v4(&lo) {
+        eprintln!("the mDNS probe will not point the sender at the loopback: {err}");
+        return false;
+    }
+    let target = SockAddr::from(std::net::SocketAddrV4::new(group, port));
+    if let Err(err) = sender.send_to(b"connetto", &target) {
+        eprintln!("the mDNS probe will not multicast to the loopback: {err}");
+        return false;
+    }
+    let mut buf = vec![std::mem::MaybeUninit::uninit(); 32];
+    match receiver.recv(buf.as_mut_slice()) {
+        Ok(n) if n > 0 => true,
+        Ok(_) => {
+            eprintln!("the mDNS probe multicast no datagram to the loopback");
+            false
+        }
+        Err(err) => {
+            eprintln!("the mDNS probe heard nothing on the loopback: {err}");
+            false
+        }
+    }
+}
+
+/// A peer node the run drives, on the suite's root and a loopback port (R76),
+/// whose discovery autolinks `autolink` on the mDNS `port`.
+#[cfg(feature = "peer")]
+fn peer_with(authority: &Authority, autolink: bool, port: u16) -> Peer {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let node = connetto_peer::Node::new(
+        connetto_peer::Trust {
+            roots: vec![authority.root.clone()],
+            accepted: AttestationLevel::ALL.to_vec(),
+        },
+        Arc::new(connetto_peer::SystemClock),
+        tx,
+    )
+    .expect("the roots hold keys");
+    let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+    Peer {
+        node: node.clone(),
+        discovery: connetto_peer::Discovery::new(node, autolink, discovery_events)
+            .with_mdns_port(port)
+            .loopback_only(),
+        listen: "127.0.0.1:0".parse().expect("a loopback address"),
+        events: rx,
+        discovery_events: discovery_events_rx,
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        java: None,
+    }
+}
+
+/// A peer node the run drives, on the suite's root and a loopback port (R76).
+#[cfg(feature = "peer")]
+fn peer(authority: &Authority) -> Peer {
+    peer_with(authority, true, fresh_mdns_port())
+}
+
+/// A second node holding its own identity under the same root, served on a
+/// loopback port, to link against the task's node (R76).
+#[cfg(feature = "peer")]
+fn far_peer(
+    authority: &Authority,
+    serial: [u8; 16],
+) -> (
+    connetto_peer::Node,
+    tokio::sync::mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
+) {
+    let (key, _der) = attesting_key();
+    let held = issue_for(authority, &key, whole_second(), 12 * HOUR, serial);
+    let (tx, rx) = mpsc::unbounded_channel();
+    let node = connetto_peer::Node::new(
+        connetto_peer::Trust {
+            roots: vec![authority.root.clone()],
+            accepted: AttestationLevel::ALL.to_vec(),
+        },
+        Arc::new(connetto_peer::SystemClock),
+        tx,
+    )
+    .expect("the roots hold keys");
+    let key: Arc<dyn DeviceKey> = Arc::new(key);
+    node.serve(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 0)),
+        connetto_peer::Identity {
+            certificate: held.certificate,
+            issuer: held.issuer,
+            key,
+        },
+    )
+    .expect("the far node serves");
+    (node, rx)
+}
+
+/// The close reasons a far node reports for its links, drained for `bound`.
+#[cfg(feature = "peer")]
+async fn far_closes(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
+    bound: Duration,
+) -> Vec<connetto_peer::CloseReason> {
+    let until = Instant::now() + bound;
+    let mut reasons = Vec::new();
+    loop {
+        let remaining = until.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        // The drain waits out the whole bound, so a close that arrives
+        // after a long gap still lands.
+        let Ok(Some(event)) = tokio::time::timeout(remaining, rx.recv()).await else {
+            // The bound ran out or the sender dropped, so nothing else is
+            // in time.
+            break;
+        };
+        if let connetto_peer::PeerEvent::Unlinked { reason, .. } = event {
+            reasons.push(reason);
+        }
+    }
+    reasons
+}
+
+/// The far drain runs for the whole bound, so a close that arrives after a
+/// long gap still lands.
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn far_closes_drains_for_the_whole_bound() {
+    use connetto_core::device_cert::{DeploymentId, DeviceIdentity, KeyId};
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let peer = DeviceIdentity::new(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(1)),
+        "peer",
+        KeyId::from_bytes([1; 32]),
+    )
+    .expect("an identity holds");
+    let late = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = tx.send(connetto_peer::PeerEvent::Unlinked {
+            peer,
+            reason: connetto_peer::CloseReason::Closed,
+        });
+    });
+    let reasons = far_closes(&mut rx, Duration::from_secs(3)).await;
+    late.await.expect("the sender ends");
+    assert_eq!(reasons, [connetto_peer::CloseReason::Closed]);
+}
+
+/// The open of a fresh device serves the peer listener (R76 proof 1).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_fresh_device_serves_its_peer_listener_at_open() {
+    let (key, der) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, [5; 16]);
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| handle.peer_address().is_some()).await;
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The refusal of a device past its expiry, which also raises the event
+/// (R76 proof 2).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn an_expired_device_refuses_to_link_and_raises_the_event() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // Past its end plus the tolerance, so the window no longer holds it.
+    let held = issue_for(&authority, &key, now - 22 * HOUR, 12 * HOUR, [5; 16]);
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    let err = handle
+        .link_peer("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect_err("the expiry refuses the link");
+    assert!(
+        matches!(err, PeerError::CertificateExpired),
+        "the refusal names the expiry, got {err:?}"
+    );
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .contains(&ClientEvent::CertificateExpired)
+    })
+    .await;
+    assert!(
+        handle.peer_address().is_none(),
+        "nothing serves an expired identity"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The refusal of a device whose clock puts its certificate outside its
+/// window (R76 proof 3).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_clock_off_device_refuses_to_link_outside_its_window() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // Not yet valid by more than the tolerance, so the local clock is off.
+    let held = issue_for(&authority, &key, now + 10 * MINUTE, 12 * HOUR, [5; 16]);
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    let err = handle
+        .link_peer("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect_err("the window refuses the link");
+    assert!(
+        matches!(err, PeerError::ClockOutsideWindow),
+        "the refusal names the window, got {err:?}"
+    );
+    // The only window event is the task's own, raised once at open.
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::ClockOutsideWindow { .. }))
+            .count()
+            == 1
+    })
+    .await;
+    assert!(
+        state
+            .lock()
+            .emitted
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::CertificateExpired)),
+        "a window refusal is not an expiry"
+    );
+    assert!(
+        handle.peer_address().is_none(),
+        "nothing serves a window-out identity"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A grant the local clock already puts past `not_after` lands the task in
+/// the window refusal, so a dial is refused by the window, not the expiry,
+/// and no expiry event joins the task's own (R76 proof 3).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_grant_past_its_window_refuses_the_dial_as_a_window() {
+    let (_, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    // The server just granted it, so a window that does not hold it now says
+    // the local clock runs ahead of `not_after`.
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: Some(now - 13 * HOUR),
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| !state.lock().stored.is_empty()).await;
+    let err = handle
+        .link_peer("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect_err("the window refuses the dial");
+    assert!(
+        matches!(err, PeerError::ClockOutsideWindow),
+        "the refusal names the window, got {err:?}"
+    );
+    // The window event is the task's own, raised once at the grant.
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ClockOutsideWindow { ahead: true }))
+    })
+    .await;
+    assert!(
+        state
+            .lock()
+            .emitted
+            .iter()
+            .all(|event| !matches!(event, ClientEvent::CertificateExpired)),
+        "a window refusal is not an expiry"
+    );
+    assert!(
+        handle.peer_address().is_none(),
+        "nothing serves a window-out identity"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The refusal of a device that holds no certificate (R76 proof 4).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_certificate_less_device_refuses_to_link() {
+    let (_, der) = attesting_key();
+    let authority = authority(SystemTime::now()).await;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    let err = handle
+        .link_peer("127.0.0.1:0".parse().expect("loopback"))
+        .await
+        .expect_err("no certificate refuses the link");
+    assert!(
+        matches!(err, PeerError::NoIdentity),
+        "the refusal names the missing identity, got {err:?}"
+    );
+    assert!(
+        handle.peer_address().is_none(),
+        "nothing serves an identity-less device"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The look that wakes at the expiry plus the tolerance closes the live peer
+/// links and the listener (R76 proof 5).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_look_at_the_expiry_closes_the_live_peer_links() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // Within the tolerance of its end, so the window holds the link for a
+    // short while, the expiry plus the tolerance landing 30 s after the open.
+    let held = issue_for(
+        &authority,
+        &key,
+        now + Duration::from_secs(30) - 7 * MINUTE,
+        2 * MINUTE,
+        [5; 16],
+    );
+    let task_identity = held.leaf.identity().clone();
+    let deadline = held.leaf.not_after() + TOLERANCE;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let (far, mut far_events) = far_peer(&authority, [9; 16]);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    // The open serves the aging identity.
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    // A live peer dials it.
+    let peer_identity = far.link(addr).await.expect("the link completes");
+    assert_eq!(
+        peer_identity, task_identity,
+        "the link answers the device's identity"
+    );
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+    })
+    .await;
+
+    // The look wakes at the expiry plus the tolerance and closes the link.
+    tokio::time::sleep(
+        deadline
+            .duration_since(SystemTime::now())
+            .unwrap_or_default()
+            + Duration::from_secs(3),
+    )
+    .await;
+    assert!(
+        handle.peer_address().is_none(),
+        "the listener closed at the expiry"
+    );
+    let task_reason = state.lock().emitted.iter().find_map(|event| {
+        if let ClientEvent::PeerUnlinked { reason, .. } = event {
+            Some(*reason)
+        } else {
+            None
+        }
+    });
+    let far_reasons = far_closes(&mut far_events, Duration::from_secs(3)).await;
+    assert!(
+        task_reason == Some(connetto_peer::CloseReason::CertificateExpired)
+            || far_reasons.contains(&connetto_peer::CloseReason::PeerExpired),
+        "one end closed the link with its own deadline reason, task {task_reason:?} far {far_reasons:?}"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A renewal granted to an aging device keeps the peer port and the live
+/// link, whose deadline the granted chain moves (R76 proof 6).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // Aging with a short window, so the old chain's deadline lands 30 s
+    // after the open.
+    let held = issue_for(
+        &authority,
+        &key,
+        now + Duration::from_secs(30) - 7 * MINUTE,
+        2 * MINUTE,
+        [5; 16],
+    );
+    let deadline = held.leaf.not_after() + TOLERANCE;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let gate = Arc::new(tokio::sync::Notify::new());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let (far, mut far_events) = far_peer(&authority, [9; 16]);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: Some(gate.clone()),
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    let _ = far.link(addr).await.expect("the link completes");
+    // The renewal is open on the gate while the link lives on the old
+    // chain's deadline.
+    poll_until(|| state.lock().requests.len() == 1).await;
+    gate.notify_waiters();
+    poll_until(|| state.lock().stored.len() == 1).await;
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+    })
+    .await;
+
+    // Past the old deadline, the link is still live on both ends.
+    tokio::time::sleep(
+        (deadline + Duration::from_secs(5))
+            .duration_since(SystemTime::now())
+            .unwrap_or_default(),
+    )
+    .await;
+    {
+        let state = state.lock();
+        assert!(
+            state
+                .emitted
+                .iter()
+                .all(|event| !matches!(event, ClientEvent::PeerUnlinked { .. })),
+            "the link outlived the old deadline, so its deadline moved"
+        );
+    }
+    assert_eq!(handle.peer_address(), Some(addr), "the grant kept the port");
+    let far_reasons = far_closes(&mut far_events, Duration::from_secs(2)).await;
+    assert!(
+        far_reasons.is_empty(),
+        "the far end kept the link, reasons {far_reasons:?}"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A peer-received list that revokes this device's own serial ends in
+/// `ClientEvent::DeviceRevoked` with every peer link closed (R76 proof 7).
+#[cfg(feature = "peer")]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the two far links and the kept list are one scenario, in the order the revocation crosses them"
+)]
+async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, [5; 16]);
+    let own_serial = held.leaf.serial().to_vec();
+    // The list revoking the device's own serial, signed before the fake
+    // link takes the issuer.
+    let list = authority
+        .issuer
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: own_serial.clone(),
+                at: now,
+            }],
+            now,
+            now + 12 * HOUR,
+        )
+        .expect("the list signs");
+    let signer = authority.certificate.clone();
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let (keeper, mut keeper_events) = far_peer(&authority, [9; 16]);
+    let (other, mut other_events) = far_peer(&authority, [10; 16]);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    let _ = keeper.link(addr).await.expect("the first link");
+    let _ = other.link(addr).await.expect("the second link");
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+            .count()
+            == 2
+    })
+    .await;
+
+    // The list-keeping peer keeps the list revoking the device's own serial.
+    keeper.keep_list(list, signer);
+
+    poll_until(|| state.lock().emitted.contains(&ClientEvent::DeviceRevoked)).await;
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::PeerUnlinked { .. }))
+            .count()
+            == 2
+    })
+    .await;
+    assert!(handle.peer_address().is_none(), "the listener closed");
+    {
+        let state = state.lock();
+        let task_reasons = state
+            .emitted
+            .iter()
+            .filter_map(|event| {
+                if let ClientEvent::PeerUnlinked { reason, .. } = event {
+                    Some(*reason)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            task_reasons.contains(&connetto_peer::CloseReason::Revoked),
+            "the device's own close names the revocation, reasons {task_reasons:?}"
+        );
+    }
+    // The list-keeping peer closed the link with its own reason.
+    let keeper_reasons = far_closes(&mut keeper_events, Duration::from_secs(3)).await;
+    assert!(
+        keeper_reasons.contains(&connetto_peer::CloseReason::PeerRevoked),
+        "the list-keeping peer names its revocation, reasons {keeper_reasons:?}"
+    );
+    // The other link went as the device's own stop says, and its end
+    // sees the close as the device's.
+    let other_reasons = far_closes(&mut other_events, Duration::from_secs(3)).await;
+    assert_eq!(
+        other_reasons,
+        vec![connetto_peer::CloseReason::Closed],
+        "the other end sees the close as the device's"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A peer-received list the device already keeps changes nothing (R76
+/// proof 8).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_stale_peer_list_changes_nothing() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, [5; 16]);
+    // A list from the test issuer, numbering one and naming a serial that
+    // is not the device's own.
+    let list = authority
+        .issuer
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: vec![8; 16],
+                at: now,
+            }],
+            now,
+            now + 12 * HOUR,
+        )
+        .expect("the list signs");
+    let signer = authority.certificate.clone();
+    let signer_key =
+        connetto_core::device_cert::certificate_key_id(&signer).expect("the issuer's key");
+    let kept = KeptList {
+        signer_key: signer_key.as_bytes().to_vec(),
+        number: 1,
+        list: list.clone(),
+        signer: signer.clone(),
+    };
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let (far, _far_events) = far_peer(&authority, [9; 16]);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        vec![kept],
+        inbox(),
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    let _ = far.link(addr).await.expect("the link completes");
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+    })
+    .await;
+
+    // The far keeps the very list the device already holds.
+    far.keep_list(list, signer);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    {
+        let state = state.lock();
+        assert!(state.lists.is_empty(), "the kept list is not re-stored");
+        assert!(
+            state
+                .emitted
+                .iter()
+                .all(|event| !matches!(event, ClientEvent::PeerUnlinked { .. })),
+            "no close for a stale list"
+        );
+    }
+    assert!(handle.peer_address().is_some(), "the listener stays");
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// Whether `state` has reported the instance `fingerprint` found (R76).
+#[cfg(feature = "peer")]
+fn reports_found(state: &Arc<Mutex<FakeState>>, fingerprint: connetto_peer::Fingerprint) -> bool {
+    state.lock().emitted.iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::PeerFound {
+                fingerprint: found,
+                ..
+            } if *found == fingerprint
+        )
+    })
+}
+
+/// Whether `state` has reported a peer link (R76).
+#[cfg(feature = "peer")]
+fn reports_linked(state: &Arc<Mutex<FakeState>>) -> bool {
+    state
+        .lock()
+        .emitted
+        .iter()
+        .any(|event| matches!(event, ClientEvent::PeerLinked { .. }))
+}
+
+/// Two clients on loopback discover each other through mDNS and autolink with
+/// no `link_peer` call, each reporting the other found (R76 proof 4).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn two_clients_discover_each_other_and_autolink() {
+    if !loopback_multicast() {
+        eprintln!("the host will not multicast on the loopback, so the discovery proof skips");
+        return;
+    }
+    eprintln!("R76-PROOF-RAN two_clients_discover_each_other_and_autolink");
+    let (key_a, der_a) = attesting_key();
+    let (key_b, der_b) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, [5; 16]);
+    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, [6; 16]);
+    let fp_a = connetto_peer::Fingerprint::of(&held_a.certificate);
+    let fp_b = connetto_peer::Fingerprint::of(&held_b.certificate);
+    let port = fresh_mdns_port();
+    let peer_a = peer_with(&authority, true, port);
+    let peer_b = peer_with(&authority, true, port);
+    let issuer = Arc::new(authority.issuer);
+    let state_a = Arc::new(Mutex::new(FakeState::default()));
+    let (events_a, _events_a) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let state_b = Arc::new(Mutex::new(FakeState::default()));
+    let (events_b, _events_b) = broadcast::channel(64);
+    let (fin_tx, fin_rx) = watch::channel(());
+    let link_a = FakeLink {
+        state: Arc::clone(&state_a),
+        events: events_a,
+        end: end_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate.clone(),
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    let link_b = FakeLink {
+        state: Arc::clone(&state_b),
+        events: events_b,
+        end: fin_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller_a, _handle_a) = Enroller::new(
+        Arc::new(RunKeys { der: der_a }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_a),
+        Vec::new(),
+        inbox(),
+        peer_a,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller_b, _handle_b) = Enroller::new(
+        Arc::new(RunKeys { der: der_b }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_b),
+        Vec::new(),
+        inbox(),
+        peer_b,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run_a = tokio::spawn(run(link_a, enroller_a));
+    let run_b = tokio::spawn(run(link_b, enroller_b));
+
+    poll_until(|| reports_found(&state_a, fp_b)).await;
+    poll_until(|| reports_found(&state_b, fp_a)).await;
+    poll_until(|| reports_linked(&state_a)).await;
+    poll_until(|| reports_linked(&state_b)).await;
+
+    end_tx.send(()).expect("the run ends");
+    fin_tx.send(()).expect("the run ends");
+    run_a.await.expect("the run ends");
+    run_b.await.expect("the run ends");
+}
+
+/// Two clients on loopback with autolink off report each other found and link
+/// only the one that calls `link_peer` (R76 proof 4).
+#[cfg(feature = "peer")]
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the two reports and the call's one link are one scenario, in the order discovery crosses them"
+)]
+async fn clients_without_autolink_report_and_link_only_on_the_call() {
+    if !loopback_multicast() {
+        eprintln!("the host will not multicast on the loopback, so the discovery proof skips");
+        return;
+    }
+    eprintln!("R76-PROOF-RAN clients_without_autolink_report_and_link_only_on_the_call");
+    let (key_a, der_a) = attesting_key();
+    let (key_b, der_b) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, [5; 16]);
+    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, [6; 16]);
+    let fp_a = connetto_peer::Fingerprint::of(&held_a.certificate);
+    let fp_b = connetto_peer::Fingerprint::of(&held_b.certificate);
+    let port = fresh_mdns_port();
+    let peer_a = peer_with(&authority, false, port);
+    let peer_b = peer_with(&authority, false, port);
+    let issuer = Arc::new(authority.issuer);
+    let state_a = Arc::new(Mutex::new(FakeState::default()));
+    let (events_a, _events_a) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let state_b = Arc::new(Mutex::new(FakeState::default()));
+    let (events_b, _events_b) = broadcast::channel(64);
+    let (fin_tx, fin_rx) = watch::channel(());
+    let link_a = FakeLink {
+        state: Arc::clone(&state_a),
+        events: events_a,
+        end: end_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate.clone(),
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    let link_b = FakeLink {
+        state: Arc::clone(&state_b),
+        events: events_b,
+        end: fin_rx,
+        issuer: Arc::clone(&issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller_a, handle_a) = Enroller::new(
+        Arc::new(RunKeys { der: der_a }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_a),
+        Vec::new(),
+        inbox(),
+        peer_a,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (enroller_b, _handle_b) = Enroller::new(
+        Arc::new(RunKeys { der: der_b }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held_b),
+        Vec::new(),
+        inbox(),
+        peer_b,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+    );
+    let run_a = tokio::spawn(run(link_a, enroller_a));
+    let run_b = tokio::spawn(run(link_b, enroller_b));
+
+    poll_until(|| reports_found(&state_a, fp_b)).await;
+    poll_until(|| reports_found(&state_b, fp_a)).await;
+    // Seconds past the find, and nothing dials itself.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    {
+        let (a, b) = (state_a.lock(), state_b.lock());
+        assert!(
+            a.emitted
+                .iter()
+                .all(|event| !matches!(event, ClientEvent::PeerLinked { .. })),
+            "autolink off dials nothing"
+        );
+        assert!(
+            b.emitted
+                .iter()
+                .all(|event| !matches!(event, ClientEvent::PeerLinked { .. })),
+            "autolink off dials nothing"
+        );
+    }
+    let address = state_a
+        .lock()
+        .emitted
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::PeerFound {
+                address,
+                fingerprint,
+            } if *fingerprint == fp_b => Some(*address),
+            _ => None,
+        })
+        .expect("the found report carries the other's address");
+    handle_a.link_peer(address).await.expect("the call links");
+    poll_until(|| reports_linked(&state_a)).await;
+    poll_until(|| reports_linked(&state_b)).await;
+
+    end_tx.send(()).expect("the run ends");
+    fin_tx.send(()).expect("the run ends");
+    run_a.await.expect("the run ends");
+    run_b.await.expect("the run ends");
 }

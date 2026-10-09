@@ -29,8 +29,13 @@
 
 pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
 pub use connetto_core::{Custody, NoGate};
+/// The peer link's close reasons, dial errors and chain refusals (R76).
+#[cfg(feature = "peer")]
+pub use connetto_peer::{CloseReason, LinkError, Refusal};
 
 use connetto_core::SUBJECTS_FUNCTION;
+#[cfg(feature = "peer")]
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::messages::{
     AckCredits, BindValue, BulkMessage, ConflictRow, ContentTicketRequest, ContentVerb,
     ControlMessage, FatalErrorReason, GateState, Handshake, MutationHeader, MutationPatch,
@@ -62,6 +67,8 @@ use sqlite_diff_rs::{
     Value,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+#[cfg(feature = "peer")]
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 mod aggregates;
@@ -79,16 +86,22 @@ pub mod dsl;
 mod enrolment;
 mod grant_expiry;
 pub mod harden;
+#[cfg(feature = "peer")]
+mod hotspot;
 #[cfg(feature = "native-auth")]
 mod keyring;
 pub mod live;
 mod memory_stores;
+#[cfg(all(feature = "peer", target_os = "android"))]
+mod multicast;
 pub mod reconnect;
 pub mod replica;
 mod subscriptions;
 
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
+#[cfg(feature = "peer")]
+pub use hotspot::{HotspotError, HotspotOffer, HotspotSecurity, JoinError};
 pub use subscriptions::{DEFAULT_GRACE, MAX_GRACE};
 pub mod teardown;
 
@@ -244,6 +257,14 @@ pub enum ClientError {
         "the device identity needs its deployment roots: call NativeDurable::with_deployment_roots"
     )]
     MissingDeploymentRoots,
+    /// A deployment root the application named is not a certificate holding
+    /// a key.
+    #[cfg(feature = "device-identity")]
+    #[error("deployment root {index} is not a certificate holding a key")]
+    InvalidDeploymentRoot {
+        /// The root's position among the roots given to `with_deployment_roots`.
+        index: usize,
+    },
     /// The local database exists but does not decrypt under the key given at
     /// connect.
     ///
@@ -338,6 +359,25 @@ pub enum ClientError {
     /// next approved re-check.
     #[error("locked: the gate is locked and application access is refused")]
     Locked,
+}
+
+/// Why a peer link could not be opened (R76).
+#[cfg(feature = "peer")]
+#[derive(Debug, thiserror::Error)]
+pub enum PeerError {
+    /// No device key, no certificate, or a build without a device identity.
+    #[error("the device has no identity to link")]
+    NoIdentity,
+    /// The device's certificate passed its expiry plus the tolerance, which
+    /// also raises `ClientEvent::CertificateExpired`.
+    #[error("the device certificate is expired")]
+    CertificateExpired,
+    /// The local clock puts the device's certificate outside its window.
+    #[error("the device clock is outside the certificate window")]
+    ClockOutsideWindow,
+    /// The dial failed.
+    #[error(transparent)]
+    Link(#[from] LinkError),
 }
 
 /// Why a sign-in switch was refused.
@@ -1174,6 +1214,53 @@ pub enum ClientEvent {
     /// until it expires, and the device asks again only on its next
     /// connection, since its level cannot change (R74 decision 33).
     AttestationRequired,
+    /// A peer device is now linked (R76).
+    #[cfg(feature = "peer")]
+    PeerLinked {
+        /// The peer the link reached.
+        peer: DeviceIdentity,
+    },
+    /// A peer link closed, with the reason (R76).
+    #[cfg(feature = "peer")]
+    PeerUnlinked {
+        /// The peer the link fell from.
+        peer: DeviceIdentity,
+        /// Why the link closed.
+        reason: CloseReason,
+    },
+    /// The device's certificate passed its expiry plus the tolerance, so
+    /// `link_peer` refuses until the device renews (R76).
+    #[cfg(feature = "peer")]
+    CertificateExpired,
+    /// The peer listener could not bind, so the device dials but does not
+    /// serve until the next standing change (R76).
+    #[cfg(feature = "peer")]
+    PeerListenFailed {
+        /// The address the listener could not bind.
+        address: SocketAddr,
+        /// Why the bind failed.
+        error: String,
+    },
+    /// Discovery found a peer instance at `address` (R76).
+    #[cfg(feature = "peer")]
+    PeerFound {
+        /// The resolved address to dial.
+        address: SocketAddr,
+        /// The instance's leaf fingerprint.
+        fingerprint: connetto_peer::Fingerprint,
+    },
+    /// Discovery lost a peer instance (R76).
+    #[cfg(feature = "peer")]
+    PeerGone {
+        /// The instance's leaf fingerprint.
+        fingerprint: connetto_peer::Fingerprint,
+    },
+    /// The device's hotspot stopped hosting, by the system or the user (R76).
+    #[cfg(feature = "peer")]
+    HotspotStopped,
+    /// The device left its joined hotspot (R76).
+    #[cfg(feature = "peer")]
+    HotspotLeft,
 }
 
 /// A primary-key column value carried on a mutation event.
