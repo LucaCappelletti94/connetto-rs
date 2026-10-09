@@ -237,10 +237,9 @@ impl HotspotBackend for AndroidHotspotBackend {
                 string(env, &class, "hostFailure")?,
             ))
         });
-        let (state, ssid, passphrase, security, failure) = match outcome {
-            Ok(values) => values,
-            // The VM is unreachable, so the standing stands as it was.
-            Err(_) => return HostStatus::Pending,
+        // The VM is unreachable, so the standing stands as it was.
+        let Ok((state, ssid, passphrase, security, failure)) = outcome else {
+            return HostStatus::Pending;
         };
         match state {
             HOST_STARTED => {
@@ -332,10 +331,9 @@ impl HotspotBackend for AndroidHotspotBackend {
                 string(env, &class, "joinGateway")?,
             ))
         });
-        let (state, address, prefix, gateway) = match outcome {
-            Ok(values) => values,
-            // The VM is unreachable, so the standing stands as it was.
-            Err(_) => return JoinStatus::Pending,
+        // The VM is unreachable, so the standing stands as it was.
+        let Ok((state, address, prefix, gateway)) = outcome else {
+            return JoinStatus::Pending;
         };
         match state {
             JOIN_AVAILABLE => {
@@ -395,10 +393,9 @@ impl connetto_peer::SocketPrep for JoinedBind {
                 .z()?;
             Ok(bound)
         })
-        .map_err(|failure| std::io::Error::new(std::io::ErrorKind::Other, failure.to_string()))?;
+        .map_err(|failure| std::io::Error::other(failure.to_string()))?;
         if !bound {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "the joined network will not take the dial's socket",
             ));
         }
