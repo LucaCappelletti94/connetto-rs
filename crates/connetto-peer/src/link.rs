@@ -129,7 +129,8 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             CloseReason::Closed
         }),
-        Ok(Some(PeerFrame::Hello { .. })) => Some(CloseReason::Protocol),
+        // A hello or an offer past the exchange is a protocol break.
+        Ok(Some(PeerFrame::Hello { .. } | PeerFrame::Offer { .. })) => Some(CloseReason::Protocol),
     }
 }
 

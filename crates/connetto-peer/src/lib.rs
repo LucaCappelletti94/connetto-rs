@@ -24,11 +24,18 @@ mod fingerprint;
 #[cfg(feature = "discovery")]
 mod policy;
 
+#[cfg(feature = "bluetooth")]
+mod beacon;
+#[cfg(feature = "bluetooth")]
+mod exchange;
+
 #[cfg(test)]
 mod tests;
 
 #[cfg(all(test, feature = "discovery"))]
 mod discovery_proofs;
+#[cfg(all(test, feature = "bluetooth"))]
+mod exchange_proofs;
 
 pub use error::{CloseReason, LinkError, Refusal, TrustError};
 pub use event::PeerEvent;
@@ -40,3 +47,10 @@ pub use node::{Liveness, Node, SocketPrep};
 pub use discovery::{Discovery, DiscoveryEvent};
 #[cfg(feature = "discovery")]
 pub use fingerprint::Fingerprint;
+
+#[cfg(feature = "bluetooth")]
+pub use beacon::{Beacon, INBOX_UUID, OUTBOX_UUID, SERVICE_UUID};
+#[cfg(feature = "bluetooth")]
+pub use error::ExchangeError;
+#[cfg(feature = "bluetooth")]
+pub use exchange::{ChunkStream, EXCHANGE_BOUND, OfferFrame};

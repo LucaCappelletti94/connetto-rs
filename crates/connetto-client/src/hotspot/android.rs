@@ -49,17 +49,17 @@ fn sdk() -> u32 {
         .unwrap_or(0)
 }
 
-/// A failure reaching the plugin through the Java VM.
+/// A failure reaching a peer plugin through the Java VM.
 #[derive(Debug, thiserror::Error)]
-enum PluginFailure {
+pub(crate) enum PluginFailure {
     /// A refusal from the Java side, kept as the exception's text, else the JNI error's.
-    #[error("the hotspot plugin refused: {0}")]
+    #[error("the peer plugin refused: {0}")]
     Java(String),
     /// The process has no reachable Java VM.
-    #[error("the hotspot plugin will not run: {0}")]
+    #[error("the peer plugin will not run: {0}")]
     NoVm(String),
     /// The application's JNI access returned without running the body.
-    #[error("the hotspot plugin will not run: the JNI access ran nothing")]
+    #[error("the peer plugin will not run: the JNI access ran nothing")]
     RanNothing,
 }
 
@@ -92,7 +92,7 @@ fn join_failure(failure: PluginFailure) -> JoinError {
 }
 
 /// The pending Java exception's text, cleared, else the JNI error's.
-fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> PluginFailure {
+pub(crate) fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> PluginFailure {
     let pending = env.exception_occurred().ok().filter(|ex| !ex.is_null());
     let _ = env.exception_clear();
     let text = pending
@@ -106,7 +106,7 @@ fn exception_text(env: &mut JNIEnv<'_>, err: &jni::errors::Error) -> PluginFailu
 }
 
 /// Run `body` on the device's Java VM, a pending exception becoming its text.
-fn call<T>(
+pub(crate) fn call<T>(
     java: &dyn JavaAccess,
     body: impl FnOnce(&mut JNIEnv<'_>) -> jni::errors::Result<T>,
 ) -> Result<T, PluginFailure> {
@@ -123,8 +123,11 @@ fn call<T>(
     }
 }
 
-/// The plugin's class, on the application's class loader.
-fn plugin<'local>(env: &mut JNIEnv<'local>) -> jni::errors::Result<JClass<'local>> {
+/// The `class` on the application's class loader.
+pub(crate) fn plugin<'local>(
+    env: &mut JNIEnv<'local>,
+    class_name: &str,
+) -> jni::errors::Result<JClass<'local>> {
     let application = env
         .call_static_method(
             "android/app/ActivityThread",
@@ -141,7 +144,7 @@ fn plugin<'local>(env: &mut JNIEnv<'local>) -> jni::errors::Result<JClass<'local
             &[],
         )?
         .l()?;
-    let name = env.new_string(PLUGIN_CLASS)?;
+    let name = env.new_string(class_name)?;
     let class = env
         .call_method(
             &class_loader,
@@ -154,12 +157,16 @@ fn plugin<'local>(env: &mut JNIEnv<'local>) -> jni::errors::Result<JClass<'local
 }
 
 /// A plugin `()I` result.
-fn int(env: &mut JNIEnv<'_>, class: &JClass<'_>, name: &str) -> jni::errors::Result<i32> {
+pub(crate) fn int(
+    env: &mut JNIEnv<'_>,
+    class: &JClass<'_>,
+    name: &str,
+) -> jni::errors::Result<i32> {
     env.call_static_method(class, name, "()I", &[])?.i()
 }
 
 /// A plugin `()Ljava/lang/String;` result, `None` where it is unset.
-fn string(
+pub(crate) fn string(
     env: &mut JNIEnv<'_>,
     class: &JClass<'_>,
     name: &str,
@@ -203,7 +210,7 @@ impl HotspotBackend for AndroidHotspotBackend {
             return Err(HotspotError::Unsupported);
         }
         let missing = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             missing_permissions(env, &class)
         })
         .map_err(host_failure)?;
@@ -211,7 +218,7 @@ impl HotspotBackend for AndroidHotspotBackend {
             return Err(HotspotError::MissingPermission(name));
         }
         call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             env.call_static_method(class, "startHost", "()V", &[])?;
             Ok(())
         })
@@ -220,7 +227,7 @@ impl HotspotBackend for AndroidHotspotBackend {
 
     fn stop_host(&self) {
         let _ = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             env.call_static_method(class, "stopHost", "()V", &[])?;
             Ok(())
         });
@@ -228,7 +235,7 @@ impl HotspotBackend for AndroidHotspotBackend {
 
     fn host_status(&self) -> HostStatus {
         let outcome = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             Ok((
                 int(env, &class, "hostState")?,
                 string(env, &class, "hostSsid")?,
@@ -281,7 +288,7 @@ impl HotspotBackend for AndroidHotspotBackend {
             return Err(JoinError::Unsupported);
         }
         let missing = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             missing_permissions(env, &class)
         })
         .map_err(join_failure)?;
@@ -294,7 +301,7 @@ impl HotspotBackend for AndroidHotspotBackend {
             SECURITY_WPA2
         };
         call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             let ssid = env.new_string(&offer.ssid)?;
             let passphrase = env.new_string(&offer.passphrase)?;
             env.call_static_method(
@@ -315,7 +322,7 @@ impl HotspotBackend for AndroidHotspotBackend {
 
     fn leave_join(&self) {
         let _ = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             env.call_static_method(class, "leave", "()V", &[])?;
             Ok(())
         });
@@ -323,7 +330,7 @@ impl HotspotBackend for AndroidHotspotBackend {
 
     fn join_status(&self) -> JoinStatus {
         let outcome = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             Ok((
                 int(env, &class, "joinState")?,
                 string(env, &class, "joinAddress")?,
@@ -387,7 +394,7 @@ impl connetto_peer::SocketPrep for JoinedBind {
         }
         let fd = sock.as_fd().as_raw_fd();
         let bound = call(&*self.java, |env| {
-            let class = plugin(env)?;
+            let class = plugin(env, PLUGIN_CLASS)?;
             let bound = env
                 .call_static_method(class, "bindSocket", "(I)Z", &[JValue::from(fd)])?
                 .z()?;

@@ -38,6 +38,11 @@
 //! server path stays over `adb reverse`, so the joiner reaches the server
 //! while it is off its usual Wi-Fi. The proof ends with both phones back on
 //! their usual networks.
+//!
+//! With `--bluetooth` the main phone hosts a hotspot after its own proof, and
+//! the run requires the demo's beacon on the panel and its legacy advertising
+//! set and GATT service in the phone's Bluetooth dump (R76 slice 5a). The
+//! proof ends with the phone's Bluetooth off and its Wi-Fi on.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -86,6 +91,18 @@ const CONNECT_BUTTONS: [&str; 3] = ["Connect", "Connetti", "Verbinden"];
 /// The silence a link gets to end after the phones leave the hotspot, on
 /// either side.
 const LINK_END_BOUND: Duration = Duration::from_secs(120);
+/// The beacon's service-data UUID (R76), required in the host's dump.
+const BEACON_SERVICE_UUID: &str = "a9952637-85d5-4071-9ed8-c28bd7ba670c";
+/// The characteristic the joiner writes to (R76).
+const BEACON_INBOX_UUID: &str = "bdd3f20f-a8d0-4003-82db-4f941b4c375b";
+/// The characteristic the joiner reads notifications from (R76).
+const BEACON_OUTBOX_UUID: &str = "62ba3a58-c377-47f5-93e1-cd6790bc2e53";
+/// The Bluetooth permissions the beacon asks for (R76).
+const BT_PERMISSIONS: [&str; 3] = [
+    "android.permission.BLUETOOTH_SCAN",
+    "android.permission.BLUETOOTH_CONNECT",
+    "android.permission.BLUETOOTH_ADVERTISE",
+];
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -95,6 +112,7 @@ async fn main() -> Result<()> {
         apk,
         unlock_pin,
         peer_serial,
+        bluetooth,
     } = cli_arguments()?;
     let device = Device::pick(serial).await?;
     let evidence = repo_path(&["target", "android-proof"])?.join(format!(
@@ -127,8 +145,9 @@ async fn main() -> Result<()> {
             let outcome = prove(&device, &apk, &stack, &evidence, unlock).await;
             // The peer proof runs only on a proved phone, and a failed
             // proof keeps its own error.
-            match (peer_serial, outcome) {
-                (Some(serial), Ok(())) => {
+            match (bluetooth, peer_serial, outcome) {
+                (true, _, Ok(())) => bluetooth_proof(&device, &evidence).await,
+                (false, Some(serial), Ok(())) => {
                     peer_proof(
                         &device,
                         &Device::new(serial),
@@ -139,7 +158,7 @@ async fn main() -> Result<()> {
                     )
                     .await
                 }
-                (_, outcome) => outcome,
+                (_, _, outcome) => outcome,
             }
         }
         Err(err) => Err(err),
@@ -740,6 +759,180 @@ async fn restore_joiner_networks(
     }
 }
 
+/// Turn a phone's Bluetooth on and hold until the platform reports it on.
+async fn bluetooth_on(device: &Device) -> Result<()> {
+    device
+        .adb(&["shell", "cmd", "bluetooth_manager", "enable"])
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let on = device
+            .adb(&["shell", "settings", "get", "global", "bluetooth_on"])
+            .await?;
+        if on.trim() == "1" {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "{} never turned its Bluetooth on after it was enabled",
+                device.serial
+            );
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The host's beacon line off the page, `advertising` with its prefix, bounded.
+async fn read_beacon(app: &mut PageSession) -> Result<String> {
+    app.wait_for_text("beacon: advertising", Duration::from_secs(60))
+        .await
+        .context("the host's beacon never advertised")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let page = app.page_text().await?;
+        if let Some(line) = page
+            .lines()
+            .find(|line| line.starts_with("beacon: advertising"))
+        {
+            return Ok(line.trim().to_owned());
+        }
+        if Instant::now() >= deadline {
+            bail!("the beacon line never carried a prefix, the page shows:\n{page}");
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// The host-side Bluetooth beacon proof (R76 slice 5a). The phone hosts a
+/// hotspot from the demo, which turns on its beacon, and the proof reads the
+/// beacon's prefix from the panel and requires the demo's advertising set and
+/// GATT service in the phone's Bluetooth dump. It ends with Bluetooth off.
+async fn bluetooth_proof(host: &Device, evidence: &Path) -> Result<()> {
+    if !demo_has_device_identity() {
+        bail!("the bluetooth proof needs a demo build with its device identity");
+    }
+    let result = run_bluetooth_proof(host, evidence).await;
+    let _ = host
+        .adb(&["shell", "cmd", "bluetooth_manager", "disable"])
+        .await;
+    result
+}
+
+/// The walk itself: turn Bluetooth on, grant its permissions, host, read the
+/// beacon's prefix, and check the advertising set and the service.
+async fn run_bluetooth_proof(host: &Device, evidence: &Path) -> Result<()> {
+    step("turn Bluetooth on");
+    bluetooth_on(host).await?;
+
+    step("grant the Bluetooth permissions");
+    for permission in BT_PERMISSIONS {
+        host.adb(&["shell", "pm", "grant", PACKAGE, permission])
+            .await?;
+    }
+    host.adb(&[
+        "shell",
+        "pm",
+        "grant",
+        PACKAGE,
+        "android.permission.NEARBY_WIFI_DEVICES",
+    ])
+    .await?;
+
+    step("host a hotspot");
+    // Some phones refuse to start an access point while their own station
+    // sits on a 5 GHz channel, so the host leaves its network, as a host in
+    // the field has none.
+    host.adb(&["shell", "svc", "wifi", "disable"]).await?;
+    let result = host_with_beacon(host, evidence).await;
+    let _ = host.adb(&["shell", "svc", "wifi", "enable"]).await;
+    result
+}
+
+/// Host from the demo and check the beacon, with the phone off its network.
+async fn host_with_beacon(host: &Device, evidence: &Path) -> Result<()> {
+    sleep(Duration::from_secs(5)).await;
+    let mut app = host.app().await?;
+    app.wait_for_text("device: certified until", Duration::from_secs(60))
+        .await?;
+    app.click("Host a hotspot").await?;
+    let beacon = read_beacon(&mut app).await?;
+    eprintln!("{beacon}");
+    host.screenshot(evidence, "bt-beacon").await?;
+
+    step("check the advertising set and the service");
+    let dump = host.adb(&["shell", "dumpsys", "bluetooth_manager"]).await?;
+    tokio::fs::write(evidence.join("host-bluetooth-dump.txt"), &dump)
+        .await
+        .context("writing the host's Bluetooth dump")?;
+    check_beacon_dump(&dump)?;
+    eprintln!(
+        "the demo advertises a legacy connectable set with 9 bytes of service data and serves its GATT service"
+    );
+
+    step("stop the hotspot");
+    app.click("Stop the hotspot").await?;
+    host.screenshot(evidence, "bt-clean").await?;
+    Ok(())
+}
+
+/// The demo's advertising set in a `dumpsys bluetooth_manager` dump: legacy,
+/// connectable, carrying 9 bytes of service data under the beacon's UUID,
+/// beside the started GATT service with both characteristics. The dump masks
+/// the service data UUID past its first group.
+fn check_beacon_dump(dump: &str) -> Result<()> {
+    let set = dump
+        .split_once(&format!("    {PACKAGE}\n"))
+        .map(|(_, rest)| rest)
+        .context("the dump lists no advertising set of the demo")?;
+    let set: Vec<&str> = set
+        .lines()
+        .take_while(|line| !line.trim().is_empty())
+        .collect();
+    let field = |name: &str| {
+        set.iter()
+            .find(|line| line.contains(&format!("\u{2514}{name} ")))
+            .and_then(|line| line.rsplit(':').next())
+            .map(str::trim)
+    };
+    if field("Legacy") != Some("true") {
+        bail!(
+            "the demo's advertising set is not legacy:\n{}",
+            set.join("\n")
+        );
+    }
+    if field("Connectable") != Some("true") {
+        bail!(
+            "the demo's advertising set is not connectable:\n{}",
+            set.join("\n")
+        );
+    }
+    let masked = format!(
+        "[{}-xxxx-xxxx-xxxx-xxxxxxxxxxxx, 9]",
+        &BEACON_SERVICE_UUID[..8]
+    );
+    if !set.iter().any(|line| line.trim() == masked) {
+        bail!(
+            "the demo's advertising set carries no 9-byte beacon:\n{}",
+            set.join("\n")
+        );
+    }
+    let service = format!("Service {BEACON_SERVICE_UUID}, started true");
+    let rest = dump
+        .split_once(&service)
+        .map(|(_, rest)| rest)
+        .context("the dump lists no started beacon service")?;
+    for characteristic in [BEACON_INBOX_UUID, BEACON_OUTBOX_UUID] {
+        if !rest
+            .lines()
+            .take(4)
+            .any(|line| line.contains(characteristic))
+        {
+            bail!("the beacon service lacks the characteristic {characteristic}");
+        }
+    }
+    Ok(())
+}
+
 /// Who answers the platform's unlock prompt.
 #[derive(Clone, Copy)]
 struct Unlock<'a> {
@@ -842,12 +1035,18 @@ struct Arguments {
     apk: Option<PathBuf>,
     unlock_pin: Option<String>,
     peer_serial: Option<String>,
+    /// The host-side Bluetooth beacon proof.
+    bluetooth: bool,
 }
 
 fn cli_arguments() -> Result<Arguments> {
     let mut arguments = Arguments::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
+        if arg == "--bluetooth" {
+            arguments.bluetooth = true;
+            continue;
+        }
         let value = args.next().ok_or_else(|| anyhow!("{arg} needs a value"))?;
         match arg.as_str() {
             "--serial" => arguments.serial = Some(value),
@@ -1437,6 +1636,53 @@ fn saved_network_id(listing: &str, ssid: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The demo's set and service as an A35 on Android 15 dumps them.
+    const BEACON_DUMP: &str = "    dev.connetto.dioxusdemo
+     Advertising ID                                     : 3
+      1:
+        \u{2514}Start time                                     : 10-09 03:05:30
+      \u{2514}Advertising:
+        \u{2514}Legacy                                         : true
+        \u{2514}Anonymous                                      : false
+        \u{2514}Connectable                                    : true
+        \u{2514}Scannable                                      : true
+        \u{2514}Advertise Data:
+          \u{2514}Include Device Name                          : false
+          \u{2514}Service Data(UUID, length of data)           : 
+            [a9952637-xxxx-xxxx-xxxx-xxxxxxxxxxxx, 9]
+
+
+  8: [151] Service a9952637-85d5-4071-9ed8-c28bd7ba670c, started true
+  8: [153]   Characteristic bdd3f20f-a8d0-4003-82db-4f941b4c375b
+  8: [155]   Characteristic 62ba3a58-c377-47f5-93e1-cd6790bc2e53
+  8: [156]     Descriptor 00002902-0000-1000-8000-00805f9b34fb
+";
+
+    #[test]
+    fn the_beacon_dump_check_takes_the_demo_set_and_refuses_its_variants() {
+        assert!(super::check_beacon_dump(BEACON_DUMP).is_ok());
+        for (from, to) in [
+            (
+                "Connectable                                    : true",
+                "Connectable                                    : false",
+            ),
+            (
+                "Legacy                                         : true",
+                "Legacy                                         : false",
+            ),
+            ("xxxxxxxxxxxx, 9]", "xxxxxxxxxxxx, 27]"),
+            ("started true", "started false"),
+            ("Characteristic 62ba3a58", "Characteristic 00000000"),
+            ("    dev.connetto.dioxusdemo", "    com.example.other"),
+        ] {
+            let broken = BEACON_DUMP.replace(from, to);
+            assert!(
+                super::check_beacon_dump(&broken).is_err(),
+                "accepted with {to}"
+            );
+        }
+    }
+
     use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::Duration;

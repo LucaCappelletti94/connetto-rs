@@ -20,6 +20,9 @@ default = []
 # The mDNS advertisement and browse beside the policy that dials what they
 # find, and the leaf fingerprint the TXT record carries (R76 slice 3).
 discovery = ["dep:mdns-sd", "dep:ring"]
+# The Bluetooth beacon and the exchange over a chunk transport, behind the
+# leaf fingerprint the beacon's prefix takes (R76 slice 5).
+bluetooth = ["discovery"]
 
 [dependencies]
 connetto-core = { workspace = true, features = ["device-cert"] }
