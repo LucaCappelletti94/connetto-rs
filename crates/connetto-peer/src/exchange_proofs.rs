@@ -513,6 +513,18 @@ async fn a_chunk_stream_splits_writes_and_rejoins_reads() {
 /// pipe once the bridge reaches the closed channel, so a stale GATT
 /// connection cannot wedge the exchange.
 #[tokio::test]
+async fn an_empty_chunk_is_skipped_and_never_read_as_the_end() {
+    let (outbound, _outbound_rx) = mpsc::channel(4);
+    let (inbound_tx, inbound_rx) = mpsc::channel(4);
+    let mut stream = ChunkStream::new(inbound_rx, outbound, 20);
+    inbound_tx.send(Vec::new()).await.expect("the chunk lands");
+    inbound_tx.send(vec![7, 8]).await.expect("the chunk lands");
+    let mut buf = [0u8; 8];
+    let read = stream.read(&mut buf).await.expect("the read lands");
+    assert_eq!(&buf[..read], &[7, 8]);
+}
+
+#[tokio::test]
 async fn a_chunk_stream_errors_writes_after_the_reader_is_gone() {
     let (outbound, outbound_rx) = mpsc::channel(4);
     let (_inbound_tx, inbound_rx) = mpsc::channel(4);

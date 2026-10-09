@@ -84,7 +84,9 @@ impl AsyncRead for ChunkStream {
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
         let this = self.get_mut();
-        if this.pending.is_empty() {
+        // An empty chunk carries no bytes, so only a closed inbound side ends
+        // the stream.
+        while this.pending.is_empty() {
             match this.inbound.poll_recv(cx) {
                 Poll::Ready(Some(chunk)) => this.pending = chunk,
                 // The peer's chunks are done, and with them the stream.

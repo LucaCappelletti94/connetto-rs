@@ -531,7 +531,11 @@ impl EnrolHandle {
         self.bluetooth
             .send(crate::bluetooth::Command::JoinNearby { host: *host, reply })
             .map_err(|_| JoinNearbyError::Join(JoinError::Failed))?;
-        match tokio::time::timeout(EXCHANGE_BOUND + JOIN_BOUND + MARGIN, answer).await {
+        // A Bluetooth not yet ready runs its action first, within its own
+        // bound, before the exchange and the join.
+        match tokio::time::timeout(PROMPT_BOUND + EXCHANGE_BOUND + JOIN_BOUND + MARGIN, answer)
+            .await
+        {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err(JoinNearbyError::Join(JoinError::Failed)),
             Err(_) => Err(JoinNearbyError::Join(JoinError::TimedOut)),
@@ -546,7 +550,9 @@ impl EnrolHandle {
         self.bluetooth
             .send(crate::bluetooth::Command::Fetch { host: *host, reply })
             .map_err(|_| BluetoothError::Failed("the client is gone".into()))?;
-        match tokio::time::timeout(EXCHANGE_BOUND + MARGIN, answer).await {
+        // A Bluetooth not yet ready runs its action first, within its own
+        // bound, before the exchange.
+        match tokio::time::timeout(PROMPT_BOUND + EXCHANGE_BOUND + MARGIN, answer).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => Err(BluetoothError::Failed("the client is gone".into())),
             Err(_) => Err(BluetoothError::TimedOut),
