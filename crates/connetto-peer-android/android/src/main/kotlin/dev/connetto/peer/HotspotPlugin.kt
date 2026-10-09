@@ -299,21 +299,6 @@ class HotspotPlugin {
             ) {
                 missing += Manifest.permission.NEARBY_WIFI_DEVICES
             }
-            if (Build.VERSION.SDK_INT >= 31) {
-                // The beacon and the exchange ask for them beside the
-                // hotspot's own, so the one prompt covers the peer link.
-                for (name in listOf(
-                    Manifest.permission.BLUETOOTH_SCAN,
-                    Manifest.permission.BLUETOOTH_CONNECT,
-                    Manifest.permission.BLUETOOTH_ADVERTISE
-                )) {
-                    if (context.checkSelfPermission(name) !=
-                        PackageManager.PERMISSION_GRANTED
-                    ) {
-                        missing += name
-                    }
-                }
-            }
             if (context.checkSelfPermission(Manifest.permission.CHANGE_WIFI_MULTICAST_STATE) !=
                 PackageManager.PERMISSION_GRANTED
             ) {
@@ -327,12 +312,23 @@ class HotspotPlugin {
             // The prompt's activity stands the context's public route, so the
             // cache seeds from it for the JNI-threaded calls.
             cachedContext = activity.applicationContext
-            val missing = missingPermissions()
+            val missing = missingPermissions().split("\n").filter { it.isNotEmpty() }.toMutableList()
+            if (Build.VERSION.SDK_INT >= 31) {
+                // The beacon and the exchange ask for theirs beside the
+                // hotspot's own, so the one prompt covers the peer link,
+                // while hosting and joining check only their own.
+                for (name in listOf(
+                    Manifest.permission.BLUETOOTH_SCAN,
+                    Manifest.permission.BLUETOOTH_CONNECT,
+                    Manifest.permission.BLUETOOTH_ADVERTISE
+                )) {
+                    if (activity.checkSelfPermission(name) != PackageManager.PERMISSION_GRANTED) {
+                        missing += name
+                    }
+                }
+            }
             if (missing.isNotEmpty()) {
-                activity.requestPermissions(
-                    missing.split("\n").toTypedArray(),
-                    PERMISSION_REQUEST
-                )
+                activity.requestPermissions(missing.toTypedArray(), PERMISSION_REQUEST)
             }
         }
 
