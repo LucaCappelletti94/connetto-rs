@@ -1171,16 +1171,22 @@ impl Device {
         eprintln!("{} runs locale {}", self.serial, locale.trim());
         let deadline = Instant::now() + Duration::from_secs(60);
         loop {
-            if let Some((left, top, right, bottom)) = self.connect_button_bounds().await? {
-                self.adb(&[
-                    "shell",
-                    "input",
-                    "tap",
-                    &left.midpoint(right).to_string(),
-                    &top.midpoint(bottom).to_string(),
-                ])
-                .await?;
-                return Ok(());
+            // A dump can crash while the screen changes under it, so a failed
+            // one waits for the next look.
+            match self.connect_button_bounds().await {
+                Ok(Some((left, top, right, bottom))) => {
+                    self.adb(&[
+                        "shell",
+                        "input",
+                        "tap",
+                        &left.midpoint(right).to_string(),
+                        &top.midpoint(bottom).to_string(),
+                    ])
+                    .await?;
+                    return Ok(());
+                }
+                Ok(None) => {}
+                Err(err) => eprintln!("{} gave no UI dump, looking again: {err:#}", self.serial),
             }
             if Instant::now() >= deadline {
                 bail!(
