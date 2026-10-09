@@ -360,8 +360,8 @@ class BluetoothPlugin {
                 if (responseNeeded) {
                     gattServer?.sendResponse(
                         device,
-                        BluetoothGatt.GATT_SUCCESS,
                         requestId,
+                        BluetoothGatt.GATT_SUCCESS,
                         offset,
                         null
                     )
@@ -379,8 +379,8 @@ class BluetoothPlugin {
                 // answers with the empty value.
                 gattServer?.sendResponse(
                     device,
-                    BluetoothGatt.GATT_SUCCESS,
                     requestId,
+                    BluetoothGatt.GATT_SUCCESS,
                     offset,
                     null
                 )
@@ -400,8 +400,8 @@ class BluetoothPlugin {
                 }
                 gattServer?.sendResponse(
                     device,
-                    BluetoothGatt.GATT_SUCCESS,
                     requestId,
+                    BluetoothGatt.GATT_SUCCESS,
                     offset,
                     state
                 )
@@ -425,8 +425,8 @@ class BluetoothPlugin {
                 if (responseNeeded) {
                     gattServer?.sendResponse(
                         device,
-                        BluetoothGatt.GATT_SUCCESS,
                         requestId,
+                        BluetoothGatt.GATT_SUCCESS,
                         offset,
                         null
                     )
@@ -486,7 +486,7 @@ class BluetoothPlugin {
             val mac = device.address
             var key = 0L
             for (i in 0 until 6) {
-                key = (key shl 8) or mac.substring(i * 3 + 1, i * 3 + 3).toLong(16)
+                key = (key shl 8) or mac.substring(i * 3, i * 3 + 2).toLong(16)
             }
             return key
         }
