@@ -1458,12 +1458,12 @@ where
     /// whether as a departure.
     ///
     /// `None` when the event never matched this consumer, `Some(true)` when an
-    /// update moved the row out of its window. Runs the same predicate matching
-    /// the live path uses, but only through the core engine, so it folds no
-    /// aggregates and fires no re-execution triggers. A departure is recomputed
-    /// here rather than stored: matching is a pure function of the event's row
-    /// images, so replay reaches the same three lists the live path did and
-    /// classifies the same way.
+    /// update moved the row out of its window. Matches this consumer's row
+    /// subscriptions read-only, so it folds no aggregates, fires no
+    /// re-execution triggers, and moves no membership or activity state. A
+    /// departure is recomputed here rather than stored: matching is a pure
+    /// function of the event's row images, so replay classifies the same way
+    /// the live path did.
     ///
     /// # Errors
     ///
@@ -1473,12 +1473,9 @@ where
         event: &PgChangeEvent,
         consumer_id: u64,
     ) -> Result<Option<bool>, MaterializerError> {
-        let notifs = self.engine.match_rows(event)?;
-        let departing =
-            matches!(event.kind(), EventKind::Update) && notifs.deleted().contains(&consumer_id);
-        let matched = notifs.inserted().contains(&consumer_id)
-            || notifs.updated().contains(&consumer_id)
-            || notifs.deleted().contains(&consumer_id);
+        let match_ = self.engine.matches_consumer(event, consumer_id)?;
+        let departing = matches!(event.kind(), EventKind::Update) && match_.deleted();
+        let matched = match_.inserted() || match_.updated() || match_.deleted();
         Ok(matched.then_some(departing))
     }
 
