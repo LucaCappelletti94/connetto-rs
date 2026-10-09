@@ -160,9 +160,8 @@ impl PeripheralBackend for AndroidBluetoothBackend {
                         // A chunk the joiner wrote.
                         "4" => {
                             let device = parts.next()?.parse().ok()?;
-                            let bytes = match CHUNKS.decode(parts.next()?) {
-                                Ok(bytes) => bytes,
-                                Err(_) => return None,
+                            let Ok(bytes) = CHUNKS.decode(parts.next()?) else {
+                                return None;
                             };
                             Some(PeripheralEvent::Chunk { device, bytes })
                         }
