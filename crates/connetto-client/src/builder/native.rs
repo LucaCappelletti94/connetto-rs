@@ -1305,10 +1305,10 @@ where
     ///
     /// # Errors
     ///
-    /// [`BluetoothError::Unsupported`] for a build without a device
-    /// identity, [`BluetoothError::Off`] or [`BluetoothError::NotPermitted`]
+    /// [`BluetoothError::Unsupported`](crate::BluetoothError::Unsupported) for a build without a device
+    /// identity, [`BluetoothError::Off`](crate::BluetoothError::Off) or [`BluetoothError::NotPermitted`](crate::BluetoothError::NotPermitted)
     /// with the prompt's outcome once the action declines, and
-    /// [`BluetoothError::TimedOut`] when the action does not finish within
+    /// [`BluetoothError::TimedOut`](crate::BluetoothError::TimedOut) when the action does not finish within
     /// its bound.
     #[cfg(feature = "peer")]
     pub async fn enable_bluetooth(&self) -> Result<(), crate::bluetooth::BluetoothError> {
@@ -1323,8 +1323,8 @@ where
     ///
     /// # Errors
     ///
-    /// [`JoinNearbyError::Bluetooth`] with the Bluetooth reason the exchange
-    /// or the platform's action gives, and [`JoinNearbyError::Join`] with the
+    /// [`JoinNearbyError::Bluetooth`](crate::JoinNearbyError::Bluetooth) with the Bluetooth reason the exchange
+    /// or the platform's action gives, and [`JoinNearbyError::Join`](crate::JoinNearbyError::Join) with the
     /// hotspot's reason the network gives.
     #[cfg(feature = "peer")]
     pub async fn join_nearby(
@@ -1344,10 +1344,10 @@ where
     ///
     /// # Errors
     ///
-    /// [`BluetoothError::Busy`] while an exchange runs,
-    /// [`BluetoothError::Exchange`] with the link's reason the host's chain
+    /// [`BluetoothError::Busy`](crate::BluetoothError::Busy) while an exchange runs,
+    /// [`BluetoothError::Exchange`](crate::BluetoothError::Exchange) with the link's reason the host's chain
     /// refuses or the exchange stalls, and
-    /// [`BluetoothError::TimedOut`] at the bound.
+    /// [`BluetoothError::TimedOut`](crate::BluetoothError::TimedOut) at the bound.
     #[cfg(feature = "peer")]
     pub async fn fetch_offer(
         &self,
