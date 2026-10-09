@@ -1214,6 +1214,9 @@ fn cli_arguments() -> Result<Arguments> {
             other => bail!("unknown argument {other}"),
         }
     }
+    if arguments.payload && arguments.peer_serial.is_none() {
+        bail!("--payload needs --peer-serial");
+    }
     Ok(arguments)
 }
 
