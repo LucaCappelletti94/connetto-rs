@@ -500,11 +500,10 @@ async fn peer_proof(
         join_by,
     )
     .await;
+    let mut bluetooth = Ok(());
     if join_by == JoinBy::Beacon {
         for phone in [host, joiner] {
-            let _ = phone
-                .adb(&["shell", "cmd", "bluetooth_manager", "disable"])
-                .await;
+            bluetooth = bluetooth.and(bluetooth_off(phone).await);
         }
     }
 
@@ -534,7 +533,7 @@ async fn peer_proof(
     let _ = joiner.adb(&["forward", "--remove-all"]).await;
     let _ = joiner.adb(&["reverse", "--remove-all"]).await;
     let _ = joiner.adb(&["shell", "am", "force-stop", PACKAGE]).await;
-    result.and(restore_role).and(restore_stay)
+    result.and(restore_role).and(restore_stay).and(bluetooth)
 }
 
 /// Reconnect a wireless joiner over `adb connect`, hold it awake and
@@ -695,6 +694,16 @@ async fn host_and_link(
                 .wait_for_text(&format!("nearby: {prefix}"), Duration::from_secs(60))
                 .await
                 .context("the second phone never saw the first phone's beacon")?;
+            // The join button takes the strongest host, so the first phone's
+            // must be the only one in sight.
+            let page = peer_app.page_text().await?;
+            let nearby: Vec<&str> = page
+                .lines()
+                .filter(|line| line.starts_with("nearby: "))
+                .collect();
+            if nearby.len() != 1 {
+                bail!("the second phone sees other hosts than the first: {nearby:?}");
+            }
             joiner.screenshot(evidence, "peer-nearby").await?;
             peer_app.click("Join the nearby host").await?;
         }
