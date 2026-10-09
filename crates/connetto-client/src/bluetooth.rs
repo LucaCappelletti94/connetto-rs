@@ -42,6 +42,9 @@ const GONE_AFTER: Duration = Duration::from_secs(30);
 const MAX_EXCHANGES: usize = 4;
 /// The GATT header the negotiated packet size leaves to the chunks.
 const CHUNK_OVERHEAD: usize = 3;
+/// The longest attribute value GATT allows, which a notification or a write
+/// cannot pass however large the packet.
+const MAX_ATTRIBUTE_VALUE: usize = 512;
 
 /// The device of a nearby host, the key the platform's Bluetooth stands on.
 pub type HostId = u64;
@@ -330,6 +333,14 @@ pub(crate) fn unsupported_backends() -> Backends {
         Arc::new(UnsupportedBackend) as Arc<dyn PeripheralBackend>,
         None,
     )
+}
+
+/// The bytes one chunk carries over a connection of `mtu`, within both the
+/// packet and the longest attribute value GATT allows.
+fn chunk_size(mtu: u16) -> usize {
+    usize::from(mtu)
+        .saturating_sub(CHUNK_OVERHEAD)
+        .clamp(1, MAX_ATTRIBUTE_VALUE)
 }
 
 /// The offer the machine hands the exchange, from the hotspot's.
@@ -1038,7 +1049,7 @@ fn start_host_exchange(
 ) {
     // The MTU is a platform packet-size count, so the widening stands
     // lossless.
-    let chunk_size = usize::from(mtu).saturating_sub(CHUNK_OVERHEAD).max(1);
+    let chunk_size = chunk_size(mtu);
     let (inbound_tx, inbound_rx) = mpsc::channel(64);
     let (outbound_tx, outbound_rx) = mpsc::channel(64);
     let node = node.clone();
@@ -1322,7 +1333,7 @@ impl Machine {
 
     /// The join's exchange, its stream live over the connected GATT (R76).
     fn begin_join_task(&mut self, mtu: u16) {
-        let chunk_size = usize::from(mtu).saturating_sub(CHUNK_OVERHEAD).max(1);
+        let chunk_size = chunk_size(mtu);
         let (inbound_tx, inbound_rx) = mpsc::channel(64);
         let (outbound_tx, outbound_rx) = mpsc::channel(64);
         let node = self.node.clone();
@@ -2326,6 +2337,14 @@ mod tests {
     }
 
     // --- The host's beacon table ---
+
+    #[test]
+    fn a_chunk_fits_both_the_packet_and_the_longest_attribute() {
+        assert_eq!(chunk_size(23), 20);
+        assert_eq!(chunk_size(185), 182);
+        assert_eq!(chunk_size(517), 512);
+        assert_eq!(chunk_size(0), 1);
+    }
 
     #[tokio::test]
     async fn a_hosting_serving_device_starts_its_beacon() {
