@@ -221,9 +221,25 @@ class BluetoothPlugin {
                 false,
                 bytes
             )
-            if (status != BluetoothGatt.GATT_SUCCESS) return FAILED
+            if (status != BluetoothGatt.GATT_SUCCESS) {
+                dropLocked(device)
+                return FAILED
+            }
             notifying[device] = true
             OK
+        }
+
+        // A lost notification leaves a gap in the ordered byte stream the
+        // exchange reads, so the connection ends at once and is reported.
+        private fun dropLocked(key: Long) {
+            val target = devices.remove(key) ?: return
+            connected.remove(key)
+            mtus.remove(key)
+            notifying.remove(key)
+            notifyQueue.remove(key)
+            ccc.remove(key)
+            eventLines.addLast("$EVENT_DISCONNECTED\t$key")
+            runCatching { gattServer?.cancelConnection(target) }
         }
 
         @JvmStatic
@@ -310,7 +326,9 @@ class BluetoothPlugin {
                         // The client starts the exchange on the negotiated
                         // packet size, so the line waits for onMtuChanged.
                     } else {
-                        devices.remove(key)
+                        // A connection a failed notification ended is
+                        // already reported.
+                        if (devices.remove(key) == null) return
                         connected.remove(key)
                         mtus.remove(key)
                         notifying.remove(key)
@@ -437,14 +455,12 @@ class BluetoothPlugin {
                 if (device == null) return
                 val key = deviceKey(device)
                 synchronized(lock) {
-                    val queue = notifyQueue[key]
                     if (status != BluetoothGatt.GATT_SUCCESS) {
-                        notifying[key] = false
-                        queue?.clear()
+                        dropLocked(key)
                         return
                     }
                     notifying[key] = false
-                    val next = queue?.removeFirstOrNull() ?: return
+                    val next = notifyQueue[key]?.removeFirstOrNull() ?: return
                     val server = gattServer ?: return
                     val characteristic = outbox ?: return
                     if (server.notifyCharacteristicChanged(
@@ -455,6 +471,8 @@ class BluetoothPlugin {
                         ) == BluetoothGatt.GATT_SUCCESS
                     ) {
                         notifying[key] = true
+                    } else {
+                        dropLocked(key)
                     }
                 }
             }

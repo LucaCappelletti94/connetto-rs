@@ -2521,9 +2521,8 @@ async fn a_kept_list_from_a_dn_sibling_issuer_does_not_refuse_the_link() {
         AttestationLevel::Unproven,
     );
 
-    // The dialer keeps a list signed by its own issuer, whose DN matches the
-    // peer's issuer DN. The link must complete; today webpki fails the
-    // list's signature under the peer's issuer key and refuses with Profile.
+    // The dialer keeps a list signed by its own issuer, a sibling of the
+    // peer's issuer under the same root, and the link completes.
     let (a_tx, _a_rx) = events();
     let (b_tx, _b_rx) = events();
     let a = node(deployment.root_der(), a_tx);
