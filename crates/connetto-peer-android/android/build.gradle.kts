@@ -11,6 +11,9 @@ android {
 
     defaultConfig {
         minSdk = 24
+        // btleplug's Java is reached from native code only, so a shrinking
+        // application build keeps it through these rules.
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {
