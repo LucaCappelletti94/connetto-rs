@@ -761,28 +761,51 @@ async fn one_join(
     usual_ssid: Option<&String>,
     join: JoinBy,
 ) -> Result<()> {
-    if join == JoinBy::Beacon {
-        step("turn Bluetooth on on both phones");
-        for phone in [host, joiner] {
-            bluetooth_on(phone).await?;
+    // The hotspot's ssid, once the host shows it, which the joiner's network
+    // cleanup forgets.
+    let mut offer_ssid = None;
+    let walked = async {
+        if join == JoinBy::Beacon {
+            step("turn Bluetooth on on both phones");
+            for phone in [host, joiner] {
+                bluetooth_on(phone).await?;
+            }
         }
+        step(&format!(
+            "host a hotspot on the first phone for the {} join",
+            join.name()
+        ));
+        // An A35 refuses to start an access point while its own station sits
+        // on a 5 GHz channel, measured on eduroam, so the host leaves its
+        // network, as a host in the field has none. Its server path stays on
+        // USB.
+        host.adb(&["shell", "svc", "wifi", "disable"]).await?;
+        sleep(Duration::from_secs(5)).await;
+        host_and_link(
+            host,
+            joiner,
+            app,
+            peer_app,
+            evidence,
+            identities,
+            join,
+            &mut offer_ssid,
+        )
+        .await
     }
-    step(&format!(
-        "host a hotspot on the first phone for the {} join",
-        join.name()
-    ));
-    // An A35 refuses to start an access point while its own station sits on
-    // a 5 GHz channel, measured on eduroam, so the host leaves its network,
-    // as a host in the field has none. Its server path stays on USB.
-    host.adb(&["shell", "svc", "wifi", "disable"]).await?;
-    sleep(Duration::from_secs(5)).await;
-    let hosted = host_and_link(host, joiner, app, peer_app, evidence, identities, join).await;
+    .await;
     // Back to rest whatever happened, so the next join starts clean: the
     // pages' own leave and stop, the host's Wi-Fi, Bluetooth off, and the
-    // joiner on its usual network.
-    if hosted.is_err() {
+    // joiner on its usual network, the first failure kept.
+    if walked.is_err() {
         let _ = peer_app.click("Leave the hotspot").await;
         let _ = app.click("Stop the hotspot").await;
+        // An abandoned join leaves the system's "Couldn't connect" notice up,
+        // and the next request reuses that dialog in place of its approval, so
+        // the cleanup closes it with the Settings process that shows it.
+        let _ = joiner
+            .adb(&["shell", "am", "force-stop", "com.android.settings"])
+            .await;
     }
     let restored = host
         .adb(&["shell", "svc", "wifi", "enable"])
@@ -792,10 +815,11 @@ async fn one_join(
     for phone in [host, joiner] {
         bluetooth = bluetooth.and(bluetooth_off(phone).await);
     }
-    let offer_ssid = hosted?;
-    restored?;
-    bluetooth?;
-    restore_joiner_networks(host, joiner, &offer_ssid, usual_ssid).await?;
+    let networks = match &offer_ssid {
+        Some(ssid) => restore_joiner_networks(host, joiner, ssid, usual_ssid).await,
+        None => Ok(()),
+    };
+    walked.and(restored).and(bluetooth).and(networks)?;
     joiner
         .screenshot(evidence, &format!("{}-peer-clean", join.name()))
         .await?;
@@ -803,7 +827,12 @@ async fn one_join(
 }
 
 /// Host on the first phone, join from the second, link, and end the link,
-/// answering the hotspot's ssid for the cleanup.
+/// recording the hotspot's ssid in `offer_ssid` as soon as it shows, so the
+/// cleanup forgets it even when a later step fails.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two phones, their pages, the evidence, both identities, the join and the ssid it records are each the step's own"
+)]
 async fn host_and_link(
     host: &Device,
     joiner: &Device,
@@ -812,7 +841,8 @@ async fn host_and_link(
     evidence: &Path,
     (host_identity, joiner_identity): (&str, &str),
     join_by: JoinBy,
-) -> Result<String> {
+    offer_ssid: &mut Option<String>,
+) -> Result<()> {
     let shot = |name: &str| format!("{}-{name}", join_by.name());
     app.click("Host a hotspot").await?;
     // Without the beacon the host's Bluetooth stays off, so hosting opens
@@ -825,6 +855,7 @@ async fn host_and_link(
             .await?;
     }
     let offer = read_hotspot_offer(app).await?;
+    *offer_ssid = Some(offer.ssid.clone());
     host.screenshot(evidence, &shot("host-offer")).await?;
 
     match join_by {
@@ -907,7 +938,7 @@ async fn host_and_link(
     app.click("Stop the hotspot").await?;
     wait_link_ends(app, peer_app).await?;
     host.screenshot(evidence, &shot("host-unlinked")).await?;
-    Ok(offer.ssid)
+    Ok(())
 }
 
 /// The page's own peer identity, `account/key prefix`, from its listening
