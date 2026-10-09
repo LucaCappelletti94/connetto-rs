@@ -1,5 +1,6 @@
-//! The Android permissions the connetto peer link asks for, and the bundled
-//! Kotlin module behind the local-only hotspot the peer link dials through.
+//! The Android permissions the connetto peer link asks for, the bundled
+//! Kotlin module behind its hotspot and beacon, and btleplug's virtual machine
+//! and Java for the Bluetooth central.
 //!
 //! See the crate's README for the two permissions the peer link needs and
 //! where each of them is used.
@@ -10,7 +11,10 @@
 mod android;
 
 #[cfg(target_os = "android")]
-pub use android::request_peer_permissions;
+pub use android::{VmError, java_vm, request_peer_permissions, use_application_class_loader};
+/// The jni btleplug links, whose virtual machine [`java_vm`] answers.
+#[cfg(target_os = "android")]
+pub use jni;
 
 /// Ask the operating system for the permissions the peer link's discovery and
 /// the hotspot need (R76), opening the prompt on the Activity when any is

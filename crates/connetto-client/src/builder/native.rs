@@ -917,9 +917,16 @@ where
                                 Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                 Arc::clone(&backend)
                                     as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                // The Android central is btleplug's, which a later slice
-                                // brings (R76 decision 20).
-                                None,
+                                // btleplug's central, absent where its thread
+                                // does not start (R76 decision 22).
+                                match crate::bluetooth::BtleplugCentral::start().await {
+                                    Ok(central) => Some(Arc::new(central)
+                                        as Arc<dyn crate::bluetooth::CentralBackend>),
+                                    Err(err) => {
+                                        tracing::warn!(%err, "the Bluetooth central did not start");
+                                        None
+                                    }
+                                },
                             )
                         }
                         None => crate::bluetooth::unsupported_backends(),

@@ -1,6 +1,6 @@
 [package]
 name = "connetto-peer-android"
-description = "The Android permissions the connetto peer link asks for, and the bundled Kotlin module that hosts and joins the local-only hotspot behind the peer link."
+description = "The Android permissions the connetto peer link asks for, the bundled Kotlin module behind its hotspot and Bluetooth beacon, and the virtual machine and Java btleplug needs as its Bluetooth central."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,30 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
-[lints]
-workspace = true
+# The workspace's lints, with `unsafe_code` lowered from forbid to deny, so
+# the one call building btleplug's virtual machine carries its own `expect`
+# (R76 decisions 17 and 22).
+[lints.rust]
+missing_docs = "forbid"
+unused_macro_rules = "forbid"
+unconditional_recursion = "forbid"
+unreachable_patterns = "forbid"
+unused_import_braces = "forbid"
+unused_must_use = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+deprecated = "deny"
+unknown_lints = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 
 [dependencies]
 thiserror.workspace = true
@@ -21,3 +43,6 @@ thiserror.workspace = true
 # `android::with_activity` reaches the Activity, without code of our own
 # touching raw JNI pointers.
 manganis = "0.7.10"
+# The jni btleplug's Android init takes (R76 decision 22), handed to the
+# client as a safe virtual machine.
+jni = "0.22"

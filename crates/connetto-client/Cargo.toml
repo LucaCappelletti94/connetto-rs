@@ -44,7 +44,7 @@ postgres-types = ["diesel/postgres_backend"]
 device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
 # The peer link (R76): the device serves its identity to other devices over
 # a second, server-independent channel, and dials them.
-peer = ["device-identity", "dep:connetto-peer"]
+peer = ["device-identity", "dep:connetto-peer", "dep:btleplug", "dep:connetto-peer-android"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -256,6 +256,14 @@ android_system_properties = { version = "0.1.6", optional = true }
 socket2 = "0.6"
 # The joined network's subnet, the targets its bind admits (R76).
 ipnet = "2.12"
+# The joiner's Bluetooth central (R76 decision 22), pinned at the fork's fix
+# of its Android init until a release carries deviceplug/btleplug#495.
+btleplug = { git = "https://github.com/LucaCappelletti94/btleplug", rev = "5f6b3686849ed5617bebba136dc29ac253e71937", optional = true }
+# The jni 0.22 virtual machine btleplug's init takes, and btleplug's Java
+# bundled in its Gradle module (R76 decision 22).
+connetto-peer-android = { path = "../connetto-peer-android", optional = true }
+# The streams btleplug's central answers with (R76 decision 22).
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }

@@ -42,7 +42,10 @@
 //! With `--bluetooth` the main phone hosts a hotspot after its own proof, and
 //! the run requires the demo's beacon on the panel and its legacy advertising
 //! set and GATT service in the phone's Bluetooth dump (R76 slice 5a). The
-//! proof ends with the phone's Bluetooth off and its Wi-Fi on.
+//! proof ends with the phone's Bluetooth off and its Wi-Fi on. With
+//! `--peer-serial` as well, the second phone finds the first one's beacon and
+//! joins through the exchange behind it in place of the join form (R76 slice
+//! 6), and both phones end with their Bluetooth off.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -146,8 +149,13 @@ async fn main() -> Result<()> {
             // The peer proof runs only on a proved phone, and a failed
             // proof keeps its own error.
             match (bluetooth, peer_serial, outcome) {
-                (true, _, Ok(())) => bluetooth_proof(&device, &evidence).await,
-                (false, Some(serial), Ok(())) => {
+                (true, None, Ok(())) => bluetooth_proof(&device, &evidence).await,
+                (bluetooth, Some(serial), Ok(())) => {
+                    let join_by = if bluetooth {
+                        JoinBy::Beacon
+                    } else {
+                        JoinBy::Form
+                    };
                     peer_proof(
                         &device,
                         &Device::new(serial),
@@ -155,6 +163,7 @@ async fn main() -> Result<()> {
                         &stack,
                         &evidence,
                         unlock,
+                        join_by,
                     )
                     .await
                 }
@@ -449,6 +458,15 @@ async fn read_hotspot_offer(app: &mut PageSession) -> Result<HotspotOfferLines> 
     }
 }
 
+/// How the second phone learns the hotspot the first one hosts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinBy {
+    /// The first phone's offer lines typed into the second's join form.
+    Form,
+    /// The first phone's Bluetooth beacon and the exchange behind it (R76).
+    Beacon,
+}
+
 /// The two-phone peer proof (R76 slice 4): `host` hosts a hotspot from the
 /// demo and `joiner` signs in as its own account and joins it, the driver
 /// tapping the system's approval in place of the user (decision 16), until
@@ -461,6 +479,7 @@ async fn peer_proof(
     stack: &Stack,
     evidence: &Path,
     unlock: Unlock<'_>,
+    join_by: JoinBy,
 ) -> Result<()> {
     if !demo_has_device_identity() {
         bail!("the peer proof needs a demo build with its device identity");
@@ -478,8 +497,16 @@ async fn peer_proof(
         evidence,
         &unlock,
         usual_ssid.as_ref(),
+        join_by,
     )
     .await;
+    if join_by == JoinBy::Beacon {
+        for phone in [host, joiner] {
+            let _ = phone
+                .adb(&["shell", "cmd", "bluetooth_manager", "disable"])
+                .await;
+        }
+    }
 
     // The joiner's log for the record, and its state, which the run leaves
     // as it found it.
@@ -546,6 +573,10 @@ async fn prepare_joiner(
 /// The walk itself: install and sign in the joiner, host on the first phone,
 /// join from the second, link, end the link, and bring the joiner back to
 /// its usual network.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two phones, the build, the stack, the evidence, the unlock, the joiner's network and the join's route are each the walk's own"
+)]
 async fn run_peer_proof(
     host: &Device,
     joiner: &Device,
@@ -554,6 +585,7 @@ async fn run_peer_proof(
     evidence: &Path,
     unlock: &Unlock<'_>,
     usual_ssid: Option<&String>,
+    join_by: JoinBy,
 ) -> Result<()> {
     joiner
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
@@ -573,6 +605,17 @@ async fn run_peer_proof(
                 "android.permission.NEARBY_WIFI_DEVICES",
             ])
             .await?;
+    }
+    if join_by == JoinBy::Beacon {
+        step("turn Bluetooth on and grant its permissions on both phones");
+        for phone in [host, joiner] {
+            bluetooth_on(phone).await?;
+            for permission in BT_PERMISSIONS {
+                phone
+                    .adb(&["shell", "pm", "grant", PACKAGE, permission])
+                    .await?;
+            }
+        }
     }
 
     let mut peer_app = sign_in_joiner(joiner, stack, evidence, unlock).await?;
@@ -598,6 +641,7 @@ async fn run_peer_proof(
         evidence,
         &host_identity,
         &joiner_identity,
+        join_by,
     )
     .await;
     let restored = host
@@ -614,6 +658,10 @@ async fn run_peer_proof(
 
 /// Host on the first phone, join from the second, link, and end the link,
 /// answering the hotspot's ssid for the cleanup.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two phones, their pages, the evidence, both identities and the join's route are each the walk's own"
+)]
 async fn host_and_link(
     host: &Device,
     joiner: &Device,
@@ -622,16 +670,35 @@ async fn host_and_link(
     evidence: &Path,
     host_identity: &str,
     joiner_identity: &str,
+    join_by: JoinBy,
 ) -> Result<String> {
     app.click("Host a hotspot").await?;
     let offer = read_hotspot_offer(app).await?;
     host.screenshot(evidence, "host-offer").await?;
 
-    step("fill the join form on the second phone");
-    peer_app.set_input("ssid", &offer.ssid).await?;
-    peer_app.set_input("passphrase", &offer.passphrase).await?;
-    peer_app.set_input("port", &offer.port.to_string()).await?;
-    peer_app.click("Join the hotspot").await?;
+    match join_by {
+        JoinBy::Form => {
+            step("fill the join form on the second phone");
+            peer_app.set_input("ssid", &offer.ssid).await?;
+            peer_app.set_input("passphrase", &offer.passphrase).await?;
+            peer_app.set_input("port", &offer.port.to_string()).await?;
+            peer_app.click("Join the hotspot").await?;
+        }
+        JoinBy::Beacon => {
+            let beacon = read_beacon(app).await?;
+            let prefix = beacon
+                .strip_prefix("beacon: advertising ")
+                .context("the beacon line carries no prefix")?
+                .to_owned();
+            step("find the beacon on the second phone");
+            peer_app
+                .wait_for_text(&format!("nearby: {prefix}"), Duration::from_secs(60))
+                .await
+                .context("the second phone never saw the first phone's beacon")?;
+            joiner.screenshot(evidence, "peer-nearby").await?;
+            peer_app.click("Join the nearby host").await?;
+        }
+    }
 
     step("approve the network on the second phone");
     joiner.tap_connect_button().await?;
@@ -1057,7 +1124,8 @@ struct Arguments {
     apk: Option<PathBuf>,
     unlock_pin: Option<String>,
     peer_serial: Option<String>,
-    /// The host-side Bluetooth beacon proof.
+    /// The Bluetooth beacon proof, host-side alone, and the beacon join with
+    /// `--peer-serial`.
     bluetooth: bool,
 }
 
