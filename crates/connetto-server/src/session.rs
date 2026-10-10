@@ -22,19 +22,20 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use connetto_core::auth::{Principal, Subject};
 use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{
-    AggregateUpdate, BindValue, BulkMessage, CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR,
-    ContentTicketGrant, ContentTicketRequest, ContentVerb, ControlMessage, DeviceRevokedAck,
-    DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal, EnrolRefused, FatalError,
-    FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake, HandshakeAck, LivePatch,
-    MembershipOpened, MutationApplied, MutationConflict, MutationHeader, MutationPatch,
-    MutationReject, MutationRejectReason, NonFatalError, PauseCause, Pong, RateLimited,
-    RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED, SignedList, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
+    AggregateUpdate, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
+    CONTENT_TICKET_SIGNER_ERROR, Challenge, ContentTicketGrant, ContentTicketRequest, ContentVerb,
+    ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal,
+    EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake,
+    HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict, MutationHeader,
+    MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause, Pong,
+    RateLimited, RegisterBot, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
+    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
+    bot_registration_message,
 };
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
 
@@ -42,6 +43,9 @@ use crate::device_cert::RevokeError;
 use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
+use ring::rand::{SecureRandom, SystemRandom};
+use ring::signature::{ED25519, UnparsedPublicKey};
+use sha2::{Digest, Sha256};
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
 };
@@ -55,8 +59,11 @@ use subql::{
 };
 use tokio::sync::{Mutex, mpsc};
 use tracing::Instrument;
+use uuid::Uuid;
 
 use crate::abuse::{Caller, Reaction};
+use crate::bots::schema::{ListEntry, PgBotRegistry, RegistryError, Verb};
+
 use crate::audit::{AuthEvent, AuthOp};
 use crate::counters;
 use crate::fence::{ReadFence, split_snapshot_cursor};
@@ -512,6 +519,8 @@ pub struct SessionConfig {
     resume_read_budget: Duration,
     /// How long one mutation may keep retrying an apply the database failed transiently before it is answered `Indeterminate`.
     write_retry_budget: Duration,
+    /// The time one connection may stay open at its first frame before the registration gate closes it (R91).
+    first_frame_budget: Duration,
 }
 
 impl Default for SessionConfig {
@@ -521,6 +530,7 @@ impl Default for SessionConfig {
             schema_version: None,
             resume_read_budget: Duration::from_secs(30),
             write_retry_budget: Duration::from_secs(5),
+            first_frame_budget: Duration::from_secs(30),
         }
     }
 }
@@ -560,10 +570,23 @@ impl SessionConfig {
         self
     }
 
+    /// Sets the time one connection may stay open at its first frame before the registration gate closes it (R91).
+    #[must_use]
+    pub const fn with_first_frame_budget(mut self, budget: Duration) -> Self {
+        self.first_frame_budget = budget;
+        self
+    }
+
     /// Delivery credits granted at handshake.
     #[must_use]
     pub fn initial_credits(&self) -> u32 {
         self.initial_credits
+    }
+
+    /// The time one connection may stay open at its first frame before the registration gate closes it (R91).
+    #[must_use]
+    pub const fn first_frame_budget(&self) -> Duration {
+        self.first_frame_budget
     }
 }
 
@@ -762,6 +785,12 @@ pub enum SessionError {
     /// at handshake).
     #[error("write target error: {0}")]
     WriteTarget(String),
+    /// The bot registry could not settle a registration because its pool was
+    /// unreachable or a statement failed (R91). The connection drops rather
+    /// than answering a refusal, because a failure is not a spent code, and
+    /// answering it as a refusal would spend the bot's only code for nothing.
+    #[error("bot registry error: {0}")]
+    Registry(String),
     /// The ban list could not be read, so the handshake failed closed rather
     /// than admitting a caller whose ban might not have been seen.
     #[error("ban list error: {0}")]
@@ -794,6 +823,38 @@ pub enum SessionError {
          ALTER TABLE {0} REPLICA IDENTITY FULL"
     )]
     ChangeStreamUnusable(String),
+}
+
+/// What the registry settled a registration into (R91).
+#[derive(Debug)]
+enum RegistrationOutcome {
+    /// The bot's id, answered with the registered frame.
+    Registered(Uuid),
+    /// The registration was refused, answered with the refusal frame.
+    Refused(RegistrationRefusal),
+}
+
+/// Why a registration was refused (R91), kept for the log line and nowhere else.
+/// The wire carries the refusal frame without saying why.
+#[derive(Debug)]
+enum RegistrationRefusal {
+    /// The list names a table the deployment does not sync.
+    TableNotSynced {
+        /// The table the entry named.
+        #[expect(dead_code, reason = "the refusal is reported through its Debug")]
+        table: String,
+    },
+    /// The list names a verb outside the four.
+    UnknownVerb {
+        /// The verb the entry named.
+        #[expect(dead_code, reason = "the refusal is reported through its Debug")]
+        verb: String,
+    },
+    /// The signature does not verify against the presented key for this
+    /// connection's nonce.
+    Signature,
+    /// The code is unknown, expired or already used, or no registry is wired.
+    Code,
 }
 
 /// Why the change feed could not be settled before opening.
@@ -1492,6 +1553,10 @@ pub struct SessionManager<
     /// completes during the shutdown is told the shutdown rather than
     /// registering into the drained registry.
     shutting_down: AtomicBool,
+    /// The bot registry that settles a `RegisterBot` on the owner pool (R91),
+    /// or `None` when the deployment wired no registry, in which case every
+    /// registration fails closed and is refused without saying why.
+    bot_registry: Option<PgBotRegistry<D::Bots>>,
 }
 
 /// Keeps the open-run-loop count right while one `serve` is in flight.
@@ -1541,6 +1606,7 @@ pub(crate) fn assemble_manager<Snap, Auth, C, O, D, S>(
     signer: S,
     withdrawal_source: Option<Snap>,
     second_opinion: Option<Arc<dyn crate::parity::SecondOpinion<D::Id, String>>>,
+    bot_registry: Option<PgBotRegistry<D::Bots>>,
 ) -> Arc<ConnettoManager<Snap, Auth, D, C, O, S>>
 where
     Snap: SnapshotSource<D::Id>,
@@ -1578,6 +1644,7 @@ where
         resume: ResumePoint::default(),
         open_sessions: Arc::new(AtomicUsize::new(0)),
         shutting_down: AtomicBool::new(false),
+        bot_registry,
     })
 }
 
@@ -2984,12 +3051,216 @@ where
             )));
     }
 
-    /// Receive and validate the handshake, decode the resume cursor, read the
-    /// client's durable mutation watermark, and reply with the ack carrying
-    /// both the server's current cursor and that watermark.
+    /// The connection's opening exchange (R91). The server sends the
+    /// challenge and the peer answers with its handshake or a bot's
+    /// registration, the loop repeating on a fresh nonce until one of the two
+    /// settles.
     ///
-    /// Returns the session identity, or `None` when the peer closed before
-    /// sending a handshake, or the manager is shutting down.
+    /// A settled handshake is handed to the handshake with its nonce spent. A
+    /// settled registration is answered with the bot id and a refused one
+    /// with the refusal frame, and the loop carries on either way. The first
+    /// frame read is bounded by the first-frame budget, so a silent peer
+    /// holds no connection for the budget's length.
+    ///
+    /// Returns the peer's handshake, or `None` when the peer closed, the
+    /// manager is shutting down, or the connection's refusals crossed its
+    /// abuse limit.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Protocol`] when the peer sends neither a handshake nor
+    /// a registration, or stays silent until the deadline, and
+    /// [`SessionError::Registry`] when the registry cannot settle a
+    /// registration.
+    async fn registration_gate<T: Transport>(
+        &self,
+        transport: &mut T,
+    ) -> Result<Option<Handshake>, SessionError> {
+        // The tally of a connection that never proves an identity keys on the
+        // connection alone, so the gate mints the id the tally names.
+        let session = SessionId::from_uuid(Uuid::new_v4());
+        let mut nonce = Self::mint_nonce();
+        let result: Result<Option<Handshake>, SessionError> =
+            loop {
+                if self.shutting_down.load(Ordering::Acquire) {
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(FatalError::new(
+                            FatalErrorReason::ServerShuttingDown,
+                        )))
+                        .await;
+                    break Ok(None);
+                }
+                if let Err(err) = transport
+                    .send_control(ControlMessage::Challenge(Challenge { nonce }))
+                    .await
+                    .map_err(transport_err)
+                {
+                    break Err(err);
+                }
+                let frame =
+                    match tokio::time::timeout(self.config.first_frame_budget(), transport.recv())
+                        .await
+                    {
+                        Ok(frame) => frame.map_err(transport_err),
+                        Err(_) => Err(SessionError::Protocol(
+                            "no first frame before the deadline".into(),
+                        )),
+                    };
+                match frame {
+                    Err(err) => break Err(err),
+                    Ok(None) => break Ok(None),
+                    Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(handshake)))) => {
+                        break Ok(Some(handshake));
+                    }
+                    Ok(Some(IncomingFrame::Control(ControlMessage::RegisterBot(registration)))) => {
+                        match self.settle_registration(&registration, &nonce).await {
+                            Ok(RegistrationOutcome::Registered(bot)) => {
+                                if let Err(err) = transport
+                                    .send_control(ControlMessage::BotRegistered(BotRegistered {
+                                        bot_id: bot.to_string(),
+                                    }))
+                                    .await
+                                    .map_err(transport_err)
+                                {
+                                    break Err(err);
+                                }
+                            }
+                            Ok(RegistrationOutcome::Refused(refusal)) => {
+                                tracing::warn!(?refusal, "a registration was refused");
+                                if let Err(err) = transport
+                                    .send_control(ControlMessage::RegistrationRefused)
+                                    .await
+                                    .map_err(transport_err)
+                                {
+                                    break Err(err);
+                                }
+                                // The refusal is metered at the tier that has not
+                                // proved an identity, the way a handshake's
+                                // refused grants are.
+                                if self.guard.refused_grants(
+                                    Caller {
+                                        session,
+                                        user: None,
+                                    },
+                                    1,
+                                ) == Reaction::Close
+                                {
+                                    break Ok(None);
+                                }
+                            }
+                            Err(err) => break Err(err),
+                        }
+                    }
+                    Ok(Some(_)) => {
+                        break Err(SessionError::Protocol(
+                            "expected a handshake or a registration first".into(),
+                        ));
+                    }
+                }
+                // A settlement that landed on the shutdown flag is told
+                // the shutdown instead of opening another round.
+                if self.shutting_down.load(Ordering::Acquire) {
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(FatalError::new(
+                            FatalErrorReason::ServerShuttingDown,
+                        )))
+                        .await;
+                    break Ok(None);
+                }
+                nonce = Self::mint_nonce();
+            };
+        // The tally id is minted here and is not the session id run_session retires.
+        self.guard.forget_connection(session);
+        result
+    }
+
+    /// Settle a registration on the owner pool before identity (R91).
+    ///
+    /// The checks run in the order list, then signature, then code, and only
+    /// a registration that clears the first two reaches the registry's
+    /// transaction, so a bad list or a bad signature never touches the
+    /// database and the code is looked up only when it will be spent. A
+    /// registry failure is a [`SessionError::Registry`], not a refusal, so a
+    /// database outage does not spend the bot's only code.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::Registry`] when the registry's pool or a statement
+    /// fails.
+    async fn settle_registration(
+        &self,
+        registration: &RegisterBot,
+        nonce: &[u8; 32],
+    ) -> Result<RegistrationOutcome, SessionError> {
+        let Some(registry) = &self.bot_registry else {
+            return Ok(RegistrationOutcome::Refused(RegistrationRefusal::Code));
+        };
+        let mut list = Vec::with_capacity(registration.list.len());
+        for entry in &registration.list {
+            let synced = self
+                .catalog
+                .tables()
+                .any(|table| table.stored_table_name() == entry.table);
+            if !synced {
+                return Ok(RegistrationOutcome::Refused(
+                    RegistrationRefusal::TableNotSynced {
+                        table: entry.table.clone(),
+                    },
+                ));
+            }
+            let Some(verb) = Verb::parse(&entry.verb) else {
+                return Ok(RegistrationOutcome::Refused(
+                    RegistrationRefusal::UnknownVerb {
+                        verb: entry.verb.clone(),
+                    },
+                ));
+            };
+            list.push(ListEntry {
+                table: entry.table.clone(),
+                verb,
+                optional: entry.optional,
+            });
+        }
+        let message = bot_registration_message(nonce);
+        let key = UnparsedPublicKey::new(&ED25519, &registration.public_key);
+        if key.verify(&message, &registration.signature).is_err() {
+            return Ok(RegistrationOutcome::Refused(RegistrationRefusal::Signature));
+        }
+        let code_hash: [u8; 32] = Sha256::digest(registration.code.as_bytes()).into();
+        match registry
+            .register(
+                code_hash,
+                registration.public_key,
+                registration.name.clone(),
+                &list,
+                SystemTime::now(),
+            )
+            .await
+        {
+            Ok(registered) => Ok(RegistrationOutcome::Registered(registered.bot)),
+            Err(RegistryError::Refused) => {
+                Ok(RegistrationOutcome::Refused(RegistrationRefusal::Code))
+            }
+            Err(error) => Err(SessionError::Registry(error.to_string())),
+        }
+    }
+
+    /// The 32-byte nonce of one registration round (R91), filled from the
+    /// system random source the way the enrolment nonce is.
+    fn mint_nonce() -> [u8; 32] {
+        let mut nonce = [0_u8; 32];
+        SystemRandom::new()
+            .fill(&mut nonce)
+            .expect("the system random source fills a 32-byte nonce");
+        nonce
+    }
+
+    /// Validate the handshake the gate received, decode the resume cursor,
+    /// read the client's durable mutation watermark, and reply with the ack
+    /// carrying both the server's current cursor and that watermark.
+    ///
+    /// Returns the session identity, or `None` when the manager is shutting
+    /// down.
     #[expect(
         clippy::too_many_lines,
         reason = "registration must sit between the grant checks and the ack, so splitting it would let a revocation cross the gap again"
@@ -2997,12 +3268,8 @@ where
     async fn run_handshake<T: Transport>(
         &self,
         transport: &mut T,
+        handshake: Handshake,
     ) -> Result<Option<HandshakeOutcome<Id, Key>>, SessionError> {
-        let handshake = match transport.recv().await.map_err(transport_err)? {
-            Some(IncomingFrame::Control(ControlMessage::Handshake(hs))) => hs,
-            Some(_) => return Err(SessionError::Protocol("expected handshake first".into())),
-            None => return Ok(None),
-        };
         if handshake.protocol_version != PROTOCOL_VERSION {
             // Outside any connection context on purpose: no session exists yet,
             // so the handle is absent rather than a stand-in.
@@ -3538,8 +3805,8 @@ where
         (principal, refusals, refusal_wait)
     }
 
-    /// Serve one connection to completion: handshake, then the run loop, then
-    /// cleanup on disconnect.
+    /// Serve one connection to completion: the registration gate, the
+    /// handshake, the run loop, and cleanup on disconnect.
     ///
     /// # Errors
     ///
@@ -3550,7 +3817,10 @@ where
         mut transport: T,
     ) -> Result<(), SessionError> {
         let _tally = OpenSessionTally::start(self.open_sessions.clone());
-        let Some(outcome) = self.run_handshake(&mut transport).await? else {
+        let Some(handshake) = self.registration_gate(&mut transport).await? else {
+            return Ok(());
+        };
+        let Some(outcome) = self.run_handshake(&mut transport, handshake).await? else {
             return Ok(());
         };
         let span = outcome.span.clone();
@@ -4031,6 +4301,18 @@ where
                     )))
                     .await;
                 Err(SessionError::Protocol("duplicate handshake".into()))
+            }
+            // A registration belongs to the gate that runs before identity
+            // (R91). After the handshake it is a protocol violation.
+            ControlMessage::RegisterBot(_) => {
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::ProtocolViolation {
+                            detail: "registration after identity".into(),
+                        },
+                    )))
+                    .await;
+                Err(SessionError::Protocol("registration after identity".into()))
             }
             // Announce a mutation upload. The paired patch follows on the bulk
             // channel and completes the write path.
@@ -6286,5 +6568,92 @@ mod tests {
         assert!(attempt_limit_reached(Some(1), 1));
         assert!(!attempt_limit_reached(Some(3), 2));
         assert!(attempt_limit_reached(Some(3), 3));
+    }
+
+    /// A refused registration's tally key dies with its connection, on every
+    /// exit the gate takes.
+    #[tokio::test]
+    async fn a_refused_registration_retires_its_gate_tally_key() {
+        use super::{Materializer, RequestGuard, RuntimeWritableCatalog};
+        use crate::abuse::Signal;
+        use crate::defaults::ConnettoDefaults;
+        use crate::{ManagerBuilder, PgReadConnector, PgSnapshotSource, pg_write_target};
+        use connetto_core::loopback;
+        use connetto_core::messages::{ControlMessage, RegisterBot};
+        use connetto_core::test_support::TestGrantChecker;
+        use connetto_core::traits::{IncomingFrame, Transport};
+        use connetto_test_harness::RosterAuth;
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::bb8::Pool;
+
+        use std::sync::Arc;
+        const DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT);";
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:9/none".to_owned(),
+        );
+        let pool = Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .await
+            .expect("the pool builds even though it connects nowhere");
+        let guard = Arc::new(RequestGuard::default());
+        let manager = ManagerBuilder::new(
+            Materializer::builder(DDL)
+                .with_write_catalog(RuntimeWritableCatalog::default())
+                .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+                .build()
+                .expect("build the materializer"),
+            PgSnapshotSource::from_ddl(pool.clone(), DDL).expect("the snapshot source"),
+            RosterAuth::granting_nobody(),
+            Arc::new(TestGrantChecker),
+            PgReadConnector::with_session_setup(pool.clone()),
+            pg_write_target::<ConnettoDefaults>(pool, DDL).expect("build the write target"),
+        )
+        .with_guard(guard.clone())
+        .build();
+
+        let (server_end, mut client) = loopback();
+        let serving = Arc::clone(&manager);
+        let serving_task = tokio::spawn(async move {
+            let _ = serving.serve(server_end).await;
+        });
+        assert!(
+            matches!(
+                client.recv().await.expect("recv the opening frame"),
+                Some(IncomingFrame::Control(ControlMessage::Challenge(_)))
+            ),
+            "the connection opens with a challenge"
+        );
+        client
+            .send_control(ControlMessage::RegisterBot(RegisterBot {
+                code: "no-such-code".to_owned(),
+                name: "bot-a".to_owned(),
+                public_key: [0; 32],
+                list: vec![],
+                signature: vec![],
+            }))
+            .await
+            .expect("send the registration");
+        let control = match client.recv().await.expect("recv the answer") {
+            Some(IncomingFrame::Control(control)) => control,
+            frame => panic!("expected the refusal frame, the connection ended: {frame:?}"),
+        };
+        assert!(
+            matches!(control, ControlMessage::RegistrationRefused),
+            "an unknown code is refused"
+        );
+        assert_eq!(
+            guard.tracked_connections(Signal::RefusedGrant),
+            1,
+            "the gate's key is tracked while the connection is open"
+        );
+        client.close().await.expect("the peer hangs up");
+        serving_task.await.expect("serve ends with the peer");
+        assert_eq!(
+            guard.tracked_connections(Signal::RefusedGrant),
+            0,
+            "the gate's key dies with the connection"
+        );
     }
 }

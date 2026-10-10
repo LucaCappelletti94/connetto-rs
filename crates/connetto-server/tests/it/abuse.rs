@@ -354,6 +354,10 @@ where
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected a handshake ack");
     };
@@ -387,6 +391,17 @@ where
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads with a challenge the person ignores, and the answer follows.
+    let leading = tokio::time::timeout(SETTLE, client.recv())
+        .await
+        .expect("recv the challenge");
+    assert!(
+        matches!(
+            leading,
+            Ok(Some(IncomingFrame::Control(ControlMessage::Challenge(_))))
+        ),
+        "the connection leads with a challenge, got {leading:?}"
+    );
     let accepted = match tokio::time::timeout(SETTLE, client.recv()).await {
         Ok(Ok(Some(IncomingFrame::Control(ControlMessage::HandshakeAck(_))))) => true,
         Ok(Ok(None)) => false,
@@ -1031,6 +1046,10 @@ async fn a_tripped_credential_limit_still_counts_its_refusals() {
             .send_control(ControlMessage::Handshake(handshake))
             .await
             .expect("send handshake");
+        // The server leads with a challenge a person ignores (R91), and the fatal follows.
+        let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+            panic!("expected the leading challenge");
+        };
         let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
             panic!("a caller past its credential limit is closed, not acknowledged");
         };

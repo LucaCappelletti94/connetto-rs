@@ -15,6 +15,7 @@ pub mod flow;
 pub mod handshake;
 pub mod mutation;
 pub mod reconnect;
+pub mod registration;
 pub mod subscription;
 
 pub use aggregate::AggregateUpdate;
@@ -37,6 +38,10 @@ pub use mutation::{
     MutationRejectReason,
 };
 pub use reconnect::{FullResyncReason, FullResyncRequired};
+pub use registration::{
+    BOT_REGISTRATION_DOMAIN, BotListEntry, BotRegistered, Challenge, RegisterBot,
+    bot_registration_message,
+};
 pub use subscription::{
     BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
     SubscriptionSpec, Unsubscribe,

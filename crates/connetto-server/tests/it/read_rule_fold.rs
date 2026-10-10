@@ -241,6 +241,10 @@ async fn connected_clients(
             ))
             .await
             .expect("send handshake");
+        // The server leads every connection with a challenge a person ignores (R91).
+        let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+            panic!("expected the leading challenge");
+        };
         let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
             panic!("expected handshake ack");
         };

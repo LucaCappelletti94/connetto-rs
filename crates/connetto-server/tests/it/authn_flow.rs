@@ -131,6 +131,10 @@ fn manager_with(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks login then revocation in order and a split would hide the sequence"
+)]
 async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let fixture = Fixture::acquire().await;
     let (authority, svc) = service();
@@ -149,6 +153,10 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -207,6 +215,10 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     // The revoked grant is refused but the connection stays open.
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack after revocation");
@@ -278,6 +290,10 @@ async fn logout_closes_the_live_connection_it_revoked() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -345,6 +361,10 @@ async fn token_reuse_closes_the_live_connection_it_revoked() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };

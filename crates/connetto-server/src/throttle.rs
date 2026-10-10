@@ -577,6 +577,12 @@ impl<K: Eq + Hash + Clone> Counters<K> {
             state.order.remove(&tracked.touched);
         }
     }
+
+    /// The keys the counter still holds, for a test that watches a key die.
+    #[cfg(test)]
+    pub(crate) fn tracked(&self) -> usize {
+        self.state.lock().windows.len()
+    }
 }
 
 impl<K: Eq + Hash + Clone> CounterState<K> {

@@ -355,6 +355,15 @@ where
         }
     }
 
+    /// The connection-level keys `signal` still holds, for a test that watches
+    /// the key a gate counted die with its connection.
+    #[cfg(test)]
+    pub(crate) fn tracked_connections(&self, signal: Signal) -> usize {
+        self.connection
+            .of(signal)
+            .map_or(0, super::throttle::Counters::tracked)
+    }
+
     /// The ban that refuses `user_id` right now, if any.
     ///
     /// Fails closed: an unreadable list is an error rather than an absence, so a

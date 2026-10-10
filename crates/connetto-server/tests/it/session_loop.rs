@@ -225,6 +225,10 @@ async fn loopback_session_full_lifecycle() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(ack) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -381,6 +385,10 @@ async fn websocket_session_delivers_snapshot_and_live_patch() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -609,6 +617,10 @@ async fn loopback_session_composite_key_sync() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };

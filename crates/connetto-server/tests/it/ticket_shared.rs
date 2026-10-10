@@ -320,6 +320,11 @@ pub(crate) async fn do_handshake_with(
         .send_control(ControlMessage::Handshake(hs))
         .await
         .expect("send handshake");
+    // The server leads with a challenge the person ignores, and the ack follows.
+    match client.recv().await.expect("recv the challenge") {
+        Some(IncomingFrame::Control(ControlMessage::Challenge(_))) => {}
+        other => panic!("the connection leads with a challenge, got {other:?}"),
+    }
     match client.recv().await.expect("recv ack") {
         Some(IncomingFrame::Control(ControlMessage::HandshakeAck(_))) => {}
         other => panic!("expected HandshakeAck, got {other:?}"),

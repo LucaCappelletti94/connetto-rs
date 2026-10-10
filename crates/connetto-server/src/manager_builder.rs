@@ -14,6 +14,7 @@ use subql::ParserDB;
 use subql::backend::Postgres;
 use subql::visibility::VisibilityPolicy;
 
+use crate::bots::schema::PgBotRegistry;
 use crate::guard::RequestGuard;
 use crate::materializer::{Materializer, ReadConnector, RuntimeWritableCatalog};
 use crate::openfga::StoreUpkeep;
@@ -59,6 +60,7 @@ where
     signer: S,
     withdrawal_source: Option<Snap>,
     second_opinion: Option<Arc<dyn SecondOpinion<D::Id, String>>>,
+    bot_registry: Option<PgBotRegistry<D::Bots>>,
 }
 
 impl<Snap, Auth, D, C> ManagerBuilder<Snap, Auth, D, C, InMemoryOplog, NoSigner>
@@ -94,6 +96,7 @@ where
             signer: NoSigner,
             withdrawal_source: None,
             second_opinion: None,
+            bot_registry: None,
         }
     }
 }
@@ -122,6 +125,16 @@ where
         self
     }
 
+    /// The bot registry that settles a `RegisterBot` on the owner pool (R91).
+    ///
+    /// Without one the manager fails closed, and every registration is refused
+    /// without saying why.
+    #[must_use]
+    pub fn with_bot_registry(mut self, registry: PgBotRegistry<D::Bots>) -> Self {
+        self.bot_registry = Some(registry);
+        self
+    }
+
     /// The oplog the reconnect catchup reads from.
     #[must_use]
     pub fn with_oplog<NewO: Oplog>(self, oplog: NewO) -> ManagerBuilder<Snap, Auth, D, C, NewO, S> {
@@ -138,6 +151,7 @@ where
             signer,
             withdrawal_source,
             second_opinion,
+            bot_registry,
             ..
         } = self;
         ManagerBuilder {
@@ -154,6 +168,7 @@ where
             signer,
             withdrawal_source,
             second_opinion,
+            bot_registry,
         }
     }
 
@@ -186,6 +201,7 @@ where
             upkeep,
             withdrawal_source,
             second_opinion,
+            bot_registry,
             ..
         } = self;
         ManagerBuilder {
@@ -202,6 +218,7 @@ where
             signer,
             withdrawal_source,
             second_opinion,
+            bot_registry,
         }
     }
 
@@ -242,6 +259,7 @@ where
             self.signer,
             self.withdrawal_source,
             self.second_opinion,
+            self.bot_registry,
         )
     }
 }

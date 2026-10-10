@@ -27,7 +27,7 @@ use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin
 use crate::audit::{ConnettoAuditSchema, pg_audit_hook};
 use crate::authn::schema::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
-use crate::bots::ConnettoBotSchema;
+use crate::bots::{ConnettoBotSchema, pg_bot_registry};
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
     ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, StatusList, pg_enrolment_store,
@@ -1101,7 +1101,8 @@ where
         .with_session(session_config.with_schema_version(Some(write_side.version)))
         .with_upkeep(write_side.upkeep)
         .with_signer(reader.signer)
-        .with_withdrawal_source(withdrawals);
+        .with_withdrawal_source(withdrawals)
+        .with_bot_registry(pg_bot_registry::<D>(pool.clone()));
         let manager = match write_side.second {
             Some(second) => manager.with_second_opinion(Arc::new(second)),
             None => manager,

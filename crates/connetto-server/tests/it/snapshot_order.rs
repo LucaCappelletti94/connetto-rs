@@ -167,6 +167,10 @@ async fn snapshot_order_holds_when_the_credit_window_is_closed() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let IncomingFrame::Control(ControlMessage::Challenge(_)) = next_frame(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let IncomingFrame::Control(ControlMessage::HandshakeAck(ack)) = next_frame(&mut client).await
     else {
         panic!("expected a handshake ack");

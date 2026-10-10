@@ -204,6 +204,11 @@ async fn anonymous_session(addr: &str, client_id: &str) -> WebSocketTransport<Tc
         )))
         .await
         .expect("send the handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    match next_control(&mut client).await {
+        ControlMessage::Challenge(_) => {}
+        other => panic!("the connection led with {other:?}"),
+    }
     match next_control(&mut client).await {
         ControlMessage::HandshakeAck(_) => {}
         other => panic!("the handshake answered {other:?}"),
@@ -529,14 +534,12 @@ async fn a_late_session_holds_the_shutdown_to_the_grace() {
         }) => {}
         other => panic!("the drained session's last frame says {other:?}"),
     }
-    // The unregistered client hears no frame at all: the drain does not reach
-    // it, and only the listener stopping closes it.
-    assert!(
-        tokio::time::timeout(Duration::from_secs(1), c.recv())
-            .await
-            .is_err(),
-        "the unregistered client hears no frame, only the listener stopping"
-    );
+    // The unregistered client hears the gate's leading challenge and no
+    // shutdown fatal. The drain does not reach it, and only the listener
+    // stopping closes it.
+    let ControlMessage::Challenge(_) = next_control(&mut c).await else {
+        panic!("the unregistered client hears the gate's challenge, not a shutdown frame");
+    };
     stream.abort();
     http.abort();
 }
@@ -651,12 +654,18 @@ async fn a_handshake_racing_the_shutdown_is_told_not_registered() {
     assert_eq!(told, 1, "only the session the drain reached was told");
 
     // B's registration lands after the flag, so B is told instead of acked.
+    // Whether the gate led B with a challenge before the flag set is racy, so
+    // the fatal is read past any leading challenge.
     let mut b = b_task.await.expect("the racing session joins");
-    match b.recv().await {
-        Ok(Some(IncomingFrame::Control(ControlMessage::FatalError(FatalError {
-            reason: FatalErrorReason::ServerShuttingDown,
-        })))) => {}
-        other => panic!("the racing session's first frame says {other:?}"),
+    loop {
+        match b.recv().await {
+            // A challenge the gate may have led with before the flag set.
+            Ok(Some(IncomingFrame::Control(ControlMessage::Challenge(_)))) => {}
+            Ok(Some(IncomingFrame::Control(ControlMessage::FatalError(FatalError {
+                reason: FatalErrorReason::ServerShuttingDown,
+            })))) => break,
+            other => panic!("the racing session's frame says {other:?}"),
+        }
     }
     assert_eq!(
         handle.live_connections().await,
@@ -711,6 +720,11 @@ async fn the_session_config_credits_are_what_the_client_counts_on() {
         ))
         .await
         .expect("send the handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    match next_control(&mut client).await {
+        ControlMessage::Challenge(_) => {}
+        other => panic!("the connection led with {other:?}"),
+    }
     match next_control(&mut client).await {
         ControlMessage::HandshakeAck(HandshakeAck {
             initial_credits, ..
@@ -832,6 +846,10 @@ async fn the_throttle_setter_subscriptions_limit_is_met_on_the_wire() {
 /// crossing bans the user, closes its live connection without a word, and a
 /// fresh login for the same identity is refused at the handshake.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks the ban from handshake to refused relogin in order and a split would hide the sequence"
+)]
 async fn the_abuse_setter_bans_the_identity_that_crosses() {
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
@@ -938,8 +956,19 @@ async fn the_abuse_setter_bans_the_identity_that_crosses() {
         ))
         .await
         .expect("send the banned handshake");
+    // The gate still led the connection with a challenge before the refusal.
+    let led = tokio::time::timeout(BOUND, again.recv()).await;
+    assert!(
+        matches!(
+            led,
+            Ok(Ok(Some(IncomingFrame::Control(ControlMessage::Challenge(
+                _
+            )))))
+        ),
+        "a banned identity is led by the challenge, got {led:?}"
+    );
     if let Ok(Ok(Some(frame))) = tokio::time::timeout(BOUND, again.recv()).await {
-        panic!("a banned identity got a frame: {frame:?}");
+        panic!("a banned identity got a frame after the challenge: {frame:?}");
     }
     stream.abort();
     http.abort();
@@ -2066,6 +2095,10 @@ async fn dropping_one_handle_clone_keeps_the_background_loops() {
 /// session with an error the log can name, and a client's close ends the
 /// session cleanly with no fatal frame.
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the test walks each malformed and clean frame in order and a split would hide the sequence"
+)]
 async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
     let _keyring = isolated_session_keyring();
     let _serial = PG_SERIAL.lock().await;
@@ -2104,6 +2137,13 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
             assert!(
                 matches!(
                     raw_control(&mut ws).await,
+                    Some(ControlMessage::Challenge(_))
+                ),
+                "the connection leads with a challenge a person ignores (R91)"
+            );
+            assert!(
+                matches!(
+                    raw_control(&mut ws).await,
                     Some(ControlMessage::HandshakeAck(_))
                 ),
                 "the skipped frame left the handshake free to open"
@@ -2111,10 +2151,24 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
 
             // An empty frame is an error the session ends on, and the log names it.
             let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
+            assert!(
+                matches!(
+                    raw_control(&mut ws).await,
+                    Some(ControlMessage::Challenge(_))
+                ),
+                "the connection leads with a challenge (R91)"
+            );
             frame_ends_the_session_named(&mut ws, vec![], "empty websocket frame").await;
 
             // A frame with a tag the codec does not know is the same, named.
             let (mut ws, _) = connect_async(&url).await.expect("the upgrade answers");
+            assert!(
+                matches!(
+                    raw_control(&mut ws).await,
+                    Some(ControlMessage::Challenge(_))
+                ),
+                "the connection leads with a challenge (R91)"
+            );
             frame_ends_the_session_named(
                 &mut ws,
                 vec![0x99, 1, 2, 3],
@@ -2130,6 +2184,13 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
             )))
             .await
             .expect("send the handshake");
+            assert!(
+                matches!(
+                    raw_control(&mut ws).await,
+                    Some(ControlMessage::Challenge(_))
+                ),
+                "the connection leads with a challenge a person ignores (R91)"
+            );
             assert!(
                 matches!(
                     raw_control(&mut ws).await,
@@ -2164,6 +2225,13 @@ async fn the_sync_adapter_handles_malformed_frames_and_clean_closes() {
             )))
             .await
             .expect("send the handshake");
+            assert!(
+                matches!(
+                    raw_control(&mut ws).await,
+                    Some(ControlMessage::Challenge(_))
+                ),
+                "the connection leads with a challenge (R91)"
+            );
             assert!(
                 matches!(
                     raw_control(&mut ws).await,

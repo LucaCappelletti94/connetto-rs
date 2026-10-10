@@ -222,6 +222,10 @@ async fn connect(
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack for {client_id}");
     };
@@ -371,6 +375,10 @@ async fn an_identified_caller_completes_under_anonymous_saturation() {
         )))
         .await
         .expect("send handshake");
+    // The server leads with a challenge a person ignores (R91), and the fatal follows.
+    let ControlMessage::Challenge(_) = next_control(&mut anon_d).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::FatalError(fatal) = next_control(&mut anon_d).await else {
         panic!("an over-share handshake is closed rather than acknowledged");
     };

@@ -11,6 +11,9 @@ mod apply_behaviour;
 mod apple_keychain;
 
 mod authentication_client;
+
+#[cfg(feature = "bot")]
+mod bot;
 #[cfg(feature = "native-auth")]
 mod builder_harness;
 

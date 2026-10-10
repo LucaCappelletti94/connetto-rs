@@ -317,6 +317,10 @@ async fn declaring_an_epoch_trims_the_log_and_closes_every_connection() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let IncomingFrame::Control(ControlMessage::Challenge(_)) = next_frame(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let IncomingFrame::Control(ControlMessage::HandshakeAck(_)) = next_frame(&mut client).await
     else {
         panic!("expected a handshake ack");
