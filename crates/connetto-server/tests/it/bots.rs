@@ -12,7 +12,7 @@ use connetto_server::bots::{ListEntry, PgBotRegistry, RegistryError, Verb, pg_bo
 use connetto_server::defaults::ConnettoDefaults;
 use connetto_server::schema::ConnettoSchema;
 use connetto_test_harness::Fixture;
-use diesel::QueryableByName;
+use diesel::{ExpressionMethods, QueryDsl};
 use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl as _;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -113,68 +113,88 @@ fn list(orders_read: bool, orders_insert: bool, invoices_optional: bool) -> Vec<
     entries
 }
 
-#[derive(QueryableByName)]
 struct CodeState {
-    #[diesel(sql_type = diesel::sql_types::Bool)]
     used: bool,
-    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>)]
     used_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Whether the code is spent, and when it spent.
 async fn code_state(pool: &Pool<AsyncPgConnection>, hash: [u8; 32]) -> CodeState {
     let mut conn = pool.get().await.expect("a connection");
-    diesel::sql_query(format!(
-        "SELECT used_at IS NOT NULL AS used, used_at FROM connetto_registration_codes \
-         WHERE code_hash = decode('{hex}', 'hex')",
-        hex = hex_of(&hash),
-    ))
-    .get_result::<CodeState>(&mut *conn)
-    .await
-    .expect("read the code")
+    let used_at: Option<chrono::DateTime<chrono::Utc>> =
+        connetto_server::defaults::connetto_registration_codes::table
+            .filter(
+                connetto_server::defaults::connetto_registration_codes::code_hash.eq(hash.to_vec()),
+            )
+            .select(connetto_server::defaults::connetto_registration_codes::used_at)
+            .first(&mut *conn)
+            .await
+            .expect("read the code");
+    CodeState {
+        used: used_at.is_some(),
+        used_at,
+    }
 }
 
-#[derive(QueryableByName)]
 struct BotRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
     owner: String,
-    #[diesel(sql_type = diesel::sql_types::Integer)]
     list_version: i32,
-    #[diesel(sql_type = diesel::sql_types::Bytea)]
     public_key: Vec<u8>,
 }
 
 /// The bot's owner, current list version and key.
 async fn bot_row(pool: &Pool<AsyncPgConnection>, bot: uuid::Uuid) -> BotRow {
     let mut conn = pool.get().await.expect("a connection");
-    diesel::sql_query(format!(
-        "SELECT owner, list_version, public_key FROM connetto_bots WHERE id = '{bot}'"
-    ))
-    .get_result::<BotRow>(&mut *conn)
-    .await
-    .expect("read the bot")
+    let (owner, list_version, public_key): (String, i32, Vec<u8>) =
+        connetto_server::defaults::connetto_bots::table
+            .filter(connetto_server::defaults::connetto_bots::id.eq(bot))
+            .select((
+                connetto_server::defaults::connetto_bots::owner,
+                connetto_server::defaults::connetto_bots::list_version,
+                connetto_server::defaults::connetto_bots::public_key,
+            ))
+            .first(&mut *conn)
+            .await
+            .expect("read the bot");
+    BotRow {
+        owner,
+        list_version,
+        public_key,
+    }
 }
 
-#[derive(QueryableByName, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct ListRow {
-    #[diesel(sql_type = diesel::sql_types::Text)]
     table_name: String,
-    #[diesel(sql_type = diesel::sql_types::Text)]
     verb: String,
-    #[diesel(sql_type = diesel::sql_types::Bool)]
     optional: bool,
 }
 
 /// The stored rows of one list version, by table and verb.
 async fn list_rows(pool: &Pool<AsyncPgConnection>, bot: uuid::Uuid, version: i32) -> Vec<ListRow> {
     let mut conn = pool.get().await.expect("a connection");
-    diesel::sql_query(format!(
-        "SELECT table_name, verb, optional FROM connetto_bot_lists \
-         WHERE bot = '{bot}' AND version = {version} ORDER BY table_name, verb"
-    ))
-    .load(&mut *conn)
-    .await
-    .expect("read the list")
+    let rows: Vec<(String, String, bool)> = connetto_server::defaults::connetto_bot_lists::table
+        .filter(connetto_server::defaults::connetto_bot_lists::bot.eq(bot))
+        .filter(connetto_server::defaults::connetto_bot_lists::version.eq(version))
+        .order_by((
+            connetto_server::defaults::connetto_bot_lists::table_name.asc(),
+            connetto_server::defaults::connetto_bot_lists::verb.asc(),
+        ))
+        .select((
+            connetto_server::defaults::connetto_bot_lists::table_name,
+            connetto_server::defaults::connetto_bot_lists::verb,
+            connetto_server::defaults::connetto_bot_lists::optional,
+        ))
+        .load(&mut *conn)
+        .await
+        .expect("read the list");
+    rows.into_iter()
+        .map(|(table_name, verb, optional)| ListRow {
+            table_name,
+            verb,
+            optional,
+        })
+        .collect()
 }
 
 /// Postgres keeps microseconds, so a time read back is compared at that grain.
@@ -285,17 +305,12 @@ async fn an_unknown_code_is_refused_and_changes_nothing() {
 }
 
 async fn bot_count(pool: &Pool<AsyncPgConnection>) -> i64 {
-    #[derive(QueryableByName)]
-    struct BotCount {
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        count: i64,
-    }
     let mut conn = pool.get().await.expect("a connection");
-    diesel::sql_query("SELECT count(*) FROM connetto_bots")
-        .get_result::<BotCount>(&mut *conn)
+    connetto_server::defaults::connetto_bots::table
+        .count()
+        .first(&mut *conn)
         .await
         .expect("count the bots")
-        .count
 }
 
 #[tokio::test]
@@ -328,6 +343,74 @@ async fn a_used_code_is_refused_and_changes_nothing() {
         micros(spent.used_at.expect("the first spend").into()),
         micros(first),
         "the refusal did not re-spend it"
+    );
+}
+
+/// Two concurrent registrations for one code settle exactly one, because the
+/// code row is locked while it is read, so a transaction that reaches it
+/// after the winner commits sees the spend and is refused.
+#[tokio::test]
+async fn two_concurrent_registrations_spend_one_code_once() {
+    let fixture = Fixture::acquire().await;
+    let (pool, store) = registry(&fixture).await;
+    let hash = [9; 32];
+    code(&pool, hash, "alice", None, true).await;
+    let now = SystemTime::now();
+    let entries = list(true, true, true);
+
+    // Both tasks hold a pool connection across the barrier, so both reach the
+    // code row while the other's transaction is open.
+    let store = std::sync::Arc::new(store);
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+    let first = {
+        let store = store.clone();
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        let entries = entries.clone();
+        tokio::spawn(async move {
+            let _held = pool.get().await.expect("a connection for the first task");
+            barrier.wait().await;
+            store
+                .register(hash, key(1), "orders bot".to_owned(), &entries, now)
+                .await
+        })
+    };
+    let second = {
+        let store = store.clone();
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        tokio::spawn(async move {
+            let _held = pool.get().await.expect("a connection for the second task");
+            barrier.wait().await;
+            store
+                .register(hash, key(2), "orders bot".to_owned(), &entries, now)
+                .await
+        })
+    };
+    let outcomes = [
+        first.await.expect("the first registration task"),
+        second.await.expect("the second registration task"),
+    ];
+    let registered = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+    assert_eq!(registered, 1, "exactly one registration settles");
+    assert!(
+        outcomes
+            .iter()
+            .any(|outcome| matches!(outcome, Err(RegistryError::Refused))),
+        "the loser is the undisclosing refusal"
+    );
+    let winner = outcomes
+        .iter()
+        .find_map(|outcome| outcome.as_ref().ok())
+        .expect("one registration settles");
+    assert_eq!(winner.version, 1, "a first registration is version 1");
+    assert_eq!(bot_count(&pool).await, 1, "one bot was minted");
+    let spent = code_state(&pool, hash).await;
+    assert!(spent.used, "the code spent once");
+    assert_eq!(
+        micros(spent.used_at.expect("the spend").into()),
+        micros(now),
+        "spent at the registration's instant"
     );
 }
 
@@ -414,17 +497,13 @@ async fn a_changed_list_registers_version_two_and_leaves_version_one() {
         }]
     );
     let accepted: i32 = {
-        #[derive(QueryableByName)]
-        struct Accepted {
-            #[diesel(sql_type = diesel::sql_types::Integer)]
-            accepted_version: i32,
-        }
         let mut conn = pool.get().await.expect("a connection");
-        diesel::sql_query("SELECT accepted_version FROM connetto_installations WHERE id = 'inst-1'")
-            .get_result::<Accepted>(&mut *conn)
+        connetto_server::defaults::connetto_installations::table
+            .filter(connetto_server::defaults::connetto_installations::id.eq("inst-1"))
+            .select(connetto_server::defaults::connetto_installations::accepted_version)
+            .first(&mut *conn)
             .await
             .expect("read the acceptance")
-            .accepted_version
     };
     assert_eq!(accepted, 1, "the installation still accepts version one");
 }
