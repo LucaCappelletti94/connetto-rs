@@ -2244,7 +2244,7 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#844a1894ff38b45e940c61e72e75c944a6f50174"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#649d793542eb2a411f542f823d9e5d7b2b927dc2"
 dependencies = [
  "rls2fga-types",
  "serde",
@@ -2257,7 +2257,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#844a1894ff38b45e940c61e72e75c944a6f50174"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#649d793542eb2a411f542f823d9e5d7b2b927dc2"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -2826,7 +2826,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#13b49a7ac26804b76f9b5fb3c8a91e187a83fee1"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#be48efe0b5ceef665314912f48b593195654b9d9"
 dependencies = [
  "arc-swap",
  "async-lock",
