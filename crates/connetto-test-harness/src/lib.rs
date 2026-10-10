@@ -690,6 +690,20 @@ pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WATERMARK_DDL).await;
 }
 
+/// The bot registry tables' DDL over the default schema's `TEXT` ids (R91),
+/// which every server requires, so the fixture creates them with the
+/// watermark and epoch tables.
+pub const BOTS_DDL: &str = connetto_server::defaults::BOTS_DDL;
+
+/// Create the bot registry tables, as admin.
+pub async fn provision_bot_tables(pool: &Pool<AsyncPgConnection>) {
+    for statement in BOTS_DDL.split(';') {
+        if !statement.trim().is_empty() {
+            exec(pool, statement).await;
+        }
+    }
+}
+
 /// A name no two calls in one process share.
 ///
 /// The clock alone is not enough: two fixtures provisioned inside one
@@ -951,6 +965,7 @@ impl Fixture {
     ) -> Self {
         let admin = pool_when_ready(&admin_url).await;
         provision_watermark(&admin).await;
+        provision_bot_tables(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
         Self {
             admin_url,

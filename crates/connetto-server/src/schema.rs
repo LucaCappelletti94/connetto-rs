@@ -77,7 +77,8 @@
 //!
 //! ```
 //! use connetto_server::defaults::{
-//!     ConnettoAudit, ConnettoAuthSchema, ConnettoBans, ConnettoEnrolments, ConnettoWatermark,
+//!     ConnettoAudit, ConnettoAuthSchema, ConnettoBans, ConnettoBots, ConnettoEnrolments,
+//!     ConnettoWatermark,
 //! };
 //!
 //! struct Complete;
@@ -89,6 +90,7 @@
 //!     type Audit = ConnettoAudit;
 //!     type Bans = ConnettoBans;
 //!     type Enrolments = ConnettoEnrolments;
+//!     type Bots = ConnettoBots;
 //! #   #[cfg(feature = "content")]
 //! #   type Files = connetto_file_server::DefaultFileSchema;
 //! }
@@ -97,6 +99,7 @@
 use crate::audit::ConnettoAuditSchema;
 use crate::authn::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
+use crate::bots::ConnettoBotSchema;
 use crate::device_cert::ConnettoEnrolmentSchema;
 use crate::watermark_schema::ConnettoWatermarkSchema;
 
@@ -122,6 +125,9 @@ pub trait ConnettoSchema: Send + Sync + 'static {
     /// The device enrolments, their certificates and the revocation-list
     /// numbers (R74).
     type Enrolments: ConnettoEnrolmentSchema<Id = Self::Id>;
+    /// The bot registry: the registration codes, the bots, their list
+    /// versions and the installations (R91).
+    type Bots: ConnettoBotSchema<Id = Self::Id>;
     /// The file server's manifests and chunk registry.
     #[cfg(feature = "content")]
     type Files: connetto_file_server::ConnettoFileSchema;
@@ -134,8 +140,8 @@ pub trait ConnettoSchema: Send + Sync + 'static {
 ///
 /// Invoked at module scope with `diesel` and `diesel_async` in scope. The
 /// member structs it emits are `ConnettoAuthSchema`, `ConnettoWatermark`,
-/// `ConnettoAudit`, `ConnettoBans` and `ConnettoEnrolments`, and the file
-/// member is the file server's `_cfs_` tables. The descriptor is the
+/// `ConnettoAudit`, `ConnettoBans`, `ConnettoEnrolments` and `ConnettoBots`,
+/// and the file member is the file server's `_cfs_` tables. The descriptor is the
 /// application's own type, destructured field by field, so a field list that
 /// disagrees with it does not compile, and without one it is `()`.
 #[macro_export]
@@ -151,6 +157,7 @@ macro_rules! connetto_schema {
         $crate::connetto_audit_table!($id, $id_sql, $pk, $pk_sql);
         $crate::connetto_ban_table!($id, $id_sql);
         $crate::connetto_enrolment_tables!($id, $id_sql; $($($desc)::+ { $($field : $field_sql),* })?);
+        $crate::connetto_bots_tables!($id, $id_sql);
 
         /// The deployment's tables, every member named.
         #[derive(Debug, Clone, Copy, Default)]
@@ -163,6 +170,7 @@ macro_rules! connetto_schema {
             type Audit = ConnettoAudit;
             type Bans = ConnettoBans;
             type Enrolments = ConnettoEnrolments;
+            type Bots = ConnettoBots;
             $crate::__connetto_schema_files!();
         }
     };

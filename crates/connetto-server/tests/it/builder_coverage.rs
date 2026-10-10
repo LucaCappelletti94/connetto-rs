@@ -1746,6 +1746,26 @@ async fn a_missing_schema_table_refuses_naming_it() {
         "{devices}"
     );
 
+    for stmt in [
+        "DROP TABLE connetto_installation_optional_tables",
+        "DROP TABLE connetto_installations",
+        "DROP TABLE connetto_bot_lists",
+        "DROP TABLE connetto_registration_codes",
+        "DROP TABLE connetto_bots",
+    ] {
+        exec(&pool, stmt).await;
+    }
+    let bots = missing(&fixture, |builder| builder).await;
+    assert!(
+        bots.starts_with("table connetto_bots does not exist"),
+        "{bots}"
+    );
+    for statement in connetto_server::defaults::BOTS_DDL.split(';') {
+        if !statement.trim().is_empty() {
+            exec(&pool, statement).await;
+        }
+    }
+
     exec(&pool, "DROP TABLE _connetto_mutations").await;
     let watermark = missing(&fixture, |builder| builder).await;
     assert!(

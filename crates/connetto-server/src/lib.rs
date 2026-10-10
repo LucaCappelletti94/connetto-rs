@@ -43,6 +43,7 @@ pub mod audit;
 pub mod auth;
 pub mod authn;
 pub mod ban;
+pub mod bots;
 pub mod builder;
 pub mod capability;
 pub mod counters;

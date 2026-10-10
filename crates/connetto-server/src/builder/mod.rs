@@ -27,6 +27,7 @@ use tower_http::cors::{AllowCredentials, AllowHeaders, AllowMethods, AllowOrigin
 use crate::audit::{ConnettoAuditSchema, pg_audit_hook};
 use crate::authn::schema::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
+use crate::bots::ConnettoBotSchema;
 use crate::defaults::ConnettoDefaults;
 use crate::device_cert::{
     ConnettoEnrolmentSchema, DeviceCertConfig, DeviceEnrolment, StatusList, pg_enrolment_store,
@@ -1207,22 +1208,24 @@ where
     }
 }
 
-/// Refuse a deployment missing a table its schema's members name, the auth
-/// and watermark tables always and the ban, audit and enrolment tables when
-/// turned on. The file member is the file server's preflight to check. Only
-/// names are checked, never columns.
+/// Refuse a deployment missing a table its schema's members name, the auth,
+/// watermark and bot registry tables always, since every connection can
+/// register a bot, and the ban, audit and enrolment tables when turned on.
+/// The file member is the file server's preflight to check. Only names are
+/// checked, never columns.
 async fn require_schema_tables<D: ConnettoSchema>(
     pool: &PgPool,
     audit: bool,
     bans: bool,
     devices: bool,
 ) -> Result<(), BuildError> {
-    let members: [(&[&str], bool); 5] = [
+    let members: [(&[&str], bool); 6] = [
         (<D::Auth as ConnettoStoreSchema>::TABLES, true),
         (<D::Watermark as ConnettoWatermarkSchema>::TABLES, true),
         (<D::Bans as ConnettoBanSchema>::TABLES, bans),
         (<D::Audit as ConnettoAuditSchema>::TABLES, audit),
         (<D::Enrolments as ConnettoEnrolmentSchema>::TABLES, devices),
+        (<D::Bots as ConnettoBotSchema>::TABLES, true),
     ];
     let required: Vec<Artifact<'_>> = members
         .into_iter()
