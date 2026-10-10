@@ -1467,6 +1467,7 @@ dependencies = [
  "connetto-core",
  "connetto-file-core",
  "connetto-file-server",
+ "connetto-schema",
  "connetto-server",
  "diesel",
  "diesel-async",

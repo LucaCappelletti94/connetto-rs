@@ -704,6 +704,27 @@ pub async fn provision_bot_tables(pool: &Pool<AsyncPgConnection>) {
     }
 }
 
+/// Apply the cap document the build generates beside the schema and policies,
+/// as a deployment migration would, so the fixture is held to the bot cap the
+/// way a real deployment is. A fixture whose tables the server boots against
+/// must carry it or the startup check refuses the boot.
+///
+/// # Panics
+///
+/// When the two documents do not generate a cap document, or the cap does not
+/// apply.
+pub async fn provision_cap_policies(
+    pool: &Pool<AsyncPgConnection>,
+    schema_sql: &str,
+    policies_sql: &str,
+) {
+    let cap = connetto_schema::cap_policies(schema_sql, policies_sql)
+        .unwrap_or_else(|err| panic!("the cap document generates: {err}"));
+    if !cap.is_empty() {
+        exec(pool, &cap).await;
+    }
+}
+
 /// A name no two calls in one process share.
 ///
 /// The clock alone is not enough: two fixtures provisioned inside one

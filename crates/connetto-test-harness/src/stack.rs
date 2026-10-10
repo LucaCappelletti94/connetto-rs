@@ -14,7 +14,7 @@ use tokio::process::{Child, Command};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
 
-use crate::{Fixture, PUBLICATION, SLOT, with_user};
+use crate::{Fixture, PUBLICATION, SLOT, provision_cap_policies, with_user};
 
 /// The file server's own tables, which every deployment serving content needs.
 const DEPLOYMENT_SQL: &str = include_str!("../../connetto-file-server/sql/schema.sql");
@@ -118,6 +118,8 @@ pub async fn provision(
     fixture.setup(&[deployment.roles]).await;
     fixture.setup(&[deployment.content]).await;
     fixture.setup(&[deployment.policies]).await;
+    // The server's startup check requires the cap on every synced table.
+    provision_cap_policies(fixture.admin(), deployment.schema, deployment.policies).await;
     fixture.start_replication(deployment.published).await;
     let fga_url = fixture.fga_url().await.to_owned();
     let (_, fga_store) = fixture.fga_store().await;

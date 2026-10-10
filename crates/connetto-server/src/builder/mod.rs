@@ -1035,6 +1035,7 @@ where
 
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
         require_schema_tables::<D>(&pool, audit, bans, device_identity.is_some()).await?;
+        require_cap_policies(&pool, &schema.pg_ddl).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
@@ -1231,6 +1232,24 @@ async fn require_schema_tables<D: ConnettoSchema>(
         .into_iter()
         .filter(|(_, used)| *used)
         .flat_map(|(tables, _)| tables.iter().copied().map(Artifact::Table))
+        .collect();
+    preflight::require(pool, &required).await?;
+    Ok(())
+}
+
+/// Refuse a deployment whose synced tables are not held to the bot cap.
+///
+/// Walks the same table list the generator walks, [`connetto_schema::schema_tables`]
+/// over the schema document, and asks Postgres for each whether it carries
+/// row-level security and the four `AS RESTRICTIVE` cap policies. Those are
+/// applied by the deployment from the generated cap document, and connetto
+/// creates no server objects of its own, so a table not capped is a
+/// deployment omission rather than something connetto can fix.
+async fn require_cap_policies(pool: &PgPool, pg_ddl: &str) -> Result<(), BuildError> {
+    let tables = connetto_schema::schema_tables(pg_ddl)?;
+    let required: Vec<Artifact<'_>> = tables
+        .iter()
+        .map(|t| Artifact::CappedTable(t.as_str()))
         .collect();
     preflight::require(pool, &required).await?;
     Ok(())
@@ -1863,7 +1882,11 @@ mod tests {
 
     /// A caller carrying only an identity, which is what these mints exercise.
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
-        connetto_core::auth::ContentCaller::new(Some(user_id.to_owned()), None)
+        connetto_core::auth::ContentCaller::new(
+            Some(user_id.to_owned()),
+            None,
+            connetto_core::BOT_LIST_WILDCARD.to_owned(),
+        )
     }
 
     #[tokio::test]

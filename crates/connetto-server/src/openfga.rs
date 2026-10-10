@@ -126,6 +126,12 @@ pub struct SubjectNaming {
     /// [`None`] when the model carries no grant a caller's own values complete,
     /// in which case there is nothing for a watcher to answer.
     subjects_parameter: Option<String>,
+    /// The condition parameter connetto's bot-list setting became, read the
+    /// same way the subjects parameter is.
+    ///
+    /// Present whenever the cap is translated in, which is always, so the
+    /// watcher answers it for every question it takes.
+    bot_list_parameter: Option<String>,
     /// For each relation the translation reported as gated on the caller's own
     /// keys, the context key its records carry the granted key under.
     ///
@@ -161,6 +167,13 @@ impl SubjectNaming {
             .iter()
             .find(|required| required.setting_key.as_deref() == Some(Key::SETTING))
             .map(|required| required.parameter.clone());
+        let bot_list_parameter = shapes
+            .required_parameters()
+            .iter()
+            .find(|required| {
+                required.setting_key.as_deref() == Some(connetto_core::BOT_LIST_SETTING)
+            })
+            .map(|required| required.parameter.clone());
         let mut gated_keys = BTreeMap::new();
         if let Some(parameter) = subjects_parameter.as_deref() {
             for entry in relations {
@@ -172,6 +185,7 @@ impl SubjectNaming {
         Self {
             user_type: Self::USER_TYPE.to_owned(),
             subjects_parameter,
+            bot_list_parameter,
             gated_keys,
         }
     }
@@ -318,15 +332,22 @@ where
     }
 
     fn request_value(&self, parameter: &str, out: &mut RequestValues) -> bool {
-        if self.naming.subjects_parameter.as_deref() != Some(parameter) {
-            return false;
+        if self.naming.subjects_parameter.as_deref() == Some(parameter) {
+            // Holding none is an answer. A caller holding no key is granted by no key.
+            for held in self.principal.capabilities() {
+                out.push(&held.key().to_string());
+            }
+            return true;
         }
-        // Holding none is an answer, not a refusal to answer: a caller holding
-        // no key is granted by no key.
-        for held in self.principal.capabilities() {
-            out.push(&held.key().to_string());
+        // The cap's list parameter is one value the caller's connections
+        // carry, read through the same function Postgres binds it with, so
+        // the local gate and the row-level rules hold the caller to one list.
+        if self.naming.bot_list_parameter.as_deref() == Some(parameter) {
+            out.push(crate::capability::bot_list_for(&self.principal));
+            true
+        } else {
+            false
         }
-        true
     }
 }
 
@@ -552,14 +573,15 @@ impl Translated {
     /// schema alone is what clients sync, so the split is by purpose rather
     /// than by content.
     ///
-    /// **Declaring the two settings is what makes the local path fire.** A
+    /// **Declaring the three settings is what makes the local path fire.** A
     /// connetto policy compares a column against `current_setting`, and a
     /// translator told nothing about those keys refuses the whole arm: the
     /// model then grants the owner alone and every share holder is denied
     /// locally, silently, with the shared rows simply not arriving. `Key` names
-    /// the share-key setting and `user_setting` names the identity one, which
-    /// are the same two values [`CallerBinding`](crate::capability) binds for
-    /// Postgres, so the two executors are told one thing.
+    /// the share-key setting, `user_setting` names the identity one and the
+    /// bot-list setting is connetto's own, all the values
+    /// [`CallerBinding`](crate::capability) binds for Postgres, so the two
+    /// executors are told one thing.
     ///
     /// # Errors
     ///
@@ -570,10 +592,24 @@ impl Translated {
         policy_sql: &str,
         user_setting: &str,
     ) -> Result<Self, SetupError> {
-        let mut sql = String::with_capacity(schema_sql.len() + policy_sql.len() + 1);
+        // The cap travels with the policies it caps. The model must hold a
+        // bot to its list exactly as Postgres does, so it is translated as
+        // one more document the two share.
+        let cap = connetto_schema::cap_policies(schema_sql, policy_sql)
+            .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        let mut sql = String::with_capacity(schema_sql.len() + policy_sql.len() + cap.len() + 1);
         sql.push_str(schema_sql);
         sql.push('\n');
         sql.push_str(policy_sql);
+        if !cap.is_empty() {
+            // The cap is its own document of `;`-separated statements, so the
+            // document before it must end in a terminator before it begins.
+            if !sql.trim_end().ends_with(';') {
+                sql.push(';');
+            }
+            sql.push('\n');
+            sql.push_str(&cap);
+        }
         let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
         let translator = rls2fga::translator::TranslatorBuilder::new()
@@ -581,6 +617,10 @@ impl Translated {
             .with_session_attributes([
                 SessionAttribute::setting(user_setting, SessionAttributeKind::CallerId),
                 SessionAttribute::setting(Key::SETTING, SessionAttributeKind::SetAttribute),
+                SessionAttribute::setting(
+                    connetto_core::BOT_LIST_SETTING,
+                    SessionAttributeKind::SetAttribute,
+                ),
             ])
             .build();
 
@@ -1870,34 +1910,44 @@ mod tests {
         }
     }
 
-    /// The naming and the records one share row implies, produced through the
-    /// translation rather than written out here.
+    /// The naming and the share grant one share row implies, produced through
+    /// the translation rather than written out here.
     ///
-    /// Which context key carries the viewer is the translation's to decide, so
-    /// reading it back from a rendered record is the only way this asserts
-    /// about the tuples a deployment really writes.
+    /// A share row renders several tuples at once: the per-row link to the
+    /// table's request gate, the public flag, the paper's link to the share
+    /// object, and the grant itself. Only the grant carries the grantee, and
+    /// only under the relation the translation reported as gated on the
+    /// caller's keys, so selecting it by that report rather than by position
+    /// or name is what keeps this asserting about the tuples a deployment
+    /// really writes.
     fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
         let translated = Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING)
             .expect("the share shape settles from one row");
-        let description = translated
-            .tuples
-            .iter()
-            .filter_map(|query| query.description.as_ref())
-            .find(|description| {
-                description
-                    .row_table()
-                    .is_some_and(|table| table.name() == "paper_shares")
-            })
-            .expect("the share grant is described per row of the join table");
-        let records = records_from_row(
-            description,
-            &ShareRow {
-                paper_id: "1",
-                viewer,
-            },
-        )
-        .expect("a share row renders its own records");
-        (translated.naming(), records)
+        let naming = translated.naming();
+        let row = ShareRow {
+            paper_id: "1",
+            viewer,
+        };
+        let mut records = Vec::new();
+        for query in &translated.tuples {
+            let Some(description) = query.description.as_ref() else {
+                continue;
+            };
+            let Some(table) = description.row_table() else {
+                continue;
+            };
+            if table.name() != "paper_shares" {
+                continue;
+            }
+            for record in
+                records_from_row(description, &row).expect("a share row renders its own records")
+            {
+                if naming.gated_keys.contains_key(record.relation.as_str()) {
+                    records.push(record);
+                }
+            }
+        }
+        (naming, records)
     }
 
     /// **The narrowing's first half.** A share row names the one subject it

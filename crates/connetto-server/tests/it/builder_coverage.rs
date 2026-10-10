@@ -29,7 +29,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
-    OPLOG_TABLE, PUBLICATION, SLOT, drop_slot, isolated_session_keyring,
+    OPLOG_TABLE, PUBLICATION, SLOT, drop_slot, isolated_session_keyring, provision_cap_policies,
 };
 use diesel::{ExpressionMethods, QueryDsl, QueryableByName};
 use diesel_async::pooled_connection::bb8::Pool;
@@ -186,6 +186,7 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
         "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
     )
     .await;
+    provision_cap_policies(pool, OWNED_PG_DDL, OWNED_POLICIES).await;
 }
 
 /// Open an anonymous session on the sync route and wait for the ack.
@@ -540,6 +541,36 @@ async fn a_late_session_holds_the_shutdown_to_the_grace() {
     http.abort();
 }
 
+/// The `big` table joins the synced catalog with the cap's policies, which
+/// make it a policy table the change stream carries.
+async fn provision_big(pool: &Pool<AsyncPgConnection>) {
+    exec(pool, "CREATE TABLE big (id INT PRIMARY KEY, body TEXT)").await;
+    provision_cap_policies(
+        pool,
+        "CREATE TABLE big (id INT PRIMARY KEY, body TEXT);",
+        NO_POLICIES,
+    )
+    .await;
+    exec(pool, "GRANT SELECT ON big TO app_reader").await;
+    exec(pool, "ALTER TABLE big REPLICA IDENTITY FULL").await;
+    exec(
+        pool,
+        &format!("ALTER PUBLICATION {PUBLICATION} ADD TABLE big"),
+    )
+    .await;
+}
+
+/// Fill `big` with a multi-megabyte body column so a snapshot of it pages.
+async fn seed_big(pool: &Pool<AsyncPgConnection>) {
+    exec(
+        pool,
+        "INSERT INTO big SELECT g, repeat(chr(97 + (g % 26)), 500) \
+         FROM generate_series(1, 30000) g",
+    )
+    .await;
+    exec(pool, "ANALYZE big").await;
+}
+
 /// A handshake whose registration lands after the shutdown flag is set is told
 /// the shutdown instead of acked: the racing session gets the fatal as its
 /// first frame, and the registry is empty when the grace ends.
@@ -572,6 +603,8 @@ async fn a_handshake_racing_the_shutdown_is_told_not_registered() {
     .reader_reserve(ReaderReserve::new().with_total(2).with_reserved(1));
     let base = format!("http://127.0.0.1:{port}");
 
+    provision_big(&pool).await;
+
     let parts = builder.build().await.expect("the deployment assembles");
     let handle = parts.handle.clone();
     let stream = tokio::spawn(parts.change_stream);
@@ -580,15 +613,7 @@ async fn a_handshake_racing_the_shutdown_is_told_not_registered() {
 
     // One anonymous reader permit: a multi-page snapshot holds it until the
     // client acks the pages, and that is what B's handshake waits on.
-    exec(&pool, "CREATE TABLE big (id INT PRIMARY KEY, body TEXT)").await;
-    exec(
-        &pool,
-        "INSERT INTO big SELECT g, repeat(chr(97 + (g % 26)), 500) \
-         FROM generate_series(1, 30000) g",
-    )
-    .await;
-    exec(&pool, "ANALYZE big").await;
-    exec(&pool, "GRANT SELECT ON big TO app_reader").await;
+    seed_big(&pool).await;
 
     let mut a = anonymous_session(&format!("127.0.0.1:{port}"), "race-a").await;
     a.send_control(ControlMessage::Subscribe(Subscribe {

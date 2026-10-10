@@ -39,6 +39,26 @@ pub const CALLER_FUNCTION: &str = "current_app_user";
 /// A caller holding no key answers NULL, and the translated search is NULL
 /// with it, so that arm admits nothing rather than everything.
 pub const SUBJECTS_FUNCTION: &str = "current_app_subjects";
+/// The session setting connetto binds on every caller's connection with the
+/// bot's effective list, its `table:verb` entries joined by
+/// [`BOT_LIST_SEPARATOR`], which the generated cap policy of every synced
+/// table compares.
+pub const BOT_LIST_SETTING: &str = "app.bot_list";
+
+/// The replica's local name for `current_setting('app.bot_list')`, which the
+/// generated cap policy of every synced table searches.
+///
+/// A connection carrying no list answers `NULL`-like nothing to the search,
+/// so it fails closed and sees or writes nothing, which is why every
+/// person's connection carries [`BOT_LIST_WILDCARD`] instead.
+pub const BOT_LIST_FUNCTION: &str = "current_bot_list";
+
+/// The separator a bot list packs its `table:verb` entries with.
+pub const BOT_LIST_SEPARATOR: char = ',';
+
+/// The list entry every person's connection carries, which every generated
+/// cap policy admits, so a person is held to its own rules alone.
+pub const BOT_LIST_WILDCARD: &str = "*";
 
 /// The name the translated DDL calls for a client-authored UUID primary key,
 /// which the application registers on every replica connection it opens.

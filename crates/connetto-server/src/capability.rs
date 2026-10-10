@@ -58,8 +58,9 @@ diesel::define_sql_function! {
     fn set_config(name: Text, value: Text, is_local: Bool) -> Text;
 }
 
-/// Render the two halves of `caller`: the identity, and the share keys packed
-/// by the deployment's [`CapabilityKey`].
+/// Render the caller for a transaction or a ticket: the identity, the share
+/// keys packed by the deployment's [`CapabilityKey`], and the bot list the
+/// caller's connection binds.
 ///
 /// The one renderer of a caller's values. A half the caller does not hold
 /// stays absent, never `""`, so an owner comparison is NULL and hides the row
@@ -72,7 +73,21 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
             .identity()
             .map(|identity| identity.user_id.to_string()),
         Key::subjects(caller.capabilities()),
+        bot_list_for(caller).to_owned(),
     )
+}
+
+/// The bot list one caller's connections carry in `app.bot_list`, the value
+/// every path that runs SQL as a caller and the watcher's request answer
+/// both bind, so Postgres and the local gate hold the caller to one list.
+///
+/// `*` for every caller until a bot login hands a registered bot its
+/// accepted list, which this is the one place to read from the caller
+/// once it carries one.
+pub(crate) fn bot_list_for<Id: Display, Key: CapabilityKey>(
+    _caller: &Principal<Id, Key>,
+) -> &'static str {
+    connetto_core::BOT_LIST_WILDCARD
 }
 
 /// The bucket a per-caller meter charges: whatever names this caller, else
@@ -107,6 +122,7 @@ pub(crate) struct CallerBinding {
     user_setting: Arc<str>,
     setting: &'static str,
     separator: char,
+    bot_list: &'static str,
 }
 
 impl CallerBinding {
@@ -121,15 +137,17 @@ impl CallerBinding {
             user_setting,
             setting: Key::SETTING,
             separator: Key::SEPARATOR,
+            bot_list: bot_list_for(caller),
         }
     }
 
-    /// Bind both values for the rest of the transaction, in one statement.
+    /// Bind all three values for the rest of the transaction, in one statement.
     ///
-    /// Both settings are always bound, a half the caller does not hold taking
-    /// [`absent_marker`]. Leaving one unbound would read as `''` rather than
-    /// NULL to the next caller on a pooled connection, which is the blank
-    /// identity chapter 08 forbids.
+    /// All the settings are always bound, a half the caller does not hold
+    /// taking [`absent_marker`], and the bot list the one value
+    /// [`bot_list_for`] reads for the caller. Leaving one unbound would read
+    /// as `''` rather than NULL to the next caller on a pooled connection,
+    /// which is the blank identity chapter 08 forbids.
     pub(crate) async fn apply(self, conn: &mut AsyncPgConnection) -> diesel::QueryResult<()> {
         let user_setting = self.user_setting.to_string();
         let subjects = self
@@ -143,6 +161,7 @@ impl CallerBinding {
         diesel::select((
             set_config(user_setting, user, true),
             set_config(self.setting, subjects, true),
+            set_config(connetto_core::BOT_LIST_SETTING, self.bot_list, true),
         ))
         .execute(conn)
         .await
@@ -170,6 +189,7 @@ impl CallerBinding {
                 self.caller.identity().unwrap_or(marker),
             ),
             (self.setting, subjects.as_str()),
+            (connetto_core::BOT_LIST_SETTING, self.bot_list),
         ]
         .into_iter()
         .map(|(setting, value)| {
@@ -587,9 +607,13 @@ mod tests {
     fn nothing_held_leaves_the_setting_unbound() {
         assert_eq!(String::subjects(&[]), Vec::<String>::new());
         assert!(
-            ContentCaller::new(None, String::subjects(&[]))
-                .packed_subjects(',')
-                .is_none()
+            ContentCaller::new(
+                None,
+                String::subjects(&[]),
+                connetto_core::BOT_LIST_WILDCARD.to_owned()
+            )
+            .packed_subjects(',')
+            .is_none()
         );
     }
 
@@ -600,7 +624,11 @@ mod tests {
             CapabilitySubject::new("key:a"),
             CapabilitySubject::new("key:a"),
         ];
-        let caller = ContentCaller::new(None, String::subjects(&keys));
+        let caller = ContentCaller::new(
+            None,
+            String::subjects(&keys),
+            connetto_core::BOT_LIST_WILDCARD.to_owned(),
+        );
         assert_eq!(
             caller.packed_subjects(',').as_deref(),
             Some("key:a,key:b"),

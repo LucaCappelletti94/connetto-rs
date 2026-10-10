@@ -1500,6 +1500,18 @@ fn register_subjects(
     .map_err(|e| ClientError::Session(format!("registering the subjects function: {e}")))
 }
 
+/// Register the no-argument function a translated cap policy calls for the
+/// caller's bot list, so the replica holds a caller to the same list
+/// Postgres holds it to.
+fn register_bot_list(db: &mut SqliteConnection, list: String) -> Result<(), ClientError> {
+    db.register_noarg_sql_function::<diesel::sql_types::Text, _, _>(
+        connetto_core::BOT_LIST_FUNCTION,
+        SqliteFunctionBehavior::DETERMINISTIC | SqliteFunctionBehavior::INNOCUOUS,
+        move || list.clone(),
+    )
+    .map_err(|e| ClientError::Session(format!("registering the bot list function: {e}")))
+}
+
 /// The SQLite function a translated schema's write guards call to let
 /// connetto's own writes land underneath the policy triggers.
 ///
@@ -2581,6 +2593,8 @@ where
         // schema that never names it pays nothing.
         let write_exempt = Arc::new(AtomicBool::new(false));
         register_write_exemption(&mut db, &write_exempt)?;
+        // A person carries the wildcard, and a bot login reads its list here (R99).
+        register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
         if let Some(ddl) = sqlite_ddl {
             db.batch_execute(ddl)?;
         }

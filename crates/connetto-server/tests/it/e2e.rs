@@ -37,7 +37,9 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use tempfile::TempDir;
 
 use connetto_client::{ReplicaKey, cipher};
-use connetto_test_harness::{Fixture, MOCK_OAUTH_PROVIDER, MockOauth, PUBLICATION, SLOT};
+use connetto_test_harness::{
+    Fixture, MOCK_OAUTH_PROVIDER, MockOauth, PUBLICATION, SLOT, provision_cap_policies,
+};
 use keyring_core::Entry;
 use openidconnect::reqwest;
 use serde_json::json;
@@ -87,7 +89,13 @@ fn server_bin() -> PathBuf {
 }
 
 /// The client binary is a sibling of the server binary in the same target
-/// profile directory. It is built by a separate crate, so it must already exist.
+/// profile directory. It is built by a separate crate, so it must already
+/// exist here. CI builds it before this suite (the `server` shard compiles
+/// both `connetto-server` and `connetto-client`), so the staleness is a
+/// local-only trap, and a change to `connetto-client` is not picked up by a bare
+/// `cargo test -p connetto-server --test it`. Rebuild it with
+/// `cargo build -p connetto-client --features="native-transport native-auth"`
+/// before re-running these tests after a client change.
 pub(super) fn client_bin() -> PathBuf {
     server_bin()
         .parent()
@@ -236,6 +244,16 @@ fn count_orders(db_path: &Path) -> i64 {
     if cipher::unlock(&mut conn, &key).is_err() {
         return 0;
     }
+    // A person's replica holds the wildcard. The harness opens its own
+    // connection, which the client never set up, so register the function
+    // here or the translated view (which calls it per row) hides every row.
+    conn.register_noarg_sql_function::<diesel::sql_types::Text, _, _>(
+        connetto_core::BOT_LIST_FUNCTION,
+        diesel::sqlite::SqliteFunctionBehavior::DETERMINISTIC
+            | diesel::sqlite::SqliteFunctionBehavior::INNOCUOUS,
+        || connetto_core::BOT_LIST_WILDCARD.to_owned(),
+    )
+    .ok();
     diesel::RunQueryDsl::get_result::<i64>(
         diesel::QueryDsl::select(orders::table, diesel::dsl::count_star()),
         &mut conn,
@@ -604,6 +622,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     )
     .await;
     exec(pool, PG_DDL).await;
+    provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
     exec(
         pool,
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
@@ -1051,6 +1070,7 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     ] {
         exec(&admin, stmt).await;
     }
+    provision_cap_policies(&admin, OWNED_PG_DDL, OWNED_POLICIES).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;
 

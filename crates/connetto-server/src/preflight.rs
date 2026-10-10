@@ -62,6 +62,16 @@ pub enum Artifact<'a> {
         /// The publication whose tables must all record their previous image.
         publication: &'a str,
     },
+    /// A synced table, by name, resolved through the connection's own
+    /// `search_path`, that must have row-level security on and the four
+    /// `AS RESTRICTIVE` cap policies the deployment applied from the
+    /// generated cap document.
+    ///
+    /// A restrictive policy bites only on a table with row-level security,
+    /// and a table with it on and no permissive policy admits nobody, so
+    /// the two halves travel together and a table missing either is not
+    /// held to a bot list at all.
+    CappedTable(&'a str),
     /// A column a table must carry, by table and column name.
     ///
     /// The table existing says nothing about its shape, and connetto reads
@@ -84,6 +94,9 @@ enum Found {
     Absent,
     /// There and unfit, naming what has to be fixed.
     Unfit(Vec<String>),
+    /// There, but row-level security or one of the four cap policies is
+    /// missing, naming each piece that is.
+    Uncapped(Vec<String>),
     /// The table is there but lacks a column connetto reads from it, naming
     /// both.
     MissingColumn { table: String, column: String },
@@ -97,6 +110,7 @@ impl Artifact<'_> {
             Self::Publication(_) | Self::PreviousImages { .. } => "publication",
             Self::Table(_) => "table",
             Self::PublishedTable { .. } => "replicated table",
+            Self::CappedTable(_) => "synced table",
             Self::TableColumn { .. } => "column",
         }
     }
@@ -105,7 +119,9 @@ impl Artifact<'_> {
     const fn name(&self) -> &str {
         match self {
             Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
-            Self::PublishedTable { table, .. } | Self::TableColumn { table, .. } => table,
+            Self::PublishedTable { table, .. }
+            | Self::CappedTable(table)
+            | Self::TableColumn { table, .. } => table,
             Self::PreviousImages { publication } => publication,
         }
     }
@@ -133,6 +149,7 @@ impl Artifact<'_> {
     /// modelled view instead. The replica-identity probe joins the view to
     /// `pg_class` on schema and name, so it reads three catalogs and stays a
     /// statement of its own.
+    #[expect(clippy::too_many_lines, reason = "one probe arm per artifact variant")]
     async fn probe(&self, conn: &mut AsyncPgConnection) -> Result<Found, diesel::result::Error> {
         let probe = match self {
             Self::PublishedTable { publication, table } => {
@@ -160,6 +177,48 @@ impl Artifact<'_> {
                     Found::Fit
                 } else {
                     Found::Unfit(deficient.into_iter().map(|row| row.name).collect())
+                });
+            }
+            Self::CappedTable(_) => {
+                // A catalog read of `pg_policies` beside `pg_class`, which
+                // the DSL does not model, so a statement of its own, one
+                // bound name.
+                let capped: Vec<Capped> = sql_query(
+                    "SELECT bool_or(c.relrowsecurity) AS rls, \
+                     COALESCE(bool_or(p.policyname = ($1 || '_connetto_cap_read')), false) AS read_cap, \
+                     COALESCE(bool_or(p.policyname = ($1 || '_connetto_cap_insert')), false) AS insert_cap, \
+                     COALESCE(bool_or(p.policyname = ($1 || '_connetto_cap_update')), false) AS update_cap, \
+                     COALESCE(bool_or(p.policyname = ($1 || '_connetto_cap_delete')), false) AS delete_cap \
+                     FROM pg_class c \
+                     LEFT JOIN pg_policies p \
+                       ON p.schemaname = (SELECT n.nspname FROM pg_namespace n WHERE n.oid = c.relnamespace) \
+                      AND p.tablename = c.relname \
+                     WHERE c.oid = to_regclass($1)",
+                )
+                .bind::<Text, _>(self.name())
+                .load(conn)
+                .await?;
+                let Some(capped) = capped.into_iter().next() else {
+                    return Ok(Found::Absent);
+                };
+                let mut missing = Vec::new();
+                if !capped.rls {
+                    missing.push("row-level security".to_owned());
+                }
+                for (piece, held) in [
+                    ("read", capped.read_cap),
+                    ("insert", capped.insert_cap),
+                    ("update", capped.update_cap),
+                    ("delete", capped.delete_cap),
+                ] {
+                    if !held {
+                        missing.push(format!("{}:{}", self.name(), piece));
+                    }
+                }
+                return Ok(if missing.is_empty() {
+                    Found::Fit
+                } else {
+                    Found::Uncapped(missing)
                 });
             }
             Self::TableColumn { table, column } => {
@@ -270,6 +329,21 @@ pub enum PreflightError {
         /// The tables to fix, comma separated.
         tables: String,
     },
+    /// The table exists but is not held to the bot cap.
+    ///
+    /// Its own variant because the fix is to apply the generated cap
+    /// document, not to provision anything that is missing.
+    #[error(
+        "synced table {table} is not held to the bot cap: missing {missing}. \
+         connetto generates the cap rules beside the deployment's schema and \
+         policies, so apply the generated document before the server will start"
+    )]
+    Uncapped {
+        /// The table that is not capped.
+        table: String,
+        /// The missing pieces, comma separated.
+        missing: String,
+    },
     /// The table exists but lacks a column connetto reads from it.
     ///
     /// Its own variant because the fix is adding a column to a table the
@@ -292,6 +366,7 @@ struct Present {
     #[diesel(sql_type = Bool)]
     present: bool,
 }
+
 /// Whether a table is present and carries the column a probe asks for.
 #[derive(QueryableByName)]
 struct Shaped {
@@ -299,6 +374,25 @@ struct Shaped {
     present: bool,
     #[diesel(sql_type = Bool)]
     column_present: bool,
+}
+
+/// The cap state of one synced table, as the probe reads it.
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "one field per probe column: RLS plus the four verb caps"
+)]
+#[derive(QueryableByName)]
+struct Capped {
+    #[diesel(sql_type = Bool)]
+    rls: bool,
+    #[diesel(sql_type = Bool)]
+    read_cap: bool,
+    #[diesel(sql_type = Bool)]
+    insert_cap: bool,
+    #[diesel(sql_type = Bool)]
+    update_cap: bool,
+    #[diesel(sql_type = Bool)]
+    delete_cap: bool,
 }
 
 /// One name a probe reported.
@@ -319,10 +413,11 @@ struct Named {
 ///
 /// [`PreflightError::Missing`] naming the absent artifact,
 /// [`PreflightError::MissingColumn`] naming a table that lacks a column
-/// connetto reads, [`PreflightError::PreviousImage`] naming the replicated
-/// tables that cannot report an old row, [`PreflightError::Probe`] when the
-/// check could not be answered, and [`PreflightError::Pool`] when no
-/// connection was available.
+/// connetto reads, [`PreflightError::Uncapped`] naming the synced table the
+/// cap rules leave out, [`PreflightError::PreviousImage`] naming the
+/// replicated tables that cannot report an old row,
+/// [`PreflightError::Probe`] when the check could not be answered, and
+/// [`PreflightError::Pool`] when no connection was available.
 pub async fn require(
     pool: &Pool<AsyncPgConnection>,
     artifacts: &[Artifact<'_>],
@@ -352,6 +447,12 @@ pub async fn require(
                 return Err(PreflightError::PreviousImage {
                     publication: artifact.name().to_owned(),
                     tables: tables.join(", "),
+                });
+            }
+            Found::Uncapped(missing) => {
+                return Err(PreflightError::Uncapped {
+                    table: artifact.name().to_owned(),
+                    missing: missing.join(", "),
                 });
             }
             Found::MissingColumn { table, column } => {

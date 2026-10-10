@@ -20,7 +20,7 @@ use connetto_server::builder::{
 use connetto_server::{OidcProviderConfig, RuntimeWritableCatalog, WebSocketTransport};
 use connetto_test_harness::{
     Fixture, MOCK_OAUTH_CLIENT_ID, MOCK_OAUTH_CLIENT_SECRET, MOCK_OAUTH_PROVIDER, MockOauth,
-    OPLOG_TABLE, PUBLICATION, SLOT,
+    OPLOG_TABLE, PUBLICATION, SLOT, provision_cap_policies,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -402,6 +402,7 @@ async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
     ] {
         exec(&pool, stmt).await;
     }
+    provision_cap_policies(&pool, OWNED_PG_DDL, OWNED_POLICIES).await;
     exec(&pool, "INSERT INTO owned VALUES (1, 'alice', 'seed')").await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;

@@ -1,9 +1,10 @@
 //! The caller a ticket carries, and the one place it is bound.
 //!
-//! The server mints a ticket carrying both halves of the caller, the identity
-//! and the packed capability subjects. Every check here binds both under the
-//! names this deployment's policies read, so a caller whose rights come from a
-//! share key is answered on its keys rather than refused.
+//! The server mints a ticket carrying the three values of the caller, the
+//! identity, the packed capability subjects and the bot list. Every check
+//! here binds them under the names this deployment's policies read, so a
+//! caller whose rights come from a share key is answered on its keys and a
+//! bot is held to its declared tables rather than refused.
 
 use connetto_core::auth::{
     ContentCaller, DEFAULT_SUBJECTS_SETTING, DEFAULT_USER_SETTING, absent_marker,
@@ -38,13 +39,14 @@ impl Default for CallerSettings {
     }
 }
 
-/// Bind both halves of `caller` for the rest of the transaction.
+/// Bind all three values of `caller` for the rest of the transaction.
 ///
-/// A half the caller does not hold takes [`absent_marker`], which no row can
+/// A value the caller does not hold takes [`absent_marker`], which no row can
 /// carry, so a comparison against it is false. Leaving it unbound instead
 /// would read as `''` to the next caller on a pooled connection, because
 /// Postgres keeps the placeholder for the life of the session once anything
-/// has bound it.
+/// has bound it. The bot list is always held, the wildcard for a caller
+/// holding no login.
 pub(crate) async fn bind_caller(
     conn: &mut AsyncPgConnection,
     settings: &CallerSettings,
@@ -57,8 +59,9 @@ pub(crate) async fn bind_caller(
     diesel::select((
         functions::set_config(&settings.user, caller.identity().unwrap_or(marker), true),
         functions::set_config(&settings.subjects, subjects.as_str(), true),
+        functions::set_config(connetto_core::BOT_LIST_SETTING, caller.bot_list(), true),
     ))
-    .get_result::<(String, String)>(conn)
+    .get_result::<(String, String, String)>(conn)
     .await
     .map(drop)
 }
@@ -137,10 +140,26 @@ mod tests {
     #[test]
     fn every_caller_shape_round_trips_to_its_attributions() {
         for caller in [
-            ContentCaller::new(Some("alice".to_owned()), None),
-            ContentCaller::new(Some("keys:user:a,b".to_owned()), None),
-            ContentCaller::new(None, ["key:k1".to_owned()]),
-            ContentCaller::new(None, ["key:k1".to_owned(), "key:k2".to_owned()]),
+            ContentCaller::new(
+                Some("alice".to_owned()),
+                None,
+                connetto_core::BOT_LIST_WILDCARD.to_owned(),
+            ),
+            ContentCaller::new(
+                Some("keys:user:a,b".to_owned()),
+                None,
+                connetto_core::BOT_LIST_WILDCARD.to_owned(),
+            ),
+            ContentCaller::new(
+                None,
+                ["key:k1".to_owned()],
+                connetto_core::BOT_LIST_WILDCARD.to_owned(),
+            ),
+            ContentCaller::new(
+                None,
+                ["key:k1".to_owned(), "key:k2".to_owned()],
+                connetto_core::BOT_LIST_WILDCARD.to_owned(),
+            ),
         ] {
             assert_eq!(round_trip(&caller), owned(&caller), "{caller:?}");
         }

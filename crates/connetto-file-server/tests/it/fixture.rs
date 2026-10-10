@@ -228,6 +228,63 @@ pub const FIXTURE_STMTS_OWN_SETTING: &[&str] = &[
     "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
 ];
 
+/// DDL for the deployment whose metadata table the bot cap holds (R91).
+///
+/// The table enables row-level security and declares no permissive policy of
+/// its own, so the default permissive policy admits every row and the one
+/// `AS RESTRICTIVE` policy decides, the very clause the build generates for
+/// the table. A caller whose list does not name the table sees nothing, and a
+/// list that binds nothing sees nothing.
+pub const FIXTURE_STMTS_BOT_LIST: &[&str] = &[
+    "CREATE TABLE IF NOT EXISTS test_file_metadata (
+         file_id     BYTEA NOT NULL,
+         uploaded_by TEXT  NOT NULL,
+         PRIMARY KEY (file_id, uploaded_by)
+     )",
+    "ALTER TABLE test_file_metadata ENABLE ROW LEVEL SECURITY",
+    "CREATE POLICY test_file_metadata_connetto_open ON test_file_metadata \
+         FOR ALL USING (true) WITH CHECK (true)",
+    "CREATE POLICY test_file_metadata_connetto_cap_read ON test_file_metadata
+         AS RESTRICTIVE FOR SELECT
+         USING ('test_file_metadata:read' = ANY(string_to_array(current_setting('app.bot_list', true), ','))
+             OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ',')))",
+    "DO $$ BEGIN
+         CREATE ROLE connetto_file_server LOGIN PASSWORD 'cfs_reader' NOINHERIT;
+     EXCEPTION WHEN duplicate_object THEN NULL;
+     END $$",
+    "GRANT SELECT ON _cfs_manifests        TO connetto_file_server",
+    "GRANT SELECT ON _cfs_manifest_chunks  TO connetto_file_server",
+    "GRANT SELECT ON test_file_metadata    TO connetto_file_server",
+    // RLS-only variant: no current_setting predicate in the function body.
+    // Visibility is enforced entirely by the RLS policies on the table.
+    "CREATE OR REPLACE FUNCTION connetto_visible_files(p_file_ids BYTEA[])
+     RETURNS BYTEA[] LANGUAGE sql SECURITY INVOKER
+         SET search_path TO '' AS $$
+         SELECT ARRAY(
+             SELECT f FROM UNNEST(p_file_ids) AS f
+             WHERE EXISTS (
+                 SELECT 1 FROM public.test_file_metadata m
+                 WHERE m.file_id = f
+             )
+         )
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_visible_files TO connetto_file_server",
+    "CREATE OR REPLACE FUNCTION connetto_set_content_state(
+         p_file_id   BYTEA,
+         p_new_state TEXT,
+         p_caller    TEXT
+     ) RETURNS BYTEA LANGUAGE plpgsql SECURITY DEFINER
+         SET search_path TO '' AS $$
+     BEGIN
+         INSERT INTO public.test_file_metadata (file_id, uploaded_by)
+         VALUES (p_file_id, p_caller)
+         ON CONFLICT DO NOTHING;
+         RETURN p_file_id;
+     END;
+     $$",
+    "GRANT EXECUTE ON FUNCTION connetto_set_content_state TO connetto_file_server",
+];
+
 pub struct Pg {
     pub _container: ContainerAsync<GenericImage>,
     pub url_admin: String,
@@ -252,6 +309,11 @@ impl Pg {
     /// Starts a container whose policy reads the deployment's own identity setting.
     pub async fn start_with_own_setting() -> Self {
         Self::start_with_fixture_stmts(FIXTURE_STMTS_OWN_SETTING).await
+    }
+
+    /// Starts a container whose metadata table the bot cap holds (R91).
+    pub async fn start_with_bot_list() -> Self {
+        Self::start_with_fixture_stmts(FIXTURE_STMTS_BOT_LIST).await
     }
 
     async fn start_with_fixture_stmts(fixture_stmts: &[&str]) -> Self {
@@ -832,12 +894,28 @@ pub async fn registry_row_count(
     rows.into_iter().next().map_or(0, |r| r.n)
 }
 
-/// A ticket caller carrying an identity and no share key.
+/// A ticket caller carrying an identity and no share key, the person's
+/// wildcard for the bot list.
 pub fn identified(user_id: &str) -> ContentCaller {
-    ContentCaller::new(Some(user_id.to_owned()), None)
+    ContentCaller::new(
+        Some(user_id.to_owned()),
+        None,
+        connetto_core::BOT_LIST_WILDCARD.to_owned(),
+    )
 }
 
-/// A ticket caller carrying share-key subjects and no identity.
+/// A ticket caller carrying an identity and the bot list its login resolved,
+/// the bot the deployment registered it with (R91).
+pub fn listed(user_id: &str, bot_list: &str) -> ContentCaller {
+    ContentCaller::new(Some(user_id.to_owned()), None, bot_list.to_owned())
+}
+
+/// A ticket caller carrying share-key subjects and no identity, the person's
+/// wildcard for the bot list.
 pub fn keyed<'a>(subjects: impl IntoIterator<Item = &'a str>) -> ContentCaller {
-    ContentCaller::new(None, subjects.into_iter().map(ToOwned::to_owned))
+    ContentCaller::new(
+        None,
+        subjects.into_iter().map(ToOwned::to_owned),
+        connetto_core::BOT_LIST_WILDCARD.to_owned(),
+    )
 }
