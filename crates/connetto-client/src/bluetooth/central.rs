@@ -314,14 +314,27 @@ async fn link(
         tokio::select! {
             outgoing = writes.recv() => {
                 let Some(bytes) = outgoing else { break };
-                if let Err(err) = peripheral.write(&inbox, &bytes, WriteType::WithResponse).await {
-                    tracing::warn!(%err, "a chunk to the host did not go");
-                    break;
+                let written = tokio::time::timeout(
+                    LINK_STEP_BOUND,
+                    peripheral.write(&inbox, &bytes, WriteType::WithResponse),
+                )
+                .await;
+                match written {
+                    Ok(Ok(())) => tracing::debug!(len = bytes.len(), "a chunk went to the host"),
+                    Ok(Err(err)) => {
+                        tracing::warn!(%err, "a chunk to the host did not go");
+                        break;
+                    }
+                    Err(_) => {
+                        tracing::warn!(len = bytes.len(), "a chunk to the host got no answer within its bound");
+                        break;
+                    }
                 }
             }
             notification = notifications.next() => {
                 let Some(notification) = notification else { break };
                 if notification.uuid == outbox.uuid {
+                    tracing::debug!(len = notification.value.len(), "the host's chunk arrived");
                     push(&queue, CentralEvent::Chunk { host, bytes: notification.value });
                 }
             }
