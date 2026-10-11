@@ -834,12 +834,26 @@ where
                         device.peer_autolink,
                         Arc::new(move || port_node.local_addr().map(|addr| addr.port())),
                         bind,
-                        Arc::new(move |addr: SocketAddr| {
-                            let handle = dial_handle.clone();
-                            tokio::spawn(async move {
-                                let _ = handle.link_peer(addr).await;
-                            });
-                        }),
+                        Arc::new(
+                            move |addr: SocketAddr, answer: tokio::sync::oneshot::Sender<bool>| {
+                                let handle = dial_handle.clone();
+                                tokio::spawn(async move {
+                                    match handle.link_peer(addr).await {
+                                        Ok(_) => {
+                                            let _ = answer.send(true);
+                                        }
+                                        Err(err) => {
+                                            tracing::debug!(
+                                                                                                %addr,
+                                                ?err,
+                                                "the dial to the joined hotspot's gateway failed"
+                                            );
+                                            let _ = answer.send(false);
+                                        }
+                                    }
+                                });
+                            },
+                        ),
                         Arc::new(move |event: ClientEvent| {
                             let _ = event_sender.send(event);
                         }),

@@ -33,6 +33,10 @@ pub(crate) const HOST_BOUND: Duration = Duration::from_secs(30);
 pub(crate) const JOIN_BOUND: Duration = Duration::from_secs(60);
 /// The margin the API methods give the machine past its bound.
 pub(crate) const MARGIN: Duration = Duration::from_secs(5);
+/// The time the joined hotspot's gateway gets for a link, after the join.
+pub(crate) const DIAL_BOUND: Duration = Duration::from_secs(60);
+/// The wait between a failed gateway dial and its redial.
+pub(crate) const REDIAL: Duration = Duration::from_secs(2);
 /// The pace of the machine's look at the backend's outcome.
 const TICK: Duration = Duration::from_millis(250);
 
@@ -263,8 +267,33 @@ enum JoinState {
         reply: Reply<Result<IpAddr, JoinError>>,
         deadline: tokio::time::Instant,
     },
-    /// Joined.
-    Joined,
+    /// Joined, with the gateway's dial standing beside it.
+    Joined {
+        /// The dial's standing, absent without autolink or a port, and
+        /// dropped once a link stands or the redial gives up.
+        dial: Option<DialPlan>,
+    },
+}
+
+/// The joined hotspot's dial standing, the gateway without a link (R76).
+struct DialPlan {
+    /// The address the dials reach.
+    address: SocketAddr,
+    /// The bound, the join's origin.
+    bound: tokio::time::Instant,
+    /// The dial in flight, its issue and its answer, none while a redial
+    /// waits.
+    in_flight: Option<InFlight>,
+    /// The redial's due, after a failed dial.
+    next: Option<tokio::time::Instant>,
+}
+
+/// A dial in flight, from its issue to its answer (R76).
+struct InFlight {
+    /// The issue's instant, the redial's origin.
+    issued: tokio::time::Instant,
+    /// The dial's answer.
+    answer: oneshot::Receiver<bool>,
 }
 
 /// The hotspot machine's commands, from the client's API (R76).
@@ -295,8 +324,8 @@ pub(crate) struct Machine {
     peer_port: Arc<dyn Fn() -> Option<u16> + Send + Sync>,
     /// Bind the dials' sockets to `subnet`, or stop binding with `None`.
     bind: SubnetBind,
-    /// Dial one peer address, fire and forget.
-    dial: Arc<dyn Fn(SocketAddr) + Send + Sync>,
+    /// Dial one gateway address, answering `answer` whether it linked.
+    dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<bool>) + Send + Sync>,
     /// Emit an event to the application.
     emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
     host: HostState,
@@ -311,7 +340,7 @@ impl Machine {
         autolink: bool,
         peer_port: Arc<dyn Fn() -> Option<u16> + Send + Sync>,
         bind: SubnetBind,
-        dial: Arc<dyn Fn(SocketAddr) + Send + Sync>,
+        dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<bool>) + Send + Sync>,
         emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
     ) -> Self {
         Self {
@@ -323,6 +352,22 @@ impl Machine {
             emit,
             host: HostState::Off,
             join: JoinState::Idle,
+        }
+    }
+
+    /// Issue the first dial to `address`, standing its plan from the join.
+    fn start_dial(&mut self, address: SocketAddr) -> DialPlan {
+        let (answer, receiver) = oneshot::channel();
+        (self.dial)(address, answer);
+        let now = tokio::time::Instant::now();
+        DialPlan {
+            address,
+            bound: now + DIAL_BOUND,
+            in_flight: Some(InFlight {
+                issued: now,
+                answer: receiver,
+            }),
+            next: None,
         }
     }
 
@@ -370,7 +415,7 @@ impl Machine {
                         self.backend.leave_join();
                         let _ = old.send(Err(JoinError::Declined));
                     }
-                    JoinState::Joined => {
+                    JoinState::Joined { .. } => {
                         self.backend.leave_join();
                         (self.bind)(None);
                     }
@@ -391,7 +436,7 @@ impl Machine {
                     self.backend.leave_join();
                     let _ = reply.send(Err(JoinError::Declined));
                 }
-                JoinState::Joined => {
+                JoinState::Joined { .. } => {
                     self.backend.leave_join();
                     (self.bind)(None);
                 }
@@ -481,11 +526,14 @@ impl Machine {
                         unreachable!("the join side left Requesting between the look and the take");
                     };
                     (self.bind)(Some((address, prefix)));
-                    let port = offer.port.filter(|_| self.autolink);
-                    if let Some(port) = port {
-                        (self.dial)(SocketAddr::new(gateway, port));
-                    }
-                    self.join = JoinState::Joined;
+                    let dial = if self.autolink {
+                        offer
+                            .port
+                            .map(|port| self.start_dial(SocketAddr::new(gateway, port)))
+                    } else {
+                        None
+                    };
+                    self.join = JoinState::Joined { dial };
                     let _ = reply.send(Ok(gateway));
                 }
                 JoinStatus::Unavailable | JoinStatus::Lost => {
@@ -511,12 +559,51 @@ impl Machine {
                 self.backend.leave_join();
                 let _ = reply.send(Err(JoinError::TimedOut));
             }
-        } else if matches!(self.join, JoinState::Joined)
+        } else if matches!(self.join, JoinState::Joined { .. })
             && matches!(self.backend.join_status(), JoinStatus::Lost)
         {
             self.join = JoinState::Idle;
             (self.bind)(None);
             (self.emit)(ClientEvent::HotspotLeft);
+        }
+
+        // The gateway's dial standing, after the rows that end the join.
+        let mut ended = false;
+        let mut unreached = false;
+        if let JoinState::Joined { dial: Some(plan) } = &mut self.join {
+            let now = tokio::time::Instant::now();
+            let mut linked = false;
+            if let Some(mut in_flight) = plan.in_flight.take() {
+                match in_flight.answer.try_recv() {
+                    Ok(true) => linked = true,
+                    Ok(false) | Err(oneshot::error::TryRecvError::Closed) => {
+                        plan.next = Some(in_flight.issued + REDIAL);
+                    }
+                    Err(oneshot::error::TryRecvError::Empty) => {
+                        plan.in_flight = Some(in_flight);
+                    }
+                }
+            }
+            if linked {
+                ended = true;
+            } else if now >= plan.bound {
+                ended = true;
+                unreached = true;
+            } else if plan.in_flight.is_none() && plan.next.is_some_and(|due| now >= due) {
+                let (answer, receiver) = oneshot::channel();
+                (self.dial)(plan.address, answer);
+                plan.in_flight = Some(InFlight {
+                    issued: now,
+                    answer: receiver,
+                });
+                plan.next = None;
+            }
+        }
+        if ended {
+            self.join = JoinState::Joined { dial: None };
+            if unreached {
+                (self.emit)(ClientEvent::JoinedHostUnreached);
+            }
         }
     }
 
@@ -529,9 +616,12 @@ impl Machine {
         ) {
             self.backend.stop_host();
         }
-        if matches!(self.join, JoinState::Requesting { .. } | JoinState::Joined) {
+        if matches!(
+            self.join,
+            JoinState::Requesting { .. } | JoinState::Joined { .. }
+        ) {
             self.backend.leave_join();
-            if matches!(self.join, JoinState::Joined) {
+            if matches!(self.join, JoinState::Joined { .. }) {
                 (self.bind)(None);
             }
         }
@@ -679,12 +769,42 @@ mod tests {
     /// A recorded subnet bind, the join's gateway and its prefix.
     type Subnets = Arc<Mutex<Vec<Option<(Ipv4Addr, u8)>>>>;
 
+    /// The dial seam's answer script, one held dial standing.
+    struct FakeDial {
+        /// The answer the next dial gets, at its call.
+        answer: Mutex<Option<bool>>,
+        /// The dial held back, its answer unsent.
+        held: Mutex<Option<oneshot::Sender<bool>>>,
+    }
+
+    impl FakeDial {
+        fn new() -> Self {
+            Self {
+                answer: Mutex::new(None),
+                held: Mutex::new(None),
+            }
+        }
+
+        /// The answer the next dial gets, at its call.
+        fn script(&self, linked: bool) {
+            *self.answer.lock() = Some(linked);
+        }
+
+        /// The held dial's answer, for the dial standing unanswered.
+        fn finish(&self, linked: bool) {
+            if let Some(answer) = self.held.lock().take() {
+                let _ = answer.send(linked);
+            }
+        }
+    }
+
     struct Harness {
         machine: Machine,
         backend: Arc<FakeBackend>,
         port: Arc<Mutex<Option<u16>>>,
         binds: Subnets,
         dials: Arc<Mutex<Vec<SocketAddr>>>,
+        dial: Arc<FakeDial>,
         events: Arc<Mutex<Vec<ClientEvent>>>,
     }
 
@@ -694,6 +814,7 @@ mod tests {
             let port: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(Some(54321)));
             let binds: Subnets = Arc::new(Mutex::new(Vec::new()));
             let dials: Arc<Mutex<Vec<SocketAddr>>> = Arc::new(Mutex::new(Vec::new()));
+            let dial = Arc::new(FakeDial::new());
             let events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
             let machine = Machine::new(
                 Arc::clone(&backend) as Arc<dyn HotspotBackend>,
@@ -708,7 +829,16 @@ mod tests {
                 }),
                 Arc::new({
                     let dials = Arc::clone(&dials);
-                    move |addr| dials.lock().push(addr)
+                    let dial = Arc::clone(&dial);
+                    move |addr, answer| {
+                        dials.lock().push(addr);
+                        match dial.answer.lock().take() {
+                            Some(linked) => {
+                                let _ = answer.send(linked);
+                            }
+                            None => *dial.held.lock() = Some(answer),
+                        }
+                    }
                 }),
                 Arc::new({
                     let events = Arc::clone(&events);
@@ -721,6 +851,7 @@ mod tests {
                 port,
                 binds,
                 dials,
+                dial,
                 events,
             }
         }
@@ -1059,6 +1190,128 @@ mod tests {
         assert_eq!(h.backend.counted("leave_join"), 0);
     }
 
+    /// The join row `The dial to the gateway fails | Joined | dial again 2
+    /// seconds later while no link to the gateway stands`, no sooner.
+    #[tokio::test]
+    async fn a_failed_dial_redials_after_its_wait() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.dial.script(false);
+        h.joined();
+        h.machine.tick();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        h.machine.tick();
+        tokio::time::advance(Duration::from_millis(900)).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 1);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 2);
+    }
+
+    /// The join row `A link to the gateway stands | Joined | stop dialing`.
+    #[tokio::test]
+    async fn a_linked_dial_stops_the_redial() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.dial.script(false);
+        h.joined();
+        h.machine.tick();
+        tokio::time::advance(REDIAL).await;
+        h.dial.script(true);
+        h.machine.tick();
+        h.machine.tick();
+        tokio::time::advance(DIAL_BOUND).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 2);
+        assert!(h.events.lock().is_empty());
+    }
+
+    /// The join row `The dial to the gateway fails | Joined | 60 seconds
+    /// after the join stop and emit JoinedHostUnreached`, once.
+    #[tokio::test]
+    async fn the_dial_bound_emits_its_unreached_once() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.dial.script(false);
+        h.joined();
+        for _ in 0..31 {
+            h.dial.script(false);
+            tokio::time::advance(REDIAL).await;
+            h.machine.tick();
+        }
+        assert_eq!(h.dials.lock().len(), 30);
+        assert_eq!(
+            h.events.lock().as_slice(),
+            &[ClientEvent::JoinedHostUnreached]
+        );
+        tokio::time::advance(DIAL_BOUND).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 30);
+        assert_eq!(
+            h.events.lock().as_slice(),
+            &[ClientEvent::JoinedHostUnreached]
+        );
+    }
+
+    /// The dial still running when the bound passes, its answer ignored
+    /// after it links.
+    #[tokio::test]
+    async fn a_running_dial_lets_its_answer_pass_the_bound() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.joined();
+        tokio::time::advance(DIAL_BOUND).await;
+        h.machine.tick();
+        assert_eq!(
+            h.events.lock().as_slice(),
+            &[ClientEvent::JoinedHostUnreached]
+        );
+        h.dial.finish(true);
+        tokio::time::advance(REDIAL).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 1);
+        assert_eq!(
+            h.events.lock().as_slice(),
+            &[ClientEvent::JoinedHostUnreached]
+        );
+    }
+
+    /// The join row `Network lost | Joined | stop dialing`, the redial
+    /// over.
+    #[tokio::test]
+    async fn a_lost_network_stops_the_redial() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.dial.script(false);
+        h.joined();
+        h.machine.tick();
+        *h.backend.join_status.lock() = JoinStatus::Lost;
+        h.machine.tick();
+        assert_eq!(h.events.lock().as_slice(), &[ClientEvent::HotspotLeft]);
+        tokio::time::advance(DIAL_BOUND).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 1);
+        assert_eq!(h.events.lock().as_slice(), &[ClientEvent::HotspotLeft]);
+    }
+
+    /// The join row `leave_hotspot | Joined | stop dialing`, the redial
+    /// over.
+    #[tokio::test]
+    async fn a_user_leave_stops_the_redial() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.dial.script(false);
+        h.joined();
+        h.machine.tick();
+        h.machine.handle(Command::Leave);
+        tokio::time::advance(DIAL_BOUND).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 1);
+        assert!(h.events.lock().is_empty());
+        assert_eq!(h.backend.counted("leave_join"), 1);
+    }
+
     /// The join rows `leave_hotspot | Idle | nothing` and `| Requesting |
     /// cancel, answer the pending call Declined`.
     #[test]
@@ -1188,7 +1441,7 @@ mod tests {
             true,
             Arc::new(|| Some(54321)),
             Arc::new(|_| {}),
-            Arc::new(|_| {}),
+            Arc::new(|_, _| {}),
             Arc::new(|_| {}),
         );
         let (tx, rx) = mpsc::unbounded_channel();

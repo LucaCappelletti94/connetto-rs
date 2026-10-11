@@ -1273,6 +1273,10 @@ pub enum ClientEvent {
     /// The device left its joined hotspot (R76).
     #[cfg(feature = "peer")]
     HotspotLeft,
+    /// The redial to its joined hotspot's gateway passed its bound with no
+    /// link standing, so it stopped (R76).
+    #[cfg(feature = "peer")]
+    JoinedHostUnreached,
 }
 
 /// A primary-key column value carried on a mutation event.
