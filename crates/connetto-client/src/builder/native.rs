@@ -923,30 +923,36 @@ where
                         }),
                     );
                     #[cfg(target_os = "android")]
-                    let (bt_readiness, bt_peripheral, bt_central) = match device.java.clone() {
+                    let (bt_readiness, bt_peripheral, bt_starter) = match device.java.clone() {
                         Some(java) => {
                             let backend =
                                 Arc::new(crate::bluetooth::AndroidBluetoothBackend::new(java));
+                            // btleplug's central, started once
+                            // Bluetooth reads Ready and retried where
+                            // its start fails (R76 decision 22).
+                            let bt_starter: crate::bluetooth::CentralStarter =
+                                Arc::new(move || -> crate::bluetooth::CentralStart {
+                                    Box::pin(async move {
+                                        crate::bluetooth::BtleplugCentral::start()
+                                            .await
+                                            .map(|central| {
+                                                Arc::new(central)
+                                                    as Arc<dyn crate::bluetooth::CentralBackend>
+                                            })
+                                            .map_err(|err| err.to_string())
+                                    })
+                                });
                             (
                                 Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                 Arc::clone(&backend)
                                     as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                // btleplug's central, absent where its thread
-                                // does not start (R76 decision 22).
-                                match crate::bluetooth::BtleplugCentral::start().await {
-                                    Ok(central) => Some(Arc::new(central)
-                                        as Arc<dyn crate::bluetooth::CentralBackend>),
-                                    Err(err) => {
-                                        tracing::warn!(%err, "the Bluetooth central did not start");
-                                        None
-                                    }
-                                },
+                                Some(bt_starter),
                             )
                         }
                         None => crate::bluetooth::unsupported_backends(),
                     };
                     #[cfg(not(target_os = "android"))]
-                    let (bt_readiness, bt_peripheral, bt_central) =
+                    let (bt_readiness, bt_peripheral, bt_starter) =
                         crate::bluetooth::unsupported_backends();
                     let bt_state = Arc::clone(&bt_readiness);
                     let serving_handle = handle.clone();
@@ -955,7 +961,7 @@ where
                     let bt_machine = crate::bluetooth::Machine::new(
                         bt_readiness,
                         bt_peripheral,
-                        bt_central,
+                        bt_starter,
                         beacon_node,
                         device.bt_scan,
                         device.bt_autojoin,
