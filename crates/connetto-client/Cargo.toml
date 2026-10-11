@@ -260,9 +260,9 @@ android_system_properties = { version = "0.1.6", optional = true }
 socket2 = "0.6"
 # The joined network's subnet, the targets its bind admits (R76).
 ipnet = "2.12"
-# The joiner's Bluetooth central (R76 decision 22), pinned at the fork's fix
-# of its Android init until a release carries deviceplug/btleplug#495.
-btleplug = { git = "https://github.com/LucaCappelletti94/btleplug", rev = "5f6b3686849ed5617bebba136dc29ac253e71937", optional = true }
+# The joiner's Bluetooth central (R76 decision 22), from the release whose
+# Android init resolves its classes through the context class loader.
+btleplug = { version = "0.13.5", optional = true }
 # The jni 0.22 virtual machine btleplug's init takes, and btleplug's Java
 # bundled in its Gradle module (R76 decision 22).
 connetto-peer-android = { path = "../connetto-peer-android", optional = true }
