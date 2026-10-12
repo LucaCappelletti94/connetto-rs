@@ -3086,7 +3086,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#978075f75cf477ba007aa03aab08e215dfdd0c60"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#dfe7a2007e60b0db46058cfee31fdf8026f17588"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -3221,7 +3221,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#be48efe0b5ceef665314912f48b593195654b9d9"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#bd56fb7079a8f319a49673353a8de96263ce8b3c"
 dependencies = [
  "arc-swap",
  "async-lock",
