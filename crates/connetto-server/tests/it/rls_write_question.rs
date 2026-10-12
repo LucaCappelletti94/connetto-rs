@@ -43,6 +43,7 @@ fn caller(identity: &str) -> Principal {
     let _ = principal.accept(Subject::Identity(VerifiedSession {
         context: AuthContext::new(identity),
         session_id: SessionId::from_token_hash(identity),
+        bot_list: None,
     }));
     principal
 }

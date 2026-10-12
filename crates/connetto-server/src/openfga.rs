@@ -345,7 +345,8 @@ where
         // carry, read through the same function Postgres binds it with, so
         // the local gate and the row-level rules hold the caller to one list.
         if self.naming.bot_list_parameter.as_deref() == Some(parameter) {
-            out.push(crate::capability::bot_list_for(&self.principal));
+            let list = crate::capability::bot_list_for(&self.principal);
+            out.push(&list);
             true
         } else {
             false
@@ -1984,6 +1985,7 @@ mod tests {
             .accept(Subject::Identity(VerifiedSession {
                 context: AuthContext::new("alice"),
                 session_id: handle,
+                bot_list: None,
             }))
             .expect("one identity");
         principal

@@ -45,7 +45,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
 use openfga_client::tonic::transport::Channel;
 use rls2fga::translator::Translator;
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
@@ -2153,6 +2153,30 @@ pub fn insert_changeset(
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
+}
+
+/// The rows the given snapshot patch frames actually carry, decoded from each
+/// zstd-compressed patchset and counted as inserts.
+///
+/// # Panics
+///
+/// Panics when a patchset cannot be decompressed or parsed.
+#[must_use]
+pub fn snapshot_rows(patches: &[SnapshotPatch]) -> usize {
+    patches
+        .iter()
+        .map(|patch| {
+            let bytes = zstd::decode_all(patch.patchset_zstd.as_slice()).expect("decompress");
+            // A snapshot carrying no rows is not a patchset at all, so it
+            // counts as none rather than failing to parse.
+            let ParsedDiffSet::Patchset(set) = ParsedDiffSet::parse(&bytes).expect("parse") else {
+                return 0;
+            };
+            set.iter()
+                .filter(|op| matches!(op, PatchsetOp::Insert { .. }))
+                .count()
+        })
+        .sum()
 }
 
 #[cfg(test)]

@@ -89,6 +89,7 @@ impl HandshakeAuthority for FixedVerifier {
                 // A fixed id so every connection this stub verifies shares one
                 // watermark key, which is what the exactly-once assertions rely on.
                 session_id: SessionId::from_token_hash("fixed-session"),
+                bot_list: None,
             }))
         })
     }

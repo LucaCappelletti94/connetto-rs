@@ -84,6 +84,7 @@ fn caller(user: &str) -> Arc<Principal> {
         .accept(Subject::Identity(VerifiedSession {
             context: AuthContext::new(user),
             session_id: SessionId::from_uuid(uuid::Uuid::new_v4()),
+            bot_list: None,
         }))
         .expect("one identity");
     Arc::new(principal)

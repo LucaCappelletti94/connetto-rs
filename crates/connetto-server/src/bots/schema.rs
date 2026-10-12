@@ -69,44 +69,9 @@ pub use connetto_core::bots::BotRegistryIdSql;
 /// One statement of a [`ConnettoBotSchema`], run on a borrowed connection.
 pub type Statement<'c, T> = Pin<Box<dyn Future<Output = QueryResult<T>> + Send + 'c>>;
 
-/// One of the four verbs a list entry declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Verb {
-    /// The `read` verb, `FOR SELECT`.
-    Read,
-    /// The `insert` verb, `FOR INSERT`.
-    Insert,
-    /// The `update` verb, `FOR UPDATE`.
-    Update,
-    /// The `delete` verb, `FOR DELETE`.
-    Delete,
-}
-
-impl Verb {
-    /// The column's spelling.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Verb::Read => "read",
-            Verb::Insert => "insert",
-            Verb::Update => "update",
-            Verb::Delete => "delete",
-        }
-    }
-
-    /// The verb a wire or column spelling names, or `None` for a spelling
-    /// outside the four the `CHECK` allows.
-    #[must_use]
-    pub fn parse(spelled: &str) -> Option<Self> {
-        match spelled {
-            "read" => Some(Self::Read),
-            "insert" => Some(Self::Insert),
-            "update" => Some(Self::Update),
-            "delete" => Some(Self::Delete),
-            _ => None,
-        }
-    }
-}
+/// One of the four verbs a list entry declares, named once in the core so a
+/// session's list and the registry's rows name the same verb.
+pub use connetto_core::bots::Verb;
 
 /// A `verb` column spelling outside the four the `CHECK` allows.
 #[derive(Debug, thiserror::Error)]

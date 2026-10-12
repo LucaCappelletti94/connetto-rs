@@ -87,6 +87,99 @@ pub fn canonical_code(code: &str) -> String {
         .collect()
 }
 
+/// One of the four verbs a bot list entry declares.
+///
+/// Named once here rather than per side, so the entries a session carries
+/// and the rows the registry stores name the same verb, and a spelling
+/// outside the four the registry's `CHECK` allows parses to `None` on both.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Verb {
+    /// The `read` verb, `FOR SELECT`.
+    Read,
+    /// The `insert` verb, `FOR INSERT`.
+    Insert,
+    /// The `update` verb, `FOR UPDATE`.
+    Update,
+    /// The `delete` verb, `FOR DELETE`.
+    Delete,
+}
+
+impl Verb {
+    /// The column's spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verb::Read => "read",
+            Verb::Insert => "insert",
+            Verb::Update => "update",
+            Verb::Delete => "delete",
+        }
+    }
+
+    /// The verb a wire or column spelling names, or `None` for a spelling
+    /// outside the four the registry's `CHECK` allows.
+    #[must_use]
+    pub fn parse(spelled: &str) -> Option<Self> {
+        match spelled {
+            "read" => Some(Self::Read),
+            "insert" => Some(Self::Insert),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+}
+
+/// The effective list a bot session carries, the entries its connection
+/// binds into [`crate::schema::BOT_LIST_SETTING`] and its replica's
+/// [`crate::schema::BOT_LIST_FUNCTION`] answers.
+///
+/// Held as entries rather than as the joined text, so a list a login
+/// resolved travels typed and is rendered only where a setting binds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BotList {
+    entries: Vec<(String, Verb)>,
+}
+
+impl BotList {
+    /// A list from its entries, each a table and the verb it declares.
+    #[must_use]
+    pub fn new(entries: impl IntoIterator<Item = (String, Verb)>) -> Self {
+        Self {
+            entries: entries.into_iter().collect(),
+        }
+    }
+
+    /// The entries, in the list's order.
+    #[must_use]
+    pub fn entries(&self) -> &[(String, Verb)] {
+        &self.entries
+    }
+
+    /// Whether the list declares nothing, which sees and writes nothing.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The text form the session setting carries, the entries' `table:verb`
+    /// spellings joined by [`crate::schema::BOT_LIST_SEPARATOR`], the one
+    /// renderer of it.
+    #[must_use]
+    pub fn text(&self) -> String {
+        let mut text = String::new();
+        for (table, verb) in &self.entries {
+            if !text.is_empty() {
+                text.push(crate::schema::BOT_LIST_SEPARATOR);
+            }
+            text.push_str(table);
+            text.push(':');
+            text.push_str(verb.as_str());
+        }
+        text
+    }
+}
+
 #[cfg(feature = "diesel-pg")]
 impl BotRegistryIdSql for diesel::sql_types::Text {
     const DDL: &'static str = REGISTRY_DDL_TEXT;
@@ -280,5 +373,47 @@ mod tests {
         // A digit outside the base32 alphabet is kept, so the form differs
         // from the code it was typed from and the lookup misses.
         assert_eq!(canonical_code("k7q2-9xa0b"), "K7Q29XA0B");
+    }
+
+    /// The four spellings parse, and a spelling outside the four does not.
+    #[test]
+    fn the_four_verbs_parse_and_a_foreign_spelling_does_not() {
+        assert_eq!(Verb::parse("read"), Some(Verb::Read));
+        assert_eq!(Verb::parse("insert"), Some(Verb::Insert));
+        assert_eq!(Verb::parse("update"), Some(Verb::Update));
+        assert_eq!(Verb::parse("delete"), Some(Verb::Delete));
+        assert_eq!(Verb::parse("drop"), None);
+        assert_eq!(Verb::parse("*"), None);
+        assert_eq!(
+            [Verb::Read, Verb::Insert, Verb::Update, Verb::Delete,]
+                .iter()
+                .map(|verb| verb.as_str())
+                .collect::<Vec<_>>(),
+            ["read", "insert", "update", "delete"]
+        );
+    }
+
+    /// The list's text is its entries' `table:verb` spellings joined by the
+    /// separator, in the list's order, and an empty list renders to nothing.
+    #[test]
+    fn the_list_renders_its_entries_in_order() {
+        let list = BotList::new([
+            ("orders".to_owned(), Verb::Read),
+            ("orders".to_owned(), Verb::Insert),
+            ("invoices".to_owned(), Verb::Read),
+        ]);
+        assert_eq!(list.text(), "orders:read,orders:insert,invoices:read");
+        assert_eq!(
+            list.entries(),
+            &[
+                ("orders".to_owned(), Verb::Read),
+                ("orders".to_owned(), Verb::Insert),
+                ("invoices".to_owned(), Verb::Read),
+            ]
+        );
+        assert!(!list.is_empty());
+        let empty = BotList::new([]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.text(), "");
     }
 }

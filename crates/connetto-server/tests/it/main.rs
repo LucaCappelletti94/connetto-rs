@@ -7,6 +7,7 @@
 
 mod abuse;
 mod bot_cap;
+mod bot_proof;
 mod bot_registration;
 mod bots;
 mod bots_client;

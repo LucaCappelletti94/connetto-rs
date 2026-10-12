@@ -45,6 +45,7 @@ async fn ask(
     let _ = principal.accept(Subject::Identity(VerifiedSession {
         context: AuthContext::new(user),
         session_id: SessionId::from_token_hash(user),
+        bot_list: None,
     }));
     let catalog = ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(CATALOG_DDL)
         .expect("the catalog parses");

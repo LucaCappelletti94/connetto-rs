@@ -6500,6 +6500,7 @@ mod tests {
                 .accept(Subject::Identity(VerifiedSession {
                     context: AuthContext::new(user),
                     session_id: handle,
+                    bot_list: None,
                 }))
                 .expect("one identity");
         }
