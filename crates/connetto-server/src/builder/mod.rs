@@ -524,7 +524,7 @@ pub enum ServeError {
     /// Building the server refused.
     #[error(transparent)]
     Build(#[from] BuildError),
-    /// The stream cannot answer what a row looked like before it changed.
+    /// The stream cannot be served, because a row's previous version or its authorization answer cannot be had.
     #[error("the change stream is unusable: {0}")]
     ChangeStreamUnusable(String),
     /// The stream gave up reconnecting, or its source ended.
@@ -1895,10 +1895,11 @@ fn change_stream<D: ConnettoSchema>(
                     "the change stream source ended".to_owned(),
                 ))
             }
-            Err(err @ SessionError::ChangeStreamUnusable(_)) => {
-                // No restart of the stream changes the table's definition, so
-                // the server closes every session and returns the refusal
-                // rather than retrying for ever (R6 decision 4).
+            // No restart of the stream changes what the deployment fixed (R6 decision 4).
+            Err(
+                err @ (SessionError::ChangeStreamUnusable(_)
+                | SessionError::AuthorizationUnanswerable { .. }),
+            ) => {
                 close_every_session(&manager).await;
                 Err(ServeError::ChangeStreamUnusable(err.to_string()))
             }
@@ -1976,39 +1977,6 @@ mod tests {
         )
     }
 
-    /// The deployment's tables in the order a deployment writes them, where
-    /// connetto's registry tables sort ahead of `items` in a catalog.
-    const NUMBERED: &str = "CREATE TABLE items (id INT PRIMARY KEY, team INT); \
-                            CREATE TABLE team_members (team INT, member TEXT);";
-
-    /// The model's catalog read from the composed document and the server's
-    /// read from the same text number every table alike, so startup goes on.
-    #[test]
-    fn one_document_numbers_every_table_alike() {
-        let schema = ServerSchema::new(NUMBERED, "");
-        let engine_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
-        let model =
-            ParserDB::parse::<PostgreSqlDialect>(&engine_ddl).expect("the model catalog parses");
-        require_one_numbering(&model, &engine_ddl).expect("one document numbers its tables once");
-    }
-
-    /// A server catalog read without the registry tables gives `items` another
-    /// id than the model's, which leaves every changed `items` row unnamed, so
-    /// startup refuses and names the table.
-    #[test]
-    fn a_catalog_without_the_registry_refuses_startup() {
-        let schema = ServerSchema::new(NUMBERED, "");
-        let model_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
-        let model =
-            ParserDB::parse::<PostgreSqlDialect>(&model_ddl).expect("the model catalog parses");
-        let refused =
-            require_one_numbering(&model, NUMBERED).expect_err("the two catalogs disagree");
-        assert!(
-            matches!(&refused, BuildError::CatalogMismatch { table } if table == "items"),
-            "{refused}"
-        );
-    }
-
     /// A service that accepts the connection and never answers fails the call
     /// at its budget, so the change path holds the event and asks again rather
     /// than waiting without end.
@@ -2045,6 +2013,39 @@ mod tests {
         assert!(
             waited < budget * 10,
             "the call ends at its budget, it waited {waited:?}"
+        );
+    }
+
+    /// The deployment's tables in the order a deployment writes them, where
+    /// connetto's registry tables sort ahead of `items` in a catalog.
+    const NUMBERED: &str = "CREATE TABLE items (id INT PRIMARY KEY, team INT); \
+                            CREATE TABLE team_members (team INT, member TEXT);";
+
+    /// The model's catalog read from the composed document and the server's
+    /// read from the same text number every table alike, so startup goes on.
+    #[test]
+    fn one_document_numbers_every_table_alike() {
+        let schema = ServerSchema::new(NUMBERED, "");
+        let engine_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
+        let model =
+            ParserDB::parse::<PostgreSqlDialect>(&engine_ddl).expect("the model catalog parses");
+        require_one_numbering(&model, &engine_ddl).expect("one document numbers its tables once");
+    }
+
+    /// A server catalog read without the registry tables gives `items` another
+    /// id than the model's, which leaves every changed `items` row unnamed, so
+    /// startup refuses and names the table.
+    #[test]
+    fn a_catalog_without_the_registry_refuses_startup() {
+        let schema = ServerSchema::new(NUMBERED, "");
+        let model_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
+        let model =
+            ParserDB::parse::<PostgreSqlDialect>(&model_ddl).expect("the model catalog parses");
+        let refused =
+            require_one_numbering(&model, NUMBERED).expect_err("the two catalogs disagree");
+        assert!(
+            matches!(&refused, BuildError::CatalogMismatch { table } if table == "items"),
+            "{refused}"
         );
     }
 

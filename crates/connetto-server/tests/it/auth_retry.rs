@@ -24,6 +24,7 @@ use connetto_server::{
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture};
 use subql::backend::Postgres;
+use subql::visibility::openfga::OpenFgaError;
 use subql::visibility::{RowView, RowWrite, Verdict, VisibilityPolicy};
 use subql::{CdcSource, PgSqliteEmuSource};
 
@@ -320,4 +321,124 @@ async fn ingest_emits_auth_retry_events_and_broadcasts_pause_resume() {
     );
 
     ingest_handle.abort();
+}
+
+/// Auth policy whose `may_see` refuses for a reason fixed by the model, the
+/// one a changed row's table with no object in the model meets.
+struct UnnameableRows;
+
+impl VisibilityPolicy for UnnameableRows {
+    type Watcher = Arc<Principal>;
+    type Error = OpenFgaError;
+    type Backend = Postgres;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_see<R>(
+        &self,
+        _row: &R,
+        _watchers: &[Self::Watcher],
+        _verdicts: &mut [Verdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Err(OpenFgaError::RowCannotBeNamed)
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_write<R>(
+        &self,
+        _write: RowWrite<'_, R>,
+        _watcher: &Self::Watcher,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Allow)
+    }
+}
+
+/// A refusal the model fixes gives the same answer however often it is
+/// asked, so the ingest loop ends with it instead of holding the event and
+/// retrying without end. Retrying would pause every client's delivery for
+/// good while looking like an outage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refusal_the_model_fixes_ends_ingest_instead_of_retrying() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let fixture = Fixture::acquire().await;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL).build().expect("materializer"),
+        EmptySnapshot,
+        UnnameableRows,
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .build();
+
+    let (server_transport, mut client) = loopback();
+    let _server = tokio::spawn(manager.clone().serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-c")
+                .with_grant(connetto_core::messages::Grant::new("user:client-c")),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "items".to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM items"),
+        }))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    match client.recv().await.expect("recv") {
+        Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_))) => {}
+        other => panic!("expected snapshot patch, got {other:?}"),
+    }
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO items (id, data) VALUES (3, 'unnamed')")
+        .expect("execute dml");
+    let retries = AtomicU32::new(0);
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(&mut source, &mut |event| {
+            if matches!(event, ReconnectEvent::AuthRetrying { .. }) {
+                retries.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    )
+    .await
+    .expect("ingest ends on the refusal instead of retrying without end");
+    assert!(
+        matches!(&ended, Err(SessionError::AuthorizationUnanswerable { table, .. }) if table == "items"),
+        "the refusal ends ingest naming the table, got {ended:?}"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        0,
+        "a fixed refusal is never retried"
+    );
 }

@@ -176,7 +176,7 @@ async fn drive_cdc<S, A>(
 ) where
     S: SnapshotSource,
     A: VisibilityPolicy<Watcher = std::sync::Arc<connetto_core::Principal>, Backend = Postgres>,
-    A::Error: core::fmt::Display,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
 {
     source.execute_sql(sql).expect("execute dml");
     while let Some(item) = source.next_item().await.expect("poll source") {
