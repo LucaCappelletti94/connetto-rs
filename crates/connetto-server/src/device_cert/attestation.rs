@@ -1570,6 +1570,44 @@ mod tests {
         assert_eq!(level, AttestationLevel::AppAttested);
     }
 
+    /// A certificate carrying `content` as its App Attest nonce extension.
+    fn nonce_cert(content: Vec<u8>) -> Vec<u8> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+        let mut params = CertificateParams::new(vec!["credential".to_owned()]).expect("params");
+        params.custom_extensions = vec![CustomExtension::from_oid_content(super::NONCE, content)];
+        params
+            .self_signed(&key)
+            .expect("certificate")
+            .der()
+            .to_vec()
+    }
+
+    fn read_nonce(content: Vec<u8>) -> Option<Vec<u8>> {
+        let der = nonce_cert(content);
+        let (_, cert) = X509Certificate::from_der(&der).expect("parse");
+        super::nonce_extension(&cert)
+    }
+
+    #[test]
+    fn the_nonce_is_the_octet_string_inside_its_tag() {
+        let wrapped = der_tl(0x30, &der_tl(0xA1, &der_tl(0x04, &[9; 32])));
+        assert_eq!(read_nonce(wrapped), Some(vec![9; 32]));
+    }
+
+    #[test]
+    fn a_nonce_without_its_tag_is_refused() {
+        let bare = der_tl(0x30, &der_tl(0x04, &[9; 32]));
+        assert_eq!(read_nonce(bare), None);
+    }
+
+    #[test]
+    fn a_nonce_tag_with_trailing_bytes_is_refused() {
+        let mut inside = der_tl(0x04, &[9; 32]);
+        inside.push(0);
+        let trailing = der_tl(0x30, &der_tl(0xA1, &inside));
+        assert_eq!(read_nonce(trailing), None);
+    }
+
     /// An attestation an iPhone 15 Pro Max on iOS 26 made for the demo's
     /// development build, over the request it sent.
     const IPHONE_ATTESTATION: &[u8] = include_bytes!("testdata/iphone_app_attest.cbor");

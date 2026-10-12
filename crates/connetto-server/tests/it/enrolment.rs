@@ -560,6 +560,34 @@ async fn a_malformed_request_or_oversized_descriptor_is_refused() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_app_attestation_that_does_not_parse_is_refused() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let mut client = session(
+        &fixture,
+        Some("alice"),
+        Some(DeviceCertConfig::new(issuer().1)),
+        &store,
+    )
+    .await;
+    let handed = nonce(&mut client).await;
+    let reply = enrol_attested(
+        &mut client,
+        &device_key(),
+        handed,
+        None,
+        Vec::new(),
+        Some(DeviceAttestation::AppleAppAttest {
+            key_id: vec![1; 32],
+            attestation: b"not an attestation object".to_vec(),
+        }),
+    )
+    .await;
+    assert_eq!(reply, refused(EnrolRefusal::InvalidRequest, "e"));
+    assert_eq!(store.records(), Vec::new());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_renewal_keeps_the_attestation_level_the_first_enrolment_recorded() {
     let fixture = Fixture::acquire().await;
     let store = Arc::new(MemoryEnrolments::default());
