@@ -53,7 +53,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::OpenFgaServiceClient;
-use openfga_client::tonic::transport::Channel;
+use openfga_client::tonic::transport::{Channel, Endpoint};
 use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -358,21 +358,49 @@ impl TokenKeys {
     }
 }
 
+/// The time one call to the authorization service may run before it fails, so
+/// a stalled service cannot hold the change stream or a mutation without
+/// limit.
+pub const DEFAULT_AUTH_CALL_BUDGET: Duration = Duration::from_secs(5);
+
 /// The authorization endpoint and the store its model lands in.
 #[derive(Clone, Debug)]
 pub struct OpenFga {
     url: String,
     store: String,
+    call_budget: Duration,
 }
 
 impl OpenFga {
-    /// Name the endpoint and the store the deployment owns.
+    /// Name the endpoint and the store the deployment owns, with
+    /// [`DEFAULT_AUTH_CALL_BUDGET`] on every call.
     #[must_use]
     pub fn new(url: impl Into<String>, store: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             store: store.into(),
+            call_budget: DEFAULT_AUTH_CALL_BUDGET,
         }
+    }
+
+    /// Bound every call to the authorization service at `budget`, measured on
+    /// a monotonic clock. A call that runs longer fails, and the change path
+    /// holds the event and asks again, as it does for any unavailable answer.
+    #[must_use]
+    pub const fn with_call_budget(mut self, budget: Duration) -> Self {
+        self.call_budget = budget;
+        self
+    }
+
+    /// The endpoint every authorization call goes through, each call and each
+    /// connection attempt bounded by the call budget.
+    fn endpoint(&self) -> Result<Endpoint, BuildError> {
+        Ok(Channel::from_shared(self.url.clone())
+            .map_err(|err| {
+                BuildError::AuthorizationEndpoint(format!("parsing the endpoint: {err}"))
+            })?
+            .timeout(self.call_budget)
+            .connect_timeout(self.call_budget))
     }
 }
 
@@ -1559,16 +1587,12 @@ async fn build_authorization<D: ConnettoSchema>(
         .collect();
     preflight::require(owner_pool, &required).await?;
 
-    let channel = Channel::from_shared(openfga.url.clone())
-        .map_err(|err| BuildError::AuthorizationEndpoint(format!("parsing the endpoint: {err}")))?
-        .connect()
-        .await
-        .map_err(|err| {
-            BuildError::AuthorizationEndpoint(format!(
-                "connecting to the authorization service at {}: {err}",
-                openfga.url
-            ))
-        })?;
+    let channel = openfga.endpoint()?.connect().await.map_err(|err| {
+        BuildError::AuthorizationEndpoint(format!(
+            "connecting to the authorization service at {}: {err}",
+            openfga.url
+        ))
+    })?;
 
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated.install_model(&mut setup, &openfga.store).await?;
@@ -1982,6 +2006,45 @@ mod tests {
         assert!(
             matches!(&refused, BuildError::CatalogMismatch { table } if table == "items"),
             "{refused}"
+        );
+    }
+
+    /// A service that accepts the connection and never answers fails the call
+    /// at its budget, so the change path holds the event and asks again rather
+    /// than waiting without end.
+    #[tokio::test]
+    async fn a_stalled_authorization_service_fails_the_call_at_its_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let address = listener.local_addr().expect("the bound address");
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let budget = Duration::from_millis(200);
+        let openfga = OpenFga::new(format!("http://{address}"), "store").with_call_budget(budget);
+        let mut client = OpenFgaServiceClient::new(
+            openfga
+                .endpoint()
+                .expect("the endpoint parses")
+                .connect_lazy(),
+        );
+        let started = tokio::time::Instant::now();
+        let answer = client
+            .list_stores(openfga_client::client::ListStoresRequest::default())
+            .await;
+        let waited = started.elapsed();
+        held.abort();
+        assert!(
+            answer.is_err(),
+            "a service that never answers gives no answer"
+        );
+        assert!(
+            waited < budget * 10,
+            "the call ends at its budget, it waited {waited:?}"
         );
     }
 
