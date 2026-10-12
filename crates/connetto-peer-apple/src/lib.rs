@@ -43,7 +43,7 @@ pub enum Idiom {
 /// The device's user-set name, or `None` for the platform's generic answer.
 ///
 /// iOS answers the user's name only under the
-/// `com.apple.developer.device-information.user-selected-name` entitlement,
+/// `com.apple.developer.device-information.user-assigned-device-name` entitlement,
 /// and answers its generic model name without it, which this reads as `None`
 /// (R76 decision 17).
 pub fn device_name() -> Option<String> {

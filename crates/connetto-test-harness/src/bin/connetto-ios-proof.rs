@@ -46,6 +46,10 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
 use connetto_test_harness::ios_signing;
+use connetto_test_harness::peer_proof::{
+    HotspotOfferLines, JoinReport, commit, own_identity, read_hotspot_offer, summary,
+    wait_link_ends,
+};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
     TLS_CERT_VAR, TLS_KEY_VAR, demo_has_device_identity, demo_mobile_features, now_millis,
@@ -80,10 +84,6 @@ const ALERT_LABELS: [&str; 6] = ["Join", "Accedi", "Connetti", "Allow", "Consent
 /// The iOS development profile the tapper's runner signs with, as
 /// `connetto-ios-signing` names it.
 const TAPPER_PROFILE: &str = "connetto tapper development";
-/// The team the signing identity belongs to.
-const TEAM_ID: &str = "7W8527FJJE";
-/// The silence a link gets to end after the phones leave the hotspot.
-const LINK_END_BOUND: Duration = Duration::from_secs(120);
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -131,24 +131,42 @@ async fn main() -> Result<()> {
                         .context("a --every-join run names no --peer-device")?,
                     identity: identity.clone(),
                 };
-                let host_tapper = Tapper::build(target.udid(), &identity, &evidence).await?;
-                let joiner_tapper = Tapper::build(joiner.udid(), &identity, &evidence).await?;
                 let passphrase = parsed
                     .passphrase
                     .context("a --every-join run names no passphrase")?;
-                joins_with_summary(
-                    &target,
-                    &joiner,
-                    &app,
-                    &host_tapper,
-                    &joiner_tapper,
-                    &stack,
-                    &evidence,
-                    &passphrase,
-                    &sync_url,
-                    proved,
-                )
-                .await
+                // A tapper that does not build fails the joins' setup, which
+                // the summary records like any other.
+                let tappers = async {
+                    let host = Tapper::build(target.udid(), &identity, &evidence).await?;
+                    let joiner = Tapper::build(joiner.udid(), &identity, &evidence).await?;
+                    Ok::<_, anyhow::Error>((host, joiner))
+                }
+                .await;
+                match tappers {
+                    Ok((host_tapper, joiner_tapper)) => {
+                        joins_with_summary(
+                            &target,
+                            &joiner,
+                            &app,
+                            &host_tapper,
+                            &joiner_tapper,
+                            &stack,
+                            &evidence,
+                            &passphrase,
+                            &sync_url,
+                            proved,
+                        )
+                        .await
+                    }
+                    Err(err) => {
+                        let summary = summary(&commit().await, &proved, Err(&err), Ok(()));
+                        eprintln!("{summary}");
+                        tokio::fs::write(evidence.join("summary.txt"), &summary)
+                            .await
+                            .context("writing the summary")?;
+                        Err(err)
+                    }
+                }
             }
             Err(_) => outcome,
         }
@@ -578,10 +596,7 @@ impl Target {
         match self {
             Self::Simulator { .. } => {
                 let entitlements = evidence.join("simulator-entitlements.plist");
-                let team = match std::env::var(TEAM_ID_VAR) {
-                    Ok(team) => team,
-                    Err(_) => team_prefix().await?,
-                };
+                let team = signing_team().await?;
                 tokio::fs::write(&entitlements, simulator_entitlements(&team))
                     .await
                     .context("writing the simulator entitlements")?;
@@ -834,13 +849,6 @@ impl JoinBy {
     }
 }
 
-/// One join's result, for the run's summary.
-struct JoinReport {
-    join: JoinBy,
-    took: Duration,
-    outcome: Result<()>,
-}
-
 /// Make the joins, write the summary, and fail when any join failed.
 #[expect(
     clippy::too_many_arguments,
@@ -878,7 +886,7 @@ async fn joins_with_summary(
     if let Err(err) = joiner.copy_demo_log(evidence).await {
         eprintln!("the demo's log stayed on {}: {err:#}", joiner.udid());
     }
-    let summary = summary(&commit().await, &proved, reports.as_deref());
+    let summary = summary(&commit().await, &proved, reports.as_deref(), Ok(()));
     eprintln!("{summary}");
     tokio::fs::write(evidence.join("summary.txt"), &summary)
         .await
@@ -886,7 +894,7 @@ async fn joins_with_summary(
     let failed: Vec<&str> = reports?
         .iter()
         .filter(|report| report.outcome.is_err())
-        .map(|report| report.join.name())
+        .map(|report| report.name)
         .collect();
     if failed.is_empty() {
         Ok(())
@@ -1008,8 +1016,8 @@ async fn peer_proof(
                 .await;
         }
         reports.push(JoinReport {
-            join,
-            took: started.elapsed(),
+            name: join.name(),
+            took: Some(started.elapsed()),
             outcome,
         });
     }
@@ -1260,95 +1268,6 @@ async fn wait_for_single_nearby(app: &mut PageSession) -> Result<()> {
     }
 }
 
-/// The offer a hosting phone shows, its lines read off the page.
-struct HotspotOfferLines {
-    /// The hotspot's ssid.
-    ssid: String,
-    /// The hotspot's passphrase.
-    passphrase: String,
-    /// The host's peer port.
-    port: u16,
-    /// The offer as one `WIFI:` payload, where the page shows it.
-    payload: Option<String>,
-}
-
-/// The offer a hosting phone shows, its lines read off the page, bounded.
-async fn read_hotspot_offer(app: &mut PageSession) -> Result<HotspotOfferLines> {
-    app.wait_for_text("hotspot ssid: ", Duration::from_secs(45))
-        .await
-        .context("the host never showed its offer")?;
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        let page = app.page_text().await?;
-        if let Some(offer) = parse_offer_lines(&page) {
-            return Ok(offer);
-        }
-        if Instant::now() >= deadline {
-            bail!("the offer's lines never finished showing, the page shows:\n{page}");
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// The offer's lines off a page's text, all three present and the port a
-/// number, or none while they are not.
-fn parse_offer_lines(page: &str) -> Option<HotspotOfferLines> {
-    let line = |label: &str| -> Option<String> {
-        page.lines()
-            .find_map(|line| line.strip_prefix(label).map(|rest| rest.trim().to_owned()))
-    };
-    let ssid = line("hotspot ssid: ")?;
-    let passphrase = line("hotspot passphrase: ")?;
-    let port = line("hotspot port: ")?;
-    if port == "none" {
-        return None;
-    }
-    Some(HotspotOfferLines {
-        ssid,
-        passphrase,
-        port: port.parse::<u16>().ok()?,
-        payload: line("hotspot payload: "),
-    })
-}
-
-/// The page's own peer identity, `account/key prefix`, from its listening
-/// line, which the wait polls until the line carries it.
-async fn own_identity(app: &mut PageSession) -> Result<String> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let page = app.page_text().await?;
-        if let Some(identity) = page
-            .lines()
-            .find_map(|line| line.strip_prefix("peer: listening on "))
-            .and_then(|rest| rest.split_once(" as "))
-            .map(|(_, identity)| identity.trim().to_owned())
-        {
-            return Ok(identity);
-        }
-        if Instant::now() >= deadline {
-            bail!("the page names no peer identity");
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
-/// Wait for both pages to drop their linked lines, which the leave and stop
-/// end the link.
-async fn wait_link_ends(app: &mut PageSession, peer_app: &mut PageSession) -> Result<()> {
-    let deadline = Instant::now() + LINK_END_BOUND;
-    loop {
-        let host_page = app.page_text().await?;
-        let peer_page = peer_app.page_text().await?;
-        if !host_page.contains("linked: ") && !peer_page.contains("linked: ") {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("the link did not end after the phones left the hotspot");
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
-}
-
 /// The name of a paired device, which its Personal Hotspot uses as the
 /// network name.
 async fn device_name(udid: &str) -> Result<String> {
@@ -1378,61 +1297,6 @@ async fn device_name(udid: &str) -> Result<String> {
     bail!("no paired device with the udid {udid}")
 }
 
-/// The commit the run built, marked `-dirty` over local changes, and
-/// `unknown` where git does not answer.
-async fn commit() -> String {
-    let Ok(root) = repo_path(&[]) else {
-        return "unknown".to_owned();
-    };
-    match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["describe", "--always", "--dirty", "--abbrev=40"])
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        }
-        _ => "unknown".to_owned(),
-    }
-}
-
-/// The run's summary: the commit, the single-phone proof, and each join with
-/// its time and, where it failed, why.
-fn summary(
-    commit: &str,
-    (proof_took, proof): &(Duration, Result<(), String>),
-    joins: Result<&[JoinReport], &anyhow::Error>,
-) -> String {
-    let line = |name: &str, took: Duration, outcome: Result<(), String>| match outcome {
-        Ok(()) => format!("{name}: passed in {}s\n", took.as_secs()),
-        Err(err) => format!("{name}: failed in {}s: {err}\n", took.as_secs()),
-    };
-    let mut text = format!("commit: {commit}\n");
-    text += &line("single-phone proof", *proof_took, proof.clone());
-    match joins {
-        Ok(reports) => {
-            for report in reports {
-                text += &line(
-                    &format!("{} join", report.join.name()),
-                    report.took,
-                    report
-                        .outcome
-                        .as_ref()
-                        .map(drop)
-                        .map_err(|err| format!("{err:#}")),
-                );
-            }
-        }
-        Err(err) => {
-            use std::fmt::Write as _;
-            let _ = writeln!(text, "joins: not run, the setup failed: {err:#}");
-        }
-    }
-    text
-}
-
 /// The `XCUITest` tapper on one phone, which taps the system's alerts and
 /// switches Personal Hotspot where the demo and its page cannot.
 struct Tapper {
@@ -1449,6 +1313,7 @@ impl Tapper {
             repo_path(&["crates", "connetto-test-harness", "ios"])?.join("Tapper.xcodeproj");
         let derived = evidence.join(format!("tapper-{udid}"));
         step(&format!("build the tapper for {udid}"));
+        let team = signing_team().await?;
         let output = Command::new("xcodebuild")
             .arg("build-for-testing")
             .arg("-project")
@@ -1462,17 +1327,16 @@ impl Tapper {
             .arg("-derivedDataPath")
             .arg(&derived)
             .arg(format!("CODE_SIGN_IDENTITY={identity}"))
-            .arg(format!("DEVELOPMENT_TEAM={TEAM_ID}"))
+            .arg(format!("DEVELOPMENT_TEAM={team}"))
             .arg(format!("PROVISIONING_PROFILE_SPECIFIER={TAPPER_PROFILE}"))
             .output()
             .await
             .context("starting xcodebuild build-for-testing")?;
         if !output.status.success() {
-            let tail = String::from_utf8_lossy(&output.stderr)
-                .lines()
-                .take(40)
-                .collect::<Vec<_>>()
-                .join("\n");
+            let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&output.stderr));
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = lines[lines.len().saturating_sub(40)..].join("\n");
             bail!("xcodebuild build-for-testing failed:\n{tail}");
         }
         let products = derived.join("Build/Products");
@@ -1532,6 +1396,8 @@ impl Tapper {
             .arg(&run)
             .arg("-destination")
             .arg(format!("id={}", self.udid))
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true)
             .spawn()
             .context("starting xcodebuild test-without-building")?;
@@ -1725,6 +1591,15 @@ async fn xcrun(args: &[&str]) -> Result<String> {
 
 /// The organizational unit of the Mac's Apple Development certificate, which
 /// is the team prefix of the app's identifier.
+/// The team the run signs with, `CONNETTO_IOS_TEAM_ID` where it names one,
+/// and else the team of the keychain's Apple Development certificate.
+async fn signing_team() -> Result<String> {
+    match std::env::var(TEAM_ID_VAR) {
+        Ok(team) => Ok(team),
+        Err(_) => team_prefix().await,
+    }
+}
+
 async fn team_prefix() -> Result<String> {
     let pem = Command::new("security")
         .args(["find-certificate", "-c", "Apple Development", "-p"])
@@ -2010,7 +1885,6 @@ fn free_port() -> Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::organizational_unit;
-    use std::time::Duration;
 
     /// Both subject spellings `openssl x509 -subject` prints yield the team.
     #[test]
@@ -2026,46 +1900,6 @@ mod tests {
                 "subject= /UID=L3523U62Y2/CN=Apple Development/OU=7W8527FJJE/O=Someone/C=US"
             ),
             Some("7W8527FJJE")
-        );
-    }
-
-    /// The summary lists the commit, the single-phone proof, and each join
-    /// with its time and, where it failed, why.
-    #[test]
-    fn the_summary_names_every_step_and_why_a_join_failed() {
-        let reports = [
-            super::JoinReport {
-                join: super::JoinBy::Beacon,
-                took: Duration::from_secs(31),
-                outcome: Ok(()),
-            },
-            super::JoinReport {
-                join: super::JoinBy::Payload,
-                took: Duration::from_secs(95),
-                outcome: Err(anyhow::anyhow!(
-                    "the second phone never saw exactly one nearby host"
-                )),
-            },
-            super::JoinReport {
-                join: super::JoinBy::Form,
-                took: Duration::from_secs(21),
-                outcome: Ok(()),
-            },
-        ];
-        assert_eq!(
-            super::summary("c0626b2", &(Duration::from_secs(180), Ok(())), Ok(&reports)),
-            "commit: c0626b2\n\
-             single-phone proof: passed in 180s\n\
-             beacon join: passed in 31s\n\
-             payload join: failed in 95s: the second phone never saw exactly one nearby host\n\
-             form join: passed in 21s\n"
-        );
-        let setup = anyhow::anyhow!("devicectl install exited with 1");
-        assert_eq!(
-            super::summary("c0626b2", &(Duration::from_secs(180), Ok(())), Err(&setup)),
-            "commit: c0626b2\n\
-             single-phone proof: passed in 180s\n\
-             joins: not run, the setup failed: devicectl install exited with 1\n"
         );
     }
 
@@ -2140,28 +1974,6 @@ mod tests {
         ] {
             assert!(super::parse_arguments(&broken).is_err(), "{broken:?}");
         }
-    }
-
-    /// The offer's lines parse off a page's text, and an unfinished offer
-    /// stays none.
-    #[test]
-    fn the_offer_lines_are_read_off_the_page() {
-        let page = "\npeer: listening on 41234\n\
-            hotspot ssid: iPhone di Luca\n\
-            hotspot passphrase: s3cr3t pass\n\
-            hotspot port: 41234\n\
-            hotspot payload: WIFI:T:WPA;S:iPhone di Luca;P:s3cr3t pass;X:41234;;\n\
-            hotspot: hosting\n";
-        let offer = super::parse_offer_lines(page).expect("all three lines are there");
-        assert_eq!(offer.ssid, "iPhone di Luca");
-        assert_eq!(offer.passphrase, "s3cr3t pass");
-        assert_eq!(offer.port, 41234);
-        assert_eq!(
-            offer.payload.as_deref(),
-            Some("WIFI:T:WPA;S:iPhone di Luca;P:s3cr3t pass;X:41234;;")
-        );
-        assert!(super::parse_offer_lines("hotspot ssid: only\n").is_none());
-        assert!(super::parse_offer_lines("hotspot port: none\n").is_none());
     }
 
     /// The tapper's arguments write into each test target's

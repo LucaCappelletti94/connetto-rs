@@ -510,8 +510,8 @@ async fn ensure_capabilities(api: &Api, bundle: &str) -> Result<()> {
         .await?;
     let mut have = std::collections::BTreeSet::new();
     for item in found["data"].as_array().into_iter().flatten() {
-        if let Some(id) = item["id"].as_str() {
-            have.insert(id.to_owned());
+        if let Some(kind) = item["attributes"]["capabilityType"].as_str() {
+            have.insert(kind.to_owned());
         }
     }
     let missing: Vec<&str> = CAPABILITIES
@@ -580,10 +580,9 @@ async fn ensure_devices(api: &Api) -> Result<Vec<String>> {
         let Some(udid) = hardware["udid"].as_str() else {
             continue;
         };
-        // devicectl also lists the simulators, whose five-group CoreDevice
-        // UUID the portal rejects, beside the physical phones, whose udid
-        // is two groups of hex.
-        if udid.matches('-').count() != 1 {
+        // devicectl also lists the simulators, which the portal rejects,
+        // beside the physical phones.
+        if hardware["reality"] != "physical" {
             continue;
         }
         let name = device["deviceProperties"]["name"].as_str().unwrap_or(udid);

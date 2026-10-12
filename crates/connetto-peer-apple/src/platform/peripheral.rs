@@ -185,7 +185,13 @@ pub(crate) fn notify(device: u64, bytes: &[u8]) -> Result<(), Error> {
         let Some(central) = standing.centrals.get(&device) else {
             return Err(not_connected());
         };
-        if send_frame(manager, outbox, central, &frame) {
+        // A frame queued behind held ones keeps its place, so the central
+        // reads them in order.
+        let queued = standing
+            .held
+            .get(&device)
+            .is_some_and(|held| !held.is_empty());
+        if !queued && send_frame(manager, outbox, central, &frame) {
             Ok(())
         } else {
             standing.held.entry(device).or_default().push_back(frame);
@@ -240,23 +246,10 @@ fn ensure_manager(recreate: bool, power_alert: bool) {
 /// stands.
 fn options(power_alert: bool) -> Retained<NSDictionary<NSString, AnyObject>> {
     let value = NSNumber::new_bool(power_alert);
-    // SAFETY: the platform's power-alert key is a valid string object the
-    // platform owns for the process, so the reference stands for this call.
-    let key: &ProtocolObject<dyn NSCopying> =
-        unsafe { ProtocolObject::from_ref(CBPeripheralManagerOptionShowPowerAlertKey) };
-    let objects =
-        [NonNull::new(Retained::as_ptr(&value).cast::<AnyObject>() as *mut AnyObject).unwrap()];
-    let keys = [NonNull::from(key)];
-    // SAFETY: the value is a valid number and the key a valid string, each
-    // alive for this call, so the platform's dictionary answers one valid
-    // pair the caller owns.
-    unsafe {
-        NSDictionary::<NSString, AnyObject>::dictionaryWithObjects_forKeys_count(
-            &objects[0] as *const _ as *mut _,
-            &keys[0] as *const _ as *mut _,
-            1,
-        )
-    }
+    // SAFETY: the platform's power-alert key is an immutable string the
+    // platform owns for the process.
+    let key: &NSString = unsafe { CBPeripheralManagerOptionShowPowerAlertKey };
+    NSDictionary::from_slices(&[key], &[value.as_ref()])
 }
 
 /// The advertisement's data, the service's UUID alone (R76 decision 25).
@@ -674,20 +667,25 @@ define_class!(
             let Some(outbox) = outbox else {
                 return;
             };
-            for (device, frames) in held {
+            for (device, mut frames) in held {
                 let Some(central) = centrals.get(&device) else {
                     continue;
                 };
-                let mut remaining = VecDeque::new();
-                for frame in frames {
-                    if send_frame(peripheral, &outbox, central, &frame) {
-                        continue;
+                // The frames go in order until the platform's queue fills,
+                // and every frame not sent stays held, ahead of any held
+                // since the take.
+                while let Some(frame) = frames.pop_front() {
+                    if !send_frame(peripheral, &outbox, central, &frame) {
+                        frames.push_front(frame);
+                        break;
                     }
-                    remaining.push_back(frame);
-                    break;
                 }
-                if !remaining.is_empty() {
-                    STANDING.lock().held.insert(device, remaining);
+                if !frames.is_empty() {
+                    let mut standing = STANDING.lock();
+                    if let Some(later) = standing.held.remove(&device) {
+                        frames.extend(later);
+                    }
+                    standing.held.insert(device, frames);
                 }
             }
         }
