@@ -43,9 +43,11 @@ type Queue = Arc<Mutex<Vec<CentralEvent>>>;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CentralError {
     /// The platform's preparation of btleplug's thread failed.
+    #[cfg(target_os = "android")]
     #[error("btleplug's thread could not be prepared: {0}")]
     Prepare(String),
     /// The virtual machine refused a call while the thread was prepared.
+    #[cfg(target_os = "android")]
     #[error("the virtual machine refused: {0}")]
     Jni(#[from] connetto_peer_android::jni::errors::Error),
     /// btleplug refused a call.
@@ -179,6 +181,13 @@ fn prepare_thread() -> Result<(), CentralError> {
     })
 }
 
+/// The thread needs no preparation off Android, where btleplug is plain
+/// CoreBluetooth (R76).
+#[cfg(not(target_os = "android"))]
+fn prepare_thread() -> Result<(), CentralError> {
+    Ok(())
+}
+
 /// The thread's loop: the machine's commands against btleplug, and
 /// btleplug's events back to the machine, until the client drops its end.
 async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>, queue: Queue) {
@@ -197,7 +206,15 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 let Some(command) = command else { break };
                 match command {
                     Command::StartScan => {
-                        if let Err(err) = adapter.start_scan(ScanFilter::default()).await {
+                        // iOS scans only connetto's service (R76 decision
+                        // 25), Android scans wide.
+                        #[cfg(target_os = "ios")]
+                        let filter = ScanFilter {
+                            services: vec![Uuid::from_bytes(SERVICE_UUID)],
+                        };
+                        #[cfg(not(target_os = "ios"))]
+                        let filter = ScanFilter::default();
+                        if let Err(err) = adapter.start_scan(filter).await {
                             tracing::warn!(%err, "the scan did not start");
                         }
                     }
@@ -243,7 +260,31 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                         };
                         let rssi = rssi_of(&adapter, &id).await;
                         let host = hosts.host(id);
-                        push(&queue, CentralEvent::Seen { host, service_data: data.clone(), rssi });
+                        push(
+                            &queue,
+                            CentralEvent::Seen {
+                                host,
+                                service_data: Some(data.clone()),
+                                rssi,
+                            },
+                        );
+                    }
+                    // The advert carries connetto's UUID alone, the
+                    // iPhone's beacon (R76 decision 25).
+                    BtEvent::ServicesAdvertisement { id, services } => {
+                        if !services.contains(&Uuid::from_bytes(SERVICE_UUID)) {
+                            continue;
+                        }
+                        let rssi = rssi_of(&adapter, &id).await;
+                        let host = hosts.host(id);
+                        push(
+                            &queue,
+                            CentralEvent::Seen {
+                                host,
+                                service_data: None,
+                                rssi,
+                            },
+                        );
                     }
                     BtEvent::DeviceDisconnected(id) => {
                         if let Some(host) = hosts.known(&id) && links.remove(&host).is_some() {

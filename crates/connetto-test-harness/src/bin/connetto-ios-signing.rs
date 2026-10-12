@@ -31,11 +31,16 @@ use serde_json::{Value, json};
 use tokio::process::Command;
 
 const BUNDLE: &str = "dev.connetto.dioxusdemo";
-/// The two development profiles, for iOS and for this Mac.
+/// The app id the tapper's test runner signs with, which `xcodebuild`
+/// derives from the test bundle's id plus the `xctrunner` suffix.
+const TAPPER_BUNDLE: &str = "dev.connetto.dioxusdemo.tapper.xctrunner";
+/// The three development profiles, for iOS and for this Mac, and one for
+/// the tapper's runner.
 #[derive(Clone, Copy)]
 enum Profile {
     Ios,
     Mac,
+    Tapper,
 }
 
 impl Profile {
@@ -43,20 +48,21 @@ impl Profile {
         match self {
             Self::Ios => "connetto dioxus demo development",
             Self::Mac => "connetto dioxus demo macos development",
+            Self::Tapper => "connetto tapper development",
         }
     }
 
     const fn kind(self) -> &'static str {
         match self {
-            Self::Ios => "IOS_APP_DEVELOPMENT",
+            Self::Ios | Self::Tapper => "IOS_APP_DEVELOPMENT",
             Self::Mac => "MAC_APP_DEVELOPMENT",
         }
     }
 
     const fn extension(self) -> &'static str {
         match self {
-            Self::Ios => "mobileprovision",
             Self::Mac => "provisionprofile",
+            Self::Ios | Self::Tapper => "mobileprovision",
         }
     }
 }
@@ -71,6 +77,7 @@ async fn main() -> Result<()> {
     let keychain = Keychain::open(&dir).await?;
     let certificate = ensure_certificate(&api, &keychain, &dir).await?;
     let bundle = ensure_bundle(&api).await?;
+    ensure_capabilities(&api, &bundle).await?;
     let devices = ensure_devices(&api).await?;
     let profile = ensure_profile(&api, &bundle, &certificate, &devices, Profile::Ios).await?;
     eprintln!(
@@ -78,6 +85,16 @@ async fn main() -> Result<()> {
         profile.display(),
         devices.len()
     );
+    let tapper_bundle = ensure_tapper_bundle(&api).await?;
+    let profile = ensure_profile(
+        &api,
+        &tapper_bundle,
+        &certificate,
+        &devices,
+        Profile::Tapper,
+    )
+    .await?;
+    eprintln!("profile {} covers the tapper", profile.display());
     let mac = ensure_this_mac(&api).await?;
     let profile = ensure_profile(&api, &bundle, &certificate, &[mac], Profile::Mac).await?;
     eprintln!("profile {} covers this Mac", profile.display());
@@ -439,14 +456,24 @@ async fn account_certificate_for(api: &Api, key: &Path) -> Result<Option<(String
 
 /// The id of the demo's bundle identifier, registered when missing.
 async fn ensure_bundle(api: &Api) -> Result<String> {
+    ensure_bundle_id(api, BUNDLE, "connetto dioxus demo").await
+}
+
+/// The id of the tapper's runner app id, registered when missing.
+async fn ensure_tapper_bundle(api: &Api) -> Result<String> {
+    ensure_bundle_id(api, TAPPER_BUNDLE, "connetto tapper runner").await
+}
+
+/// The id of a bundle identifier, registered when missing.
+async fn ensure_bundle_id(api: &Api, identifier: &str, name: &str) -> Result<String> {
     let found = api
-        .get(&format!("bundleIds?filter[identifier]={BUNDLE}"))
+        .get(&format!("bundleIds?filter[identifier]={identifier}"))
         .await?;
     if let Some(bundle) = found["data"]
         .as_array()
         .into_iter()
         .flatten()
-        .find(|bundle| bundle["attributes"]["identifier"] == BUNDLE)
+        .find(|bundle| bundle["attributes"]["identifier"] == identifier)
     {
         return Ok(bundle["id"]
             .as_str()
@@ -457,8 +484,8 @@ async fn ensure_bundle(api: &Api) -> Result<String> {
         .post(
             "bundleIds",
             &json!({ "data": { "type": "bundleIds", "attributes": {
-                "identifier": BUNDLE,
-                "name": "connetto dioxus demo",
+                "identifier": identifier,
+                "name": name,
                 "platform": "IOS",
             } } }),
         )
@@ -467,6 +494,64 @@ async fn ensure_bundle(api: &Api) -> Result<String> {
         .as_str()
         .context("a bundle without an id")?
         .to_owned())
+}
+
+/// The capability types the bundle id must carry so its profiles hold the
+/// App Attest and Hotspot entitlements.
+const CAPABILITIES: [&str; 2] = ["APP_ATTEST", "HOT_SPOT"];
+
+/// Every capability the bundle id must carry, written through the API,
+/// which replaces the whole set, so the existing capabilities go out with
+/// the missing ones. Where the API is read-only it names the portal step,
+/// since the profile takes its entitlements from the bundle id.
+async fn ensure_capabilities(api: &Api, bundle: &str) -> Result<()> {
+    let found = api
+        .get(&format!("bundleIds/{bundle}/bundleIdCapabilities"))
+        .await?;
+    let mut have = std::collections::BTreeSet::new();
+    for item in found["data"].as_array().into_iter().flatten() {
+        if let Some(id) = item["id"].as_str() {
+            have.insert(id.to_owned());
+        }
+    }
+    let missing: Vec<&str> = CAPABILITIES
+        .iter()
+        .copied()
+        .filter(|capability| !have.contains(*capability))
+        .collect();
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let wanted: Vec<&str> = have
+        .iter()
+        .map(String::as_str)
+        .chain(CAPABILITIES.iter().copied())
+        .collect();
+    let data: Vec<Value> = wanted
+        .iter()
+        .map(|id| json!({ "type": "bundleIdCapabilities", "id": id }))
+        .collect();
+    match api
+        .post(
+            &format!("bundleIds/{bundle}/relationships/bundleIdCapabilities"),
+            &json!({ "data": data }),
+        )
+        .await
+    {
+        Ok(_) => {
+            for capability in &missing {
+                eprintln!("capability {capability} enabled on the bundle id");
+            }
+            Ok(())
+        }
+        Err(err) if err.to_string().contains("does not allow 'CREATE'") => {
+            eprintln!(
+                "the API keeps the bundle id's capabilities read-only, so enable App Attest and Personal Hotspot on the App ID `{BUNDLE}` at developer.apple.com. The profile takes the entitlements from the bundle id, and the joiner's NEHotspotConfiguration join refuses without the Hotspot one"
+            );
+            Ok(())
+        }
+        Err(err) => Err(err).context("writing the bundle id's capabilities"),
+    }
 }
 
 /// The ids of every iPhone and iPad paired with this Mac, registered when
@@ -495,6 +580,12 @@ async fn ensure_devices(api: &Api) -> Result<Vec<String>> {
         let Some(udid) = hardware["udid"].as_str() else {
             continue;
         };
+        // devicectl also lists the simulators, whose five-group CoreDevice
+        // UUID the portal rejects, beside the physical phones, whose udid
+        // is two groups of hex.
+        if udid.matches('-').count() != 1 {
+            continue;
+        }
         let name = device["deviceProperties"]["name"].as_str().unwrap_or(udid);
         let found = api.get(&format!("devices?filter[udid]={udid}")).await?;
         let id = if let Some(id) = found["data"][0]["id"].as_str() {
@@ -627,7 +718,40 @@ async fn ensure_profile(
     tokio::fs::create_dir_all(&folder).await?;
     let path = folder.join(format!("{uuid}.{}", profile.extension()));
     tokio::fs::write(&path, content).await?;
+    remove_stale_profiles(&folder, profile, &path).await?;
     Ok(path)
+}
+
+/// Remove the folder's other copies of the profile, the generations the
+/// portal deleted, among which `dx` would otherwise pick one.
+async fn remove_stale_profiles(folder: &Path, profile: Profile, keep: &Path) -> Result<()> {
+    let mut entries = tokio::fs::read_dir(folder).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        let path = entry.path();
+        if path == keep
+            || path.extension().and_then(|ext| ext.to_str()) != Some(profile.extension())
+        {
+            continue;
+        }
+        let Some(file) = path.to_str() else {
+            continue;
+        };
+        let Ok(decoded) = run("security", &["cms", "-D", "-i", file]).await else {
+            continue;
+        };
+        if profile_name(&decoded) == Some(profile.name()) {
+            eprintln!("removing the stale profile {}", path.display());
+            tokio::fs::remove_file(&path).await?;
+        }
+    }
+    Ok(())
+}
+
+/// The `Name` of a decoded profile's property list.
+fn profile_name(plist: &str) -> Option<&str> {
+    let (_, after) = plist.split_once("<key>Name</key>")?;
+    let (_, value) = after.split_once("<string>")?;
+    value.split_once("</string>").map(|(name, _)| name)
 }
 
 async fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -655,4 +779,24 @@ async fn run(program: &str, args: &[&str]) -> Result<String> {
         );
     }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::profile_name;
+
+    #[test]
+    fn a_profile_name_is_the_string_after_its_key() {
+        let plist = "<dict>\n\t<key>AppIDName</key>\n\t<string>XC dev connetto</string>\n\t<key>Name</key>\n\t<string>connetto dioxus demo development</string>\n\t<key>TeamName</key>\n\t<string>Luca</string>\n</dict>";
+        assert_eq!(
+            profile_name(plist),
+            Some("connetto dioxus demo development")
+        );
+    }
+
+    #[test]
+    fn a_plist_without_a_name_has_none() {
+        let plist = "<dict>\n\t<key>AppIDName</key>\n\t<string>XC dev connetto</string>\n</dict>";
+        assert_eq!(profile_name(plist), None);
+    }
 }

@@ -472,6 +472,39 @@ impl EnrolHandle {
         }
     }
 
+    /// Host this device's personal hotspot under its typed details, its
+    /// beacon's outcome beside the offer, within the machines' bounds (R76
+    /// decision 26).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn host_personal_hotspot(
+        &self,
+        ssid: &str,
+        passphrase: &str,
+    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
+        let (reply, answer) = oneshot::channel();
+        self.bluetooth
+            .send(crate::bluetooth::Command::PersonalHost {
+                ssid: ssid.to_owned(),
+                passphrase: passphrase.to_owned(),
+                caller: reply,
+            })
+            .map_err(|_| HotspotError::Failed)?;
+        match tokio::time::timeout(HOST_BOUND + PROMPT_BOUND + MARGIN, answer).await {
+            Ok(Ok(hosted)) => hosted,
+            Ok(Err(_)) => Err(HotspotError::Failed),
+            Err(_) => Err(HotspotError::TimedOut),
+        }
+    }
+
+    /// The personal hotspot's landing bound, started when an exchange
+    /// hands the offer out (R76 decision 26).
+    #[cfg(feature = "peer")]
+    pub(crate) fn personal_offer_handed_out(&self) {
+        let _ = self
+            .hotspot
+            .send(crate::hotspot::Command::PersonalOfferHandedOut);
+    }
+
     /// Stop hosting, or cancel the pending request (R76).
     #[cfg(feature = "peer")]
     pub(crate) fn stop_hotspot(&self) {
@@ -520,13 +553,14 @@ impl EnrolHandle {
         }
     }
 
-    /// Join the nearby host's hotspot through the exchange, within the
-    /// machines' bounds (R76 decision 19).
+    /// Join the nearby host's hotspot through the exchange, answered with
+    /// its proved identity and the network's gateway, within the machines'
+    /// bounds (R76 decisions 19 and 25).
     #[cfg(feature = "peer")]
     pub(crate) async fn join_nearby(
         &self,
         host: &HostId,
-    ) -> Result<std::net::IpAddr, JoinNearbyError> {
+    ) -> Result<(DeviceIdentity, std::net::IpAddr), JoinNearbyError> {
         let (reply, answer) = oneshot::channel();
         self.bluetooth
             .send(crate::bluetooth::Command::JoinNearby { host: *host, reply })
@@ -542,10 +576,14 @@ impl EnrolHandle {
         }
     }
 
-    /// Fetch the nearby host's offer through the exchange, within the
-    /// machine's bound (R76 decision 19).
+    /// Fetch the nearby host's offer through the exchange, answered with
+    /// its proved identity, within the machine's bound (R76 decisions 19
+    /// and 25).
     #[cfg(feature = "peer")]
-    pub(crate) async fn fetch_offer(&self, host: &HostId) -> Result<HotspotOffer, BluetoothError> {
+    pub(crate) async fn fetch_offer(
+        &self,
+        host: &HostId,
+    ) -> Result<(DeviceIdentity, HotspotOffer), BluetoothError> {
         let (reply, answer) = oneshot::channel();
         self.bluetooth
             .send(crate::bluetooth::Command::Fetch { host: *host, reply })

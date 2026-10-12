@@ -864,7 +864,11 @@ where
                                 None => Arc::new(crate::hotspot::UnsupportedBackend),
                             }
                         }
-                        #[cfg(not(target_os = "android"))]
+                        #[cfg(target_os = "ios")]
+                        {
+                            Arc::new(crate::hotspot::AppleHotspotBackend::new())
+                        }
+                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
                         {
                             Arc::new(crate::hotspot::UnsupportedBackend)
                         }
@@ -927,36 +931,31 @@ where
                         Some(java) => {
                             let backend =
                                 Arc::new(crate::bluetooth::AndroidBluetoothBackend::new(java));
-                            // btleplug's central, started once
-                            // Bluetooth reads Ready and retried where
-                            // its start fails (R76 decision 22).
-                            let bt_starter: crate::bluetooth::CentralStarter =
-                                Arc::new(move || -> crate::bluetooth::CentralStart {
-                                    Box::pin(async move {
-                                        crate::bluetooth::BtleplugCentral::start()
-                                            .await
-                                            .map(|central| {
-                                                Arc::new(central)
-                                                    as Arc<dyn crate::bluetooth::CentralBackend>
-                                            })
-                                            .map_err(|err| err.to_string())
-                                    })
-                                });
                             (
                                 Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
                                 Arc::clone(&backend)
                                     as Arc<dyn crate::bluetooth::PeripheralBackend>,
-                                Some(bt_starter),
+                                Some(crate::bluetooth::btleplug_starter()),
                             )
                         }
                         None => crate::bluetooth::unsupported_backends(),
                     };
-                    #[cfg(not(target_os = "android"))]
+                    #[cfg(target_os = "ios")]
+                    let (bt_readiness, bt_peripheral, bt_starter) = {
+                        let backend = Arc::new(crate::bluetooth::AppleBluetoothBackend::new());
+                        (
+                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                            Arc::clone(&backend) as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                            Some(crate::bluetooth::btleplug_starter()),
+                        )
+                    };
+                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     let (bt_readiness, bt_peripheral, bt_starter) =
                         crate::bluetooth::unsupported_backends();
                     let bt_state = Arc::clone(&bt_readiness);
                     let serving_handle = handle.clone();
                     let join_handle = handle.clone();
+                    let handed_handle = handle.clone();
                     let beacon_node = peer_node.clone();
                     let bt_machine = crate::bluetooth::Machine::new(
                         bt_readiness,
@@ -979,6 +978,10 @@ where
                         }),
                         Arc::new(move |event: ClientEvent| {
                             let _ = event_sender_bt.send(event);
+                        }),
+                        Arc::new({
+                            let handle = handed_handle;
+                            move || handle.personal_offer_handed_out()
                         }),
                     );
                     (
@@ -1239,6 +1242,45 @@ where
         }
     }
 
+    /// Host this device's personal hotspot under the caller's typed
+    /// details, the beacon's outcome beside the offer, within the
+    /// machines' bounds (R76 decision 26).
+    ///
+    /// # Errors
+    ///
+    /// [`HotspotError::Unsupported`] on a system without a personal
+    /// hotspot or for a build without a device identity,
+    /// [`HotspotError::Incompatible`] on a model that cannot host, and
+    /// [`HotspotError::TimedOut`] when the answer does not stand within
+    /// its bound. The beacon's refusal stands beside the offer on the
+    /// success.
+    #[cfg(feature = "peer")]
+    pub async fn host_personal_hotspot(
+        &self,
+        ssid: &str,
+        passphrase: &str,
+    ) -> Result<crate::bluetooth::Hosted, HotspotError> {
+        match &self.device {
+            Some(device) => device.host_personal_hotspot(ssid, passphrase).await,
+            None => Err(HotspotError::Unsupported),
+        }
+    }
+
+    /// The personal hotspot's network name, where the platform answers one
+    /// (R76 decision 26).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn personal_hotspot_name(&self) -> Option<String> {
+        #[cfg(target_os = "ios")]
+        {
+            connetto_peer_apple::device_name()
+        }
+        #[cfg(not(target_os = "ios"))]
+        {
+            None
+        }
+    }
+
     /// Stop hosting, or cancel the pending request (R76).
     ///
     /// A no-op on a system without a hotspot or for a build without a device
@@ -1331,8 +1373,9 @@ where
         }
     }
 
-    /// Join the nearby host's hotspot through the exchange, within the
-    /// machines' bounds (R76 decision 19).
+    /// Join the nearby host's hotspot through the exchange, answered with
+    /// the host's proved identity and the network's gateway, within the
+    /// machines' bounds (R76 decisions 19 and 25).
     ///
     /// # Errors
     ///
@@ -1343,7 +1386,10 @@ where
     pub async fn join_nearby(
         &self,
         host: &crate::bluetooth::HostId,
-    ) -> Result<std::net::IpAddr, crate::bluetooth::JoinNearbyError> {
+    ) -> Result<
+        (connetto_core::device_cert::DeviceIdentity, std::net::IpAddr),
+        crate::bluetooth::JoinNearbyError,
+    > {
         match &self.device {
             Some(device) => device.join_nearby(host).await,
             None => Err(crate::bluetooth::JoinNearbyError::Bluetooth(
@@ -1352,8 +1398,9 @@ where
         }
     }
 
-    /// Fetch the nearby host's offer through the exchange, within the
-    /// machine's bound (R76 decision 19).
+    /// Fetch the nearby host's offer through the exchange, answered with
+    /// the host's proved identity, within the machine's bound (R76
+    /// decisions 19 and 25).
     ///
     /// # Errors
     ///
@@ -1365,7 +1412,10 @@ where
     pub async fn fetch_offer(
         &self,
         host: &crate::bluetooth::HostId,
-    ) -> Result<HotspotOffer, crate::bluetooth::BluetoothError> {
+    ) -> Result<
+        (connetto_core::device_cert::DeviceIdentity, HotspotOffer),
+        crate::bluetooth::BluetoothError,
+    > {
         match &self.device {
             Some(device) => device.fetch_offer(host).await,
             None => Err(crate::bluetooth::BluetoothError::Unsupported),

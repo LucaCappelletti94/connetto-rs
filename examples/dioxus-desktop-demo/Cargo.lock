@@ -1219,12 +1219,14 @@ dependencies = [
  "connetto-core",
  "connetto-peer",
  "connetto-peer-android",
+ "connetto-peer-apple",
  "connetto-schema",
  "core-foundation",
  "diesel",
  "diesel-sqlite-session",
  "futures-util",
  "getrandom 0.3.4",
+ "if-addrs",
  "ipnet",
  "jni 0.21.1",
  "js-sys",
@@ -1329,6 +1331,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1417,6 +1420,24 @@ version = "0.0.0"
 dependencies = [
  "jni 0.22.4",
  "manganis",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "connetto-peer-apple"
+version = "0.0.0"
+dependencies = [
+ "block2",
+ "connetto-peer",
+ "dispatch2",
+ "if-addrs",
+ "libc",
+ "objc2",
+ "objc2-core-bluetooth",
+ "objc2-foundation",
+ "objc2-network-extension",
+ "objc2-ui-kit",
+ "parking_lot",
  "thiserror 2.0.20",
 ]
 
@@ -5555,6 +5576,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "79b30b9eacc37434a61377866f68b27acef9fa5496f25cc9ca8b2549032e0394"
 dependencies = [
  "bitflags 2.13.2",
+ "dispatch2",
  "objc2",
  "objc2-foundation",
 ]
@@ -5624,6 +5646,17 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e48e0b8b339e0d9d2ed4416b7f93f9d4daadff7d4dd797f89867cde11aeac607"
 dependencies = [
+ "objc2",
+ "objc2-foundation",
+]
+
+[[package]]
+name = "objc2-network-extension"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9126ecdaea052ce2a6b7a894303d0806368b92c77165052da1c3eb52d9e5f9b1"
+dependencies = [
+ "block2",
  "objc2",
  "objc2-foundation",
 ]

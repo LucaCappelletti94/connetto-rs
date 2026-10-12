@@ -44,6 +44,8 @@ base64 = "0.22"
 robius-directories = "6"
 # Sign-in through the platform's in-app browser tab and the app's own redirect.
 connetto-auth-session = { path = "../../crates/connetto-auth-session" }
+# The writer that sends a phone build's log to stdout and its log file.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 # Windows Hello prompts over the demo's window (R53).
 [target.'cfg(target_os = "windows")'.dependencies]

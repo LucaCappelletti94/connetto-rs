@@ -16,6 +16,7 @@ members = [
   "crates/connetto-app-attest",
   "crates/connetto-peer",
   "crates/connetto-peer-android",
+  "crates/connetto-peer-apple",
   # The documents and the build-time translation every browser demo shares.
   # A member rather than an exclusion, so the root gate lints it with the rest.
   "examples/deployment",
