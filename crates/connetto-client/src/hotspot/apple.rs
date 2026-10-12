@@ -27,9 +27,31 @@ pub(crate) struct AppleHotspotBackend {
     /// The interface's address when the join was asked, which a joined
     /// network replaces.
     before: RwLock<Option<std::net::Ipv4Addr>>,
+    /// The offer the join side last asked for, when, and whether it was
+    /// asked once more (R76 decision 28).
+    asked: RwLock<Option<(HotspotOffer, tokio::time::Instant, bool)>>,
 }
 
 impl AppleHotspotBackend {
+    /// Ask the system for the network once more where decision 28's rule
+    /// says the first ask landed nowhere.
+    fn rejoin_if_due(&self, answered: bool, landed: bool) {
+        let mut asked = self.asked.write();
+        let Some((offer, at, again)) = asked.as_mut() else {
+            return;
+        };
+        if !super::rejoin_due(answered, landed, at.elapsed(), *again) {
+            return;
+        }
+        *again = true;
+        tracing::debug!(ssid = %offer.ssid, "the joined network never landed, asking once more");
+        if let Err(err) =
+            apple::hotspot::join(&offer.ssid, &offer.passphrase, security(offer.security))
+        {
+            tracing::debug!(?err, "the second ask for the network was refused");
+        }
+    }
+
     /// The backend's new.
     pub(crate) fn new() -> Self {
         Self {
@@ -37,6 +59,7 @@ impl AppleHotspotBackend {
             joined_ssid: RwLock::new(None),
             was_available: RwLock::new(false),
             before: RwLock::new(None),
+            asked: RwLock::new(None),
         }
     }
 }
@@ -89,6 +112,7 @@ impl HotspotBackend for AppleHotspotBackend {
         *self.before.write() = apple::hotspot::joined().map(|joined| joined.address);
         match apple::hotspot::join(&offer.ssid, &offer.passphrase, security(offer.security)) {
             Ok(()) => {
+                *self.asked.write() = Some((offer.clone(), tokio::time::Instant::now(), false));
                 *self.joined_ssid.write() = Some(offer.ssid.clone());
                 *self.was_available.write() = false;
                 Ok(())
@@ -98,6 +122,7 @@ impl HotspotBackend for AppleHotspotBackend {
     }
 
     fn leave_join(&self) {
+        *self.asked.write() = None;
         let ssid = self.joined_ssid.write().take();
         if let Some(ssid) = ssid {
             let _ = apple::hotspot::leave(&ssid);
@@ -125,6 +150,7 @@ impl HotspotBackend for AppleHotspotBackend {
             }
             None => false,
         };
+        self.rejoin_if_due(joining.is_some(), landed);
         match joined {
             // The network is up once its address and its gateway stand; a
             // missing gateway stays pending for the machine's bound.

@@ -754,9 +754,43 @@ impl Machine {
         self.join = JoinState::Idle;
     }
 }
+
+/// How long an Apple join the system answered gets to move the interface
+/// before it is asked for once more (R76 decision 28).
+pub(crate) const REJOIN_AFTER: Duration = Duration::from_secs(15);
+
+/// Whether an Apple join is due its one more ask: the system answered it,
+/// the interface has not moved, [`REJOIN_AFTER`] has passed since the ask,
+/// and the join has not been asked twice (R76 decision 28).
+#[cfg_attr(
+    not(any(target_os = "ios", test)),
+    expect(dead_code, reason = "only the Apple backend asks a join twice")
+)]
+pub(crate) fn rejoin_due(
+    answered: bool,
+    landed: bool,
+    waited: Duration,
+    asked_again: bool,
+) -> bool {
+    answered && !landed && !asked_again && waited >= REJOIN_AFTER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_answered_join_that_never_landed_is_asked_once_more() {
+        assert!(rejoin_due(true, false, REJOIN_AFTER, false));
+    }
+
+    #[test]
+    fn a_join_is_not_asked_again_early_unanswered_landed_or_twice() {
+        assert!(!rejoin_due(true, false, Duration::from_secs(14), false));
+        assert!(!rejoin_due(false, false, REJOIN_AFTER * 2, false));
+        assert!(!rejoin_due(true, true, REJOIN_AFTER * 2, false));
+        assert!(!rejoin_due(true, false, REJOIN_AFTER * 2, true));
+    }
 
     /// A backend whose outcome the test steers, recording its calls.
     struct FakeBackend {

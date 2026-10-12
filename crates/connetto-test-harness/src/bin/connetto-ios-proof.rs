@@ -1090,9 +1090,10 @@ async fn one_join(
         host.record(host_app, evidence, &shot("host-offer")).await?;
 
         join_on_second_phone(join, &offer, joiner, peer_app, joiner_tapper, evidence).await?;
-        // The joiner moved onto the hotspot, which can reset the link its
-        // page session rode on.
+        // The joiner moved onto the hotspot, which can reset the links both
+        // pages' sessions ride on.
         *peer_app = joiner_inspector.reattach().await?;
+        *host_app = host_inspector.reattach().await?;
 
         step("link through the hotspot");
         wait_linked(host_app, peer_app, host_identity, joiner_identity).await?;
