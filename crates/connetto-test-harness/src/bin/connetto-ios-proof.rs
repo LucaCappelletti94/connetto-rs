@@ -393,6 +393,18 @@ async fn sign_out(app: &mut PageSession) -> Result<()> {
     .await
 }
 
+/// Sign the demo out on `phone` when it stands signed in, so a run leaves no
+/// account in the keychain's account index, which outlives the demo's
+/// uninstall while each run's provider names a new account.
+async fn leave_signed_out(phone: &Target, evidence: &Path) -> Result<()> {
+    let mut inspector = Inspector::start(phone, evidence).await?;
+    let mut app = inspector.page(|url| url.starts_with("dioxus://")).await?;
+    if app.page_text().await?.contains("Signed in as:") {
+        sign_out(&mut app).await?;
+    }
+    Ok(())
+}
+
 /// Fill the dev user into the identity provider's form and submit it. The
 /// authentication session catches the final redirect itself, so no trusted
 /// input is needed.
@@ -858,6 +870,11 @@ async fn joins_with_summary(
         sync_url,
     )
     .await;
+    for phone in [host, joiner] {
+        if let Err(err) = leave_signed_out(phone, evidence).await {
+            eprintln!("{} stayed signed in: {err:#}", phone.udid());
+        }
+    }
     if let Err(err) = joiner.copy_demo_log(evidence).await {
         eprintln!("the demo's log stayed on {}: {err:#}", joiner.udid());
     }
@@ -924,17 +941,7 @@ async fn peer_proof(
     joiner
         .record(&mut peer_app, evidence, "peer-signed-in")
         .await?;
-    // A fresh install has not been allowed Bluetooth, and the joiner scans
-    // only once it is, so the user's own action asks for it (R76 decision
-    // 21).
-    step("turn on Bluetooth on the second phone");
-    peer_app.click("Turn on Bluetooth").await?;
-    joiner_tapper
-        .run("tap-alert", 40, evidence, "peer-bluetooth")
-        .await?;
-    peer_app
-        .wait_for_text("bluetooth: ready", Duration::from_secs(30))
-        .await?;
+    turn_on_bluetooth(&mut peer_app, joiner_tapper, evidence).await?;
 
     // The host signed out at the end of its proof, so it signs back in.
     step("sign the host back in");
@@ -960,8 +967,7 @@ async fn peer_proof(
     let mut reports = Vec::with_capacity(JoinBy::EVERY.len());
     for &join in &JoinBy::EVERY {
         let started = Instant::now();
-        // The joiner's network moved during the last join, which can reset
-        // the link its page session rode on, so each join takes a fresh one.
+        // Each join takes a fresh page, since the last moved the joiner's network.
         let outcome = match joiner_inspector.reattach().await {
             Ok(page) => {
                 peer_app = page;
@@ -971,6 +977,7 @@ async fn peer_proof(
                     &mut host_app,
                     &mut host_inspector,
                     &mut peer_app,
+                    &mut joiner_inspector,
                     host_tapper,
                     joiner_tapper,
                     evidence,
@@ -1009,11 +1016,24 @@ async fn peer_proof(
     Ok(reports)
 }
 
+/// Turn Bluetooth on through the demo, since a fresh install has not been
+/// allowed it and the joiner scans only once it is, so the user's own action
+/// asks for it (R76 decision 21).
+async fn turn_on_bluetooth(app: &mut PageSession, tapper: &Tapper, evidence: &Path) -> Result<()> {
+    step("turn on Bluetooth on the second phone");
+    app.click("Turn on Bluetooth").await?;
+    tapper
+        .run("tap-alert", 40, evidence, "peer-bluetooth")
+        .await?;
+    app.wait_for_text("bluetooth: ready", Duration::from_secs(30))
+        .await
+}
+
 /// One join, from a Personal Hotspot hosted on the first phone to the link's
 /// end, and the phones back at rest whatever happened.
 #[expect(
     clippy::too_many_arguments,
-    reason = "the two phones, their pages, their tappers, the evidence, both identities, the hotspot name and password and the join are each the step's own"
+    reason = "the two phones, their pages, inspectors and tappers, the evidence, both identities, the hotspot name and password and the join are each the step's own"
 )]
 async fn one_join(
     host: &Target,
@@ -1021,6 +1041,7 @@ async fn one_join(
     host_app: &mut PageSession,
     host_inspector: &mut Inspector,
     peer_app: &mut PageSession,
+    joiner_inspector: &mut Inspector,
     host_tapper: &Tapper,
     joiner_tapper: &Tapper,
     evidence: &Path,
@@ -1061,6 +1082,9 @@ async fn one_join(
         host.record(host_app, evidence, &shot("host-offer")).await?;
 
         join_on_second_phone(join, &offer, joiner, peer_app, joiner_tapper, evidence).await?;
+        // The joiner moved onto the hotspot, which can reset the link its
+        // page session rode on.
+        *peer_app = joiner_inspector.reattach().await?;
 
         step("link through the hotspot");
         wait_linked(host_app, peer_app, host_identity, joiner_identity).await?;
