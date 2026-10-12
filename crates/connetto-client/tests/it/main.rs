@@ -14,6 +14,8 @@ mod authentication_client;
 
 #[cfg(feature = "bot")]
 mod bot;
+#[cfg(any(feature = "native-transport", feature = "native-auth"))]
+mod bots;
 #[cfg(feature = "native-auth")]
 mod builder_harness;
 

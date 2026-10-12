@@ -10,7 +10,7 @@
 const DEVICE_ROOT: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
 
 fn main() {
-    connetto_schema::emit::<String>(
+    connetto_schema::emit::<String, connetto_schema::TextIds>(
         std::path::Path::new("schema.sql"),
         std::path::Path::new("policies.sql"),
         None,

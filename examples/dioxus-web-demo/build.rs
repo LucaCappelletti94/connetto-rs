@@ -4,7 +4,7 @@
 //! own local tier, so it runs the shared schema step over those three.
 
 fn main() {
-    connetto_schema::emit::<String>(
+    connetto_schema::emit::<String, connetto_schema::TextIds>(
         std::path::Path::new("../deployment/schema.sql"),
         std::path::Path::new("../deployment/policies.sql"),
         Some(std::path::Path::new("frontend.sql")),

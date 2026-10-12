@@ -69,6 +69,9 @@ use crate::{
     pg_ban_store, pg_write_target, preflight,
 };
 
+/// The id-type marker a deployment's bot registry tables are declared with.
+type RegistryIds<D> = <<D as ConnettoSchema>::Bots as ConnettoBotSchema>::IdSql;
+
 /// The path the sync route answers on.
 pub const SYNC_PATH: &str = ws::SYNC_PATH;
 
@@ -305,11 +308,25 @@ impl ServerSchema {
         }
     }
 
-    /// The one catalog the engine classifies, the policies beside the DDL,
-    /// because a folded read rule reads the policy text the engine must hold.
+    /// The deployment's DDL with connetto's bot registry tables appended, the
+    /// one document every server catalog parses.
+    ///
+    /// A catalog numbers its tables by position, so two catalogs read from
+    /// different documents give one table two ids, and a changed row named in
+    /// one cannot be found in the other. Every catalog the server builds, the
+    /// change stream's, the snapshot's, the write target's, the engine's and
+    /// the authorization model's, reads this text.
     #[must_use]
-    pub fn catalog(&self) -> String {
-        format!("{}\n{}", self.pg_ddl, self.pg_policies)
+    pub fn engine_ddl<Id: connetto_core::bots::BotRegistryIdSql>(&self) -> String {
+        connetto_schema::with_registry::<Id>(&self.pg_ddl)
+    }
+
+    /// The one catalog the engine classifies, the policies beside
+    /// [`engine_ddl`](Self::engine_ddl), because a folded read rule reads the
+    /// policy text the engine must hold.
+    #[must_use]
+    pub fn catalog<Id: connetto_core::bots::BotRegistryIdSql>(&self) -> String {
+        format!("{}\n{}", self.engine_ddl::<Id>(), self.pg_policies)
     }
 }
 
@@ -379,6 +396,13 @@ pub enum BuildError {
     /// A deployment artifact the server needs is absent.
     #[error(transparent)]
     Preflight(#[from] crate::preflight::PreflightError),
+    /// The authorization model's catalog and the server's numbered one table
+    /// differently, so a changed row could not be named for the model.
+    #[error("the authorization model and the server number the table {table} differently")]
+    CatalogMismatch {
+        /// The table the two catalogs disagree on.
+        table: String,
+    },
     /// The device certificate settings cannot issue.
     #[error("device identity: {0}")]
     DeviceIdentity(#[source] crate::device_cert::ConfigError),
@@ -1035,7 +1059,7 @@ where
 
         let pool = build_pool(&database.owner_url, owner_pool_size).await?;
         require_schema_tables::<D>(&pool, audit, bans, device_identity.is_some()).await?;
-        require_cap_policies(&pool, &schema.pg_ddl).await?;
+        require_cap_policies::<D>(&pool, &schema.pg_ddl).await?;
         let (oplog, lag_watch) = prepare_change_log(
             &pool,
             &slot,
@@ -1082,7 +1106,7 @@ where
             database_url: database.owner_url,
             slot,
             publication,
-            pg_ddl: schema.pg_ddl,
+            pg_ddl: schema.engine_ddl::<RegistryIds<D>>(),
         };
         let file_router = reader.file_router;
         let sweep = reader.sweep;
@@ -1246,8 +1270,13 @@ async fn require_schema_tables<D: ConnettoSchema>(
 /// applied by the deployment from the generated cap document, and connetto
 /// creates no server objects of its own, so a table not capped is a
 /// deployment omission rather than something connetto can fix.
-async fn require_cap_policies(pool: &PgPool, pg_ddl: &str) -> Result<(), BuildError> {
-    let tables = connetto_schema::schema_tables(pg_ddl)?;
+async fn require_cap_policies<D: ConnettoSchema>(
+    pool: &PgPool,
+    pg_ddl: &str,
+) -> Result<(), BuildError> {
+    // The cap reaches the registry tables connetto appends to the document.
+    let combined = connetto_schema::with_registry::<<D::Bots as ConnettoBotSchema>::IdSql>(pg_ddl);
+    let tables = connetto_schema::schema_tables(&combined)?;
     let required: Vec<Artifact<'_>> = tables
         .iter()
         .map(|t| Artifact::CappedTable(t.as_str()))
@@ -1419,7 +1448,8 @@ async fn build_reader_side<D: ConnettoSchema>(
     )
     .await?;
     let snapshot =
-        PgSnapshotSource::from_ddl(pool.clone(), &schema.pg_ddl)?.with_publication(publication);
+        PgSnapshotSource::from_ddl(pool.clone(), &schema.engine_ddl::<RegistryIds<D>>())?
+            .with_publication(publication);
     Ok(ReaderSide {
         pool,
         signer,
@@ -1478,6 +1508,25 @@ fn caller_mapping() -> CallerMappings {
     }
 }
 
+/// Refuse startup when the authorization model numbers any table differently
+/// from the catalog every other server part reads.
+///
+/// A catalog numbers its tables by position. The model names a changed row
+/// through the table id the change stream assigned it, so one table with two
+/// ids leaves that row unnamed, and the change path refuses it forever.
+fn require_one_numbering(model: &ParserDB, engine_ddl: &str) -> Result<(), BuildError> {
+    let engine = ParserDB::parse::<PostgreSqlDialect>(engine_ddl)
+        .map_err(|err| SetupError::Catalog(format!("{err:?}")))?;
+    for table in connetto_schema::schema_tables(engine_ddl)? {
+        let in_model = subql::catalog_helpers::table_id::<Postgres, _>(model, &table);
+        let in_engine = subql::catalog_helpers::table_id::<Postgres, _>(&engine, &table);
+        if in_model != in_engine {
+            return Err(BuildError::CatalogMismatch { table });
+        }
+    }
+    Ok(())
+}
+
 /// The change path's executor, the deployment's policies translated, the
 /// rules put on the authorization service, and the facts behind them filled
 /// if they are new.
@@ -1491,8 +1540,15 @@ async fn build_authorization<D: ConnettoSchema>(
     publication: &str,
     openfga: &OpenFga,
 ) -> Result<(ServerAuth<D::Id>, Translator, GrantReach), BuildError> {
-    let translated =
-        Translated::of::<String>(&schema.pg_ddl, &schema.pg_policies, DEFAULT_USER_SETTING)?;
+    let translated = Translated::of::<String, RegistryIds<D>>(
+        &schema.pg_ddl,
+        &schema.pg_policies,
+        DEFAULT_USER_SETTING,
+    )?;
+    require_one_numbering(
+        translated.shapes_arc().catalog(),
+        &schema.engine_ddl::<RegistryIds<D>>(),
+    )?;
     // A policy reading a table the change stream does not carry never hears
     // of a grant given or taken, so the store goes stale and then answers
     // confidently and wrongly, and this set difference names the table.
@@ -1573,7 +1629,7 @@ async fn build_write_side<D: ConnettoSchema>(
         build_authorization::<D>(&pools.owner, &pools.reader, schema, publication, openfga).await?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let upkeep_translator = translator.clone();
-    let materializer = Materializer::builder(&schema.catalog())
+    let materializer = Materializer::builder(&schema.catalog::<RegistryIds<D>>())
         .with_write_catalog(writable)
         .with_translator(translator)
         .with_caller(caller_mapping())
@@ -1582,17 +1638,23 @@ async fn build_write_side<D: ConnettoSchema>(
     // The second opinion reads as the reader role, so it takes its pool before the write target consumes it.
     let second = if second_opinion {
         Some(
-            RlsAuth::<D::Id, String>::from_ddl(pools.reader.clone(), &schema.pg_ddl)
-                .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
+            RlsAuth::<D::Id, String>::from_ddl(
+                pools.reader.clone(),
+                &schema.engine_ddl::<RegistryIds<D>>(),
+            )
+            .map_err(|err| BuildError::SecondOpinion(err.to_string()))?,
         )
     } else {
         None
     };
     let upkeep = auth.upkeep(reach, upkeep_translator, pools.reader.clone());
-    let write = pg_write_target::<D>(pools.reader, &schema.pg_ddl)?;
+    let write = pg_write_target::<D>(pools.reader, &schema.engine_ddl::<RegistryIds<D>>())?;
     // A changed policy makes an existing replica stale, so a client holding one is told through the advertised version.
-    let version =
-        connetto_schema::translate::<String>(&schema.pg_ddl, &schema.pg_policies)?.version();
+    let version = connetto_schema::translate::<String, <D::Bots as ConnettoBotSchema>::IdSql>(
+        &schema.pg_ddl,
+        &schema.pg_policies,
+    )?
+    .version();
     Ok(WriteSide {
         auth,
         materializer,
@@ -1888,6 +1950,39 @@ mod tests {
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )
+    }
+
+    /// The deployment's tables in the order a deployment writes them, where
+    /// connetto's registry tables sort ahead of `items` in a catalog.
+    const NUMBERED: &str = "CREATE TABLE items (id INT PRIMARY KEY, team INT); \
+                            CREATE TABLE team_members (team INT, member TEXT);";
+
+    /// The model's catalog read from the composed document and the server's
+    /// read from the same text number every table alike, so startup goes on.
+    #[test]
+    fn one_document_numbers_every_table_alike() {
+        let schema = ServerSchema::new(NUMBERED, "");
+        let engine_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
+        let model =
+            ParserDB::parse::<PostgreSqlDialect>(&engine_ddl).expect("the model catalog parses");
+        require_one_numbering(&model, &engine_ddl).expect("one document numbers its tables once");
+    }
+
+    /// A server catalog read without the registry tables gives `items` another
+    /// id than the model's, which leaves every changed `items` row unnamed, so
+    /// startup refuses and names the table.
+    #[test]
+    fn a_catalog_without_the_registry_refuses_startup() {
+        let schema = ServerSchema::new(NUMBERED, "");
+        let model_ddl = schema.engine_ddl::<connetto_core::bots::TextIds>();
+        let model =
+            ParserDB::parse::<PostgreSqlDialect>(&model_ddl).expect("the model catalog parses");
+        let refused =
+            require_one_numbering(&model, NUMBERED).expect_err("the two catalogs disagree");
+        assert!(
+            matches!(&refused, BuildError::CatalogMismatch { table } if table == "items"),
+            "{refused}"
+        );
     }
 
     #[tokio::test]

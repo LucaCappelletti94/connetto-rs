@@ -78,6 +78,7 @@ pub mod auth;
 pub mod away;
 #[cfg(feature = "bot")]
 pub mod bot;
+pub mod bots;
 pub mod builder;
 pub mod cipher;
 mod clock;
@@ -179,6 +180,10 @@ pub enum ClientError {
     /// a fresh challenge, so there is no close reason to carry.
     #[error("the registration was refused")]
     RegistrationRefused,
+    /// The install's own validation refused the add before a row was written
+    /// (R91), so the app's transaction rolls back whole and nothing uploads.
+    #[error("the install was refused: {0}")]
+    InstallRefused(String),
     /// The SQLite capture session failed.
     #[error("session error: {0}")]
     Session(String),

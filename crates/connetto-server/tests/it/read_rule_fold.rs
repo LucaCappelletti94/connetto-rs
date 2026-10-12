@@ -210,8 +210,12 @@ async fn connected_clients(
     )>,
 ) {
     let translated =
-        connetto_server::openfga::Translated::of::<String>(PG_DDL, POLICIES, DEFAULT_USER_SETTING)
-            .expect("the policy translates");
+        connetto_server::openfga::Translated::of::<String, connetto_core::bots::TextIds>(
+            PG_DDL,
+            POLICIES,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("the policy translates");
     let (_, translator, _) = translated.into_parts();
     let materializer = Materializer::builder(&format!("{PG_DDL}\n{POLICIES}"))
         .with_write_catalog(RuntimeWritableCatalog::default())

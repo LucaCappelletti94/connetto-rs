@@ -923,6 +923,17 @@ fn value_literal(value: &PgValue<Postgres>) -> Option<Expr> {
     Some(Expr::Value(literal.into()))
 }
 
+/// Whether `table` is a bot registry table a client writes (R91), the codes
+/// and the installations.
+///
+/// connetto appends the registry tables to every schema, so a deployment's
+/// writable catalog never names them. These are still admitted as mutation
+/// targets, and their rows are gated by the deployment's rules and the cap.
+/// A bot and its list are written by the server alone and stay refused.
+fn registry_table(table: &str) -> bool {
+    connetto_core::bots::CLIENT_WRITTEN_REGISTRY_TABLES.contains(&table)
+}
+
 impl<DB, W, C> Materializer<DB, W, C>
 where
     DB: DatabaseLike + 'static,
@@ -1658,7 +1669,7 @@ where
     ) -> Result<PlannedOp, MaterializerError> {
         let schema = op.table();
         let table = schema.name().clone();
-        if !self.write.is_writable(&table) {
+        if !self.write.is_writable(&table) && !registry_table(&table) {
             return Err(MaterializerError::NotWritable(table));
         }
         let table_id = self.table_id(&table)?;
@@ -1729,7 +1740,7 @@ where
         op: &PatchsetOp<'_, TableSchema<String>, String, Vec<u8>>,
     ) -> Result<PlannedOp, MaterializerError> {
         let table = op.table().name().clone();
-        if !self.write.is_writable(&table) {
+        if !self.write.is_writable(&table) && !registry_table(&table) {
             return Err(MaterializerError::NotWritable(table));
         }
         match op {
@@ -2332,6 +2343,39 @@ pub(crate) fn decompress(payload_zstd: &[u8]) -> std::io::Result<Vec<u8>> {
 }
 
 #[cfg(test)]
+mod registry_write_tests {
+    //! Which of connetto's bot registry tables a client mutation may target.
+
+    use super::registry_table;
+
+    /// A client writes its registration codes and its installations, so the
+    /// write path admits those whatever the deployment's write policy names.
+    #[test]
+    fn the_client_written_registry_tables_are_admitted() {
+        for table in [
+            "connetto_registration_codes",
+            "connetto_installations",
+            "connetto_installation_optional_tables",
+        ] {
+            assert!(registry_table(table), "{table} is written by a client");
+        }
+    }
+
+    /// Only the server writes a bot and its list, at registration. A client
+    /// mutation on either would let a permissive deployment rule forge a bot
+    /// or widen its list, so the write path refuses them.
+    #[test]
+    fn the_server_written_registry_tables_are_refused() {
+        for table in ["connetto_bots", "connetto_bot_lists"] {
+            assert!(
+                !registry_table(table),
+                "{table} is written by the server only"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod wire_contract {
     //! Pin the exact JSON string [`value_to_json`] emits for each
     //! [`PgValue`] variant. The client aggregate decoders in
@@ -2538,10 +2582,14 @@ mod membership_term_tests {
     const CLIENT_SQL: &str = "SELECT * FROM docs WHERE project_id IN (SELECT project_id FROM project_members WHERE user_id = current_app_user())";
 
     fn materializer(caller: Option<CallerMappings>) -> Materializer {
-        let translator = Translated::of::<String>(SCHEMA, POLICIES, DEFAULT_USER_SETTING)
-            .expect("the motivating policy translates")
-            .into_parts()
-            .1;
+        let translator = Translated::of::<String, connetto_core::bots::TextIds>(
+            SCHEMA,
+            POLICIES,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("the motivating policy translates")
+        .into_parts()
+        .1;
         let builder = Materializer::builder(SCHEMA).with_translator(translator);
         match caller {
             Some(caller) => builder.with_caller(caller),
@@ -2724,8 +2772,12 @@ mod membership_term_tests {
     const OWN_QUERY: &str = "SELECT * FROM items";
 
     fn own_materializer() -> Materializer {
-        let translated = Translated::of::<String>(OWN_DDL, OWN_POLICIES, DEFAULT_USER_SETTING)
-            .expect("the own-shape policy translates");
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            OWN_DDL,
+            OWN_POLICIES,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("the own-shape policy translates");
         let (_, translator, _) = translated.into_parts();
         let catalog = format!("{OWN_DDL}\n{OWN_POLICIES}");
         Materializer::builder(&catalog)

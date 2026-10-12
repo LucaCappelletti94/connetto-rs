@@ -27,6 +27,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use connetto_core::auth::Principal;
+use connetto_core::bots::BotRegistryIdSql;
 use diesel::QueryableByName;
 use diesel::pg::Pg;
 use diesel::query_builder::{BoxedSqlQuery, SqlQuery};
@@ -190,10 +191,11 @@ impl SubjectNaming {
         }
     }
 
-    /// Whether the model has a grant a caller's own values complete.
+    /// Whether a declared set attribute is one the caller's own values state,
+    /// the share key or the bot list, so a model with either asks the caller.
     #[must_use]
     pub const fn asks_the_caller(&self) -> bool {
-        self.subjects_parameter.is_some()
+        self.subjects_parameter.is_some() || self.bot_list_parameter.is_some()
     }
 
     /// Read one fact back as who it concerned.
@@ -587,7 +589,7 @@ impl Translated {
     ///
     /// [`SetupError::Catalog`] when the two documents do not parse, and
     /// [`SetupError::Untranslated`] naming every expression left unhandled.
-    pub fn of<Key: CapabilityKey>(
+    pub fn of<Key: CapabilityKey, Id: BotRegistryIdSql>(
         schema_sql: &str,
         policy_sql: &str,
         user_setting: &str,
@@ -595,10 +597,14 @@ impl Translated {
         // The cap travels with the policies it caps. The model must hold a
         // bot to its list exactly as Postgres does, so it is translated as
         // one more document the two share.
-        let cap = connetto_schema::cap_policies(schema_sql, policy_sql)
+        let cap = connetto_schema::cap_policies::<Id>(schema_sql, policy_sql)
             .map_err(|err| SetupError::Catalog(err.to_string()))?;
+        // The cap names the registry tables connetto appends, so the catalog
+        // the model is built over must carry them, the way the cap's own
+        // generation does.
+        let schema_sql = connetto_schema::with_registry::<Id>(schema_sql);
         let mut sql = String::with_capacity(schema_sql.len() + policy_sql.len() + cap.len() + 1);
-        sql.push_str(schema_sql);
+        sql.push_str(&schema_sql);
         sql.push('\n');
         sql.push_str(policy_sql);
         if !cap.is_empty() {
@@ -1795,11 +1801,14 @@ mod tests {
         ActionStatement, ColumnKind, Record, RelationName, RowCell, RowList, RowValues,
         records_from_row,
     };
-    use subql::backend::Postgres;
+    use subql::backend::{Postgres, Value};
     use subql::catalog_helpers;
+    use subql::visibility::RowView;
 
     use super::{
-        BTreeMap, GrantHolder, GrantMove, Reconciled, SubjectNaming, Translated, WithdrawnFact,
+        BTreeMap, Body, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject, OpenFgaPolicy,
+        OpenFgaServiceClient, ParserDB, Principal, Reconciled, SubjectNaming, Translated,
+        VisibilityPolicy, WithdrawnFact,
     };
     use connetto_core::auth::DEFAULT_USER_SETTING;
 
@@ -1820,6 +1829,12 @@ mod tests {
                 WHERE memberships.team = docs.team \
                   AND memberships.member = current_setting('app.user_id', true)))";
 
+    /// A request-only read gate on the bot list, the cap connetto puts on a
+    /// synced table to bound what a bot reads.
+    const BOT_LIST_CAP: &str = "CREATE POLICY notes_bot ON notes FOR SELECT USING (\
+        'notes:read' = ANY(string_to_array(current_setting('app.bot_list', true), ',')) \
+        OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ',')))";
+
     const SCHEMA: &str = "
         CREATE TABLE notes(id INTEGER PRIMARY KEY, owner TEXT);
         ALTER TABLE notes ENABLE ROW LEVEL SECURITY;
@@ -1829,8 +1844,12 @@ mod tests {
     ";
 
     fn translated(policies: &str) -> Translated {
-        Translated::of::<String>(SCHEMA, policies, DEFAULT_USER_SETTING)
-            .expect("every policy here is one rls2fga classifies")
+        Translated::of::<String, connetto_core::bots::TextIds>(
+            SCHEMA,
+            policies,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("every policy here is one rls2fga classifies")
     }
 
     /// **This is the phase's central claim, and it is the half that can be
@@ -1885,6 +1904,139 @@ mod tests {
         );
     }
 
+    /// The bot-list cap is a declared set attribute the caller's own values
+    /// state, so the translation reports a parameter for it and the watcher
+    /// answers it, the same as the held-key arm.
+    #[test]
+    fn the_bot_list_parameter_is_read_from_the_translation() {
+        let naming = translated(BOT_LIST_CAP).naming();
+        assert!(
+            naming.asks_the_caller(),
+            "the bot-list cap is a declared set attribute the caller's own \
+             values state, so the translation must report a parameter for it"
+        );
+    }
+
+    /// One row image, read the way the session names its tables.
+    struct SessionOrderRow {
+        table: subql::TableId,
+        owner: &'static str,
+    }
+
+    impl RowView for SessionOrderRow {
+        type Backend = Postgres;
+
+        fn table_id(&self) -> subql::TableId {
+            self.table
+        }
+
+        fn value_at(&self, col: subql::ColumnId) -> Result<Value<Postgres>, subql::ValueError> {
+            match col {
+                0 => Ok(Value::Int(1)),
+                1 => Ok(Value::String(self.owner.to_owned())),
+                _ => Ok(Value::Missing),
+            }
+        }
+    }
+
+    /// A transport that never answers, so a question that reaches it gets no
+    /// answer inside the deadline and the test around it fails.
+    #[derive(Clone, Copy)]
+    struct Never;
+
+    impl GrpcService<Body> for Never {
+        type ResponseBody = openfga_client::tonic::body::Body;
+        type Error = std::io::Error;
+        type Future = std::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            openfga_client::tonic::codegen::http::Response<Self::ResponseBody>,
+                            Self::Error,
+                        >,
+                    > + Send,
+            >,
+        >;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(
+            &mut self,
+            _request: openfga_client::tonic::codegen::http::Request<Body>,
+        ) -> Self::Future {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    /// The caller one identity grant would produce.
+    fn caller_alice() -> Principal {
+        use connetto_core::SessionId;
+        use connetto_core::auth::{AuthContext, Subject, VerifiedSession};
+
+        let handle = SessionId::from_token_hash("alice");
+        let mut principal = Principal::unidentified(handle);
+        principal
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("alice"),
+                session_id: handle,
+            }))
+            .expect("one identity");
+        principal
+    }
+
+    /// The executor over a transport that never answers.
+    fn delegate_never() -> subql::visibility::openfga::OpenFgaPolicy<
+        ParserDB,
+        Never,
+        ModelSubject<String, String>,
+        Postgres,
+    > {
+        let (shapes, _translator, _reach) = translated(OWN_SHAPE).into_parts();
+        OpenFgaPolicy::new(shapes, OpenFgaServiceClient::new(Never), "store")
+            .expect("the index is usable")
+    }
+
+    /// A row named by the engine's table order, the registry tables included, must be
+    /// judged, not refused as unnameable. The transport never answers, so a question
+    /// that reaches it fails the deadline.
+    #[tokio::test]
+    async fn a_row_named_in_the_engine_order_is_judged_not_refused() {
+        use subql::visibility::Verdict;
+
+        let translated = translated(OWN_SHAPE);
+        let naming = translated.naming();
+        let (shapes, _translator, _reach) = translated.into_parts();
+        let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate_never(), naming);
+        let engine = connetto_schema::with_registry::<connetto_core::bots::TextIds>(SCHEMA);
+        let session = subql::ParserDB::parse::<sqlparser::dialect::PostgreSqlDialect>(&engine)
+            .expect("the engine catalog parses");
+        let notes = catalog_helpers::table_id::<Postgres, _>(&session, "notes")
+            .expect("notes is in the session catalog");
+        let row = SessionOrderRow {
+            table: notes,
+            owner: "alice",
+        };
+        let watcher = Arc::new(caller_alice());
+        let mut verdicts = vec![Verdict::Deny];
+        let answered = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            auth.may_see(&row, &[watcher], &mut verdicts),
+        )
+        .await
+        .expect("the row is judged without a round trip");
+        answered.expect("a named row is judged, not refused");
+        assert_eq!(
+            verdicts[0],
+            Verdict::Allow,
+            "a row the owner wrote is visible to the owner"
+        );
+    }
+
     /// One row of the share table, read the way the change path reads a row
     /// image.
     struct ShareRow {
@@ -1921,8 +2073,12 @@ mod tests {
     /// or name is what keeps this asserting about the tuples a deployment
     /// really writes.
     fn share_records(viewer: &'static str) -> (Arc<SubjectNaming>, Vec<Record>) {
-        let translated = Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING)
-            .expect("the share shape settles from one row");
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            SHARE_SCHEMA,
+            SHARE_POLICY,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("the share shape settles from one row");
         let naming = translated.naming();
         let row = ShareRow {
             paper_id: "1",
@@ -2179,7 +2335,7 @@ mod tests {
     /// none.
     #[test]
     fn a_table_with_no_policy_at_all_grants_everybody_without_a_round_trip() {
-        let shapes = Translated::of::<String>(
+        let shapes = Translated::of::<String, connetto_core::bots::TextIds>(
             "CREATE TABLE orders (id INT PRIMARY KEY, quantity BIGINT NOT NULL);",
             "",
             DEFAULT_USER_SETTING,
@@ -2198,7 +2354,7 @@ mod tests {
     /// Step 6's refusal, which is absolute rather than degrading per table.
     #[test]
     fn a_policy_with_no_translation_refuses_startup() {
-        let refused = Translated::of::<String>(
+        let refused = Translated::of::<String, connetto_core::bots::TextIds>(
             SCHEMA,
             "CREATE POLICY notes_p ON notes FOR ALL USING (mystery_function(owner))",
             DEFAULT_USER_SETTING,
@@ -2247,7 +2403,11 @@ mod tests {
     /// phase along with the replay coverage its D4 deleted.
     #[test]
     fn a_share_written_as_a_join_table_row_boots_since_the_upstream_repair() {
-        let translated = Translated::of::<String>(SHARE_SCHEMA, SHARE_POLICY, DEFAULT_USER_SETTING);
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            SHARE_SCHEMA,
+            SHARE_POLICY,
+            DEFAULT_USER_SETTING,
+        );
         assert!(
             translated.is_ok(),
             "the shape settles from one row since the repair, so nothing refuses it: {:?}",
@@ -2276,9 +2436,12 @@ mod tests {
         const POLICY: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
             current_setting('app.user_id', true) = ANY(viewers))";
 
-        let Err(super::SetupError::Unwithdrawable(named)) =
-            Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING)
-        else {
+        let Err(super::SetupError::Unwithdrawable(named)) = Translated::of::<
+            String,
+            connetto_core::bots::TextIds,
+        >(
+            SCHEMA, POLICY, DEFAULT_USER_SETTING
+        ) else {
             panic!(
                 "nothing can withdraw this grant, so it must stop the server rather than \
                  serve access the database has taken away"
@@ -2315,7 +2478,11 @@ mod tests {
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM paper_shares)))";
 
-        let translated = Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING);
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            SCHEMA,
+            POLICY,
+            DEFAULT_USER_SETTING,
+        );
         assert!(
             translated.is_ok(),
             "the replay declares the slice it determines, so the reconcile keeps it \
@@ -2340,8 +2507,12 @@ mod tests {
             EXISTS (SELECT 1 FROM item_share s WHERE s.item_id = item.id \
               AND s.viewer = current_setting('app.user_id', true) \
               AND s.weight > (SELECT avg(weight) FROM item_share)))";
-        let translated =
-            Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING).expect("translates");
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            SCHEMA,
+            POLICY,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("translates");
         let mats = translated.shapes.materialisations();
         assert!(
             !mats.is_empty(),
@@ -2382,9 +2553,12 @@ mod tests {
         const POLICY: &str = "CREATE POLICY p ON \"user\" FOR SELECT USING (\
             owner = current_setting('app.user_id', true))";
 
-        let Err(super::SetupError::Unplannable(detail)) =
-            Translated::of::<String>(SCHEMA, POLICY, DEFAULT_USER_SETTING)
-        else {
+        let Err(super::SetupError::Unplannable(detail)) = Translated::of::<
+            String,
+            connetto_core::bots::TextIds,
+        >(
+            SCHEMA, POLICY, DEFAULT_USER_SETTING
+        ) else {
             panic!("two things under one type name must stop the boot");
         };
         assert!(

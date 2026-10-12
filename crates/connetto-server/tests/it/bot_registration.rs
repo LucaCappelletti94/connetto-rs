@@ -89,7 +89,9 @@ async fn code(pool: &Pool<AsyncPgConnection>, code: &str, future: bool) {
 
 fn sha256_of(code: &str) -> [u8; 32] {
     let mut out = [0_u8; 32];
-    out.copy_from_slice(Sha256::digest(code.as_bytes()).as_slice());
+    out.copy_from_slice(
+        Sha256::digest(connetto_core::bots::canonical_code(code).as_bytes()).as_slice(),
+    );
     out
 }
 
