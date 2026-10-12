@@ -1,7 +1,7 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rcgen::{
-    BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType,
+    BasicConstraints, CertificateParams, CustomExtension, DistinguishedName, DnType, DnValue,
     ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair, KeyUsagePurpose, PKCS_ECDSA_P256_SHA256,
     SanType, SerialNumber, SubjectPublicKeyInfo,
 };
@@ -12,6 +12,10 @@ use x509_parser::prelude::FromDer;
 use super::attestation::{ATTESTATION_EXTENSION, AttestationLevel};
 use super::identity::{DeploymentId, DeviceIdentity, KeyId};
 use super::request::CertificateRequest;
+
+/// X.520 `serialNumber` (2.5.4.5), which keeps sibling issuers' subjects apart, since
+/// revocation lists are matched to a certificate by its issuer's name.
+const SERIAL_NUMBER_ATTRIBUTE: [u64; 4] = [2, 5, 4, 5];
 
 /// The deployment's root, kept offline and used only by `connetto-ca`.
 pub struct RootCa {
@@ -117,6 +121,15 @@ impl RootCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "connetto device issuer");
+        let mut serial_hex = String::with_capacity(serial.len() * 2);
+        for byte in serial {
+            use std::fmt::Write as _;
+            let _ = write!(serial_hex, "{byte:02x}");
+        }
+        params.distinguished_name.push(
+            DnType::CustomDnType(SERIAL_NUMBER_ATTRIBUTE.to_vec()),
+            DnValue::PrintableString(serial_hex.as_str().try_into()?),
+        );
         params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = to_time(not_before).ok_or(RootError::Validity)?;

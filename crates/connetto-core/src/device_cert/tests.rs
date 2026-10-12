@@ -597,6 +597,54 @@ fn webpki_refuses_a_certificate_the_list_revokes() {
 }
 
 #[test]
+fn a_list_from_a_sibling_issuer_leaves_the_other_issuers_chains_verifying() {
+    let start = at(1_800_000_000);
+    let (root, issuer) = authorities(start);
+    let sibling_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("sibling key");
+    let sibling_cert = root
+        .sign_issuer(
+            &sibling_key.subject_public_key_info(),
+            start,
+            YEAR + 30 * DAY,
+            [3; 16],
+        )
+        .expect("sign the sibling");
+    let sibling =
+        DeviceIssuer::new(sibling_cert, sibling_key, root.certificate()).expect("load the sibling");
+    let leaf = issued(&issuer, start, 0x44);
+    let der = sibling
+        .sign_list(1, &[], start + DAY / 4, start + 30 * DAY)
+        .expect("the sibling signs");
+    let crl = webpki::CertRevocationList::from(
+        webpki::BorrowedCertRevocationList::from_der(&der).expect("webpki parses the list"),
+    );
+    let crls = [&crl];
+    let root_der = rustls_pki_types::CertificateDer::from(root.certificate().to_vec());
+    let anchors = [anchor_from_trusted_cert(&root_der).expect("anchor")];
+    let leaf_der = rustls_pki_types::CertificateDer::from(leaf);
+    let end_entity = EndEntityCert::try_from(&leaf_der).expect("leaf");
+    let intermediates = [rustls_pki_types::CertificateDer::from(
+        issuer.certificate().to_vec(),
+    )];
+    let options = webpki::RevocationOptionsBuilder::new(&crls)
+        .expect("options")
+        .with_status_policy(webpki::UnknownStatusPolicy::Allow)
+        .build();
+    let verdict = end_entity.verify_for_usage(
+        webpki::ALL_VERIFICATION_ALGS,
+        &anchors,
+        &intermediates,
+        rustls_pki_types::UnixTime::since_unix_epoch(
+            start.duration_since(UNIX_EPOCH).expect("after the epoch") + DAY / 2,
+        ),
+        KeyUsage::client_auth(),
+        Some(options),
+        None,
+    );
+    assert_eq!(verdict.map(drop), Ok(()));
+}
+
+#[test]
 fn a_root_signed_list_revokes_an_issuer_and_webpki_refuses_its_chain() {
     let start = at(1_800_000_000);
     let (root, issuer) = authorities(start);
