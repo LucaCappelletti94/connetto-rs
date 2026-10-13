@@ -182,7 +182,7 @@ fn prepare_thread() -> Result<(), CentralError> {
 }
 
 /// The thread needs no preparation off Android, where btleplug is plain
-/// `CoreBluetooth` (R76).
+/// `CoreBluetooth` on iOS and `BlueZ` on Linux (R76).
 #[cfg(not(target_os = "android"))]
 #[expect(
     clippy::unnecessary_wraps,
@@ -211,7 +211,7 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 match command {
                     Command::StartScan => {
                         // iOS scans only connetto's service (R76 decision
-                        // 25), Android scans wide.
+                        // 25), Android and Linux scan wide.
                         #[cfg(target_os = "ios")]
                         let filter = ScanFilter {
                             services: vec![Uuid::from_bytes(SERVICE_UUID)],

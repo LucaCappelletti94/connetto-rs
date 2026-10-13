@@ -258,8 +258,11 @@ open = { version = "5.4", optional = true }
 # iOS.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 webbrowser = { version = "1.2", optional = true }
+
 # The peer's Bluetooth, the central the joiner runs on Android and on the
-# Apple side through CoreBluetooth (R76 decision 22).
+# Apple side through CoreBluetooth, and on Linux through btleplug's BlueZ
+# half (R76 decisions 17 and 22).
+[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))'.dependencies]
 btleplug = { version = "0.13.5", optional = true }
 
 # Android: the Keystore-backed store of the same family. The NDK ships no
