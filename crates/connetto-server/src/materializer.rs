@@ -43,7 +43,7 @@ use sqlite_diff_rs::{
     ChangesetOp, DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK,
     TableSchema, Value,
 };
-use sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement};
+use sqlparser::ast::{BinaryOperator, Expr, GroupByExpr, SetExpr, Statement};
 use sqlparser::dialect::{PostgreSqlDialect, SQLiteDialect};
 use sqlparser::parser::Parser;
 use subql::EventKind;
@@ -486,6 +486,9 @@ where
     /// Postgres as SQL the classifier reads. `None` for a deployment serving no
     /// membership term, where a subscription never names the caller.
     caller: Option<CallerMappings>,
+    /// Per-viewer re-reads of an ungrouped aggregate, whose one-cell answer
+    /// goes on the wire as that value, the shape a client reads a scalar in.
+    scalar_rereads: HashSet<SubscriptionId>,
 }
 
 /// How a deployment's two caller settings reach the replica.
@@ -551,6 +554,7 @@ impl<W: WritableCatalog, C: ReadConnector> Materializer<ParserDB, W, C> {
             catalog,
             write,
             caller,
+            scalar_rereads: HashSet::new(),
         })
     }
 
@@ -1057,6 +1061,7 @@ where
     /// existed. One call for rows, folds, and read tiers alike: the wrapper
     /// resolves whichever registry holds the id (U7).
     pub fn unregister(&mut self, sub_id: SubscriptionId) -> bool {
+        self.scalar_rereads.remove(&sub_id);
         self.engine.unregister_subscription(sub_id)
     }
 
@@ -1139,7 +1144,11 @@ where
                 consumer_id,
                 group_key: None,
                 group_values_json: None,
-                result_json: Some(rows_json(&columns, &rows)),
+                result_json: Some(whole_answer_json(
+                    self.scalar_rereads.contains(&subscription_id),
+                    &columns,
+                    &rows,
+                )),
                 is_full_result: true,
             }],
             // The enum is non_exhaustive upstream: a tier this build does not
@@ -1238,6 +1247,7 @@ where
             resolved.scalar_updates,
             resolved.rows_updates,
             resolved.row_deltas,
+            &self.scalar_rereads,
         );
 
         let engine = &notifications.engine;
@@ -1315,6 +1325,7 @@ where
         resolved_scalar: Vec<ScalarUpd>,
         rows_updates: Vec<RowsUpd>,
         row_deltas: Vec<RowDlt>,
+        scalar_rereads: &HashSet<SubscriptionId>,
     ) -> Vec<ComputedChange> {
         let mut computed = Vec::new();
         for update in agg_updates.into_iter().chain(resolved_agg) {
@@ -1330,7 +1341,7 @@ where
                 is_full_result: true,
             });
         }
-        computed.extend(Self::rows_changes(rows_updates));
+        computed.extend(Self::rows_changes(rows_updates, scalar_rereads));
         for delta in row_deltas {
             computed.push(ComputedChange {
                 subscription_id: delta.subscription_id,
@@ -1353,7 +1364,10 @@ where
     /// only the newest generation per subscription survives and its pages
     /// concatenate into one wire frame: the wire's full-result replacement is
     /// atomic where a paged delivery would show a half-replaced answer.
-    fn rows_changes(updates: Vec<RowsUpd>) -> Vec<ComputedChange> {
+    fn rows_changes(
+        updates: Vec<RowsUpd>,
+        scalar_rereads: &HashSet<SubscriptionId>,
+    ) -> Vec<ComputedChange> {
         /// One subscription's newest re-read, its pages concatenated.
         struct PendingRows {
             consumer_id: u64,
@@ -1391,7 +1405,11 @@ where
                 consumer_id: pending.consumer_id,
                 group_key: None,
                 group_values_json: None,
-                result_json: Some(rows_json(&pending.columns, &pending.rows)),
+                result_json: Some(whole_answer_json(
+                    scalar_rereads.contains(&subscription_id),
+                    &pending.columns,
+                    &pending.rows,
+                )),
                 is_full_result: true,
             })
             .collect()
@@ -1917,11 +1935,18 @@ where
                 ..
             })) if viewer.is_some() => {
                 let setup = viewer.expect("matched Some above");
-                self.register_request_with(
+                let registered = self.register_request_with(
                     consumer_id,
                     build(retry_seed).database_reads_per_consumer(),
                     setup,
-                )
+                )?;
+                // The refusal names an aggregate, so one ungrouped projection is a scalar one.
+                if let Registration::Computed(capture) = &registered
+                    && answers_one_value(pg_sql)
+                {
+                    self.scalar_rereads.insert(capture.subscription_id);
+                }
+                Ok(registered)
             }
             other => other,
         }
@@ -1993,6 +2018,35 @@ pub(crate) fn row_json(columns: &[String], row: &[PgValue<Postgres>]) -> String 
 /// A whole row answer as a JSON array of objects.
 pub(crate) fn rows_json(columns: &[String], rows: &[Vec<PgValue<Postgres>>]) -> String {
     serde_json::Value::Array(rows.iter().map(|row| row_object(columns, row)).collect()).to_string()
+}
+
+/// A whole re-read's wire body: a scalar re-read's one cell as that value,
+/// any other answer as its row objects.
+fn whole_answer_json(scalar: bool, columns: &[String], rows: &[Vec<PgValue<Postgres>>]) -> String {
+    if scalar {
+        // No row at all is an ungrouped aggregate whose `HAVING` held for none.
+        return rows
+            .first()
+            .and_then(|row| row.first())
+            .map_or_else(|| value_to_json(&PgValue::Null), value_to_json);
+    }
+    rows_json(columns, rows)
+}
+
+/// Whether `pg_sql` is one `SELECT` with no `GROUP BY` projecting one item.
+fn answers_one_value(pg_sql: &str) -> bool {
+    let Ok(statements) = Parser::parse_sql(&PostgreSqlDialect {}, pg_sql) else {
+        return false;
+    };
+    let [Statement::Query(query)] = statements.as_slice() else {
+        return false;
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return false;
+    };
+    select.projection.len() == 1
+        && matches!(&select.group_by, GroupByExpr::Expressions(exprs, mods)
+            if exprs.is_empty() && mods.is_empty())
 }
 
 /// Decoded group values as a JSON array string, in `GROUP BY` order (R84).

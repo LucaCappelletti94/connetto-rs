@@ -106,26 +106,11 @@ async fn next_aggregate(client: &mut Client, sub_id: &str) -> AggregateUpdate {
     update
 }
 
-/// The count a computed answer carries, whichever shape served it: a bare
-/// scalar body, or the whole re-read's one-object row array.
+/// The count a computed answer carries, which the client reads only as a bare number.
 fn count_of(update: &AggregateUpdate) -> i64 {
     let body = update.result_json.as_deref().expect("an answer has a body");
-    let value: serde_json::Value = serde_json::from_str(body).expect("the body is JSON");
-    let scalar = match &value {
-        serde_json::Value::Array(rows) => {
-            assert_eq!(rows.len(), 1, "a count re-read answers one row: {body}");
-            rows[0]
-                .as_object()
-                .and_then(|row| row.values().next())
-                .cloned()
-                .unwrap_or(serde_json::Value::Null)
-        }
-        other => other.clone(),
-    };
-    scalar
-        .as_i64()
-        .or_else(|| scalar.as_str().and_then(|s| s.parse().ok()))
-        .unwrap_or_else(|| panic!("no count in {body}"))
+    body.parse()
+        .unwrap_or_else(|_| panic!("a count answers as a bare number, got {body}"))
 }
 
 /// Run `sql` on the emulated source and dispatch every event it produced.
@@ -230,5 +215,35 @@ async fn a_key_only_viewer_gets_its_own_statistic() {
         count_of(&seed),
         2,
         "the key holder counts the rows its subject grants, and no others"
+    );
+}
+
+/// A grouped statistic over an RLS table still answers as its row objects,
+/// which a keyed handle takes its group keys from.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_grouped_statistic_over_an_rls_table_keeps_its_rows() {
+    let fixture = Fixture::acquire().await;
+    let manager = manager(&fixture).await;
+    fixture
+        .exec("INSERT INTO notes VALUES (1, 'alice'), (2, 'alice'), (10, 'bob')")
+        .await;
+
+    let mut alice = connect(&manager);
+    alice.handshake_with("alice", "user:alice").await;
+    alice
+        .subscribe(
+            "by-owner",
+            "SELECT owner, COUNT(*) FROM notes GROUP BY owner",
+        )
+        .await;
+    let seed = next_aggregate(&mut alice, "by-owner").await;
+
+    let body: serde_json::Value =
+        serde_json::from_str(seed.result_json.as_deref().expect("an answer has a body"))
+            .expect("the body is JSON");
+    assert_eq!(
+        body,
+        serde_json::json!([{ "owner": "alice", "count": 2 }]),
+        "alice's one group, as the whole answer's row objects"
     );
 }
