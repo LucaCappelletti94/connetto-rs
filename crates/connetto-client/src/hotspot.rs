@@ -23,6 +23,8 @@ use crate::ClientEvent;
 pub(crate) mod android;
 #[cfg(target_os = "ios")]
 pub(crate) mod apple;
+#[cfg(target_os = "linux")]
+pub(crate) mod linux;
 mod wifi_payload;
 
 pub use wifi_payload::WifiPayloadError;
@@ -31,6 +33,8 @@ pub use wifi_payload::WifiPayloadError;
 pub(crate) use android::{AndroidHotspotBackend, JoinedBind};
 #[cfg(target_os = "ios")]
 pub(crate) use apple::AppleHotspotBackend;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::LinuxHotspotBackend;
 
 /// The time a hosted hotspot gets to start.
 pub(crate) const HOST_BOUND: Duration = Duration::from_secs(30);
@@ -120,6 +124,9 @@ pub enum HotspotError {
     /// Tethering is disallowed.
     #[error("tethering is disallowed")]
     Disallowed,
+    /// The device is already joined to a network.
+    #[error("the device is already joined to a network")]
+    Joined,
     /// The hotspot did not start within its bound.
     #[error("the hotspot did not start within its bound")]
     TimedOut,
@@ -137,6 +144,9 @@ pub enum JoinError {
     /// The permission `name` is not granted.
     #[error("the permission {0} is not granted")]
     MissingPermission(String),
+    /// The device is already hosting a hotspot.
+    #[error("the device is already hosting a hotspot")]
+    Hosting,
     /// The network is not available to this device.
     #[error("the network is not available to this device")]
     Declined,
@@ -150,13 +160,13 @@ pub enum JoinError {
 
 /// The host side's outcome, as the backend stands it (R76).
 #[cfg_attr(
-    not(any(target_os = "android", test)),
+    not(any(target_os = "android", target_os = "linux", test)),
     expect(
         dead_code,
-        reason = "Android's backend and the tests construct these standings, the other systems host no regular hotspot"
+        reason = "the platform backends and the proofs construct these standings, the other systems host no regular hotspot"
     )
 )]
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum HostStatus {
     /// Nothing requested, or the request in flight.
     Pending,
@@ -177,7 +187,7 @@ pub(crate) enum HostStatus {
 
 /// The join side's outcome, as the backend stands it (R76).
 #[cfg_attr(
-    not(any(target_os = "android", target_os = "ios", test)),
+    not(any(target_os = "android", target_os = "ios", target_os = "linux", test)),
     expect(
         dead_code,
         reason = "the platform backends and the proofs construct these standings, a non-Apple build reads them through the tables only"

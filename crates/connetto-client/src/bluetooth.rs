@@ -31,15 +31,19 @@ use crate::hotspot::{
 mod android;
 #[cfg(target_os = "ios")]
 mod apple;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
 mod central;
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::AndroidBluetoothBackend;
 #[cfg(target_os = "ios")]
 pub(crate) use apple::AppleBluetoothBackend;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
 pub(crate) use central::BtleplugCentral;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::LinuxBluetoothBackend;
 
 /// The pace of the machine's look while an exchange runs.
 const FAST_TICK: Duration = Duration::from_millis(20);
@@ -186,7 +190,7 @@ pub enum BeaconState {
 
 /// An event the host's GATT service reports (R76).
 #[cfg_attr(
-    not(any(target_os = "android", target_os = "ios")),
+    not(any(target_os = "android", target_os = "ios", target_os = "linux")),
     expect(
         dead_code,
         reason = "the platform backends construct these events, a non-Apple build reads them through the tables only"
@@ -219,7 +223,7 @@ pub enum PeripheralEvent {
 
 /// An event the joiner's central reports (R76).
 #[cfg_attr(
-    not(any(test, target_os = "android", target_os = "ios")),
+    not(any(test, target_os = "android", target_os = "ios", target_os = "linux")),
     expect(
         dead_code,
         reason = "btleplug's central runs on Android and iOS, so elsewhere only the proofs construct these events"
@@ -581,7 +585,7 @@ pub(crate) type CentralStarter = Arc<dyn Fn() -> CentralStart + Send + Sync>;
 
 /// btleplug's central as the machine's starter, which the machine runs once
 /// Bluetooth reads Ready and again after a failed start (R76 decision 22).
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
 pub(crate) fn btleplug_starter() -> CentralStarter {
     Arc::new(|| -> CentralStart {
         Box::pin(async {

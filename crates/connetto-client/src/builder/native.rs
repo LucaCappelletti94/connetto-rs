@@ -853,7 +853,7 @@ where
                 );
                 let enrolment = core.client().enrolment(enroller);
                 #[cfg(feature = "peer")]
-                let (runner, beacon_rx, bt_backend) = {
+                let (runner, beacon_rx, bt_backend) = Box::pin(async {
                     let backend: Arc<dyn crate::hotspot::HotspotBackend> = {
                         #[cfg(target_os = "android")]
                         {
@@ -868,7 +868,23 @@ where
                         {
                             Arc::new(crate::hotspot::AppleHotspotBackend::new())
                         }
-                        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                        #[cfg(target_os = "linux")]
+                        {
+                            match connetto_peer::linux::ZbusNm::new().await {
+                                Ok(io) => {
+                                    Arc::new(crate::hotspot::LinuxHotspotBackend::new(Arc::new(io)))
+                                }
+                                Err(err) => {
+                                    tracing::warn!(%err, "the system bus did not stand");
+                                    Arc::new(crate::hotspot::UnsupportedBackend)
+                                }
+                            }
+                        }
+                        #[cfg(not(any(
+                            target_os = "android",
+                            target_os = "ios",
+                            target_os = "linux"
+                        )))]
                         {
                             Arc::new(crate::hotspot::UnsupportedBackend)
                         }
@@ -949,7 +965,32 @@ where
                             Some(crate::bluetooth::btleplug_starter()),
                         )
                     };
-                    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+                    #[cfg(target_os = "linux")]
+                    let (bt_readiness, bt_peripheral, bt_starter) = {
+                        match connetto_peer::linux::BluerBluez::new().await {
+                            Ok(io) => {
+                                let backend = Arc::new(
+                                    crate::bluetooth::LinuxBluetoothBackend::new(Arc::new(io)),
+                                );
+                                (
+                                    Arc::clone(&backend)
+                                        as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                                    Arc::clone(&backend)
+                                        as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                                    Some(crate::bluetooth::btleplug_starter()),
+                                )
+                            }
+                            Err(err) => {
+                                tracing::warn!(%err, "the BlueZ session did not stand");
+                                crate::bluetooth::unsupported_backends()
+                            }
+                        }
+                    };
+                    #[cfg(not(any(
+                        target_os = "android",
+                        target_os = "ios",
+                        target_os = "linux"
+                    )))]
                     let (bt_readiness, bt_peripheral, bt_starter) =
                         crate::bluetooth::unsupported_backends();
                     let bt_state = Arc::clone(&bt_readiness);
@@ -989,7 +1030,7 @@ where
                         bt_machine.1,
                         bt_state,
                     )
-                };
+                }).await;
                 #[cfg(feature = "peer")]
                 let pump: CorePump = Box::pin(async move {
                     tokio::join!(pump, enrolment, runner);

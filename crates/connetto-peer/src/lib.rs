@@ -28,6 +28,8 @@ mod policy;
 mod beacon;
 #[cfg(feature = "bluetooth")]
 mod exchange;
+#[cfg(all(feature = "bluetooth", target_os = "linux"))]
+pub mod linux;
 
 #[cfg(test)]
 mod tests;

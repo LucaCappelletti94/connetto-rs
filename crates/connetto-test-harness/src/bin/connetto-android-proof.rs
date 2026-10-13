@@ -61,13 +61,33 @@
 //! (R76 decision 4). This is the run to make whenever two phones are at hand
 //! and before a peer phase closes.
 
+//!
+//! With `--linux-peer` and `--every-join`, the second device is pippo
+//! itself. The run drives a native client in a child process, signed in as
+//! its own account and durable under the evidence directory, beside the
+//! phone, and makes every join both ways, linux hosting and the phone
+//! joining through the beacon, the payload and the form, then the phone
+//! hosting and linux joining the same three ways (R76 slice 9b). The phone
+//! stays off its network for the walk, since the home LAN would link the
+//! two by discovery, and pippo's station holds its own network throughout,
+//! the joins taking their link through the hotspots alone. The run ends
+//! with the phone back on its usual network and both Bluetooth adapters
+//! off.
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
+use connetto_client::BluetoothState;
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
-use connetto_test_harness::peer_devices::{own_identity, read_hotspot_offer, wait_link_ends};
+use connetto_test_harness::linux_proof::{
+    ADAPTER_OFF_BOUND, LegClient, LegOffer, in_hotspot_subnet, parse_station_name, run_leg,
+    ss_remote_address,
+};
+use connetto_test_harness::peer_devices::{
+    LINK_END_BOUND, own_identity, read_hotspot_offer, wait_link_ends,
+};
 use connetto_test_harness::peer_proof::{JoinReport, commit, summary};
 use connetto_test_harness::stack::{
     demo_has_device_identity, demo_mobile_features, now_millis, repo_path,
@@ -148,6 +168,10 @@ const PEER_USER: &str = "bob";
 /// the locales the proof phones run, which the driver taps in place of the
 /// user (R76 decision 16).
 const CONNECT_BUTTONS: [&str; 3] = ["Connect", "Connetti", "Verbinden"];
+/// The unlock prompt's switch from the fingerprint sensor to the PIN pad in
+/// the runner's locales, which a run given the PIN taps on a phone with a
+/// fingerprint enrolled.
+const PIN_FALLBACK_BUTTONS: [&str; 3] = ["Use PIN", "Usa PIN", "PIN verwenden"];
 /// The Bluetooth enable dialog's refusal in the runner's locales, which a
 /// host whose beacon stays down taps (R76 decision 21).
 const DENY_BUTTONS: [&str; 6] = [
@@ -170,15 +194,37 @@ const BT_PERMISSIONS: [&str; 3] = [
     "android.permission.BLUETOOTH_CONNECT",
     "android.permission.BLUETOOTH_ADVERTISE",
 ];
+/// How long pippo's station gets to be back on its network after a join.
+const STATION_BACK_BOUND: Duration = Duration::from_secs(60);
+/// The argument lines `--help` shows.
+const USAGE: &str = "\
+usage: connetto-android-proof [--serial SERIAL] [--apk PATH] [--unlock-pin PIN] \
+[--peer-serial SECOND] [--linux-peer] [--bluetooth] [--payload] [--every-join]
+
+--serial         the phone the proof runs on
+--apk            an APK to deploy instead of building one
+--unlock-pin     the PIN the driver types into the unlock prompt
+--peer-serial    a second attached phone, which joins the first phone's hotspot
+--linux-peer     pippo takes the second device's place in the six-join walk
+--bluetooth      the host-side beacon proof, and the beacon join with --peer-serial
+--payload        the join through the host's WIFI: payload, with --peer-serial
+--every-join     every join in one run, with a summary
+";
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // The proof starts itself again as its Linux leg, a child serving the
+    // command stream, which takes none of the runner's arguments.
+    if std::env::args().nth(1).as_deref() == Some("--linux-leg") {
+        return run_leg().await;
+    }
     let stack = Stack::from_env()?;
     let Arguments {
         serial,
         apk,
         unlock_pin,
         peer_serial,
+        linux_peer,
         bluetooth,
         payload,
         every_join,
@@ -219,9 +265,10 @@ async fn main() -> Result<()> {
             );
             // The peer proof runs only on a proved phone, and a failed
             // proof keeps its own error.
-            match (bluetooth, peer_serial, outcome) {
-                (true, None, Ok(())) => bluetooth_proof(&device, &evidence).await,
-                (_, Some(serial), Ok(())) => {
+            match (linux_peer, bluetooth, peer_serial, outcome) {
+                (true, _, _, Ok(())) => linux_joins_with_summary(&device, &evidence, &proved).await,
+                (false, true, None, Ok(())) => bluetooth_proof(&device, &evidence).await,
+                (false, _, Some(serial), Ok(())) => {
                     let joins = JoinBy::chosen(every_join, bluetooth, payload);
                     let joiner = Device::new(serial);
                     let run = PeerRun {
@@ -232,11 +279,37 @@ async fn main() -> Result<()> {
                     };
                     joins_with_summary(&device, &joiner, &run, joins, &proved).await
                 }
-                (_, _, outcome) => outcome,
+                (_, _, _, outcome) => outcome,
             }
         }
         Err(err) => Err(err),
     };
+    let cleanup = finish(
+        &device,
+        &evidence,
+        previous.as_deref(),
+        stay_on.as_deref(),
+        error_dialogs.as_deref(),
+        &outcome,
+    )
+    .await;
+    outcome.and(cleanup)
+}
+
+/// The run's cleanup: the device log, the failure's screenshot, the
+/// forwards and reverses, the demo's stop, and the device's settings back.
+///
+/// # Errors
+///
+/// When the log will not be written or a setting will not come back.
+async fn finish(
+    device: &Device,
+    evidence: &Path,
+    previous: Option<&str>,
+    stay_on: Option<&str>,
+    error_dialogs: Option<&str>,
+    outcome: &Result<()>,
+) -> Result<()> {
     let log = device.adb(&["logcat", "-d"]).await.unwrap_or_default();
     if outcome.is_err() {
         for line in log.lines().filter(|line| {
@@ -250,14 +323,14 @@ async fn main() -> Result<()> {
     tokio::fs::write(evidence.join("logcat.txt"), log)
         .await
         .context("writing the device log")?;
-    if let Err(err) = &outcome {
-        let _ = device.screenshot(&evidence, "failure").await;
+    if let Err(err) = outcome {
+        let _ = device.screenshot(evidence, "failure").await;
         eprintln!("proof failed: {err:#}");
     }
     let _ = device.adb(&["forward", "--remove-all"]).await;
     let _ = device.adb(&["reverse", "--remove-all"]).await;
     let _ = device.adb(&["shell", "am", "force-stop", package()]).await;
-    let restored = match previous.as_deref() {
+    let restored = match previous {
         Some(holder) => device.set_browser_role_holder(holder).await,
         None => device
             .adb(&[
@@ -271,13 +344,11 @@ async fn main() -> Result<()> {
             .await
             .map(drop),
     };
-    let screen = device
-        .restore_global_setting(STAY_ON, stay_on.as_deref())
-        .await;
+    let screen = device.restore_global_setting(STAY_ON, stay_on).await;
     let dialogs = device
-        .restore_global_setting(HIDE_ERROR_DIALOGS, error_dialogs.as_deref())
+        .restore_global_setting(HIDE_ERROR_DIALOGS, error_dialogs)
         .await;
-    outcome.and(restored).and(screen).and(dialogs)
+    restored.and(screen).and(dialogs)
 }
 
 /// What `connetto-demo-stack` tells its command.
@@ -637,6 +708,38 @@ struct PeerOutcome {
     joins: Result<Vec<JoinReport>>,
     /// The second phone's log and its restored settings.
     teardown: Result<()>,
+}
+
+/// Which side hosts in one join of the linux run.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    /// The phone hosts and linux joins.
+    PhoneHosts,
+    /// Linux hosts and the phone joins.
+    LinuxHosts,
+}
+
+/// The six joins the linux run makes, linux hosting first, then the phone,
+/// each through the beacon, the payload and the form.
+const LINUX_JOINS: [(Direction, JoinBy); 6] = [
+    (Direction::LinuxHosts, JoinBy::Beacon),
+    (Direction::LinuxHosts, JoinBy::Payload),
+    (Direction::LinuxHosts, JoinBy::Form),
+    (Direction::PhoneHosts, JoinBy::Beacon),
+    (Direction::PhoneHosts, JoinBy::Payload),
+    (Direction::PhoneHosts, JoinBy::Form),
+];
+
+/// A join's name in the summary and the evidence, its side named.
+const fn join_name(direction: Direction, join: JoinBy) -> &'static str {
+    match (direction, join) {
+        (Direction::PhoneHosts, JoinBy::Beacon) => "beacon (phone hosts)",
+        (Direction::PhoneHosts, JoinBy::Payload) => "payload (phone hosts)",
+        (Direction::PhoneHosts, JoinBy::Form) => "form (phone hosts)",
+        (Direction::LinuxHosts, JoinBy::Beacon) => "beacon (linux hosts)",
+        (Direction::LinuxHosts, JoinBy::Payload) => "payload (linux hosts)",
+        (Direction::LinuxHosts, JoinBy::Form) => "form (linux hosts)",
+    }
 }
 
 /// The two-phone peer proof (R76 slice 4): `host` hosts a hotspot from the
@@ -1307,6 +1410,744 @@ fn check_beacon_dump(dump: &str) -> Result<()> {
     Ok(())
 }
 
+/// The linux-peer run, the six joins with their summary (R76 slice 9b).
+///
+/// # Errors
+///
+/// As [`joins_with_summary`].
+async fn linux_joins_with_summary(
+    phone: &Device,
+    evidence: &Path,
+    proved: &(Duration, Result<(), String>),
+) -> Result<()> {
+    let reports = linux_peer_proof(phone, evidence).await;
+    let summary = summary(&commit().await, proved, reports.as_deref(), Ok(()));
+    eprintln!("{summary}");
+    tokio::fs::write(evidence.join("summary.txt"), &summary)
+        .await
+        .context("writing the summary")?;
+    let failed: Vec<&str> = reports?
+        .iter()
+        .filter(|report| report.outcome.is_err())
+        .map(|report| report.name)
+        .collect();
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!("the {} join failed", failed.join(", ")))
+    }
+}
+
+/// The linux-peer proof: the phone's single-phone proof, then pippo in the
+/// second device's place, a native client driven in a child process.
+///
+/// # Errors
+///
+/// When the leg will not stand, the walk fails its setup, or the machines
+/// cannot come back to rest.
+async fn linux_peer_proof(phone: &Device, evidence: &Path) -> Result<Vec<JoinReport>> {
+    if !demo_has_device_identity() {
+        bail!("the linux peer proof needs a demo build with its device identity");
+    }
+    step("prepare the linux leg");
+    for permission in BT_PERMISSIONS
+        .iter()
+        .copied()
+        .chain(["android.permission.NEARBY_WIFI_DEVICES"])
+    {
+        phone
+            .adb(&["shell", "pm", "grant", package(), permission])
+            .await?;
+    }
+    // The phone's usual network, read while it still holds one, which the
+    // run's cleanup brings it back to, and pippo's, which the joins must
+    // not keep down.
+    let phone_usual = phone.current_ssid().await?;
+    let pippo_usual = linux_station()
+        .await?
+        .context("pippo's station names no connection, the run cannot restore it")?;
+    eprintln!(
+        "the phone holds {phone_usual:?} and pippo holds {pippo_usual} until the run restores them"
+    );
+    // The phone leaves the home LAN for the whole section, so the LAN never
+    // links the two by discovery; its demo reaches the server over adb
+    // reverse.
+    step("take the phone off its network");
+    phone.adb(&["shell", "svc", "wifi", "disable"]).await?;
+    sleep(Duration::from_secs(5)).await;
+    let leg = LegClient::spawn(evidence).await?;
+    let (linux_identity, _) = leg.wait_ready().await?;
+    let mut app = phone.app().await?;
+    app.wait_for_text("device: certified until", Duration::from_secs(60))
+        .await?;
+    let phone_identity = own_identity(&mut app).await?;
+    let result = run_linux_joins(
+        phone,
+        &mut app,
+        &leg,
+        &phone_identity,
+        &linux_identity,
+        &pippo_usual,
+        evidence,
+    )
+    .await;
+
+    let leg_log = leg.take_log();
+    tokio::fs::write(evidence.join("linux-leg.log"), leg_log)
+        .await
+        .context("writing the linux leg's log")?;
+    // The adapter power-off talks to the leg, so it runs before the close.
+    let adapter = linux_adapter_off(&leg).await;
+    let leg_closed = leg.close().await;
+    let phone_back = restore_phone_network(phone, phone_usual.as_ref()).await;
+    let bluetooth = bluetooth_off(phone).await;
+    let reports = result?;
+    // The joins' outcomes stand whatever the cleanup meets, so a cleanup
+    // that fails is reported beside them and leaves the summary whole.
+    for (what, outcome) in [
+        ("powering the linux adapter off", adapter),
+        ("closing the linux leg", leg_closed),
+        ("bringing the phone back to its network", phone_back),
+        ("turning the phone's Bluetooth off", bluetooth),
+    ] {
+        if let Err(err) = outcome {
+            eprintln!("the cleanup failed {what}: {err:#}");
+        }
+    }
+    Ok(reports)
+}
+
+/// The walk itself: each join in turn, every one recorded, with the
+/// machines brought back to rest after each.
+async fn run_linux_joins(
+    phone: &Device,
+    app: &mut PageSession,
+    leg: &LegClient,
+    phone_identity: &str,
+    linux_identity: &str,
+    pippo_usual: &str,
+    evidence: &Path,
+) -> Result<Vec<JoinReport>> {
+    let mut reports = Vec::with_capacity(LINUX_JOINS.len());
+    for (direction, join) in LINUX_JOINS.iter().copied() {
+        let started = Instant::now();
+        let name = join_name(direction, join);
+        let outcome = one_linux_join(
+            phone,
+            app,
+            leg,
+            phone_identity,
+            linux_identity,
+            direction,
+            join,
+            pippo_usual,
+            evidence,
+        )
+        .await;
+        if let Err(err) = &outcome {
+            eprintln!("the {name} join failed: {err:#}");
+            let _ = phone
+                .screenshot(evidence, &format!("{name}-failure-phone"))
+                .await;
+            let _ = write_linux_state(evidence, &format!("{name}-failure-linux"), leg, None).await;
+        }
+        reports.push(JoinReport {
+            name,
+            took: Some(started.elapsed()),
+            outcome,
+        });
+    }
+    Ok(reports)
+}
+
+/// One join of the linux run, from the offer to the link's end, and the
+/// machines back at rest whatever happened.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the phone, its page, the leg, both identities, the direction, the join, the usual network and the evidence are each the step's own"
+)]
+async fn one_linux_join(
+    phone: &Device,
+    app: &mut PageSession,
+    leg: &LegClient,
+    phone_identity: &str,
+    linux_identity: &str,
+    direction: Direction,
+    join: JoinBy,
+    pippo_usual: &str,
+    evidence: &Path,
+) -> Result<()> {
+    let name = join_name(direction, join);
+    // The hotspot's ssid, recorded as soon as it shows, so the cleanup
+    // forgets it even when a later step fails.
+    let mut offer_ssid = None;
+    let walked = match direction {
+        Direction::PhoneHosts => {
+            phone_hosts_walk(
+                phone,
+                app,
+                leg,
+                phone_identity,
+                linux_identity,
+                join,
+                name,
+                evidence,
+                &mut offer_ssid,
+            )
+            .await
+        }
+        Direction::LinuxHosts => {
+            linux_hosts_walk(
+                phone,
+                app,
+                leg,
+                phone_identity,
+                linux_identity,
+                join,
+                name,
+                evidence,
+                &mut offer_ssid,
+            )
+            .await
+        }
+    };
+    // Back to rest whatever happened, so the next join starts clean: the
+    // pages' own leave and stop, the phone's network left down until the run
+    // ends, both adapters off, and pippo's station back, the first failure
+    // kept.
+    if walked.is_err() {
+        // The phone as the failure left it, before the cleanup moves it.
+        let name = join_name(direction, join);
+        let _ = phone
+            .screenshot(evidence, &format!("{name}-failure-moment"))
+            .await;
+        if let Ok(page) = app.page_text().await {
+            let _ = tokio::fs::write(evidence.join(format!("{name}-failure-page.txt")), page).await;
+        }
+        let _ = leg.leave().await;
+        let _ = leg.stop().await;
+        let _ = app.click("Leave the hotspot").await;
+        let _ = app.click("Stop the hotspot").await;
+        // An abandoned join leaves the system's "Couldn't connect" notice up,
+        // and the next request reuses that dialog in place of its approval, so
+        // the cleanup closes it with the Settings process that shows it.
+        let _ = phone
+            .adb(&["shell", "am", "force-stop", "com.android.settings"])
+            .await;
+    }
+    let station = wait_linux_station(pippo_usual).await;
+    let mut bluetooth = bluetooth_off(phone).await;
+    bluetooth = bluetooth.and(linux_adapter_off(leg).await);
+    let networks = match &offer_ssid {
+        Some(ssid) => phone.forget_network(ssid).await.map(drop),
+        None => Ok(()),
+    };
+    // The phone's network stays down between joins, so the home LAN never
+    // links the two by discovery.
+    let lan = phone
+        .adb(&["shell", "svc", "wifi", "disable"])
+        .await
+        .map(drop);
+    sleep(Duration::from_secs(5)).await;
+    walked.and(station).and(bluetooth).and(networks).and(lan)?;
+    phone
+        .screenshot(evidence, &format!("{name}-peer-clean"))
+        .await?;
+    Ok(())
+}
+
+/// Turn the beacon's radio on on both sides, which the beacon joins need.
+///
+/// # Errors
+///
+/// When a side will not power its adapter within the bound.
+async fn beacon_on_both_sides(phone: &Device, leg: &LegClient) -> Result<()> {
+    step("turn Bluetooth on on both sides");
+    bluetooth_on(phone).await?;
+    leg.enable_bluetooth().await?;
+    Ok(())
+}
+
+/// The walk while the phone hosts: the offer from its page, the join from
+/// the leg, the link named on both sides and proven over the hotspot, and
+/// the link's end.
+///
+/// # Errors
+///
+/// When a step's bound runs or a page never shows its line.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the phone, its page, the leg, both identities, the join, its name, the evidence and the ssid the cleanup forgets are each the walk's own"
+)]
+async fn phone_hosts_walk(
+    phone: &Device,
+    app: &mut PageSession,
+    leg: &LegClient,
+    phone_identity: &str,
+    linux_identity: &str,
+    join: JoinBy,
+    name: &'static str,
+    evidence: &Path,
+    offer_ssid: &mut Option<String>,
+) -> Result<()> {
+    if join == JoinBy::Beacon {
+        beacon_on_both_sides(phone, leg).await?;
+    }
+    // The phone's network stays down from the section's start, which an
+    // A35 also needs to start an access point.
+    step(&format!("host a hotspot on the phone for the {name} join"));
+    app.click("Host a hotspot").await?;
+    if join != JoinBy::Beacon {
+        step("decline Bluetooth on the phone");
+        phone
+            .tap_dialog_button(&DENY_BUTTONS, "the Bluetooth enable dialog's refusal")
+            .await?;
+        app.wait_for_text("hosting, the beacon is off", Duration::from_secs(30))
+            .await?;
+    }
+    let offer = read_hotspot_offer(app).await?;
+    *offer_ssid = Some(offer.ssid.clone());
+    phone
+        .screenshot(evidence, &format!("{name}-host-offer"))
+        .await?;
+    assert_no_link(app, leg).await?;
+    let gateway = match join {
+        JoinBy::Form => {
+            step("join the hotspot from linux");
+            leg.join_form(&offer.ssid, &offer.passphrase, offer.port)
+                .await?
+        }
+        JoinBy::Payload => {
+            let payload = offer
+                .payload
+                .as_deref()
+                .context("the phone shows no WIFI: payload")?;
+            step("join the hotspot from the payload on linux");
+            leg.join_payload(payload).await?
+        }
+        JoinBy::Beacon => {
+            let beacon = read_beacon(app).await?;
+            let prefix = beacon
+                .strip_prefix("beacon: advertising ")
+                .context("the beacon line carries no prefix")?
+                .to_owned();
+            step("find the beacon on linux");
+            let host = leg.wait_nearby(&prefix).await?;
+            leg.join_nearby(&host).await?.1
+        }
+    };
+    step("link through the hotspot");
+    if app
+        .wait_for_text(
+            &format!("linked: {linux_identity}"),
+            Duration::from_secs(90),
+        )
+        .await
+        .is_err()
+    {
+        let linked = leg.linked().await.unwrap_or_default();
+        bail!("the phone never named linux as linked, linux names no peer or:\n{linked:?}");
+    }
+    leg.wait_linked(phone_identity, Duration::from_secs(30))
+        .await?;
+    step("prove the link runs over the hotspot");
+    let ss_line = ss_link_line(move |remote| remote == gateway).await?;
+    phone
+        .screenshot(evidence, &format!("{name}-host-linked"))
+        .await?;
+    write_linux_state(
+        evidence,
+        &format!("{name}-linux-linked"),
+        leg,
+        Some(ss_line.as_str()),
+    )
+    .await?;
+    step("leave the hotspot on linux");
+    leg.leave().await?;
+    step("stop the hotspot on the phone");
+    app.click("Stop the hotspot").await?;
+    wait_link_ends_leg(app, leg, phone_identity).await?;
+    phone
+        .screenshot(evidence, &format!("{name}-host-unlinked"))
+        .await?;
+    Ok(())
+}
+
+/// The walk while linux hosts: the offer stood up on pippo, then the
+/// phone's side of it.
+///
+/// # Errors
+///
+/// As [`linux_hosts_preamble`] and [`linux_hosts_join`].
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the phone, its page, the leg, both identities, the join, its name, the evidence and the ssid the cleanup forgets are each the walk's own"
+)]
+async fn linux_hosts_walk(
+    phone: &Device,
+    app: &mut PageSession,
+    leg: &LegClient,
+    phone_identity: &str,
+    linux_identity: &str,
+    join: JoinBy,
+    name: &'static str,
+    evidence: &Path,
+    offer_ssid: &mut Option<String>,
+) -> Result<()> {
+    let (offer, port) =
+        linux_hosts_preamble(phone, app, leg, join, name, evidence, offer_ssid).await?;
+    linux_hosts_join(
+        phone,
+        app,
+        leg,
+        phone_identity,
+        linux_identity,
+        join,
+        name,
+        &offer,
+        port,
+        evidence,
+    )
+    .await
+}
+
+/// The linux host's start: the beacon's sides, the phone off its network,
+/// the offer stood up with its beacon standing asserted, and its port.
+///
+/// # Errors
+///
+/// When the hotspot will not host, the beacon stands down where the join
+/// needs it up, or a step's bound runs.
+async fn linux_hosts_preamble(
+    phone: &Device,
+    app: &mut PageSession,
+    leg: &LegClient,
+    join: JoinBy,
+    name: &'static str,
+    evidence: &Path,
+    offer_ssid: &mut Option<String>,
+) -> Result<(LegOffer, u16)> {
+    // `host_hotspot` powers the adapter on Linux (decision 21), where no
+    // dialog stands to decline, so the payload and form joins run beside a
+    // live beacon the phone leaves unused.
+    if join == JoinBy::Beacon {
+        beacon_on_both_sides(phone, leg).await?;
+    }
+    assert_no_link(app, leg).await?;
+    step(&format!("host a hotspot on linux for the {name} join"));
+    let offer = leg.host().await?;
+    *offer_ssid = Some(offer.ssid.clone());
+    if let (JoinBy::Beacon, Some(reason)) = (join, offer.beacon_off.as_deref()) {
+        bail!("linux hosted the beacon join with its beacon down: {reason}");
+    }
+    write_linux_state(evidence, &format!("{name}-linux-offer"), leg, None).await?;
+    let port = match offer.port {
+        Some(port) => port,
+        None => leg.wait_serving().await?,
+    };
+    Ok((offer, port))
+}
+
+/// The linux host's link: the phone shown the offer and joined by its way,
+/// the system's approval, the link named on both sides and proven over the
+/// hotspot, and the link's end.
+///
+/// # Errors
+///
+/// When the phone will not take the offer, the link never shows, no
+/// established connection names the hotspot, or a step's bound runs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the phone, its page, the leg, both identities, the join, its name, the offer, its port and the evidence are each the link's own"
+)]
+async fn linux_hosts_join(
+    phone: &Device,
+    app: &mut PageSession,
+    leg: &LegClient,
+    phone_identity: &str,
+    linux_identity: &str,
+    join: JoinBy,
+    name: &'static str,
+    offer: &LegOffer,
+    port: u16,
+    evidence: &Path,
+) -> Result<()> {
+    // The phone's network comes back for the join, which moves it from its
+    // own network to linux's hotspot.
+    step("bring the phone's network back for the join");
+    phone.adb(&["shell", "svc", "wifi", "enable"]).await?;
+    sleep(Duration::from_secs(5)).await;
+    match join {
+        JoinBy::Form => {
+            step("fill the join form on the phone");
+            app.set_input("ssid", &offer.ssid).await?;
+            app.set_input("passphrase", &offer.passphrase).await?;
+            app.set_input("port", &port.to_string()).await?;
+            app.click("Join the hotspot").await?;
+        }
+        JoinBy::Payload => {
+            step("paste the payload on the phone");
+            app.set_input("payload", &offer.payload).await?;
+            app.click("Join from the payload").await?;
+            if app
+                .wait_for_text("joining the hotspot", Duration::from_secs(10))
+                .await
+                .is_err()
+            {
+                let page = app.page_text().await.unwrap_or_default();
+                bail!("the phone did not take the payload, its page shows:\n{page}");
+            }
+        }
+        JoinBy::Beacon => {
+            let prefix = leg.wait_beacon().await?;
+            step("find the beacon on the phone");
+            app.wait_for_text(&format!("nearby: {prefix}"), Duration::from_secs(60))
+                .await
+                .context("the phone never saw linux's beacon")?;
+            // The join button takes the strongest host, so linux's
+            // must be the only one in sight.
+            let page = app.page_text().await?;
+            let nearby: Vec<&str> = page
+                .lines()
+                .filter(|line| line.starts_with("nearby: "))
+                .collect();
+            if nearby.len() != 1 {
+                bail!("the phone sees other hosts than linux: {nearby:?}");
+            }
+            phone
+                .screenshot(evidence, &format!("{name}-peer-nearby"))
+                .await?;
+            app.click("Join the nearby host").await?;
+        }
+    }
+    step("approve the network on the phone");
+    phone.tap_connect_button().await?;
+    step("link through the hotspot");
+    leg.wait_linked(phone_identity, Duration::from_secs(90))
+        .await?;
+    if app
+        .wait_for_text(
+            &format!("linked: {linux_identity}"),
+            Duration::from_secs(30),
+        )
+        .await
+        .is_err()
+    {
+        let linked = leg.linked().await.unwrap_or_default();
+        bail!("linux never named the phone as linked, the phone names:\n{linked:?}");
+    }
+    step("prove the link runs over the hotspot");
+    let ss_line = ss_link_line(in_hotspot_subnet).await?;
+    phone
+        .screenshot(evidence, &format!("{name}-peer-linked"))
+        .await?;
+    write_linux_state(
+        evidence,
+        &format!("{name}-linux-linked"),
+        leg,
+        Some(ss_line.as_str()),
+    )
+    .await?;
+    step("leave the hotspot on the phone");
+    app.click("Leave the hotspot").await?;
+    step("stop the hotspot on linux");
+    leg.stop().await?;
+    // Leaving the hotspot hands the phone's station back to its home
+    // network, where discovery would link it to pippo over the LAN, so the
+    // phone goes off Wi-Fi before the link's end is awaited.
+    step("take the phone off its network");
+    phone.adb(&["shell", "svc", "wifi", "disable"]).await?;
+    wait_link_ends_leg(app, leg, phone_identity).await?;
+    phone
+        .screenshot(evidence, &format!("{name}-host-unlinked"))
+        .await?;
+    Ok(())
+}
+
+/// No link may stand before a join's join step, so the run proves the join
+/// made the link: a stale link closes after 45 s of silence, and the wait
+/// fails only past [`LINK_END_BOUND`].
+///
+/// # Errors
+///
+/// When a link still stands past the bound, or a side does not answer.
+async fn assert_no_link(app: &mut PageSession, leg: &LegClient) -> Result<()> {
+    let deadline = Instant::now() + LINK_END_BOUND;
+    loop {
+        let page = app.page_text().await?;
+        let phone_linked = page.lines().any(|line| line.starts_with("linked: "));
+        let linked = leg.linked().await?;
+        if !phone_linked && linked.is_empty() {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "a link stands before the join step, the phone names a link, \
+                 linux names: {linked:?}"
+            );
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Wait for the phone's page to drop its linked line and the leg to drop the
+/// phone from its linked list, which the leave and the stop end the link.
+///
+/// # Errors
+///
+/// When a link stands past [`LINK_END_BOUND`], or a side does not answer.
+async fn wait_link_ends_leg(app: &mut PageSession, leg: &LegClient, peer: &str) -> Result<()> {
+    let deadline = Instant::now() + LINK_END_BOUND;
+    loop {
+        let page = app.page_text().await?;
+        let linked = leg.linked().await?;
+        if !page.contains("linked: ") && !linked.iter().any(|held| held == peer) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the link did not end after the leave and the stop");
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// pippo's station's connection name, which `nmcli dev status` names while
+/// the Wi-Fi device holds one.
+///
+/// # Errors
+///
+/// When `nmcli` fails.
+async fn linux_station() -> Result<Option<String>> {
+    let output = Command::new("nmcli")
+        .args(["dev", "status"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("nmcli dev status exited with {}", output.status);
+    }
+    Ok(parse_station_name(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// One line of pippo's established TCP connections whose remote endpoint
+/// satisfies `expect`, which the run's link proof reads.
+///
+/// # Errors
+///
+/// When `ss` will not run or no line satisfies `expect`.
+async fn ss_link_line(expect: impl Fn(IpAddr) -> bool) -> Result<String> {
+    let output = Command::new("ss")
+        .args(["-tnH", "state", "established"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("ss -tnH state established exited with {}", output.status);
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    text.lines()
+        .find(|line| ss_remote_address(line).is_some_and(&expect))
+        .map(str::to_owned)
+        .context("no established connection on pippo matches the hotspot link")
+}
+
+/// Hold until pippo's station is back on `usual`, which `NetworkManager`
+/// reconnects on its own once a join's connection is gone.
+///
+/// # Errors
+///
+/// When the station never comes back within the bound.
+async fn wait_linux_station(usual: &str) -> Result<()> {
+    let deadline = Instant::now() + STATION_BACK_BOUND;
+    loop {
+        if linux_station().await?.as_deref() == Some(usual) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("pippo's station never came back on {usual}");
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Power the linux adapter off where it stands on, and hold until it reports
+/// itself off.
+///
+/// # Errors
+///
+/// When `bluetoothctl` fails or the adapter never reports itself off.
+async fn linux_adapter_off(leg: &LegClient) -> Result<()> {
+    if leg.bluetooth().await? == BluetoothState::Off {
+        return Ok(());
+    }
+    step("power the linux adapter off");
+    let output = Command::new("bluetoothctl")
+        .args(["power", "off"])
+        .output()
+        .await?;
+    if !output.status.success() {
+        bail!("bluetoothctl power off exited with {}", output.status);
+    }
+    let deadline = Instant::now() + ADAPTER_OFF_BOUND;
+    loop {
+        if leg.bluetooth().await? == BluetoothState::Off {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the linux adapter never reported itself off");
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// Bring the phone back to its usual network at the end of the run, where
+/// the joins kept it down.
+///
+/// # Errors
+///
+/// When the phone never comes back on its usual network within the bound.
+async fn restore_phone_network(phone: &Device, usual: Option<&String>) -> Result<()> {
+    if usual.is_none() {
+        return Ok(());
+    }
+    let _ = phone.adb(&["shell", "svc", "wifi", "enable"]).await;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let current = phone.current_ssid().await?;
+        if current.as_deref() == usual.map(String::as_str) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("the phone is back on {current:?}, not {usual:?}");
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
+}
+
+/// The leg's full standing as a text file beside the run's evidence, which a
+/// headless machine shows in place of a screenshot.
+///
+/// # Errors
+///
+/// When the file cannot be written.
+async fn write_linux_state(
+    evidence: &Path,
+    name: &str,
+    leg: &LegClient,
+    ss_line: Option<&str>,
+) -> Result<()> {
+    let mut text = match leg.state().await {
+        Ok(state) => format!("{state}\n"),
+        Err(err) => format!("the leg answered no state: {err:#}\n"),
+    };
+    if let Some(line) = ss_line {
+        text.push_str("ss: ");
+        text.push_str(line);
+        text.push('\n');
+    }
+    tokio::fs::write(evidence.join(format!("{name}.txt")), text)
+        .await
+        .with_context(|| format!("writing the leg's state file {name}"))
+}
+
 /// Who answers the platform's unlock prompt.
 #[derive(Clone, Copy)]
 struct Unlock<'a> {
@@ -1353,6 +2194,15 @@ impl Unlock<'_> {
         device.screenshot(evidence, name).await?;
         match self.pin {
             Some(pin) => {
+                // A phone with a fingerprint enrolled opens the prompt on the
+                // sensor, and its PIN pad sits behind the prompt's own button.
+                if let Some((left, top, right, bottom)) =
+                    device.dialog_button_bounds(&PIN_FALLBACK_BUTTONS).await?
+                {
+                    let x = i32::midpoint(left, right).to_string();
+                    let y = i32::midpoint(top, bottom).to_string();
+                    device.adb(&["shell", "input", "tap", &x, &y]).await?;
+                }
                 // The credential pad needs a moment to take focus.
                 sleep(Duration::from_secs(1)).await;
                 device.adb(&["shell", "input", "text", pin]).await?;
@@ -1401,14 +2251,20 @@ fn step(name: &str) {
     eprintln!("== {name}");
 }
 
-/// `--serial` and `--apk`, both optional.
 /// What the command line names.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "each flag names one run mode the command line takes, and none groups into a mode of its own"
+)]
 struct Arguments {
     serial: Option<String>,
     apk: Option<PathBuf>,
     unlock_pin: Option<String>,
     peer_serial: Option<String>,
+    /// Pippo takes the second device's place in the six-join walk, which
+    /// needs `--every-join` (R76 slice 9b).
+    linux_peer: bool,
     /// The Bluetooth beacon proof, host-side alone, and the beacon join with
     /// `--peer-serial`.
     bluetooth: bool,
@@ -1421,6 +2277,10 @@ struct Arguments {
 }
 
 fn cli_arguments() -> Result<Arguments> {
+    if std::env::args().any(|arg| arg == "--help" || arg == "-h") {
+        eprintln!("{USAGE}");
+        std::process::exit(0);
+    }
     let mut arguments = Arguments::default();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -1436,6 +2296,10 @@ fn cli_arguments() -> Result<Arguments> {
             arguments.every_join = true;
             continue;
         }
+        if arg == "--linux-peer" {
+            arguments.linux_peer = true;
+            continue;
+        }
         let value = args.next().ok_or_else(|| anyhow!("{arg} needs a value"))?;
         match arg.as_str() {
             "--serial" => arguments.serial = Some(value),
@@ -1448,10 +2312,19 @@ fn cli_arguments() -> Result<Arguments> {
             other => bail!("unknown argument {other}"),
         }
     }
+    if arguments.linux_peer && arguments.peer_serial.is_some() {
+        bail!("--linux-peer and --peer-serial name the same side twice, pick one");
+    }
+    if arguments.linux_peer && !arguments.every_join {
+        bail!("--linux-peer runs the six-join walk, so it needs --every-join");
+    }
+    if arguments.linux_peer && (arguments.bluetooth || arguments.payload) {
+        bail!("--linux-peer walks every join both ways, so --bluetooth and --payload name none");
+    }
     if arguments.payload && arguments.peer_serial.is_none() {
         bail!("--payload needs --peer-serial");
     }
-    if arguments.every_join && arguments.peer_serial.is_none() {
+    if arguments.every_join && arguments.peer_serial.is_none() && !arguments.linux_peer {
         bail!("--every-join needs --peer-serial");
     }
     if arguments.every_join && (arguments.bluetooth || arguments.payload) {
