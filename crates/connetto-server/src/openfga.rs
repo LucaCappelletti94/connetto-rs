@@ -1840,9 +1840,9 @@ mod tests {
     use subql::visibility::RowView;
 
     use super::{
-        BTreeMap, Body, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject, OpenFgaPolicy,
-        OpenFgaServiceClient, ParserDB, Principal, Reconciled, SubjectNaming, Translated,
-        VisibilityPolicy, WithdrawnFact,
+        BTreeMap, Body, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject, OpenFgaError,
+        OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, Reconciled, SubjectNaming,
+        Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
     };
     use connetto_core::auth::DEFAULT_USER_SETTING;
 
@@ -2600,5 +2600,42 @@ mod tests {
             detail.contains("user"),
             "the refusal names the table an operator has to rename: {detail}"
         );
+    }
+
+    /// An unreachable store holds the event for a retry, a model refusal ends the stream.
+    #[test]
+    fn store_failure_classifies_a_store_failure_by_whether_it_clears() {
+        let write = super::store_failure(&OpenFgaError::Transport {
+            attempts: 3,
+            message: "the connection was refused".to_owned(),
+        });
+        assert!(
+            matches!(write, UpkeepError::Write(_)),
+            "a connection that refuses is a write failure the session holds and retries: {write:?}"
+        );
+
+        let refused = super::store_failure(&OpenFgaError::RowCannotBeNamed);
+        assert!(
+            matches!(refused, UpkeepError::Unanswerable(_)),
+            "a refusal the model fixes is unanswerable, so it ends the stream rather than retries: {refused:?}"
+        );
+    }
+
+    /// A key cell no placeholder carries is refused for good, naming the cell kind.
+    #[test]
+    fn a_key_cell_no_placeholder_carries_is_unanswerable() {
+        let Err(err) = super::bind_key(
+            diesel::sql_query("SELECT 1").into_boxed(),
+            &[Value::Jsonb(serde_json::json!({}))],
+        ) else {
+            panic!("a jsonb key cannot ride the replay");
+        };
+        match err {
+            UpkeepError::Unanswerable(reason) => assert!(
+                reason.contains("Jsonb"),
+                "the refusal names the cell kind an operator has to rename: {reason}"
+            ),
+            other => panic!("the refusal is unanswerable, not {other:?}"),
+        }
     }
 }

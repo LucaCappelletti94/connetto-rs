@@ -19,8 +19,8 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectEvent, SessionError,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, ReconnectEvent, RlsAuthError,
+    SessionError, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture};
 use subql::backend::Postgres;
@@ -364,6 +364,93 @@ impl VisibilityPolicy for UnnameableRows {
     }
 }
 
+/// Row-level-security policy whose pool cannot hand out a connection, the
+/// outage half of the `RlsAuthError` classification.
+struct RlsPoolError;
+
+impl VisibilityPolicy for RlsPoolError {
+    type Watcher = Arc<Principal>;
+    type Error = RlsAuthError;
+    type Backend = Postgres;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_see<R>(
+        &self,
+        _row: &R,
+        _watchers: &[Self::Watcher],
+        _verdicts: &mut [Verdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Err(RlsAuthError::Pool(
+            "the pool cannot hand out a connection".to_owned(),
+        ))
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_write<R>(
+        &self,
+        _write: RowWrite<'_, R>,
+        _watcher: &Self::Watcher,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Allow)
+    }
+}
+
+/// Row-level-security policy that cannot speak for the table, the refusal
+/// half of the `RlsAuthError` classification.
+struct RlsUndecidable;
+
+impl VisibilityPolicy for RlsUndecidable {
+    type Watcher = Arc<Principal>;
+    type Error = RlsAuthError;
+    type Backend = Postgres;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_see<R>(
+        &self,
+        _row: &R,
+        _watchers: &[Self::Watcher],
+        _verdicts: &mut [Verdict],
+    ) -> Result<(), Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Err(RlsAuthError::Undecidable {
+            table: "items".to_owned(),
+            detail: "the table's rules are not installed".to_owned(),
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn may_write<R>(
+        &self,
+        _write: RowWrite<'_, R>,
+        _watcher: &Self::Watcher,
+    ) -> Result<Verdict, Self::Error>
+    where
+        R: RowView<Backend = Postgres> + Sync + ?Sized,
+    {
+        Ok(Verdict::Allow)
+    }
+}
+
 /// A refusal the model fixes gives the same answer however often it is
 /// asked, so the ingest loop ends with it instead of holding the event and
 /// retrying without end. Retrying would pause every client's delivery for
@@ -440,5 +527,157 @@ async fn a_refusal_the_model_fixes_ends_ingest_instead_of_retrying() {
         retries.load(Ordering::Relaxed),
         0,
         "a fixed refusal is never retried"
+    );
+}
+
+/// A row-level-security pool that cannot hand out a connection is an outage,
+/// so `dispatch_event` reports `AuthUnavailable` and the ingest loop holds
+/// the event rather than acking it past the unanswered question.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_level_security_outage_holds_the_event() {
+    let fixture = Fixture::acquire().await;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL).build().expect("materializer"),
+        EmptySnapshot,
+        RlsPoolError,
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .build();
+
+    // Connect a client and subscribe so a route is registered; `dispatch_event`
+    // only consults the auth policy when at least one watcher waits.
+    let (server_transport, mut client) = loopback();
+    let _server = tokio::spawn(manager.clone().serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-d")
+                .with_grant(connetto_core::messages::Grant::new("user:client-d")),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "items".to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM items"),
+        }))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    match client.recv().await.expect("recv") {
+        Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_))) => {}
+        other => panic!("expected snapshot patch, got {other:?}"),
+    }
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO items (id, data) VALUES (7, 'held')")
+        .expect("execute dml");
+    let event = source
+        .next_item()
+        .await
+        .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
+        .expect("one event");
+
+    let result = manager.dispatch_event(&event).await;
+    assert!(
+        matches!(result, Err(SessionError::AuthUnavailable(_))),
+        "a pool outage must propagate as auth unavailable so the cursor is held: {result:?}"
+    );
+    let idle = tokio::time::timeout(Duration::from_millis(200), client.recv()).await;
+    assert!(
+        idle.is_err() || matches!(idle, Ok(Ok(None))),
+        "no live patch must arrive while the rules cannot be asked"
+    );
+}
+
+/// A table whose row-level rules cannot be spoken for is a fixed refusal, so
+/// the ingest loop ends naming the table instead of retrying without end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_row_level_security_refusal_ends_ingest_instead_of_retrying() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let fixture = Fixture::acquire().await;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL).build().expect("materializer"),
+        EmptySnapshot,
+        RlsUndecidable,
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .build();
+
+    let (server_transport, mut client) = loopback();
+    let _server = tokio::spawn(manager.clone().serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-e")
+                .with_grant(connetto_core::messages::Grant::new("user:client-e")),
+        ))
+        .await
+        .expect("send handshake");
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
+    let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
+        panic!("expected handshake ack");
+    };
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "items".to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM items"),
+        }))
+        .await
+        .expect("send subscribe");
+    let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
+        panic!("expected snapshot begin");
+    };
+    match client.recv().await.expect("recv") {
+        Some(IncomingFrame::Bulk(BulkMessage::SnapshotPatch(_))) => {}
+        other => panic!("expected snapshot patch, got {other:?}"),
+    }
+    let ControlMessage::SnapshotEnd(_) = next_control(&mut client).await else {
+        panic!("expected snapshot end");
+    };
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO items (id, data) VALUES (8, 'undecided')")
+        .expect("execute dml");
+    let retries = AtomicU32::new(0);
+    let ended = tokio::time::timeout(
+        Duration::from_secs(10),
+        manager.ingest(&mut source, &mut |event| {
+            if matches!(event, ReconnectEvent::AuthRetrying { .. }) {
+                retries.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    )
+    .await
+    .expect("ingest ends on the refusal instead of retrying without end");
+    assert!(
+        matches!(&ended, Err(SessionError::AuthorizationUnanswerable { table, .. }) if table == "items"),
+        "the refusal ends ingest naming the table, got {ended:?}"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        0,
+        "a refusal the deployment fixes is never retried"
     );
 }
