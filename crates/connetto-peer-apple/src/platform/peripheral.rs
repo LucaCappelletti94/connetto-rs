@@ -2,14 +2,13 @@
 //! peripheral manager on its one serial queue (R76).
 
 use std::collections::{HashMap, VecDeque};
-use std::ptr::NonNull;
 use std::sync::{LazyLock, mpsc};
 use std::time::Duration;
 
 use dispatch2::{DispatchQueue, DispatchRetained};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
-use objc2::{AnyThread, define_class, msg_send};
+use objc2::{AnyThread, Message, define_class, msg_send};
 use objc2_core_bluetooth::{
     CBATTError, CBATTRequest, CBAdvertisementDataServiceUUIDsKey, CBAttributePermissions,
     CBCentral, CBCharacteristic, CBCharacteristicProperties, CBError, CBManager,
@@ -18,8 +17,7 @@ use objc2_core_bluetooth::{
     CBService, CBUUID,
 };
 use objc2_foundation::{
-    NSArray, NSCopying, NSData, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol,
-    NSString, NSUUID,
+    NSArray, NSData, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString, NSUUID,
 };
 use parking_lot::Mutex;
 
@@ -54,12 +52,22 @@ struct Standing {
     held: HashMap<u64, VecDeque<Vec<u8>>>,
     /// The advertisement is live.
     advertising: bool,
-    /// The service is registered.
-    service_up: bool,
-    /// A service add is in flight on the platform's queue.
-    service_pending: bool,
+    /// Where the service's registration with the platform stands.
+    registration: Registration,
     /// The host wants the service and the advertisement.
     wanted: bool,
+}
+
+/// Where the service's registration with the platform stands.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Registration {
+    /// No service is registered or being added.
+    #[default]
+    Absent,
+    /// A service add is in flight on the platform's queue.
+    Adding,
+    /// The service is registered.
+    Registered,
 }
 
 static STANDING: LazyLock<Mutex<Standing>> = LazyLock::new(|| Mutex::new(Standing::default()));
@@ -96,9 +104,14 @@ pub(crate) fn state() -> State {
 }
 
 /// Run the platform's strongest action once.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the unsupported platform's prompt refuses, and both answer the one signature lib.rs exposes"
+)]
 pub(crate) fn prompt() -> Result<(), Error> {
     // A recreated manager re-shows the platform's power alert where the
-    // radio stands off; an existing, on manager has nothing to show.
+    // radio stands off. An existing manager whose radio is on has nothing to
+    // show.
     let recreate = {
         let standing = STANDING.lock();
         standing.manager.is_some() && standing.radio == Some(CBManagerState::PoweredOff)
@@ -128,10 +141,10 @@ pub(crate) fn start() -> Result<(), Error> {
             return Ok(());
         }
         standing.wanted = true;
-        if standing.service_up {
-            begin_advertising(standing);
-        } else if !standing.service_pending {
-            add_service(standing);
+        match standing.registration {
+            Registration::Registered => begin_advertising(standing),
+            Registration::Absent => add_service(standing),
+            Registration::Adding => {}
         }
         // A pending add settles on the platform's queue and
         // answers the advertisement itself.
@@ -152,13 +165,13 @@ pub(crate) fn stop() -> Result<(), Error> {
             // platform's stop answers nothing to return.
             unsafe { manager.stopAdvertising() };
         }
-        if standing.service_up {
+        if standing.registration == Registration::Registered {
             // SAFETY: the manager is alive for the process, and the
             // platform's removal answers nothing to return. The removal is
             // done when the call returns, the platform reporting nothing
             // after it.
             unsafe { manager.removeAllServices() };
-            standing.service_up = false;
+            standing.registration = Registration::Absent;
             standing.service = None;
             standing.inbox = None;
             standing.outbox = None;
@@ -221,8 +234,7 @@ fn ensure_manager(recreate: bool, power_alert: bool) {
     standing.centrals.clear();
     standing.held.clear();
     standing.advertising = false;
-    standing.service_up = false;
-    standing.service_pending = false;
+    standing.registration = Registration::Absent;
     standing.wanted = false;
     let queue = DispatchQueue::new("connetto-peer-apple", None);
     let delegate = PeripheralDelegate::new();
@@ -254,34 +266,19 @@ fn options(power_alert: bool) -> Retained<NSDictionary<NSString, AnyObject>> {
 
 /// The advertisement's data, the service's UUID alone (R76 decision 25).
 fn advertise_data() -> Retained<NSDictionary<NSString, AnyObject>> {
-    // SAFETY: the service UUID is a valid 16-byte constant, so the platform
-    // answers a UUID the caller owns.
-    let uuid = unsafe { CBUUID::UUIDWithData(&NSData::with_bytes(&SERVICE_UUID)) };
-    // The platform's key stands for an array of service UUIDs.
-    let uuids = [NonNull::new(Retained::as_ptr(&uuid) as *mut CBUUID).unwrap()];
-    let uuid_array: Retained<NSArray<CBUUID>> = unsafe {
-        NSArray::initWithObjects_count(NSArray::alloc(), &uuids[0] as *const _ as *mut _, 1)
-    };
-    // SAFETY: the platform's service-UUIDs key is a valid string object the
-    // platform owns for the process, so the reference stands for this call.
-    let key: &ProtocolObject<dyn NSCopying> =
-        unsafe { ProtocolObject::from_ref(CBAdvertisementDataServiceUUIDsKey) };
-    let objects =
-        [
-            NonNull::new(Retained::as_ptr(&uuid_array).cast::<AnyObject>() as *mut AnyObject)
-                .unwrap(),
-        ];
-    let keys = [NonNull::from(key)];
-    // SAFETY: the UUID array is a valid object and the key a valid string,
-    // each alive for this call, so the platform's dictionary answers one
-    // valid pair the caller owns.
-    unsafe {
-        NSDictionary::<NSString, AnyObject>::dictionaryWithObjects_forKeys_count(
-            &objects[0] as *const _ as *mut _,
-            &keys[0] as *const _ as *mut _,
-            1,
-        )
-    }
+    let service_uuid = uuid(&SERVICE_UUID);
+    let uuid_array = NSArray::<CBUUID>::from_slice(&[&*service_uuid]);
+    // SAFETY: the platform's service-UUIDs key is an immutable string the
+    // platform owns for the process.
+    let key: &NSString = unsafe { CBAdvertisementDataServiceUUIDsKey };
+    NSDictionary::from_slices(&[key], &[uuid_array.as_ref()])
+}
+
+/// The platform's UUID for one of the peer's 16-byte constants.
+fn uuid(bytes: &[u8; 16]) -> Retained<CBUUID> {
+    // SAFETY: the bytes are a valid 16-byte UUID, so the platform answers a
+    // UUID the caller owns.
+    unsafe { CBUUID::UUIDWithData(&NSData::with_bytes(bytes)) }
 }
 
 /// Begin the advertisement from the platform's queue.
@@ -300,47 +297,39 @@ fn add_service(standing: &mut Standing) {
     let Some(manager) = standing.manager.as_ref() else {
         return;
     };
-    // SAFETY: the UUIDs are the peer's 16-byte constants, valid strings and
-    // permissions for the characteristics, and the inits answer objects the
-    // caller owns.
-    let (inbox, outbox) = unsafe {
-        (
-            CBMutableCharacteristic::initWithType_properties_value_permissions(
-                CBMutableCharacteristic::alloc(),
-                &CBUUID::UUIDWithData(&NSData::with_bytes(&INBOX_UUID)),
-                CBCharacteristicProperties::Write,
-                None,
-                CBAttributePermissions::Writeable,
-            ),
-            CBMutableCharacteristic::initWithType_properties_value_permissions(
-                CBMutableCharacteristic::alloc(),
-                &CBUUID::UUIDWithData(&NSData::with_bytes(&OUTBOX_UUID)),
-                CBCharacteristicProperties::Read | CBCharacteristicProperties::Notify,
-                None,
-                CBAttributePermissions::Readable,
-            ),
+    let inbox_uuid = uuid(&INBOX_UUID);
+    let outbox_uuid = uuid(&OUTBOX_UUID);
+    let service_uuid = uuid(&SERVICE_UUID);
+    // SAFETY: the UUID is the peer's inbox constant, the properties and
+    // permissions are valid for a writable characteristic, and the init
+    // answers an object the caller owns.
+    let inbox = unsafe {
+        CBMutableCharacteristic::initWithType_properties_value_permissions(
+            CBMutableCharacteristic::alloc(),
+            &inbox_uuid,
+            CBCharacteristicProperties::Write,
+            None,
+            CBAttributePermissions::Writeable,
         )
     };
-    // SAFETY: the UUID is the peer's 16-byte service constant, and the init
-    // answers a service the caller owns.
+    // SAFETY: the UUID is the peer's outbox constant, the properties and
+    // permissions are valid for a readable, notifying characteristic, and the
+    // init answers an object the caller owns.
+    let outbox = unsafe {
+        CBMutableCharacteristic::initWithType_properties_value_permissions(
+            CBMutableCharacteristic::alloc(),
+            &outbox_uuid,
+            CBCharacteristicProperties::Read | CBCharacteristicProperties::Notify,
+            None,
+            CBAttributePermissions::Readable,
+        )
+    };
+    // SAFETY: the UUID is the peer's service constant, and the init answers a
+    // service the caller owns.
     let service = unsafe {
-        CBMutableService::initWithType_primary(
-            CBMutableService::alloc(),
-            &CBUUID::UUIDWithData(&NSData::with_bytes(&SERVICE_UUID)),
-            true,
-        )
+        CBMutableService::initWithType_primary(CBMutableService::alloc(), &service_uuid, true)
     };
-    let objects: [NonNull<CBCharacteristic>; 2] = [
-        NonNull::new(Retained::as_ptr(&inbox).cast::<CBCharacteristic>() as *mut CBCharacteristic)
-            .unwrap(),
-        NonNull::new(Retained::as_ptr(&outbox).cast::<CBCharacteristic>() as *mut CBCharacteristic)
-            .unwrap(),
-    ];
-    // SAFETY: both characteristics are valid objects alive for this call, so
-    // the platform's array answers one valid pair the caller owns.
-    let characteristics: Retained<NSArray<CBCharacteristic>> = unsafe {
-        NSArray::initWithObjects_count(NSArray::alloc(), &objects[0] as *const _ as *mut _, 2)
-    };
+    let characteristics = NSArray::<CBCharacteristic>::from_slice(&[&inbox, &outbox]);
     // SAFETY: the platform's set answers nothing to return, and the array
     // holds the service's own characteristics.
     unsafe { service.setCharacteristics(Some(&characteristics)) };
@@ -351,7 +340,7 @@ fn add_service(standing: &mut Standing) {
     standing.inbox = Some(inbox);
     standing.outbox = Some(outbox);
     standing.service = Some(service);
-    standing.service_pending = true;
+    standing.registration = Registration::Adding;
 }
 
 /// Send one frame to one subscribed central, true when the platform took it.
@@ -362,12 +351,7 @@ fn send_frame(
     frame: &[u8],
 ) -> bool {
     let data = NSData::with_bytes(frame);
-    let objects = [NonNull::from(central)];
-    // SAFETY: the central is a valid object alive for this call, so the
-    // platform's array answers one valid element the caller owns.
-    let centrals: Retained<NSArray<CBCentral>> = unsafe {
-        NSArray::initWithObjects_count(NSArray::alloc(), &objects[0] as *const _ as *mut _, 1)
-    };
+    let centrals = NSArray::from_slice(&[central]);
     // SAFETY: the manager is alive for the process, the frame is valid data
     // the platform copies, and the platform's send answers a plain bool.
     unsafe {
@@ -390,7 +374,6 @@ fn device_key(identifier: &NSUUID) -> u64 {
     key_from_uuid_text(&identifier.to_string()).unwrap_or(u64::MAX)
 }
 
-/// A characteristic's object identity, for the platform's pointer compare.
 /// Whether `characteristic` is the one `uuid` names, by its UUID's bytes,
 /// since the platform may hand a delegate another object for the same
 /// characteristic.
@@ -407,7 +390,7 @@ fn is_characteristic(characteristic: &CBCharacteristic, uuid: &[u8; 16]) -> bool
 fn off_error() -> Error {
     Error::Apple {
         domain: "CoreBluetooth".to_owned(),
-        code: isize::from(CBError(2).0),
+        code: CBError(2).0,
         description: "the radio is not on".to_owned(),
     }
 }
@@ -416,18 +399,14 @@ fn off_error() -> Error {
 fn not_connected() -> Error {
     Error::Apple {
         domain: "CoreBluetooth".to_owned(),
-        code: isize::from(CBError(3).0),
+        code: CBError(3).0,
         description: "the central is not subscribed".to_owned(),
     }
 }
 
 /// What a framework error stands for.
 fn describe(error: &NSError) -> String {
-    format!(
-        "{} {}",
-        error.domain().to_string(),
-        error.localizedDescription().to_string()
-    )
+    format!("{} {}", error.domain(), error.localizedDescription())
 }
 
 /// Run `work` on the manager's queue and take its answer.
@@ -437,7 +416,7 @@ fn hop<T: Send + 'static>(
     let queue = STANDING.lock().queue.clone().ok_or(Error::Unsupported)?;
     let (tx, rx) = mpsc::channel();
     queue.exec_async(move || {
-        let answer = work(&mut *STANDING.lock());
+        let answer = work(&mut STANDING.lock());
         let _ = tx.send(answer);
     });
     rx.recv_timeout(HOP).map_err(|_| Error::TimedOut(HOP))
@@ -466,8 +445,7 @@ define_class!(
                 standing.service = None;
                 standing.inbox = None;
                 standing.outbox = None;
-                standing.service_up = false;
-                standing.service_pending = false;
+                standing.registration = Registration::Absent;
                 standing.wanted = false;
             }
         }
@@ -496,7 +474,7 @@ define_class!(
             error: Option<&NSError>,
         ) {
             let mut standing = STANDING.lock();
-            standing.service_pending = false;
+            standing.registration = Registration::Absent;
             match error {
                 // A service added after the host stopped wanting it is
                 // removed again.
@@ -511,13 +489,12 @@ define_class!(
                     standing.outbox = None;
                 }
                 None => {
-                    standing.service_up = true;
+                    standing.registration = Registration::Registered;
                     if !standing.advertising {
                         begin_advertising(&mut standing);
                     }
                 }
                 Some(error) => {
-                    standing.service_up = false;
                     standing.wanted = false;
                     standing.service = None;
                     standing.inbox = None;
@@ -547,9 +524,7 @@ define_class!(
             let mtu =
                 u16::try_from(unsafe { central.maximumUpdateValueLength() }).unwrap_or(u16::MAX);
             let mut standing = STANDING.lock();
-            // SAFETY: the platform passes the central for the duration of
-            // this call, and the retain keeps it alive for the exchange.
-            let central = unsafe { Retained::retain(central as *const _ as *mut _).unwrap() };
+            let central = central.retain();
             standing.centrals.insert(device, central);
             EVENTS.lock().push(Event::Connected { device, mtu });
         }
@@ -695,10 +670,10 @@ define_class!(
 impl PeripheralDelegate {
     /// The delegate's one instance.
     fn new() -> Retained<Self> {
-        // SAFETY: the definition registers the class, the alloc answers an
+        let this = Self::alloc().set_ivars(());
+        // SAFETY: the definition registers the class, the alloc answered an
         // uninit object of this class, and NSObject's init answers the
         // initialized object the caller owns.
-        let this = Self::alloc().set_ivars(());
         unsafe { msg_send![super(this), init] }
     }
 }

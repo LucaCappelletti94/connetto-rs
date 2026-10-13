@@ -59,7 +59,7 @@ fn event(event: apple::Event) -> PeripheralEvent {
 }
 
 /// The platform's error as the client's `Failed`.
-fn failed(error: connetto_peer_apple::Error) -> BluetoothError {
+fn failed(error: &connetto_peer_apple::Error) -> BluetoothError {
     BluetoothError::Failed(error.to_string())
 }
 
@@ -76,7 +76,7 @@ impl ReadinessBackend for AppleBluetoothBackend {
     }
 
     fn prompt(&self) -> Result<(), BluetoothError> {
-        apple::prompt().map_err(failed)
+        apple::prompt().map_err(|error| failed(&error))
     }
 
     fn prompt_outcome(&self) -> Option<PromptOutcome> {
@@ -88,7 +88,7 @@ impl PeripheralBackend for AppleBluetoothBackend {
     fn start(&self, _beacon: [u8; 9]) -> Result<(), BluetoothError> {
         // The advert carries the service's UUID alone, so the beacon's bytes
         // stand out of it (R76 decision 25).
-        apple::start().map_err(failed)
+        apple::start().map_err(|error| failed(&error))
     }
 
     fn stop(&self) {
@@ -100,7 +100,7 @@ impl PeripheralBackend for AppleBluetoothBackend {
     }
 
     fn notify(&self, device: u64, bytes: &[u8]) -> Result<(), BluetoothError> {
-        let sent = apple::notify(device, bytes).map_err(failed);
+        let sent = apple::notify(device, bytes).map_err(|error| failed(&error));
         tracing::debug!(
             device,
             len = bytes.len(),

@@ -38,17 +38,12 @@ pub(crate) fn join(ssid: &str, passphrase: &str, security: Security) -> Result<(
         let answer = match error {
             // The device already stands on the network, so the join's goal
             // stands reached.
-            Some(error)
-                if join_already_associated(
-                    &error.domain().to_string(),
-                    isize::from(error.code()),
-                ) =>
-            {
+            Some(error) if join_already_associated(&error.domain().to_string(), error.code()) => {
                 Ok(Joining::AlreadyThere)
             }
             Some(error) => Err(Error::Apple {
                 domain: error.domain().to_string(),
-                code: isize::from(error.code()),
+                code: error.code(),
                 description: error.localizedDescription().to_string(),
             }),
             None => Ok(Joining::Joined),
@@ -93,7 +88,7 @@ pub(crate) fn joined() -> Option<Joined> {
                 .then_some(interface.addr)
                 .and_then(|addr| match addr {
                     if_addrs::IfAddr::V4(v4) => Some((v4.ip, v4.prefixlen)),
-                    _ => None,
+                    if_addrs::IfAddr::V6(_) => None,
                 })
         })?;
     Some(Joined {

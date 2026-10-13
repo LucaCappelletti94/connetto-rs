@@ -73,7 +73,7 @@ fn security(security: HotspotSecurity) -> apple::hotspot::Security {
 }
 
 /// The platform's join refusal as the client's.
-fn join_refusal(error: apple::Error) -> JoinError {
+fn join_refusal(error: &apple::Error) -> JoinError {
     match error {
         apple::Error::Unsupported => JoinError::Unsupported,
         // A WPA3 setter absent at run time is a refusal for this join, not
@@ -117,7 +117,7 @@ impl HotspotBackend for AppleHotspotBackend {
                 *self.was_available.write() = false;
                 Ok(())
             }
-            Err(error) => Err(join_refusal(error)),
+            Err(error) => Err(join_refusal(&error)),
         }
     }
 
@@ -152,7 +152,7 @@ impl HotspotBackend for AppleHotspotBackend {
         };
         self.rejoin_if_due(joining.is_some(), landed);
         match joined {
-            // The network is up once its address and its gateway stand; a
+            // The network is up once its address and its gateway stand. A
             // missing gateway stays pending for the machine's bound.
             Some(apple::hotspot::Joined {
                 address,

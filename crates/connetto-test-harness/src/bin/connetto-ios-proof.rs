@@ -69,8 +69,6 @@ const USER: &str = "alice";
 const DEFAULT_SIMULATOR: &str = "iPhone 17 Pro";
 /// The variable naming the team ID a simulator build's entitlements carry.
 const TEAM_ID_VAR: &str = "CONNETTO_IOS_TEAM_ID";
-/// The system's alert button labels in the runner's locales, which the
-/// tapper taps in place of the user (R76).
 /// The filter a device's demo logs under, the peer link's and the radios'
 /// own steps included, which the demo's log file keeps for the evidence.
 const DEMO_LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_dioxus::away=debug,connetto_client::bluetooth=debug,connetto_client::hotspot=debug,connetto_peer=debug,connetto_peer_apple=debug";
@@ -80,6 +78,8 @@ const DEMO_LOG_SOURCES: [&str; 2] = [
     "Library/Application Support/connetto-dioxus-demo/connetto-demo.log",
     "Library/Application Support/connetto-demo.log",
 ];
+/// The system's alert button labels in the runner's locales, which the
+/// tapper taps in place of the user (R76).
 const ALERT_LABELS: [&str; 6] = ["Join", "Accedi", "Connetti", "Allow", "Consenti", "OK"];
 /// The iOS development profile the tapper's runner signs with, as
 /// `connetto-ios-signing` names it.
