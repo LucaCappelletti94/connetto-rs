@@ -170,6 +170,8 @@ jobs:
         with:
           # Full history improves blame-based new-code attribution.
           fetch-depth: 0
+          # The scan runs clippy, whose build scripts must not find the token.
+          persist-credentials: false
 
       # Downloaded into the checkout, the path the reports name, which is the
       # same on every hosted runner.
@@ -196,7 +198,7 @@ jobs:
             --component clippy
 
       - name: SonarQube scan
-        uses: SonarSource/sonarqube-scan-action@v8
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         with:
