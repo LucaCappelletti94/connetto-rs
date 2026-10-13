@@ -121,6 +121,10 @@ jobs:
             --profile testfast \
             --codecov \
             --output-path codecov.json
+          cargo +stable llvm-cov report \
+            --profile testfast \
+            --lcov \
+            --output-path lcov-${{ matrix.name }}.info
 
       - uses: codecov/codecov-action@v7
         with:
@@ -128,6 +132,14 @@ jobs:
           flags: ${{ matrix.name }}
           token: ${{ secrets.CODECOV_TOKEN }}
           fail_ci_if_error: true
+
+      # The same measurement in LCOV, for the SonarQube scan below.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: lcov-${{ matrix.name }}
+          path: lcov-${{ matrix.name }}.info
+          retention-days: 1
+          if-no-files-found: error
 
       - name: Save cargo downloads
         if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
@@ -138,3 +150,57 @@ jobs:
             ~/.cargo/registry/cache
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+  # The scan imports the three shards' LCOV, so SonarQube Cloud measures new
+  # code on the same coverage Codecov does. It runs only once every shard
+  # passed, since a missing shard would read as uncovered code.
+  sonar:
+    name: SonarQube scan
+    needs: coverage
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Neither a fork's pull request nor a Dependabot run can read SONAR_TOKEN,
+    # so the scan runs for same-repo human branches and pushes to main only.
+    if: >-
+      github.event_name == 'push' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history improves blame-based new-code attribution.
+          fetch-depth: 0
+          # The scan runs clippy, whose build scripts must not find the token.
+          persist-credentials: false
+
+      # Downloaded into the checkout, the path the reports name, which is the
+      # same on every hosted runner.
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: lcov-*
+          merge-multiple: true
+
+      - name: Restore cargo downloads
+        id: cache-1
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Install stable clippy
+        run: |
+          rustup toolchain install stable \
+            --profile minimal \
+            --component clippy
+
+      - name: SonarQube scan
+        uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >-
+            -Dsonar.rust.lcov.reportPaths=lcov-server.info,lcov-client.info,lcov-rest.info

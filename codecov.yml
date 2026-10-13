@@ -3,9 +3,34 @@
 # binaries are outside that set: the browser stack only ever runs inside the
 # browser test workflow, which compiles for wasm and reports no native
 # coverage at all, and the demo stack and Android proof need a device. Their
-# shared provisioning module is reached from nothing else. So these lines are
-# unreachable by any instrument, not missing tests.
+# shared provisioning module is reached from nothing else. The wasm crate, the
+# examples and the Rust that builds only for Android, iOS, Windows, macOS
+# or wasm are outside it too. So these lines are unreachable by any instrument, not missing tests.
+# sonar-project.properties excludes the same paths, which the two tools share.
 coverage:
   ignore:
     - crates/connetto-test-harness/src/bin/**
     - crates/connetto-test-harness/src/stack.rs
+    - crates/connetto-web/**
+    - examples/**
+    - crates/connetto-app-attest/src/ios.rs
+    - crates/connetto-auth-session/src/android.rs
+    - crates/connetto-auth-session/src/ios.rs
+    - crates/connetto-peer-android/**
+    - crates/connetto-peer-apple/**
+    - crates/connetto-client/src/bluetooth/android.rs
+    - crates/connetto-client/src/bluetooth/apple.rs
+    - crates/connetto-client/src/bluetooth/central.rs
+    - crates/connetto-client/src/hotspot/android.rs
+    - crates/connetto-client/src/hotspot/apple.rs
+    - crates/*/examples/**
+    - crates/connetto-client/src/device_key/android.rs
+    - crates/connetto-client/src/device_key/apple.rs
+    - crates/connetto-client/src/device_key/windows.rs
+    - crates/connetto-client/src/keyring/android.rs
+    - crates/connetto-client/src/keyring/apple.rs
+    - crates/connetto-client/src/keyring/windows.rs
+    - crates/connetto-dioxus/src/hello.rs
+    - crates/connetto-file-client/src/browser_store.rs
+    - crates/connetto-file-client/src/browser_store/**
+    - crates/connetto-file-client/src/http/browser.rs
