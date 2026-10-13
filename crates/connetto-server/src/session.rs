@@ -2639,10 +2639,16 @@ where
         event: &PgChangeEvent,
     ) -> Result<Vec<GrantMove>, SessionError> {
         match &self.upkeep {
-            Some(upkeep) => upkeep
-                .keep_current(event)
-                .await
-                .map_err(|err| SessionError::AuthUnavailable(err.to_string())),
+            Some(upkeep) => match upkeep.keep_current(event).await {
+                Ok(moves) => Ok(moves),
+                // The table stopped recording its previous image, so the
+                // change stream cannot deliver. Refuse rather than hold the
+                // event and retry forever (R6 decision 4).
+                Err(crate::openfga::UpkeepError::IncompletePreviousImage) => {
+                    Err(SessionError::ChangeStreamUnusable(self.event_table(event)))
+                }
+                Err(err) => Err(SessionError::AuthUnavailable(err.to_string())),
+            },
             None => Ok(Vec::new()),
         }
     }

@@ -1150,6 +1150,12 @@ pub enum UpkeepError {
     /// A query the changed row asks to be replayed could not be run or read.
     #[error("replaying a query the changed row requires: {0}")]
     Replay(String),
+    /// The previous row image carries only its key, so what the row granted
+    /// before the change is not knowable. This is terminal. The table
+    /// records no previous image, so the same failure repeats on every
+    /// later change and the change stream refuses to serve.
+    #[error("the previous row image carries only its key, so what it granted is not knowable")]
+    IncompletePreviousImage,
 }
 
 /// One authorization fact that moved, and who it concerned.
@@ -1287,6 +1293,12 @@ where
                 // there is nothing here to apply. Everything else means the
                 // difference is not knowable, which is not the same as empty.
                 Err(StoreDiffError::NotARowEvent) => return Ok(Vec::new()),
+                // The table stopped recording its previous image, so the difference
+                // is not knowable and will never be knowable. It is terminal, and
+                // the event cannot be held for a retry.
+                Err(StoreDiffError::IncompletePreviousImage) => {
+                    return Err(UpkeepError::IncompletePreviousImage);
+                }
                 Err(err) => return Err(UpkeepError::Diff(err.to_string())),
             };
             self.delegate

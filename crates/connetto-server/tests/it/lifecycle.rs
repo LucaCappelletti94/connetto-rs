@@ -30,7 +30,8 @@ use tempfile::TempDir;
 use tokio::net::{TcpListener, TcpStream};
 
 use super::e2e::{
-    NO_POLICIES, PG_DDL, PG_SERIAL, exec, mint_token, reset_fixture, signing_keys, with_user_url,
+    NO_POLICIES, OWNED_PG_DDL, OWNED_POLICIES, PG_DDL, PG_SERIAL, exec, mint_token, reset_fixture,
+    signing_keys, with_user_url,
 };
 
 /// How long the readiness probe and the frame waits give the server.
@@ -74,6 +75,46 @@ pub(super) async fn builder_over(
     .oplog_table(OPLOG_TABLE)
     .oidc_providers(vec![provider])
     .writable(RuntimeWritableCatalog::builder().writable("orders").build());
+    (builder, idp, keys)
+}
+
+/// The one-construction-path server over the `owned` fixture, which carries a
+/// policy and so a model shape. The change path asks the store what the row
+/// granted, which is the path a key-only previous image trips.
+pub(super) async fn builder_over_owned(
+    fixture: &Fixture,
+    port: u16,
+) -> (ServerBuilder, MockOauth, TempDir) {
+    let url = fixture.admin_url().to_owned();
+    let reader = with_user_url(&url, "app_reader", "app_reader");
+    let idp = MockOauth::start().await;
+    let keys = TempDir::new().expect("key dir");
+    let (private, public) = signing_keys(&keys);
+    let token = TokenKeys::from_pem(
+        std::fs::read(&private).expect("read the private half"),
+        std::fs::read(&public).expect("read the public half"),
+    );
+    let (_channel, store) = fixture.fga_store().await;
+    let provider = OidcProvider::Generic(
+        OidcProviderConfig::new(
+            MOCK_OAUTH_PROVIDER,
+            MOCK_OAUTH_CLIENT_ID,
+            idp.issuer().to_owned(),
+            format!("http://127.0.0.1:{port}/auth/callback"),
+        )
+        .with_client_secret(Some(MOCK_OAUTH_CLIENT_SECRET.to_owned())),
+    );
+    let builder = ServerBuilder::new(
+        Database::new(url, reader),
+        ServerSchema::new(OWNED_PG_DDL, OWNED_POLICIES),
+        token,
+        OpenFga::new(fixture.fga_url().await.to_owned(), store),
+    )
+    .slot(SLOT)
+    .publication(PUBLICATION)
+    .oplog_table(OPLOG_TABLE)
+    .oidc_providers(vec![provider])
+    .writable(RuntimeWritableCatalog::builder().writable("owned").build());
     (builder, idp, keys)
 }
 
@@ -329,4 +370,96 @@ async fn an_unusable_change_stream_ends_serve_with_the_sessions_closed() {
     }
     // The refusal is an outcome for the embedder, not a crash: the test keeps
     // running in the same runtime to the last line to prove the point.
+}
+
+/// The same terminal outcome on a table the model shapes, so the refusal
+/// arrives from the store's level step rather than the transition's. A
+/// key-only previous image on a shaped table is held by the upkeep's diff
+/// as a transient `AuthUnavailable` and retried for ever when it is not
+/// mapped to the terminal `ChangeStreamUnusable`, which this test would
+/// time out on (R6 decision 4).
+#[tokio::test]
+async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
+    let _keyring = connetto_test_harness::isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+    // The `owned` fixture carries a policy, so the table reaches the model
+    // with a shape and the store's diff reads its previous image.
+    for stmt in [
+        "DROP TABLE IF EXISTS owned CASCADE",
+        "DROP TABLE IF EXISTS _connetto_mutations",
+        OWNED_PG_DDL,
+        "ALTER TABLE owned ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
+        "CREATE TABLE _connetto_mutations \
+         (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_reader",
+    ] {
+        exec(&pool, stmt).await;
+    }
+    exec(&pool, "INSERT INTO owned VALUES (1, 'alice', 'seed')").await;
+    fixture.start_replication(&["owned"]).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let (builder, _idp, _keys) = builder_over_owned(&fixture, port).await;
+    let base = format!("http://127.0.0.1:{port}");
+
+    let (_fire, signal) = tokio::sync::oneshot::channel::<()>();
+    let serve = tokio::spawn(async move {
+        let shutdown = async move {
+            let _ = signal.await;
+        };
+        builder.serve(listener, shutdown).await
+    });
+    wait_ready(&base).await;
+
+    let (token, _) = mint_token(&base).await;
+    let mut client = live_session(&format!("127.0.0.1:{port}"), &token).await;
+    client
+        .send_control(ControlMessage::Subscribe(Subscribe {
+            sub_id: "owned".to_owned(),
+            spec: SubscriptionSpec::new("SELECT * FROM owned"),
+        }))
+        .await
+        .expect("send the subscription");
+
+    match next_control(&mut client).await {
+        ControlMessage::SnapshotBegin(snapshot) if snapshot.sub_id == "owned" => {}
+        other => panic!("the snapshot opened with {other:?} instead"),
+    }
+
+    exec(&pool, "ALTER TABLE owned REPLICA IDENTITY DEFAULT").await;
+    exec(&pool, "DELETE FROM owned WHERE id = 1").await;
+
+    let outcome = tokio::time::timeout(BOUND, serve)
+        .await
+        .expect("serve ends on the refusal")
+        .expect("serve joins");
+    match outcome {
+        Err(ServeError::ChangeStreamUnusable(why)) => {
+            assert!(why.contains("owned"), "the refusal names the table: {why}");
+        }
+        other => panic!("serve answered {other:?}"),
+    }
+
+    let last = loop {
+        if let fatal @ ControlMessage::FatalError(_) = next_control(&mut client).await {
+            break fatal;
+        }
+    };
+    match last {
+        ControlMessage::FatalError(FatalError {
+            reason: FatalErrorReason::ServerShuttingDown,
+        }) => {}
+        other => panic!("the session's last frame says {other:?}"),
+    }
 }

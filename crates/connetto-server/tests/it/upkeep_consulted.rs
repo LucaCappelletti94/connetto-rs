@@ -158,3 +158,67 @@ async fn store_upkeep_passed_at_construction_is_called_on_cdc_event() {
         "the upkeep must be consulted for every CDC event"
     );
 }
+
+/// Upkeep whose store write fails, as when the authorization service is down.
+struct FailingUpkeep;
+
+impl StoreUpkeep for FailingUpkeep {
+    fn keep_current<'a>(
+        &'a self,
+        _event: &'a PgChangeEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
+        Box::pin(async move { Err(UpkeepError::Write("the store is unreachable".to_owned())) })
+    }
+}
+
+/// A store that could not be brought level holds the event as an unavailable answer, so the ingest loop asks again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_store_write_holds_the_event() {
+    let fixture = Fixture::acquire().await;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
+        EmptySnapshot,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .with_upkeep(Arc::new(FailingUpkeep))
+    .build();
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO notes (id, body) VALUES (1, 'hello')")
+        .expect("execute dml");
+    let event = source
+        .next_item()
+        .await
+        .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
+        .expect("one event");
+
+    let retries = AtomicU64::new(0);
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        manager.ingest(&mut OneEvent(Some(event)), &mut |reported| {
+            if matches!(
+                reported,
+                connetto_server::ReconnectEvent::AuthRetrying { .. }
+            ) {
+                retries.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    )
+    .await;
+    assert!(
+        ended.is_err(),
+        "the held event is asked again rather than ending ingest, got {ended:?}"
+    );
+    assert!(
+        retries.load(Ordering::Relaxed) >= 1,
+        "the failed write is reported as a retry"
+    );
+}
