@@ -14,15 +14,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ControlMessage, Handshake, Ping, Subscribe, SubscriptionSpec,
-    Unsubscribe,
+    AckCredits, BulkMessage, ControlMessage, FatalErrorReason, Handshake, Ping, Subscribe,
+    SubscriptionSpec, Unsubscribe,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SessionManager,
-    SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, loopback, pg_write_target,
+    ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig, SessionError,
+    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, WebSocketTransport, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use diesel::prelude::*;
@@ -733,4 +734,57 @@ async fn loopback_session_composite_key_sync() {
 
     client.close().await.expect("close client");
     server.await.expect("join server").expect("session ok");
+}
+
+/// A handshake that declares the wrong protocol version is told to the peer
+/// with the mismatch, and the run ends with the violation, so a stale client
+/// is never served the shape of a protocol it cannot read.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mismatched_protocol_version_is_told_and_ends_the_run() {
+    let fixture = Fixture::acquire().await;
+    let materializer = Materializer::builder(PG_DDL)
+        .build()
+        .expect("build materializer");
+    let manager = ManagerBuilder::new(
+        materializer,
+        SeedSnapshot,
+        RosterAuth::granting("client-a").withholding(WITHHELD_ID),
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .build();
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+
+    client
+        .send_control(ControlMessage::Handshake(Handshake::new(
+            PROTOCOL_VERSION + 1,
+            "client-a",
+        )))
+        .await
+        .expect("send the stale handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
+    let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
+        panic!("the mismatch is told to the peer");
+    };
+    let FatalErrorReason::ProtocolVersionMismatch { expected, got } = fatal.reason else {
+        panic!("the fatal names the mismatch, got {fatal:?}");
+    };
+    assert_eq!(expected, PROTOCOL_VERSION);
+    assert_eq!(got, PROTOCOL_VERSION + 1);
+
+    let error = server
+        .await
+        .expect("join server")
+        .expect_err("the mismatch ends the run");
+    assert!(
+        matches!(error, SessionError::Protocol(_)),
+        "the run ends with the violation, got {error:?}"
+    );
 }

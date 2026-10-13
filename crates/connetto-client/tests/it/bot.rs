@@ -323,3 +323,287 @@ async fn register_without_a_challenge_is_a_protocol_error() {
         "the broken exchange reports a protocol violation, got {broken:?}"
     );
 }
+
+/// The reset the wire reports when the socket dies mid handshake.
+#[derive(Debug, thiserror::Error)]
+#[error("the socket reset during the handshake")]
+struct SocketReset;
+
+/// A transport that carries the client's handshake and resets at a scripted
+/// read, the way a socket that drops mid exchange does. Sends always
+/// succeed; `recv` hands out the scripted challenge until it reaches the
+/// reset.
+struct ResetSocket {
+    reads: usize,
+    reset_after: usize,
+    nonce: [u8; 32],
+}
+
+impl ResetSocket {
+    /// The socket dies on the client's first read, before any frame.
+    fn down_on_first_read() -> Self {
+        Self {
+            reads: 0,
+            reset_after: 0,
+            nonce: [0; 32],
+        }
+    }
+
+    /// The socket hands out the challenge and dies on the read the answer
+    /// would be.
+    fn down_after_challenge(nonce: [u8; 32]) -> Self {
+        Self {
+            reads: 0,
+            reset_after: 1,
+            nonce,
+        }
+    }
+}
+
+impl Transport for ResetSocket {
+    type Error = SocketReset;
+
+    fn send_control(
+        &mut self,
+        _message: ControlMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn send_bulk(
+        &mut self,
+        _message: BulkMessage,
+    ) -> impl Future<Output = Result<(), Self::Error>> {
+        std::future::ready(Ok(()))
+    }
+
+    fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
+        self.reads += 1;
+        if self.reads > self.reset_after {
+            std::future::ready(Err(SocketReset))
+        } else {
+            std::future::ready(Ok(Some(IncomingFrame::Control(ControlMessage::Challenge(
+                Challenge { nonce: self.nonce },
+            )))))
+        }
+    }
+
+    fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
+        std::future::ready(Ok(()))
+    }
+}
+
+/// A dialer that hands out exactly one transport, the one the test attached.
+struct OneShotSocket {
+    transport: Option<ResetSocket>,
+}
+
+impl TransportFactory for OneShotSocket {
+    type Transport = ResetSocket;
+    type Error = DialRefused;
+
+    fn connect(&mut self) -> impl Future<Output = Result<ResetSocket, DialRefused>> + Send {
+        std::future::ready(self.transport.take().ok_or(DialRefused))
+    }
+}
+
+/// A first frame that is a control frame other than the challenge is a broken
+/// exchange, because the signature `register` mints binds the challenge's
+/// nonce, and there is none.
+#[tokio::test]
+async fn register_with_a_wrong_control_first_frame_is_a_protocol_error() {
+    let (mut server, mut client_end) = loopback();
+    tokio::spawn(async move {
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "wrong".to_owned(),
+                session_token: "wrong".to_owned(),
+                resume_token: "wrong".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: None,
+                initial_credits: 64,
+                last_applied_seq: None,
+            }))
+            .await
+            .expect("send the wrong first frame");
+    });
+    let broken = register(&mut client_end, &registration(mint_key_pair()))
+        .await
+        .expect_err("a first frame other than the challenge breaks the exchange");
+    let ClientError::Protocol(why) = broken else {
+        panic!("the broken exchange is a protocol violation, got {broken:?}");
+    };
+    assert!(
+        why.starts_with("expected the connection's challenge"),
+        "the violation names the wrong first frame, got {why}"
+    );
+}
+
+/// A bulk first frame is the same broken exchange, with the bulk plane
+/// speaking before the challenge.
+#[tokio::test]
+async fn register_with_a_bulk_first_frame_is_a_protocol_error() {
+    let (mut server, mut client_end) = loopback();
+    tokio::spawn(async move {
+        server
+            .send_bulk(BulkMessage::SnapshotPatch(SnapshotPatch {
+                sub_id: "sub".to_owned(),
+                patchset_zstd: vec![],
+            }))
+            .await
+            .expect("send the wrong first frame");
+    });
+    let broken = register(&mut client_end, &registration(mint_key_pair()))
+        .await
+        .expect_err("a first frame other than the challenge breaks the exchange");
+    let ClientError::Protocol(why) = broken else {
+        panic!("the broken exchange is a protocol violation, got {broken:?}");
+    };
+    assert!(
+        why.starts_with("expected the connection's challenge"),
+        "the violation names the wrong first frame, got {why}"
+    );
+}
+
+/// A settled answer whose bot id is not a UUID is a broken exchange, not a
+/// bot the caller can be handed.
+#[tokio::test]
+async fn register_with_a_non_uuid_answer_is_a_protocol_error() {
+    let (mut server, mut client_end) = loopback();
+    let nonce = [0x46; 32];
+    let key_pair = mint_key_pair();
+    tokio::spawn(async move {
+        server
+            .send_control(ControlMessage::Challenge(Challenge { nonce }))
+            .await
+            .expect("send the challenge");
+        let Some(IncomingFrame::Control(ControlMessage::RegisterBot(_))) =
+            server.recv().await.expect("recv the registration")
+        else {
+            panic!("the registration did not arrive");
+        };
+        server
+            .send_control(ControlMessage::BotRegistered(BotRegistered {
+                bot_id: "not-a-uuid".to_owned(),
+            }))
+            .await
+            .expect("send the broken answer");
+    });
+    let broken = register(&mut client_end, &registration(key_pair))
+        .await
+        .expect_err("an answer without a uuid breaks the exchange");
+    let ClientError::Protocol(why) = broken else {
+        panic!("the broken answer is a protocol violation, got {broken:?}");
+    };
+    assert!(
+        why.starts_with("the registered bot id is not a uuid"),
+        "the violation names the broken id, got {why}"
+    );
+}
+
+/// An answer that is not the registration's is a broken exchange, because the
+/// bot cannot be told whether its registration landed.
+#[tokio::test]
+async fn register_with_a_wrong_answer_is_a_protocol_error() {
+    let (mut server, mut client_end) = loopback();
+    let nonce = [0x47; 32];
+    let key_pair = mint_key_pair();
+    tokio::spawn(async move {
+        server
+            .send_control(ControlMessage::Challenge(Challenge { nonce }))
+            .await
+            .expect("send the challenge");
+        let Some(IncomingFrame::Control(ControlMessage::RegisterBot(_))) =
+            server.recv().await.expect("recv the registration")
+        else {
+            panic!("the registration did not arrive");
+        };
+        server
+            .send_control(ControlMessage::Challenge(Challenge { nonce }))
+            .await
+            .expect("send the wrong answer");
+    });
+    let broken = register(&mut client_end, &registration(key_pair))
+        .await
+        .expect_err("a second challenge is not the registration's answer");
+    let ClientError::Protocol(why) = broken else {
+        panic!("the wrong answer is a protocol violation, got {broken:?}");
+    };
+    assert_eq!(why, "expected the registration's answer");
+}
+
+/// A connection that closes before the registration's answer is a broken
+/// exchange too: the bot cannot be told whether its registration landed.
+#[tokio::test]
+async fn register_with_the_connection_closed_first_is_a_protocol_error() {
+    let (mut server, mut client_end) = loopback();
+    let nonce = [0x48; 32];
+    let key_pair = mint_key_pair();
+    tokio::spawn(async move {
+        server
+            .send_control(ControlMessage::Challenge(Challenge { nonce }))
+            .await
+            .expect("send the challenge");
+        let Some(IncomingFrame::Control(ControlMessage::RegisterBot(_))) =
+            server.recv().await.expect("recv the registration")
+        else {
+            panic!("the registration did not arrive");
+        };
+        drop(server);
+    });
+    let broken = register(&mut client_end, &registration(key_pair))
+        .await
+        .expect_err("a closed connection is not the registration's answer");
+    let ClientError::Protocol(why) = broken else {
+        panic!("the closed connection is a protocol violation, got {broken:?}");
+    };
+    assert_eq!(
+        why,
+        "the connection closed before the registration's answer"
+    );
+}
+
+/// A socket that dies while the client reads the challenge is a transport
+/// error, not a protocol one, so the caller can tell the wire broke from a
+/// server that broke the exchange.
+#[tokio::test]
+async fn a_socket_down_on_the_first_read_is_a_transport_error() {
+    let builder = ClientBuilder::new(
+        bundle(),
+        OneShotSocket {
+            transport: Some(ResetSocket::down_on_first_read()),
+        },
+    );
+    let Err(dead) = builder.connect_driven().await else {
+        panic!("the socket dies mid handshake, so the connect fails")
+    };
+    let ClientError::Transport(why) = dead else {
+        panic!("a dead socket is a transport error, got {dead:?}");
+    };
+    assert!(
+        why.contains("socket reset"),
+        "the reset is named, got {why}"
+    );
+}
+
+/// The same reset one read later: the challenge arrived, and the socket died
+/// on the read the challenge's answer would be.
+#[tokio::test]
+async fn a_socket_down_after_the_challenge_is_a_transport_error() {
+    let builder = ClientBuilder::new(
+        bundle(),
+        OneShotSocket {
+            transport: Some(ResetSocket::down_after_challenge([0x49; 32])),
+        },
+    );
+    let Err(dead) = builder.connect_driven().await else {
+        panic!("the socket dies mid handshake, so the connect fails")
+    };
+    let ClientError::Transport(why) = dead else {
+        panic!("a dead socket is a transport error, got {dead:?}");
+    };
+    assert!(
+        why.contains("socket reset"),
+        "the reset is named, got {why}"
+    );
+}

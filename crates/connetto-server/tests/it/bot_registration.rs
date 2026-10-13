@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::messages::{
-    BotListEntry, Challenge, ControlMessage, FatalErrorReason, Handshake, RegisterBot,
+    BotListEntry, Challenge, ControlMessage, FatalErrorReason, Handshake, Ping, RegisterBot,
     bot_registration_message,
 };
 use connetto_core::test_support::TestGrantChecker;
@@ -22,8 +22,8 @@ use connetto_server::bots::pg_bot_registry;
 use connetto_server::defaults::ConnettoDefaults;
 use connetto_server::{
     AbuseLimits, ConnectionLimits, ManagerBuilder, Materializer, PersonLimits, PgReadConnector,
-    PgSnapshotSource, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionManager,
-    ThrottleConfig, TierLimits, pg_write_target,
+    PgSnapshotSource, RequestGuard, RuntimeWritableCatalog, SessionConfig, SessionError,
+    SessionManager, ThrottleConfig, TierLimits, pg_write_target,
 };
 use connetto_test_harness::{Fixture, RosterAuth};
 use diesel::{ExpressionMethods, QueryDsl};
@@ -605,5 +605,262 @@ async fn a_registry_failure_drops_the_connection_without_a_refusal() {
     assert!(
         matches!(closed, Ok(Ok(None))),
         "a registry failure drops the connection without a frame, got {closed:?}"
+    );
+}
+
+/// A first frame that is neither the exchange's handshake nor a registration
+/// is a protocol violation, and the run ends with it, so a peer that speaks
+/// another protocol is told so and is not served.
+#[tokio::test]
+async fn a_first_frame_that_is_not_the_exchange_is_a_protocol_violation() {
+    let pool = dead_pool().await;
+    let registry_pool = dead_pool().await;
+    let session = SessionConfig::new().with_first_frame_budget(Duration::from_secs(5));
+    let manager = manager(
+        pool,
+        guard_with_connection_refusals(100),
+        registry_pool,
+        session,
+    );
+    let (server_end, mut client) = loopback();
+    let serving = Arc::clone(&manager);
+    let serving_task = tokio::spawn(async move { serving.serve(server_end).await });
+    let frame = client.recv().await.expect("recv the opening frame");
+    let Some(IncomingFrame::Control(ControlMessage::Challenge(_))) = frame else {
+        panic!("the connection did not open with a challenge: {frame:?}");
+    };
+    client
+        .send_control(ControlMessage::Ping(Ping { nonce: 7 }))
+        .await
+        .expect("send the wrong first frame");
+    let SessionError::Protocol(why) = serving_task
+        .await
+        .expect("serve ends")
+        .expect_err("the violation ends the run")
+    else {
+        panic!("a first frame outside the exchange is a protocol violation");
+    };
+    assert_eq!(why, "expected a handshake or a registration first");
+    let closed = client.recv().await.expect("recv the close");
+    assert!(closed.is_none(), "the peer is dropped without a frame");
+}
+
+/// A peer that hangs up before the first frame ends the run with a transport
+/// error, so a hung peer is not waited on for the first frame budget.
+#[tokio::test]
+async fn a_peer_that_hangs_up_before_the_first_frame_ends_the_run() {
+    let pool = dead_pool().await;
+    let registry_pool = dead_pool().await;
+    let manager = manager(
+        pool,
+        guard_with_connection_refusals(100),
+        registry_pool,
+        SessionConfig::new(),
+    );
+    let (server_end, client_end) = loopback();
+    drop(client_end);
+    let SessionError::Transport(why) = manager
+        .serve(server_end)
+        .await
+        .expect_err("the hung peer ends the run")
+    else {
+        panic!("a peer that hung up is a transport error");
+    };
+    assert!(
+        why.contains("hung up"),
+        "the transport names the hang up, got {why}"
+    );
+}
+
+/// A settled registration whose peer hangs up ends the run with a transport
+/// error, so a settlement whose answer never lands is not mistaken for a
+/// live session.
+#[tokio::test]
+async fn a_lost_peer_ends_a_settled_registration_with_a_transport_error() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    registry(&pool).await;
+    code(&pool, "hangup-code", true).await;
+    let key = mint_key();
+    let manager = manager(
+        pool.clone(),
+        guard_with_connection_refusals(100),
+        pool.clone(),
+        SessionConfig::new(),
+    );
+    let (server_end, mut client) = loopback();
+    let serving = Arc::clone(&manager);
+    let serving_task = tokio::spawn(async move { serving.serve(server_end).await });
+    let frame = client.recv().await.expect("recv the opening frame");
+    let Some(IncomingFrame::Control(ControlMessage::Challenge(challenge))) = frame else {
+        panic!("the connection did not open with a challenge: {frame:?}");
+    };
+    client
+        .send_control(ControlMessage::RegisterBot(registration(
+            "hangup-code",
+            &key,
+            &challenge.nonce,
+        )))
+        .await
+        .expect("send the registration");
+    drop(client);
+    let err = serving_task
+        .await
+        .expect("serve ends")
+        .expect_err("the lost peer ends the run");
+    assert!(
+        matches!(err, SessionError::Transport(_)),
+        "a lost peer is a transport error, got {err:?}"
+    );
+}
+
+/// A refused registration whose peer hangs up ends the run with a transport
+/// error, so the refusal is not waited on or retried against a dead peer.
+#[tokio::test]
+async fn a_lost_peer_ends_a_refused_registration_with_a_transport_error() {
+    let pool = dead_pool().await;
+    let registry_pool = dead_pool().await;
+    let manager = manager(
+        pool,
+        guard_with_connection_refusals(100),
+        registry_pool,
+        SessionConfig::new(),
+    );
+    let (server_end, mut client) = loopback();
+    let serving = Arc::clone(&manager);
+    let serving_task = tokio::spawn(async move { serving.serve(server_end).await });
+    let frame = client.recv().await.expect("recv the opening frame");
+    let Some(IncomingFrame::Control(ControlMessage::Challenge(challenge))) = frame else {
+        panic!("the connection did not open with a challenge: {frame:?}");
+    };
+    let mut reg = registration("no-such-code", &mint_key(), &challenge.nonce);
+    reg.list[0].table = "nobody".to_owned();
+    client
+        .send_control(ControlMessage::RegisterBot(reg))
+        .await
+        .expect("send the registration");
+    drop(client);
+    let err = serving_task
+        .await
+        .expect("serve ends")
+        .expect_err("the lost peer ends the run");
+    assert!(
+        matches!(err, SessionError::Transport(_)),
+        "a lost peer is a transport error, got {err:?}"
+    );
+}
+
+/// A shutdown that lands while a refused round settles is told to the peer
+/// with the fatal, and the run ends cleanly, so a peer that was just refused
+/// is not re-invited into a server that is going away.
+#[tokio::test]
+async fn a_shutdown_landing_on_a_refused_round_is_told_with_the_fatal() {
+    let pool = dead_pool().await;
+    let registry_pool = dead_pool().await;
+    let manager = manager(
+        pool,
+        guard_with_connection_refusals(100),
+        registry_pool,
+        SessionConfig::new(),
+    );
+    let (server_end, mut client) = loopback();
+    let serving = Arc::clone(&manager);
+    let serving_task = tokio::spawn(async move { serving.serve(server_end).await });
+    let frame = client.recv().await.expect("recv the opening frame");
+    let Some(IncomingFrame::Control(ControlMessage::Challenge(challenge))) = frame else {
+        panic!("the connection did not open with a challenge: {frame:?}");
+    };
+    manager.shutdown().await;
+    let mut reg = registration("no-such-code", &mint_key(), &challenge.nonce);
+    reg.list[0].table = "nobody".to_owned();
+    client
+        .send_control(ControlMessage::RegisterBot(reg))
+        .await
+        .expect("send the registration");
+    let ControlMessage::RegistrationRefused = next_control(&mut client).await else {
+        panic!("the list that names no synced table is refused");
+    };
+    let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
+        panic!("the shutdown is told to the peer");
+    };
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::ServerShuttingDown),
+        "the fatal names the shutdown, got {fatal:?}"
+    );
+    let closed = client.recv().await.expect("recv the close");
+    assert!(closed.is_none(), "the run ends after the fatal");
+    let Ok(()) = serving_task.await.expect("serve joins") else {
+        panic!("the shutdown ends the run cleanly");
+    };
+}
+
+/// A registration that lists the write verbs settles with the list it asked
+/// for, so a bot that earns insert, update and delete holds exactly those.
+#[tokio::test]
+async fn a_registration_that_earns_the_write_verbs_settles_with_them() {
+    let fixture = Fixture::acquire().await;
+    let pool = fixture.admin().clone();
+    registry(&pool).await;
+    code(&pool, "write-code", true).await;
+    let key = mint_key();
+    let manager = manager(
+        pool.clone(),
+        guard_with_connection_refusals(100),
+        pool.clone(),
+        SessionConfig::new(),
+    );
+    let (mut client, challenge) = open(&manager).await;
+    let mut public_key = [0_u8; 32];
+    public_key.copy_from_slice(key.public_key().as_ref());
+    let reg = RegisterBot {
+        code: "write-code".to_owned(),
+        name: "bot-a".to_owned(),
+        public_key,
+        list: vec![
+            BotListEntry {
+                table: "orders".to_owned(),
+                verb: "insert".to_owned(),
+                optional: false,
+            },
+            BotListEntry {
+                table: "orders".to_owned(),
+                verb: "update".to_owned(),
+                optional: true,
+            },
+            BotListEntry {
+                table: "orders".to_owned(),
+                verb: "delete".to_owned(),
+                optional: false,
+            },
+        ],
+        signature: key
+            .sign(&bot_registration_message(&challenge.nonce))
+            .as_ref()
+            .to_vec(),
+    };
+    client
+        .send_control(ControlMessage::RegisterBot(reg))
+        .await
+        .expect("send the registration");
+    let ControlMessage::BotRegistered(answer) = next_control(&mut client).await else {
+        panic!("the registration settles");
+    };
+    let bot_id = uuid::Uuid::parse_str(&answer.bot_id).expect("the bot id is a uuid");
+    let mut conn = pool.get().await.expect("a connection");
+    let verbs: Vec<String> = connetto_server::defaults::connetto_bot_lists::table
+        .filter(connetto_server::defaults::connetto_bot_lists::bot.eq(bot_id))
+        .order_by(connetto_server::defaults::connetto_bot_lists::verb.asc())
+        .select(connetto_server::defaults::connetto_bot_lists::verb)
+        .load(&mut *conn)
+        .await
+        .expect("read the list");
+    assert_eq!(
+        verbs,
+        vec![
+            "delete".to_owned(),
+            "insert".to_owned(),
+            "update".to_owned()
+        ],
+        "the deployment holds exactly the list the bot registered"
     );
 }
