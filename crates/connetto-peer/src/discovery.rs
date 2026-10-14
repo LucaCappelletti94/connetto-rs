@@ -366,8 +366,8 @@ async fn serve_round(
                                 continue;
                             };
                             // The peer may have re-advertised under a fresh
-                            // name before this goodbye; only the last name's
-                            // removal reports the peer gone.
+                            // name before this goodbye, so only the last
+                            // name's removal reports the peer gone.
                             let last_name = !names.values().any(|still| *still == fp);
                             let actions = if last_name {
                                 policy.removed(fp)
