@@ -21,7 +21,7 @@ use crate::ClientEvent;
 
 #[cfg(target_os = "android")]
 pub(crate) mod android;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub(crate) mod apple;
 #[cfg(target_os = "linux")]
 pub(crate) mod linux;
@@ -31,7 +31,7 @@ pub use wifi_payload::WifiPayloadError;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::{AndroidHotspotBackend, JoinedBind};
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub(crate) use apple::AppleHotspotBackend;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::LinuxHotspotBackend;
@@ -187,7 +187,13 @@ pub(crate) enum HostStatus {
 
 /// The join side's outcome, as the backend stands it (R76).
 #[cfg_attr(
-    not(any(target_os = "android", target_os = "ios", target_os = "linux", test)),
+    not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        test
+    )),
     expect(
         dead_code,
         reason = "the platform backends and the proofs construct these standings, a non-Apple build reads them through the tables only"
@@ -237,10 +243,10 @@ pub(crate) trait HotspotBackend: Send + Sync {
 }
 
 /// The backend for a system without a hotspot (R76).
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 pub(crate) struct UnsupportedBackend;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 impl HotspotBackend for UnsupportedBackend {
     fn request_host(&self) -> Result<(), HotspotError> {
         Err(HotspotError::Unsupported)
@@ -773,7 +779,7 @@ pub(crate) const REJOIN_AFTER: Duration = Duration::from_secs(15);
 /// the interface has not moved, [`REJOIN_AFTER`] has passed since the ask,
 /// and the join has not been asked twice (R76 decision 28).
 #[cfg_attr(
-    not(any(target_os = "ios", test)),
+    not(any(target_os = "ios", target_os = "macos", test)),
     expect(dead_code, reason = "only the Apple backend asks a join twice")
 )]
 pub(crate) fn rejoin_due(
@@ -1398,7 +1404,7 @@ mod tests {
     /// The personal host row `host_personal_hotspot | the system cannot
     /// host a personal hotspot | the typed refusal stands, and its network
     /// never lands` (R76 decision 26).
-    #[cfg(not(target_os = "ios"))]
+    #[cfg(not(any(target_os = "ios", target_os = "macos")))]
     #[test]
     fn a_system_without_a_personal_hotspot_refuses_the_request() {
         let backend = UnsupportedBackend;

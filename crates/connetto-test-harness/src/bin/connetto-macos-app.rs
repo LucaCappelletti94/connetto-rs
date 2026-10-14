@@ -1,6 +1,7 @@
 //! Builds `examples/dioxus-desktop-demo` as a macOS `.app` the data protection
 //! keychain admits, so its secrets sit behind Touch ID or the login password
-//! (R51).
+//! (R51). When `connetto-demo-stack` names a device root, the build also
+//! carries the peer link and the hotspot it joins (R76).
 //!
 //! ```text
 //! cargo run -p connetto-test-harness --bin connetto-macos-app
@@ -20,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result, bail};
 use connetto_test_harness::ios_signing;
-use connetto_test_harness::stack::repo_path;
+use connetto_test_harness::stack::{demo_has_device_identity, repo_path};
 use tokio::process::Command;
 
 const BUNDLE: &str = "dev.connetto.dioxusdemo";
@@ -32,9 +33,15 @@ const APP: &str =
 #[tokio::main]
 async fn main() -> Result<()> {
     let demo = repo_path(&DEMO_DIR)?;
-    let status = Command::new("dx")
-        .args(["build", "--platform", "desktop"])
-        .current_dir(&demo)
+    let mut dx = Command::new("dx");
+    dx.args(["build", "--platform", "desktop"])
+        .current_dir(&demo);
+    // The peer link proves the device identity it is named for, so the
+    // features ride on the same device root the stack exports (R76).
+    if demo_has_device_identity() {
+        dx.args(["--features", "device-identity,peer"]);
+    }
+    let status = dx
         // The bundle's path is this program's only output.
         .stdout(std::process::Stdio::from(std::io::stderr()))
         .status()

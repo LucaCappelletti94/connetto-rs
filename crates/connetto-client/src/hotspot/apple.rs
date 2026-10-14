@@ -1,19 +1,24 @@
-//! The Apple hotspot backend, over the system's join API (R76).
+//! The Apple hotspot backend, over the system's join (R76).
 //!
-//! The join side asks the platform's `NEHotspotConfigurationManager` to join
-//! the offered network, and reads the joined network's address, subnet and
-//! gateway from the system. The host side stands on the user's own Personal
-//! Hotspot, which the app can only describe, never start.
+//! The join side asks the platform to join the offered network, the Network
+//! Extension's on iOS and `CoreWLAN`'s on the Mac, and reads the joined
+//! network's address, subnet and gateway from the system. The host side
+//! stands on the user's own Personal Hotspot, which the app can only
+//! describe, never start, and the Mac refuses it, since it never hosts
+//! (R76 decision 1).
 
 use parking_lot::RwLock;
 
-use connetto_peer_apple::{self as apple, Idiom};
+use connetto_peer_apple as apple;
+#[cfg(target_os = "ios")]
+use connetto_peer_apple::Idiom;
 
 use super::{
     HostStatus, HotspotBackend, HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinStatus,
 };
 
 /// The personal hotspot's lane, the platform's bridge for it.
+#[cfg(target_os = "ios")]
 const PERSONAL_LANE: &str = "bridge100";
 
 /// The Apple hotspot backend, over `connetto-peer-apple` (R76).
@@ -84,6 +89,13 @@ fn join_refusal(error: &apple::Error) -> JoinError {
 
 /// Whether the personal hotspot's network has landed.
 fn personal_landed() -> bool {
+    // The Mac's bridge100 is its virtualisation bridge, and the Mac never
+    // hosts, so the landed read stands false there (R76 decision 1).
+    #[cfg(target_os = "macos")]
+    {
+        false
+    }
+    #[cfg(target_os = "ios")]
     if_addrs::get_if_addrs().is_ok_and(|interfaces| {
         interfaces.iter().any(|interface| {
             interface.name == PERSONAL_LANE && matches!(interface.addr, if_addrs::IfAddr::V4(_))
@@ -174,6 +186,12 @@ impl HotspotBackend for AppleHotspotBackend {
         }
     }
 
+    #[cfg(target_os = "macos")]
+    fn request_personal_host(&self, _ssid: &str, _passphrase: &str) -> Result<(), HotspotError> {
+        // The Mac never hosts (R76 decision 1).
+        Err(HotspotError::Unsupported)
+    }
+    #[cfg(target_os = "ios")]
     fn request_personal_host(&self, ssid: &str, passphrase: &str) -> Result<(), HotspotError> {
         // Only a phone hosts a Personal Hotspot, so anything but a phone
         // stands refused (R76 decision 27).
