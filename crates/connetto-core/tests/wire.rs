@@ -13,14 +13,15 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, DeviceAttestation,
-        DeviceRevokedAck, DeviceSummary, DevicesList, DevicesRequest, EnrolChallenge,
-        EnrolChallengeRequest, EnrolGrant, EnrolRefusal, EnrolRefused, EnrolRequest, FatalError,
-        FatalErrorReason, FullResyncReason, FullResyncRequired, Grant, Handshake, HandshakeAck,
-        LivePatch, MutationConflict, MutationHeader, MutationPatch, MutationReject,
-        MutationRejectReason, NonFatalError, PauseCause, Ping, Pong, RateLimited, RevocationUpdate,
-        RevokeDeviceRequest, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe,
-        SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        AckCredits, AggregateUpdate, BotListEntry, BotRegistered, BulkMessage, Challenge,
+        ConflictRow, ControlMessage, DeviceAttestation, DeviceRevokedAck, DeviceSummary,
+        DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
+        EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
+        FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
+        MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
+        PauseCause, Ping, Pong, RateLimited, RegisterBot, RevocationUpdate, RevokeDeviceRequest,
+        SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
+        SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -57,6 +58,35 @@ fn round_trip_bulk(message: &BulkMessage) {
         "framed bulk decoder must consume everything"
     );
     assert_eq!(*message, framed_back, "framed bulk round-trip mismatch");
+}
+
+#[test]
+fn registration_frames_round_trip() {
+    // The verb word passes through as bare text, so a spelling outside the
+    // four decodes and is refused by the server instead of failing the frame.
+    round_trip_control(&ControlMessage::Challenge(Challenge { nonce: [0x11; 32] }));
+    round_trip_control(&ControlMessage::RegisterBot(RegisterBot {
+        code: "K7QX-2M9P-WF4D-8H3T-6CRN-A5".into(),
+        name: "bot-a".into(),
+        public_key: [0x02; 32],
+        list: vec![
+            BotListEntry {
+                table: "orders".into(),
+                verb: "read".into(),
+                optional: false,
+            },
+            BotListEntry {
+                table: "invoices".into(),
+                verb: "drop".into(),
+                optional: true,
+            },
+        ],
+        signature: vec![0x03; 64],
+    }));
+    round_trip_control(&ControlMessage::BotRegistered(BotRegistered {
+        bot_id: "6ba7b810-9dad-11d1-80b4-00c04fd430c8".into(),
+    }));
+    round_trip_control(&ControlMessage::RegistrationRefused);
 }
 
 #[test]

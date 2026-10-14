@@ -90,6 +90,19 @@ impl Verb {
             Verb::Delete => "delete",
         }
     }
+
+    /// The verb a wire or column spelling names, or `None` for a spelling
+    /// outside the four the `CHECK` allows.
+    #[must_use]
+    pub fn parse(spelled: &str) -> Option<Self> {
+        match spelled {
+            "read" => Some(Self::Read),
+            "insert" => Some(Self::Insert),
+            "update" => Some(Self::Update),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
 }
 
 /// A `verb` column spelling outside the four the `CHECK` allows.

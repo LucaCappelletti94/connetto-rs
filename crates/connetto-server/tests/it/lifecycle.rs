@@ -188,6 +188,10 @@ pub(super) async fn live_session(addr: &str, token: &str) -> WebSocketTransport<
         ))
         .await
         .expect("send the handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     match next_control(&mut client).await {
         ControlMessage::HandshakeAck(HandshakeAck { connection_id, .. }) => {
             assert!(

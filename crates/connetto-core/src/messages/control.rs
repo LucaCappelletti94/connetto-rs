@@ -93,6 +93,7 @@ use super::{
     handshake::{Handshake, HandshakeAck},
     mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
+    registration::{BotRegistered, Challenge, RegisterBot},
     subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
 };
 
@@ -108,6 +109,15 @@ pub enum ControlMessage {
     Handshake(Handshake),
     /// Server acknowledges an opened session.
     HandshakeAck(HandshakeAck),
+    /// The server's opening frame of every connection (R91), the random bytes
+    /// the first frame of the connection signs.
+    Challenge(Challenge),
+    /// A bot answers a challenge with a registration (R91).
+    RegisterBot(RegisterBot),
+    /// The server settles a registration with the bot id (R91).
+    BotRegistered(BotRegistered),
+    /// The server refuses a registration without saying why (R91).
+    RegistrationRefused,
 
     /// Client registers a subscription.
     Subscribe(Subscribe),

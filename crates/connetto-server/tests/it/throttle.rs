@@ -164,6 +164,10 @@ async fn connect(
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(ack) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -374,6 +378,10 @@ async fn too_many_connections_on_one_handle_are_closed() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
         panic!("the third connection is closed rather than acknowledged");
     };
@@ -421,6 +429,10 @@ async fn an_anonymous_caller_cannot_reconnect_past_its_connection_limit() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
         panic!("the third connection on this run is closed rather than acknowledged");
     };
@@ -496,6 +508,10 @@ async fn a_tripped_credential_limit_stops_checking_grants() {
         .await
         .expect("send handshake");
 
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::FatalError(fatal) = next_control(&mut client).await else {
         panic!("a caller past its credential limit is closed, not acknowledged");
     };

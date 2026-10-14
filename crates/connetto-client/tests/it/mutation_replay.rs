@@ -354,6 +354,7 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
     let mut real = open_session(&manager);
     let relay = tokio::spawn(async move {
         forward(&mut mitm_end, &mut real).await; // handshake
+        forward(&mut real, &mut mitm_end).await; // the gate's challenge
         forward(&mut real, &mut mitm_end).await; // ack
         forward(&mut mitm_end, &mut real).await; // mutation header
         forward(&mut mitm_end, &mut real).await; // mutation patchset

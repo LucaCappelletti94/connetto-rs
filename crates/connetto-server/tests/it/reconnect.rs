@@ -255,6 +255,10 @@ where
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -701,6 +705,10 @@ async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> Loopba
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -967,6 +975,10 @@ async fn open_restarted_session(
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -1132,6 +1144,10 @@ async fn open_fenced_session(
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };

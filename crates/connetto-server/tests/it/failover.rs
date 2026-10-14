@@ -103,6 +103,12 @@ async fn connect(manager: &Arc<Manager>, cursor: Option<Cursor>) -> LoopbackTran
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let IncomingFrame::Control(ControlMessage::Challenge(_)) =
+        next_frame(&mut client, "the leading challenge").await
+    else {
+        panic!("expected the leading challenge");
+    };
     let IncomingFrame::Control(ControlMessage::HandshakeAck(_)) =
         next_frame(&mut client, "the handshake ack").await
     else {

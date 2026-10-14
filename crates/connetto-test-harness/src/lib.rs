@@ -1803,10 +1803,7 @@ impl Client {
             .send_control(ControlMessage::Handshake(handshake))
             .await
             .expect("send handshake");
-        let ControlMessage::HandshakeAck(ack) = self.next_control().await else {
-            panic!("expected handshake ack");
-        };
-        ack
+        self.take_handshake_ack().await
     }
 
     /// Send a handshake presenting `grant` and the cursor a client persisted, so
@@ -1829,8 +1826,26 @@ impl Client {
             .send_control(ControlMessage::Handshake(handshake))
             .await
             .expect("send handshake");
+        self.take_handshake_ack().await
+    }
+
+    /// The handshake ack of the frame the caller just sent (R91). The server
+    /// leads every connection with a `Challenge` the person ignores, and the
+    /// ack follows it. A peer that leads with nothing answers with the bare
+    /// ack.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the answer is neither the leading challenge nor the
+    /// handshake ack.
+    async fn take_handshake_ack(&mut self) -> HandshakeAck {
+        match self.next_control().await {
+            ControlMessage::Challenge(_) => {}
+            ControlMessage::HandshakeAck(ack) => return ack,
+            other => panic!("expected the leading challenge or the handshake ack, got {other:?}"),
+        }
         let ControlMessage::HandshakeAck(ack) = self.next_control().await else {
-            panic!("expected handshake ack");
+            panic!("expected the handshake ack after the challenge");
         };
         ack
     }

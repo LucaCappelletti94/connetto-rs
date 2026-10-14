@@ -113,6 +113,10 @@ async fn snapshot_failure_is_nonfatal_and_the_session_survives() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -204,6 +208,10 @@ async fn refusals_are_byte_identical_across_causes() {
                 ))
                 .await
                 .expect("send handshake");
+            // The server leads every connection with a challenge a person ignores (R91).
+            let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+                panic!("expected the leading challenge");
+            };
             let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
                 panic!("expected handshake ack");
             };
@@ -426,6 +434,10 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(&mut client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(&mut client).await else {
         panic!("expected handshake ack");
     };
@@ -558,6 +570,10 @@ async fn client_handshake<T: Transport>(client: &mut T, user: &str) {
         ))
         .await
         .expect("send handshake");
+    // The server leads every connection with a challenge a person ignores (R91).
+    let ControlMessage::Challenge(_) = next_control(client).await else {
+        panic!("expected the leading challenge");
+    };
     let ControlMessage::HandshakeAck(_) = next_control(client).await else {
         panic!("expected handshake ack");
     };

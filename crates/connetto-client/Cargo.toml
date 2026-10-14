@@ -35,6 +35,10 @@ native-transport = [
 # (no libpq), which the orphan rule forbids a downstream crate from mapping, so
 # they are opt-in here rather than forced on every SQLite-only client.
 postgres-types = ["diesel/postgres_backend"]
+# A bot registering itself over a live connection (R91): the Ed25519
+# signature over the connection's nonce. Native only, like `native-auth`,
+# because ring does not build for the browser's wasm target.
+bot = ["dep:ring"]
 # Native OAuth acquisition (docs/architecture/11-authentication.md phase 4): the
 # loopback listener, system browser, OS secure storage for the refresh token,
 # and the HTTP calls to connetto-server's login, token, and refresh endpoints.
@@ -271,6 +275,8 @@ uuid = { version = "1", default-features = false, features = ["js"] }
 
 [dev-dependencies]
 parking_lot = "0.12"
+# The bot registration tests mint and verify the Ed25519 key the exchange signs with.
+ring = { version = "0.17", features = ["std"] }
 # The shared fake transport the suites here drive `connect` and `resume` with.
 connetto-core = { workspace = true, features = ["test-support"] }
 # The loop tests run the real server in-process. Its write target is the real

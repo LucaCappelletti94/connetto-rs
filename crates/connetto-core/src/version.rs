@@ -11,4 +11,4 @@
 /// compression discipline. Compatible additive changes (new optional fields on
 /// an existing struct) do not require a bump because MessagePack-encoded named
 /// structs tolerate unknown/missing fields at the serde layer.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;

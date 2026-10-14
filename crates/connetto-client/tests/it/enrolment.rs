@@ -145,7 +145,7 @@ async fn enrolment_phase() {
         "offline" => offline().await,
         "forget" => forget().await,
         "report" => Box::pin(report()).await,
-        "learned" => learned_at_connect().await,
+        "learned" => Box::pin(learned_at_connect()).await,
         "untrusted" => untrusted().await,
         "no-roots" => no_roots().await,
         "rotation" => Box::pin(rotation_withdraws()).await,

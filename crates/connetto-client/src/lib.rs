@@ -76,6 +76,8 @@ pub mod archive;
 #[cfg(feature = "native-auth")]
 pub mod auth;
 pub mod away;
+#[cfg(feature = "bot")]
+pub mod bot;
 pub mod builder;
 pub mod cipher;
 mod clock;
@@ -172,6 +174,11 @@ pub enum ClientError {
         /// The refusal the peer sent.
         reason: FatalErrorReason,
     },
+    /// The bot's registration was refused (R91). The refusal is the wire's
+    /// `RegistrationRefused` frame, after which the connection carries on with
+    /// a fresh challenge, so there is no close reason to carry.
+    #[error("the registration was refused")]
+    RegistrationRefused,
     /// The SQLite capture session failed.
     #[error("session error: {0}")]
     Session(String),
@@ -2232,6 +2239,7 @@ struct HandshakeOk {
     resume_token: String,
     watermark: Option<u64>,
     schema_version: Option<SchemaVersion>,
+    challenge: Option<[u8; 32]>,
 }
 
 /// Run the opening handshake over `transport`: send the hello (carrying the
@@ -2291,11 +2299,23 @@ where
         .send_control(ControlMessage::Handshake(handshake))
         .await
         .map_err(|e| ClientError::Transport(e.to_string()))?;
-    match transport
+    // The server opens every connection with a challenge (R91) the handshake answers nothing with.
+    let mut challenge: Option<[u8; 32]> = None;
+    let frame = transport
         .recv()
         .await
-        .map_err(|e| ClientError::Transport(e.to_string()))?
-    {
+        .map_err(|e| ClientError::Transport(e.to_string()))?;
+    let frame = match frame {
+        Some(IncomingFrame::Control(ControlMessage::Challenge(challenge_frame))) => {
+            challenge = Some(challenge_frame.nonce);
+            transport
+                .recv()
+                .await
+                .map_err(|e| ClientError::Transport(e.to_string()))?
+        }
+        other => other,
+    };
+    match frame {
         Some(IncomingFrame::Control(ControlMessage::HandshakeAck(ack))) => {
             // Server-gated staleness detection: when the server advertises a
             // schema version, the client must declare the same one. A client
@@ -2319,6 +2339,7 @@ where
                 resume_token: ack.resume_token,
                 watermark: ack.last_applied_seq,
                 schema_version: ack.schema_version,
+                challenge,
             })
         }
         Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
@@ -2398,6 +2419,12 @@ struct Run {
 struct Wire<T> {
     transport: T,
     connection_id: String,
+    /// The connection's challenge nonce, spent by the first frame that signs it.
+    #[expect(
+        dead_code,
+        reason = "R99's login signs against this connection's nonce and R91 stores it for that"
+    )]
+    challenge: Option<[u8; 32]>,
 }
 
 #[derive(Clone, Copy)]
@@ -2852,6 +2879,7 @@ where
         self.wire = Some(Wire {
             transport,
             connection_id: ack.connection_id,
+            challenge: ack.challenge,
         });
         self.history_cleared = false;
         self.attach_replay = AttachReplay::Pending { watermark };
