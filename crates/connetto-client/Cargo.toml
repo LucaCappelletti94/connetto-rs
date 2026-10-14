@@ -214,6 +214,12 @@ apple-native-keyring-store = { version = "1.0.2", features = [
 security-framework = { version = "3.7", features = ["OSX_10_15"], optional = true }
 # The enclave's refusals arrive as `CFError`, which is not `Send`.
 core-foundation = { version = "0.10", optional = true }
+# The peer's Apple bridge, the peripheral's readiness and the join, the
+# Network Extension's on iOS and CoreWLAN's on macOS (R76).
+[target.'cfg(any(target_os = "ios", target_os = "macos"))'.dependencies]
+connetto-peer-apple = { path = "../connetto-peer-apple", optional = true }
+# The streams btleplug's central answers with (R76 decision 22).
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 # App Attest, behind the one crate allowed unsafe code (R74 decision 35).
@@ -223,12 +229,8 @@ apple-native-keyring-store = { version = "1.0.2", features = [
 ], optional = true }
 security-framework = { version = "3.7", optional = true }
 core-foundation = { version = "0.10", optional = true }
-# The peer's Apple bridge, the peripheral and the Network Extension join (R76).
-connetto-peer-apple = { path = "../connetto-peer-apple", optional = true }
 # The interfaces the personal hotspot's landing bound reads (R76 decision 26).
 if-addrs = "0.15"
-# The streams btleplug's central answers with (R76 decision 22).
-futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
@@ -262,7 +264,7 @@ webbrowser = { version = "1.2", optional = true }
 # The peer's Bluetooth, the central the joiner runs on Android and on the
 # Apple side through CoreBluetooth, and on Linux through btleplug's BlueZ
 # half (R76 decisions 17 and 22).
-[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))'.dependencies]
+[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))'.dependencies]
 btleplug = { version = "0.13.5", optional = true }
 
 # Android: the Keystore-backed store of the same family. The NDK ships no

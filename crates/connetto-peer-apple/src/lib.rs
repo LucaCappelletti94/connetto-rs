@@ -45,7 +45,7 @@ pub enum Idiom {
 /// iOS answers the user's name only under the
 /// `com.apple.developer.device-information.user-assigned-device-name` entitlement,
 /// and answers its generic model name without it, which this reads as `None`
-/// (R76 decision 17).
+/// (R76 decision 17). macOS answers the hostname the user sets for the Mac.
 pub fn device_name() -> Option<String> {
     crate::platform::device::device_name()
 }
@@ -54,7 +54,8 @@ pub fn device_name() -> Option<String> {
 ///
 /// A Wi-Fi pad's Personal Hotspot cannot be turned on from an app, so the
 /// client's hotspot backend reads this to answer a typed refusal for a
-/// personal host on anything but a phone (R76 decision 27).
+/// personal host on anything but a phone (R76 decision 27). The Mac answers
+/// `Other` and never hosts (R76 decision 1).
 pub fn device_idiom() -> Idiom {
     crate::platform::device::device_idiom()
 }
@@ -117,7 +118,7 @@ pub(crate) fn join_already_associated(domain: &str, code: isize) -> bool {
 
 /// One hex digit's value, sixteen standing for invalid.
 #[cfg_attr(
-    not(any(target_os = "ios", test)),
+    not(any(target_os = "ios", target_os = "macos", test)),
     expect(
         dead_code,
         reason = "the iOS platform and the tests call this, a host build without tests uses neither"
@@ -135,7 +136,7 @@ pub(crate) fn nibble(byte: u8) -> u8 {
 /// The first eight bytes of a canonical UUID text, big-endian, the device
 /// key the exchange stands on (R76).
 #[cfg_attr(
-    not(any(target_os = "ios", test)),
+    not(any(target_os = "ios", target_os = "macos", test)),
     expect(
         dead_code,
         reason = "the iOS platform and the tests call this, a host build without tests uses neither"
@@ -291,7 +292,8 @@ pub mod bluetooth {
     /// The advertisement carries the service's UUID alone (R76 decision 25),
     /// and the service's add and the advertisement's start settle on the
     /// platform's own queue, so this answer may stand before the
-    /// advertisement is live.
+    /// advertisement is live. On the Mac the service stands refused, since
+    /// the Mac never hosts (R76 decision 1).
     ///
     /// # Errors
     ///
@@ -380,8 +382,9 @@ pub mod hotspot {
     ///
     /// # Errors
     ///
-    /// A framework error where the platform answers one, and its WPA3
-    /// selector standing absent.
+    /// A framework error where the platform answers one, its WPA3 selector
+    /// standing absent on iOS and iPadOS, and the Wi-Fi interface standing
+    /// absent on macOS.
     pub fn join(ssid: &str, passphrase: &str, security: Security) -> Result<(), crate::Error> {
         crate::platform::hotspot::join(ssid, passphrase, security)
     }
@@ -410,12 +413,12 @@ pub mod hotspot {
     }
 }
 
-#[cfg(any(target_os = "ios", test))]
+#[cfg(any(target_os = "ios", target_os = "macos", test))]
 mod route;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(not(any(target_os = "ios", target_os = "macos")))]
 #[path = "unsupported.rs"]
 mod platform;
 
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 mod platform;

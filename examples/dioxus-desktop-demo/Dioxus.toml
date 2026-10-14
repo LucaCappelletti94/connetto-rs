@@ -16,6 +16,12 @@ local_network = { description = "Find and link to nearby devices" }
 [ios.plist]
 NSBonjourServices = ["_connetto-peer._tcp"]
 
+# The macOS local network usage description, which the unified
+# `local_network` permission never writes, since its platform key stands
+# iOS only (R76).
+[macos.plist]
+NSLocalNetworkUsageDescription = "Find and link to nearby devices"
+
 # App Attest vouches for this build at device enrolment (R74 decisions 32 and
 # 35). The development profile takes the entitlements from the App ID's
 # capabilities, which a human enables on the App ID, since the API keeps the
