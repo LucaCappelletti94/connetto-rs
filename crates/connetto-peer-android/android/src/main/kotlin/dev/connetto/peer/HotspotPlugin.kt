@@ -108,15 +108,18 @@ class HotspotPlugin {
                                 started.close()
                                 return
                             }
-                            reservation = started
                             val config =
                                 runCatching { started.getSoftApConfiguration() }
                                     .getOrNull()
+                            // A hotspot whose details cannot be read has no
+                            // joiners to offer, so it closes with the failure.
                             if (config == null) {
+                                started.close()
                                 hostState = HOST_FAILED
                                 hostFailure = "0"
                                 return
                             }
+                            reservation = started
                             hostSsid =
                                 config.wifiSsid
                                     ?.bytes
@@ -169,6 +172,11 @@ class HotspotPlugin {
                 } catch (e: SecurityException) {
                     hostState = HOST_FAILED
                     hostFailure = Manifest.permission.NEARBY_WIFI_DEVICES
+                } catch (e: IllegalStateException) {
+                    // The platform still holds a request this side gave up,
+                    // whose late `onStarted` closes its reservation.
+                    hostState = HOST_FAILED
+                    hostFailure = "0"
                 }
             }
         }

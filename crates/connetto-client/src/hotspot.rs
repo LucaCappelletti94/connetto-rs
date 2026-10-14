@@ -656,6 +656,7 @@ impl Machine {
 pub(crate) struct Runner {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     backend: Arc<dyn HotspotBackend>,
+    bind: SubnetBind,
 }
 
 impl Future for Runner {
@@ -670,9 +671,11 @@ impl Drop for Runner {
     fn drop(&mut self) {
         // A dropped client leaves the machine unpollable, so the tables'
         // "Client closed" rows apply here, where they are no-ops on the
-        // backend's own standing.
+        // backend's own standing. The released network takes the dial bind
+        // with it.
         self.backend.stop_host();
         self.backend.leave_join();
+        (self.bind)(None);
     }
 }
 
@@ -680,11 +683,13 @@ impl Drop for Runner {
 /// applying to a dropped client (R76).
 pub(crate) fn run(machine: Machine, commands: mpsc::UnboundedReceiver<Command>) -> Runner {
     let backend = Arc::clone(&machine.backend);
+    let bind = Arc::clone(&machine.bind);
     Runner {
         future: Box::pin(async move {
             machine.run(commands).await;
         }),
         backend,
+        bind,
     }
 }
 
@@ -1489,6 +1494,30 @@ mod tests {
             .await
             .expect("the loop ends with its channel")
             .expect("the loop task ends");
+    }
+
+    /// A dropped runner releases both sides and clears the dial bind, so a
+    /// dial into the joined subnet no longer asks for the released network.
+    #[test]
+    fn a_dropped_runner_releases_its_sides_and_clears_the_bind() {
+        let backend: Arc<FakeBackend> = Arc::new(FakeBackend::new());
+        let binds: Subnets = Arc::new(Mutex::new(Vec::new()));
+        let machine = Machine::new(
+            Arc::clone(&backend) as Arc<dyn HotspotBackend>,
+            true,
+            Arc::new(|| Some(54321)),
+            Arc::new({
+                let binds = Arc::clone(&binds);
+                move |subnet| binds.lock().push(subnet)
+            }),
+            Arc::new(|_, _| {}),
+            Arc::new(|_| {}),
+        );
+        let (_tx, rx) = mpsc::unbounded_channel();
+        drop(run(machine, rx));
+        assert_eq!(backend.counted("stop_host"), 1);
+        assert_eq!(backend.counted("leave_join"), 1);
+        assert_eq!(*binds.lock(), vec![None]);
     }
 
     /// The offer's debug form hides its passphrase.

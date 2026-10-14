@@ -449,18 +449,23 @@ async fn peer_proof(
     step("prepare the peer phone");
     let (stay_on, previous_role) = prepare_joiner(joiner, &unlock).await?;
     // The joiner's usual network, read after the wireless reconnect, which
-    // the cleanup must bring it back to.
-    let usual_ssid = joiner.current_ssid().await?;
-    let result = run_peer_proof(
-        host,
-        joiner,
-        apk,
-        stack,
-        evidence,
-        &unlock,
-        usual_ssid.as_ref(),
-    )
-    .await;
+    // the cleanup must bring it back to. A failed read still runs the
+    // cleanup below before it reports.
+    let result = match joiner.current_ssid().await {
+        Ok(usual_ssid) => {
+            run_peer_proof(
+                host,
+                joiner,
+                apk,
+                stack,
+                evidence,
+                &unlock,
+                usual_ssid.as_ref(),
+            )
+            .await
+        }
+        Err(err) => Err(err),
+    };
 
     // The joiner's log for the record, and its state, which the run leaves
     // as it found it.
