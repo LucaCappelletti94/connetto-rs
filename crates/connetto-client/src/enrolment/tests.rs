@@ -593,6 +593,11 @@ async fn authority(not_before: SystemTime) -> Authority {
     }
 }
 
+/// A test serial of sixteen `byte`s, positive for any byte from 1 to 127.
+fn positive_serial(byte: u8) -> CertificateSerial {
+    CertificateSerial::new([byte; 16]).expect("the test serial is positive")
+}
+
 /// A certificate `authority` issued for `key`, valid from `not_before` for
 /// `lifetime`.
 fn issue_for(
@@ -1167,7 +1172,7 @@ fn peer(authority: &Authority) -> Peer {
 #[cfg(feature = "peer")]
 fn far_peer(
     authority: &Authority,
-    serial: [u8; 16],
+    serial: CertificateSerial,
 ) -> (
     connetto_peer::Node,
     tokio::sync::mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
@@ -1256,7 +1261,7 @@ async fn a_fresh_device_serves_its_peer_listener_at_open() {
     let (key, der) = attesting_key();
     let now = whole_second();
     let authority = authority(now).await;
-    let held = issue_for(&authority, &key, now, 12 * HOUR, [5; 16]);
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
@@ -1303,7 +1308,13 @@ async fn an_expired_device_refuses_to_link_and_raises_the_event() {
     let now = SystemTime::now();
     let authority = authority(now).await;
     // Past its end plus the tolerance, so the window no longer holds it.
-    let held = issue_for(&authority, &key, now - 22 * HOUR, 12 * HOUR, [5; 16]);
+    let held = issue_for(
+        &authority,
+        &key,
+        now - 22 * HOUR,
+        12 * HOUR,
+        positive_serial(5),
+    );
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
@@ -1368,7 +1379,13 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
     let now = SystemTime::now();
     let authority = authority(now).await;
     // Not yet valid by more than the tolerance, so the local clock is off.
-    let held = issue_for(&authority, &key, now + 10 * MINUTE, 12 * HOUR, [5; 16]);
+    let held = issue_for(
+        &authority,
+        &key,
+        now + 10 * MINUTE,
+        12 * HOUR,
+        positive_serial(5),
+    );
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
@@ -1582,7 +1599,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         &key,
         now + Duration::from_secs(30) - 7 * MINUTE,
         2 * MINUTE,
-        [5; 16],
+        positive_serial(5),
     );
     let task_identity = held.leaf.identity().clone();
     let deadline = held.leaf.not_after() + TOLERANCE;
@@ -1591,7 +1608,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     let (end_tx, end_rx) = watch::channel(());
     #[cfg(feature = "peer")]
     let peer = peer(&authority);
-    let (far, mut far_events) = far_peer(&authority, [9; 16]);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -1681,7 +1698,7 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
         &key,
         now + Duration::from_secs(30) - 7 * MINUTE,
         2 * MINUTE,
-        [5; 16],
+        positive_serial(5),
     );
     let deadline = held.leaf.not_after() + TOLERANCE;
     let state = Arc::new(Mutex::new(FakeState::default()));
@@ -1690,7 +1707,7 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
     let gate = Arc::new(tokio::sync::Notify::new());
     #[cfg(feature = "peer")]
     let peer = peer(&authority);
-    let (far, mut far_events) = far_peer(&authority, [9; 16]);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -1774,7 +1791,7 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
     let (key, der) = attesting_key();
     let now = SystemTime::now();
     let authority = authority(now).await;
-    let held = issue_for(&authority, &key, now, 12 * HOUR, [5; 16]);
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
     let own_serial = held.leaf.serial().to_vec();
     // The list revoking the device's own serial, signed before the fake
     // link takes the issuer.
@@ -1796,8 +1813,8 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
     let (end_tx, end_rx) = watch::channel(());
     #[cfg(feature = "peer")]
     let peer = peer(&authority);
-    let (keeper, mut keeper_events) = far_peer(&authority, [9; 16]);
-    let (other, mut other_events) = far_peer(&authority, [10; 16]);
+    let (keeper, mut keeper_events) = far_peer(&authority, positive_serial(9));
+    let (other, mut other_events) = far_peer(&authority, positive_serial(10));
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -1899,7 +1916,7 @@ async fn a_stale_peer_list_changes_nothing() {
     let (key, der) = attesting_key();
     let now = SystemTime::now();
     let authority = authority(now).await;
-    let held = issue_for(&authority, &key, now, 12 * HOUR, [5; 16]);
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
     // A list from the test issuer, numbering one and naming a serial that
     // is not the device's own.
     let list = authority
@@ -1928,7 +1945,7 @@ async fn a_stale_peer_list_changes_nothing() {
     let (end_tx, end_rx) = watch::channel(());
     #[cfg(feature = "peer")]
     let peer = peer(&authority);
-    let (far, _far_events) = far_peer(&authority, [9; 16]);
+    let (far, _far_events) = far_peer(&authority, positive_serial(9));
     let link = FakeLink {
         state: Arc::clone(&state),
         events,
@@ -2025,8 +2042,8 @@ async fn two_clients_discover_each_other_and_autolink() {
     let (key_b, der_b) = attesting_key();
     let now = whole_second();
     let authority = authority(now).await;
-    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, [5; 16]);
-    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, [6; 16]);
+    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, positive_serial(5));
+    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, positive_serial(6));
     let fp_a = connetto_peer::Fingerprint::of(&held_a.certificate);
     let fp_b = connetto_peer::Fingerprint::of(&held_b.certificate);
     let port = fresh_mdns_port();
@@ -2119,8 +2136,8 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
     let (key_b, der_b) = attesting_key();
     let now = whole_second();
     let authority = authority(now).await;
-    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, [5; 16]);
-    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, [6; 16]);
+    let held_a = issue_for(&authority, &key_a, now, 12 * HOUR, positive_serial(5));
+    let held_b = issue_for(&authority, &key_b, now, 12 * HOUR, positive_serial(6));
     let fp_a = connetto_peer::Fingerprint::of(&held_a.certificate);
     let fp_b = connetto_peer::Fingerprint::of(&held_b.certificate);
     let port = fresh_mdns_port();

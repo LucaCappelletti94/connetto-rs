@@ -122,8 +122,9 @@ impl RootCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "connetto device issuer");
-        let mut serial_hex = String::with_capacity(serial.len() * 2);
-        for byte in serial {
+        let serial_bytes = serial.as_bytes();
+        let mut serial_hex = String::with_capacity(serial_bytes.len() * 2);
+        for byte in serial_bytes {
             use std::fmt::Write as _;
             let _ = write!(serial_hex, "{byte:02x}");
         }
@@ -135,7 +136,7 @@ impl RootCa {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = to_time(not_before).ok_or(RootError::Validity)?;
         params.not_after = to_time(not_before + valid_for).ok_or(RootError::Validity)?;
-        params.serial_number = Some(SerialNumber::from_slice(&serial.as_bytes()));
+        params.serial_number = Some(SerialNumber::from_slice(&serial_bytes));
         Ok(params.signed_by(&public, &signer)?.der().to_vec())
     }
 }

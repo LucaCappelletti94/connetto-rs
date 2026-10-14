@@ -657,7 +657,7 @@ fn a_list_from_a_sibling_issuer_leaves_the_other_issuers_chains_verifying() {
             &sibling_key.subject_public_key_info(),
             start,
             YEAR + 30 * DAY,
-            [3; 16],
+            serial(3),
         )
         .expect("sign the sibling");
     let sibling =
