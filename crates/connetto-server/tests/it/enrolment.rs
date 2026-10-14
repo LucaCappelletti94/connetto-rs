@@ -5,8 +5,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime};
 
 use connetto_core::device_cert::{
-    ANDROID_ATTESTATION_CHALLENGE, AttestationLevel, CertificateRequest, DeploymentId,
-    DeviceCertificate, DeviceIssuer, KeyId, RootCa,
+    ANDROID_ATTESTATION_CHALLENGE, AttestationLevel, CertificateRequest, CertificateSerial,
+    DeploymentId, DeviceCertificate, DeviceIssuer, KeyId, RootCa,
 };
 use connetto_core::messages::{
     ControlMessage, DeviceAttestation, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
@@ -14,7 +14,7 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::device_cert::{
-    AndroidStatus, DeviceCertConfig, DeviceEnrolment, MemoryEnrolments, StatusList,
+    AndroidStatus, DeviceCertConfig, DeviceEnrolment, MemoryEnrolments, RandomSource, StatusList,
 };
 use connetto_server::{AbuseConfig, LoopbackTransport, RequestGuard, ThrottleConfig, loopback};
 use connetto_test_harness::{Fixture, RosterAuth, WITHHELD_ID};
@@ -52,7 +52,7 @@ pub(super) fn rooted_issuer() -> (Vec<u8>, Vec<u8>, DeviceIssuer) {
             &key.subject_public_key_info(),
             now - DAY,
             395 * DAY,
-            [1; 16],
+            CertificateSerial::new([1; 16]).expect("the serial is positive"),
         )
         .expect("issuer");
     let issuer = DeviceIssuer::new(cert.clone(), key, root.certificate()).expect("load");
@@ -325,6 +325,60 @@ async fn a_signed_in_device_enrols_and_is_recorded() {
     assert_eq!(records[0].key, key_id);
     assert_eq!(records[0].serial.as_slice(), leaf.serial());
     assert_eq!(records[0].descriptor, vec![0x91, 0x01]);
+}
+
+/// The serial a held draw hands the enrolment, its leading zero a
+/// certificate cannot carry.
+const ZERO_LEADING: [u8; 16] = [
+    0x00, 109, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83,
+];
+/// The serial a redraw hands it, one the certificate can carry.
+const REDRAWN: [u8; 16] = [
+    109, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84,
+];
+
+/// A source that holds its first 16-octet draw, a serial with a leading
+/// zero, and hands the redraw one the certificate can carry.
+struct HeldDraw {
+    held: AtomicU32,
+}
+
+impl RandomSource for HeldDraw {
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
+        if dest.len() == 16 {
+            let held = self.held.fetch_add(1, Ordering::Relaxed);
+            dest.copy_from_slice(if held == 0 { &ZERO_LEADING } else { &REDRAWN });
+        } else {
+            dest.fill(0x11);
+        }
+        Ok(())
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_zero_leading_draw_is_redrawn_and_recorded_as_issued() {
+    let fixture = Fixture::acquire().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (issuer_cert, issuer) = issuer();
+    let enrolment = DeviceEnrolment::new(DeviceCertConfig::new(issuer), Arc::clone(&store) as _)
+        .with_random(Box::new(HeldDraw {
+            held: AtomicU32::new(0),
+        }));
+    let manager = enrolling_manager(&fixture, Some(enrolment)).await;
+    let mut client = connect(&manager, Some("alice")).await;
+    let key = device_key();
+    let handed = nonce(&mut client).await;
+    let reply = enrol(&mut client, &key, handed, None, vec![0x91, 0x01]).await;
+    let ControlMessage::EnrolGrant(EnrolGrant { chain, .. }) = reply else {
+        panic!("expected a grant, got {reply:?}");
+    };
+    assert_eq!(chain.len(), 2);
+    assert_eq!(chain[1].as_slice(), issuer_cert.as_slice());
+    let leaf = DeviceCertificate::parse(&chain[0]).expect("the leaf meets the profile");
+    assert_eq!(leaf.serial(), REDRAWN.as_slice());
+    let records = store.records();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].serial.as_slice(), leaf.serial());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

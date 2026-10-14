@@ -7,10 +7,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use connetto_core::SessionId;
 use connetto_core::device_cert::{
-    AttestationLevel, CertificateRequest, IssueError, KeyId, ListError, Revoked,
+    AttestationLevel, CertificateRequest, CertificateSerial, IssueError, KeyId, ListError, Revoked,
 };
 use connetto_core::messages::{DeviceSummary, EnrolGrant, EnrolRefusal, EnrolRequest, SignedList};
-use ring::rand::{SecureRandom as _, SystemRandom};
+use ring::rand::{SecureRandom, SystemRandom};
 use tokio::time::Instant;
 
 use super::{DeviceCertConfig, LifetimeError, StatusList, verify};
@@ -352,12 +352,28 @@ pub enum RevokeError {
     Unavailable(#[source] EnrolmentError),
 }
 
+/// A source the enrolment draws its nonces and serials from.
+pub trait RandomSource: Send + Sync {
+    /// Draw random bytes into `dest`.
+    ///
+    /// # Errors
+    ///
+    /// The source's error.
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified>;
+}
+
+impl RandomSource for SystemRandom {
+    fn fill(&self, dest: &mut [u8]) -> Result<(), ring::error::Unspecified> {
+        SecureRandom::fill(self, dest)
+    }
+}
+
 /// The issuer settings, the table enrolments are recorded in, and the
 /// revocation lists last published.
 pub struct DeviceEnrolment<Id> {
     config: DeviceCertConfig,
     store: Arc<dyn EnrolmentStore<Id>>,
-    random: SystemRandom,
+    random: Box<dyn RandomSource>,
     lists: tokio::sync::Mutex<Option<Vec<SignedList>>>,
     revoker: Option<SessionRevoker>,
     /// The attestation status list an Android chain's serials are checked against.
@@ -379,7 +395,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         Self {
             config,
             store,
-            random: SystemRandom::new(),
+            random: Box::new(SystemRandom::new()),
             lists: tokio::sync::Mutex::new(None),
             revoker: None,
             clock: SystemTime::now,
@@ -393,6 +409,15 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
     #[must_use]
     pub fn with_issue_clock(mut self, clock: fn() -> SystemTime) -> Self {
         self.clock = clock;
+        self
+    }
+
+    /// A source the enrolment draws its serials from, so a test holds a
+    /// draw the system source would not make.
+    #[cfg(feature = "test-seams")]
+    #[must_use]
+    pub fn with_random(mut self, random: Box<dyn RandomSource>) -> Self {
+        self.random = random;
         self
     }
 
@@ -478,9 +503,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                     ceiling_secs: ceiling.as_secs(),
                 },
             })?;
-        let mut serial = [0; 16];
-        self.random
-            .fill(&mut serial)
+        let serial = CertificateSerial::random(|bytes| self.random.fill(bytes))
             .map_err(|_| EnrolRefusal::IssuerUnavailable)?;
         let not_before = (self.clock)();
         let issuer = self.config.issuer();
@@ -496,7 +519,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         let enrolment = Enrolment {
             user: user.clone(),
             key,
-            serial,
+            serial: serial.as_bytes(),
             issuer: issuer.key_id(),
             issued_at: not_before,
             expires_at: not_before + lifetime,

@@ -12,6 +12,7 @@ use x509_parser::prelude::FromDer;
 use super::attestation::{ATTESTATION_EXTENSION, AttestationLevel};
 use super::identity::{DeploymentId, DeviceIdentity, KeyId};
 use super::request::CertificateRequest;
+use super::serial::CertificateSerial;
 
 /// X.520 `serialNumber` (2.5.4.5), which keeps sibling issuers' subjects apart, since
 /// revocation lists are matched to a certificate by its issuer's name.
@@ -112,7 +113,7 @@ impl RootCa {
         issuer_key: &[u8],
         not_before: SystemTime,
         valid_for: Duration,
-        serial: [u8; 16],
+        serial: CertificateSerial,
     ) -> Result<Vec<u8>, RootError> {
         let public = SubjectPublicKeyInfo::from_der(issuer_key)?;
         let signer = Issuer::from_ca_cert_der(&self.certificate.as_slice().into(), &self.key)?;
@@ -121,8 +122,9 @@ impl RootCa {
         params
             .distinguished_name
             .push(DnType::CommonName, "connetto device issuer");
-        let mut serial_hex = String::with_capacity(serial.len() * 2);
-        for byte in serial {
+        let serial_bytes = serial.as_bytes();
+        let mut serial_hex = String::with_capacity(serial_bytes.len() * 2);
+        for byte in serial_bytes {
             use std::fmt::Write as _;
             let _ = write!(serial_hex, "{byte:02x}");
         }
@@ -134,7 +136,7 @@ impl RootCa {
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
         params.not_before = to_time(not_before).ok_or(RootError::Validity)?;
         params.not_after = to_time(not_before + valid_for).ok_or(RootError::Validity)?;
-        params.serial_number = Some(SerialNumber::from_slice(&serial));
+        params.serial_number = Some(SerialNumber::from_slice(&serial_bytes));
         Ok(params.signed_by(&public, &signer)?.der().to_vec())
     }
 }
@@ -301,7 +303,7 @@ impl DeviceIssuer {
         account: &str,
         not_before: SystemTime,
         lifetime: Duration,
-        serial: [u8; 16],
+        serial: CertificateSerial,
         attestation: AttestationLevel,
     ) -> Result<Vec<u8>, IssueError> {
         let identity = DeviceIdentity::new(
@@ -327,7 +329,7 @@ impl DeviceIssuer {
         params.subject_alt_names = vec![SanType::URI(uri)];
         params.not_before = to_time(not_before).ok_or(IssueError::Validity)?;
         params.not_after = to_time(not_after).ok_or(IssueError::Validity)?;
-        params.serial_number = Some(SerialNumber::from_slice(&serial));
+        params.serial_number = Some(SerialNumber::from_slice(&serial.as_bytes()));
         params.custom_extensions = vec![CustomExtension::from_oid_content(
             ATTESTATION_EXTENSION,
             attestation.extension_value(),

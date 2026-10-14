@@ -833,7 +833,8 @@ mod tests {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use connetto_core::device_cert::{
-        ANDROID_ATTESTATION_CHALLENGE, AttestationLevel, DeploymentId, DeviceIssuer, RootCa,
+        ANDROID_ATTESTATION_CHALLENGE, AttestationLevel, CertificateSerial, DeploymentId,
+        DeviceIssuer, RootCa,
     };
     use connetto_core::messages::DeviceAttestation;
     use rcgen::{
@@ -905,7 +906,12 @@ mod tests {
         .expect("root");
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
         let cert = root
-            .sign_issuer(&key.subject_public_key_info(), now, TEN_YEARS, [1; 16])
+            .sign_issuer(
+                &key.subject_public_key_info(),
+                now,
+                TEN_YEARS,
+                CertificateSerial::new([1; 16]).expect("the serial is positive"),
+            )
             .expect("issuer");
         DeviceIssuer::new(cert, key, root.certificate()).expect("issuer")
     }

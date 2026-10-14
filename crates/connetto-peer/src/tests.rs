@@ -18,14 +18,19 @@ use crate::{
     Trust,
 };
 use connetto_core::device_cert::{
-    AttestationLevel, CertificateRequest, CertificateSigner, DeploymentId, DeviceCertificate,
-    DeviceIdentity, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, Revoked, RootCa, key_id,
-    public_key_info,
+    AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
+    DeviceCertificate, DeviceIdentity, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, Revoked,
+    RootCa, key_id, public_key_info,
 };
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as RcgenSigningKey};
 use socket2::SockRef;
 use tokio::sync::mpsc;
 use tokio::time;
+
+/// A test serial as the issuer takes it, its first byte positive.
+fn positive(bytes: [u8; 16]) -> CertificateSerial {
+    CertificateSerial::new(bytes).expect("the test serial is positive")
+}
 
 const DAY: Duration = Duration::from_hours(24);
 
@@ -99,7 +104,12 @@ impl Deployment {
             .expect("the key round-trips");
         let certificate = self
             .root
-            .sign_issuer(&public_key_info(&holder), now - 10 * DAY, 366 * DAY, serial)
+            .sign_issuer(
+                &public_key_info(&holder),
+                now - 10 * DAY,
+                366 * DAY,
+                positive(serial),
+            )
             .expect("the issuer signs");
         let signer = DeviceIssuer::new(certificate.clone(), key, self.root.certificate())
             .expect("the issuer loads");
@@ -129,7 +139,14 @@ impl Deployment {
         let request = CertificateRequest::parse(&csr).expect("the request parses");
         let leaf = issuer
             .signer
-            .issue(&request, account, not_before, lifetime, serial, level)
+            .issue(
+                &request,
+                account,
+                not_before,
+                lifetime,
+                positive(serial),
+                level,
+            )
             .expect("the certificate issues");
         let parsed = DeviceCertificate::parse(&leaf).expect("the profile holds");
         Peer {
@@ -163,7 +180,7 @@ impl Deployment {
                 peer.identity.account(),
                 not_before,
                 lifetime,
-                serial,
+                positive(serial),
                 peer.level,
             )
             .expect("the reissue grants");
