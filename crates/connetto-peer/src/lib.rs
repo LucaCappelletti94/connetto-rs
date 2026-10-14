@@ -17,11 +17,29 @@ mod node;
 mod signer;
 mod verify;
 
+#[cfg(feature = "discovery")]
+mod discovery;
+#[cfg(feature = "discovery")]
+mod fingerprint;
+#[cfg(feature = "discovery")]
+mod policy;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, feature = "discovery"))]
+mod discovery_proofs;
+
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
 
 pub use error::{CloseReason, LinkError, Refusal, TrustError};
 pub use event::PeerEvent;
 pub use frame::PeerFrame;
 pub use identity::{Clock, Identity, SystemClock, Trust};
 pub use node::{Liveness, Node};
+
+#[cfg(feature = "discovery")]
+pub use discovery::{Discovery, DiscoveryEvent};
+#[cfg(feature = "discovery")]
+pub use fingerprint::Fingerprint;

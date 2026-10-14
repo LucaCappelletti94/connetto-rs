@@ -136,7 +136,7 @@ async fn enrolment_phase() {
     };
     match phase.as_str() {
         "first" => first_connect().await,
-        "renewal" => renewal().await,
+        "renewal" => Box::pin(renewal()).await,
         "reissue" => reissue().await,
         "cap" => cap().await,
         "revoke" => Box::pin(revoke()).await,
@@ -146,7 +146,7 @@ async fn enrolment_phase() {
         "forget" => forget().await,
         "report" => Box::pin(report()).await,
         "learned" => Box::pin(learned_at_connect()).await,
-        "untrusted" => untrusted().await,
+        "untrusted" => Box::pin(untrusted()).await,
         "no-roots" => no_roots().await,
         "rotation" => Box::pin(rotation_withdraws()).await,
         "clock-behind" => Box::pin(clock_behind()).await,
@@ -1869,17 +1869,17 @@ async fn peer_report() {
         matches!(refused, connetto_client::PeerError::Link(_)),
         "the refusal is a dial refusal, got {refused:?}"
     );
-    let until = Instant::now() + Duration::from_secs(3);
-    let mut linked_c = false;
-    while Instant::now() < until {
-        if let Ok(event) = b_events.try_recv() {
-            linked_c |= matches!(
+    assert!(
+        next_event(&mut b_events, Duration::from_secs(3), |event| {
+            matches!(
                 event,
                 ClientEvent::PeerLinked { peer } if peer.key() == c_cert.identity().key()
-            );
-        }
-    }
-    assert!(!linked_c, "b never links c");
+            )
+        })
+        .await
+        .is_none(),
+        "b never links c"
+    );
 
     a.close().await;
     b2.close().await;

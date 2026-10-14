@@ -54,7 +54,7 @@ impl DeviceKey for Device {
 }
 
 /// An issuer beside the certificate and key it signs with.
-struct Issuer {
+pub(crate) struct Issuer {
     /// The issuer certificate, DER.
     certificate: Vec<u8>,
     /// The signing key, for the lists it signs.
@@ -65,13 +65,13 @@ struct Issuer {
 
 /// A deployment a test mints: one root and the issuers and devices it
 /// signs.
-struct Deployment {
+pub(crate) struct Deployment {
     root: RootCa,
 }
 
 impl Deployment {
     /// Mint a root for deployment `id`, valid around `now`.
-    fn new(id: u128, now: SystemTime) -> Self {
+    pub(crate) fn new(id: u128, now: SystemTime) -> Self {
         let root = RootCa::create(
             DeploymentId::from_uuid(uuid::Uuid::from_u128(id)),
             now - 10 * DAY,
@@ -82,12 +82,12 @@ impl Deployment {
     }
 
     /// The root's DER, what a device is built with.
-    fn root_der(&self) -> Vec<u8> {
+    pub(crate) fn root_der(&self) -> Vec<u8> {
         self.root.certificate().to_vec()
     }
 
     /// Sign one more issuer, valid around `now`.
-    fn add_issuer(&self, now: SystemTime, serial: [u8; 16]) -> Issuer {
+    pub(crate) fn add_issuer(&self, now: SystemTime, serial: [u8; 16]) -> Issuer {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the issuer key");
         let holder = Device(Arc::new(key));
         let stored = rustls_pki_types::PrivatePkcs8KeyDer::from(holder.0.serialize_der());
@@ -108,7 +108,7 @@ impl Deployment {
 
     /// A device certificate under `issuer`, valid from `not_before` for `lifetime`.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    fn device(
+    pub(crate) fn device(
         &self,
         issuer: &Issuer,
         account: &str,
@@ -140,7 +140,7 @@ impl Deployment {
 
     /// Reissue the device `peer` under `issuer`, a new serial and window.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    fn reissue(
+    pub(crate) fn reissue(
         &self,
         issuer: &Issuer,
         peer: &Peer,
@@ -201,24 +201,24 @@ impl Deployment {
 }
 
 /// A device certificate beside the key that signs for it.
-struct Peer {
+pub(crate) struct Peer {
     /// The key, held in memory.
     key: Device,
     /// What the certificate names.
-    identity: DeviceIdentity,
+    pub(crate) identity: DeviceIdentity,
     /// The serial a list names the leaf by.
     serial: Vec<u8>,
     /// The attestation level the leaf records.
     level: AttestationLevel,
     /// The leaf, DER.
-    leaf: Vec<u8>,
+    pub(crate) leaf: Vec<u8>,
     /// The issuer certificate, DER.
     issuer: Vec<u8>,
 }
 
 impl Peer {
     /// The presented identity the node serves and dials with.
-    fn identity(&self) -> Identity {
+    pub(crate) fn identity(&self) -> Identity {
         Identity {
             certificate: self.leaf.clone(),
             issuer: self.issuer.clone(),
@@ -269,7 +269,7 @@ fn node_on(
 }
 
 /// A node on one deployment root and the system clock.
-fn node(root_der: Vec<u8>, events: mpsc::UnboundedSender<PeerEvent>) -> Node {
+pub(crate) fn node(root_der: Vec<u8>, events: mpsc::UnboundedSender<PeerEvent>) -> Node {
     node_on(vec![root_der], all_levels(), Arc::new(SystemClock), events)
 }
 
@@ -293,7 +293,7 @@ fn node_liveness(
 }
 
 /// An event channel pair.
-fn events() -> (
+pub(crate) fn events() -> (
     mpsc::UnboundedSender<PeerEvent>,
     mpsc::UnboundedReceiver<PeerEvent>,
 ) {
@@ -301,7 +301,7 @@ fn events() -> (
 }
 
 /// The whole second the wall clock stands on, as X.509 carries time.
-fn whole_second() -> SystemTime {
+pub(crate) fn whole_second() -> SystemTime {
     let secs = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .expect("after the epoch")
@@ -310,7 +310,7 @@ fn whole_second() -> SystemTime {
 }
 
 /// Serve `peer` on loopback, answering the bound address.
-fn serve(node: &Node, peer: &Peer) -> SocketAddr {
+pub(crate) fn serve(node: &Node, peer: &Peer) -> SocketAddr {
     node.serve(SocketAddr::from(([127, 0, 0, 1], 0)), peer.identity())
         .expect("the listener binds")
 }
@@ -1620,6 +1620,135 @@ async fn a_dial_nobody_answers_or_without_an_identity_fails_typed() {
         a.link(closed).await,
         Err(LinkError::Unreachable(_))
     ));
+}
+
+/// A peer that closes the link before its hello is unreachable, not a
+/// protocol break.
+#[tokio::test]
+async fn a_peer_that_closes_before_its_hello_is_unreachable() {
+    let now = whole_second();
+    let deployment = Deployment::new(20, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let peer = deployment.device(
+        &issuer,
+        "peer",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let dialer = deployment.device(
+        &issuer,
+        "dialer",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    // A raw server on the peer's identity, completing the handshake and
+    // closing before the peer's hello.
+    let crls = Arc::new(parking_lot::RwLock::new(Arc::from(
+        Vec::<crate::verify::Crl>::new().into_boxed_slice(),
+    )));
+    let config = crate::node::server_config_for(
+        &trust_root(deployment.root_der()),
+        Arc::new(SystemClock),
+        Some(peer.key_id()),
+        crls,
+        &peer.identity(),
+    );
+    let acceptor = tokio_rustls::TlsAcceptor::from(config);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("the loopback binds");
+    let addr = listener.local_addr().expect("its address");
+    tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.expect("the dialer connects");
+        let tls = acceptor.accept(tcp).await.expect("the handshake completes");
+        drop(tls);
+    });
+    let (d_tx, _d_rx) = events();
+    let dialer_node = node(deployment.root_der(), d_tx);
+    let _served = serve(&dialer_node, &dialer);
+    let err = dialer_node
+        .link(addr)
+        .await
+        .expect_err("the hello never comes");
+    assert!(
+        matches!(err, LinkError::Unreachable(_)),
+        "a closed peer is unreachable, got {err:?}"
+    );
+}
+
+/// Decision 13. The listener runs at most 16 inbound handshakes at once and
+/// closes a connection beyond that at accept, and a real peer links after
+/// the stalled ones give up their sockets.
+#[tokio::test]
+async fn a_seventeenth_inbound_connection_is_closed_at_accept() {
+    use tokio::io::AsyncReadExt;
+
+    let now = whole_second();
+    let deployment = Deployment::new(21, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let peer = deployment.device(
+        &issuer,
+        "peer",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // Sixteen connections that send nothing, each holding an inbound
+    // handshake for the ten-second bound.
+    let mut stalled = Vec::with_capacity(16);
+    for _ in 0..16 {
+        stalled.push(
+            tokio::net::TcpStream::connect(host_addr)
+                .await
+                .expect("it connects"),
+        );
+    }
+    // The seventeenth gets closed at accept, at once.
+    let mut seventeenth = tokio::net::TcpStream::connect(host_addr)
+        .await
+        .expect("it connects");
+    let mut eof = [0u8; 8];
+    assert_eq!(
+        time::timeout(Duration::from_secs(5), seventeenth.read(&mut eof))
+            .await
+            .expect("the close is readable within the bound")
+            .expect("a close ends the read"),
+        0,
+        "the seventeenth connection is closed at accept"
+    );
+    // The stalled handshakes give up their sockets, and a real peer links.
+    drop(stalled);
+    // A bound for the stalled handshakes to notice the close and free their
+    // places.
+    time::sleep(Duration::from_secs(1)).await;
+    let _raw = raw_linked(deployment.root_der(), &peer, host_addr).await;
+    let event = await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Linked { .. })
+    })
+    .await;
+    assert_eq!(
+        event,
+        PeerEvent::Linked {
+            peer: peer.identity.clone()
+        }
+    );
 }
 
 #[tokio::test]

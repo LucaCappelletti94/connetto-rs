@@ -221,6 +221,12 @@ fn renew(
     {
         slot.leaf = leaf.to_vec();
         slot.issuer = issuer.to_vec();
+        // The renewed chain changes the leaf discovery fingerprints.
+        #[cfg(feature = "discovery")]
+        state
+            .peer_fingerprints
+            .lock()
+            .insert(key, crate::fingerprint::Fingerprint::of(leaf));
     }
     Ok(())
 }
