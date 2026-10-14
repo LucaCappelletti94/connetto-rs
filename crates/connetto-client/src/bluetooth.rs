@@ -1700,6 +1700,7 @@ enum Next {
 pub(crate) struct Runner {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
     hotspot: Arc<dyn crate::hotspot::HotspotBackend>,
+    hotspot_bind: crate::hotspot::SubnetBind,
     peripheral: Arc<dyn PeripheralBackend>,
     central: Option<Arc<dyn CentralBackend>>,
 }
@@ -1716,9 +1717,11 @@ impl Drop for Runner {
     fn drop(&mut self) {
         // A dropped client leaves the machines unpollable, so the tables'
         // "Client closed" rows apply here, where they are no-ops on the
-        // backends' own standing.
+        // backends' own standing. The released network takes the dial bind
+        // with it.
         self.hotspot.stop_host();
         self.hotspot.leave_join();
+        (self.hotspot_bind)(None);
         self.peripheral.stop();
         if let Some(central) = &self.central {
             central.stop_scan();
@@ -1735,6 +1738,7 @@ pub(crate) fn run(
     mut bluetooth_commands: mpsc::UnboundedReceiver<Command>,
 ) -> Runner {
     let hotspot_backend = Arc::clone(&hotspot.backend);
+    let hotspot_bind = Arc::clone(&hotspot.bind);
     let peripheral = Arc::clone(&bluetooth.peripheral);
     let central = bluetooth.central.clone();
     Runner {
@@ -1784,6 +1788,7 @@ pub(crate) fn run(
             }
         }),
         hotspot: hotspot_backend,
+        hotspot_bind,
         peripheral,
         central,
     }
@@ -2968,5 +2973,41 @@ mod tests {
             .await
             .expect("the runner ends")
             .expect("the runner task is sound");
+    }
+
+    /// A dropped runner clears the dial bind beside releasing the hotspot,
+    /// so a dial into the joined subnet no longer asks for the released
+    /// network.
+    #[test]
+    fn a_dropped_runner_clears_the_dial_bind() {
+        let wire = Arc::new(Wire::new());
+        let (bt_machine, _bt_beacon) = Machine::new(
+            Arc::new(FakeReadiness::new(BluetoothState::Ready)),
+            Arc::new(FakePeripheral::new(wire)),
+            None,
+            quiet_node(),
+            false,
+            false,
+            true,
+            Arc::new(|| None),
+            Arc::new(move |_offer, _reply| {}),
+            Arc::new(|_event| {}),
+        );
+        let binds = Arc::new(Mutex::new(Vec::new()));
+        let hotspot_machine = crate::hotspot::Machine::new(
+            Arc::new(FakeHotspotBackend::new()) as Arc<dyn crate::hotspot::HotspotBackend>,
+            false,
+            Arc::new(|| Some(54321)),
+            Arc::new({
+                let binds = Arc::clone(&binds);
+                move |subnet| binds.lock().push(subnet)
+            }),
+            Arc::new(|_addr, _answer| {}),
+            Arc::new(|_event| {}),
+        );
+        let (_hotspot_tx, hotspot_rx) = mpsc::unbounded_channel();
+        let (_bt_tx, bt_rx) = mpsc::unbounded_channel();
+        drop(run(hotspot_machine, hotspot_rx, bt_machine, bt_rx));
+        assert_eq!(*binds.lock(), vec![None]);
     }
 }

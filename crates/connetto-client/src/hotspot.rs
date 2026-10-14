@@ -312,7 +312,7 @@ pub(crate) enum Command {
 }
 
 /// Bind the dials' sockets to a joined subnet, or stop binding (R76).
-type SubnetBind = Arc<dyn Fn(Option<(Ipv4Addr, u8)>) + Send + Sync>;
+pub(crate) type SubnetBind = Arc<dyn Fn(Option<(Ipv4Addr, u8)>) + Send + Sync>;
 
 /// The hotspot machine, one per client (R76).
 pub(crate) struct Machine {
@@ -321,7 +321,7 @@ pub(crate) struct Machine {
     /// The peer port the device serves, from its listener's standing.
     peer_port: Arc<dyn Fn() -> Option<u16> + Send + Sync>,
     /// Bind the dials' sockets to `subnet`, or stop binding with `None`.
-    bind: SubnetBind,
+    pub(crate) bind: SubnetBind,
     /// Dial one gateway address, answering `answer` whether it linked.
     dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<bool>) + Send + Sync>,
     /// Emit an event to the application.
