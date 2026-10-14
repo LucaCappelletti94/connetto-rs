@@ -22,7 +22,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 use tracing::{debug, warn};
 
-use crate::error::{CloseReason, LinkError};
+use crate::error::{CloseReason, LinkError, Refusal, TrustError};
 use crate::event::PeerEvent;
 use crate::frame::{FrameError, PROTOCOL_VERSION, PeerFrame, read_frame, write_frame};
 use crate::identity::{Clock, Identity, Trust};
@@ -66,7 +66,7 @@ impl Default for Liveness {
 pub(crate) struct NodeState {
     trust: Trust,
     root_key_ids: Vec<KeyId>,
-    verifier: PeerVerifier,
+    pub(crate) verifier: PeerVerifier,
     own_key: Arc<RwLock<Option<KeyId>>>,
     identity: RwLock<Option<Identity>>,
     lists: Arc<RwLock<Vec<KeptList>>>,
@@ -107,9 +107,9 @@ pub(crate) struct LinkSlot {
     /// What the certificate names.
     pub(crate) peer: DeviceIdentity,
     /// The peer's leaf, DER.
-    leaf: Vec<u8>,
+    pub(crate) leaf: Vec<u8>,
     /// The peer's issuer, DER.
-    issuer: Vec<u8>,
+    pub(crate) issuer: Vec<u8>,
     /// The revocation list numbers the peer has, by issuer key id.
     pub(crate) numbers: BTreeMap<[u8; 32], u64>,
     /// The key id of the side that dialed this connection.
@@ -139,6 +139,13 @@ pub(crate) enum LinkCommand {
         issuer: KeyId,
         /// The list's number.
         number: u64,
+    },
+    /// Hand the renewed chain to the link still holding the old one.
+    Certificate {
+        /// The renewed leaf, DER.
+        leaf: Vec<u8>,
+        /// The renewed leaf's issuer, DER.
+        issuer: Vec<u8>,
     },
 }
 
@@ -176,31 +183,38 @@ impl fmt::Debug for Node {
 impl Node {
     /// Build the node on a trust, behind `clock`, telling `events` what it
     /// learns about its links.
+    ///
+    /// # Errors
+    ///
+    /// [`TrustError`] when a deployment root holds no key.
     pub fn new(
         trust: Trust,
         clock: Arc<dyn Clock>,
         events: mpsc::UnboundedSender<PeerEvent>,
-    ) -> Self {
+    ) -> Result<Self, TrustError> {
         Self::with_liveness(trust, clock, events, Liveness::default())
     }
 
     /// Build the node with its links' liveness bounds, `liveness`'s ping
     /// pace and silence limit.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// When a root holds no key.
+    /// [`TrustError`] when a deployment root holds no key.
     pub fn with_liveness(
         trust: Trust,
         clock: Arc<dyn Clock>,
         events: mpsc::UnboundedSender<PeerEvent>,
         liveness: Liveness,
-    ) -> Self {
+    ) -> Result<Self, TrustError> {
         let root_key_ids = trust
             .roots
             .iter()
-            .map(|root| certificate_key_id(root).expect("a root holds a key"))
-            .collect();
+            .enumerate()
+            .map(|(index, root)| {
+                certificate_key_id(root).map_err(|source| TrustError::Root { index, source })
+            })
+            .collect::<Result<_, _>>()?;
         let own_key = Arc::new(RwLock::new(None));
         let lists = Arc::new(RwLock::new(Vec::new()));
         let crls = Arc::new(RwLock::new(Arc::from(Vec::<Crl>::new().into_boxed_slice())));
@@ -222,10 +236,10 @@ impl Node {
             ping_every: liveness.ping_every,
             silence_limit: liveness.silence_limit,
         });
-        Self {
+        Ok(Self {
             _lifetime: Arc::new(Lifetime(Arc::clone(&state))),
             state,
-        }
+        })
     }
 
     /// Present `identity` on `listen`, keeping the port and the live links
@@ -237,12 +251,21 @@ impl Node {
     /// drive the acceptor.
     pub fn serve(&self, listen: SocketAddr, identity: Identity) -> io::Result<SocketAddr> {
         *self.state.own_key.write() = Some(key_id(&*identity.key));
-        *self.state.identity.write() = Some(identity);
-        {
-            let slot = self.state.listener.read();
-            if let Some(slot) = slot.as_ref() {
-                return Ok(slot.addr);
+        let renewed = {
+            let mut identity_slot = self.state.identity.write();
+            let renewed = identity_slot
+                .as_ref()
+                .is_none_or(|held| held.certificate != identity.certificate);
+            *identity_slot = Some(identity);
+            renewed
+        };
+        if let Some(slot) = self.state.listener.read().as_ref() {
+            // The port and the live links stay, and a changed presented
+            // chain reaches them.
+            if renewed {
+                self.renew_links();
             }
+            return Ok(slot.addr);
         }
         let std_listener = std::net::TcpListener::bind(listen)?;
         std_listener.set_nonblocking(true)?;
@@ -259,6 +282,22 @@ impl Node {
         });
         self.state.serving.store(true, Ordering::Release);
         Ok(addr)
+    }
+
+    /// Hand the node's current chain to the live links, which verify it as at
+    /// a handshake and move their expiry deadline.
+    fn renew_links(&self) {
+        let identity_slot = self.state.identity.read();
+        let held = identity_slot.as_ref().expect("serving holds an identity");
+        let links = self.state.links.lock();
+        for slot_state in links.values() {
+            if let SlotState::Live(slot) = slot_state {
+                let _ = slot.command.send(LinkCommand::Certificate {
+                    leaf: held.certificate.clone(),
+                    issuer: held.issuer.clone(),
+                });
+            }
+        }
     }
 
     /// Close every link with `reason` and drop the listener.
@@ -330,7 +369,7 @@ impl Node {
             .clone();
         let mut tls = tls;
         let (peer_numbers, _peer_dial) = exchange_hello(&mut tls, &self.state, dial).await?;
-        let registered = register_link(
+        register_link(
             &self.state,
             Handshaken {
                 peer: peer.clone(),
@@ -341,12 +380,8 @@ impl Node {
                 dial,
             },
             tls,
-        );
-        if registered {
-            Ok(peer)
-        } else {
-            Err(LinkError::NotServing)
-        }
+        )?;
+        Ok(peer)
     }
 
     /// Keep `list`, signed by `signer`, and forward it to the links that
@@ -395,30 +430,30 @@ impl Node {
             *self.state.crls.write() = Arc::from(crls.into_boxed_slice());
         }
         // Forward the list to the links that lack it, then close the links
-        // the list revokes. The command channel is unbounded, so a
-        // revocation is never dropped.
+        // the list revokes. A link the list revokes receives it first, so
+        // the peer's intake can react to its own revocation, and the command
+        // channel is unbounded, so a revocation is never dropped.
         let links = self.state.links.lock();
         for slot_state in links.values() {
             let SlotState::Live(slot) = slot_state else {
                 continue;
             };
-            if chain_revoked(&self.state, slot) {
+            let lacks = slot
+                .numbers
+                .get(&issuer.as_bytes()[..])
+                .is_none_or(|had| kept.number > *had);
+            if lacks {
+                let _ = slot.command.send(LinkCommand::List {
+                    list: kept.der.clone(),
+                    signer: kept.signer.clone(),
+                    issuer,
+                    number: kept.number,
+                });
+            }
+            if chain_revoked(&self.state, &slot.leaf, &slot.issuer) {
                 let _ = slot
                     .command
                     .send(LinkCommand::Close(CloseReason::PeerRevoked));
-            } else {
-                let lacks = slot
-                    .numbers
-                    .get(&issuer.as_bytes()[..])
-                    .is_none_or(|had| kept.number > *had);
-                if lacks {
-                    let _ = slot.command.send(LinkCommand::List {
-                        list: kept.der.clone(),
-                        signer: kept.signer.clone(),
-                        issuer,
-                        number: kept.number,
-                    });
-                }
             }
         }
     }
@@ -426,6 +461,9 @@ impl Node {
 
 /// Close every link with `reason` and drop the listener.
 fn stop_state(state: &NodeState, reason: CloseReason) {
+    // A stopped node presents nothing, so it dials nobody until it serves again.
+    *state.identity.write() = None;
+    *state.own_key.write() = None;
     if let Some(slot) = state.listener.write().take() {
         let _ = slot.stop.send(true);
     }
@@ -458,11 +496,11 @@ fn stop_state(state: &NodeState, reason: CloseReason) {
 
 /// Whether a kept list revokes the peer's chain, the leaf under its issuer
 /// or the issuer under a shipped root.
-fn chain_revoked(state: &NodeState, slot: &LinkSlot) -> bool {
+fn chain_revoked(state: &NodeState, leaf: &[u8], issuer: &[u8]) -> bool {
     let (Some(leaf_serial), Some(issuer_serial), Some(issuer_key)) = (
-        certificate_serial(&slot.leaf).ok(),
-        certificate_serial(&slot.issuer).ok(),
-        certificate_key_id(&slot.issuer).ok(),
+        certificate_serial(leaf).ok(),
+        certificate_serial(issuer).ok(),
+        certificate_key_id(issuer).ok(),
     ) else {
         return false;
     };
@@ -657,7 +695,8 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, identity: Identity) {
         }
     };
     let dialer = peer.key();
-    // An inbound link a stop dropped needs no answer, the dialer sees the close.
+    // An inbound link a stop or a fresh list dropped needs no answer, the
+    // dialer sees the close.
     let _ = register_link(
         &state,
         Handshaken {
@@ -763,13 +802,18 @@ struct Handshaken {
 }
 
 /// Register a completed link under the duplicate rule, spawning its frame
-/// task on a kept link and dropping a losing one without an event. Answers
-/// `false` when the node stopped before the link could register.
+/// task on a kept link and dropping a losing one without an event.
+///
+/// # Errors
+///
+/// [`LinkError::NotServing`] when the node stopped before the link could
+/// register, and [`LinkError::Refused`] when a list kept since the handshake
+/// revokes the peer's chain.
 fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     state: &Arc<NodeState>,
     handshaken: Handshaken,
     tls: S,
-) -> bool {
+) -> Result<(), LinkError> {
     let Handshaken {
         peer,
         leaf,
@@ -793,7 +837,12 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let mut links = state.links.lock();
         // A stop may have landed between the dial and the registration.
         if !state.serving.load(Ordering::Acquire) {
-            return false;
+            return Err(LinkError::NotServing);
+        }
+        // A list kept between the handshake and this registration revokes
+        // the chain here, under the same lock `keep_list` sweeps the links in.
+        if chain_revoked(state, &leaf, &issuer) {
+            return Err(LinkError::Refused(Refusal::Revoked));
         }
         let fresh = links.get(&peer_key).is_none();
         let keep_new = match links.get(&peer_key) {
@@ -862,5 +911,5 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             let _ = tokio::time::timeout(WRITE_BOUND, write_frame(&mut tls, &close)).await;
         });
     }
-    true
+    Ok(())
 }

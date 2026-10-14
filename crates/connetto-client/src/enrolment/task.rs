@@ -9,6 +9,11 @@ use std::time::SystemTime;
 
 use std::collections::HashMap;
 
+#[cfg(feature = "peer")]
+use std::net::SocketAddr;
+
+#[cfg(feature = "peer")]
+use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::device_cert::{
     CertificateRequest, CertificateSigner, DeviceCertificate, DeviceDescriptor, DeviceKey, KeyHome,
     KeyId, RevocationList, certificate_key_id, certificate_serial, key_id, verify_chain,
@@ -17,10 +22,14 @@ use connetto_core::messages::{
     ControlMessage, DeviceSummary, DevicesRequest, EnrolChallengeRequest, EnrolRefusal,
     EnrolRequest, FatalErrorReason, RevokeDeviceRequest, SignedList, SyncStatus,
 };
+#[cfg(feature = "peer")]
+use connetto_peer::{CloseReason, LinkError, PeerEvent};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use super::{Answer, Held, KeptList, Standing, half_life};
+use super::{Answer, Held, KeptList, Standing, TOLERANCE, half_life};
+#[cfg(feature = "peer")]
+use crate::PeerError;
 use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
 use crate::{ClientError, ClientEvent};
 
@@ -167,6 +176,48 @@ enum Command {
         key: KeyId,
         reply: oneshot::Sender<Result<(), CertificateError>>,
     },
+    /// `link_peer` refused as expired, so the task raises the event (R76).
+    #[cfg(feature = "peer")]
+    CertificateExpired,
+}
+
+/// The peer node the task drives, the listener address it binds and the
+/// node's link events (R76).
+#[cfg(feature = "peer")]
+pub(crate) struct Peer {
+    /// The node presenting this device's identity.
+    pub(crate) node: connetto_peer::Node,
+    /// The address the listener binds.
+    pub(crate) listen: SocketAddr,
+    /// The node's link events, until the task reads them.
+    pub(crate) events: mpsc::UnboundedReceiver<PeerEvent>,
+}
+
+/// The next peer-link event, or nothing when the build has no peer link (R76).
+#[cfg(feature = "peer")]
+type NextPeerEvent = Option<connetto_peer::PeerEvent>;
+#[cfg(not(feature = "peer"))]
+type NextPeerEvent = core::convert::Infallible;
+
+/// The peer link's event receiver, empty when the build has no peer link
+/// (R76).
+struct PeerEvents {
+    #[cfg(feature = "peer")]
+    rx: mpsc::UnboundedReceiver<connetto_peer::PeerEvent>,
+}
+
+impl PeerEvents {
+    /// The next event, or a future that never resolves without the peer link.
+    async fn next(&mut self) -> NextPeerEvent {
+        #[cfg(feature = "peer")]
+        {
+            self.rx.recv().await
+        }
+        #[cfg(not(feature = "peer"))]
+        {
+            core::future::pending().await
+        }
+    }
 }
 
 /// The task's half the builder hands to the client.
@@ -181,6 +232,8 @@ pub(crate) struct Enroller {
     commands: mpsc::UnboundedReceiver<Command>,
     published: watch::Sender<Option<DeviceCertificate>>,
     home: watch::Sender<Option<KeyHome>>,
+    #[cfg(feature = "peer")]
+    peer: Option<Peer>,
 }
 
 /// The application's half, held by the native client.
@@ -189,13 +242,23 @@ pub(crate) struct EnrolHandle {
     commands: mpsc::UnboundedSender<Command>,
     published: watch::Receiver<Option<DeviceCertificate>>,
     home: watch::Receiver<Option<KeyHome>>,
+    #[cfg(feature = "peer")]
+    peer: connetto_peer::Node,
 }
 
 impl Enroller {
     /// A task enrolling `keys` at `lifetime`, the server's default when
     /// `None`, sending `descriptor`, verifying against `roots`, starting
     /// from the certificate `held` and the lists `kept` the replica holds and
-    /// taking pushed `lists`, and the handle that steers it.
+    /// taking pushed `lists`, steering the peer node `peer` (R76), and the
+    /// handle that steers it.
+    #[cfg_attr(
+        feature = "peer",
+        expect(
+            clippy::too_many_arguments,
+            reason = "the peer node joins the seven enrolment inputs and a config struct would hide the same arity behind another type"
+        )
+    )]
     pub(crate) fn new(
         keys: Arc<dyn DeviceKeys>,
         lifetime: Option<Duration>,
@@ -204,10 +267,13 @@ impl Enroller {
         held: Option<Held>,
         kept: Vec<KeptList>,
         lists: super::ListInbox,
+        #[cfg(feature = "peer")] peer: Peer,
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
         let (home, homed) = watch::channel(None);
+        #[cfg(feature = "peer")]
+        let peer_node = peer.node.clone();
         (
             Self {
                 keys: Arc::clone(&keys),
@@ -220,12 +286,16 @@ impl Enroller {
                 commands,
                 published,
                 home,
+                #[cfg(feature = "peer")]
+                peer: Some(peer),
             },
             EnrolHandle {
                 keys,
                 commands: sender,
                 published: observed,
                 home: homed,
+                #[cfg(feature = "peer")]
+                peer: peer_node,
             },
         )
     }
@@ -276,16 +346,59 @@ impl EnrolHandle {
     pub(crate) async fn delete_key(&self) -> Result<(), ClientError> {
         self.keys.delete().await
     }
+
+    /// Where the device's peer listener binds, once the task serves (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn peer_address(&self) -> Option<SocketAddr> {
+        self.peer.local_addr()
+    }
+
+    /// Dial `addr`, refusing by the device's standing before any socket
+    /// opens and handing back the peer's identity once the link is live
+    /// (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn link_peer(&self, addr: SocketAddr) -> Result<DeviceIdentity, PeerError> {
+        // A copy, so no watch guard is held across the dial.
+        let held = self.published.borrow().clone();
+        match Standing::of_leaf(held.as_ref(), SystemTime::now()) {
+            Standing::NoKey => Err(PeerError::NoIdentity),
+            Standing::Expired => {
+                let _ = self.commands.send(Command::CertificateExpired);
+                Err(PeerError::CertificateExpired)
+            }
+            Standing::ClockOff => Err(PeerError::ClockOutsideWindow),
+            Standing::Fresh | Standing::Aging => match self.peer.link(addr).await {
+                Ok(peer) => Ok(peer),
+                Err(LinkError::NotServing) => Err(PeerError::NoIdentity),
+                Err(err) => Err(PeerError::Link(err)),
+            },
+        }
+    }
 }
 
 /// How long to sleep before looking at `held` again.
 pub(super) fn next_look(held: Option<&Held>, now: SystemTime) -> Duration {
-    match (Standing::of(held, now), held) {
-        (Standing::Fresh, Some(held)) => half_life(held)
+    let Some(held) = held else {
+        return RECHECK;
+    };
+    let (start, end) = (held.leaf.not_before(), held.leaf.not_after());
+    match Standing::of(Some(held), now) {
+        Standing::Fresh => half_life(held)
             .duration_since(now)
             .unwrap_or_default()
             .min(RECHECK),
-        _ => RECHECK,
+        // The expiry wake reaches the exact moment, so a link never outlives
+        // the window by the look's slack (R76 decision 9), and the hourly look
+        // still retries a renewal and catches a jumped clock.
+        Standing::Aging => (end + TOLERANCE)
+            .duration_since(now)
+            .unwrap_or_default()
+            .min(RECHECK),
+        Standing::ClockOff => (start - TOLERANCE)
+            .duration_since(now)
+            .unwrap_or_default()
+            .min(RECHECK),
+        Standing::Expired | Standing::NoKey => RECHECK,
     }
 }
 
@@ -350,6 +463,16 @@ struct Run<L> {
     /// Whether the deployment refused the device's attestation level, so it
     /// asks again only on its next connection (decision 33).
     attestation_refused: bool,
+    /// The peer node the task drives, its listener address and the standing
+    /// it last acted on (R76).
+    #[cfg(feature = "peer")]
+    peer: connetto_peer::Node,
+    #[cfg(feature = "peer")]
+    peer_listen: SocketAddr,
+    #[cfg(feature = "peer")]
+    peer_standing: Standing,
+    /// The peer link's events, until the task ends them (R76).
+    peer_events: PeerEvents,
 }
 
 /// A certificate withdrawn because the root revoked its issuer.
@@ -562,6 +685,8 @@ impl<L: Link> Run<L> {
             Standing::Expired => self.clock_outside(true),
             _ => self.clock_off = false,
         }
+        #[cfg(feature = "peer")]
+        self.peer_transition(standing).await;
         Ok(())
     }
 
@@ -576,6 +701,8 @@ impl<L: Link> Run<L> {
         self.withdrawn = Some(Withdrawn { lifetime });
         self.publish();
         self.link.emit(ClientEvent::CertificateWithdrawn);
+        #[cfg(feature = "peer")]
+        self.peer_stop(CloseReason::Withdrawn);
     }
 
     /// Delete the key and certificate of a revoked device and say so
@@ -592,6 +719,8 @@ impl<L: Link> Run<L> {
         self.held = None;
         self.publish();
         self.link.emit(ClientEvent::DeviceRevoked);
+        #[cfg(feature = "peer")]
+        self.peer_stop(CloseReason::Revoked);
     }
 
     /// Keep each verified list newer than the one kept from its signer, and
@@ -634,6 +763,8 @@ impl<L: Link> Run<L> {
                 tracing::warn!(error = %err, "a revocation list could not be kept");
                 continue;
             }
+            #[cfg(feature = "peer")]
+            self.peer.keep_list(kept.list.clone(), kept.signer.clone());
             self.kept.insert(signer_key, kept);
             let own = self.held.as_ref().is_some_and(|held| {
                 certificate_key_id(&held.issuer).is_ok_and(|issuer| issuer == list.issuer())
@@ -709,6 +840,77 @@ impl<L: Link> Run<L> {
         }
     }
 
+    /// Re-evaluate the standing of the held certificate and let the peer link
+    /// cross the row the standing crossed (R76).
+    #[cfg(feature = "peer")]
+    async fn stand_by(&mut self) -> Standing {
+        let standing = self.standing(SystemTime::now());
+        self.peer_transition(standing).await;
+        standing
+    }
+
+    /// Re-evaluate the standing of the held certificate, in a build without
+    /// the peer link.
+    #[cfg(not(feature = "peer"))]
+    fn stand_by(&mut self) -> std::future::Ready<Standing> {
+        std::future::ready(self.standing(SystemTime::now()))
+    }
+
+    /// Serve or stop the peer listener as the standing the task crossed says
+    /// (R76).
+    #[cfg(feature = "peer")]
+    async fn peer_transition(&mut self, after: Standing) {
+        let before = self.peer_standing;
+        self.peer_standing = after;
+        match (before, after) {
+            (_, Standing::Fresh | Standing::Aging) => self.peer_serve().await,
+            (Standing::Fresh | Standing::Aging, Standing::Expired) => {
+                self.peer_stop(CloseReason::CertificateExpired);
+            }
+            (Standing::Fresh | Standing::Aging, Standing::ClockOff) => {
+                self.peer_stop(CloseReason::ClockOutsideWindow);
+            }
+            _ => {}
+        }
+    }
+
+    /// Bind the peer listener and present the held identity, keeping the port
+    /// and the live links when the identity changes (R76).
+    #[cfg(feature = "peer")]
+    async fn peer_serve(&mut self) {
+        let (certificate, issuer) = match &self.held {
+            Some(held) => (held.certificate.clone(), held.issuer.clone()),
+            None => return,
+        };
+        let key = match self.key().await {
+            Ok(key) => key,
+            Err(err) => {
+                tracing::warn!(error = %err, "the device key could not be opened, so the peer link waits");
+                return;
+            }
+        };
+        let identity = connetto_peer::Identity {
+            certificate,
+            issuer,
+            key,
+        };
+        if let Err(err) = self.peer.serve(self.peer_listen, identity) {
+            tracing::warn!(error = %err, "the peer listener could not bind");
+            self.link.emit(ClientEvent::PeerListenFailed {
+                address: self.peer_listen,
+                error: err.to_string(),
+            });
+        }
+    }
+
+    /// Close every peer link with `reason` and take the listener, which is a
+    /// no-op when the node serves nothing (R76).
+    #[cfg(feature = "peer")]
+    fn peer_stop(&mut self, reason: CloseReason) {
+        self.peer_standing = Standing::NoKey;
+        self.peer.stop(reason);
+    }
+
     /// Act on a live connection as the certificate's standing says
     /// (lifecycle rows "Connected and signed in", "Half-life crossed" and
     /// "Wall clock changes, or the hourly look"). The hourly look never
@@ -720,7 +922,7 @@ impl<L: Link> Run<L> {
         if self.attestation_refused {
             return;
         }
-        let outcome = match self.standing(SystemTime::now()) {
+        let outcome = match self.stand_by().await {
             Standing::Fresh => return,
             Standing::ClockOff if by_look => return,
             Standing::NoKey => {
@@ -742,13 +944,27 @@ impl<L: Link> Run<L> {
 }
 
 /// Run the enrolment task until the client ends.
+#[expect(
+    clippy::too_many_lines,
+    reason = "the select's arms are the whole loop and splitting them would scatter the task's lifecycle"
+)]
 pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
     let mut events = link.events();
     let held = enroller.held.take();
-    let kept = core::mem::take(&mut enroller.kept)
+    #[cfg(feature = "peer")]
+    let peer = enroller
+        .peer
+        .take()
+        .expect("a peer build hands the task its node");
+    let kept: HashMap<Vec<u8>, KeptList> = core::mem::take(&mut enroller.kept)
         .into_iter()
         .map(|kept| (kept.signer_key.clone(), kept))
         .collect();
+    // The lists the replica keeps at open, for the node's handshakes (R76).
+    #[cfg(feature = "peer")]
+    for kept in kept.values() {
+        peer.node.keep_list(kept.list.clone(), kept.signer.clone());
+    }
     let mut run = Run {
         link,
         enroller,
@@ -758,19 +974,29 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         withdrawn: None,
         clock_off: false,
         attestation_refused: false,
+        #[cfg(feature = "peer")]
+        peer: peer.node,
+        #[cfg(feature = "peer")]
+        peer_listen: peer.listen,
+        #[cfg(feature = "peer")]
+        peer_standing: Standing::NoKey,
+        #[cfg(feature = "peer")]
+        peer_events: PeerEvents { rx: peer.events },
+        #[cfg(not(feature = "peer"))]
+        peer_events: PeerEvents {},
     };
     // Opened at once, so a lost key is noticed before any connection.
     if let Err(err) = run.key().await {
         tracing::warn!(error = %err, "the device key could not be opened");
     }
     // Lifecycle row "Opened with the replica".
-    run.standing(SystemTime::now());
+    let _ = run.stand_by().await;
     let mut due = run.link.connected().await;
     let mut by_look = false;
     let mut steering = true;
     loop {
         if !run.link.alive() {
-            return;
+            break;
         }
         if due {
             due = false;
@@ -779,7 +1005,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
         by_look = false;
         let look = next_look(run.held.as_ref(), SystemTime::now());
         tokio::select! {
-            () = run.link.ended() => return,
+            () = run.link.ended() => break,
             event = events.recv() => match event {
                 Ok(ClientEvent::SyncStatus(SyncStatus::Connected)) | Err(RecvError::Lagged(_)) => {
                     run.attestation_refused = false;
@@ -789,7 +1015,7 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     run.revoked().await;
                 }
                 Ok(_) => {}
-                Err(RecvError::Closed) => return,
+                Err(RecvError::Closed) => break,
             },
             command = run.enroller.commands.recv(), if steering => match command {
                 Some(Command::Reissue { lifetime, reply }) => {
@@ -806,6 +1032,10 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 Some(Command::Revoke { key, reply }) => {
                     let _ = reply.send(run.revoke(key).await);
                 }
+                #[cfg(feature = "peer")]
+                Some(Command::CertificateExpired) => {
+                    run.link.emit(ClientEvent::CertificateExpired);
+                }
                 None => steering = false,
             },
             Some(lists) = run.enroller.lists.recv() => {
@@ -814,10 +1044,34 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                     due = run.link.connected().await;
                 }
             }
+            peer = run.peer_events.next() => {
+                #[cfg(feature = "peer")]
+                match peer {
+                    Some(PeerEvent::Linked { peer }) => {
+                        run.link.emit(ClientEvent::PeerLinked { peer });
+                    }
+                    Some(PeerEvent::Unlinked { peer, reason }) => {
+                        run.link.emit(ClientEvent::PeerUnlinked { peer, reason });
+                    }
+                    Some(PeerEvent::ListReceived { list, signer }) => {
+                        run.take_lists(vec![SignedList { list, signer }]).await;
+                        if run.withdrawn.is_some() {
+                            due = run.link.connected().await;
+                        }
+                    }
+                    None => {}
+                }
+                #[cfg(not(feature = "peer"))]
+                match peer {}
+            },
             () = tokio::time::sleep(look) => {
+                let _ = run.stand_by().await;
                 due = run.link.connected().await;
                 by_look = true;
             }
         }
     }
+    // The task is done, so the peer link ends with it (R76).
+    #[cfg(feature = "peer")]
+    run.peer.stop(CloseReason::Closed);
 }

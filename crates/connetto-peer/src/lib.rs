@@ -20,7 +20,7 @@ mod verify;
 #[cfg(test)]
 mod tests;
 
-pub use error::{CloseReason, LinkError, Refusal};
+pub use error::{CloseReason, LinkError, Refusal, TrustError};
 pub use event::PeerEvent;
 pub use frame::PeerFrame;
 pub use identity::{Clock, Identity, SystemClock, Trust};

@@ -42,6 +42,9 @@ postgres-types = ["diesel/postgres_backend"]
 # A device identity key for peer sync (R74): in the security chip, or a
 # software key in the plain secret store where no chip is usable.
 device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
+# The peer link (R76): the device serves its identity to other devices over
+# a second, server-independent channel, and dials them.
+peer = ["device-identity", "dep:connetto-peer"]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -159,6 +162,8 @@ ring = { version = "0.17", features = ["std"], optional = true }
 # The binary derives the schema version it declares from the translated
 # bundle, the same step the server runs. Native only, with the binary.
 connetto-schema = { workspace = true, optional = true }
+# The peer link the device serves and dials (R76).
+connetto-peer = { path = "../connetto-peer", optional = true }
 # The page codec, one per target, both selected here rather than by a feature
 # because `ReplicaCipher::Encrypted` cannot be honest without it: in a SQLite
 # with no codec, `PRAGMA key` is an unrecognised pragma that succeeds silently

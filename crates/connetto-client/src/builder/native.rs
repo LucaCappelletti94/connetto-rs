@@ -6,6 +6,8 @@
 //! platform's runtime owns. Everything the build composes rides the core.
 
 use std::fmt::Display;
+#[cfg(feature = "peer")]
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -16,6 +18,8 @@ use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
 use connetto_core::{DialError, NativeStream, WebSocketTransport, dial};
 
 use crate::GateMechanism;
+#[cfg(feature = "peer")]
+use crate::PeerError;
 use crate::TransportFactory;
 #[cfg(feature = "native-auth")]
 use crate::auth::{KeyringKeyStore, NativeAuthenticator, remembered_account};
@@ -31,6 +35,8 @@ use crate::builder::sign_in::{AccountChoice, Keyring};
 use crate::builder::sign_in::{HeldCredential, NativeSignIn, NoKeyring, SignInKind, StorageMarker};
 use crate::builder::tuning::SyncTuning;
 use crate::cipher::ReplicaKey;
+#[cfg(feature = "peer")]
+use crate::enrolment::Peer;
 #[cfg(feature = "device-identity")]
 use crate::enrolment::{CertificateError, DeviceKeys, EnrolHandle, Enroller, PlatformKeys};
 use crate::reconnect::ReconnectPolicy;
@@ -40,8 +46,12 @@ use crate::teardown::content_dir;
 #[cfg(feature = "native-auth")]
 use crate::teardown::{ForgetError, PurgeError, forget_device, wipe_replica};
 use crate::{ClientError, ConnettoClient, Custody};
+#[cfg(feature = "peer")]
+use connetto_core::device_cert::AttestationLevel;
 #[cfg(feature = "device-identity")]
 use connetto_core::device_cert::{DeviceCertificate, DeviceDescriptor, KeyHome};
+#[cfg(feature = "peer")]
+use tokio::sync::mpsc;
 
 /// The platform transport, a WebSocket over a plain loopback socket or a
 /// TLS stream the platform's trust store verified.
@@ -439,6 +449,10 @@ struct DeviceSetup {
     descriptor: Vec<u8>,
     refused: Option<String>,
     roots: Vec<Vec<u8>>,
+    #[cfg(feature = "peer")]
+    peer_listen: SocketAddr,
+    #[cfg(feature = "peer")]
+    peer_accepted: Vec<AttestationLevel>,
     #[cfg(target_os = "android")]
     java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
@@ -452,6 +466,10 @@ impl Default for DeviceSetup {
             descriptor: rmp_serde::to_vec_named(&()).unwrap_or_default(),
             refused: None,
             roots: Vec::new(),
+            #[cfg(feature = "peer")]
+            peer_listen: SocketAddr::from(([0, 0, 0, 0], 0)),
+            #[cfg(feature = "peer")]
+            peer_accepted: AttestationLevel::ALL.to_vec(),
             #[cfg(target_os = "android")]
             java: None,
         }
@@ -471,6 +489,13 @@ impl DeviceSetup {
         }
         if self.roots.is_empty() {
             return Err(ClientError::MissingDeploymentRoots);
+        }
+        if let Some(index) = self
+            .roots
+            .iter()
+            .position(|root| connetto_core::device_cert::certificate_key_id(root).is_err())
+        {
+            return Err(ClientError::InvalidDeploymentRoot { index });
         }
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         let chip = Arc::new(crate::device_key::SecureEnclave);
@@ -541,6 +566,27 @@ where
     #[must_use]
     pub fn with_deployment_roots(mut self, roots: impl IntoIterator<Item = Vec<u8>>) -> Self {
         self.device.roots = roots.into_iter().collect();
+        self
+    }
+
+    /// The address this device's peer listener binds, every interface on a
+    /// system-chosen port by default (R76 decision 6).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_listener(mut self, listen: SocketAddr) -> Self {
+        self.device.peer_listen = listen;
+        self
+    }
+
+    /// The attestation levels this device accepts from its peers, all three
+    /// by default (R76 decision 8).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_peer_accepted_attestation(
+        mut self,
+        accepted: impl IntoIterator<Item = AttestationLevel>,
+    ) -> Self {
+        self.device.peer_accepted = accepted.into_iter().collect();
         self
     }
 
@@ -676,6 +722,26 @@ where
                 // certificate from the moment it is handed back.
                 let held = core.client().stored_certificate().await?;
                 let (kept, lists) = core.client().revocation_inbox().await?;
+                #[cfg(feature = "peer")]
+                let (peer_events, peer_events_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
+                let peer = Peer {
+                    node: connetto_peer::Node::new(
+                        connetto_peer::Trust {
+                            roots: device.roots.clone(),
+                            accepted: device.peer_accepted,
+                        },
+                        Arc::new(connetto_peer::SystemClock),
+                        peer_events,
+                    )
+                    .map_err(
+                        |connetto_peer::TrustError::Root { index, .. }| {
+                            ClientError::InvalidDeploymentRoot { index }
+                        },
+                    )?,
+                    listen: device.peer_listen,
+                    events: peer_events_rx,
+                };
                 let (enroller, handle) = Enroller::new(
                     keys,
                     device.lifetime,
@@ -684,6 +750,8 @@ where
                     held,
                     kept,
                     lists,
+                    #[cfg(feature = "peer")]
+                    peer,
                 );
                 let enrolment = core.client().enrolment(enroller);
                 let pump: CorePump = Box::pin(async move {
@@ -865,6 +933,38 @@ where
     #[must_use]
     pub fn device_key_home(&self) -> Option<KeyHome> {
         self.device.as_ref().and_then(EnrolHandle::key_home)
+    }
+
+    /// The address this device's peer listener binds, once the device's
+    /// standing serves it, and `None` before that or for a build without a
+    /// device identity (R76).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn peer_address(&self) -> Option<SocketAddr> {
+        self.device.as_ref().and_then(EnrolHandle::peer_address)
+    }
+
+    /// Dial `addr`, refusing by this device's standing before any socket
+    /// opens and handing back the peer's identity once the link is live
+    /// (R76).
+    ///
+    /// # Errors
+    ///
+    /// [`PeerError::NoIdentity`] with no key or certificate, or a build
+    /// without a device identity, [`PeerError::CertificateExpired`] with a
+    /// certificate past its expiry, which also raises
+    /// `ClientEvent::CertificateExpired`, [`PeerError::ClockOutsideWindow`]
+    /// with the local clock outside the certificate's window, and
+    /// [`PeerError::Link`] for a failed dial.
+    #[cfg(feature = "peer")]
+    pub async fn link_peer(
+        &self,
+        addr: SocketAddr,
+    ) -> Result<connetto_core::device_cert::DeviceIdentity, PeerError> {
+        match &self.device {
+            Some(device) => device.link_peer(addr).await,
+            None => Err(PeerError::NoIdentity),
+        }
     }
 }
 

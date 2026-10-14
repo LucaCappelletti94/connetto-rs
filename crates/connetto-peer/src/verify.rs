@@ -19,7 +19,7 @@ use crate::identity::{Clock, Trust};
 pub(crate) type Crl = webpki::CertRevocationList<'static>;
 /// The tolerance a wall clock gets against the certificate windows, five
 /// minutes either way.
-const TOLERANCE: Duration = Duration::from_secs(300);
+pub(crate) const TOLERANCE: Duration = Duration::from_secs(300);
 
 /// A kept revocation list, beside what a verifier and a forward need.
 #[derive(Clone)]
