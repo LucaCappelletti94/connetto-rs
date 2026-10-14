@@ -24,7 +24,9 @@ env:
 jobs:
   checks:
     name: Check ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    # Only pushes and same-repository pull requests may reach the self-hosted
+    # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.name == 'root native' && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     timeout-minutes: 40
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. These jobs never run the demo, so any file serves.
