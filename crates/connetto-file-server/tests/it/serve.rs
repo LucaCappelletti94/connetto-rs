@@ -1028,3 +1028,74 @@ async fn a_renamed_identity_setting_serves() {
         "the file server must bind the identity under app.who"
     );
 }
+
+/// Serves `uri` over `app` and answers its status.
+async fn status_of(app: &axum::Router, uri: String) -> StatusCode {
+    let req = axum::http::Request::builder()
+        .uri(uri)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap().status()
+}
+
+/// A file referenced from the table the cap holds is served to the person and
+/// to the bot whose list names the table, and refused to the bot whose list
+/// does not (R91). The ticket carries the caller's list and the bind sets
+/// `app.bot_list`, so the restrictive policy reads the value it decides on.
+#[tokio::test]
+async fn a_capped_table_is_served_to_a_person_and_to_a_bot_that_lists_it() {
+    use crate::fixture::{connect_admin, insert_committed_manifest, register_file_ownership};
+    use connetto_file_core::{ChunkHash, ChunkMeta, ChunkStore, FileId};
+    use connetto_file_server::FsStore;
+
+    let pg = Pg::start_with_bot_list().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let bytes = vec![0x5Au8; 96];
+    let hash = ChunkHash::from_bytes(*blake3::hash(&bytes).as_bytes());
+    {
+        let fs = FsStore::new(dir.path()).unwrap();
+        fs.write_chunk(&hash, &bytes).await.unwrap();
+    }
+    let (app, signer) = build_router(&pg, fs_store(&dir)).await;
+
+    let file_id_bytes = [7u8; 32];
+    let file_id = FileId::from_bytes(file_id_bytes);
+    let id_hex = connetto_file_server::hex_32(&file_id_bytes);
+    let chunks = vec![ChunkMeta { hash, len: 96 }];
+    let mut admin_conn = connect_admin(&pg.url_admin).await;
+    insert_committed_manifest(&mut admin_conn, &file_id, &identified("alice"), &chunks).await;
+    register_file_ownership(&mut admin_conn, &file_id, "alice").await;
+
+    let mint = |caller: connetto_file_server::ContentCaller| {
+        signer
+            .mint(&TicketPayload {
+                file_id: file_id_bytes,
+                verb: Verb::Read,
+                ceiling: u64::MAX,
+                expiry: chrono::Utc::now().timestamp() + 3600,
+                caller,
+            })
+            .unwrap()
+    };
+
+    let person = mint(crate::fixture::identified("alice"));
+    assert_eq!(
+        status_of(&app, format!("/files/{id_hex}?t={person}")).await,
+        StatusCode::OK,
+        "the person's wildcard list passes the cap"
+    );
+
+    let listed = mint(crate::fixture::listed("bot-a", "test_file_metadata:read"));
+    assert_eq!(
+        status_of(&app, format!("/files/{id_hex}?t={listed}")).await,
+        StatusCode::OK,
+        "the bot whose list names the table is served"
+    );
+
+    let other = mint(crate::fixture::listed("bot-b", "other_table:read"));
+    assert_eq!(
+        status_of(&app, format!("/files/{id_hex}?t={other}")).await,
+        StatusCode::NOT_FOUND,
+        "the bot whose list does not name the table is refused"
+    );
+}

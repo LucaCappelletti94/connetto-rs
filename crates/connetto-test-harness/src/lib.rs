@@ -690,6 +690,41 @@ pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
     exec(pool, WATERMARK_DDL).await;
 }
 
+/// The bot registry tables' DDL over the default schema's `TEXT` ids (R91),
+/// which every server requires, so the fixture creates them with the
+/// watermark and epoch tables.
+pub const BOTS_DDL: &str = connetto_server::defaults::BOTS_DDL;
+
+/// Create the bot registry tables, as admin.
+pub async fn provision_bot_tables(pool: &Pool<AsyncPgConnection>) {
+    for statement in BOTS_DDL.split(';') {
+        if !statement.trim().is_empty() {
+            exec(pool, statement).await;
+        }
+    }
+}
+
+/// Apply the cap document the build generates beside the schema and policies,
+/// as a deployment migration would, so the fixture is held to the bot cap the
+/// way a real deployment is. A fixture whose tables the server boots against
+/// must carry it or the startup check refuses the boot.
+///
+/// # Panics
+///
+/// When the two documents do not generate a cap document, or the cap does not
+/// apply.
+pub async fn provision_cap_policies(
+    pool: &Pool<AsyncPgConnection>,
+    schema_sql: &str,
+    policies_sql: &str,
+) {
+    let cap = connetto_schema::cap_policies(schema_sql, policies_sql)
+        .unwrap_or_else(|err| panic!("the cap document generates: {err}"));
+    if !cap.is_empty() {
+        exec(pool, &cap).await;
+    }
+}
+
 /// A name no two calls in one process share.
 ///
 /// The clock alone is not enough: two fixtures provisioned inside one
@@ -951,6 +986,7 @@ impl Fixture {
     ) -> Self {
         let admin = pool_when_ready(&admin_url).await;
         provision_watermark(&admin).await;
+        provision_bot_tables(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
         Self {
             admin_url,

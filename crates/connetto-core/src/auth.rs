@@ -209,27 +209,39 @@ impl<Id, Key> Principal<Id, Key> {
     }
 }
 
-/// The caller a content ticket carries: the identity, and the capability
-/// subjects it holds.
+/// The caller a content ticket carries: the identity, the capability
+/// subjects it holds, and the bot list a login bound on the run.
 ///
-/// Both halves travel so the file server binds what the mint bound, and an
-/// unheld half stays unheld rather than becoming `""`, which would be a real
-/// identity a policy could match. The subjects ride as the list they are,
-/// because a commit is attributed to each of them and only the binding needs
-/// them joined, under the separator that deployment's key type chose.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// All three travel so the file server binds what the mint bound, and an
+/// unheld value stays unheld rather than becoming `""`, which would be a
+/// real identity a policy could match. The subjects ride as the list they
+/// are, because a commit is attributed to each of them and only the binding
+/// needs them joined, under the separator that deployment's key type chose.
+/// The bot list rides as the value the connection binds, the wildcard for a
+/// caller holding no login.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ContentCaller {
     identity: Option<String>,
     subjects: Vec<String>,
+    bot_list: String,
 }
 
 impl ContentCaller {
-    /// Name both halves.
+    /// Name all three values.
+    ///
+    /// `bot_list` is the value the caller's connection binds into
+    /// [`crate::schema::BOT_LIST_SETTING`], the wildcard for a caller holding
+    /// no login, so the ticket and the connection hold the caller to one list.
     #[must_use]
-    pub fn new(identity: Option<String>, subjects: impl IntoIterator<Item = String>) -> Self {
+    pub fn new(
+        identity: Option<String>,
+        subjects: impl IntoIterator<Item = String>,
+        bot_list: String,
+    ) -> Self {
         Self {
             identity,
             subjects: subjects.into_iter().collect(),
+            bot_list,
         }
     }
 
@@ -244,6 +256,14 @@ impl ContentCaller {
     #[must_use]
     pub fn subjects(&self) -> &[String] {
         &self.subjects
+    }
+
+    /// The bot list the caller's connection binds into
+    /// [`crate::schema::BOT_LIST_SETTING`], the wildcard for a caller holding
+    /// no login.
+    #[must_use]
+    pub fn bot_list(&self) -> &str {
+        &self.bot_list
     }
 
     /// The subjects joined for the one Postgres setting a policy reads them
@@ -297,6 +317,16 @@ impl ContentCaller {
                 self.packed_subjects(separator)
                     .map(|subjects| format!("keys:{subjects}"))
             })
+    }
+}
+
+impl Default for ContentCaller {
+    fn default() -> Self {
+        Self {
+            identity: None,
+            subjects: Vec::new(),
+            bot_list: crate::BOT_LIST_WILDCARD.to_owned(),
+        }
     }
 }
 
@@ -441,8 +471,16 @@ mod tests {
     /// meter bucket.
     #[test]
     fn a_key_spelled_like_a_pair_owns_its_own_rows() {
-        let one_key = ContentCaller::new(None, ["a,b".to_owned()]);
-        let two_keys = ContentCaller::new(None, ["a".to_owned(), "b".to_owned()]);
+        let one_key = ContentCaller::new(
+            None,
+            ["a,b".to_owned()],
+            crate::BOT_LIST_WILDCARD.to_owned(),
+        );
+        let two_keys = ContentCaller::new(
+            None,
+            ["a".to_owned(), "b".to_owned()],
+            crate::BOT_LIST_WILDCARD.to_owned(),
+        );
         assert_ne!(
             one_key.storage_key('|'),
             two_keys.storage_key('|'),

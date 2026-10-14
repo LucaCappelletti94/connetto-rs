@@ -355,7 +355,11 @@ mod tests {
 
     /// A caller carrying only an identity, which is what these mints exercise.
     fn identified(user_id: &str) -> connetto_core::auth::ContentCaller {
-        connetto_core::auth::ContentCaller::new(Some(user_id.to_owned()), None)
+        connetto_core::auth::ContentCaller::new(
+            Some(user_id.to_owned()),
+            None,
+            connetto_core::BOT_LIST_WILDCARD.to_owned(),
+        )
     }
 
     #[test]

@@ -98,6 +98,7 @@ mod app {
         type Audit = ConnettoAudit;
         type Bans = ConnettoBans;
         type Enrolments = ConnettoEnrolments;
+        type Bots = ConnettoBots;
         type Files = connetto_file_server::DefaultFileSchema;
     }
 }
@@ -139,10 +140,19 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
          session_id UUID PRIMARY KEY REFERENCES connetto_sessions (session_id) ON DELETE CASCADE, \
          issuer TEXT NOT NULL, access_token TEXT NOT NULL, refresh_token TEXT, \
          expires_at TIMESTAMPTZ)",
+        "DROP TABLE connetto_installation_optional_tables",
+        "DROP TABLE connetto_installations",
+        "DROP TABLE connetto_bot_lists",
+        "DROP TABLE connetto_registration_codes",
+        "DROP TABLE connetto_bots",
     ] {
         exec(&pool, stmt).await;
     }
-
+    for statement in app::BOTS_DDL.split(';') {
+        if !statement.trim().is_empty() {
+            exec(&pool, statement).await;
+        }
+    }
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a listener");
