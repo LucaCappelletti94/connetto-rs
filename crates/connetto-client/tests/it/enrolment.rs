@@ -136,7 +136,7 @@ async fn enrolment_phase() {
     };
     match phase.as_str() {
         "first" => first_connect().await,
-        "renewal" => renewal().await,
+        "renewal" => Box::pin(renewal()).await,
         "reissue" => reissue().await,
         "cap" => cap().await,
         "revoke" => Box::pin(revoke()).await,
@@ -146,7 +146,7 @@ async fn enrolment_phase() {
         "forget" => forget().await,
         "report" => Box::pin(report()).await,
         "learned" => Box::pin(learned_at_connect()).await,
-        "untrusted" => untrusted().await,
+        "untrusted" => Box::pin(untrusted()).await,
         "no-roots" => no_roots().await,
         "rotation" => Box::pin(rotation_withdraws()).await,
         "clock-behind" => Box::pin(clock_behind()).await,
