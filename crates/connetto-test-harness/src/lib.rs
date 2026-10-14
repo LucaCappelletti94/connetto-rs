@@ -1297,6 +1297,15 @@ pub enum HarnessAuthError {
     Fga(#[from] OpenFgaError),
 }
 
+impl connetto_server::FailedAuthorization for HarnessAuthError {
+    fn clears_by_itself(&self) -> bool {
+        match self {
+            Self::Rls(err) => err.clears_by_itself(),
+            Self::Fga(err) => err.clears_by_itself(),
+        }
+    }
+}
+
 impl HarnessAuth {
     /// The stand-in policy: it grants the callers the fixture named.
     #[must_use]
@@ -1776,6 +1785,9 @@ fn spawn_ingest_task(
                 if let ReconnectEvent::Retrying { error, .. } = &event {
                     restarts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     eprintln!("the harness change feed failed and reconnects: {error}");
+                }
+                if let ReconnectEvent::AuthRetrying { error, .. } = &event {
+                    eprintln!("the harness change feed holds an event the authorization path refused: {error}");
                 }
             })
             .await;

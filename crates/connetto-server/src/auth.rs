@@ -82,6 +82,18 @@ mod rls {
         }
     }
 
+    impl crate::session::FailedAuthorization for RlsAuthError {
+        fn clears_by_itself(&self) -> bool {
+            match self {
+                Self::Pool(_) | Self::Query(_) => true,
+                Self::Catalog(_)
+                | Self::KeyValue(_)
+                | Self::UnsupportedKeyType { .. }
+                | Self::Undecidable { .. } => false,
+            }
+        }
+    }
+
     /// A visibility policy that enforces reads through Postgres Row-Level
     /// Security.
     ///

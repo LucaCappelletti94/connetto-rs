@@ -295,7 +295,7 @@ fn manager<A>(
 ) -> Arc<SessionManager<KeyedSnapshot, A, ConnettoDefaults>>
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
-    A::Error: core::fmt::Display,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
 {
     let manager = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
@@ -339,7 +339,7 @@ async fn connect<A>(
 ) -> Live
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
-    A::Error: core::fmt::Display,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
 {
     let (server_end, mut client) = loopback();
     let serving = Arc::clone(manager);
@@ -376,7 +376,7 @@ async fn handshake_accepted<A>(
 ) -> bool
 where
     A: VisibilityPolicy<Watcher = Arc<Principal>, Backend = PgBackend> + 'static,
-    A::Error: core::fmt::Display,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
 {
     let (server_end, mut client) = loopback();
     let serving = Arc::clone(manager);

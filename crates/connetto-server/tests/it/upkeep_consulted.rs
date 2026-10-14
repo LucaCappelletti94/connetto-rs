@@ -222,3 +222,73 @@ async fn a_failed_store_write_holds_the_event() {
         "the failed write is reported as a retry"
     );
 }
+
+/// Upkeep that refuses the change the same way however often it is asked.
+struct UnanswerableUpkeep;
+
+impl StoreUpkeep for UnanswerableUpkeep {
+    fn keep_current<'a>(
+        &'a self,
+        _event: &'a PgChangeEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
+        Box::pin(async move {
+            Err(UpkeepError::Unanswerable(
+                "the store refuses the change for good".to_owned(),
+            ))
+        })
+    }
+}
+
+/// A store refusal that cannot clear ends the change stream naming the table,
+/// instead of holding the event and retrying without end.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_refusal_that_cannot_clear_ends_ingest() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    let fixture = Fixture::acquire().await;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .build()
+            .expect("build materializer"),
+        EmptySnapshot,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+            .expect("build write target"),
+    )
+    .with_upkeep(Arc::new(UnanswerableUpkeep))
+    .build();
+
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO notes (id, body) VALUES (1, 'refused')")
+        .expect("execute dml");
+    let event = source
+        .next_item()
+        .await
+        .expect("poll source")
+        .and_then(subql::SourceItem::into_event)
+        .expect("one event");
+
+    let retries = AtomicU32::new(0);
+    let ended = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        manager.ingest(&mut OneEvent(Some(event)), &mut |event| {
+            if matches!(event, connetto_server::ReconnectEvent::AuthRetrying { .. }) {
+                retries.fetch_add(1, Ordering::Relaxed);
+            }
+        }),
+    )
+    .await
+    .expect("ingest ends on the refusal instead of retrying without end");
+    assert!(
+        matches!(&ended, Err(connetto_server::SessionError::AuthorizationUnanswerable { table, .. }) if table == "notes"),
+        "the refusal ends ingest naming the table, got {ended:?}"
+    );
+    assert_eq!(
+        retries.load(Ordering::Relaxed),
+        0,
+        "a refusal the store will not clear is never retried"
+    );
+}

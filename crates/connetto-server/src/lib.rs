@@ -137,9 +137,9 @@ pub use reserve::{ReaderGate, ReaderReserve};
 pub use row_view::ValuesRow;
 pub use schema::ConnettoSchema;
 pub use session::{
-    NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, ResumePoint, SessionConfig,
-    SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, StreamCheck,
-    StreamCheckError, subject_set_reach,
+    FailedAuthorization, NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, ResumePoint,
+    SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
+    StreamCheck, StreamCheckError, subject_set_reach,
 };
 pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};

@@ -194,7 +194,7 @@ async fn drive<A, O>(
 ) -> Vec<PgChangeEvent>
 where
     A: VisibilityPolicy<Watcher = Arc<connetto_core::auth::Principal>, Backend = Postgres>,
-    A::Error: core::fmt::Display,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
     O: Oplog,
 {
     source.execute_sql(sql).expect("execute dml");
@@ -238,7 +238,7 @@ where
         + Send
         + Sync
         + 'static,
-    A::Error: core::fmt::Display + Send,
+    A::Error: core::fmt::Display + Send + connetto_server::FailedAuthorization,
 {
     let (server_transport, mut client) = loopback();
     let server = manager.clone();

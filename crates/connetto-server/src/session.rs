@@ -823,6 +823,35 @@ pub enum SessionError {
          ALTER TABLE {0} REPLICA IDENTITY FULL"
     )]
     ChangeStreamUnusable(String),
+    /// The authorization path refused an event for a reason the deployment fixes, so the server stops serving instead of retrying.
+    #[error(
+        "the authorization path cannot answer for a change in {table}, and asking again \
+         gives the same answer: {reason}"
+    )]
+    AuthorizationUnanswerable {
+        /// The changed row's table.
+        table: String,
+        /// What the authorization path reported.
+        reason: String,
+    },
+}
+
+/// Whether an authorization failure can clear by itself, which decides between holding an event and ending the change stream.
+pub trait FailedAuthorization {
+    /// Whether asking the same question again can give another answer.
+    fn clears_by_itself(&self) -> bool;
+}
+
+impl FailedAuthorization for std::io::Error {
+    fn clears_by_itself(&self) -> bool {
+        true
+    }
+}
+
+impl FailedAuthorization for core::convert::Infallible {
+    fn clears_by_itself(&self) -> bool {
+        match *self {}
+    }
 }
 
 /// What the registry settled a registration into (R91).
@@ -1652,7 +1681,7 @@ impl<Snap, Auth, C, O, Id, Key, D, S> SessionManager<Snap, Auth, D, C, O, Id, Ke
 where
     Snap: SnapshotSource<Id, Key>,
     Auth: VisibilityPolicy<Watcher = Arc<Principal<Id, Key>>, Backend = Postgres>,
-    Auth::Error: core::fmt::Display,
+    Auth::Error: core::fmt::Display + FailedAuthorization,
     C: ReadConnector,
     C::Error: FailedRead,
     O: Oplog,
@@ -1705,20 +1734,20 @@ where
         self.device_enrolment.set(enrolment)
     }
 
-    /// Which refusal a transition failure is.
-    ///
-    /// A policy that could not answer is the transient case the ingest loop
-    /// holds the event for. The other two do not clear by themselves: a table
-    /// that does not record its previous row image produces the same failure on
-    /// every later change, and so does one the catalog does not know, so the
-    /// server refuses to serve rather than retrying for ever (R6 decision 4).
+    /// Which refusal a transition failure is, holding the event only for a failure that can clear (R6 decision 4).
     fn transition_refusal(
         &self,
         event: &PgChangeEvent,
         err: TransitionError<Auth::Error>,
     ) -> SessionError {
         match err {
-            TransitionError::Policy(err) => SessionError::AuthUnavailable(err.to_string()),
+            TransitionError::Policy(err) if err.clears_by_itself() => {
+                SessionError::AuthUnavailable(err.to_string())
+            }
+            TransitionError::Policy(err) => SessionError::AuthorizationUnanswerable {
+                table: self.event_table(event),
+                reason: err.to_string(),
+            },
             // `NotARowEvent` is unreachable, because a truncate is answered
             // before the question is put. Refusing is the direction to fail in
             // if that ever stops being true.
@@ -2695,9 +2724,7 @@ where
     ///
     /// # Errors
     ///
-    /// [`SessionError::AuthUnavailable`], because a store that could not be
-    /// brought level is the same class of unknown as an unreachable service and
-    /// takes the same path.
+    /// [`SessionError::AuthUnavailable`] for a store that could not be brought level, [`SessionError::ChangeStreamUnusable`] and [`SessionError::AuthorizationUnanswerable`] for a failure that cannot clear.
     async fn keep_store_current(
         &self,
         event: &PgChangeEvent,
@@ -2705,13 +2732,16 @@ where
         match &self.upkeep {
             Some(upkeep) => match upkeep.keep_current(event).await {
                 Ok(moves) => Ok(moves),
-                // The table stopped recording its previous image, so the
-                // change stream cannot deliver. Refuse rather than hold the
-                // event and retry forever (R6 decision 4).
                 Err(crate::openfga::UpkeepError::IncompletePreviousImage) => {
                     Err(SessionError::ChangeStreamUnusable(self.event_table(event)))
                 }
-                Err(err) => Err(SessionError::AuthUnavailable(err.to_string())),
+                Err(err) if err.clears_by_itself() => {
+                    Err(SessionError::AuthUnavailable(err.to_string()))
+                }
+                Err(err) => Err(SessionError::AuthorizationUnanswerable {
+                    table: self.event_table(event),
+                    reason: err.to_string(),
+                }),
             },
             None => Ok(Vec::new()),
         }
@@ -2950,11 +2980,11 @@ where
                     let started = Instant::now();
                     match self.ingest(&mut source, &mut on_event).await {
                         Ok(()) => return Ok(()),
-                        // Reconnecting cannot help: the same table produces the
-                        // same refusal on the next event, so retrying it would
-                        // spin for ever against a deployment that has to be
-                        // fixed (R6 decision 4).
-                        Err(err @ SessionError::ChangeStreamUnusable(_)) => return Err(err),
+                        // The same event meets the same refusal after a reconnect (R6 decision 4).
+                        Err(
+                            err @ (SessionError::ChangeStreamUnusable(_)
+                            | SessionError::AuthorizationUnanswerable { .. }),
+                        ) => return Err(err),
                         Err(err) => {
                             if started.elapsed() >= policy.healthy_after {
                                 episode.reset();

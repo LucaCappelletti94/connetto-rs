@@ -1194,18 +1194,50 @@ pub enum UpkeepError {
     /// What the row moved could not be worked out.
     #[error("what the changed row moved could not be worked out: {0}")]
     Diff(String),
-    /// The store refused the write.
+    /// The store could not be reached to take the write.
     #[error("writing the difference to the authorization store: {0}")]
     Write(String),
     /// A query the changed row asks to be replayed could not be run or read.
     #[error("replaying a query the changed row requires: {0}")]
     Replay(String),
-    /// The previous row image carries only its key, so what the row granted
-    /// before the change is not knowable. This is terminal. The table
-    /// records no previous image, so the same failure repeats on every
-    /// later change and the change stream refuses to serve.
+    /// The previous row image carries only its key, so the change stream refuses to serve.
     #[error("the previous row image carries only its key, so what it granted is not knowable")]
     IncompletePreviousImage,
+    /// The model, the catalog or the row refuses the change the same way however often it is asked.
+    #[error("the authorization store refuses the change for good: {0}")]
+    Unanswerable(String),
+}
+
+impl crate::session::FailedAuthorization for UpkeepError {
+    fn clears_by_itself(&self) -> bool {
+        match self {
+            Self::Write(_) | Self::Replay(_) => true,
+            Self::Diff(_) | Self::IncompletePreviousImage | Self::Unanswerable(_) => false,
+        }
+    }
+}
+
+impl crate::session::FailedAuthorization for OpenFgaError {
+    fn clears_by_itself(&self) -> bool {
+        match self {
+            Self::Rejected { .. }
+            | Self::RowCannotBeNamed
+            | Self::StatementNotAnswered { .. }
+            | Self::SliceCannotBeNamed { .. }
+            | Self::MissingRequiredParameters => false,
+            // Transport, Incomplete and any variant this build does not know keep their retry.
+            _ => true,
+        }
+    }
+}
+
+/// The upkeep error a store failure is, by whether it can clear.
+fn store_failure(err: &OpenFgaError) -> UpkeepError {
+    if crate::session::FailedAuthorization::clears_by_itself(err) {
+        UpkeepError::Write(err.to_string())
+    } else {
+        UpkeepError::Unanswerable(err.to_string())
+    }
 }
 
 /// One authorization fact that moved, and who it concerned.
@@ -1249,7 +1281,7 @@ fn bind_key<'a>(
             Value::Bytes(value) => query.bind::<Binary, _>(value.clone()),
             Value::Uuid(value) => query.bind::<diesel::sql_types::Uuid, _>(*value),
             other => {
-                return Err(UpkeepError::Replay(format!(
+                return Err(UpkeepError::Unanswerable(format!(
                     "a replayed query keys on a {:?}, which no placeholder here carries",
                     other.scalar_kind()
                 )));
@@ -1354,7 +1386,7 @@ where
             self.delegate
                 .apply(&diff)
                 .await
-                .map_err(|err| UpkeepError::Write(err.to_string()))?;
+                .map_err(|err| store_failure(&err))?;
             // The obligation the queries carry is discharged here, before
             // the event is delivered and before any replacement is read.
             // Until they have run the store still states what the change took
@@ -1647,7 +1679,7 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                         .delegate
                         .reconcile_records(k, &records)
                         .await
-                        .map_err(|err| UpkeepError::Write(err.to_string()))?;
+                        .map_err(|err| store_failure(&err))?;
                     tracing::debug!(
                         added = report.added.len(),
                         removed = report.removed.len(),
@@ -1663,12 +1695,13 @@ impl<Id, Key, T> FgaUpkeep<Id, Key, T> {
                         .delegate
                         .materialise(std::iter::once(*m), &replayer)
                         .await
-                        // A query that cannot run is a replay failure, not the
-                        // store being down, and an operator acts on that
-                        // difference.
+                        // A query that cannot run is a replay failure, which an operator acts on differently.
                         .map_err(|err| match err {
                             subql::visibility::openfga::ReconcileError::Replay(inner) => inner,
-                            other => UpkeepError::Write(other.to_string()),
+                            subql::visibility::openfga::ReconcileError::Store(inner) => {
+                                store_failure(&inner)
+                            }
+                            other => UpkeepError::Unanswerable(other.to_string()),
                         })?;
                     outcome.note_keys(&self.naming, &reports);
                     if reports
@@ -1807,9 +1840,9 @@ mod tests {
     use subql::visibility::RowView;
 
     use super::{
-        BTreeMap, Body, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject, OpenFgaPolicy,
-        OpenFgaServiceClient, ParserDB, Principal, Reconciled, SubjectNaming, Translated,
-        VisibilityPolicy, WithdrawnFact,
+        BTreeMap, Body, FgaAuth, GrantHolder, GrantMove, GrpcService, ModelSubject, OpenFgaError,
+        OpenFgaPolicy, OpenFgaServiceClient, ParserDB, Principal, Reconciled, SubjectNaming,
+        Translated, UpkeepError, VisibilityPolicy, WithdrawnFact,
     };
     use connetto_core::auth::DEFAULT_USER_SETTING;
 
@@ -2567,5 +2600,42 @@ mod tests {
             detail.contains("user"),
             "the refusal names the table an operator has to rename: {detail}"
         );
+    }
+
+    /// An unreachable store holds the event for a retry, a model refusal ends the stream.
+    #[test]
+    fn store_failure_classifies_a_store_failure_by_whether_it_clears() {
+        let write = super::store_failure(&OpenFgaError::Transport {
+            attempts: 3,
+            message: "the connection was refused".to_owned(),
+        });
+        assert!(
+            matches!(write, UpkeepError::Write(_)),
+            "a connection that refuses is a write failure the session holds and retries: {write:?}"
+        );
+
+        let refused = super::store_failure(&OpenFgaError::RowCannotBeNamed);
+        assert!(
+            matches!(refused, UpkeepError::Unanswerable(_)),
+            "a refusal the model fixes is unanswerable, so it ends the stream rather than retries: {refused:?}"
+        );
+    }
+
+    /// A key cell no placeholder carries is refused for good, naming the cell kind.
+    #[test]
+    fn a_key_cell_no_placeholder_carries_is_unanswerable() {
+        let Err(err) = super::bind_key(
+            diesel::sql_query("SELECT 1").into_boxed(),
+            &[Value::Jsonb(serde_json::json!({}))],
+        ) else {
+            panic!("a jsonb key cannot ride the replay");
+        };
+        match err {
+            UpkeepError::Unanswerable(reason) => assert!(
+                reason.contains("Jsonb"),
+                "the refusal names the cell kind an operator has to rename: {reason}"
+            ),
+            other => panic!("the refusal is unanswerable, not {other:?}"),
+        }
     }
 }

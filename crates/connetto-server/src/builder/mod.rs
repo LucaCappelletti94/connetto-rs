@@ -53,7 +53,7 @@ use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use openfga_client::client::OpenFgaServiceClient;
-use openfga_client::tonic::transport::Channel;
+use openfga_client::tonic::transport::{Channel, Endpoint};
 use pg2sqlite::prelude::SessionVariableMapping;
 use rls2fga::translator::Translator;
 use sqlparser::dialect::PostgreSqlDialect;
@@ -358,21 +358,49 @@ impl TokenKeys {
     }
 }
 
+/// The time one call to the authorization service may run before it fails, so
+/// a stalled service cannot hold the change stream or a mutation without
+/// limit.
+pub const DEFAULT_AUTH_CALL_BUDGET: Duration = Duration::from_secs(5);
+
 /// The authorization endpoint and the store its model lands in.
 #[derive(Clone, Debug)]
 pub struct OpenFga {
     url: String,
     store: String,
+    call_budget: Duration,
 }
 
 impl OpenFga {
-    /// Name the endpoint and the store the deployment owns.
+    /// Name the endpoint and the store the deployment owns, with
+    /// [`DEFAULT_AUTH_CALL_BUDGET`] on every call.
     #[must_use]
     pub fn new(url: impl Into<String>, store: impl Into<String>) -> Self {
         Self {
             url: url.into(),
             store: store.into(),
+            call_budget: DEFAULT_AUTH_CALL_BUDGET,
         }
+    }
+
+    /// Bound every call to the authorization service at `budget`, measured on
+    /// a monotonic clock. A call that runs longer fails, and the change path
+    /// holds the event and asks again, as it does for any unavailable answer.
+    #[must_use]
+    pub const fn with_call_budget(mut self, budget: Duration) -> Self {
+        self.call_budget = budget;
+        self
+    }
+
+    /// The endpoint every authorization call goes through, each call and each
+    /// connection attempt bounded by the call budget.
+    fn endpoint(&self) -> Result<Endpoint, BuildError> {
+        Ok(Channel::from_shared(self.url.clone())
+            .map_err(|err| {
+                BuildError::AuthorizationEndpoint(format!("parsing the endpoint: {err}"))
+            })?
+            .timeout(self.call_budget)
+            .connect_timeout(self.call_budget))
     }
 }
 
@@ -496,7 +524,7 @@ pub enum ServeError {
     /// Building the server refused.
     #[error(transparent)]
     Build(#[from] BuildError),
-    /// The stream cannot answer what a row looked like before it changed.
+    /// The stream cannot be served, because a row's previous version or its authorization answer cannot be had.
     #[error("the change stream is unusable: {0}")]
     ChangeStreamUnusable(String),
     /// The stream gave up reconnecting, or its source ended.
@@ -1559,16 +1587,12 @@ async fn build_authorization<D: ConnettoSchema>(
         .collect();
     preflight::require(owner_pool, &required).await?;
 
-    let channel = Channel::from_shared(openfga.url.clone())
-        .map_err(|err| BuildError::AuthorizationEndpoint(format!("parsing the endpoint: {err}")))?
-        .connect()
-        .await
-        .map_err(|err| {
-            BuildError::AuthorizationEndpoint(format!(
-                "connecting to the authorization service at {}: {err}",
-                openfga.url
-            ))
-        })?;
+    let channel = openfga.endpoint()?.connect().await.map_err(|err| {
+        BuildError::AuthorizationEndpoint(format!(
+            "connecting to the authorization service at {}: {err}",
+            openfga.url
+        ))
+    })?;
 
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated.install_model(&mut setup, &openfga.store).await?;
@@ -1871,10 +1895,11 @@ fn change_stream<D: ConnettoSchema>(
                     "the change stream source ended".to_owned(),
                 ))
             }
-            Err(err @ SessionError::ChangeStreamUnusable(_)) => {
-                // No restart of the stream changes the table's definition, so
-                // the server closes every session and returns the refusal
-                // rather than retrying for ever (R6 decision 4).
+            // No restart of the stream changes what the deployment fixed (R6 decision 4).
+            Err(
+                err @ (SessionError::ChangeStreamUnusable(_)
+                | SessionError::AuthorizationUnanswerable { .. }),
+            ) => {
                 close_every_session(&manager).await;
                 Err(ServeError::ChangeStreamUnusable(err.to_string()))
             }
@@ -1950,6 +1975,45 @@ mod tests {
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )
+    }
+
+    /// A service that accepts the connection and never answers fails the call
+    /// at its budget, so the change path holds the event and asks again rather
+    /// than waiting without end.
+    #[tokio::test]
+    async fn a_stalled_authorization_service_fails_the_call_at_its_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind a local port");
+        let address = listener.local_addr().expect("the bound address");
+        let held = tokio::spawn(async move {
+            let mut open = Vec::new();
+            while let Ok((socket, _)) = listener.accept().await {
+                open.push(socket);
+            }
+        });
+        let budget = Duration::from_millis(200);
+        let openfga = OpenFga::new(format!("http://{address}"), "store").with_call_budget(budget);
+        let mut client = OpenFgaServiceClient::new(
+            openfga
+                .endpoint()
+                .expect("the endpoint parses")
+                .connect_lazy(),
+        );
+        let started = tokio::time::Instant::now();
+        let answer = client
+            .list_stores(openfga_client::client::ListStoresRequest::default())
+            .await;
+        let waited = started.elapsed();
+        held.abort();
+        assert!(
+            answer.is_err(),
+            "a service that never answers gives no answer"
+        );
+        assert!(
+            waited < budget * 10,
+            "the call ends at its budget, it waited {waited:?}"
+        );
     }
 
     /// The deployment's tables in the order a deployment writes them, where
