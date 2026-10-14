@@ -123,10 +123,12 @@ log "Incus API on localhost only, for ci-runner's confined certificate"
 incus config set core.https_address=127.0.0.1:8443
 
 log "Host caches every runner VM mounts"
-for dir in cargo-registry cargo-git sccache targets registry-mirror; do
+# Only what is read and written with plain file IO: virtiofs in these VMs refuses shared mmap,
+# which libgit2 needs for cargo's git checkouts and rustc for a target directory.
+for dir in cargo-registry sccache registry-mirror; do
   mkdir -p "$CACHE_ROOT/$dir"
 done
-chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/cargo-git" "$CACHE_ROOT/sccache" "$CACHE_ROOT/targets"
+chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache"
 chmod 0755 "$CACHE_ROOT"
 
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
@@ -164,9 +166,12 @@ make_profile() {
   local name=$1 cpus=$2 memory=$3
   incus profile show "$name" --project "$PROJECT" >/dev/null 2>&1 || incus profile create "$name" --project "$PROJECT"
   incus profile set "$name" limits.cpu="$cpus" limits.memory="$memory" limits.cpu.priority=5 --project "$PROJECT"
-  for dir in cargo-registry cargo-git sccache targets; do
+  for dir in cargo-registry sccache; do
     incus profile device show "$name" --project "$PROJECT" | grep -q "^$dir:" \
       || incus profile device add "$name" "$dir" disk source="$CACHE_ROOT/$dir" path="/srv/cache/$dir" --project "$PROJECT"
+  done
+  for dir in cargo-git targets; do
+    incus profile device remove "$name" "$dir" --project "$PROJECT" >/dev/null 2>&1 || true
   done
 }
 make_profile ci-light 4 8GiB

@@ -84,15 +84,24 @@ source ~/.cargo/env
 rustup toolchain install nightly --profile minimal -c clippy -t wasm32-unknown-unknown
 curl -fsSL https://get.nexte.st/latest/linux | tar xz -C ~/.cargo/bin
 cargo install wasm-pack --locked --version $WASM_PACK_VERSION
-# The registry and git checkouts live on the host, shared by every VM.
-rm -rf ~/.cargo/registry ~/.cargo/git
+# The registry lives on the host, shared by every VM. Git checkouts stay local, because
+# libgit2 needs shared mmap, which virtiofs refuses here.
+rm -rf ~/.cargo/registry
 ln -s $CACHE/cargo-registry ~/.cargo/registry
-ln -s $CACHE/cargo-git ~/.cargo/git
 EOF
 
-echo "== Environment the runner hands every job, the hosted image's names plus the caches"
+echo "== The GitHub Actions runner, extracted where GARM looks for a cached copy"
 run_home="/home/$RUNNER/actions-runner"
 install -d -o "$RUNNER" -g "$RUNNER" "$run_home"
+release=$(curl -fsSL https://api.github.com/repos/actions/runner/releases/latest)
+asset=$(jq -r '.assets[] | select(.name | test("^actions-runner-linux-x64-[0-9.]+\\.tar\\.gz$"))' <<<"$release")
+curl -fsSL "$(jq -r .browser_download_url <<<"$asset")" -o /tmp/actions-runner.tar.gz
+echo "$(jq -r '.digest | sub("^sha256:"; "")' <<<"$asset")  /tmp/actions-runner.tar.gz" | sha256sum -c --status
+tar xzf /tmp/actions-runner.tar.gz -C "$run_home"
+"$run_home/bin/installdependencies.sh" >/dev/null
+chown -R "$RUNNER:$RUNNER" "$run_home"
+
+echo "== Environment the runner hands every job, the hosted image's names plus the caches"
 cat > "$run_home/.env" <<EOF
 LANG=C.UTF-8
 JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
@@ -107,7 +116,6 @@ CHROMEWEBDRIVER=/usr/local/share/chromedriver-linux64
 RUSTC_WRAPPER=/usr/local/bin/sccache
 SCCACHE_DIR=$CACHE/sccache
 SCCACHE_CACHE_SIZE=300G
-CONNETTO_CI_TARGETS=$CACHE/targets
 EOF
 echo "/home/$RUNNER/.cargo/bin:$SDK/platform-tools:$SDK/cmdline-tools/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   > "$run_home/.path"
