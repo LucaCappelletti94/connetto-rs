@@ -202,8 +202,11 @@ async fn run() -> Result<()> {
     let query = std::env::var("CONNETTO_QUERY").context("set CONNETTO_QUERY")?;
     let schema_sql = read_ddl("CONNETTO_SCHEMA_SQL").context("set CONNETTO_SCHEMA_SQL")?;
     let policies_sql = read_ddl("CONNETTO_POLICIES_SQL").unwrap_or_default();
-    let bundle = connetto_schema::translate::<String>(&schema_sql, &policies_sql)
-        .map_err(|err| anyhow!("translating CONNETTO_SCHEMA_SQL: {err}"))?;
+    let bundle = connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+        &schema_sql,
+        &policies_sql,
+    )
+    .map_err(|err| anyhow!("translating CONNETTO_SCHEMA_SQL: {err}"))?;
 
     let mut client = connect(SyncSchema::new(bundle), server).await?;
     tracing::info!(connection = ?client.connection_id(), "connected");

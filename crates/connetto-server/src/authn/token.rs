@@ -443,6 +443,7 @@ impl TokenAuthority {
                     user_id: claims.sub,
                 },
                 session_id: claims.sid,
+                bot_list: None,
             }),
             GrantClaims::Key(claims) => Subject::Capability(CapabilitySubject::new(claims.sub)),
         })

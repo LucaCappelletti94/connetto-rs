@@ -3226,7 +3226,9 @@ where
         if key.verify(&message, &registration.signature).is_err() {
             return Ok(RegistrationOutcome::Refused(RegistrationRefusal::Signature));
         }
-        let code_hash: [u8; 32] = Sha256::digest(registration.code.as_bytes()).into();
+        let code_hash: [u8; 32] =
+            Sha256::digest(connetto_core::bots::canonical_code(&registration.code).as_bytes())
+                .into();
         match registry
             .register(
                 code_hash,
@@ -6498,6 +6500,7 @@ mod tests {
                 .accept(Subject::Identity(VerifiedSession {
                     context: AuthContext::new(user),
                     session_id: handle,
+                    bot_list: None,
                 }))
                 .expect("one identity");
         }

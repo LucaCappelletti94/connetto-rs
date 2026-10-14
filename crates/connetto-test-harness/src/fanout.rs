@@ -829,7 +829,10 @@ async fn provision_with(
     let borrowed: Vec<&str> = statements.iter().map(String::as_str).collect();
     fixture.setup(&borrowed).await;
     let reader_pool = pool_for(&with_user(fixture.admin_url(), READER, READER)).await;
-    let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), shape.ddl())
+    // The model's catalog carries the registry tables, so every catalog this
+    // server builds reads the same composed text and numbers the tables alike.
+    let engine_ddl = connetto_schema::with_registry::<connetto_core::bots::TextIds>(shape.ddl());
+    let snapshot = PgSnapshotSource::from_ddl(reader_pool.clone(), &engine_ddl)
         .expect("snapshot source")
         .with_publication(PUBLICATION);
     let (fga, upkeep, translator) = fga_auth(fixture, shape, reader_pool.clone()).await;
@@ -841,7 +844,7 @@ async fn provision_with(
         // is the one run that compares nothing.
         Executor::Reachable(flag) => HarnessAuth::reachable(flag, fga, upkeep),
     };
-    let config = ServerConfig::new(shape.ddl(), fixture.admin_url())
+    let config = ServerConfig::new(engine_ddl.clone(), fixture.admin_url())
         .with_writable(
             RuntimeWritableCatalog::builder()
                 .writable(shape.data_table())
@@ -867,7 +870,7 @@ async fn provision_with(
     // every question would report a difference on each of them.
     if compared {
         server.install_second_opinion(Arc::new(
-            RlsAuth::from_ddl(reader_pool, shape.ddl()).expect("second opinion"),
+            RlsAuth::from_ddl(reader_pool, &engine_ddl).expect("second opinion"),
         ));
     }
     server
@@ -881,7 +884,7 @@ async fn fga_auth(
     pool: Pool<AsyncPgConnection>,
 ) -> (crate::HarnessFga, Arc<dyn StoreUpkeep>, Translator) {
     let (channel, store) = fixture.fga_store().await;
-    let translated = Translated::of::<String>(
+    let translated = Translated::of::<String, connetto_core::bots::TextIds>(
         shape.ddl(),
         shape.policies(),
         connetto_core::auth::DEFAULT_USER_SETTING,

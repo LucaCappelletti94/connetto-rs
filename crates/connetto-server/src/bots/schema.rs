@@ -63,47 +63,15 @@ use crate::authn::schema::Instant;
 #[doc(hidden)]
 pub use uuid::Uuid;
 
+#[doc(hidden)]
+pub use connetto_core::bots::BotRegistryIdSql;
+
 /// One statement of a [`ConnettoBotSchema`], run on a borrowed connection.
 pub type Statement<'c, T> = Pin<Box<dyn Future<Output = QueryResult<T>> + Send + 'c>>;
 
-/// One of the four verbs a list entry declares.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Verb {
-    /// The `read` verb, `FOR SELECT`.
-    Read,
-    /// The `insert` verb, `FOR INSERT`.
-    Insert,
-    /// The `update` verb, `FOR UPDATE`.
-    Update,
-    /// The `delete` verb, `FOR DELETE`.
-    Delete,
-}
-
-impl Verb {
-    /// The column's spelling.
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Verb::Read => "read",
-            Verb::Insert => "insert",
-            Verb::Update => "update",
-            Verb::Delete => "delete",
-        }
-    }
-
-    /// The verb a wire or column spelling names, or `None` for a spelling
-    /// outside the four the `CHECK` allows.
-    #[must_use]
-    pub fn parse(spelled: &str) -> Option<Self> {
-        match spelled {
-            "read" => Some(Self::Read),
-            "insert" => Some(Self::Insert),
-            "update" => Some(Self::Update),
-            "delete" => Some(Self::Delete),
-            _ => None,
-        }
-    }
-}
+/// One of the four verbs a list entry declares, named once in the core so a
+/// session's list and the registry's rows name the same verb.
+pub use connetto_core::bots::Verb;
 
 /// A `verb` column spelling outside the four the `CHECK` allows.
 #[derive(Debug, thiserror::Error)]
@@ -257,6 +225,10 @@ pub trait ConnettoBotSchema: Send + Sync + 'static {
     /// requires to exist, since every connection can register a bot (R98
     /// decision 5).
     const TABLES: &'static [&'static str];
+
+    /// The registry `Id` column's SQL type, which names the registry DDL the
+    /// deployment's schema document carries and the translated schema uses.
+    type IdSql: BotRegistryIdSql;
 
     /// The code row `code_hash` names, locked `FOR UPDATE`, and its creator,
     /// the bot it names, when it expires and when it spent.
@@ -463,32 +435,6 @@ impl<S: ConnettoBotSchema> PgBotRegistry<S> {
     }
 }
 
-/// The registry tables' DDL over one of the `Id` SQL types
-/// [`connetto_bots_tables!`] accepts, which the macro reads for the
-/// deployment's own.
-#[doc(hidden)]
-pub trait BotRegistryIdSql {
-    /// The registry tables' DDL over this `Id` SQL type, which a deployment
-    /// includes in its schema document.
-    const DDL: &'static str;
-}
-
-/// The DDL over `TEXT` ids.
-const __DDL_TEXT: &str = "CREATE TABLE connetto_bots (id UUID PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, public_key BYTEA NOT NULL CHECK (octet_length(public_key) = 32), list_version INT NOT NULL, wake_url TEXT); CREATE TABLE connetto_registration_codes (code_hash BYTEA PRIMARY KEY, creator TEXT NOT NULL, bot UUID REFERENCES connetto_bots (id), expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ); CREATE TABLE connetto_bot_lists (bot UUID NOT NULL REFERENCES connetto_bots (id), version INT NOT NULL, table_name TEXT NOT NULL, verb TEXT NOT NULL CHECK (verb IN ('read', 'insert', 'update', 'delete')), optional BOOLEAN NOT NULL, PRIMARY KEY (bot, version, table_name, verb)); CREATE TABLE connetto_installations (id TEXT PRIMARY KEY, bot UUID NOT NULL REFERENCES connetto_bots (id), owner TEXT NOT NULL, accepted_version INT NOT NULL); CREATE TABLE connetto_installation_optional_tables (installation TEXT NOT NULL REFERENCES connetto_installations (id), table_name TEXT NOT NULL, PRIMARY KEY (installation, table_name));";
-
-/// The DDL over `UUID` ids.
-const __DDL_UUID: &str = "CREATE TABLE connetto_bots (id UUID PRIMARY KEY, owner UUID NOT NULL, name TEXT NOT NULL, public_key BYTEA NOT NULL CHECK (octet_length(public_key) = 32), list_version INT NOT NULL, wake_url TEXT); CREATE TABLE connetto_registration_codes (code_hash BYTEA PRIMARY KEY, creator UUID NOT NULL, bot UUID REFERENCES connetto_bots (id), expires_at TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ); CREATE TABLE connetto_bot_lists (bot UUID NOT NULL REFERENCES connetto_bots (id), version INT NOT NULL, table_name TEXT NOT NULL, verb TEXT NOT NULL CHECK (verb IN ('read', 'insert', 'update', 'delete')), optional BOOLEAN NOT NULL, PRIMARY KEY (bot, version, table_name, verb)); CREATE TABLE connetto_installations (id UUID PRIMARY KEY, bot UUID NOT NULL REFERENCES connetto_bots (id), owner UUID NOT NULL, accepted_version INT NOT NULL); CREATE TABLE connetto_installation_optional_tables (installation UUID NOT NULL REFERENCES connetto_installations (id), table_name TEXT NOT NULL, PRIMARY KEY (installation, table_name));";
-
-#[doc(hidden)]
-impl BotRegistryIdSql for diesel::sql_types::Text {
-    const DDL: &'static str = __DDL_TEXT;
-}
-
-#[doc(hidden)]
-impl BotRegistryIdSql for diesel::sql_types::Uuid {
-    const DDL: &'static str = __DDL_UUID;
-}
-
 /// Generate the default bot registry tables and their
 /// [`ConnettoBotSchema`] impl, over the deployment's `Id` SQL type, plus the
 /// tables' DDL with that type in the id columns, [`BOTS_DDL`], which a
@@ -500,85 +446,7 @@ impl BotRegistryIdSql for diesel::sql_types::Uuid {
 #[macro_export]
 macro_rules! connetto_bots_tables {
     ($id:ty, $id_sql:ty) => {
-        diesel::table! {
-            /// One row per registered bot.
-            connetto_bots (id) {
-                /// The id connetto minted at the first registration.
-                id -> diesel::sql_types::Uuid,
-                /// The registration code's creator, the bot's owner.
-                owner -> $id_sql,
-                /// The name the registration gave it.
-                name -> diesel::sql_types::Text,
-                /// Its Ed25519 public key, 32 bytes.
-                public_key -> diesel::sql_types::Bytea,
-                /// The current list version.
-                list_version -> diesel::sql_types::Integer,
-                /// The wake URL R103 registers for it, absent until then.
-                wake_url -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
-            }
-        }
-
-        diesel::table! {
-            /// One row per one-time registration code, its SHA-256 as the key.
-            connetto_registration_codes (code_hash) {
-                /// The SHA-256 of the code, which the code itself never is.
-                code_hash -> diesel::sql_types::Bytea,
-                /// The signed-in person who created it.
-                creator -> $id_sql,
-                /// The bot it names, absent for a first registration.
-                bot -> diesel::sql_types::Nullable<diesel::sql_types::Uuid>,
-                /// When it stops being usable.
-                expires_at -> diesel::sql_types::Timestamptz,
-                /// When a registration spent it.
-                used_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
-            }
-        }
-
-        diesel::table! {
-            /// One row per table and verb of one bot's list version.
-            connetto_bot_lists (bot, version, table_name, verb) {
-                /// The bot the version belongs to.
-                bot -> diesel::sql_types::Uuid,
-                /// The version the row belongs to.
-                version -> diesel::sql_types::Integer,
-                /// The table the entry names.
-                table_name -> diesel::sql_types::Text,
-                /// The verb, one of `read`, `insert`, `update` and `delete`.
-                verb -> diesel::sql_types::Text,
-                /// Whether the entry's table is optional for an installation.
-                optional -> diesel::sql_types::Bool,
-            }
-        }
-
-        diesel::table! {
-            /// One row per bot installed for an owner.
-            connetto_installations (id) {
-                /// The deployment's id of the installation, minted by the
-                /// admin's app.
-                id -> $id_sql,
-                /// The bot it runs.
-                bot -> diesel::sql_types::Uuid,
-                /// The owner it serves.
-                owner -> $id_sql,
-                /// The list version the admin accepted.
-                accepted_version -> diesel::sql_types::Integer,
-            }
-        }
-
-        diesel::table! {
-            /// One row per optional table an installation accepted.
-            connetto_installation_optional_tables (installation, table_name) {
-                /// The installation the acceptance belongs to.
-                installation -> $id_sql,
-                /// The optional table it accepted.
-                table_name -> diesel::sql_types::Text,
-            }
-        }
-
-        diesel::allow_tables_to_appear_in_same_query!(
-            connetto_installations,
-            connetto_installation_optional_tables,
-        );
+        connetto_core::connetto_registry_tables!(pg, $id_sql);
 
         /// The registry tables' DDL over the deployment's `Id` SQL type,
         /// which a deployment includes in its schema document.
@@ -590,13 +458,8 @@ macro_rules! connetto_bots_tables {
 
         impl $crate::bots::ConnettoBotSchema for ConnettoBots {
             type Id = $id;
-            const TABLES: &'static [&'static str] = &[
-                "connetto_bots",
-                "connetto_registration_codes",
-                "connetto_bot_lists",
-                "connetto_installations",
-                "connetto_installation_optional_tables",
-            ];
+            type IdSql = $id_sql;
+            const TABLES: &'static [&'static str] = connetto_core::bots::REGISTRY_TABLES;
 
             fn code_facts(
                 conn: &mut diesel_async::AsyncPgConnection,

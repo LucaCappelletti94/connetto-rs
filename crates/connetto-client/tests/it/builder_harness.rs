@@ -195,7 +195,8 @@ async fn builder_anonymous_connect_reads_a_synced_row() {
         .await;
 
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String>(PG_DDL, "").expect("translate the sources"),
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(PG_DDL, "")
+            .expect("translate the sources"),
     );
     let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema)
         .with_dialer(OneShot {
@@ -251,9 +252,11 @@ async fn builder_held_credential_reads_the_callers_own_row() {
             .with_replication(["orders"])
             .with_session(
                 SessionConfig::new().with_schema_version(Some(
-                    connetto_schema::translate::<String>(PG_DDL, POLICIES)
-                        .expect("translate")
-                        .version(),
+                    connetto_schema::translate::<String, connetto_core::bots::TextIds>(
+                        PG_DDL, POLICIES,
+                    )
+                    .expect("translate")
+                    .version(),
                 )),
             ),
         snapshot,
@@ -267,7 +270,8 @@ async fn builder_held_credential_reads_the_callers_own_row() {
         .await;
 
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String>(PG_DDL, POLICIES).expect("translate the sources"),
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(PG_DDL, POLICIES)
+            .expect("translate the sources"),
     );
     let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema)
         .with_dialer(OneShot {
@@ -325,7 +329,8 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
     let dir = tempdir().expect("a temp dir");
     let store = SharedKeyStore::new();
     let schema = SyncSchema::new(
-        connetto_schema::translate::<String>(NOTES_DDL, "").expect("translate the sources"),
+        connetto_schema::translate::<String, connetto_core::bots::TextIds>(NOTES_DDL, "")
+            .expect("translate the sources"),
     );
 
     let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())

@@ -138,14 +138,18 @@ fn instant_monotonic() -> Duration {
 fn monotonic() -> Duration {
     let millis = web_sys::window()
         .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or(0.0);
+        .map_or(0.0, |p| p.now());
     // Millis since the time origin, a non-negative integer-valued float within
     // u64, so the truncating cast loses nothing.
     debug_assert!(
         millis.is_finite() && millis >= 0.0,
         "performance.now is not a valid reading"
     );
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the debug_assert bounds millis to a non-negative u64 millisecond count"
+    )]
     Duration::from_millis(millis as u64)
 }
 
@@ -159,6 +163,11 @@ fn wall() -> Duration {
         millis.is_finite() && millis >= 0.0,
         "Date.now is not a valid reading"
     );
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "the debug_assert bounds millis to a non-negative u64 millisecond count"
+    )]
     Duration::from_millis(millis as u64)
 }
 

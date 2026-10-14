@@ -121,7 +121,7 @@ fn upstream_bundle() -> connetto_core::schema::SchemaBundle {
             "/../../examples/deployment/policies.sql"
         ),
     );
-    connetto_schema::translate::<String>(&ddl, &policies)
+    connetto_schema::translate::<String, connetto_core::bots::TextIds>(&ddl, &policies)
         .unwrap_or_else(|err| panic!("translating the upstream schema: {err}"))
 }
 

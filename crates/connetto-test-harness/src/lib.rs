@@ -45,7 +45,7 @@ use diesel_async::{AsyncPgConnection, RunQueryDsl, SimpleAsyncConnection};
 use openfga_client::client::{CreateStoreRequest, OpenFgaServiceClient};
 use openfga_client::tonic::transport::Channel;
 use rls2fga::translator::Translator;
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, ParsedDiffSet, PatchsetOp, SimpleTable, Value};
 use sqlparser::dialect::PostgreSqlDialect;
 use subql::backend::Postgres;
 use subql::visibility::openfga::OpenFgaError;
@@ -695,13 +695,28 @@ pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
 /// watermark and epoch tables.
 pub const BOTS_DDL: &str = connetto_server::defaults::BOTS_DDL;
 
-/// Create the bot registry tables, as admin.
+/// Create the bot registry tables, as admin, readable by every role a test
+/// connects as.
+///
+/// The server loads the authorization facts behind the registry as its reader
+/// role, the way it does a deployment's own tables, so a deployment grants
+/// that role `SELECT` on them. A fixture creates its reader roles per test, so
+/// the grant goes to `PUBLIC`, and the cap and the deployment's rules still
+/// decide which rows a role sees.
 pub async fn provision_bot_tables(pool: &Pool<AsyncPgConnection>) {
     for statement in BOTS_DDL.split(';') {
         if !statement.trim().is_empty() {
             exec(pool, statement).await;
         }
     }
+    exec(
+        pool,
+        &format!(
+            "GRANT SELECT ON {} TO PUBLIC",
+            connetto_core::bots::REGISTRY_TABLES.join(", ")
+        ),
+    )
+    .await;
 }
 
 /// Apply the cap document the build generates beside the schema and policies,
@@ -718,9 +733,26 @@ pub async fn provision_cap_policies(
     schema_sql: &str,
     policies_sql: &str,
 ) {
-    let cap = connetto_schema::cap_policies(schema_sql, policies_sql)
-        .unwrap_or_else(|err| panic!("the cap document generates: {err}"));
+    let cap =
+        connetto_schema::cap_policies::<connetto_core::bots::TextIds>(schema_sql, policies_sql)
+            .unwrap_or_else(|err| panic!("the cap document generates: {err}"));
     if !cap.is_empty() {
+        // The document is not idempotent, and the registry tables it caps
+        // persist across the tests that share one Postgres, so a re-provision
+        // would refuse the re-create. Drop the rules it (re)creates first.
+        let tables = connetto_schema::schema_tables(&connetto_schema::with_registry::<
+            connetto_core::bots::TextIds,
+        >(schema_sql))
+        .expect("the schema with the registry parses");
+        for table in &tables {
+            for suffix in ["open", "cap_read", "cap_insert", "cap_update", "cap_delete"] {
+                exec(
+                    pool,
+                    &format!("DROP POLICY IF EXISTS \"{table}_connetto_{suffix}\" ON \"{table}\""),
+                )
+                .await;
+            }
+        }
         exec(pool, &cap).await;
     }
 }
@@ -778,13 +810,23 @@ pub async fn provision_oplog(pool: &Pool<AsyncPgConnection>) {
 
 /// Set up the publication, slot, and oplog table for logical replication.
 ///
+/// The publication carries `tables` and connetto's bot registry tables, which
+/// every deployment's publication must carry as well, since the registry is
+/// synced like the deployment's own tables.
+///
 /// # Panics
 ///
 /// When slot removal, DDL execution, or oplog provisioning fails.
 pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str]) {
     drop_slot(pool).await;
     exec(pool, &format!("DROP PUBLICATION IF EXISTS {PUBLICATION}")).await;
-    for table in tables {
+    let mut published: Vec<&str> = tables.to_vec();
+    for registry in connetto_core::bots::REGISTRY_TABLES {
+        if !published.contains(registry) {
+            published.push(registry);
+        }
+    }
+    for table in &published {
         exec(pool, &format!("ALTER TABLE {table} REPLICA IDENTITY FULL")).await;
     }
     provision_oplog(pool).await;
@@ -792,7 +834,7 @@ pub async fn start_replication_on(pool: &Pool<AsyncPgConnection>, tables: &[&str
         pool,
         &format!(
             "CREATE PUBLICATION {PUBLICATION} FOR TABLE {}",
-            tables.join(", ")
+            published.join(", ")
         ),
     )
     .await;
@@ -1659,6 +1701,9 @@ pub async fn spawn_server(
         let table_refs: Vec<&str> = replication_tables.iter().map(String::as_str).collect();
         start_replication_on(&admin_pool, &table_refs).await;
     }
+    // Every catalog below reads `pg_ddl` as given. The caller hands the same
+    // text to the snapshot and the authorization it built, so a table carries
+    // one id in all of them.
     let upkeep = auth.upkeep();
     let engine_connector = PgReadConnector::with_session_setup(connector_pool.clone());
     let mut materializer_builder = Materializer::builder(&pg_ddl)
@@ -2108,6 +2153,30 @@ pub fn insert_changeset(
     ChangeSet::<SimpleTable, String, Vec<u8>>::new()
         .insert(insert)
         .build()
+}
+
+/// The rows the given snapshot patch frames actually carry, decoded from each
+/// zstd-compressed patchset and counted as inserts.
+///
+/// # Panics
+///
+/// Panics when a patchset cannot be decompressed or parsed.
+#[must_use]
+pub fn snapshot_rows(patches: &[SnapshotPatch]) -> usize {
+    patches
+        .iter()
+        .map(|patch| {
+            let bytes = zstd::decode_all(patch.patchset_zstd.as_slice()).expect("decompress");
+            // A snapshot carrying no rows is not a patchset at all, so it
+            // counts as none rather than failing to parse.
+            let ParsedDiffSet::Patchset(set) = ParsedDiffSet::parse(&bytes).expect("parse") else {
+                return 0;
+            };
+            set.iter()
+                .filter(|op| matches!(op, PatchsetOp::Insert { .. }))
+                .count()
+        })
+        .sum()
 }
 
 #[cfg(test)]

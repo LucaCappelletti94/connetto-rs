@@ -73,7 +73,7 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
             .identity()
             .map(|identity| identity.user_id.to_string()),
         Key::subjects(caller.capabilities()),
-        bot_list_for(caller).to_owned(),
+        bot_list_for(caller),
     )
 }
 
@@ -81,13 +81,13 @@ pub(crate) fn rendered_caller<Id: Display, Key: CapabilityKey>(
 /// every path that runs SQL as a caller and the watcher's request answer
 /// both bind, so Postgres and the local gate hold the caller to one list.
 ///
-/// `*` for every caller until a bot login hands a registered bot its
-/// accepted list, which this is the one place to read from the caller
-/// once it carries one.
-pub(crate) fn bot_list_for<Id: Display, Key: CapabilityKey>(
-    _caller: &Principal<Id, Key>,
-) -> &'static str {
-    connetto_core::BOT_LIST_WILDCARD
+/// The wildcard for a caller holding nothing, and the list's own text for the
+/// login that resolved one, read from the caller the one place it lives.
+pub(crate) fn bot_list_for<Id: Display, Key: CapabilityKey>(caller: &Principal<Id, Key>) -> String {
+    caller.bot_list().map_or_else(
+        || connetto_core::BOT_LIST_WILDCARD.to_owned(),
+        connetto_core::bots::BotList::text,
+    )
 }
 
 /// The bucket a per-caller meter charges: whatever names this caller, else
@@ -122,7 +122,7 @@ pub(crate) struct CallerBinding {
     user_setting: Arc<str>,
     setting: &'static str,
     separator: char,
-    bot_list: &'static str,
+    bot_list: String,
 }
 
 impl CallerBinding {
@@ -189,7 +189,7 @@ impl CallerBinding {
                 self.caller.identity().unwrap_or(marker),
             ),
             (self.setting, subjects.as_str()),
-            (connetto_core::BOT_LIST_SETTING, self.bot_list),
+            (connetto_core::BOT_LIST_SETTING, self.bot_list.as_str()),
         ]
         .into_iter()
         .map(|(setting, value)| {
@@ -693,12 +693,48 @@ mod tests {
             .accept(Subject::Identity(VerifiedSession {
                 context: AuthContext::new("key:k1"),
                 session_id: handle(5),
+                bot_list: None,
             }))
             .expect("one identity is accepted");
         assert_ne!(
             meter_key(&identified, identified.session_id()),
             meter_key(&first, first.session_id()),
             "an identity spelled like the key meters apart from the key holder"
+        );
+    }
+
+    /// The binding reads the wildcard for a person and the list's own text for a login that resolved one.
+    #[test]
+    fn the_binding_reads_the_list_from_the_caller() {
+        use connetto_core::SessionId;
+        use connetto_core::auth::{AuthContext, Subject, VerifiedSession};
+        use connetto_core::bots::{BotList, Verb};
+
+        fn handle(byte: u8) -> SessionId {
+            SessionId::from_uuid(uuid::Uuid::from_bytes([byte; 16]))
+        }
+
+        let person: Principal = Principal::unidentified(handle(1));
+        assert_eq!(
+            bot_list_for(&person),
+            connetto_core::BOT_LIST_WILDCARD,
+            "a caller holding no list carries the wildcard"
+        );
+
+        let mut bot: Principal = Principal::unidentified(handle(2));
+        bot.accept(Subject::Identity(VerifiedSession {
+            context: AuthContext::new("bot-a"),
+            session_id: handle(2),
+            bot_list: Some(BotList::new([
+                ("t".to_owned(), Verb::Read),
+                ("t".to_owned(), Verb::Insert),
+            ])),
+        }))
+        .expect("one identity is accepted");
+        assert_eq!(
+            bot_list_for(&bot),
+            "t:read,t:insert",
+            "a caller holding a list carries its own text"
         );
     }
 }

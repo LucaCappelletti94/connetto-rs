@@ -325,10 +325,14 @@ mod tests {
     );
 
     fn reach(shape: (&str, &str)) -> GrantReach {
-        Translated::of::<String>(shape.0, shape.1, DEFAULT_USER_SETTING)
-            .expect("the shape translates")
-            .into_parts()
-            .2
+        Translated::of::<String, connetto_core::bots::TextIds>(
+            shape.0,
+            shape.1,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("the shape translates")
+        .into_parts()
+        .2
     }
 
     /// **The central claim.** A membership fact hangs on the team, and the
@@ -337,9 +341,12 @@ mod tests {
     /// to, and the withdrawal then reaches nobody.
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
-        let translated =
-            Translated::of::<String>(CROSS_TABLE.0, CROSS_TABLE.1, DEFAULT_USER_SETTING)
-                .expect("the shape translates");
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            CROSS_TABLE.0,
+            CROSS_TABLE.1,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("the shape translates");
         // The member relation is the team's leaf relation. Its name comes from
         // the model, so the test reads it from there rather than spelling it.
         let member = translated

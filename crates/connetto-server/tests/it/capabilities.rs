@@ -134,6 +134,7 @@ fn caller(user: Option<&str>, keys: &[&str]) -> Principal {
             .accept(Subject::Identity(VerifiedSession {
                 context: AuthContext::new(user),
                 session_id: handle,
+                bot_list: None,
             }))
             .expect("one identity");
     }

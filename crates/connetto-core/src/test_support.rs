@@ -29,18 +29,24 @@ pub fn replica_key() -> ReplicaKey {
 /// `test-support` precisely because it checks nothing, so no production build
 /// can reach it and no constructor installs it by default.
 ///
-/// A grant is `user:<id>`, optionally `user:<id>#<run>`, or `key:<subject>`.
-/// Anything else is refused. The prefix stands in for the `knd` claim the real
-/// checker reads out of a verified token: this stand-in has no signature to
-/// carry one, so the string is all there is, and mirroring the claim keeps
-/// every test explicit about which kind of grant it presents.
+/// A grant is `user:<id>`, optionally `user:<id>#<run>`, `key:<subject>`, or
+/// `bot:<id>#<entries>`. Anything else is refused. The prefix stands in for
+/// the `knd` claim the real checker reads out of a verified token: this
+/// stand-in has no signature to carry one, so the string is all there is, and
+/// mirroring the claim keeps every test explicit about which kind of grant it
+/// presents.
 ///
 /// A `user:<id>#<run>` grant names one person holding several concurrent runs:
 /// the part between the prefix and the `#` is the `user_id` and the whole
-/// string seeds the handle, deterministically, so a reconnect on the same grant
-/// keeps its watermark. A real deployment gets the handle from the auth store,
-/// which mints a fresh one per login, so two devices of one person never
+/// string seeds the handle, deterministically, so a reconnect on the same
+/// grant keeps its watermark. A real deployment gets the handle from the auth
+/// store, which mints a fresh one per login, so two devices of one person never
 /// collide.
+///
+/// A `bot:<id>#<entries>` grant binds a bot's session settings the way a bot
+/// login resolves them, with the identity before the `#` and the effective
+/// list after it as `table:verb` entries joined by commas, and any other shape
+/// is refused like a bad grant.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct TestGrantChecker;
 
@@ -61,9 +67,47 @@ impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
                     crate::auth::CapabilitySubject::new(token),
                 ));
             }
+            if let Some(bot) = token.strip_prefix("bot:") {
+                let (user_id, entries) = bot.split_once('#').ok_or_else(|| {
+                    crate::traits::GrantRefused::Invalid("a bot grant names no entries".to_owned())
+                })?;
+                if user_id.is_empty() {
+                    return Err(crate::traits::GrantRefused::Invalid(
+                        "a bot grant named no user".to_owned(),
+                    ));
+                }
+                let mut list = Vec::new();
+                if !entries.is_empty() {
+                    for entry in entries.split(crate::schema::BOT_LIST_SEPARATOR) {
+                        let (table, verb) = entry.split_once(':').ok_or_else(|| {
+                            crate::traits::GrantRefused::Invalid(format!(
+                                "a bot list entry names no verb: {entry:?}"
+                            ))
+                        })?;
+                        if table.is_empty() {
+                            return Err(crate::traits::GrantRefused::Invalid(
+                                "a bot list entry names no table".to_owned(),
+                            ));
+                        }
+                        let Some(verb) = crate::bots::Verb::parse(verb) else {
+                            return Err(crate::traits::GrantRefused::Invalid(format!(
+                                "a bot list entry spells no verb: {verb:?}"
+                            )));
+                        };
+                        list.push((table.to_owned(), verb));
+                    }
+                }
+                return Ok(crate::auth::Subject::Identity(
+                    crate::auth::VerifiedSession {
+                        context: crate::auth::AuthContext::new(user_id),
+                        session_id: crate::SessionId::from_token_hash(token),
+                        bot_list: Some(crate::bots::BotList::new(list)),
+                    },
+                ));
+            }
             let Some(named) = token.strip_prefix("user:") else {
                 return Err(crate::traits::GrantRefused::Invalid(format!(
-                    "a grant naming neither a user nor a key: {token:?}"
+                    "a grant naming neither a user, a key nor a bot: {token:?}"
                 )));
             };
             let user_id = named.split_once('#').map_or(named, |(user, _run)| user);
@@ -76,6 +120,7 @@ impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
                 crate::auth::VerifiedSession {
                     context: crate::auth::AuthContext::new(user_id),
                     session_id: crate::SessionId::from_token_hash(token),
+                    bot_list: None,
                 },
             ))
         })
@@ -502,4 +547,69 @@ pub async fn two_accounts_keep_their_own_key<S: crate::traits::ReplicaKeyStore>(
         "and left bob openable"
     );
     store.clear(bob).await.expect("clear bob");
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::auth::Subject;
+    use crate::messages::Grant;
+    use crate::traits::{GrantRefused, HandshakeAuthority};
+
+    use super::TestGrantChecker;
+
+    fn check(grant: &str) -> Result<Subject, GrantRefused> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build a runtime");
+        runtime.block_on(async { TestGrantChecker.check_grant(&Grant::new(grant)).await })
+    }
+
+    /// A `bot:` grant resolves to an identity carrying the list it names, and
+    /// a person's grant resolves none.
+    #[test]
+    fn a_bot_grant_binds_the_list_it_names() {
+        let Subject::Identity(session) =
+            check("bot:bot-a#t:read,t:insert").expect("the grant resolves")
+        else {
+            panic!("a bot grant resolves a login");
+        };
+        assert_eq!(session.context.user_id, "bot-a");
+        let list = session.bot_list.expect("the grant names a list");
+        assert_eq!(
+            list.entries(),
+            &[
+                ("t".to_owned(), crate::bots::Verb::Read),
+                ("t".to_owned(), crate::bots::Verb::Insert),
+            ]
+        );
+
+        let Subject::Identity(person) = check("user:alice").expect("the grant resolves") else {
+            panic!("a person grant resolves a login");
+        };
+        assert!(person.bot_list.is_none());
+    }
+
+    /// A bot grant naming no entries binds the empty list, which sees nothing.
+    #[test]
+    fn a_bot_grant_with_no_entries_is_an_empty_list() {
+        let Subject::Identity(session) = check("bot:bot-a#").expect("the grant resolves") else {
+            panic!("a bot grant resolves a login");
+        };
+        assert!(session.bot_list.expect("the grant names a list").is_empty());
+    }
+
+    /// An entry outside the shape is refused like any other bad grant.
+    #[test]
+    fn a_bot_grant_entry_outside_the_shape_is_refused() {
+        for grant in [
+            "bot:bot-a",
+            "bot:#t:read",
+            "bot:bot-a#t:drop",
+            "bot:bot-a#t",
+            "bot:bot-a#:read",
+            "bot:bot-a#t:read,,",
+        ] {
+            assert!(check(grant).is_err(), "{grant:?} is refused");
+        }
+    }
 }

@@ -12,7 +12,9 @@ use connetto_core::traits::Transport;
 use connetto_server::{IdentityResolver, ResolveFuture, VerifiedClaims};
 use connetto_test_harness::{Fixture, RowValue, insert_changeset, isolated_session_keyring};
 use diesel::QueryDsl;
+use diesel_async::AsyncPgConnection;
 use diesel_async::RunQueryDsl as _;
+use diesel_async::pooled_connection::bb8::Pool;
 use tokio::net::TcpListener;
 
 use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
@@ -121,6 +123,33 @@ impl IdentityResolver for UuidResolver {
     }
 }
 
+/// Recreate the bot registry tables over the deployment's `UUID` ids, with
+/// what a deployment's migration gives them, the cap rules, the reader grant
+/// and the publication.
+async fn recreate_registry_over_uuid(pool: &Pool<AsyncPgConnection>) {
+    for statement in app::BOTS_DDL.split(';') {
+        if !statement.trim().is_empty() {
+            exec(pool, statement).await;
+        }
+    }
+    let registry_cap = connetto_schema::cap_policies::<connetto_core::bots::UuidIds>("", "")
+        .expect("the registry's own cap document");
+    connetto_test_harness::exec(pool, &registry_cap).await;
+    let registry = connetto_core::bots::REGISTRY_TABLES.join(", ");
+    exec(pool, &format!("GRANT SELECT ON {registry} TO PUBLIC")).await;
+    for table in connetto_core::bots::REGISTRY_TABLES {
+        exec(pool, &format!("ALTER TABLE {table} REPLICA IDENTITY FULL")).await;
+    }
+    exec(
+        pool,
+        &format!(
+            "ALTER PUBLICATION {} ADD TABLE {registry}",
+            connetto_test_harness::PUBLICATION
+        ),
+    )
+    .await;
+}
+
 #[tokio::test]
 async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let _keyring = isolated_session_keyring();
@@ -148,11 +177,7 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     ] {
         exec(&pool, stmt).await;
     }
-    for statement in app::BOTS_DDL.split(';') {
-        if !statement.trim().is_empty() {
-            exec(&pool, statement).await;
-        }
-    }
+    recreate_registry_over_uuid(&pool).await;
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a listener");

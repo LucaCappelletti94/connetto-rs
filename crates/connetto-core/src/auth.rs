@@ -66,18 +66,24 @@ impl<Id> AuthContext<Id> {
     }
 }
 
-/// A checked login grant: the identity it names plus the auth store's handle
-/// for the run it belongs to.
+/// A checked login grant: the identity it names, the auth store's handle for
+/// the run it belongs to, and the bot list the login bound when it resolved
+/// one.
 ///
 /// The session id is connetto-owned (minted at login, carried in the signed
 /// token's `sid` claim), never the client-fabricated `client_id`, so it
 /// survives a worker restart or a fresh transport on the same session.
+///
+/// The bot list rides the login because it is the one grant that resolves
+/// session settings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerifiedSession<Id = String> {
     /// The identity the session carries.
     pub context: AuthContext<Id>,
     /// The connetto-minted session id, keyed on by the durable watermark.
     pub session_id: crate::SessionId,
+    /// The bot list the login bound, when it resolved one.
+    pub bot_list: Option<crate::bots::BotList>,
 }
 
 /// The subject a capability grant names, for example `key:abc123`.
@@ -144,6 +150,7 @@ pub struct Principal<Id = String, Key = String> {
     session_id: SessionId,
     identity: Option<AuthContext<Id>>,
     capabilities: Vec<CapabilitySubject<Key>>,
+    bot_list: Option<crate::bots::BotList>,
 }
 
 impl<Id, Key> Principal<Id, Key> {
@@ -158,6 +165,7 @@ impl<Id, Key> Principal<Id, Key> {
             session_id,
             identity: None,
             capabilities: Vec::new(),
+            bot_list: None,
         }
     }
 
@@ -181,10 +189,12 @@ impl<Id, Key> Principal<Id, Key> {
             Subject::Identity(session) if self.identity.is_none() => {
                 self.identity = Some(session.context);
                 self.session_id = session.session_id;
+                self.bot_list = session.bot_list;
                 Ok(())
             }
             Subject::Identity(_) => {
                 self.identity = None;
+                self.bot_list = None;
                 Err(AmbiguousIdentity)
             }
         }
@@ -200,6 +210,12 @@ impl<Id, Key> Principal<Id, Key> {
     #[must_use]
     pub const fn identity(&self) -> Option<&AuthContext<Id>> {
         self.identity.as_ref()
+    }
+
+    /// The bot list a login bound on this run, when one resolved it.
+    #[must_use]
+    pub fn bot_list(&self) -> Option<&crate::bots::BotList> {
+        self.bot_list.as_ref()
     }
 
     /// The subjects whose capability grants resolved, in no meaningful order.
@@ -406,6 +422,7 @@ mod tests {
         Subject::Identity(VerifiedSession {
             context: AuthContext::new(user),
             session_id: handle(byte),
+            bot_list: None,
         })
     }
 
@@ -460,6 +477,46 @@ mod tests {
 
         assert!(first.identity().is_none());
         assert!(second.identity().is_none());
+    }
+
+    /// A login that resolves a bot list binds it to the caller, and a person's
+    /// login resolves none.
+    #[test]
+    fn a_login_binds_the_bot_list_it_resolves() {
+        use crate::bots::{BotList, Verb};
+
+        let mut principal: Principal = Principal::unidentified(handle(1));
+        principal
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("bot-a"),
+                session_id: handle(2),
+                bot_list: Some(BotList::new([
+                    ("t".to_owned(), Verb::Read),
+                    ("t".to_owned(), Verb::Insert),
+                ])),
+            }))
+            .unwrap();
+        assert_eq!(
+            principal.bot_list().unwrap().entries(),
+            &[("t".to_owned(), Verb::Read), ("t".to_owned(), Verb::Insert),],
+            "the list the login resolved is what the caller carries"
+        );
+
+        let mut person: Principal = Principal::unidentified(handle(3));
+        person.accept(login(4, "alice")).unwrap();
+        assert!(person.bot_list().is_none());
+
+        // A second identity drops the list with it.
+        let mut ambiguous: Principal = Principal::unidentified(handle(5));
+        ambiguous
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("bot-a"),
+                session_id: handle(6),
+                bot_list: Some(BotList::new([("t".to_owned(), Verb::Read)])),
+            }))
+            .unwrap();
+        assert!(ambiguous.accept(login(7, "bob")).is_err());
+        assert!(ambiguous.bot_list().is_none());
     }
 
     /// Two callers under a deployment whose separator is not a comma keep

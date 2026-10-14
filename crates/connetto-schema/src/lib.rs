@@ -15,7 +15,12 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 
+use connetto_core::bots::BotRegistryIdSql;
+
 use connetto_core::auth::CapabilityKey;
+/// The registry id markers build scripts and other diesel-free callers pass
+/// for `emit` and `translate`, re-exported beside [`translate`].
+pub use connetto_core::bots::{TextIds, UuidIds};
 use connetto_core::sql::quote_ident;
 use connetto_core::{
     AUDIT_TABLE, BOT_LIST_FUNCTION, BOT_LIST_SEPARATOR, BOT_LIST_SETTING, BOT_LIST_WILDCARD,
@@ -108,7 +113,15 @@ pub fn schema_tables(schema_sql: &str) -> Result<Vec<String>, SchemaError> {
 /// # Errors
 ///
 /// [`SchemaError::Translate`] when either document does not parse.
-pub fn cap_policies(schema_sql: &str, policies_sql: &str) -> Result<String, SchemaError> {
+pub fn cap_policies<Id: BotRegistryIdSql>(
+    schema_sql: &str,
+    policies_sql: &str,
+) -> Result<String, SchemaError> {
+    let schema_sql = with_registry::<Id>(schema_sql);
+    cap_policies_inner(&schema_sql, policies_sql)
+}
+
+fn cap_policies_inner(schema_sql: &str, policies_sql: &str) -> Result<String, SchemaError> {
     let tables = schema_tables(schema_sql)?;
     // A table is secured when either document enables row-level security on
     // it, so the schema document's own `ENABLE ROW LEVEL SECURITY` counts the
@@ -137,6 +150,19 @@ pub fn cap_policies(schema_sql: &str, policies_sql: &str) -> Result<String, Sche
     Ok(statements.join(";\n"))
 }
 
+/// The schema document connetto translates, the deployment's own document
+/// with the registry tables connetto appends, a `;` between the deployment's
+/// last statement and the registry DDL.
+pub fn with_registry<Id: BotRegistryIdSql>(schema_sql: &str) -> String {
+    let mut out = schema_sql.trim_end().to_owned();
+    if !out.ends_with(';') {
+        out.push(';');
+    }
+    out.push('\n');
+    out.push_str(<Id as BotRegistryIdSql>::DDL);
+    out
+}
+
 /// Translate the two Postgres source documents with connetto's fixed options
 /// and return the bundle they produce.
 ///
@@ -154,13 +180,14 @@ pub fn cap_policies(schema_sql: &str, policies_sql: &str) -> Result<String, Sche
 ///
 /// [`SchemaError::Translate`] when a source does not parse or the translation
 /// fails, [`SchemaError::Sqlite`] when the replica DDL is not accepted.
-pub fn translate<K: CapabilityKey>(
+pub fn translate<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema_sql: &str,
     policies_sql: &str,
 ) -> Result<SchemaBundle, SchemaError> {
+    let schema_sql = with_registry::<Id>(schema_sql);
     let options = options::<K>();
-    let mut translator = parsed_documents(schema_sql, policies_sql)?;
-    let cap = cap_policies(schema_sql, policies_sql)?;
+    let mut translator = parsed_documents(&schema_sql, policies_sql)?;
+    let cap = cap_policies_inner(&schema_sql, policies_sql)?;
     if !cap.is_empty() {
         translator = translator
             .sql(&cap)
@@ -216,7 +243,7 @@ pub fn translate<K: CapabilityKey>(
 ///
 /// As [`translate`], plus [`SchemaError::MissingOutDir`] outside a build
 /// script and [`SchemaError::Sqlite`] for a refused local tier.
-pub fn emit<K: CapabilityKey>(
+pub fn emit<K: CapabilityKey, Id: BotRegistryIdSql>(
     schema: &Path,
     policies: &Path,
     local_tier: Option<&Path>,
@@ -225,8 +252,8 @@ pub fn emit<K: CapabilityKey>(
     println!("cargo::rerun-if-changed={}", policies.display());
     let schema_sql = std::fs::read_to_string(schema)?;
     let policies_sql = std::fs::read_to_string(policies)?;
-    let cap = cap_policies(&schema_sql, &policies_sql)?;
-    let mut bundle = translate::<K>(&schema_sql, &policies_sql)?;
+    let cap = cap_policies::<Id>(&schema_sql, &policies_sql)?;
+    let mut bundle = translate::<K, Id>(&schema_sql, &policies_sql)?;
     if let Some(local_tier) = local_tier {
         println!("cargo::rerun-if-changed={}", local_tier.display());
         let tier_sql = std::fs::read_to_string(local_tier)?;
@@ -506,7 +533,7 @@ mod tests {
     /// The cap document is the four `AS RESTRICTIVE` policies per table the
     /// schema document creates, in document order, with the row-level
     /// security enabling pair only on a table the policies document leaves
-    /// without it.
+    /// without it, and it reaches the registry tables connetto appends.
     #[test]
     fn cap_policies_cover_every_table_and_enable_rls_where_absent() {
         let schema = "CREATE TABLE orders (id INT PRIMARY KEY, label TEXT); \
@@ -519,9 +546,20 @@ mod tests {
                  OR '*' = ANY(string_to_array(current_setting('app.bot_list', true), ','))"
             )
         };
+        // The deployment's tables in document order, then the five registry
+        // tables connetto appends. `orders` is secured; the rest are not.
+        let tables = [
+            ("orders", false),
+            ("notes", true),
+            ("connetto_bots", true),
+            ("connetto_registration_codes", true),
+            ("connetto_bot_lists", true),
+            ("connetto_installations", true),
+            ("connetto_installation_optional_tables", true),
+        ];
         let mut expected = Vec::new();
-        for table in ["orders", "notes"] {
-            if table == "notes" {
+        for (table, needs_enable) in tables {
+            if needs_enable {
                 expected.push(format!("ALTER TABLE \"{table}\" ENABLE ROW LEVEL SECURITY"));
                 expected.push(format!(
                     "CREATE POLICY \"{table}_connetto_open\" ON \"{table}\" \
@@ -550,7 +588,8 @@ mod tests {
             ));
         }
         assert_eq!(
-            cap_policies(schema, policies).expect("the documents parse"),
+            cap_policies::<connetto_core::bots::TextIds>(schema, policies)
+                .expect("the documents parse"),
             expected.join(";\n")
         );
     }
@@ -565,7 +604,8 @@ mod tests {
                       ALTER TABLE notes ENABLE ROW LEVEL SECURITY;";
         let policies = "CREATE POLICY notes_p ON notes FOR ALL USING \
                         (owner = current_setting('app.user_id', true));";
-        let cap = cap_policies(schema, policies).expect("the documents parse");
+        let cap = cap_policies::<connetto_core::bots::TextIds>(schema, policies)
+            .expect("the documents parse");
         assert!(
             !cap.contains("notes_connetto_open"),
             "the schema document enabled row-level security, so the cap adds \
@@ -586,12 +626,34 @@ mod tests {
         let policies = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;\n\
                         CREATE POLICY items_p ON items FOR ALL USING \
                         (owner = current_setting('app.user_id', true));";
-        let bundle = translate::<String>(schema, policies).expect("translates");
+        let bundle = translate::<String, connetto_core::bots::TextIds>(schema, policies)
+            .expect("translates");
         assert!(
             bundle.replica_ddl().contains("current_bot_list"),
             "the replica DDL names the bot list function: {}",
             bundle.replica_ddl()
         );
+        // connetto adds the registry tables to the document it translates, so
+        // the Postgres source and the replica DDL both carry them.
+        for table in [
+            "connetto_bots",
+            "connetto_registration_codes",
+            "connetto_bot_lists",
+            "connetto_installations",
+            "connetto_installation_optional_tables",
+        ] {
+            assert!(
+                bundle
+                    .schema_source()
+                    .contains(&format!("CREATE TABLE {table} ")),
+                "the Postgres source carries {table}: {}",
+                bundle.schema_source()
+            );
+            assert!(
+                bundle.replica_ddl().contains(table),
+                "the replica DDL carries {table}"
+            );
+        }
     }
 
     /// The derivation and the database agree on the views over the

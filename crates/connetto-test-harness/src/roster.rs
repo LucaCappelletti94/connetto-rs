@@ -225,6 +225,7 @@ mod tests {
             .accept(Subject::Identity(VerifiedSession {
                 context: AuthContext::new(user),
                 session_id: SessionId::from_token_hash(user),
+                bot_list: None,
             }))
             .expect("one identity");
         Arc::new(principal)
