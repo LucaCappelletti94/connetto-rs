@@ -22,69 +22,10 @@ env:
 # tree saved after a Cargo.lock change holds none of the artifacts the
 # older lock left behind. Pull requests also restore the nearest older key.
 jobs:
-  format:
-    name: Format ${{ matrix.name }}
+  checks:
+    name: Check ${{ matrix.name }}
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    strategy:
-      fail-fast: false
-      matrix:
-        # Every workspace, because a check that runs at the root alone leaves
-        # each standalone one to drift: six files were unformatted when this
-        # matrix replaced the single root run.
-        include:
-          - name: root
-            cwd: .
-          - name: connetto-web
-            cwd: crates/connetto-web
-          - name: wasm-smoke
-            cwd: examples/wasm-smoke
-          - name: dioxus-web-demo
-            cwd: examples/dioxus-web-demo
-          - name: yew-web-demo
-            cwd: examples/yew-web-demo
-          - name: webauthn-unlock
-            cwd: examples/webauthn-unlock
-          - name: dioxus-desktop-demo
-            cwd: examples/dioxus-desktop-demo
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        id: cache-1
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable rustfmt
-        run: |
-          rustup toolchain install stable \
-            --profile minimal \
-            --component rustfmt
-
-      - name: Check formatting
-        working-directory: ${{ matrix.cwd }}
-        run: cargo +stable fmt --all -- --check
-
-      - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
-  lint:
-    name: Lint ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 40
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. These jobs never run the demo, so any file serves.
     env:
@@ -92,6 +33,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Every workspace, because a check that runs at the root alone leaves
+        # each standalone one to drift: six files were unformatted when this
+        # matrix replaced the single root run.
         include:
           - name: root native
             cwd: .
@@ -128,11 +72,11 @@ jobs:
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
-      - name: Install stable clippy
+      - name: Install stable rustfmt and clippy
         run: |
           rustup toolchain install stable \
             --profile minimal \
-            --component clippy
+            --component rustfmt,clippy
 
       - name: Add wasm target
         if: matrix.target != ''
@@ -144,7 +88,14 @@ jobs:
         if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
         uses: ./.github/actions/install-desktop-deps
 
+      - name: Check formatting
+        working-directory: ${{ matrix.cwd }}
+        run: cargo +stable fmt --all -- --check
+
+      # Clippy type-checks every target under these flags, so no separate cargo
+      # check runs. Each check below runs even when one before it failed.
       - name: Run clippy
+        if: ${{ !cancelled() }}
         working-directory: ${{ matrix.cwd }}
         run: |
           cargo +stable clippy \
@@ -153,6 +104,16 @@ jobs:
             ${{ matrix.target }} \
             -- \
             -D warnings
+
+      - name: Check docs
+        if: ${{ !cancelled() }}
+        working-directory: ${{ matrix.cwd }}
+        run: |
+          RUSTDOCFLAGS="-D warnings" \
+            cargo +stable doc \
+              --no-deps \
+              --all-features \
+              ${{ matrix.target }}
 
       - name: Save cargo downloads
         if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
@@ -165,39 +126,14 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
   nightly-lint:
-    name: Nightly lint ${{ matrix.name }}
+    name: Nightly lint
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     # --all-features turns on the demo's device-identity feature, whose build
-    # embeds a deployment root. These jobs never run the demo, so any file serves.
+    # embeds a deployment root. This job never runs the demo, so any file serves.
     env:
       CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
     continue-on-error: true
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: root native
-            cwd: .
-            target: ""
-          - name: connetto-web wasm
-            cwd: crates/connetto-web
-            target: --target wasm32-unknown-unknown
-          - name: wasm-smoke wasm
-            cwd: examples/wasm-smoke
-            target: --target wasm32-unknown-unknown
-          - name: dioxus-web-demo wasm
-            cwd: examples/dioxus-web-demo
-            target: --target wasm32-unknown-unknown
-          - name: yew-web-demo wasm
-            cwd: examples/yew-web-demo
-            target: --target wasm32-unknown-unknown
-          - name: webauthn-unlock wasm
-            cwd: examples/webauthn-unlock
-            target: --target wasm32-unknown-unknown
-          - name: dioxus-desktop-demo native
-            cwd: examples/dioxus-desktop-demo
-            target: ""
     steps:
       - uses: actions/checkout@v7
 
@@ -217,183 +153,34 @@ jobs:
           rustup toolchain install nightly \
             --profile minimal \
             --component clippy
+          rustup target add wasm32-unknown-unknown --toolchain nightly
 
-      - name: Add wasm target
-        if: matrix.target != ''
-        run: rustup target add wasm32-unknown-unknown --toolchain nightly
-
-      # The root legs pass --all-features, which turns on connetto-dioxus's
-      # desktop feature and its webview stack.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
         uses: ./.github/actions/install-desktop-deps
 
+      # Every workspace runs even after one fails, so one report lists them all.
       - name: Run nightly clippy
-        working-directory: ${{ matrix.cwd }}
         run: |
-          cargo +nightly clippy \
-            --all-targets \
-            --all-features \
-            ${{ matrix.target }} \
-            -- \
-            -D warnings
-
-      - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
-  docs:
-    name: Docs ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    # --all-features turns on the demo's device-identity feature, whose build
-    # embeds a deployment root. These jobs never run the demo, so any file serves.
-    env:
-      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: root native
-            cwd: .
-            target: ""
-          - name: connetto-web wasm
-            cwd: crates/connetto-web
-            target: --target wasm32-unknown-unknown
-          - name: wasm-smoke wasm
-            cwd: examples/wasm-smoke
-            target: --target wasm32-unknown-unknown
-          - name: dioxus-web-demo wasm
-            cwd: examples/dioxus-web-demo
-            target: --target wasm32-unknown-unknown
-          - name: yew-web-demo wasm
-            cwd: examples/yew-web-demo
-            target: --target wasm32-unknown-unknown
-          - name: webauthn-unlock wasm
-            cwd: examples/webauthn-unlock
-            target: --target wasm32-unknown-unknown
-          - name: dioxus-desktop-demo native
-            cwd: examples/dioxus-desktop-demo
-            target: ""
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        id: cache-1
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable rustdoc
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Add wasm target
-        if: matrix.target != ''
-        run: rustup target add wasm32-unknown-unknown --toolchain stable
-
-      # The root legs pass --all-features, which turns on connetto-dioxus's
-      # desktop feature and its webview stack.
-      - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
-        uses: ./.github/actions/install-desktop-deps
-
-      - name: Check docs
-        working-directory: ${{ matrix.cwd }}
-        run: |
-          RUSTDOCFLAGS="-D warnings" \
-            cargo +stable doc \
-              --no-deps \
-              --all-features \
-              ${{ matrix.target }}
-
-      - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
-        uses: actions/cache/save@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: ${{ steps.cache-1.outputs.cache-primary-key }}
-
-  compile:
-    name: Compile ${{ matrix.name }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    # --all-features turns on the demo's device-identity feature, whose build
-    # embeds a deployment root. These jobs never run the demo, so any file serves.
-    env:
-      CONNETTO_DEMO_BUILD_DEVICE_ROOT: /dev/null
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: root native
-            cwd: .
-            target: ""
-          - name: connetto-web wasm
-            cwd: crates/connetto-web
-            target: --target wasm32-unknown-unknown
-          - name: wasm-smoke wasm
-            cwd: examples/wasm-smoke
-            target: --target wasm32-unknown-unknown
-          - name: dioxus-web-demo wasm
-            cwd: examples/dioxus-web-demo
-            target: --target wasm32-unknown-unknown
-          - name: yew-web-demo wasm
-            cwd: examples/yew-web-demo
-            target: --target wasm32-unknown-unknown
-          - name: webauthn-unlock wasm
-            cwd: examples/webauthn-unlock
-            target: --target wasm32-unknown-unknown
-          - name: dioxus-desktop-demo native
-            cwd: examples/dioxus-desktop-demo
-            target: ""
-    steps:
-      - uses: actions/checkout@v7
-
-      - name: Restore cargo downloads
-        id: cache-1
-        uses: actions/cache/restore@v6
-        with:
-          path: |
-            ~/.cargo/registry/index
-            ~/.cargo/registry/cache
-            ~/.cargo/git/db
-          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
-
-      - name: Install stable toolchain
-        run: rustup toolchain install stable --profile minimal
-
-      - name: Add wasm target
-        if: matrix.target != ''
-        run: rustup target add wasm32-unknown-unknown --toolchain stable
-
-      # The root legs pass --all-features, which turns on connetto-dioxus's
-      # desktop feature and its webview stack.
-      - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
-        uses: ./.github/actions/install-desktop-deps
-
-      - name: Check workspace
-        working-directory: ${{ matrix.cwd }}
-        run: |
-          cargo +stable check \
-            --all-targets \
-            --all-features \
-            ${{ matrix.target }}
+          failed=()
+          while read -r cwd target; do
+            echo "::group::nightly clippy ${cwd} ${target}"
+            if ! (cd "$cwd" && cargo +nightly clippy --all-targets --all-features ${target:+"$target"} -- -D warnings </dev/null); then
+              failed+=("$cwd")
+            fi
+            echo "::endgroup::"
+          done <<'EOF'
+          .
+          crates/connetto-web --target=wasm32-unknown-unknown
+          examples/wasm-smoke --target=wasm32-unknown-unknown
+          examples/dioxus-web-demo --target=wasm32-unknown-unknown
+          examples/yew-web-demo --target=wasm32-unknown-unknown
+          examples/webauthn-unlock --target=wasm32-unknown-unknown
+          examples/dioxus-desktop-demo
+          EOF
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::nightly clippy failed in ${failed[*]}"
+            exit 1
+          fi
 
       - name: Save cargo downloads
         if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
