@@ -3,12 +3,12 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use connetto_core::device_cert::{DeviceCertificate, KeyId};
 use rustls::pki_types::CertificateDer;
 use serde_bytes::ByteBuf;
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
 use crate::error::{CloseReason, Refusal};
@@ -16,6 +16,11 @@ use crate::event::PeerEvent;
 use crate::frame::{FrameError, FrameReader, PeerFrame, write_frame};
 use crate::node::{HELLO_TIMEOUT, LinkCommand, NodeState, WRITE_BOUND};
 use crate::verify::TOLERANCE;
+
+/// How long a link whose write failed reads on for a close the peer queued.
+/// The frames sit in the receive buffer already, so the bound only matters
+/// when the write failed on a stall instead of a reset.
+const DRAIN_BOUND: Duration = Duration::from_secs(1);
 
 /// Drive the link's frames until it closes, emitting the close once.
 pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
@@ -50,35 +55,84 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let deadline_sleep =
             tokio::time::sleep(deadline.duration_since(clock.now()).unwrap_or_default());
         let silence = tokio::time::sleep_until(last_seen + silence_limit);
-        let close = tokio::select! {
+        let stop = tokio::select! {
             () = deadline_sleep => {
                 // A back-jumped wall clock re-arms the sleep, and a real expiry
                 // closes the link.
                 if clock.now() >= deadline {
-                    Some(CloseReason::PeerExpired)
+                    Some(Stop::Close(CloseReason::PeerExpired))
                 } else {
                     None
                 }
             }
-            () = silence => Some(CloseReason::PeerLost),
+            () = silence => Some(Stop::Close(CloseReason::PeerLost)),
             _ = ping.tick() => match bounded_write(&mut io, &PeerFrame::Ping).await {
                 Ok(()) => None,
-                Err(_) => Some(CloseReason::Closed),
+                Err(_) => Some(Stop::WriteFailed),
             },
             frame = reader.next(&mut io) => {
                 on_frame(&state, &mut io, key, seq, frame, &mut last_seen, &mut deadline).await
             }
             command = commands.recv() => on_command(&state, &mut io, key, seq, command).await,
         };
-        if let Some(reason) = close {
+        if let Some(stop) = stop {
+            let reason = match stop {
+                Stop::Close(reason) => reason,
+                Stop::WriteFailed => queued_close(&mut reader, &mut io).await,
+            };
             finish(&state, key, seq, reason);
             break;
         }
     }
-    drop(io);
+    hang_up(&mut io).await;
 }
 
-/// What a received frame does to the link, `Some` when it closes it.
+/// Hang up without a reset. A socket closed with bytes unread resets the
+/// connection, and the reset discards what the kernel has not sent yet, a
+/// `Close` written just before among it. So the write side shuts down, and
+/// the peer's bytes are read and dropped until the peer hangs up too or
+/// `WRITE_BOUND` passes.
+pub(crate) async fn hang_up<S: AsyncRead + AsyncWrite + Unpin>(io: &mut S) {
+    let drain = async {
+        if io.shutdown().await.is_err() {
+            return;
+        }
+        let mut sink = [0; 1024];
+        while matches!(io.read(&mut sink).await, Ok(1..)) {}
+    };
+    let _ = tokio::time::timeout(WRITE_BOUND, drain).await;
+}
+
+/// Why the frame loop stops.
+enum Stop {
+    /// The link closes with the reason.
+    Close(CloseReason),
+    /// A write to the peer failed, which a reset after the peer's own close
+    /// also causes, so the frames the peer already sent decide the reason.
+    WriteFailed,
+}
+
+/// The close a peer queued before its end went away. A `Duplicate` close
+/// keeps its reason, and any other close, the stream's end, a broken frame
+/// or `DRAIN_BOUND` without one reads as `Closed`.
+async fn queued_close<S: AsyncRead + Unpin>(reader: &mut FrameReader, io: &mut S) -> CloseReason {
+    let read = async {
+        loop {
+            match Box::pin(reader.next(io)).await {
+                Ok(Some(PeerFrame::Close {
+                    reason: CloseReason::Duplicate,
+                })) => return CloseReason::Duplicate,
+                Ok(Some(PeerFrame::Close { .. }) | None) | Err(_) => return CloseReason::Closed,
+                Ok(Some(_)) => {}
+            }
+        }
+    };
+    tokio::time::timeout(DRAIN_BOUND, read)
+        .await
+        .unwrap_or(CloseReason::Closed)
+}
+
+/// What a received frame does to the link, `Some` when it stops it.
 async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
     state: &Arc<NodeState>,
     io: &mut S,
@@ -87,18 +141,18 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
     frame: Result<Option<PeerFrame>, FrameError>,
     last_seen: &mut tokio::time::Instant,
     deadline: &mut SystemTime,
-) -> Option<CloseReason> {
+) -> Option<Stop> {
     match frame {
-        Err(err) => Some(match err {
+        Err(err) => Some(Stop::Close(match err {
             FrameError::TooLong | FrameError::Malformed => CloseReason::Protocol,
             FrameError::Io(_) => CloseReason::Closed,
-        }),
-        Ok(None) => Some(CloseReason::Closed),
+        })),
+        Ok(None) => Some(Stop::Close(CloseReason::Closed)),
         Ok(Some(PeerFrame::Ping)) => {
             *last_seen = tokio::time::Instant::now();
             match bounded_write(io, &PeerFrame::Pong).await {
                 Ok(()) => None,
-                Err(_) => Some(CloseReason::Closed),
+                Err(_) => Some(Stop::WriteFailed),
             }
         }
         Ok(Some(PeerFrame::Pong)) => {
@@ -120,33 +174,39 @@ async fn on_frame<S: AsyncRead + AsyncWrite + Unpin>(
         // name the same key, so the link's deadline moves.
         Ok(Some(PeerFrame::Certificate { leaf, issuer })) => {
             *last_seen = tokio::time::Instant::now();
-            renew(state, key, seq, &leaf[..], &issuer[..], deadline).err()
+            renew(state, key, seq, &leaf[..], &issuer[..], deadline)
+                .err()
+                .map(Stop::Close)
         }
         // Only a duplicate keeps the sender's reason, since every other
         // reason names the sender's view of this end.
-        Ok(Some(PeerFrame::Close { reason })) => Some(if reason == CloseReason::Duplicate {
-            CloseReason::Duplicate
-        } else {
-            CloseReason::Closed
-        }),
+        Ok(Some(PeerFrame::Close { reason })) => {
+            Some(Stop::Close(if reason == CloseReason::Duplicate {
+                CloseReason::Duplicate
+            } else {
+                CloseReason::Closed
+            }))
+        }
         // A hello or an offer past the exchange is a protocol break.
-        Ok(Some(PeerFrame::Hello { .. } | PeerFrame::Offer { .. })) => Some(CloseReason::Protocol),
+        Ok(Some(PeerFrame::Hello { .. } | PeerFrame::Offer { .. })) => {
+            Some(Stop::Close(CloseReason::Protocol))
+        }
     }
 }
 
-/// What a command from the node does to the link, `Some` when it closes it.
+/// What a command from the node does to the link, `Some` when it stops it.
 async fn on_command<S: AsyncRead + AsyncWrite + Unpin>(
     state: &Arc<NodeState>,
     io: &mut S,
     key: KeyId,
     seq: u64,
     command: Option<LinkCommand>,
-) -> Option<CloseReason> {
+) -> Option<Stop> {
     match command {
         Some(LinkCommand::Close(reason)) => {
             // The sender names the close, so both ends keep it.
             let _ = bounded_write(io, &PeerFrame::Close { reason }).await;
-            Some(reason)
+            Some(Stop::Close(reason))
         }
         Some(LinkCommand::List {
             list,
@@ -170,7 +230,7 @@ async fn on_command<S: AsyncRead + AsyncWrite + Unpin>(
                     }
                     None
                 }
-                Err(_) => Some(CloseReason::Closed),
+                Err(_) => Some(Stop::WriteFailed),
             }
         }
         // Hand the renewed chain to the link still holding the old one.
@@ -181,10 +241,10 @@ async fn on_command<S: AsyncRead + AsyncWrite + Unpin>(
             };
             match bounded_write(io, &frame).await {
                 Ok(()) => None,
-                Err(_) => Some(CloseReason::Closed),
+                Err(_) => Some(Stop::WriteFailed),
             }
         }
-        None => Some(CloseReason::Closed),
+        None => Some(Stop::Close(CloseReason::Closed)),
     }
 }
 

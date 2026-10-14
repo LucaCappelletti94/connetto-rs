@@ -1103,6 +1103,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 reason: CloseReason::Duplicate,
             };
             let _ = tokio::time::timeout(WRITE_BOUND, write_frame(&mut tls, &close)).await;
+            crate::link::hang_up(&mut tls).await;
         });
     }
     Ok(())
