@@ -1801,8 +1801,9 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use connetto_core::device_cert::{
-        AttestationLevel, CertificateRequest, CertificateSigner, DeploymentId, DeviceCertificate,
-        DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RootCa, public_key_info,
+        AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
+        DeviceCertificate, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RootCa,
+        public_key_info,
     };
     use connetto_peer::{Identity, PeerEvent, SystemClock, Trust};
     use parking_lot::Mutex;
@@ -1871,7 +1872,12 @@ mod tests {
             let issuer_holder = MemKey(Arc::clone(&issuer_key));
             let spki = public_key_info(&issuer_holder);
             let issuer_cert = root
-                .sign_issuer(&spki, now - 10 * DAY, 366 * DAY, [1; 16])
+                .sign_issuer(
+                    &spki,
+                    now - 10 * DAY,
+                    366 * DAY,
+                    CertificateSerial::new([1; 16]).expect("the test serial is positive"),
+                )
                 .expect("the issuer signs");
             let issuer_pair = KeyPair::from_pkcs8_der_and_sign_algo(
                 &rustls::pki_types::PrivatePkcs8KeyDer::from(issuer_key.serialize_der()),
@@ -1912,7 +1918,7 @@ mod tests {
                     account,
                     now,
                     DAY,
-                    serial,
+                    CertificateSerial::new(serial).expect("the test serial is positive"),
                     AttestationLevel::Unproven,
                 )
                 .expect("the certificate issues");
