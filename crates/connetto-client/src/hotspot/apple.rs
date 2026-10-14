@@ -21,6 +21,11 @@ use super::{
 #[cfg(target_os = "ios")]
 const PERSONAL_LANE: &str = "bridge100";
 
+/// The permission a Mac's join names when Location Services access is
+/// missing (R76 slice 9c).
+#[cfg(target_os = "macos")]
+const LOCATION_PERMISSION: &str = "Location Services";
+
 /// The Apple hotspot backend, over `connetto-peer-apple` (R76).
 pub(crate) struct AppleHotspotBackend {
     /// The typed personal offer, where the device stands one.
@@ -121,6 +126,13 @@ impl HotspotBackend for AppleHotspotBackend {
     }
 
     fn request_join(&self, offer: &HotspotOffer) -> Result<(), JoinError> {
+        // macOS refuses to join a network by name for a process without
+        // Location Services access, so the join names the permission and
+        // the application asks for it (R76 slice 9c).
+        #[cfg(target_os = "macos")]
+        if apple::hotspot::location_access() != apple::hotspot::LocationAccess::Granted {
+            return Err(JoinError::MissingPermission(LOCATION_PERMISSION.to_owned()));
+        }
         *self.before.write() = apple::hotspot::joined().map(|joined| joined.address);
         match apple::hotspot::join(&offer.ssid, &offer.passphrase, security(offer.security)) {
             Ok(()) => {
@@ -150,7 +162,10 @@ impl HotspotBackend for AppleHotspotBackend {
         let joining = match apple::hotspot::completion() {
             // The system will not give the network, or the user declined its
             // join dialog (R76).
-            Some(Err(_)) => return JoinStatus::Unavailable,
+            Some(Err(error)) => {
+                tracing::debug!(%error, "the system refused the join");
+                return JoinStatus::Unavailable;
+            }
             Some(Ok(joining)) => Some(joining),
             None => None,
         };

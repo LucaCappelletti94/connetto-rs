@@ -411,6 +411,34 @@ pub mod hotspot {
     pub fn joined() -> Option<Joined> {
         crate::platform::hotspot::joined()
     }
+
+    /// The process's standing with Location Services (R76 slice 9c).
+    #[cfg(target_os = "macos")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LocationAccess {
+        /// The user allowed it.
+        Granted,
+        /// The user or a policy refused it.
+        Denied,
+        /// The user was never asked.
+        NotAsked,
+    }
+
+    /// The process's standing with Location Services.
+    ///
+    /// macOS hands a process without it scanned networks that carry no
+    /// name, and refuses to join them, so a join asks for it first
+    /// (measured 2026-10-14).
+    #[cfg(target_os = "macos")]
+    pub fn location_access() -> LocationAccess {
+        crate::platform::location::access()
+    }
+
+    /// Ask the user for location access, on the main queue.
+    #[cfg(target_os = "macos")]
+    pub fn request_location_access() {
+        crate::platform::location::request();
+    }
 }
 
 #[cfg(any(target_os = "ios", target_os = "macos", test))]

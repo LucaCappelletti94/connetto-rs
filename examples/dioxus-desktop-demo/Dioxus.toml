@@ -21,6 +21,8 @@ NSBonjourServices = ["_connetto-peer._tcp"]
 # iOS only (R76).
 [macos.plist]
 NSLocalNetworkUsageDescription = "Find and link to nearby devices"
+NSLocationUsageDescription = "Join a nearby device's hotspot"
+NSLocationWhenInUseUsageDescription = "Join a nearby device's hotspot"
 
 # App Attest vouches for this build at device enrolment (R74 decisions 32 and
 # 35). The development profile takes the entitlements from the App ID's
