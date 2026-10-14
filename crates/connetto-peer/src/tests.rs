@@ -4,24 +4,28 @@
 //! which also completes a raw TLS peer through the crate's own client config
 //! so it can stop reading and sending after the handshake.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use parking_lot::Mutex;
+
+use crate::frame::{PeerFrame, read_frame, write_frame};
+use crate::node::client_config_for;
+use crate::{
+    CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, Refusal, SocketPrep, SystemClock,
+    Trust,
+};
 use connetto_core::device_cert::{
     AttestationLevel, CertificateRequest, CertificateSigner, DeploymentId, DeviceCertificate,
     DeviceIdentity, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, Revoked, RootCa, key_id,
     public_key_info,
 };
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as RcgenSigningKey};
+use socket2::SockRef;
 use tokio::sync::mpsc;
 use tokio::time;
-
-use crate::frame::{PeerFrame, read_frame, write_frame};
-use crate::node::client_config_for;
-use crate::{
-    CloseReason, Identity, LinkError, Liveness, Node, PeerEvent, Refusal, SystemClock, Trust,
-};
 
 const DAY: Duration = Duration::from_hours(24);
 
@@ -255,6 +259,16 @@ struct ShiftedClock {
 impl crate::Clock for ShiftedClock {
     fn now(&self) -> SystemTime {
         SystemTime::now() + self.offset
+    }
+}
+
+/// A clock fixed at a moment, for the epoch proofs.
+#[derive(Debug)]
+struct FixedClock(SystemTime);
+
+impl crate::Clock for FixedClock {
+    fn now(&self) -> SystemTime {
+        self.0
     }
 }
 
@@ -820,6 +834,98 @@ async fn a_clock_outside_the_window_refuses_and_a_small_skew_links() {
     honest_node.stop(CloseReason::Closed);
     skewed_node.stop(CloseReason::Closed);
     tolerant_node.stop(CloseReason::Closed);
+}
+
+/// A clock standing seconds after the epoch skips the attempt before the
+/// epoch and refuses with a typed reason, and a clock standing before the
+/// epoch, where no attempt is representable, refuses the chain.
+#[tokio::test]
+async fn a_clock_at_the_epoch_refuses_without_a_panic() {
+    let now = whole_second();
+    let deployment = Deployment::new(22, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+
+    let honest = deployment.device(
+        &issuer,
+        "honest",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let early = deployment.device(
+        &issuer,
+        "early",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let pre = deployment.device(
+        &issuer,
+        "pre",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (o_tx, mut o_rx) = events();
+    let honest_node = node(deployment.root_der(), o_tx);
+    // The early node's clock stands ten seconds after the epoch, so its
+    // minus-tolerance attempt stands before the epoch.
+    let (s_tx, mut s_rx) = events();
+    let early_node = node_on(
+        vec![deployment.root_der()],
+        all_levels(),
+        Arc::new(FixedClock(SystemTime::UNIX_EPOCH + Duration::from_secs(10))),
+        s_tx,
+    );
+    // The pre node's clock stands ten minutes before the epoch, so no
+    // attempt of its verifier is representable.
+    let (p_tx, mut p_rx) = events();
+    let pre_node = node_on(
+        vec![deployment.root_der()],
+        all_levels(),
+        Arc::new(FixedClock(
+            SystemTime::UNIX_EPOCH - Duration::from_secs(600),
+        )),
+        p_tx,
+    );
+
+    let honest_addr = serve(&honest_node, &honest);
+    serve(&early_node, &early);
+    serve(&pre_node, &pre);
+
+    // The early clock's dial meets the refusal its verifier stands, with the
+    // attempt before the epoch skipped.
+    let err = early_node
+        .link(honest_addr)
+        .await
+        .expect_err("refused by the early clock");
+    assert!(
+        matches!(err, LinkError::Refused(Refusal::NotYetValid)),
+        "got {err:?}"
+    );
+
+    // The pre clock's dial meets the refusal no representable attempt leaves.
+    let err = pre_node
+        .link(honest_addr)
+        .await
+        .expect_err("refused by the pre clock");
+    assert!(
+        matches!(err, LinkError::Refused(Refusal::Profile)),
+        "got {err:?}"
+    );
+
+    // No events on either side for the refused handshakes.
+    no_events(&mut o_rx, Duration::from_secs(1)).await;
+    no_events(&mut s_rx, Duration::from_secs(1)).await;
+    no_events(&mut p_rx, Duration::from_secs(1)).await;
+
+    honest_node.stop(CloseReason::Closed);
+    early_node.stop(CloseReason::Closed);
+    pre_node.stop(CloseReason::Closed);
 }
 
 /// Proof 6.
@@ -2280,4 +2386,106 @@ async fn a_stopped_node_dials_nobody() {
     a.stop(CloseReason::Withdrawn);
     assert!(matches!(a.link(b_addr).await, Err(LinkError::NotServing)));
     no_events(&mut b_rx, Duration::from_millis(500)).await;
+}
+
+/// A prep that records every dial target it prepares.
+struct RecordingPrep {
+    targets: Arc<Mutex<Vec<SocketAddr>>>,
+}
+
+impl SocketPrep for RecordingPrep {
+    fn prepare(&self, _sock: SockRef<'_>, target: SocketAddr) -> io::Result<()> {
+        self.targets.lock().push(target);
+        Ok(())
+    }
+}
+
+/// A prep that refuses every dial socket.
+struct RefusingPrep;
+
+impl SocketPrep for RefusingPrep {
+    fn prepare(&self, _sock: SockRef<'_>, _target: SocketAddr) -> io::Result<()> {
+        Err(io::Error::other("the prep refuses the socket"))
+    }
+}
+
+/// The dial socket passes through the prep before its connect, and the
+/// link still completes.
+#[tokio::test]
+async fn a_dial_socket_passes_through_its_prep_before_its_connect() {
+    let now = whole_second();
+    let deployment = Deployment::new(1, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let a_addr = serve(&a, &alice);
+    serve(&b, &bob);
+    let targets = Arc::new(Mutex::new(Vec::new()));
+    let prep: Arc<dyn SocketPrep> = Arc::new(RecordingPrep {
+        targets: Arc::clone(&targets),
+    });
+    b.set_socket_prep(Some(prep));
+    assert_eq!(
+        b.link(a_addr).await.expect("the link completes"),
+        alice.identity
+    );
+    assert_eq!(targets.lock().as_slice(), &[a_addr]);
+}
+
+/// A refusing prep stops the dial with `Unreachable`.
+#[tokio::test]
+async fn a_refusing_prep_refuses_the_dial_as_unreachable() {
+    let now = whole_second();
+    let deployment = Deployment::new(1, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alice = deployment.device(
+        &issuer,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    let a_addr = serve(&a, &alice);
+    serve(&b, &bob);
+    b.set_socket_prep(Some(Arc::new(RefusingPrep)));
+    assert!(matches!(
+        b.link(a_addr).await,
+        Err(LinkError::Unreachable(_))
+    ));
+    b.set_socket_prep(None);
+    assert_eq!(
+        b.link(a_addr).await.expect("the link completes"),
+        alice.identity
+    );
 }

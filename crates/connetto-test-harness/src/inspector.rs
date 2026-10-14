@@ -243,6 +243,24 @@ impl PageSession {
             bail!("the page has no button {label:?}")
         }
     }
+
+    /// Focus the input named `name` and type `text` into it, trusted input
+    /// the form's handler treats as the user's.
+    ///
+    /// # Errors
+    ///
+    /// When the page has no such input, or as [`Self::call`].
+    pub async fn set_input(&mut self, name: &str, text: &str) -> Result<()> {
+        let script = format!(
+            "(() => {{ const input = document.querySelector('input[name={name:?}]'); if (!input) return false; input.focus(); return true; }})()"
+        );
+        if self.evaluate(&script).await? != true {
+            bail!("the page has no input named {name:?}")
+        }
+        self.call("Input.insertText", serde_json::json!({ "text": text }))
+            .await?;
+        Ok(())
+    }
 }
 
 /// The next text frame as JSON, before `deadline`.

@@ -2550,6 +2550,12 @@ where
         self.shared.events.subscribe()
     }
 
+    /// The client's event stream the background tasks publish into (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn event_sender(&self) -> broadcast::Sender<ClientEvent> {
+        self.shared.events.clone()
+    }
+
     /// Postfix-free spelling of the [`Watchable`](crate::dsl::Watchable)
     /// verb: `client.live(query)` is `query.live(&client)`, with the handle
     /// type chosen at compile time from the query's shape. The `R` parameter

@@ -31,6 +31,8 @@ use super::{Answer, Held, KeptList, Standing, TOLERANCE, half_life};
 #[cfg(feature = "peer")]
 use crate::PeerError;
 use crate::device_key::{ChipError, ChipKeys, KeyRecords, OpenedKey};
+#[cfg(feature = "peer")]
+use crate::hotspot::{HOST_BOUND, HotspotError, HotspotOffer, JOIN_BOUND, JoinError, MARGIN};
 #[cfg(all(feature = "peer", target_os = "android"))]
 use crate::multicast::MulticastLock;
 use crate::{ClientError, ClientEvent};
@@ -278,6 +280,7 @@ pub(crate) struct Enroller {
 }
 
 /// The application's half, held by the native client.
+#[derive(Clone)]
 pub(crate) struct EnrolHandle {
     keys: Arc<dyn DeviceKeys>,
     commands: mpsc::UnboundedSender<Command>,
@@ -289,6 +292,9 @@ pub(crate) struct EnrolHandle {
     clock_off: Arc<AtomicBool>,
     #[cfg(feature = "peer")]
     peer: connetto_peer::Node,
+    #[cfg(feature = "peer")]
+    /// The hotspot machine's commands, until it ends with the client (R76).
+    hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
 }
 
 impl Enroller {
@@ -301,7 +307,7 @@ impl Enroller {
         feature = "peer",
         expect(
             clippy::too_many_arguments,
-            reason = "the peer node joins the seven enrolment inputs and a config struct would hide the same arity behind another type"
+            reason = "the peer node and its hotspot channel join the seven enrolment inputs and a config struct would hide the same arity behind another type"
         )
     )]
     pub(crate) fn new(
@@ -313,6 +319,7 @@ impl Enroller {
         kept: Vec<KeptList>,
         lists: super::ListInbox,
         #[cfg(feature = "peer")] peer: Peer,
+        #[cfg(feature = "peer")] hotspot: mpsc::UnboundedSender<crate::hotspot::Command>,
     ) -> (Self, EnrolHandle) {
         let (sender, commands) = mpsc::unbounded_channel();
         let (published, observed) = watch::channel(held.as_ref().map(|held| held.leaf.clone()));
@@ -345,6 +352,8 @@ impl Enroller {
                 clock_off,
                 #[cfg(feature = "peer")]
                 peer: peer_node,
+                #[cfg(feature = "peer")]
+                hotspot,
             },
         )
     }
@@ -425,6 +434,54 @@ impl EnrolHandle {
                 Err(err) => Err(PeerError::Link(err)),
             },
         }
+    }
+
+    /// Host this device's hotspot, answered with its details or the reason
+    /// it will not, within the machine's bound (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn host_hotspot(&self) -> Result<HotspotOffer, HotspotError> {
+        let (reply, answer) = oneshot::channel();
+        self.hotspot
+            .send(crate::hotspot::Command::Host(reply))
+            .map_err(|_| HotspotError::Failed)?;
+        match tokio::time::timeout(HOST_BOUND + MARGIN, answer).await {
+            Ok(Ok(offer)) => offer,
+            Ok(Err(_)) => Err(HotspotError::Failed),
+            Err(_) => Err(HotspotError::TimedOut),
+        }
+    }
+
+    /// Stop hosting, or cancel the pending request (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn stop_hotspot(&self) {
+        let _ = self.hotspot.send(crate::hotspot::Command::StopHost);
+    }
+
+    /// Join `offer`'s network, answered with its gateway, within the
+    /// machine's bound (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) async fn join_hotspot(
+        &self,
+        offer: &HotspotOffer,
+    ) -> Result<std::net::IpAddr, JoinError> {
+        let (reply, answer) = oneshot::channel();
+        self.hotspot
+            .send(crate::hotspot::Command::Join {
+                offer: offer.clone(),
+                reply,
+            })
+            .map_err(|_| JoinError::Failed)?;
+        match tokio::time::timeout(JOIN_BOUND + MARGIN, answer).await {
+            Ok(Ok(gateway)) => gateway,
+            Ok(Err(_)) => Err(JoinError::Failed),
+            Err(_) => Err(JoinError::TimedOut),
+        }
+    }
+
+    /// Leave the joined network, or cancel the pending request (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn leave_hotspot(&self) {
+        let _ = self.hotspot.send(crate::hotspot::Command::Leave);
     }
 }
 
