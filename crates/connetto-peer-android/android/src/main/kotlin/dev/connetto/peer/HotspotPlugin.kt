@@ -21,7 +21,7 @@ import java.net.Inet4Address
 /**
  * The local-only hotspot the peer link hosts, and the peer hotspots it joins.
  *
- * All state stands behind [lock]; the [JvmStatic]s are the JNI surface the
+ * All state stands behind [lock], and the [JvmStatic]s are the JNI surface the
  * client drives. The host side answers with [HOST_PENDING] until the system
  * has started the hotspot, at which point the details stand ready for
  * `hostSsid`, `hostPassphrase` and `hostSecurity`. The join side answers with
@@ -29,7 +29,7 @@ import java.net.Inet4Address
  * which point the joined address, prefix and gateway stand ready.
  *
  * The host callbacks are the API 34 signatures, whose `onStarted` hands the
- * configured reservation; the API 33 signatures the platform removed, so
+ * configured reservation. The platform removed the API 33 signatures, so
  * hosting stands on 34 and later only.
  */
 class HotspotPlugin {
@@ -287,7 +287,7 @@ class HotspotPlugin {
         fun joinGateway(): String? = synchronized(lock) { joinGateway }
 
         // Joined with newlines, so the JNI side, which cannot safely build
-        // the array's constructor, splits on lines; empty when nothing is
+        // the array's constructor, splits on lines. Empty when nothing is
         // missing.
         @JvmStatic
         fun missingPermissions(): String {
@@ -339,6 +339,7 @@ class HotspotPlugin {
             }
         }
 
+        /** The application context, cached once the framework hands it out. */
         private fun context(): Context? {
             cachedContext?.let { return it }
             val context = contextFromFramework()
@@ -346,6 +347,7 @@ class HotspotPlugin {
             return context
         }
 
+        /** The running application, read through `ActivityThread` by reflection. */
         private fun contextFromFramework(): Context? = runCatching {
             val application =
                 Class.forName("android.app.ActivityThread")
@@ -354,7 +356,7 @@ class HotspotPlugin {
             application as? Context
         }.getOrNull()
 
-        // The user's leave, or the join's request replacing it.
+        /** The user's leave, or the join's request replacing it. */
         private fun leaveLocked() {
             unregisterLocked()
             joinAddress = null
@@ -363,8 +365,10 @@ class HotspotPlugin {
             joinState = JOIN_IDLE
         }
 
-        // The network is gone or released, so the callback and the network
-        // go with it. The state stands, the client steers it.
+        /**
+         * The network is gone or released, so the callback and the network
+         * go with it. The state stands, the client steers it.
+         */
         private fun unregisterLocked() {
             val callback = joinCallback ?: return
             val context = context() ?: return
@@ -375,6 +379,10 @@ class HotspotPlugin {
             joinNetwork = null
         }
 
+        /**
+         * The joined IPv4 address, prefix and gateway from [linkProperties],
+         * marking the join available once the address and gateway are known.
+         */
         private fun fillInFrom(linkProperties: LinkProperties) {
             val address = linkProperties.linkAddresses
                 .firstOrNull { it.address is Inet4Address }

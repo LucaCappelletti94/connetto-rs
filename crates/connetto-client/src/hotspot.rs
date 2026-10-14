@@ -702,6 +702,7 @@ mod tests {
     }
 
     impl FakeBackend {
+        /// A backend whose requests succeed and whose sides stand pending.
         fn new() -> Self {
             Self {
                 host_request: Mutex::new(Ok(())),
@@ -712,6 +713,7 @@ mod tests {
             }
         }
 
+        /// The host side started with `security`, its details ready.
         fn started(&self, security: HotspotSecurity) {
             *self.host_status.lock() = HostStatus::Started {
                 ssid: "hotspot".into(),
@@ -720,6 +722,7 @@ mod tests {
             };
         }
 
+        /// The join side available on a fixed address and gateway.
         fn available(&self) {
             *self.join_status.lock() = JoinStatus::Available {
                 address: "192.168.43.1".parse().unwrap(),
@@ -728,6 +731,7 @@ mod tests {
             };
         }
 
+        /// How often the machine made `call` on the backend.
         fn counted(&self, call: &'static str) -> usize {
             self.calls
                 .lock()
@@ -778,6 +782,7 @@ mod tests {
     }
 
     impl FakeDial {
+        /// A dial seam with no answer scripted and no dial held.
         fn new() -> Self {
             Self {
                 answer: Mutex::new(None),
@@ -809,6 +814,8 @@ mod tests {
     }
 
     impl Harness {
+        /// A machine over fresh doubles, linking a joined host on its own
+        /// when `autolink` holds.
         fn new(autolink: bool) -> Self {
             let backend: Arc<FakeBackend> = Arc::new(FakeBackend::new());
             let port: Arc<Mutex<Option<u16>>> = Arc::new(Mutex::new(Some(54321)));
@@ -856,6 +863,7 @@ mod tests {
             }
         }
 
+        /// An offer for the doubles' hotspot with `security` and `port`.
         fn offer(security: HotspotSecurity, port: Option<u16>) -> HotspotOffer {
             HotspotOffer::new("hotspot", "secret", security, port)
         }
