@@ -30,6 +30,9 @@ mod tests;
 #[cfg(all(test, feature = "discovery"))]
 mod discovery_proofs;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use error::{CloseReason, LinkError, Refusal, TrustError};
 pub use event::PeerEvent;
 pub use frame::PeerFrame;

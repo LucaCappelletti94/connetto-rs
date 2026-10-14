@@ -5,12 +5,11 @@
 //! when it does not, so a host without loopback multicast never reads as a
 //! discovery failure.
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use connetto_core::device_cert::{AttestationLevel, DeviceIdentity};
-use socket2::{Domain, SockAddr, Socket, Type};
 use tokio::sync::mpsc;
 use tokio::time;
 
@@ -18,6 +17,7 @@ use crate::Discovery;
 use crate::DiscoveryEvent;
 use crate::Fingerprint;
 use crate::PeerEvent;
+use crate::test_support::loopback_multicast;
 use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
 
 /// A loopback port the proof's mDNS daemons bind, clear of the system
@@ -31,81 +31,6 @@ fn fresh_mdns_port() -> u16 {
 }
 const DAY: Duration = Duration::from_hours(24);
 const WAIT: Duration = Duration::from_secs(30);
-
-/// A loopback multicast round-trip, answered when the host lets it through.
-///
-/// Binds a datagram socket to the loopback, joins the mDNS group there, and
-/// asks a second socket, pointed at the loopback, to multicast to it.
-fn loopback_multicast() -> bool {
-    let works = probe_loopback_multicast();
-    assert!(
-        works || std::env::var_os("CONNETTO_REQUIRE_MULTICAST").is_none(),
-        "CONNETTO_REQUIRE_MULTICAST is set and the loopback multicast probe failed"
-    );
-    works
-}
-
-/// Whether a datagram sent to the mDNS group over the loopback comes back.
-fn probe_loopback_multicast() -> bool {
-    let group = Ipv4Addr::new(224, 0, 0, 251);
-    let lo = Ipv4Addr::LOCALHOST;
-    let receiver = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
-        Ok(socket) => socket,
-        Err(err) => {
-            eprintln!("the mDNS probe will not open a socket: {err}");
-            return false;
-        }
-    };
-    // Bound to every address, since a socket bound to the loopback's unicast
-    // address never receives a datagram sent to the group.
-    let bind = SockAddr::from(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0));
-    if let Err(err) = receiver.bind(&bind) {
-        eprintln!("the mDNS probe will not bind the loopback: {err}");
-        return false;
-    }
-    let Some(addr) = receiver
-        .local_addr()
-        .ok()
-        .and_then(|addr| addr.as_socket_ipv4())
-    else {
-        eprintln!("the mDNS probe will not read its bound address");
-        return false;
-    };
-    let port = addr.port();
-    if let Err(err) = receiver.join_multicast_v4(&group, &lo) {
-        eprintln!("the mDNS probe will not join the group on the loopback: {err}");
-        return false;
-    }
-    let _ = receiver.set_read_timeout(Some(Duration::from_secs(3)));
-    let sender = match Socket::new(Domain::IPV4, Type::DGRAM, None) {
-        Ok(socket) => socket,
-        Err(err) => {
-            eprintln!("the mDNS probe will not open a sender: {err}");
-            return false;
-        }
-    };
-    if let Err(err) = sender.set_multicast_if_v4(&lo) {
-        eprintln!("the mDNS probe will not point the sender at the loopback: {err}");
-        return false;
-    }
-    let target = SockAddr::from(SocketAddrV4::new(group, port));
-    if let Err(err) = sender.send_to(b"connetto", &target) {
-        eprintln!("the mDNS probe will not multicast to the loopback: {err}");
-        return false;
-    }
-    let mut buf = vec![std::mem::MaybeUninit::uninit(); 32];
-    match receiver.recv(buf.as_mut_slice()) {
-        Ok(n) if n > 0 => true,
-        Ok(_) => {
-            eprintln!("the mDNS probe multicast no datagram to the loopback");
-            false
-        }
-        Err(err) => {
-            eprintln!("the mDNS probe heard nothing on the loopback: {err}");
-            false
-        }
-    }
-}
 
 /// The node's link events handed to the discovery and teed to `out`, until
 /// the node's channel ends.
