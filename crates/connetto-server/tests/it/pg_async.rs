@@ -499,7 +499,10 @@ async fn pg_oplog_appends_and_reads_back() {
             let SourceItem::Event(event) = item else {
                 continue;
             };
-            let record = mat.oplog_record(&event).expect("build oplog record");
+            let record = mat
+                .oplog_record(&event)
+                .expect("encode the event's patch")
+                .expect("build oplog record");
             expected.push((
                 record.position(),
                 record.table().to_owned(),
@@ -592,8 +595,8 @@ async fn pg_oplog_appends_and_reads_back() {
     // No cast, so the column's own type is what rejects this.
     let refused = sql_query(
         "INSERT INTO connetto_oplog_test \
-         (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event) \
-         VALUES (9999, 1, 0, 'orders', 'nonsense', '\\x00', false, '\\x00')",
+         (commit_lsn, xid, ordinal, table_name, op, pk, is_tombstone, event, payload) \
+         VALUES (9999, 1, 0, 'orders', 'nonsense', '\\x00', false, '\\x00', '\\x00')",
     )
     .execute(&mut *conn)
     .await;
@@ -657,7 +660,10 @@ async fn pg_oplog_round_trips_a_composite_key() {
             let SourceItem::Event(event) = item else {
                 continue;
             };
-            let record = mat.oplog_record(&event).expect("build oplog record");
+            let record = mat
+                .oplog_record(&event)
+                .expect("encode the event's patch")
+                .expect("build oplog record");
             appended.push(record.pk().to_vec());
             oplog.append(record).await.expect("append record");
         }
@@ -709,7 +715,11 @@ fn two_transactions() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
         for item in source.drain().expect("drain") {
             match item {
                 SourceItem::Event(event) => {
-                    records.push(mat.oplog_record(&event).expect("build oplog record"));
+                    records.push(
+                        mat.oplog_record(&event)
+                            .expect("encode the event's patch")
+                            .expect("build oplog record"),
+                    );
                 }
                 SourceItem::Commit(commit) => commits.push(commit),
             }

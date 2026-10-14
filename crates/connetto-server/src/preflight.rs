@@ -62,6 +62,18 @@ pub enum Artifact<'a> {
         /// The publication whose tables must all record their previous image.
         publication: &'a str,
     },
+    /// A column a table must carry, by table and column name.
+    ///
+    /// The table existing says nothing about its shape, and connetto reads
+    /// whatever it names from the table the deployment provisions, so a
+    /// column the table lacks is a boot that looks healthy and then fails
+    /// every statement that names it.
+    TableColumn {
+        /// The table the column must live in.
+        table: &'a str,
+        /// The column connetto reads from it.
+        column: &'a str,
+    },
 }
 
 /// What a probe found.
@@ -72,6 +84,9 @@ enum Found {
     Absent,
     /// There and unfit, naming what has to be fixed.
     Unfit(Vec<String>),
+    /// The table is there but lacks a column connetto reads from it, naming
+    /// both.
+    MissingColumn { table: String, column: String },
 }
 
 impl Artifact<'_> {
@@ -82,6 +97,7 @@ impl Artifact<'_> {
             Self::Publication(_) | Self::PreviousImages { .. } => "publication",
             Self::Table(_) => "table",
             Self::PublishedTable { .. } => "replicated table",
+            Self::TableColumn { .. } => "column",
         }
     }
 
@@ -89,7 +105,7 @@ impl Artifact<'_> {
     const fn name(&self) -> &str {
         match self {
             Self::ReplicationSlot(name) | Self::Publication(name) | Self::Table(name) => name,
-            Self::PublishedTable { table, .. } => table,
+            Self::PublishedTable { table, .. } | Self::TableColumn { table, .. } => table,
             Self::PreviousImages { publication } => publication,
         }
     }
@@ -144,6 +160,33 @@ impl Artifact<'_> {
                     Found::Fit
                 } else {
                     Found::Unfit(deficient.into_iter().map(|row| row.name).collect())
+                });
+            }
+            Self::TableColumn { table, column } => {
+                // A catalogue read the DSL does not model, beside to_regclass, so a statement of its own.
+                let shaped: Vec<Shaped> = sql_query(
+                    "SELECT to_regclass($1) IS NOT NULL AS present, \
+                     COALESCE(to_regclass($1) IS NOT NULL AND EXISTS ( \
+                         SELECT 1 FROM pg_attribute a \
+                         WHERE a.attrelid = to_regclass($1) AND a.attname = $2 \
+                           AND a.attnum > 0 AND NOT a.attisdropped), false) AS column_present",
+                )
+                .bind::<Text, _>(table)
+                .bind::<Text, _>(column)
+                .load(conn)
+                .await?;
+                let Some(shaped) = shaped.into_iter().next() else {
+                    return Ok(Found::Absent);
+                };
+                return Ok(if shaped.column_present {
+                    Found::Fit
+                } else if shaped.present {
+                    Found::MissingColumn {
+                        table: table.to_string(),
+                        column: column.to_string(),
+                    }
+                } else {
+                    Found::Absent
                 });
             }
             Self::ReplicationSlot(_) => {
@@ -227,12 +270,35 @@ pub enum PreflightError {
         /// The tables to fix, comma separated.
         tables: String,
     },
+    /// The table exists but lacks a column connetto reads from it.
+    ///
+    /// Its own variant because the fix is adding a column to a table the
+    /// deployment already provisions, not creating a new object.
+    #[error(
+        "table {table} has no {column} column. connetto reads the column and \
+         creates no server objects, so the deployment must add it before the \
+         server will start"
+    )]
+    MissingColumn {
+        /// The table that lacks the column.
+        table: String,
+        /// The column connetto reads from it.
+        column: String,
+    },
 }
 
 #[derive(QueryableByName)]
 struct Present {
     #[diesel(sql_type = Bool)]
     present: bool,
+}
+/// Whether a table is present and carries the column a probe asks for.
+#[derive(QueryableByName)]
+struct Shaped {
+    #[diesel(sql_type = Bool)]
+    present: bool,
+    #[diesel(sql_type = Bool)]
+    column_present: bool,
 }
 
 /// One name a probe reported.
@@ -252,9 +318,11 @@ struct Named {
 /// # Errors
 ///
 /// [`PreflightError::Missing`] naming the absent artifact,
-/// [`PreflightError::PreviousImage`] naming the replicated tables that cannot
-/// report an old row, [`PreflightError::Probe`] when the check could not be
-/// answered, and [`PreflightError::Pool`] when no connection was available.
+/// [`PreflightError::MissingColumn`] naming a table that lacks a column
+/// connetto reads, [`PreflightError::PreviousImage`] naming the replicated
+/// tables that cannot report an old row, [`PreflightError::Probe`] when the
+/// check could not be answered, and [`PreflightError::Pool`] when no
+/// connection was available.
 pub async fn require(
     pool: &Pool<AsyncPgConnection>,
     artifacts: &[Artifact<'_>],
@@ -285,6 +353,9 @@ pub async fn require(
                     publication: artifact.name().to_owned(),
                     tables: tables.join(", "),
                 });
+            }
+            Found::MissingColumn { table, column } => {
+                return Err(PreflightError::MissingColumn { table, column });
             }
         }
     }

@@ -410,6 +410,9 @@ pub struct Dispatched {
     /// because a relationship row moved, never because a row it reads changed
     /// (R27). Empty for every event until a membership term is registered.
     pub narrowings: Vec<TermMove>,
+    /// What the oplog keeps for this event, its compressed patch included, or
+    /// `None` when the event's table is absent from the catalog.
+    pub record: Option<ChangeRecord>,
 }
 
 /// One server-computed result movement, ready to frame on the wire.
@@ -1203,13 +1206,17 @@ where
         }
     }
 
-    /// Dispatch one CDC event into row patches and computed-result changes.
+    /// Dispatch one CDC event into row patches, computed-result changes and the
+    /// record the oplog keeps.
     ///
-    /// Row notifications fold once into a compressed patchset shared across the
-    /// matched consumers. Everything the engine's tiers produced (fold deltas,
-    /// replaced extremes, re-read row answers, keyed row changes) arrives
-    /// already resolved: the engine drove its connector for every read this
-    /// event required, each bounded by its registration's budget.
+    /// The event folds once into a compressed patchset, shared across the
+    /// matched consumers and kept in the record, so a catchup sends the same
+    /// bytes later instead of folding it again. It is built whenever the event
+    /// is logged, matched or not, since the consumer that needs it may be away.
+    /// Everything the engine's tiers produced (fold deltas, replaced extremes,
+    /// re-read row answers, keyed row changes) arrives already resolved: the
+    /// engine drove its connector for every read this event required, each
+    /// bounded by its registration's budget.
     ///
     /// # Errors
     ///
@@ -1266,8 +1273,9 @@ where
         consumers.extend_from_slice(engine.deleted());
         consumers.sort_unstable();
         consumers.dedup();
-        let patches = if consumers.is_empty() {
-            Vec::new()
+        let identity = self.event_identity(event);
+        let (patches, record) = if consumers.is_empty() && identity.is_none() {
+            (Vec::new(), None)
         } else {
             let built =
                 pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
@@ -1288,7 +1296,7 @@ where
             // supported pointer width, and a counter saturates rather than
             // panics regardless.
             let payload_len = u64::try_from(payload.len()).unwrap_or(u64::MAX);
-            consumers
+            let patches = consumers
                 .into_iter()
                 .map(|consumer_id| {
                     let leaving = departing.contains(&consumer_id);
@@ -1304,7 +1312,10 @@ where
                         departure: leaving && departure.is_some(),
                     }
                 })
-                .collect()
+                .collect();
+            let record =
+                identity.map(|(table, pk)| ChangeRecord::new(table, pk, event.clone(), payload));
+            (patches, record)
         };
 
         let narrowings = term_moves(&self.catalog, notifications.engine.narrowings());
@@ -1313,6 +1324,7 @@ where
             patches,
             computed,
             narrowings,
+            record,
         })
     }
 
@@ -1415,62 +1427,76 @@ where
             .collect()
     }
 
-    /// Build the oplog record for a dispatched CDC event.
+    /// Build the oplog record for a CDC event, encoding its patch.
     ///
-    /// Resolves the table name and a stable primary-key encoding from the
-    /// catalog once, so the oplog and the catchup auth filter carry them without
-    /// a second catalog pass. Returns `None` when the event's table is absent
-    /// from the catalog. Call only after
-    /// [`dispatch`](Self::dispatch) has accepted the event, which guarantees it
-    /// is a row event.
-    #[must_use]
-    pub fn oplog_record(&self, event: &PgChangeEvent) -> Option<ChangeRecord> {
-        let (table, pk) = self.event_identity(event)?;
-        Some(ChangeRecord::new(table, pk, event.clone()))
-    }
-
-    /// The catchup payload for one consumer, and whether it is a departure.
-    ///
-    /// `None` when the event never matched this consumer. Replaces asking for
-    /// the matched set and the payload separately, which took two engine calls
-    /// and could not tell a departure from a removal because the merged list
-    /// does not carry the distinction.
-    ///
-    /// Runs the same predicate matching the live path uses, but only through
-    /// the core engine, so it folds no aggregates and fires no re-execution
-    /// triggers. A departure is recomputed here rather than stored: matching is
-    /// a pure function of the event's row images, so replay reaches the same
-    /// three lists the live path did and classifies the same way. Live and replay
-    /// therefore cannot disagree, whatever either can determine.
+    /// The record [`dispatch`](Self::dispatch) logs, for a caller that logs an
+    /// event without dispatching it. Resolves the table name and a stable
+    /// primary-key encoding from the catalog once, so the oplog and the catchup
+    /// auth filter carry them without a second catalog pass. `Ok(None)` when the
+    /// event's table is absent from the catalog.
     ///
     /// # Errors
     ///
-    /// [`MaterializerError::Dispatch`] when the event cannot be matched,
-    /// [`MaterializerError::Emit`] when it cannot be folded, and
+    /// [`MaterializerError::Emit`] when the event cannot be folded, and
     /// [`MaterializerError::Compression`] on a compression failure.
-    pub fn replay_patch(
+    pub fn oplog_record(
+        &self,
+        event: &PgChangeEvent,
+    ) -> Result<Option<ChangeRecord>, MaterializerError> {
+        let Some((table, pk)) = self.event_identity(event) else {
+            return Ok(None);
+        };
+        Ok(Some(ChangeRecord::new(
+            table,
+            pk,
+            event.clone(),
+            self.encode_patch(event)?,
+        )))
+    }
+
+    /// Whether a logged event reaches one consumer on replay, and if so
+    /// whether as a departure.
+    ///
+    /// `None` when the event never matched this consumer, `Some(true)` when an
+    /// update moved the row out of its window. Matches this consumer's row
+    /// subscriptions read-only, so it folds no aggregates, fires no
+    /// re-execution triggers, and moves no membership or activity state. A
+    /// departure is recomputed here rather than stored: matching is a pure
+    /// function of the event's row images, so replay classifies the same way
+    /// the live path did.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Dispatch`] when the event cannot be matched.
+    pub fn replay_match(
         &mut self,
         event: &PgChangeEvent,
         consumer_id: u64,
-    ) -> Result<Option<(Vec<u8>, bool)>, MaterializerError> {
-        let (matched, departing) = {
-            let notifs = self.engine.match_rows(event)?;
-            let departing = matches!(event.kind(), EventKind::Update)
-                && notifs.deleted().contains(&consumer_id);
-            let matched = notifs.inserted().contains(&consumer_id)
-                || notifs.updated().contains(&consumer_id)
-                || notifs.deleted().contains(&consumer_id);
-            (matched, departing)
-        };
-        if !matched {
-            return Ok(None);
-        }
+    ) -> Result<Option<bool>, MaterializerError> {
+        let match_ = self.engine.matches_consumer(event, consumer_id)?;
+        let departing = matches!(event.kind(), EventKind::Update) && match_.deleted();
+        let matched = match_.inserted() || match_.updated() || match_.deleted();
+        Ok(matched.then_some(departing))
+    }
+
+    /// The compressed departure notice for the row `event` moved out of a
+    /// window, the same bytes the live path sends a departing consumer.
+    ///
+    /// [`None`] when the event folds to no operation.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Emit`] when the event cannot be folded, and
+    /// [`MaterializerError::Compression`] on a compression failure.
+    pub fn departure_notice(
+        &self,
+        event: &PgChangeEvent,
+    ) -> Result<Option<Vec<u8>>, MaterializerError> {
         let built = pgoutput_patchset_builder(&self.catalog, std::slice::from_ref(event.change()))
             .map_err(|err| MaterializerError::Emit(format!("{err}")))?;
-        if departing && let Some(notice) = Self::departure_patchset(&built) {
-            return Ok(Some((compress(&notice)?, true)));
-        }
-        Ok(Some((compress(&built.build())?, false)))
+        Ok(Self::departure_patchset(&built)
+            .map(|bytes| compress(&bytes))
+            .transpose()?)
     }
 
     /// Fold one event into a compressed patchset, the catchup delivery payload.
@@ -1861,6 +1887,11 @@ where
     /// the seed query answered is the subquery's own text rather than SQL
     /// rebuilt from resolved names (R63).
     ///
+    /// `subscriber` and `subjects` state the caller the registration will
+    /// carry, because a complete classified read rule describes one more
+    /// caller-reading term than the filter names, and with the caller unstated
+    /// the rule keeps query-only matching.
+    ///
     /// # Errors
     ///
     /// [`MaterializerError::Register`] for whatever `register` would answer
@@ -1871,8 +1902,16 @@ where
         consumer_id: u64,
         pg_sql: &str,
         binds: &[BindValue],
+        subscriber: Option<PgValue<Postgres>>,
+        subjects: Vec<PgValue<Postgres>>,
     ) -> Result<Vec<subql::term::TermDescription>, MaterializerError> {
-        let request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        let mut request = SubscriptionRequest::new(consumer_id, pg_sql).binds(wire_binds(binds));
+        if subscriber.is_some() || !subjects.is_empty() {
+            if let Some(subscriber) = subscriber {
+                request = request.subscriber(subscriber);
+            }
+            request = request.subjects(subjects);
+        }
         self.engine
             .describe_terms(&request)
             .map_err(MaterializerError::Register)
@@ -2261,11 +2300,26 @@ fn column_name_at<DB: DatabaseLike>(
 
 /// Zstd-compress a raw bulk payload at the materializer's standard level.
 ///
+/// Reuses one compression context per thread. A fresh context clears its
+/// tables on every call, which on a patch-sized payload costs about fifteen
+/// times the compression itself.
+///
 /// # Errors
 ///
 /// Propagates the underlying [`std::io::Error`].
 pub(crate) fn compress(bytes: &[u8]) -> std::io::Result<Vec<u8>> {
-    zstd::encode_all(bytes, ZSTD_LEVEL)
+    thread_local! {
+        static COMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Compressor<'static>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    crate::counters::add(&crate::counters::PATCH_COMPRESSIONS, 1);
+    COMPRESSOR.with_borrow_mut(|slot| {
+        let compressor = match slot {
+            Some(compressor) => compressor,
+            None => slot.insert(zstd::bulk::Compressor::new(ZSTD_LEVEL)?),
+        };
+        compressor.compress(bytes)
+    })
 }
 
 /// Zstd-decompress a bulk payload.
@@ -2469,7 +2523,10 @@ mod membership_term_tests {
     use super::*;
     use crate::openfga::Translated;
     use connetto_core::auth::DEFAULT_USER_SETTING;
+    use std::sync::Arc;
     use subql::term::TermDescription;
+
+    use subql::{ChangeEvent, PgCommitPosition, PgLsn, PgXid};
 
     /// The motivating pair: a guarded table filtered through a membership.
     const SCHEMA: &str = "CREATE TABLE docs (id BIGINT PRIMARY KEY, project_id BIGINT NOT NULL);\nCREATE TABLE project_members (project_id BIGINT NOT NULL, user_id TEXT NOT NULL, PRIMARY KEY (project_id, user_id));";
@@ -2518,7 +2575,7 @@ mod membership_term_tests {
             "the mapping must rewrite the caller, got {pg_sql}"
         );
         let terms = mat
-            .describe_terms(1, &pg_sql, &[])
+            .describe_terms(1, &pg_sql, &[], None, Vec::new())
             .expect("the canonical shape describes");
         let [term] = terms.as_slice() else {
             panic!("one canonical term describes, got {terms:?}");
@@ -2636,17 +2693,230 @@ mod membership_term_tests {
     fn a_non_canonical_shape_describes_no_term() {
         let mat = materializer(Some(mapping()));
         assert!(
-            mat.describe_terms(1, "SELECT * FROM docs WHERE project_id > 5", &[])
-                .expect("a literal comparison is an ordinary predicate")
-                .is_empty(),
+            mat.describe_terms(
+                1,
+                "SELECT * FROM docs WHERE project_id > 5",
+                &[],
+                None,
+                Vec::new()
+            )
+            .expect("a literal comparison is an ordinary predicate")
+            .is_empty(),
             "a comparison against a literal is not a membership subquery"
         );
         let joined = "SELECT * FROM docs WHERE project_id IN (SELECT pm.project_id FROM project_members pm JOIN docs d ON d.project_id = pm.project_id WHERE pm.user_id = current_setting('app.user_id', true))";
-        let described = mat.describe_terms(1, joined, &[]);
+        let described = mat.describe_terms(1, joined, &[], None, Vec::new());
         assert!(
             matches!(described, Err(MaterializerError::Register(_))),
             "a subquery joining a second table is outside the shape subql compiles, \
              so it is refused rather than described, got {described:?}"
         );
+    }
+    /// The catalog every connetto table carries, identity or subject set on
+    /// one column, beside the query the caller sends, which names no term.
+    const OWN_DDL: &str =
+        "CREATE TABLE items (id BIGINT PRIMARY KEY, owner TEXT NOT NULL, label TEXT NOT NULL);";
+    const OWN_POLICIES: &str = "ALTER TABLE items ENABLE ROW LEVEL SECURITY;\n\
+         CREATE POLICY items_p ON items FOR ALL USING (\n\
+         owner = current_setting('app.user_id', true)\n\
+         OR owner = ANY(string_to_array(current_setting('app.subjects', true), ','))\n\
+         );";
+    const OWN_QUERY: &str = "SELECT * FROM items";
+
+    fn own_materializer() -> Materializer {
+        let translated = Translated::of::<String>(OWN_DDL, OWN_POLICIES, DEFAULT_USER_SETTING)
+            .expect("the own-shape policy translates");
+        let (_, translator, _) = translated.into_parts();
+        let catalog = format!("{OWN_DDL}\n{OWN_POLICIES}");
+        Materializer::builder(&catalog)
+            .with_translator(translator)
+            .with_caller(CallerMappings {
+                identity: SessionVariableMapping::current_setting(
+                    DEFAULT_USER_SETTING,
+                    "current_app_user",
+                ),
+                subjects: Some(
+                    SessionVariableMapping::current_setting(
+                        connetto_core::auth::DEFAULT_SUBJECTS_SETTING,
+                        "current_app_subjects",
+                    )
+                    .holding_set(','),
+                ),
+            })
+            .build()
+            .expect("the catalog parses")
+    }
+
+    /// The rule's term seeds the caller the session will state, so the seam
+    /// registers the way `register_subscription` does once the rule's term
+    /// describes.
+    fn own_registration(
+        mat: &mut Materializer,
+        consumer_id: u64,
+        identity: &str,
+        keys: &[&str],
+    ) -> Registration {
+        let subscriber = PgValue::String(identity.to_owned());
+        let subjects: Vec<PgValue<Postgres>> = keys
+            .iter()
+            .map(|key| PgValue::String((*key).to_owned()))
+            .collect();
+        let terms = mat
+            .describe_terms(
+                consumer_id,
+                OWN_QUERY,
+                &[],
+                Some(subscriber.clone()),
+                subjects.clone(),
+            )
+            .expect("the rule's term describes");
+        let seed = TermSeed {
+            subscriber: Some(subscriber),
+            subjects,
+            term_values: Vec::new(),
+        };
+        let registration = mat
+            .register_translated(
+                consumer_id,
+                OWN_QUERY,
+                &[],
+                Some(seed),
+                ReadBudget::new(core::time::Duration::from_secs(5)),
+                None,
+            )
+            .expect("the registration folds the rule");
+        assert!(
+            !terms.is_empty(),
+            "the rule describes its caller-reading term"
+        );
+        registration
+    }
+
+    fn own_event(owner: &str) -> PgChangeEvent {
+        let mut data = pg_walstream::RowData::with_capacity(3);
+        data.push(Arc::from("id"), pg_walstream::ColumnValue::text("1"));
+        data.push(Arc::from("owner"), pg_walstream::ColumnValue::text(owner));
+        data.push(Arc::from("label"), pg_walstream::ColumnValue::text("x"));
+        let change = ChangeEvent::insert("public", "items", 0, data, pg_walstream::Lsn::new(1));
+        PgChangeEvent::new(change, PgCommitPosition::new(PgLsn(1), PgXid(1), 1))
+    }
+
+    /// A query naming no caller term still folds the table's rule, and the
+    /// dispatch then reaches only the callers the row admits. Against the
+    /// engine without the fold the same registration is one shared predicate
+    /// every insert matches, so every consumer below receives.
+    #[tokio::test]
+    async fn a_read_rule_folds_into_a_plain_query() {
+        let mut mat = own_materializer();
+        let registration = own_registration(&mut mat, 1, "alice", &["team:a"]);
+        assert!(matches!(registration, Registration::Row(_)));
+        let registration = own_registration(&mut mat, 2, "bob", &[]);
+        assert!(matches!(registration, Registration::Row(_)));
+
+        let dispatched = mat
+            .dispatch(&own_event("alice"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [1], "the row admits alice alone");
+
+        let dispatched = mat
+            .dispatch(&own_event("team:a"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [1], "the row names a subject only alice holds");
+
+        let dispatched = mat
+            .dispatch(&own_event("bob"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [2], "the row names bob's identity");
+
+        let dispatched = mat
+            .dispatch(&own_event("carol"))
+            .await
+            .expect("the dispatch runs");
+        assert!(
+            dispatched.patches.is_empty(),
+            "the row admits no registered caller"
+        );
+    }
+
+    /// The storm cell's exact subscription, a plain filter that names no caller
+    /// term, registered the way `register_subscription` seeds a caller-identity
+    /// term. The folded rule must still reach only the caller the row admits,
+    /// which is what narrows the catch-up walk the storm is built of.
+    #[tokio::test]
+    async fn a_plain_filtered_query_folds_the_read_rule() {
+        const QUERY: &str = "SELECT * FROM items WHERE id > 0";
+        let mut mat = own_materializer();
+        for (consumer_id, identity) in [(1, "user-0"), (2, "user-1")] {
+            let subscriber = PgValue::String(identity.to_owned());
+            let terms = mat
+                .describe_terms(
+                    consumer_id,
+                    QUERY,
+                    &[],
+                    Some(subscriber.clone()),
+                    Vec::new(),
+                )
+                .expect("the rule's term describes");
+            assert!(
+                !terms.is_empty(),
+                "the rule describes its caller-reading term"
+            );
+            let seed = TermSeed {
+                subscriber: Some(subscriber),
+                subjects: Vec::new(),
+                term_values: Vec::new(),
+            };
+            let registration = mat
+                .register_translated(
+                    consumer_id,
+                    QUERY,
+                    &[],
+                    Some(seed),
+                    ReadBudget::new(core::time::Duration::from_secs(5)),
+                    None,
+                )
+                .expect("the registration folds the rule");
+            assert!(matches!(registration, Registration::Row(_)));
+        }
+
+        let dispatched = mat
+            .dispatch(&own_event("user-0"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [1], "the row admits user-0 alone");
+
+        let dispatched = mat
+            .dispatch(&own_event("user-1"))
+            .await
+            .expect("the dispatch runs");
+        let consumers: Vec<u64> = dispatched
+            .patches
+            .iter()
+            .map(|patch| patch.consumer_id)
+            .collect();
+        assert_eq!(consumers, [2], "the row admits user-1 alone");
     }
 }

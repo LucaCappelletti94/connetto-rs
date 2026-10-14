@@ -306,6 +306,7 @@ mod tests {
     use super::GrantReach;
     use crate::openfga::Translated;
     use connetto_core::auth::DEFAULT_USER_SETTING;
+    use rls2fga::generator::json_model::Userset;
 
     /// The harness's own cross-table shape, which is what this phase exists
     /// for: the grant is a membership row and the rows that vanish are in
@@ -336,9 +337,29 @@ mod tests {
     /// to, and the withdrawal then reaches nobody.
     #[test]
     fn a_membership_fact_reaches_the_guarded_table() {
-        let reach = reach(CROSS_TABLE);
+        let translated =
+            Translated::of::<String>(CROSS_TABLE.0, CROSS_TABLE.1, DEFAULT_USER_SETTING)
+                .expect("the shape translates");
+        // The member relation is the team's leaf relation. Its name comes from
+        // the model, so the test reads it from there rather than spelling it.
+        let member = translated
+            .model()
+            .type_definitions
+            .iter()
+            .find(|definition| definition.type_name.as_str() == "teams")
+            .expect("the model names the team type")
+            .relations
+            .as_ref()
+            .expect("the team declares its relations")
+            .iter()
+            .find(|(_, rule)| matches!(rule, Userset::This { .. }))
+            .expect("the team carries a leaf member relation")
+            .0
+            .as_str()
+            .to_owned();
+        let reach = translated.into_parts().2;
         assert_eq!(
-            reach.tables_for("teams:1", "member"),
+            reach.tables_for("teams:1", &member),
             ["items".to_owned()],
             "items.can_select is defined through the team's member relation"
         );

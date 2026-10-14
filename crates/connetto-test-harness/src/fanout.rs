@@ -764,9 +764,10 @@ pub async fn term_over_owner_fixture(fixture: &Fixture) -> Server {
     .await
 }
 
-/// The pairing every example build uses: `current_setting('app.user_id')`
-/// spelled `current_app_user()` on the replica.
-fn caller_mapping() -> CallerMappings {
+/// The pairing every deployment build uses, `current_setting('app.user_id')`
+/// spelled `current_app_user()` on the replica with the subject set beside it.
+#[must_use]
+pub fn caller_mapping() -> CallerMappings {
     CallerMappings {
         identity: SessionVariableMapping::current_setting(
             connetto_core::auth::DEFAULT_USER_SETTING,

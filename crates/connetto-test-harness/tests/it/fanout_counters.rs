@@ -61,10 +61,10 @@ async fn the_change_path_asks_the_service_nothing_whatever_the_audience() {
         "route clones at {LARGE} subscribers"
     );
 
-    // The dispatch and oplog_record takes are per event regardless of the
-    // subscriber count, and any transaction-control events cost the same in
-    // both runs, so the difference between the runs isolates the
-    // per-subscriber advance_cursor takes. A lower bound rather than equality,
+    // The dispatch take is per event regardless of the subscriber count, and
+    // any transaction-control events cost the same in both runs, so the
+    // difference between the runs isolates the per-subscriber advance_cursor
+    // takes. A lower bound rather than equality,
     // since time-based source events would only ever add takes.
     let extra_lock_takes =
         large.counters.materializer_lock_takes - small.counters.materializer_lock_takes;

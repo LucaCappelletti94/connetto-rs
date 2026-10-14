@@ -4,6 +4,8 @@
 
 mod capability_live;
 
+mod catchup_cost;
+
 mod fanout_counters;
 
 mod fanout_delegated;

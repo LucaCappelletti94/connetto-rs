@@ -2848,7 +2848,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -6182,7 +6182,7 @@ dependencies = [
 [[package]]
 name = "pg2sqlite"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#95ce88134a0cfbe6ed060863474f1774a997d566"
+source = "git+https://github.com/LucaCappelletti94/pg2sqlite?branch=main#b969950fc5f958a65b01d430df9961c6f763171b"
 dependencies = [
  "git2",
  "sql-traits",
@@ -6972,7 +6972,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7493,9 +7493,10 @@ dependencies = [
 [[package]]
 name = "rls2fga"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#10839a694ac77b23c8005d882d7d69915ab7989c"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#649d793542eb2a411f542f823d9e5d7b2b927dc2"
 dependencies = [
  "openfga-client",
+ "prost",
  "rls2fga-types",
  "serde",
  "serde_json",
@@ -7507,7 +7508,7 @@ dependencies = [
 [[package]]
 name = "rls2fga-types"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#10839a694ac77b23c8005d882d7d69915ab7989c"
+source = "git+https://github.com/LucaCappelletti94/rls2fga?branch=main#649d793542eb2a411f542f823d9e5d7b2b927dc2"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -7661,7 +7662,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7720,7 +7721,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys 2.17.0",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -8381,7 +8382,7 @@ dependencies = [
 [[package]]
 name = "sql-traits"
 version = "0.1.0"
-source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#72f0bc5e962ee979c81a767aeb13e6961575bd48"
+source = "git+https://github.com/earth-metabolome-initiative/sql-traits?branch=main#dfe7a2007e60b0db46058cfee31fdf8026f17588"
 dependencies = [
  "geometric-traits",
  "serde",
@@ -8562,7 +8563,7 @@ dependencies = [
 [[package]]
 name = "subql"
 version = "0.1.0"
-source = "git+https://github.com/LucaCappelletti94/subql?branch=main#a49f0190ef979e1296b5ef7dfa0bdfb49e482fee"
+source = "git+https://github.com/LucaCappelletti94/subql?branch=main#bd56fb7079a8f319a49673353a8de96263ce8b3c"
 dependencies = [
  "arc-swap",
  "async-lock",
@@ -8772,10 +8773,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -10005,7 +10006,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

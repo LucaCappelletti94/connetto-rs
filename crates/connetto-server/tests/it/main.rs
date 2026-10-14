@@ -70,11 +70,15 @@ mod pg_async;
 
 mod preflight_previous_image;
 
+mod preflight_oplog_payload;
+
 mod provider;
 
 mod read_ceiling;
 
 mod read_filter;
+
+mod read_rule_fold;
 
 mod reconnect;
 

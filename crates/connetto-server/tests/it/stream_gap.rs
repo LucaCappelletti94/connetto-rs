@@ -62,7 +62,11 @@ fn records() -> (Vec<ChangeRecord>, Vec<PgCommit>) {
         for item in source.drain().expect("poll source") {
             match item {
                 SourceItem::Event(event) => {
-                    out.push(mat.oplog_record(&event).expect("build oplog record"));
+                    out.push(
+                        mat.oplog_record(&event)
+                            .expect("encode the event's patch")
+                            .expect("build oplog record"),
+                    );
                 }
                 SourceItem::Commit(commit) => commits.push(commit),
             }
