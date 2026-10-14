@@ -26,7 +26,7 @@ jobs:
     name: Check ${{ matrix.name }}
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && matrix.name == 'root native' && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: &light-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     timeout-minutes: 40
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. These jobs never run the demo, so any file serves.
@@ -129,7 +129,7 @@ jobs:
 
   nightly-lint:
     name: Nightly lint
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 45
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. This job never runs the demo, so any file serves.
@@ -199,7 +199,7 @@ jobs:
     # device. Its own job because the matrix legs pass --all-features, which
     # would switch the desktop renderer on for the phone.
     name: Build dioxus-desktop-demo android
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -949,7 +949,7 @@ jobs:
 
   file-core-wasm:
     name: File core wasm
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -999,7 +999,7 @@ jobs:
 
   passkey-gate:
     name: Passkey gate
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

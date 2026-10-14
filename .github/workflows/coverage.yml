@@ -162,7 +162,9 @@ jobs:
   sonar:
     name: SonarQube scan
     needs: coverage
-    runs-on: ubuntu-latest
+    # Only pushes and same-repository pull requests may reach the self-hosted
+    # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     timeout-minutes: 45
     # Neither a fork's pull request nor a Dependabot run can read SONAR_TOKEN,
     # so the scan runs for same-repo human branches and pushes to main only.
