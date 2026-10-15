@@ -28,7 +28,7 @@ import java.util.UUID
 /**
  * The Bluetooth beacon and the GATT service the exchange runs over (R76).
  *
- * All state stands behind [lock]; the [JvmStatic]s are the JNI surface the
+ * All state stands behind [lock], and the [JvmStatic]s are the JNI surface the
  * client drives. The readiness stands on the adapter's switch and the
  * three runtime permissions. The host side starts a legacy advertisement
  * carrying the beacon's service data under the service uuid, and a GATT
@@ -250,6 +250,7 @@ class BluetoothPlugin {
             }
         }
 
+        /** The runtime Bluetooth permissions not granted, none before API 31. */
         private fun missingPermissionsLocked(): List<String> {
             val context = context() ?: return emptyList()
             if (Build.VERSION.SDK_INT < 31) return emptyList()
@@ -265,6 +266,7 @@ class BluetoothPlugin {
                 .map { it.substringAfterLast('.') }
         }
 
+        /** Watch the app's activities once, so a return from the system's prompt settles it. */
         private fun registerLifecycleLocked() {
             if (callbacksRegistered) return
             val application = context()?.applicationContext as? Application ?: return
@@ -478,6 +480,7 @@ class BluetoothPlugin {
             }
         }
 
+        /** Stop the advertisement and the GATT server, and forget every connection. */
         private fun stopLocked() {
             runCatching {
                 val manager = manager()
@@ -495,11 +498,13 @@ class BluetoothPlugin {
             ccc.clear()
         }
 
+        /** The client configuration descriptor a central writes to subscribe. */
         private fun cccDescriptor(): BluetoothGattDescriptor = BluetoothGattDescriptor(
             CCC_UUID,
             BluetoothGattDescriptor.PERMISSION_READ or BluetoothGattDescriptor.PERMISSION_WRITE
         )
 
+        /** The device's MAC address read as one 48-bit key. */
         private fun deviceKey(device: BluetoothDevice): Long {
             val mac = device.address
             var key = 0L
@@ -509,11 +514,14 @@ class BluetoothPlugin {
             return key
         }
 
+        /** The system's Bluetooth manager, where a context stands. */
         private fun manager(): BluetoothManager? =
             context()?.getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
 
+        /** The default adapter, where the device has one. */
         private fun adapter(): BluetoothAdapter? = manager()?.adapter
 
+        /** The application context, cached once the framework hands it out. */
         private fun context(): Context? {
             cachedContext?.let { return it }
             val context = contextFromFramework()
@@ -521,6 +529,7 @@ class BluetoothPlugin {
             return context
         }
 
+        /** The running application, read through `ActivityThread` by reflection. */
         private fun contextFromFramework(): Context? = runCatching {
             val application =
                 Class.forName("android.app.ActivityThread")

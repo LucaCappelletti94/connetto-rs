@@ -1814,6 +1814,7 @@ mod tests {
 
     const DAY: Duration = Duration::from_hours(24);
 
+    /// Now, truncated to the whole second a certificate encodes.
     fn whole_second() -> SystemTime {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -1858,6 +1859,7 @@ mod tests {
     }
 
     impl Deployment {
+        /// A deployment with its root, one issuer and the host and joiner leaves.
         fn new() -> Self {
             let now = whole_second();
             let root = RootCa::create(
@@ -1974,6 +1976,7 @@ mod tests {
     }
 
     impl FakeReadiness {
+        /// A readiness standing at `state`, nothing missing and no prompt asked.
         fn new(state: BluetoothState) -> Self {
             Self {
                 state: Mutex::new(state),
@@ -2014,6 +2017,7 @@ mod tests {
     }
 
     impl Wire {
+        /// An empty wire both ways.
         fn new() -> Self {
             Self {
                 to_joiner: Mutex::new(VecDeque::new()),
@@ -2033,6 +2037,7 @@ mod tests {
     }
 
     impl FakePeripheral {
+        /// A peripheral over `wire` that has started nothing.
         fn new(wire: Arc<Wire>) -> Self {
             Self {
                 wire,
@@ -2044,6 +2049,7 @@ mod tests {
             }
         }
 
+        /// Queue `event` for the machine's next poll.
         fn push(&self, event: PeripheralEvent) {
             self.queue.lock().push_back(event);
         }
@@ -2093,6 +2099,7 @@ mod tests {
     }
 
     impl FakeCentral {
+        /// A central over `wire` that has scanned for nothing.
         fn new(wire: Arc<Wire>) -> Self {
             Self {
                 wire,
@@ -2104,10 +2111,12 @@ mod tests {
             }
         }
 
+        /// Queue `event` for the machine's next poll.
         fn push(&self, event: CentralEvent) {
             self.queue.lock().push_back(event);
         }
 
+        /// Whether the machine started a scan.
         fn started(&self) -> bool {
             *self.scans.lock() > 0
         }
@@ -2160,15 +2169,19 @@ mod tests {
         Fingerprint::of(&[seed; 32])
     }
 
+    /// The offer the fakes' hotspot hands out.
     fn offer() -> HotspotOffer {
         HotspotOffer::new("hotspot", "secret", HotspotSecurity::Wpa2, Some(54321))
     }
 
     impl Harness {
+        /// A harness at `state`, scanning, prompting and serving `fp(1)`.
         fn new(state: BluetoothState) -> Self {
             Self::with(state, quiet_node(), true, false, true, Some(fp(1)))
         }
 
+        /// A harness over fresh fakes with the given standings and serving
+        /// fingerprint.
         fn with(
             state: BluetoothState,
             node: Node,
@@ -2223,6 +2236,7 @@ mod tests {
             self.beacon.borrow().clone()
         }
 
+        /// Tick the machine once, hosting `hosting` and joined to nothing.
         fn tick(&mut self, hosting: Option<&HotspotOffer>) {
             self.machine.tick(hosting, false);
         }
@@ -2261,6 +2275,7 @@ mod tests {
     type JoinReply = oneshot::Sender<Result<IpAddr, JoinError>>;
 
     impl Harness {
+        /// The host the machine would try next.
         fn strongest_untried(&self) -> Option<HostId> {
             self.machine.strongest_untried_host()
         }
@@ -2277,6 +2292,7 @@ mod tests {
     }
 
     impl ExchangePair {
+        /// A host and a joiner machine over one wire, each serving its leaf.
         fn new() -> Self {
             let d = Deployment::new();
             let wire = Arc::new(Wire::new());
@@ -2882,6 +2898,7 @@ mod tests {
     }
 
     impl FakeHotspotBackend {
+        /// A hotspot backend whose host stands started.
         fn new() -> Self {
             Self {
                 host_status: Mutex::new(crate::hotspot::HostStatus::Started {
