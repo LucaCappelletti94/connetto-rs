@@ -194,6 +194,14 @@ pub struct Node {
     _lifetime: Arc<Lifetime>,
 }
 
+#[cfg(test)]
+impl Node {
+    /// The state the node's links run on.
+    pub(crate) fn state(&self) -> &Arc<NodeState> {
+        &self.state
+    }
+}
+
 /// Closes the listener and every link when the last `Node` handle drops.
 struct Lifetime(Arc<NodeState>);
 
@@ -1103,6 +1111,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 reason: CloseReason::Duplicate,
             };
             let _ = tokio::time::timeout(WRITE_BOUND, write_frame(&mut tls, &close)).await;
+            crate::link::hang_up(&mut tls).await;
         });
     }
     Ok(())

@@ -1645,6 +1645,129 @@ async fn a_duplicate_close_holds_the_peer_until_the_bound_or_a_stop() {
     );
 }
 
+/// A raw peer linked to the host whose socket holds a list the host
+/// forwarded and the peer never read, so dropping it resets the connection.
+async fn raw_with_unread_bytes(
+    deployment: &Deployment,
+    issuer: &Issuer,
+    host_node: &Node,
+    h_rx: &mut mpsc::UnboundedReceiver<PeerEvent>,
+    peer: &Peer,
+    host_addr: SocketAddr,
+    number: u64,
+) -> tokio_rustls::TlsStream<tokio::net::TcpStream> {
+    let raw = raw_linked(deployment.root_der(), peer, host_addr).await;
+    assert_eq!(
+        next_events(h_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: peer.identity.clone()
+        }]
+    );
+    let (list, signer) = deployment.issuer_list(issuer, number, &[], whole_second());
+    host_node.keep_list(list, signer);
+    let (tcp, _) = raw.get_ref();
+    time::timeout(Duration::from_secs(10), tcp.peek(&mut [0; 1]))
+        .await
+        .expect("the forwarded list arrives within the bound")
+        .expect("the socket peeks");
+    raw
+}
+
+#[tokio::test]
+async fn a_duplicate_close_behind_a_ping_survives_a_reset() {
+    let now = whole_second();
+    let deployment = Deployment::new(22, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let reset = deployment.device(
+        &issuer,
+        "reset",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let hung_up = deployment.device(
+        &issuer,
+        "hung-up",
+        now,
+        DAY,
+        [3; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+    let ping = PeerFrame::Ping;
+    let close = PeerFrame::Close {
+        reason: CloseReason::Duplicate,
+    };
+
+    // A peer that drops its socket resets the connection. With both frames
+    // sent first, the host answers the ping into the reset and still finds
+    // the close queued behind it.
+    let mut raw = raw_with_unread_bytes(
+        &deployment,
+        &issuer,
+        &host_node,
+        &mut h_rx,
+        &reset,
+        host_addr,
+        1,
+    )
+    .await;
+    raw.get_ref().0.set_nodelay(true).expect("the socket sets");
+    write_frame(&mut raw, &ping).await.expect("the ping writes");
+    write_frame(&mut raw, &close)
+        .await
+        .expect("the close writes");
+    drop(raw);
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+
+    // Frames written back to back may still sit unsent when the socket
+    // closes, so a hang-up keeps the connection until the host has read them.
+    let mut raw = raw_with_unread_bytes(
+        &deployment,
+        &issuer,
+        &host_node,
+        &mut h_rx,
+        &hung_up,
+        host_addr,
+        2,
+    )
+    .await;
+    write_frame(&mut raw, &ping).await.expect("the ping writes");
+    write_frame(&mut raw, &close)
+        .await
+        .expect("the close writes");
+    crate::link::hang_up(&mut raw).await;
+    drop(raw);
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+
+    host_node.stop(CloseReason::Withdrawn);
+    let mut gone = next_events(&mut h_rx, 2).await;
+    gone.sort_by_key(|event| format!("{event:?}"));
+    let mut expected = vec![
+        PeerEvent::Unlinked {
+            peer: reset.identity.clone(),
+            reason: CloseReason::Withdrawn,
+        },
+        PeerEvent::Unlinked {
+            peer: hung_up.identity.clone(),
+            reason: CloseReason::Withdrawn,
+        },
+    ];
+    expected.sort_by_key(|event| format!("{event:?}"));
+    assert_eq!(gone, expected);
+}
+
 #[tokio::test]
 async fn a_stale_or_unverified_list_is_neither_kept_nor_forwarded() {
     let now = whole_second();
