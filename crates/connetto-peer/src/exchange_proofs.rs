@@ -1,11 +1,16 @@
 //! The R76 slice 5 proofs, over chunk streams built on one channel each
 //! way, with every certificate minted here.
 
+use std::io;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
-use connetto_core::device_cert::AttestationLevel;
-use rustls::pki_types::ServerName;
+use connetto_core::device_cert::{
+    AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeviceKey,
+    DeviceKeyError, KeyHome, key_id,
+};
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, SigningKey as _};
+use rustls::pki_types::{CertificateDer, ServerName};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
@@ -14,6 +19,7 @@ use crate::error::{ExchangeError, Refusal};
 use crate::exchange::{ChunkStream, EXCHANGE_BOUND, OfferFrame};
 use crate::frame::{PeerFrame, read_frame, write_frame};
 use crate::node::{client_config_for, server_config_for};
+use crate::signer::{IdentityClientCert, IdentityServerCert};
 use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
 use crate::{CloseReason, PeerEvent, SystemClock, Trust};
 
@@ -547,4 +553,458 @@ async fn a_chunk_stream_errors_writes_after_the_reader_is_gone() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
     assert!(failed, "a write into a closed channel fails");
+}
+
+/// A device key held in memory, standing in for a chip.
+struct RcgenKey(Arc<KeyPair>);
+
+impl DeviceKey for RcgenKey {
+    fn public_point(&self) -> [u8; 65] {
+        self.0
+            .public_key_raw()
+            .try_into()
+            .expect("an uncompressed P-256 point")
+    }
+
+    fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+        self.0
+            .sign(message)
+            .map_err(|err| DeviceKeyError::Platform(Box::new(err)))
+    }
+
+    fn home(&self) -> KeyHome {
+        KeyHome::Software
+    }
+}
+
+/// A device key and the leaf the root signs for it, with no issuer between,
+/// the chain a truncated peer presents (R76 slice 5a).
+fn lone_leaf(deployment: &Deployment, now: SystemTime, serial: [u8; 16]) -> (RcgenKey, Vec<u8>) {
+    let key = RcgenKey(Arc::new(
+        KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the key generates"),
+    ));
+    let csr =
+        CertificateRequest::build(&CertificateSigner::new(&key), &[3; 32]).expect("the csr builds");
+    let request = CertificateRequest::parse(&csr).expect("the request parses");
+    let leaf = deployment
+        .root_signer()
+        .issue(
+            &request,
+            "lone",
+            now,
+            DAY,
+            CertificateSerial::new(serial).expect("the serial is positive"),
+            AttestationLevel::Unproven,
+        )
+        .expect("the leaf issues");
+    (key, leaf)
+}
+
+/// A joiner that presents no issuer certificate is refused before the
+/// offer, so a truncated chain cannot stand behind the exchange (R76 slice 5a).
+#[tokio::test]
+async fn a_joiner_that_presents_no_issuer_is_refused_without_the_offer() {
+    let now = whole_second();
+    let deployment = Deployment::new(37, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let (lone_key, lone_leaf) = lone_leaf(&deployment, now, [4; 16]);
+
+    let (h_tx, _h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    serve(&host_node, &host);
+
+    let (host_io, joiner_io) = chunk_pair(20);
+    let offer = OfferFrame::new("camp", "opensesame", 1, Some(5678));
+    let (host_res, _client) = tokio::join!(host_node.offer_over(host_io, offer), async {
+        // The config presents the lone leaf alone, the way a truncated
+        // peer's resolver would, with the crate's own verifier.
+        let crls = Arc::new(parking_lot::RwLock::new(Arc::from(
+            Vec::<crate::verify::Crl>::new().into_boxed_slice(),
+        )));
+        let verifier = crate::verify::PeerVerifier::new(
+            &Trust {
+                roots: vec![deployment.root_der()],
+                accepted: all_levels(),
+            },
+            Arc::new(SystemClock),
+            Arc::new(parking_lot::RwLock::new(Some(key_id(&lone_key)))),
+            crls,
+        );
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("ring speaks TLS 1.3")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_client_cert_resolver(Arc::new(IdentityClientCert::new(
+            vec![CertificateDer::from(lone_leaf.clone())],
+            Arc::new(lone_key),
+        )));
+        let connector = TlsConnector::from(Arc::new(config));
+        let domain = ServerName::try_from("connetto-peer").expect("a valid dial name");
+        connector
+            .connect(domain, joiner_io)
+            .await
+            .expect("the handshake completes")
+    });
+    assert!(matches!(
+        &host_res,
+        Err(ExchangeError::Protocol(message)) if *message == "the peer presented no issuer certificate"
+    ));
+    host_node.stop(CloseReason::Closed);
+}
+
+/// A host that presents no issuer certificate gets no fetch, so a truncated
+/// chain cannot stand behind the exchange (R76 slice 5a).
+#[tokio::test]
+async fn a_host_that_presents_no_issuer_gets_no_fetch() {
+    let now = whole_second();
+    let deployment = Deployment::new(38, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let joiner = deployment.device(
+        &issuer,
+        "joiner",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (lone_key, lone_leaf) = lone_leaf(&deployment, now, [5; 16]);
+
+    let (j_tx, _j_rx) = events();
+    let joiner_node = node(deployment.root_der(), j_tx);
+    serve(&joiner_node, &joiner);
+
+    let (host_io, joiner_io) = chunk_pair(20);
+    let ((), joiner_res) = tokio::join!(
+        async {
+            // The config presents the lone leaf alone, the way a truncated
+            // peer's resolver would, with the crate's own verifier.
+            let crls = Arc::new(parking_lot::RwLock::new(Arc::from(
+                Vec::<crate::verify::Crl>::new().into_boxed_slice(),
+            )));
+            let verifier = crate::verify::PeerVerifier::new(
+                &Trust {
+                    roots: vec![deployment.root_der()],
+                    accepted: all_levels(),
+                },
+                Arc::new(SystemClock),
+                Arc::new(parking_lot::RwLock::new(Some(key_id(&lone_key)))),
+                crls,
+            );
+            let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .expect("ring speaks TLS 1.3")
+            .with_client_cert_verifier(Arc::new(verifier))
+            .with_cert_resolver(Arc::new(IdentityServerCert::new(
+                vec![CertificateDer::from(lone_leaf.clone())],
+                Arc::new(lone_key),
+            )));
+            let _ = TlsAcceptor::from(Arc::new(config))
+                .accept(host_io)
+                .await
+                .expect("the handshake completes");
+        },
+        joiner_node.fetch_over(joiner_io)
+    );
+    assert!(matches!(
+        &joiner_res,
+        Err(ExchangeError::Protocol(message)) if *message == "the peer presented no issuer certificate"
+    ));
+    joiner_node.stop(CloseReason::Closed);
+}
+
+/// A joiner that breaks the frame protocol where its lists come gets no
+/// offer, with the break named (R76 slice 5a).
+#[tokio::test]
+async fn a_joiner_that_breaks_the_frame_protocol_where_its_lists_come() {
+    let now = whole_second();
+    let deployment = Deployment::new(39, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let joiner = deployment.device(
+        &issuer,
+        "joiner",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    // An over-long frame names the ceiling.
+    let (h_tx, _h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    serve(&host_node, &host);
+    let (host_io, joiner_io) = chunk_pair(20);
+    let offer = OfferFrame::new("camp", "opensesame", 1, Some(5678));
+    let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
+        let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
+        let hello = PeerFrame::Hello {
+            version: 1,
+            dial: 1,
+            numbers: Vec::new(),
+        };
+        write_frame(&mut raw, &hello)
+            .await
+            .expect("the hello writes");
+        let _ = read_frame(&mut raw).await;
+        raw.write_all(&[0xff, 0xff, 0xff, 0xff])
+            .await
+            .expect("the bytes write");
+    });
+    assert!(matches!(
+        &host_res,
+        Err(ExchangeError::Protocol(message)) if *message == "the frame exceeds the ceiling"
+    ));
+    host_node.stop(CloseReason::Closed);
+
+    // A frame that is not a list names itself.
+    let (h_tx, _h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    serve(&host_node, &host);
+    let (host_io, joiner_io) = chunk_pair(514);
+    let offer = OfferFrame::new("camp", "opensesame", 1, Some(5678));
+    let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
+        let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
+        let hello = PeerFrame::Hello {
+            version: 1,
+            dial: 1,
+            numbers: Vec::new(),
+        };
+        write_frame(&mut raw, &hello)
+            .await
+            .expect("the hello writes");
+        let _ = read_frame(&mut raw).await;
+        write_frame(&mut raw, &PeerFrame::Ping)
+            .await
+            .expect("the probe writes");
+    });
+    assert!(matches!(
+        &host_res,
+        Err(ExchangeError::Protocol(message)) if *message == "the joiner sent a Ping frame where its lists end"
+    ));
+    host_node.stop(CloseReason::Closed);
+}
+
+/// A host that breaks the frame protocol where the offer comes gets a named
+/// refusal from the joiner (R76 slice 5a).
+#[tokio::test]
+async fn a_host_that_breaks_the_frame_protocol_where_the_offer_comes() {
+    let now = whole_second();
+    let deployment = Deployment::new(40, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let joiner = deployment.device(
+        &issuer,
+        "joiner",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (j_tx, _j_rx) = events();
+    let joiner_node = node(deployment.root_der(), j_tx);
+    serve(&joiner_node, &joiner);
+
+    let (host_io, joiner_io) = chunk_pair(20);
+    let (_host, joiner_res) = tokio::join!(
+        async {
+            let mut raw = raw_server(deployment.root_der(), &host, host_io).await;
+            let _hello = read_frame(&mut raw).await.expect("the hello reads");
+            raw.write_all(&[0xff, 0xff, 0xff, 0xff])
+                .await
+                .expect("the bytes write");
+        },
+        joiner_node.fetch_over(joiner_io)
+    );
+    assert!(matches!(
+        &joiner_res,
+        Err(ExchangeError::Protocol(message)) if *message == "the frame exceeds the ceiling"
+    ));
+    joiner_node.stop(CloseReason::Closed);
+}
+
+/// A host that sends a ping where the offer comes gets a named refusal from
+/// the joiner (R76 slice 5a).
+#[tokio::test]
+async fn a_host_that_sends_a_ping_where_the_offer_comes() {
+    let now = whole_second();
+    let deployment = Deployment::new(41, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let joiner = deployment.device(
+        &issuer,
+        "joiner",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (j_tx, _j_rx) = events();
+    let joiner_node = node(deployment.root_der(), j_tx);
+    serve(&joiner_node, &joiner);
+
+    let (host_io, joiner_io) = chunk_pair(514);
+    let (_host, joiner_res) = tokio::join!(
+        async {
+            let mut raw = raw_server(deployment.root_der(), &host, host_io).await;
+            let hello = PeerFrame::Hello {
+                version: 1,
+                dial: 0,
+                numbers: Vec::new(),
+            };
+            write_frame(&mut raw, &hello)
+                .await
+                .expect("the hello writes");
+            let _ = read_frame(&mut raw).await.expect("the hello reads");
+            while read_frame(&mut raw).await.expect("the swap ends").is_some() {}
+            write_frame(&mut raw, &PeerFrame::Ping)
+                .await
+                .expect("the probe writes");
+        },
+        joiner_node.fetch_over(joiner_io)
+    );
+    assert!(matches!(
+        &joiner_res,
+        Err(ExchangeError::Protocol(message)) if message.starts_with("the host sent a Ping")
+    ));
+    joiner_node.stop(CloseReason::Closed);
+}
+
+/// A host that closes before its offer gets a named refusal from the
+/// joiner (R76 slice 5a).
+#[tokio::test]
+async fn a_host_that_closes_before_its_offer_refuses_the_fetch() {
+    let now = whole_second();
+    let deployment = Deployment::new(42, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let joiner = deployment.device(
+        &issuer,
+        "joiner",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (j_tx, _j_rx) = events();
+    let joiner_node = node(deployment.root_der(), j_tx);
+    serve(&joiner_node, &joiner);
+
+    let (host_io, joiner_io) = chunk_pair(20);
+    let (_host, joiner_res) = tokio::join!(
+        async {
+            let mut raw = raw_server(deployment.root_der(), &host, host_io).await;
+            let hello = PeerFrame::Hello {
+                version: 1,
+                dial: 0,
+                numbers: Vec::new(),
+            };
+            write_frame(&mut raw, &hello)
+                .await
+                .expect("the hello writes");
+            let _ = read_frame(&mut raw).await.expect("the hello reads");
+            // The host ends the swap, without its offer, and drops.
+            while read_frame(&mut raw).await.expect("the swap ends").is_some() {}
+        },
+        joiner_node.fetch_over(joiner_io)
+    );
+    assert!(matches!(
+        &joiner_res,
+        Err(ExchangeError::Protocol(message)) if *message == "the host closed before its offer"
+    ));
+    joiner_node.stop(CloseReason::Closed);
+}
+
+/// An empty write into a chunk stream yields zero bytes, so a flush that
+/// carries nothing ends cleanly (R76 slice 5a).
+#[tokio::test]
+async fn an_empty_write_into_a_chunk_stream_yields_zero() {
+    let (outbound, _outbound_rx) = mpsc::channel(4);
+    let (_inbound_tx, inbound_rx) = mpsc::channel(4);
+    let mut stream = ChunkStream::new(inbound_rx, outbound, 16);
+    let written = stream.write(&[]).await.expect("an empty write");
+    assert_eq!(written, 0, "nothing crosses for an empty write");
+}
+
+/// A shutdown chunk stream refuses the next write and the next flush, so a
+/// torn exchange cannot queue bytes into a closed pipe (R76 slice 5a).
+#[tokio::test]
+async fn a_shutdown_chunk_stream_refuses_writes_and_flushes() {
+    let (outbound, _outbound_rx) = mpsc::channel(4);
+    let (_inbound_tx, inbound_rx) = mpsc::channel(4);
+    let mut stream = ChunkStream::new(inbound_rx, outbound, 16);
+    stream
+        .shutdown()
+        .await
+        .expect("the shutdown ends the writes");
+    let error = stream
+        .write(b"late")
+        .await
+        .expect_err("the writes are done");
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "the chunk reader is gone");
+    let error = stream.flush().await.expect_err("the flush is done too");
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "the chunk reader is gone");
+}
+
+/// The offer frame's debug form redacts its passphrase, so a log that names
+/// a frame never carries the network key (R76 slice 5a).
+#[test]
+fn an_offer_frame_redacts_its_passphrase_in_its_debug_form() {
+    let frame = OfferFrame::new("camp", "opensesame", 1, Some(5678));
+    let debug = format!("{frame:?}");
+    assert!(
+        !debug.contains("opensesame"),
+        "the passphrase stays out of the log"
+    );
+    assert!(
+        debug.contains("<redacted>"),
+        "the redaction stands in its place"
+    );
+    assert!(debug.contains("camp"), "the network name stays");
+    assert!(debug.contains("5678"), "the port stays");
 }
