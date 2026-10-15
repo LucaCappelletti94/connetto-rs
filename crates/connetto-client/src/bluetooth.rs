@@ -19,6 +19,7 @@ use connetto_core::device_cert::DeviceIdentity;
 use connetto_peer::{
     Beacon, ChunkStream, EXCHANGE_BOUND, ExchangeError, Fingerprint, Node, OfferFrame,
 };
+use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::ClientEvent;
@@ -28,9 +29,13 @@ use crate::hotspot::{
 
 #[cfg(target_os = "android")]
 mod android;
+#[cfg(target_os = "android")]
+mod central;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::AndroidBluetoothBackend;
+#[cfg(target_os = "android")]
+pub(crate) use central::BtleplugCentral;
 
 /// The pace of the machine's look while an exchange runs.
 const FAST_TICK: Duration = Duration::from_millis(20);
@@ -45,6 +50,9 @@ const CHUNK_OVERHEAD: usize = 3;
 /// The longest attribute value GATT allows, which a notification or a write
 /// cannot pass however large the packet.
 const MAX_ATTRIBUTE_VALUE: usize = 512;
+/// The time a failed central start waits before it starts again (R76 central
+/// table).
+const CENTRAL_RETRY: Duration = Duration::from_secs(30);
 
 /// The device of a nearby host, the key the platform's Bluetooth stands on.
 pub type HostId = u64;
@@ -107,6 +115,9 @@ pub enum BluetoothError {
     /// An exchange is already running.
     #[error("an exchange is already running")]
     Busy,
+    /// The central is starting, so the call goes once it runs.
+    #[error("the Bluetooth central is starting")]
+    CentralStarting,
     /// The exchange failed, with the link's reason.
     #[error(transparent)]
     Exchange(#[from] ExchangeError),
@@ -200,10 +211,10 @@ pub enum PeripheralEvent {
 
 /// An event the joiner's central reports (R76).
 #[cfg_attr(
-    not(test),
+    not(any(test, target_os = "android")),
     expect(
         dead_code,
-        reason = "the central's backend arrives with btleplug (R76 decision 20), so only the proofs construct these events"
+        reason = "btleplug's central runs on Android only until R76's slice 8, so elsewhere only the proofs construct these events"
     )
 )]
 #[derive(Clone, Debug)]
@@ -214,8 +225,8 @@ pub enum CentralEvent {
         host: HostId,
         /// The beacon's service data.
         service_data: Vec<u8>,
-        /// The signal's strength.
-        rssi: i16,
+        /// The signal's strength, where the platform reports one.
+        rssi: Option<i16>,
     },
     /// The host connected, with the negotiated packet size.
     Connected {
@@ -319,11 +330,12 @@ impl PeripheralBackend for UnsupportedBackend {
     fn disconnect(&self, _device: u64) {}
 }
 
-/// A system's readiness, its peripheral, and its central where it runs one.
+/// A system's readiness, its peripheral, and its central's starter where it
+/// runs one.
 pub(crate) type Backends = (
     Arc<dyn ReadinessBackend>,
     Arc<dyn PeripheralBackend>,
-    Option<Arc<dyn CentralBackend>>,
+    Option<CentralStarter>,
 );
 
 /// The backends on a system with no Bluetooth, which runs no central.
@@ -537,12 +549,37 @@ enum BeaconDecision {
 /// The seam handing an exchange's offer to the hotspot's join.
 pub(crate) type JoinSeam =
     Arc<dyn Fn(HotspotOffer, Reply<Result<IpAddr, JoinError>>) + Send + Sync>;
+/// The starter's start, resolving to the central or the platform's
+/// reason (R76 decision 22).
+pub(crate) type CentralStart =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn CentralBackend>, String>> + Send>>;
+/// The seam that starts the joiner's central once, answering with it or
+/// the platform's reason (R76 decision 22).
+pub(crate) type CentralStarter = Arc<dyn Fn() -> CentralStart + Send + Sync>;
+
+/// The joiner's central's standing, and its start's answer (R76 central
+/// table).
+enum CentralState {
+    /// The central does not run, with the time its retry is due.
+    Absent { retry: Option<tokio::time::Instant> },
+    /// The start is in flight, with its answer.
+    Starting(oneshot::Receiver<Result<Arc<dyn CentralBackend>, String>>),
+    /// The central runs, in the state the runner's drop reads.
+    Running,
+}
 
 /// The machine, one per client (R76).
 pub(crate) struct Machine {
     readiness: Arc<dyn ReadinessBackend>,
     peripheral: Arc<dyn PeripheralBackend>,
-    central: Option<Arc<dyn CentralBackend>>,
+    /// The seam that starts the central, `None` on a system that runs no
+    /// central.
+    starter: Option<CentralStarter>,
+    /// The central's standing (R76 central table).
+    central_state: CentralState,
+    /// The running central, shared with the runner's drop so a central
+    /// started after the loop began is still stopped with it.
+    central: Arc<Mutex<Option<Arc<dyn CentralBackend>>>>,
     node: Node,
     /// The fingerprint the device serves, `None` where it does not.
     serving: Arc<dyn Fn() -> Option<Fingerprint> + Send + Sync>,
@@ -571,9 +608,10 @@ pub(crate) struct Machine {
 }
 
 impl Machine {
-    /// The machine over the backends, the peer node, the scan and autojoin
-    /// standings, the prompt standing, and the serving, join and event
-    /// seams. The receiver stands the host's beacon for the panel.
+    /// The machine over the backends, the central's starter where the system
+    /// runs one, the peer node, the scan and autojoin standings, the prompt
+    /// standing, and the serving, join and event seams. The receiver stands
+    /// the host's beacon for the panel.
     #[expect(
         clippy::too_many_arguments,
         reason = "the three backends and the three seams join the node and its three standings, and a config struct would hide the same arity behind another type"
@@ -581,7 +619,7 @@ impl Machine {
     pub(crate) fn new(
         readiness: Arc<dyn ReadinessBackend>,
         peripheral: Arc<dyn PeripheralBackend>,
-        central: Option<Arc<dyn CentralBackend>>,
+        starter: Option<CentralStarter>,
         node: Node,
         scan: bool,
         autojoin: bool,
@@ -598,7 +636,9 @@ impl Machine {
             Self {
                 readiness,
                 peripheral,
-                central,
+                starter,
+                central_state: CentralState::Absent { retry: None },
+                central: Arc::new(Mutex::new(None)),
                 node,
                 serving,
                 join,
@@ -687,7 +727,7 @@ impl Machine {
 
     /// A manual exchange from the call's rows (R76 joiner table).
     fn begin_manual(&mut self, host: HostId, kind: Kind, reply: ManualReply) {
-        if self.central.is_none() {
+        if self.starter.is_none() {
             // The system runs no central, so the call has nothing to join
             // with.
             Self::answer_manual(reply, BluetoothError::Unsupported);
@@ -699,7 +739,9 @@ impl Machine {
             return;
         }
         match self.readiness.state() {
-            BluetoothState::Ready => self.begin_join_exchange(host, kind, Some(reply)),
+            // While Bluetooth reads Ready, the central's rows apply (R76
+            // central table).
+            BluetoothState::Ready => self.manual_central(host, kind, reply),
             BluetoothState::Unsupported => {
                 Self::answer_manual(reply, BluetoothError::Unsupported);
             }
@@ -713,6 +755,27 @@ impl Machine {
                     self.prompt_for(PromptPending::Join { host, reply }, false);
                 }
             },
+        }
+    }
+
+    /// The central's rows against a manual call, while Bluetooth reads
+    /// Ready (R76 central table).
+    fn manual_central(&mut self, host: HostId, kind: Kind, reply: ManualReply) {
+        match self.central_state {
+            // The central is absent, so the start goes and the call waits
+            // for it.
+            CentralState::Absent { .. } => {
+                self.start_central();
+                Self::answer_manual(reply, BluetoothError::CentralStarting);
+            }
+            // The start is in flight, so the call waits for it.
+            CentralState::Starting(_) => {
+                Self::answer_manual(reply, BluetoothError::CentralStarting);
+            }
+            // The central runs, so the joiner's rows apply.
+            CentralState::Running => {
+                self.begin_join_exchange(host, kind, Some(reply));
+            }
         }
     }
 
@@ -826,14 +889,12 @@ impl Machine {
                         let _ = reply.send(Ok(()));
                     }
                     PromptPending::Fetch { host, reply } => {
-                        self.begin_join_exchange(
-                            host,
-                            Kind::Fetch,
-                            Some(ManualReply::Fetch(reply)),
-                        );
+                        // The prompt settled Ready, so the central's rows
+                        // apply.
+                        self.manual_central(host, Kind::Fetch, ManualReply::Fetch(reply));
                     }
                     PromptPending::Join { host, reply } => {
-                        self.begin_join_exchange(host, Kind::Join, Some(ManualReply::Join(reply)));
+                        self.manual_central(host, Kind::Join, ManualReply::Join(reply));
                     }
                 },
                 (BluetoothState::Unsupported, Some(_)) => {
@@ -880,11 +941,64 @@ impl Machine {
             }
         }
 
+        self.tick_central(state, now);
         self.tick_host(state, hosting, serving.as_ref());
         self.tick_joiner(state, joined, serving.is_some(), now);
         self.answer_hosted(state);
         self.answer_joined(now);
         self.update_beacon(state, hosting.is_some(), serving.is_some());
+    }
+
+    /// The central's rows (R76 central table).
+    fn tick_central(&mut self, state: BluetoothState, now: tokio::time::Instant) {
+        // Bluetooth reads Ready and the central is absent, so the start
+        // goes, retrying from its bound where the last start failed.
+        if state == BluetoothState::Ready
+            && let CentralState::Absent { retry } = &self.central_state
+            && retry.is_none_or(|until| now >= until)
+        {
+            self.start_central();
+        }
+        // The start's answer, once it stands or the task ends without it.
+        if let CentralState::Starting(answer) = &mut self.central_state {
+            match answer.try_recv() {
+                Ok(Ok(central)) => {
+                    // The central runs, so the joiner's rows apply on this
+                    // look.
+                    *self.central.lock() = Some(central);
+                    self.central_state = CentralState::Running;
+                }
+                Ok(Err(reason)) => {
+                    tracing::warn!(%reason, "the Bluetooth central did not start");
+                    self.central_state = CentralState::Absent {
+                        retry: Some(now + CENTRAL_RETRY),
+                    };
+                }
+                Err(oneshot::error::TryRecvError::Closed) => {
+                    tracing::warn!("the Bluetooth central's start ended without its answer");
+                    self.central_state = CentralState::Absent {
+                        retry: Some(now + CENTRAL_RETRY),
+                    };
+                }
+                Err(oneshot::error::TryRecvError::Empty) => {}
+            }
+        }
+    }
+
+    /// The central's start, spawned and its answer watched on the later
+    /// looks (R76 central table).
+    fn start_central(&mut self) {
+        let Some(starter) = self.starter.clone() else {
+            // The system runs no central, so it stays absent.
+            return;
+        };
+        let (answer_tx, answer_rx) = oneshot::channel();
+        self.central_state = CentralState::Starting(answer_rx);
+        let pending = (starter)();
+        tokio::spawn(async move {
+            let outcome = pending.await;
+            let _ = answer_tx.send(outcome);
+        });
     }
 
     /// The host's beacon rows (R76 host table).
@@ -1085,19 +1199,19 @@ impl Machine {
         serving: bool,
         now: tokio::time::Instant,
     ) {
-        // The scan's condition, decision 19, on a system whose central runs
-        // and whose Bluetooth stands Ready.
+        // The scan's condition, decision 19, on a system whose central
+        // runs and whose Bluetooth stands Ready.
         let should_scan = self.scan
             && serving
             && !joined
             && state == BluetoothState::Ready
-            && self.central.is_some();
+            && matches!(self.central_state, CentralState::Running);
 
         match self.joiner {
             // Scan or autojoin turned on while the device serves with no
             // joined hotspot.
             JoinerState::Idle if should_scan => {
-                if let Some(central) = &self.central {
+                if let Some(central) = &*self.central.lock() {
                     central.start_scan();
                 }
                 self.joiner = JoinerState::Scanning;
@@ -1105,7 +1219,7 @@ impl Machine {
             // Scan turned off, the device stops serving, a hotspot is
             // joined, or Bluetooth leaves Ready.
             JoinerState::Scanning if !should_scan => {
-                if let Some(central) = &self.central {
+                if let Some(central) = &*self.central.lock() {
                     central.stop_scan();
                 }
                 self.report_hosts_gone();
@@ -1137,9 +1251,10 @@ impl Machine {
             (self.emit)(ClientEvent::HostGone { host });
         }
 
-        // The central's events.
+        // The central's events, where it runs.
         let events = self
             .central
+            .lock()
             .as_ref()
             .map(|central| central.poll())
             .unwrap_or_default();
@@ -1160,31 +1275,31 @@ impl Machine {
                                     HostRecord {
                                         prefix: beacon.prefix,
                                         last_seen: now,
-                                        rssi: Some(rssi),
+                                        rssi,
                                         tried: false,
                                     },
                                 );
                                 (self.emit)(ClientEvent::HostNearby {
                                     host,
                                     prefix: beacon.prefix,
-                                    rssi: Some(rssi),
+                                    rssi,
                                 });
                             }
                             // A known prefix refreshes its signal.
                             Some(record) if record.prefix == beacon.prefix => {
                                 record.last_seen = now;
-                                record.rssi = Some(rssi);
+                                record.rssi = rssi;
                             }
                             // A new prefix is a new host, untried again.
                             Some(record) => {
                                 record.prefix = beacon.prefix;
                                 record.last_seen = now;
-                                record.rssi = Some(rssi);
+                                record.rssi = rssi;
                                 record.tried = false;
                                 (self.emit)(ClientEvent::HostNearby {
                                     host,
                                     prefix: beacon.prefix,
-                                    rssi: Some(rssi),
+                                    rssi,
                                 });
                             }
                         }
@@ -1195,7 +1310,7 @@ impl Machine {
                     if matches!(&self.joiner, JoinerState::Exchanging { host: h, .. } if *h == host)
                     {
                         self.begin_join_task(mtu);
-                    } else if let Some(central) = &self.central {
+                    } else if let Some(central) = &*self.central.lock() {
                         central.disconnect(host);
                     }
                 }
@@ -1250,11 +1365,10 @@ impl Machine {
             if let JoinerState::Exchanging { host, outbound, .. } = &mut self.joiner
                 && let Some(outbound) = outbound.as_mut()
             {
+                // The central's handle, for the chunks' writes.
+                let central = self.central.lock().clone();
                 while let Ok(chunk) = outbound.try_recv() {
-                    let written = self
-                        .central
-                        .as_ref()
-                        .map(|central| central.write(*host, &chunk));
+                    let written = central.as_ref().map(|central| central.write(*host, &chunk));
                     if !matches!(written, Some(Ok(()))) {
                         failed = true;
                         break;
@@ -1315,7 +1429,7 @@ impl Machine {
     /// The join's exchange, from the scan or the call (R76).
     fn begin_join_exchange(&mut self, host: HostId, kind: Kind, reply: Option<ManualReply>) {
         if matches!(self.joiner, JoinerState::Scanning)
-            && let Some(central) = &self.central
+            && let Some(central) = &*self.central.lock()
         {
             central.stop_scan();
         }
@@ -1328,7 +1442,7 @@ impl Machine {
             outbound: None,
             task_reply: None,
         };
-        if let Some(central) = &self.central {
+        if let Some(central) = &*self.central.lock() {
             central.connect(host);
         }
     }
@@ -1396,7 +1510,7 @@ impl Machine {
         else {
             return;
         };
-        if let Some(central) = &self.central {
+        if let Some(central) = &*self.central.lock() {
             central.disconnect(host);
         }
         match outcome {
@@ -1630,7 +1744,7 @@ impl Machine {
         // The host's service stops, the joiner's scan and exchange cancel.
         self.peripheral.stop();
         if matches!(self.joiner, JoinerState::Scanning)
-            && let Some(central) = &self.central
+            && let Some(central) = &*self.central.lock()
         {
             central.stop_scan();
         }
@@ -1641,6 +1755,10 @@ impl Machine {
         self.pending_join.clear();
         self.prompting = None;
         self.action_waiters.clear();
+        // The central's rows, the start's answer dropped and the running
+        // central stopped.
+        self.central_state = CentralState::Absent { retry: None };
+        self.central.lock().take();
         // The beacon's standing settles, for the panel.
         let state = self.readiness.state();
         self.update_beacon(state, false, (self.serving)().is_some());
@@ -1702,7 +1820,7 @@ pub(crate) struct Runner {
     hotspot: Arc<dyn crate::hotspot::HotspotBackend>,
     hotspot_bind: crate::hotspot::SubnetBind,
     peripheral: Arc<dyn PeripheralBackend>,
-    central: Option<Arc<dyn CentralBackend>>,
+    central: Arc<Mutex<Option<Arc<dyn CentralBackend>>>>,
 }
 
 impl Future for Runner {
@@ -1723,9 +1841,9 @@ impl Drop for Runner {
         self.hotspot.leave_join();
         (self.hotspot_bind)(None);
         self.peripheral.stop();
-        if let Some(central) = &self.central {
-            central.stop_scan();
-        }
+        // The running central stops with the client, its thread ending with
+        // its last command sender.
+        self.central.lock().take();
     }
 }
 
@@ -1740,7 +1858,7 @@ pub(crate) fn run(
     let hotspot_backend = Arc::clone(&hotspot.backend);
     let hotspot_bind = Arc::clone(&hotspot.bind);
     let peripheral = Arc::clone(&bluetooth.peripheral);
-    let central = bluetooth.central.clone();
+    let central = Arc::clone(&bluetooth.central);
     Runner {
         future: Box::pin(async move {
             let mut hotspot_closed = false;
@@ -2154,12 +2272,56 @@ mod tests {
         }
     }
 
+    /// The answer a start's starter waits on, over the fakes.
+    type StarterAnswer = oneshot::Sender<Result<Arc<FakeCentral>, String>>;
+
+    /// A starter the test steers, each start answering when the test sends.
+    struct FakeStarter {
+        /// The starts the machine has asked, oldest first.
+        starts: Mutex<Vec<StarterAnswer>>,
+        /// Every start the machine has asked, answered or not.
+        total: Mutex<usize>,
+    }
+
+    impl FakeStarter {
+        fn new() -> Self {
+            Self {
+                starts: Mutex::new(Vec::new()),
+                total: Mutex::new(0),
+            }
+        }
+
+        fn asked(&self) -> usize {
+            *self.total.lock()
+        }
+
+        fn answer(&self, outcome: Result<Arc<FakeCentral>, String>) {
+            let sender = self.starts.lock().remove(0);
+            let _ = sender.send(outcome);
+        }
+    }
+
+    /// The fake central, as the machine's central.
+    fn central_handle(central: Arc<FakeCentral>) -> Arc<dyn CentralBackend> {
+        central
+    }
+
+    /// A starter that stands the central at once, for the machines whose
+    /// tests begin with it running.
+    fn instant_starter(central: Arc<FakeCentral>) -> CentralStarter {
+        Arc::new(move || -> CentralStart {
+            let central = central.clone();
+            Box::pin(async move { Ok(central as Arc<dyn CentralBackend>) })
+        })
+    }
+
     /// The machine over the fakes, with its seams' records.
     struct Harness {
         machine: Machine,
         readiness: Arc<FakeReadiness>,
         peripheral: Arc<FakePeripheral>,
         central: Arc<FakeCentral>,
+        starter: Arc<FakeStarter>,
         serving: Arc<Mutex<Option<Fingerprint>>>,
         events: Arc<Mutex<Vec<ClientEvent>>>,
         beacon: watch::Receiver<BeaconState>,
@@ -2194,6 +2356,7 @@ mod tests {
             let readiness = Arc::new(FakeReadiness::new(state));
             let peripheral = Arc::new(FakePeripheral::new(wire.clone()));
             let central = Arc::new(FakeCentral::new(wire));
+            let starter = Arc::new(FakeStarter::new());
             let serving = Arc::new(Mutex::new(serving));
             let scan = Arc::new(Mutex::new(scan));
             let autojoin = Arc::new(Mutex::new(autojoin));
@@ -2203,7 +2366,21 @@ mod tests {
             let (machine, beacon) = Machine::new(
                 Arc::clone(&readiness) as Arc<dyn ReadinessBackend>,
                 Arc::clone(&peripheral) as Arc<dyn PeripheralBackend>,
-                Some(Arc::clone(&central) as Arc<dyn CentralBackend>),
+                Some({
+                    let starter = Arc::clone(&starter);
+                    let seam: CentralStarter = Arc::new(move || -> CentralStart {
+                        let (tx, rx) = oneshot::channel();
+                        *starter.total.lock() += 1;
+                        starter.starts.lock().push(tx);
+                        Box::pin(async move {
+                            match rx.await {
+                                Ok(central) => central.map(central_handle),
+                                Err(_) => Err("the start's answer was dropped".into()),
+                            }
+                        })
+                    });
+                    seam
+                }),
                 node,
                 *scan.lock(),
                 *autojoin.lock(),
@@ -2226,6 +2403,7 @@ mod tests {
                 readiness,
                 peripheral,
                 central,
+                starter,
                 serving,
                 events,
                 beacon,
@@ -2241,11 +2419,21 @@ mod tests {
             self.machine.tick(hosting, false);
         }
 
+        /// Stand the central over the fakes, for a fresh machine whose radio
+        /// stands Ready, so the joiner's rows run against it.
+        async fn settle(&mut self) {
+            self.machine.tick(None, false);
+            self.starter.answer(Ok(Arc::clone(&self.central)));
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            self.machine.tick(None, false);
+        }
+
         fn host_seen(&self, host: HostId, host_fp: &Fingerprint, rssi: i16) {
             self.central.push(CentralEvent::Seen {
                 host,
                 service_data: Beacon::of(host_fp).to_service_data().to_vec(),
-                rssi,
+                rssi: Some(rssi),
             });
         }
 
@@ -2293,7 +2481,7 @@ mod tests {
 
     impl ExchangePair {
         /// A host and a joiner machine over one wire, each serving its leaf.
-        fn new() -> Self {
+        async fn new() -> Self {
             let d = Deployment::new();
             let wire = Arc::new(Wire::new());
             // The host plays no joiner and the joiner plays no host, so their
@@ -2304,13 +2492,12 @@ mod tests {
             let joiner_node = serving_node(d.root.clone(), d.joiner_identity);
             let h_readiness = Arc::new(FakeReadiness::new(BluetoothState::Ready));
             let h_peripheral = Arc::new(FakePeripheral::new(wire.clone()));
-            let h_central = Arc::new(FakeCentral::new(dead_wire.clone()));
             let h_serving = Arc::new(Mutex::new(Some(host_fp)));
             let h_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
             let (host, _h_beacon) = Machine::new(
                 h_readiness,
                 h_peripheral.clone(),
-                Some(h_central as Arc<dyn CentralBackend>),
+                None,
                 host_node,
                 false,
                 false,
@@ -2332,10 +2519,10 @@ mod tests {
             let joins: Arc<Mutex<Vec<(HotspotOffer, JoinReply)>>> =
                 Arc::new(Mutex::new(Vec::new()));
             let j_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-            let (joiner, _j_beacon) = Machine::new(
+            let (mut joiner, _j_beacon) = Machine::new(
                 j_readiness,
                 j_peripheral,
-                Some(j_central.clone() as Arc<dyn CentralBackend>),
+                Some(instant_starter(Arc::clone(&j_central))),
                 joiner_node,
                 true,
                 false,
@@ -2353,6 +2540,11 @@ mod tests {
                     move |event| events.lock().push(event)
                 }),
             );
+            // The central stands, so the joiner's rows run against it.
+            joiner.tick(None, false);
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            joiner.tick(None, false);
             Self {
                 host,
                 host_peripheral: h_peripheral,
@@ -2568,12 +2760,146 @@ mod tests {
         assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
     }
 
+    // --- The joiner's central table ---
+
+    #[tokio::test]
+    async fn the_central_does_not_start_while_bluetooth_is_not_ready() {
+        let mut h = Harness::new(BluetoothState::Off);
+        h.tick(None);
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 0);
+        assert!(h.machine.central.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn the_central_starts_on_first_ready_and_the_scan_begins_once_it_runs() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(None);
+        // The start goes, but the scan waits for the central to run.
+        assert_eq!(h.starter.asked(), 1);
+        assert!(!h.central.started());
+        h.starter.answer(Ok(Arc::clone(&h.central)));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        h.tick(None);
+        assert!(matches!(h.machine.central_state, CentralState::Running));
+        assert!(h.central.started());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_start_retries_after_its_bound_while_ready_and_not_before() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 1);
+        h.starter.answer(Err("the adapter is missing".into()));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        h.tick(None);
+        // The failure stands, and the retry waits its 30 seconds.
+        assert!(matches!(
+            h.machine.central_state,
+            CentralState::Absent { .. }
+        ));
+        assert_eq!(h.starter.asked(), 1);
+        tokio::time::sleep(Duration::from_secs(29)).await;
+        h.tick(None);
+        assert!(matches!(
+            h.machine.central_state,
+            CentralState::Absent { .. }
+        ));
+        assert_eq!(h.starter.asked(), 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 2);
+        h.starter.answer(Ok(Arc::clone(&h.central)));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        h.tick(None);
+        assert!(matches!(h.machine.central_state, CentralState::Running));
+    }
+
+    #[tokio::test]
+    async fn a_manual_join_while_the_central_is_starting_answers_central_starting() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 1);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.machine.handle(Command::JoinNearby {
+            host: 1,
+            reply: reply_tx,
+        });
+        let answer = reply_rx.try_recv().expect("the caller is answered");
+        assert!(matches!(
+            answer,
+            Err(JoinNearbyError::Bluetooth(BluetoothError::CentralStarting))
+        ));
+        // The call did not start a second central.
+        assert_eq!(h.starter.asked(), 1);
+        assert!(h.machine.central.lock().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_manual_fetch_while_the_central_is_starting_answers_central_starting() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 1);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.machine.handle(Command::Fetch {
+            host: 1,
+            reply: reply_tx,
+        });
+        let answer = reply_rx.try_recv().expect("the caller is answered");
+        assert!(matches!(answer, Err(BluetoothError::CentralStarting)));
+        assert_eq!(h.starter.asked(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_manual_join_while_absent_and_ready_starts_the_central() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        h.machine.handle(Command::JoinNearby {
+            host: 1,
+            reply: reply_tx,
+        });
+        let answer = reply_rx.try_recv().expect("the caller is answered");
+        assert!(matches!(
+            answer,
+            Err(JoinNearbyError::Bluetooth(BluetoothError::CentralStarting))
+        ));
+        // The call started the central, and its tick does not start a second.
+        assert_eq!(h.starter.asked(), 1);
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 1);
+        assert!(matches!(h.machine.central_state, CentralState::Starting(_)));
+        assert!(!h.central.started());
+    }
+
+    #[tokio::test]
+    async fn a_closed_client_drops_a_starting_central() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 1);
+        h.machine.close();
+        // The start's answer is dropped, so the central never stands.
+        assert!(matches!(
+            h.machine.central_state,
+            CentralState::Absent { .. }
+        ));
+        assert!(h.machine.central.lock().is_none());
+        h.starter.answer(Ok(Arc::clone(&h.central)));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        // The dropped answer did not stand a central.
+        assert!(h.machine.central.lock().is_none());
+        assert!(!h.central.started());
+    }
+
     // --- The joiner's scan and exchange table ---
 
     #[tokio::test]
     async fn scan_on_while_serving_starts_scanning() {
         let mut h = Harness::new(BluetoothState::Ready);
-        h.tick(None);
+        h.settle().await;
         assert!(h.central.started());
     }
 
@@ -2581,7 +2907,7 @@ mod tests {
     async fn scan_off_stops_scanning_and_reports_its_hosts_gone() {
         let mut h = Harness::new(BluetoothState::Ready);
         let host_fp = fp(9);
-        h.tick(None);
+        h.settle().await;
         h.host_seen(1, &host_fp, -50);
         h.tick(None);
         assert_eq!(h.host_nearby(), vec![(1, host_fp.prefix())]);
@@ -2595,7 +2921,7 @@ mod tests {
     async fn a_new_beacon_reports_host_nearby_and_a_known_one_refreshes() {
         let mut h = Harness::new(BluetoothState::Ready);
         let host_fp = fp(9);
-        h.tick(None);
+        h.settle().await;
         h.host_seen(1, &host_fp, -50);
         h.tick(None);
         assert_eq!(h.host_nearby(), vec![(1, host_fp.prefix())]);
@@ -2609,7 +2935,7 @@ mod tests {
     async fn an_unseen_beacon_is_reported_gone_after_its_bound() {
         let mut h = Harness::new(BluetoothState::Ready);
         let host_fp = fp(9);
-        h.tick(None);
+        h.settle().await;
         h.host_seen(1, &host_fp, -50);
         h.tick(None);
         assert_eq!(h.host_gone(), Vec::<HostId>::new());
@@ -2630,7 +2956,7 @@ mod tests {
         );
         let weak = fp(10);
         let strong = fp(11);
-        h.tick(None);
+        h.settle().await;
         h.host_seen(1, &weak, -80);
         h.host_seen(2, &strong, -40);
         h.tick(None);
@@ -2640,28 +2966,36 @@ mod tests {
     #[tokio::test]
     async fn a_join_without_ready_bluetooth_runs_its_action_once() {
         let mut h = Harness::new(BluetoothState::Off);
-        let (reply_tx, _reply_rx) = oneshot::channel();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
         h.machine.handle(Command::Fetch {
             host: 1,
             reply: reply_tx,
         });
         h.tick(None);
         assert_eq!(*h.readiness.prompt_calls.lock(), 1);
-        // The user approves, so the radio stands Ready and the exchange goes.
+        // The user approves, so the radio stands Ready and the central's
+        // rows apply.
         *h.readiness.state.lock() = BluetoothState::Ready;
         *h.readiness.outcome.lock() = Some(PromptOutcome::NotAsked);
         h.tick(None);
         assert_eq!(*h.readiness.prompt_calls.lock(), 1);
-        assert_eq!(*h.central.connects.lock(), vec![1]);
+        // The central is absent, so the start goes and the call waits for
+        // it.
+        assert_eq!(h.starter.asked(), 1);
+        assert!(matches!(
+            reply_rx.try_recv(),
+            Ok(Err(BluetoothError::CentralStarting))
+        ));
     }
 
     #[tokio::test]
     async fn a_system_without_a_central_neither_scans_nor_joins() {
         let mut h = Harness::new(BluetoothState::Ready);
-        h.machine.central = None;
+        h.machine.starter = None;
         h.tick(None);
         h.tick(None);
-        assert_eq!(*h.central.starts.lock(), 0);
+        assert_eq!(h.starter.asked(), 0);
+        assert!(h.machine.central.lock().is_none());
         let (reply_tx, mut reply_rx) = oneshot::channel();
         h.machine.handle(Command::Fetch {
             host: 1,
@@ -2677,6 +3011,7 @@ mod tests {
     #[tokio::test]
     async fn a_manual_join_runs_its_exchange_from_its_state() {
         let mut h = Harness::new(BluetoothState::Ready);
+        h.settle().await;
         let (first_tx, _first_rx) = oneshot::channel();
         h.machine.handle(Command::Fetch {
             host: 1,
@@ -2699,7 +3034,7 @@ mod tests {
     async fn a_refused_or_failed_exchange_marks_its_host_tried() {
         let mut h = Harness::new(BluetoothState::Ready);
         let host_fp = fp(9);
-        h.tick(None);
+        h.settle().await;
         h.host_seen(1, &host_fp, -50);
         h.tick(None);
         // A manual fetch, whose NotServing exchange ends refused.
@@ -2722,7 +3057,7 @@ mod tests {
     #[tokio::test]
     async fn a_host_that_disconnects_ends_its_exchange_at_once() {
         let mut h = Harness::new(BluetoothState::Ready);
-        h.tick(None);
+        h.settle().await;
         h.host_seen(1, &fp(9), -50);
         h.tick(None);
         let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -2743,13 +3078,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_declined_join_marks_its_host_tried() {
-        let mut pair = ExchangePair::new();
+        let mut pair = ExchangePair::new().await;
         let device: HostId = 1;
         // The host's beacon is seen, so it is tracked and untried.
         pair.joiner_central.push(CentralEvent::Seen {
             host: device,
             service_data: Beacon::of(&pair.host_fp).to_service_data().to_vec(),
-            rssi: -40,
+            rssi: Some(-40),
         });
         pair.joiner.tick(None, false);
         let (join_tx, mut join_rx) = oneshot::channel();
@@ -2780,6 +3115,7 @@ mod tests {
     #[tokio::test]
     async fn bluetooth_leaving_ready_fails_its_exchange() {
         let mut h = Harness::new(BluetoothState::Ready);
+        h.settle().await;
         let (reply_tx, mut reply_rx) = oneshot::channel();
         h.machine.handle(Command::Fetch {
             host: 1,
@@ -2801,13 +3137,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bluetooth_becoming_ready_starts_its_scan() {
+    async fn bluetooth_becoming_ready_starts_its_central_and_scan() {
         let mut h = Harness::new(BluetoothState::Off);
         h.tick(None);
         h.tick(None);
-        // The scan does not start while the radio stands Off.
-        assert_eq!(*h.central.starts.lock(), 0);
+        // The central does not start while the radio stands Off.
+        assert_eq!(h.starter.asked(), 0);
         *h.readiness.state.lock() = BluetoothState::Ready;
+        h.tick(None);
+        assert_eq!(h.starter.asked(), 1);
+        h.starter.answer(Ok(Arc::clone(&h.central)));
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
         h.tick(None);
         assert!(h.central.started());
     }
@@ -2815,7 +3156,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_client_stops_its_scan_and_exchange() {
         let mut h = Harness::new(BluetoothState::Ready);
-        h.tick(None);
+        h.settle().await;
         assert!(h.central.started());
         // An exchange runs beneath the scan.
         let (reply_tx, mut reply_rx) = oneshot::channel();
@@ -2836,7 +3177,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_completed_exchange_sends_its_offer_and_ends() {
-        let mut pair = ExchangePair::new();
+        let mut pair = ExchangePair::new().await;
         let device: HostId = 1;
         let (fetch_tx, _fetch_rx) = oneshot::channel();
         pair.joiner.handle(Command::Fetch {
@@ -2859,7 +3200,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_exchanged_offer_reaches_its_caller_and_the_join() {
-        let mut pair = ExchangePair::new();
+        let mut pair = ExchangePair::new().await;
         let device: HostId = 1;
         let (join_tx, mut join_rx) = oneshot::channel();
         pair.joiner.handle(Command::JoinNearby {
@@ -2937,13 +3278,12 @@ mod tests {
         let wire = Arc::new(Wire::new());
         let h_readiness = Arc::new(FakeReadiness::new(BluetoothState::Ready));
         let h_peripheral = Arc::new(FakePeripheral::new(wire.clone()));
-        let h_central = Arc::new(FakeCentral::new(wire));
         let h_serving = Arc::new(Mutex::new(Some(fp(1))));
         let h_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
         let (bt_machine, _bt_beacon) = Machine::new(
             h_readiness,
             h_peripheral,
-            Some(h_central as Arc<dyn CentralBackend>),
+            None,
             quiet_node(),
             false,
             false,
