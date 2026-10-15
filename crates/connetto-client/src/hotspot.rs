@@ -21,6 +21,9 @@ use crate::ClientEvent;
 
 #[cfg(target_os = "android")]
 pub(crate) mod android;
+mod wifi_payload;
+
+pub use wifi_payload::WifiPayloadError;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::{AndroidHotspotBackend, JoinedBind};
