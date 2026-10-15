@@ -2500,6 +2500,18 @@ async fn an_enable_call_answers_from_the_machine_and_fails_when_the_machine_is_g
     machine.await.expect("the machine ends");
 }
 
+/// The identity a nearby host proves in the exchange, as the fake machines
+/// answer it.
+#[cfg(feature = "peer")]
+fn nearby_host_identity() -> connetto_core::device_cert::DeviceIdentity {
+    connetto_core::device_cert::DeviceIdentity::new(
+        DeploymentId::from_uuid(uuid::Uuid::from_u128(7)),
+        "host",
+        connetto_core::device_cert::KeyId::from_bytes([7; 32]),
+    )
+    .expect("an identity holds")
+}
+
 /// The nearby join's call answers from the machine's gateway, and a machine
 /// that drops the reply fails the call within its bound (R76 decision 19).
 #[cfg(feature = "peer")]
@@ -2512,9 +2524,17 @@ async fn a_join_nearby_call_answers_from_the_machine_and_fails_when_the_machine_
             panic!("the nearby join's request reaches the Bluetooth machine");
         };
         assert_eq!(host, 9, "the request names the host");
-        let _ = reply.send(Ok("192.168.4.1".parse().expect("a private gateway")));
+        let _ = reply.send(Ok((
+            nearby_host_identity(),
+            "192.168.4.1".parse().expect("a private gateway"),
+        )));
     });
-    let gateway = handle.join_nearby(&9).await.expect("the machine answers");
+    let (identity, gateway) = handle.join_nearby(&9).await.expect("the machine answers");
+    assert_eq!(
+        identity,
+        nearby_host_identity(),
+        "the host's proven identity reaches the caller"
+    );
     assert_eq!(
         gateway,
         "192.168.4.1"
@@ -2555,14 +2575,22 @@ async fn a_fetch_call_answers_from_the_machine_and_fails_when_the_machine_is_gon
             panic!("the fetch's request reaches the Bluetooth machine");
         };
         assert_eq!(host, 3, "the request names the host");
-        let _ = reply.send(Ok(crate::hotspot::HotspotOffer::new(
-            "camp",
-            "opensesame",
-            crate::hotspot::HotspotSecurity::Wpa2,
-            Some(5678),
+        let _ = reply.send(Ok((
+            nearby_host_identity(),
+            crate::hotspot::HotspotOffer::new(
+                "camp",
+                "opensesame",
+                crate::hotspot::HotspotSecurity::Wpa2,
+                Some(5678),
+            ),
         )));
     });
-    let offer = handle.fetch_offer(&3).await.expect("the machine answers");
+    let (identity, offer) = handle.fetch_offer(&3).await.expect("the machine answers");
+    assert_eq!(
+        identity,
+        nearby_host_identity(),
+        "the host's proven identity reaches the caller"
+    );
     assert_eq!(offer.ssid, "camp", "the machine's offer reaches the caller");
     machine.await.expect("the machine ends");
 

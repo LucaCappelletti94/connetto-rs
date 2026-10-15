@@ -1979,7 +1979,16 @@ mod tests {
         let (hotspot_tx, mut hotspot_rx) = mpsc::unbounded_channel();
         let (bluetooth_tx, mut bluetooth_rx) = mpsc::unbounded_channel();
         let (note_tx, mut note_rx) = mpsc::channel(8);
+        // The identity the nearby host proves in the exchange.
+        let host = connetto_core::device_cert::DeviceIdentity::new(
+            connetto_core::device_cert::DeploymentId::from_uuid(uuid::Uuid::from_u128(7)),
+            "host",
+            connetto_core::device_cert::KeyId::from_bytes([7; 32]),
+        )
+        .expect("an identity holds");
+        let machine_host = host.clone();
         let machine = tokio::spawn(async move {
+            let host = machine_host;
             let gateway: std::net::IpAddr = "192.168.4.1".parse().expect("a private gateway");
             let offer = crate::hotspot::HotspotOffer::new(
                 "camp",
@@ -2002,6 +2011,8 @@ mod tests {
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
                         }
+                        // The personal hotspot is the iPhone's, which this test does not host.
+                        Some(_) => {}
                         None => break,
                     },
                     command = bluetooth_rx.recv() => match command {
@@ -2009,10 +2020,10 @@ mod tests {
                             let _ = reply.send(Ok(()));
                         }
                         Some(crate::bluetooth::Command::JoinNearby { reply, .. }) => {
-                            let _ = reply.send(Ok(gateway));
+                            let _ = reply.send(Ok((host.clone(), gateway)));
                         }
                         Some(crate::bluetooth::Command::Fetch { reply, .. }) => {
-                            let _ = reply.send(Ok(offer.clone()));
+                            let _ = reply.send(Ok((host.clone(), offer.clone())));
                         }
                         Some(crate::bluetooth::Command::Host(reply)) => {
                             let _ = reply.send(Ok(crate::bluetooth::Hosted {
@@ -2035,6 +2046,8 @@ mod tests {
                                 .send(if on { "prompt true" } else { "prompt false" })
                                 .await;
                         }
+                        // The personal hotspot is the iPhone's, which this test does not host.
+                        Some(_) => {}
                         None => break,
                     },
                 }
@@ -2127,14 +2140,22 @@ mod tests {
             .enable_bluetooth()
             .await
             .expect("the machine answers");
-        let gateway = client.join_nearby(&9).await.expect("the machine answers");
+        let (identity, gateway) = client.join_nearby(&9).await.expect("the machine answers");
+        assert_eq!(
+            identity, host,
+            "the host's proven identity reaches the caller"
+        );
         assert_eq!(
             gateway,
             "192.168.4.1"
                 .parse::<std::net::IpAddr>()
                 .expect("a private gateway")
         );
-        let fetched = client.fetch_offer(&9).await.expect("the machine answers");
+        let (identity, fetched) = client.fetch_offer(&9).await.expect("the machine answers");
+        assert_eq!(
+            identity, host,
+            "the host's proven identity reaches the caller"
+        );
         assert_eq!(
             fetched.ssid, "camp",
             "the machine's offer reaches the caller"
