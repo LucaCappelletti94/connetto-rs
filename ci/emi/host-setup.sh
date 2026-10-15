@@ -125,11 +125,34 @@ incus config set core.https_address=127.0.0.1:8443
 log "Host caches every runner VM mounts"
 # Only what is read and written with plain file IO: virtiofs in these VMs refuses shared mmap,
 # which libgit2 needs for cargo's git checkouts and rustc for a target directory.
-for dir in cargo-registry sccache registry-mirror actions; do
+for dir in cargo-registry sccache handoff registry-mirror actions; do
   mkdir -p "$CACHE_ROOT/$dir"
 done
-chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache"
+chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache" "$CACHE_ROOT/handoff"
 chmod 0755 "$CACHE_ROOT"
+
+log "Daily cleanup of the run folders jobs hand files through"
+cat > /etc/systemd/system/ci-handoff-clean.service <<EOF
+[Unit]
+Description=Delete CI handoff run folders older than two days
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/find $CACHE_ROOT/handoff -mindepth 1 -maxdepth 1 -mmin +2880 -exec rm -rf {} +
+EOF
+cat > /etc/systemd/system/ci-handoff-clean.timer <<'EOF'
+[Unit]
+Description=Daily cleanup of CI handoff run folders
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+systemctl daemon-reload
+systemctl enable --now ci-handoff-clean.timer
 
 log "Docker Hub pull-through mirror on $BRIDGE_IP:$MIRROR_PORT"
 # Host networking, because a published port DNATs to Docker's 172.17/16, which the CI egress ACL drops.
@@ -166,7 +189,7 @@ make_profile() {
   local name=$1 cpus=$2 memory=$3
   incus profile show "$name" --project "$PROJECT" >/dev/null 2>&1 || incus profile create "$name" --project "$PROJECT"
   incus profile set "$name" limits.cpu="$cpus" limits.memory="$memory" limits.cpu.priority=5 --project "$PROJECT"
-  for dir in cargo-registry sccache; do
+  for dir in cargo-registry sccache handoff; do
     incus profile device show "$name" --project "$PROJECT" | grep -q "^$dir:" \
       || incus profile device add "$name" "$dir" disk source="$CACHE_ROOT/$dir" path="/srv/cache/$dir" --project "$PROJECT"
   done

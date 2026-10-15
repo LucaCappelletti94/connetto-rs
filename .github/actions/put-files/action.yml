@@ -1,0 +1,37 @@
+name: Hand files to later jobs
+description: >-
+  Stores a directory for the jobs of this run that need it. A self-hosted
+  runner on emi copies it into the run's folder of the host's shared handoff
+  mount, since emi downloads GitHub artifacts at under 2 MB/s. A hosted
+  runner uploads it as a one-day artifact. get-files reads either back.
+inputs:
+  name:
+    description: The name get-files asks for.
+    required: true
+  path:
+    description: The directory to store.
+    required: true
+runs:
+  using: composite
+  steps:
+    - if: runner.environment == 'github-hosted'
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+        retention-days: 1
+        if-no-files-found: error
+
+    - if: runner.environment != 'github-hosted'
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        SOURCE: ${{ inputs.path }}
+      run: |
+        # Keyed by run only, so a rerun of the consumers alone finds the first attempt's files.
+        run_dir="/srv/cache/handoff/${GITHUB_REPOSITORY//\//-}-$GITHUB_RUN_ID"
+        staging="$run_dir/.$NAME-$GITHUB_RUN_ATTEMPT-$GITHUB_JOB-$$"
+        mkdir -p "$staging"
+        cp -a "$SOURCE/." "$staging/"
+        rm -rf "${run_dir:?}/$NAME"
+        mv "$staging" "$run_dir/$NAME"

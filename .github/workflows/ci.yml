@@ -686,19 +686,15 @@ jobs:
       - name: Strip debug sections from the prebuilt binaries
         run: strip --strip-debug browser-bins/* android-bins/*
 
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/put-files
         with:
           name: browser-bins
           path: browser-bins
-          retention-days: 1
-          if-no-files-found: error
 
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/put-files
         with:
           name: android-bins
           path: android-bins
-          retention-days: 1
-          if-no-files-found: error
 
       - name: Prune target cache
         if: always()
@@ -727,7 +723,8 @@ jobs:
   browser-tests:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
-    runs-on: *heavy-runner
+    # Light VMs sit idle once the checks finish, while the heavy ones still run the suites.
+    runs-on: *light-runner
     # A shard runs a quarter of the suites against its own machine-local
     # stack from the prebuilt binaries, so the serial rule inside one process
     # holds while the wall clock divides by four.
@@ -765,7 +762,7 @@ jobs:
           key: t-browser-wasm-lines-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || '' }}
 
-      - uses: actions/download-artifact@v8
+      - uses: ./.github/actions/get-files
         with:
           name: browser-bins
           path: browser-bins
@@ -824,7 +821,7 @@ jobs:
     # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
     name: Android emulator proof
     needs: browser-build
-    runs-on: *heavy-runner
+    runs-on: *light-runner
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -856,12 +853,12 @@ jobs:
           key: t-android-emulator-lines-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-lines-{0}-', runner.os) || '' }}
 
-      - uses: actions/download-artifact@v8
+      - uses: ./.github/actions/get-files
         with:
           name: browser-bins
           path: browser-bins
 
-      - uses: actions/download-artifact@v8
+      - uses: ./.github/actions/get-files
         with:
           name: android-bins
           path: android-bins
