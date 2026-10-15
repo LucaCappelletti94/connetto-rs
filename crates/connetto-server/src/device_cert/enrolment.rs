@@ -486,7 +486,10 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
                 &request.csr,
                 csr.public_key(),
             )
-            .map_err(|_| EnrolRefusal::InvalidRequest)?,
+            .map_err(|mismatch| {
+                tracing::warn!(%mismatch, "the device attestation does not match its request");
+                EnrolRefusal::InvalidRequest
+            })?,
             Err(err) => {
                 tracing::warn!(error = %err, "the enrolment table refused the stored level");
                 return Err(EnrolRefusal::IssuerUnavailable);

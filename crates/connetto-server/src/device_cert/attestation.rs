@@ -655,7 +655,7 @@ fn apple(
             _ => None,
         })
         .collect();
-    let Some(auth_data) = object_field(statement, "authData").and_then(|value| match value {
+    let Some(auth_data) = object_field(&object, "authData").and_then(|value| match value {
         ciborium::Value::Bytes(bytes) => Some(bytes.as_slice()),
         _ => None,
     }) else {
@@ -751,28 +751,36 @@ fn app_attest_chain(config: &super::DeviceCertConfig, certs: &[&[u8]]) -> bool {
 }
 
 /// The nonce extension's octet string, `None` when absent or unparseable,
-/// the extension holding a single octet string in a sequence.
+/// the extension holding a sequence of one field tagged `[1]` that wraps the
+/// octet string.
 fn nonce_extension(cert: &X509Certificate<'_>) -> Option<Vec<u8>> {
     let extension = find_extension(cert, NONCE)?;
     let children = der_children(extension.value)?;
-    let [inner] = children.as_slice() else {
+    let [tagged] = children.as_slice() else {
         return None;
     };
+    if tagged.tag != 0xA1 {
+        return None;
+    }
+    let inner = der_tlv(tagged.value)?;
+    if inner.total != tagged.value.len() {
+        return None;
+    }
     inner.as_octet_string().map(<[u8]>::to_vec)
 }
 
 /// The App Attest authenticator data's checked fields, `None` when the
-/// layout departs: a 32-byte `rpId` hash, a 4-byte counter, a 16-byte
-/// `aaguid`, a 2-byte credential id length of 32, the 32-byte credential id
-/// and the 77-byte encoded key.
+/// layout departs: a 32-byte `rpId` hash, a flags byte, a 4-byte counter, a
+/// 16-byte `aaguid`, a 2-byte credential id length of 32, the 32-byte
+/// credential id and the 77-byte encoded key.
 fn auth_data_fields(auth_data: &[u8]) -> Option<AuthDataFields> {
-    const MINIMUM: usize = 32 + 4 + 16 + 2 + 32 + 77;
+    const MINIMUM: usize = 32 + 1 + 4 + 16 + 2 + 32 + 77;
     if auth_data.len() < MINIMUM {
         return None;
     }
-    let counter = u32::from_be_bytes(auth_data[32..36].try_into().ok()?);
-    let aaguid = auth_data[36..52].try_into().ok()?;
-    let credential_length = u16::from_be_bytes(auth_data[52..54].try_into().ok()?);
+    let counter = u32::from_be_bytes(auth_data[33..37].try_into().ok()?);
+    let aaguid = auth_data[37..53].try_into().ok()?;
+    let credential_length = u16::from_be_bytes(auth_data[53..55].try_into().ok()?);
     if credential_length != 32 {
         return None;
     }
@@ -780,7 +788,7 @@ fn auth_data_fields(auth_data: &[u8]) -> Option<AuthDataFields> {
         rp_id_hash: auth_data[..32].to_vec(),
         counter,
         aaguid,
-        credential_id: auth_data[54..86].to_vec(),
+        credential_id: auth_data[55..87].to_vec(),
     })
 }
 
@@ -844,8 +852,8 @@ mod tests {
     use x509_parser::{certificate::X509Certificate, prelude::FromDer};
 
     use super::{
-        AndroidStatus, AppAttestEnvironment, SerialCheck, SerialStatus, StatusCache, StatusList,
-        serial_hex, verify,
+        AndroidStatus, AppAttestEnvironment, AttestationMismatch, SerialCheck, SerialStatus,
+        StatusCache, StatusList, serial_hex, verify,
     };
 
     type Config = super::super::DeviceCertConfig;
@@ -1361,6 +1369,7 @@ mod tests {
         let credential_id = super::sha256(cred.public_key_raw());
         let auth_data = [
             super::sha256(app_id.as_bytes()),
+            vec![ATTESTED_CREDENTIAL],
             counter.to_be_bytes().to_vec(),
             aaguid.to_vec(),
             32u16.to_be_bytes().to_vec(),
@@ -1372,7 +1381,7 @@ mod tests {
         let mut params = CertificateParams::new(vec!["credential".to_owned()]).expect("params");
         params.custom_extensions = vec![CustomExtension::from_oid_content(
             super::NONCE,
-            der_tl(0x30, &der_tl(0x04, &nonce)),
+            der_tl(0x30, &der_tl(0xA1, &der_tl(0x04, &nonce))),
         )];
         let issuer = Issuer::new(
             CertificateParams::new(vec!["intermediate".to_owned()]).expect("params"),
@@ -1396,10 +1405,14 @@ mod tests {
                         ]),
                     ),
                     (
-                        ciborium::Value::Text("authData".to_owned()),
-                        ciborium::Value::Bytes(auth_data),
+                        ciborium::Value::Text("receipt".to_owned()),
+                        ciborium::Value::Bytes(Vec::new()),
                     ),
                 ]),
+            ),
+            (
+                ciborium::Value::Text("authData".to_owned()),
+                ciborium::Value::Bytes(auth_data),
             ),
         ]);
         let mut cbor = Vec::new();
@@ -1429,16 +1442,17 @@ mod tests {
         if let Some(x5c) = x5c {
             statement.push((ciborium::Value::Text("x5c".to_owned()), x5c));
         }
-        if let Some(auth_data) = auth_data {
-            statement.push((ciborium::Value::Text("authData".to_owned()), auth_data));
-        }
-        ciborium::Value::Map(vec![
+        let mut fields = vec![
             (ciborium::Value::Text("fmt".to_owned()), fmt),
             (
                 ciborium::Value::Text("attStmt".to_owned()),
                 ciborium::Value::Map(statement),
             ),
-        ])
+        ];
+        if let Some(auth_data) = auth_data {
+            fields.push((ciborium::Value::Text("authData".to_owned()), auth_data));
+        }
+        ciborium::Value::Map(fields)
     }
 
     /// The object's bytes, CBOR.
@@ -1454,7 +1468,7 @@ mod tests {
         let statement = super::object_field(&decoded, "attStmt").expect("attStmt");
         (
             super::object_field(statement, "x5c").expect("x5c").clone(),
-            super::object_field(statement, "authData")
+            super::object_field(&decoded, "authData")
                 .expect("authData")
                 .clone(),
         )
@@ -1474,6 +1488,10 @@ mod tests {
             .collect()
     }
 
+    /// The authenticator data's flags at attestation, the attested credential
+    /// data present.
+    const ATTESTED_CREDENTIAL: u8 = 0x40;
+
     /// The authenticator data with `app_id`'s hash, `counter`, `aaguid` and
     /// `credential_id`, the key's own hash where the last is `None`.
     fn auth_data(
@@ -1485,6 +1503,7 @@ mod tests {
     ) -> Vec<u8> {
         [
             super::sha256(app_id.as_bytes()),
+            vec![ATTESTED_CREDENTIAL],
             counter.to_be_bytes().to_vec(),
             aaguid.to_vec(),
             32u16.to_be_bytes().to_vec(),
@@ -1508,7 +1527,7 @@ mod tests {
         let mut params = CertificateParams::new(vec!["credential".to_owned()]).expect("params");
         params.custom_extensions = vec![CustomExtension::from_oid_content(
             super::NONCE,
-            der_tl(0x30, &der_tl(0x04, &nonce)),
+            der_tl(0x30, &der_tl(0xA1, &der_tl(0x04, &nonce))),
         )];
         let issuer = Issuer::new(
             CertificateParams::new(vec!["intermediate".to_owned()]).expect("params"),
@@ -1549,6 +1568,90 @@ mod tests {
         )
         .expect("a valid object answers a level");
         assert_eq!(level, AttestationLevel::AppAttested);
+    }
+
+    /// A certificate carrying `content` as its App Attest nonce extension.
+    fn nonce_cert(content: Vec<u8>) -> Vec<u8> {
+        let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("key");
+        let mut params = CertificateParams::new(vec!["credential".to_owned()]).expect("params");
+        params.custom_extensions = vec![CustomExtension::from_oid_content(super::NONCE, content)];
+        params
+            .self_signed(&key)
+            .expect("certificate")
+            .der()
+            .to_vec()
+    }
+
+    fn read_nonce(content: Vec<u8>) -> Option<Vec<u8>> {
+        let der = nonce_cert(content);
+        let (_, cert) = X509Certificate::from_der(&der).expect("parse");
+        super::nonce_extension(&cert)
+    }
+
+    #[test]
+    fn the_nonce_is_the_octet_string_inside_its_tag() {
+        let wrapped = der_tl(0x30, &der_tl(0xA1, &der_tl(0x04, &[9; 32])));
+        assert_eq!(read_nonce(wrapped), Some(vec![9; 32]));
+    }
+
+    #[test]
+    fn a_nonce_without_its_tag_is_refused() {
+        let bare = der_tl(0x30, &der_tl(0x04, &[9; 32]));
+        assert_eq!(read_nonce(bare), None);
+    }
+
+    #[test]
+    fn a_nonce_tag_with_trailing_bytes_is_refused() {
+        let mut inside = der_tl(0x04, &[9; 32]);
+        inside.push(0);
+        let trailing = der_tl(0x30, &der_tl(0xA1, &inside));
+        assert_eq!(read_nonce(trailing), None);
+    }
+
+    /// An attestation an iPhone 15 Pro Max on iOS 26 made for the demo's
+    /// development build, over the request it sent.
+    const IPHONE_ATTESTATION: &[u8] = include_bytes!("testdata/iphone_app_attest.cbor");
+    const IPHONE_KEY_ID: &[u8] = include_bytes!("testdata/iphone_app_attest_key_id.bin");
+    const IPHONE_CSR: &[u8] = include_bytes!("testdata/iphone_app_attest_csr.der");
+
+    fn iphone_config() -> Config {
+        Config::new(issuer()).with_app_attest(
+            vec!["7W8527FJJE.dev.connetto.dioxusdemo".to_owned()],
+            AppAttestEnvironment::Development,
+        )
+    }
+
+    #[test]
+    fn an_iphone_attestation_proves_app_attested() {
+        let level = verify(
+            &iphone_config(),
+            None,
+            Some(&DeviceAttestation::AppleAppAttest {
+                key_id: IPHONE_KEY_ID.to_vec(),
+                attestation: IPHONE_ATTESTATION.to_vec(),
+            }),
+            IPHONE_CSR,
+            &[],
+        );
+        assert_eq!(level, Ok(AttestationLevel::AppAttested));
+    }
+
+    #[test]
+    fn an_iphone_attestation_over_another_request_is_refused() {
+        let mut csr = IPHONE_CSR.to_vec();
+        let last = csr.len() - 1;
+        csr[last] ^= 1;
+        let level = verify(
+            &iphone_config(),
+            None,
+            Some(&DeviceAttestation::AppleAppAttest {
+                key_id: IPHONE_KEY_ID.to_vec(),
+                attestation: IPHONE_ATTESTATION.to_vec(),
+            }),
+            &csr,
+            &[],
+        );
+        assert_eq!(level, Err(AttestationMismatch::Nonce));
     }
 
     #[test]
@@ -1938,7 +2041,7 @@ mod tests {
             None,
             &key,
         );
-        auth[52..54].copy_from_slice(&16u16.to_be_bytes());
+        auth[53..55].copy_from_slice(&16u16.to_be_bytes());
         let (attestation, attested_key_id, csr) =
             apple_auth_data(&root, auth, &key, key_id.clone());
         refuse(
