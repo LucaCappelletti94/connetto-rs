@@ -476,6 +476,11 @@ jobs:
     # missing (R76 slice 3).
     env:
       CONNETTO_REQUIRE_MULTICAST: "1"
+      # Pull requests build tests without thin LTO and with 16 codegen units.
+      # Pushes to main keep the release profile, so a thin-LTO-only bug still
+      # fails there. The secret-store script reads the same variable.
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: "0"
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -487,7 +492,7 @@ jobs:
         include:
           - name: server
             packages: -p connetto-server
-            # The e2e tests spawn both binaries from the release target dir,
+            # The e2e tests spawn both binaries from the test profile's target dir,
             # and neither cargo test nor nextest builds another package's bin.
             bins: -p connetto-server -p connetto-client
           - name: client
@@ -547,7 +552,7 @@ jobs:
 
       - name: Build spawned binaries
         if: matrix.bins != ''
-        run: cargo +stable build --release --all-features --bins ${{ matrix.bins }}
+        run: cargo +stable build --profile "$CARGO_TEST_PROFILE" --all-features --bins ${{ matrix.bins }}
 
       - uses: ./.github/actions/pull-test-images
 
@@ -556,7 +561,7 @@ jobs:
       # log-capture isolation, and a wedged test is killed and named instead
       # of holding the shard to the job timeout.
       - name: Run Rust suite
-        run: keyctl session -- cargo +stable nextest run --release --all-features --test-threads 4 ${{ matrix.packages }}
+        run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       # R71's groups that need a private session bus, root, or Docker.
       - name: Run Secret Service custody tests
