@@ -111,11 +111,33 @@ RestartSec=5s
 [Install]
 WantedBy=default.target
 EOF
+
+echo "== action archive cache, refilled every 10 minutes"
+install -m 0755 "$(dirname "$0")/fill-action-cache.sh" "$home/bin/fill-action-cache.sh"
+cat > "$HOME/.config/systemd/user/fill-action-cache.service" <<EOF
+[Unit]
+Description=Download the actions connetto's workflows use into the runner VMs' archive cache
+
+[Service]
+Type=oneshot
+ExecStart=$home/bin/fill-action-cache.sh
+EOF
+cat > "$HOME/.config/systemd/user/fill-action-cache.timer" <<EOF
+[Unit]
+Description=Refill the action archive cache every 10 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=10min
+
+[Install]
+WantedBy=timers.target
+EOF
 XDG_RUNTIME_DIR=/run/user/$(id -u)
 export XDG_RUNTIME_DIR
 systemctl --user daemon-reload
-systemctl --user enable garm.service
-systemctl --user restart garm.service
+systemctl --user enable garm.service fill-action-cache.timer
+systemctl --user restart garm.service fill-action-cache.timer
 sleep 3
 systemctl --user --no-pager status garm.service | head -n 5
 curl -s -o /dev/null -w "GARM API http %{http_code}\n" "http://$BRIDGE_IP:$GARM_PORT/api/v1/"

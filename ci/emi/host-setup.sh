@@ -125,7 +125,7 @@ incus config set core.https_address=127.0.0.1:8443
 log "Host caches every runner VM mounts"
 # Only what is read and written with plain file IO: virtiofs in these VMs refuses shared mmap,
 # which libgit2 needs for cargo's git checkouts and rustc for a target directory.
-for dir in cargo-registry sccache registry-mirror; do
+for dir in cargo-registry sccache registry-mirror actions; do
   mkdir -p "$CACHE_ROOT/$dir"
 done
 chown "$GUEST_UID:$GUEST_UID" "$CACHE_ROOT/cargo-registry" "$CACHE_ROOT/sccache"
@@ -170,16 +170,21 @@ make_profile() {
     incus profile device show "$name" --project "$PROJECT" | grep -q "^$dir:" \
       || incus profile device add "$name" "$dir" disk source="$CACHE_ROOT/$dir" path="/srv/cache/$dir" --project "$PROJECT"
   done
+  incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
+    || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
   for dir in cargo-git targets; do
     incus profile device remove "$name" "$dir" --project "$PROJECT" >/dev/null 2>&1 || true
   done
 }
-make_profile ci-light 4 8GiB
+# 4 vCPUs and 16 GiB, the size of GitHub's hosted Linux runner.
+make_profile ci-light 4 16GiB
 make_profile ci-heavy 8 32GiB
 
 log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"
 id "$RUNNER_USER" >/dev/null 2>&1 \
   || useradd --system --create-home --home-dir "$RUNNER_HOME" --shell /bin/bash "$RUNNER_USER"
+# Action archives, filled by ci-runner with the GitHub App's token and read-only in the VMs.
+install -d -m 0755 -o "$RUNNER_USER" -g "$RUNNER_USER" "$CACHE_ROOT/actions"
 install -d -m 0700 -o "$RUNNER_USER" -g "$RUNNER_USER" "$RUNNER_HOME/.ssh" "$RUNNER_HOME/incus"
 install -m 0600 -o "$RUNNER_USER" -g "$RUNNER_USER" "$(getent passwd "$SUDO_USER" | cut -d: -f6)/.ssh/authorized_keys" \
   "$RUNNER_HOME/.ssh/authorized_keys"

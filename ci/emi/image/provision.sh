@@ -116,6 +116,7 @@ CHROMEWEBDRIVER=/usr/local/share/chromedriver-linux64
 RUSTC_WRAPPER=/usr/local/bin/sccache
 SCCACHE_DIR=$CACHE/sccache
 SCCACHE_CACHE_SIZE=300G
+ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=$CACHE/actions
 EOF
 echo "/home/$RUNNER/.cargo/bin:$SDK/platform-tools:$SDK/cmdline-tools/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   > "$run_home/.path"
