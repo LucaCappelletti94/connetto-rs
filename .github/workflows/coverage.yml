@@ -24,7 +24,9 @@ env:
 jobs:
   coverage:
     name: Coverage ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    # Only pushes and same-repository pull requests may reach the self-hosted
+    # runners on emi. LINUX_HEAVY names their scale set, and unset it means GitHub's.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
     # The discovery proofs fail here, never skip, when loopback multicast is
     # missing (R76 slice 3).
     env:
