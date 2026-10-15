@@ -821,7 +821,8 @@ jobs:
     # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
     name: Android emulator proof
     needs: browser-build
-    runs-on: *light-runner
+    # On a light VM the proof timed out at the browser tab and at the keyguard.
+    runs-on: *heavy-runner
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
