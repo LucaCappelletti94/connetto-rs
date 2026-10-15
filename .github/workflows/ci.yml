@@ -627,8 +627,13 @@ jobs:
   browser-build:
     name: Browser stack build
     runs-on: *heavy-runner
-    # The release server and the release topology test binary, built once
-    # here instead of in every shard, where they were most of the budget.
+    # The server and the topology test binary, built once here instead of in
+    # every shard, where they were most of the budget. Pull requests build
+    # them in testfast like the Rust test jobs, and the harness reads the same
+    # variable for the builds it starts.
+    env:
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: "0"
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -660,7 +665,7 @@ jobs:
       - name: Build the browser stack
         run: |
           cargo +stable run \
-            --release \
+            --profile "$CARGO_TEST_PROFILE" \
             -p connetto-test-harness \
             --bin connetto-browser-stack \
             -- \
@@ -670,12 +675,12 @@ jobs:
       - name: Build the Android proof
         run: |
           cargo +stable build \
-            --release \
+            --profile "$CARGO_TEST_PROFILE" \
             -p connetto-test-harness \
             --bin connetto-demo-stack \
             --bin connetto-android-proof
           mkdir android-bins
-          cp target/release/connetto-demo-stack target/release/connetto-android-proof android-bins/
+          cp "target/$CARGO_TEST_PROFILE/connetto-demo-stack" "target/$CARGO_TEST_PROFILE/connetto-android-proof" android-bins/
 
       # Panic locations do not need the DWARF sections.
       - name: Strip debug sections from the prebuilt binaries
@@ -699,7 +704,7 @@ jobs:
         if: always()
         run: |
           rm -rf target/debug/incremental
-          rm -rf target/release/incremental
+          rm -rf "target/$CARGO_TEST_PROFILE/incremental"
           rm -rf target/tmp
 
       - name: Save cargo downloads

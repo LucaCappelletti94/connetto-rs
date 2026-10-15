@@ -50,8 +50,8 @@ use connetto_server::capability::MintCapabilityKey;
 use connetto_server::{CookieSameSite, RuntimeWritableCatalog};
 use connetto_test_harness::stack::{
     Deployment, KeyDir, SYNC_PORT_VAR, display_command, ensure_server_bin, exe_name, ports,
-    provision, repo_path, require_free, require_success, run_process, strings, wait_for_tcp,
-    wait_until_closed,
+    provision, repo_path, require_free, require_success, run_process, strings, test_profile,
+    wait_for_tcp, wait_until_closed,
 };
 use connetto_test_harness::{Fixture, MockOauth, PUBLICATION, SLOT, with_user};
 use diesel_async::AsyncPgConnection;
@@ -611,10 +611,12 @@ async fn prepare_services(server_bin: PathBuf, addresses: Addresses) -> Result<S
 
 /// The verified-topology run, or with `run` false the build of the binary it runs.
 fn topology_args(run: bool) -> Vec<OsString> {
+    let profile = test_profile();
     let mut args = strings(&[
         "+stable",
         "test",
-        "--release",
+        "--profile",
+        &profile,
         "-p",
         "connetto-client",
         "--all-features",
