@@ -110,6 +110,28 @@ tar xzf /tmp/actions-runner.tar.gz -C "$run_home"
 "$run_home/bin/installdependencies.sh" >/dev/null
 chown -R "$RUNNER:$RUNNER" "$run_home"
 
+echo "== Job hooks: the VM's peak memory and sccache's statistics, printed in every job's log"
+install -d /opt/ci-hooks
+cat > /opt/ci-hooks/job-started.sh <<'EOF'
+#!/usr/bin/env bash
+# Samples the VM's memory in use until the job-completed hook stops it.
+setsid nohup bash -c 'peak=0; while :; do
+  used=$(awk "/^MemTotal:/{t=\$2} /^MemAvailable:/{a=\$2} END{print t-a}" /proc/meminfo)
+  if [ "$used" -gt "$peak" ]; then peak=$used; echo "$peak" > /tmp/ci-mem-peak-kib; fi
+  sleep 2
+done' >/dev/null 2>&1 &
+echo $! > /tmp/ci-mem-sampler.pid
+sccache --zero-stats >/dev/null 2>&1 || true
+EOF
+cat > /opt/ci-hooks/job-completed.sh <<'EOF'
+#!/usr/bin/env bash
+# Prints what the speed work measures, each line prefixed so it can be grepped from the log.
+kill "$(cat /tmp/ci-mem-sampler.pid 2>/dev/null)" 2>/dev/null || true
+echo "ci-measure peak-memory-mib=$(( $(cat /tmp/ci-mem-peak-kib 2>/dev/null || echo 0) / 1024 ))"
+sccache --show-stats 2>/dev/null | sed 's/^/ci-measure sccache /' || echo "ci-measure sccache unavailable"
+EOF
+chmod 0755 /opt/ci-hooks/job-started.sh /opt/ci-hooks/job-completed.sh
+
 echo "== Environment the runner hands every job, the hosted image's names plus the caches"
 cat > "$run_home/.env" <<EOF
 LANG=C.UTF-8
@@ -128,6 +150,9 @@ SCCACHE_CACHE_SIZE=300G
 ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=$CACHE/actions
 CARGO_NET_GIT_FETCH_WITH_CLI=true
 CARGO_NET_RETRY=10
+SCCACHE_IDLE_TIMEOUT=0
+ACTIONS_RUNNER_HOOK_JOB_STARTED=/opt/ci-hooks/job-started.sh
+ACTIONS_RUNNER_HOOK_JOB_COMPLETED=/opt/ci-hooks/job-completed.sh
 EOF
 echo "/home/$RUNNER/.cargo/bin:$SDK/platform-tools:$SDK/cmdline-tools/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   > "$run_home/.path"
