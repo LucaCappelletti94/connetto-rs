@@ -76,6 +76,8 @@ pub mod archive;
 #[cfg(feature = "native-auth")]
 pub mod auth;
 pub mod away;
+#[cfg(feature = "peer")]
+mod bluetooth;
 #[cfg(feature = "bot")]
 pub mod bot;
 pub mod bots;
@@ -101,6 +103,10 @@ pub mod reconnect;
 pub mod replica;
 mod subscriptions;
 
+#[cfg(feature = "peer")]
+pub use bluetooth::{
+    BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, PromptOutcome,
+};
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};
 #[cfg(feature = "peer")]
@@ -1277,6 +1283,29 @@ pub enum ClientEvent {
     /// link standing, so it stopped (R76).
     #[cfg(feature = "peer")]
     JoinedHostUnreached,
+    /// The platform's Bluetooth standing changed (R76 decision 21).
+    #[cfg(feature = "peer")]
+    BluetoothChanged {
+        /// The standing the platform reports.
+        state: crate::bluetooth::BluetoothState,
+    },
+    /// A nearby host's beacon was seen, or its prefix changed (R76 decision
+    /// 19).
+    #[cfg(feature = "peer")]
+    HostNearby {
+        /// The host's device.
+        host: crate::bluetooth::HostId,
+        /// The beacon's prefix.
+        prefix: [u8; 8],
+        /// The signal the beacon carried.
+        rssi: Option<i16>,
+    },
+    /// A nearby host's beacon was not seen for its bound (R76 decision 19).
+    #[cfg(feature = "peer")]
+    HostGone {
+        /// The host's device.
+        host: crate::bluetooth::HostId,
+    },
 }
 
 /// A primary-key column value carried on a mutation event.

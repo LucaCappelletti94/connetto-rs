@@ -39,7 +39,7 @@ use connetto_test_harness::{
     ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth,
 };
 use openidconnect::reqwest;
-use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256};
+use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
 use tempfile::tempdir;
 
 /// The longest any bounded wait in a phase runs.
@@ -138,13 +138,13 @@ async fn enrolment_phase() {
     match phase.as_str() {
         "first" => first_connect().await,
         "renewal" => Box::pin(renewal()).await,
-        "reissue" => reissue().await,
+        "reissue" => Box::pin(reissue()).await,
         "cap" => cap().await,
         "revoke" => Box::pin(revoke()).await,
         "spectator" => spectator().await,
         "restart" => Box::pin(restart()).await,
         "offline" => offline().await,
-        "forget" => forget().await,
+        "forget" => Box::pin(forget()).await,
         "report" => Box::pin(report()).await,
         "learned" => Box::pin(learned_at_connect()).await,
         "untrusted" => Box::pin(untrusted()).await,
@@ -163,8 +163,8 @@ async fn enrolment_phase() {
 /// An issuer valid for a year and a month from now, under a fresh root.
 ///
 /// The key is made with the suite's own `rcgen` and the issuer loads it from
-/// PKCS #8 bytes, so the two `rcgen` majors in the graph never meet as one
-/// value.
+/// PKCS #8 bytes, so the suite's key pair never crosses the crate boundary as
+/// a `KeyPair` value.
 fn issuer() -> DeviceIssuer {
     let (root, cert, key) = authority();
     DeviceIssuer::from_pkcs8(cert.clone(), key, root).expect("load")
@@ -191,7 +191,7 @@ static ROTATION: std::sync::LazyLock<Rotation> = std::sync::LazyLock::new(|| {
     let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
     let cert = root
         .sign_issuer(
-            &key.public_key_der(),
+            &key.subject_public_key_info(),
             now - DAY,
             395 * DAY,
             CertificateSerial::new([1; 16]).expect("the serial is positive"),
@@ -200,7 +200,7 @@ static ROTATION: std::sync::LazyLock<Rotation> = std::sync::LazyLock::new(|| {
     let next_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("next issuer key");
     let next_cert = root
         .sign_issuer(
-            &next_key.public_key_der(),
+            &next_key.subject_public_key_info(),
             now - DAY,
             395 * DAY,
             CertificateSerial::new([2; 16]).expect("the serial is positive"),

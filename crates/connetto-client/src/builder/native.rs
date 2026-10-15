@@ -302,6 +302,10 @@ where
                 teardown: None,
                 #[cfg(feature = "device-identity")]
                 device: None,
+                #[cfg(feature = "peer")]
+                beacon: None,
+                #[cfg(feature = "peer")]
+                bt_state: None,
             },
             pump,
         ))
@@ -446,6 +450,13 @@ pub struct NativeDurable<T: Transport, C, K: StorageMarker, KS> {
 
 /// What a keyring build enrols its device key with (R74).
 #[cfg(feature = "device-identity")]
+#[cfg_attr(
+    feature = "peer",
+    expect(
+        clippy::struct_excessive_bools,
+        reason = "autolink, scan, autojoin and prompt are independent switches the application sets one by one"
+    )
+)]
 struct DeviceSetup {
     lifetime: Option<core::time::Duration>,
     descriptor: Vec<u8>,
@@ -457,6 +468,12 @@ struct DeviceSetup {
     peer_listen: SocketAddr,
     #[cfg(feature = "peer")]
     peer_accepted: Vec<AttestationLevel>,
+    #[cfg(feature = "peer")]
+    bt_scan: bool,
+    #[cfg(feature = "peer")]
+    bt_autojoin: bool,
+    #[cfg(feature = "peer")]
+    bt_prompt: bool,
     #[cfg(target_os = "android")]
     java: Option<Arc<dyn crate::device_key::JavaAccess>>,
 }
@@ -476,6 +493,12 @@ impl Default for DeviceSetup {
             peer_listen: SocketAddr::from(([0, 0, 0, 0], 0)),
             #[cfg(feature = "peer")]
             peer_accepted: AttestationLevel::ALL.to_vec(),
+            #[cfg(feature = "peer")]
+            bt_scan: true,
+            #[cfg(feature = "peer")]
+            bt_autojoin: false,
+            #[cfg(feature = "peer")]
+            bt_prompt: true,
             #[cfg(target_os = "android")]
             java: None,
         }
@@ -602,6 +625,36 @@ where
         accepted: impl IntoIterator<Item = AttestationLevel>,
     ) -> Self {
         self.device.peer_accepted = accepted.into_iter().collect();
+        self
+    }
+
+    /// Whether the device scans for nearby hosts in the background, on by
+    /// default (R76 decision 19).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_hotspot_scan(mut self, scan: bool) -> Self {
+        self.device.bt_scan = scan;
+        self
+    }
+
+    /// Whether the device joins the strongest host it sees, off by default
+    /// (R76 decision 19). Implies the scan.
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_hotspot_autojoin(mut self, autojoin: bool) -> Self {
+        self.device.bt_autojoin = autojoin;
+        if autojoin {
+            self.device.bt_scan = true;
+        }
+        self
+    }
+
+    /// Whether the call-driven Bluetooth prompts run, on by default (R76
+    /// decision 21).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn with_bluetooth_prompt(mut self, prompt: bool) -> Self {
+        self.device.bt_prompt = prompt;
         self
     }
 
@@ -734,6 +787,12 @@ where
         #[cfg(not(feature = "native-auth"))]
         let _ = (resolved, key_store);
         let (core, pump) = core.connect_with_pump().await?;
+        #[cfg(feature = "peer")]
+        let mut beacon: Option<
+            tokio::sync::watch::Receiver<crate::bluetooth::BeaconState>,
+        > = None;
+        #[cfg(feature = "peer")]
+        let mut bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>> = None;
         #[cfg(feature = "device-identity")]
         let (device, pump) = match keys {
             Some(keys) => {
@@ -745,6 +804,8 @@ where
                 let (peer_events, peer_events_rx) = mpsc::unbounded_channel();
                 #[cfg(feature = "peer")]
                 let (hotspot_tx, hotspot_rx) = mpsc::unbounded_channel();
+                #[cfg(feature = "peer")]
+                let (bluetooth_tx, bluetooth_rx) = mpsc::unbounded_channel();
                 #[cfg(feature = "peer")]
                 let node = connetto_peer::Node::new(
                     connetto_peer::Trust {
@@ -787,10 +848,12 @@ where
                     peer,
                     #[cfg(feature = "peer")]
                     hotspot_tx,
+                    #[cfg(feature = "peer")]
+                    bluetooth_tx,
                 );
                 let enrolment = core.client().enrolment(enroller);
                 #[cfg(feature = "peer")]
-                let hotspot_runner = {
+                let (runner, beacon_rx, bt_backend) = {
                     let backend: Arc<dyn crate::hotspot::HotspotBackend> = {
                         #[cfg(target_os = "android")]
                         {
@@ -811,6 +874,7 @@ where
                     let bind_node = peer_node.clone();
                     let dial_handle = handle.clone();
                     let event_sender = core.client().event_sender();
+                    let event_sender_bt = event_sender.clone();
                     #[cfg(target_os = "android")]
                     let bind = {
                         let java = device.java.clone();
@@ -858,16 +922,71 @@ where
                             let _ = event_sender.send(event);
                         }),
                     );
-                    crate::hotspot::run(machine, hotspot_rx)
+                    #[cfg(target_os = "android")]
+                    let (bt_readiness, bt_peripheral, bt_central) = match device.java.clone() {
+                        Some(java) => {
+                            let backend =
+                                Arc::new(crate::bluetooth::AndroidBluetoothBackend::new(java));
+                            (
+                                Arc::clone(&backend) as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                                Arc::clone(&backend)
+                                    as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                                // The Android central is btleplug's, which a later slice
+                                // brings (R76 decision 20).
+                                None,
+                            )
+                        }
+                        None => crate::bluetooth::unsupported_backends(),
+                    };
+                    #[cfg(not(target_os = "android"))]
+                    let (bt_readiness, bt_peripheral, bt_central) =
+                        crate::bluetooth::unsupported_backends();
+                    let bt_state = Arc::clone(&bt_readiness);
+                    let serving_handle = handle.clone();
+                    let join_handle = handle.clone();
+                    let beacon_node = peer_node.clone();
+                    let bt_machine = crate::bluetooth::Machine::new(
+                        bt_readiness,
+                        bt_peripheral,
+                        bt_central,
+                        beacon_node,
+                        device.bt_scan,
+                        device.bt_autojoin,
+                        device.bt_prompt,
+                        Arc::new({
+                            let handle = serving_handle;
+                            move || handle.peer_serving_fingerprint()
+                        }),
+                        Arc::new(move |offer, reply| {
+                            let handle = join_handle.clone();
+                            tokio::spawn(async move {
+                                let answer = handle.join_hotspot(&offer).await;
+                                let _ = reply.send(answer);
+                            });
+                        }),
+                        Arc::new(move |event: ClientEvent| {
+                            let _ = event_sender_bt.send(event);
+                        }),
+                    );
+                    (
+                        crate::bluetooth::run(machine, hotspot_rx, bt_machine.0, bluetooth_rx),
+                        bt_machine.1,
+                        bt_state,
+                    )
                 };
                 #[cfg(feature = "peer")]
                 let pump: CorePump = Box::pin(async move {
-                    tokio::join!(pump, enrolment, hotspot_runner);
+                    tokio::join!(pump, enrolment, runner);
                 });
                 #[cfg(not(feature = "peer"))]
                 let pump: CorePump = Box::pin(async move {
                     tokio::join!(pump, enrolment);
                 });
+                #[cfg(feature = "peer")]
+                {
+                    beacon = Some(beacon_rx);
+                    bt_state = Some(bt_backend);
+                }
                 (Some(handle), pump)
             }
             None => (None, pump),
@@ -881,6 +1000,10 @@ where
                 teardown,
                 #[cfg(feature = "device-identity")]
                 device,
+                #[cfg(feature = "peer")]
+                beacon,
+                #[cfg(feature = "peer")]
+                bt_state,
             },
             pump,
         ))
@@ -939,6 +1062,12 @@ pub struct NativeClient<T: Transport, C = ()> {
     teardown: Option<Box<dyn Forget>>,
     #[cfg(feature = "device-identity")]
     device: Option<EnrolHandle>,
+    #[cfg(feature = "peer")]
+    /// The host's beacon standing, for the application's panel (R76).
+    beacon: Option<tokio::sync::watch::Receiver<crate::bluetooth::BeaconState>>,
+    #[cfg(feature = "peer")]
+    /// The platform's Bluetooth standing, readable at any time (R76).
+    bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>>,
 }
 
 impl<T, C> NativeClient<T, C>
@@ -1078,8 +1207,8 @@ where
         }
     }
 
-    /// Host this device's hotspot, answering its details or the reason it
-    /// will not, within the machine's bound (R76).
+    /// Host this device's hotspot, the beacon's outcome beside its details
+    /// or the reason it will not, within the machines' bounds (R76).
     ///
     /// # Errors
     ///
@@ -1087,9 +1216,10 @@ where
     /// build without a device identity, [`HotspotError::MissingPermission`]
     /// with a permission the device has not granted, the mapped failure from
     /// the device's Wi-Fi manager, and [`HotspotError::TimedOut`] when the
-    /// hotspot does not start within its bound.
+    /// hotspot does not start within its bound. The beacon's refusal stands
+    /// beside the offer on the success.
     #[cfg(feature = "peer")]
-    pub async fn host_hotspot(&self) -> Result<HotspotOffer, HotspotError> {
+    pub async fn host_hotspot(&self) -> Result<crate::bluetooth::Hosted, HotspotError> {
         match &self.device {
             Some(device) => device.host_hotspot().await,
             None => Err(HotspotError::Unsupported),
@@ -1144,6 +1274,115 @@ where
     pub async fn leave_hotspot(&self) {
         if let Some(device) = &self.device {
             device.leave_hotspot();
+        }
+    }
+
+    /// The platform's Bluetooth standing, readable at any time (R76
+    /// decision 21).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn bluetooth_state(&self) -> crate::bluetooth::BluetoothState {
+        match &self.bt_state {
+            Some(backend) => backend.state(),
+            None => crate::bluetooth::BluetoothState::Unsupported,
+        }
+    }
+
+    /// The host's beacon standing, for the application's panel (R76).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn beacon_state(&self) -> crate::bluetooth::BeaconState {
+        match &self.beacon {
+            Some(receiver) => receiver.borrow().clone(),
+            None => crate::bluetooth::BeaconState::Off {
+                reason: "no bluetooth on this system",
+            },
+        }
+    }
+
+    /// Enable Bluetooth, the platform's action inside the call, within the
+    /// machine's bound (R76 decision 21).
+    ///
+    /// # Errors
+    ///
+    /// [`BluetoothError::Unsupported`](crate::BluetoothError::Unsupported) for a build without a device
+    /// identity, [`BluetoothError::Off`](crate::BluetoothError::Off) or [`BluetoothError::NotPermitted`](crate::BluetoothError::NotPermitted)
+    /// with the prompt's outcome once the action declines, and
+    /// [`BluetoothError::TimedOut`](crate::BluetoothError::TimedOut) when the action does not finish within
+    /// its bound.
+    #[cfg(feature = "peer")]
+    pub async fn enable_bluetooth(&self) -> Result<(), crate::bluetooth::BluetoothError> {
+        match &self.device {
+            Some(device) => device.enable_bluetooth().await,
+            None => Err(crate::bluetooth::BluetoothError::Unsupported),
+        }
+    }
+
+    /// Join the nearby host's hotspot through the exchange, within the
+    /// machines' bounds (R76 decision 19).
+    ///
+    /// # Errors
+    ///
+    /// [`JoinNearbyError::Bluetooth`](crate::JoinNearbyError::Bluetooth) with the Bluetooth reason the exchange
+    /// or the platform's action gives, and [`JoinNearbyError::Join`](crate::JoinNearbyError::Join) with the
+    /// hotspot's reason the network gives.
+    #[cfg(feature = "peer")]
+    pub async fn join_nearby(
+        &self,
+        host: &crate::bluetooth::HostId,
+    ) -> Result<std::net::IpAddr, crate::bluetooth::JoinNearbyError> {
+        match &self.device {
+            Some(device) => device.join_nearby(host).await,
+            None => Err(crate::bluetooth::JoinNearbyError::Bluetooth(
+                crate::bluetooth::BluetoothError::Unsupported,
+            )),
+        }
+    }
+
+    /// Fetch the nearby host's offer through the exchange, within the
+    /// machine's bound (R76 decision 19).
+    ///
+    /// # Errors
+    ///
+    /// [`BluetoothError::Busy`](crate::BluetoothError::Busy) while an exchange runs,
+    /// [`BluetoothError::Exchange`](crate::BluetoothError::Exchange) with the link's reason the host's chain
+    /// refuses or the exchange stalls, and
+    /// [`BluetoothError::TimedOut`](crate::BluetoothError::TimedOut) at the bound.
+    #[cfg(feature = "peer")]
+    pub async fn fetch_offer(
+        &self,
+        host: &crate::bluetooth::HostId,
+    ) -> Result<HotspotOffer, crate::bluetooth::BluetoothError> {
+        match &self.device {
+            Some(device) => device.fetch_offer(host).await,
+            None => Err(crate::bluetooth::BluetoothError::Unsupported),
+        }
+    }
+
+    /// The scan's standing, at run time (R76 decision 19). A no-op for a
+    /// build without a device identity.
+    #[cfg(feature = "peer")]
+    pub fn set_hotspot_scan(&self, scan: bool) {
+        if let Some(device) = &self.device {
+            device.set_hotspot_scan(scan);
+        }
+    }
+
+    /// The autojoin's standing, at run time, implying the scan (R76 decision
+    /// 19). A no-op for a build without a device identity.
+    #[cfg(feature = "peer")]
+    pub fn set_hotspot_autojoin(&self, autojoin: bool) {
+        if let Some(device) = &self.device {
+            device.set_hotspot_autojoin(autojoin);
+        }
+    }
+
+    /// The prompt's standing, at run time (R76 decision 21). A no-op for a
+    /// build without a device identity.
+    #[cfg(feature = "peer")]
+    pub fn set_bluetooth_prompt(&self, prompt: bool) {
+        if let Some(device) = &self.device {
+            device.set_bluetooth_prompt(prompt);
         }
     }
 }
@@ -1350,6 +1589,10 @@ impl<T: Transport, C> NativeClient<T, C> {
             teardown: None,
             #[cfg(feature = "device-identity")]
             device: None,
+            #[cfg(feature = "peer")]
+            beacon: None,
+            #[cfg(feature = "peer")]
+            bt_state: None,
         }
     }
 }
@@ -1450,4 +1693,460 @@ async fn resolve_provider_sign_in<K: StorageMarker>(
         credential,
         provider: Some((native, authenticator)),
     })
+}
+
+#[cfg(all(test, feature = "native-transport", feature = "peer"))]
+mod tests {
+    use core::future::Future;
+    use core::marker::PhantomData;
+    use std::sync::Arc;
+    use std::time::{Duration, SystemTime};
+
+    use connetto_core::device_cert::{AttestationLevel, DeploymentId, RootCa};
+    use connetto_core::schema::SchemaBundle;
+    use connetto_core::test_support::FakeTransport;
+    use connetto_core::traits::{MaybeSend, Transport};
+    use tokio::sync::{mpsc, watch};
+
+    use super::NativeClient;
+    use crate::bluetooth::{BeaconState, BluetoothState};
+    use crate::enrolment::{DeviceKeys, Enroller};
+    use crate::{ClientBuilder, Grant, HeldCredential, TransportFactory};
+
+    /// A schema a test's bundle holds.
+    fn bundle() -> crate::SyncSchema {
+        crate::SyncSchema::new(SchemaBundle::new(
+            "",
+            "",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        ))
+    }
+
+    /// The refusal a dialer that never reaches a server hands back.
+    #[derive(Debug, thiserror::Error)]
+    #[error("no server is reachable")]
+    struct Unreachable;
+
+    /// A dialer that never reaches a server, so a running client stays
+    /// offline (R76 slice 5a).
+    struct NeverDial<T>(PhantomData<fn() -> T>);
+
+    impl<T> Default for NeverDial<T> {
+        fn default() -> Self {
+            Self(PhantomData)
+        }
+    }
+
+    impl<T: Transport + MaybeSend + 'static> TransportFactory for NeverDial<T> {
+        type Transport = T;
+        type Error = Unreachable;
+
+        fn connect(&mut self) -> impl Future<Output = Result<T, Unreachable>> + MaybeSend {
+            core::future::ready(Err(Unreachable))
+        }
+    }
+
+    /// The credential the tests sign in with.
+    fn held(user: &str) -> HeldCredential {
+        HeldCredential::new(Grant::new(format!("user:{user}")), user).expect("a held credential")
+    }
+
+    /// A device key that stands nowhere, for the build the task runs without
+    /// one (R76 slice 5a).
+    struct NowhereKeys;
+
+    impl DeviceKeys for NowhereKeys {
+        fn open(
+            &self,
+        ) -> core::pin::Pin<
+            Box<
+                dyn Future<
+                        Output = Result<
+                            crate::device_key::OpenedKey<
+                                Box<dyn connetto_core::device_cert::DeviceKey>,
+                            >,
+                            crate::ClientError,
+                        >,
+                    > + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                Err(crate::ClientError::Transport(
+                    "the test holds no device key".into(),
+                ))
+            })
+        }
+
+        fn delete(
+            &self,
+        ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), crate::ClientError>> + Send + '_>>
+        {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The autojoin's standing implies the scan's at the build stage, the
+    /// way the runtime's standing does (R76 decision 19).
+    #[test]
+    fn an_autojoin_standing_implies_the_scan_standing() {
+        let builder = super::NativeClientBuilder::new("ws://127.0.0.1:1/", bundle())
+            .signed_in(
+                crate::Auth::new("http://127.0.0.1:9", "test")
+                    .with_account(crate::AccountChoice::New)
+                    .keyring("cov-autojoin-implies-scan"),
+            )
+            .durable(std::env::temp_dir().join("cov-native-builder"))
+            .with_hotspot_scan(false)
+            .with_hotspot_autojoin(true)
+            .with_bluetooth_prompt(false);
+        assert!(builder.device.bt_autojoin, "the autojoin stands");
+        assert!(builder.device.bt_scan, "the autojoin implies the scan");
+        assert!(!builder.device.bt_prompt, "the prompt stands as asked");
+    }
+
+    /// A build without a device identity refuses the peer's calls with the
+    /// typed reasons the calls document (R76 slice 5a).
+    #[tokio::test]
+    async fn a_build_without_a_device_identity_refuses_the_peer_calls() {
+        let client = super::NativeClientBuilder::new("ws://127.0.0.1:1/", bundle())
+            .with_dialer(NeverDial::<FakeTransport>::default())
+            .signed_in(held("carol"))
+            .connect()
+            .await
+            .expect("the build opens offline");
+
+        let offer = crate::hotspot::HotspotOffer::new(
+            "camp",
+            "opensesame",
+            crate::hotspot::HotspotSecurity::Wpa2,
+            Some(5678),
+        );
+        assert!(
+            matches!(
+                client.host_hotspot().await,
+                Err(crate::hotspot::HotspotError::Unsupported)
+            ),
+            "the build has no device identity to host"
+        );
+        assert!(
+            matches!(
+                client.join_hotspot(&offer).await,
+                Err(crate::hotspot::JoinError::Unsupported)
+            ),
+            "the build has no device identity to join"
+        );
+        assert!(
+            matches!(
+                client.enable_bluetooth().await,
+                Err(crate::bluetooth::BluetoothError::Unsupported)
+            ),
+            "the build has no device identity to enable"
+        );
+        assert!(
+            matches!(
+                client.fetch_offer(&3).await,
+                Err(crate::bluetooth::BluetoothError::Unsupported)
+            ),
+            "the build has no device identity to fetch"
+        );
+        assert!(
+            matches!(
+                client.join_nearby(&3).await,
+                Err(crate::bluetooth::JoinNearbyError::Bluetooth(
+                    crate::bluetooth::BluetoothError::Unsupported
+                ))
+            ),
+            "the build has no device identity to join nearby"
+        );
+        assert_eq!(client.bluetooth_state(), BluetoothState::Unsupported);
+        assert_eq!(
+            client.beacon_state(),
+            BeaconState::Off {
+                reason: "no bluetooth on this system"
+            }
+        );
+        assert!(
+            client.peer_address().is_none(),
+            "nothing serves without the device"
+        );
+        assert!(client.device_certificate().is_none());
+        assert!(client.device_key_home().is_none());
+        let address: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        assert!(
+            matches!(
+                client.link_peer(address).await,
+                Err(crate::PeerError::NoIdentity)
+            ),
+            "the build has no identity to present"
+        );
+
+        // The no-ops run without the device.
+        client.stop_hotspot().await;
+        client.leave_hotspot().await;
+        client.set_hotspot_scan(true);
+        client.set_hotspot_autojoin(true);
+        client.set_bluetooth_prompt(false);
+
+        client.close().await;
+    }
+
+    /// A device build hands its hotspot and Bluetooth calls to the machines
+    /// and reads their standings, and refuses the peer calls a
+    /// certificate-less device cannot take (R76 slice 5a).
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the build, the machines and the calls are one scenario"
+    )]
+    #[tokio::test]
+    async fn a_device_build_hands_its_calls_to_the_machines_and_reads_their_standings() {
+        // The core opens offline, the way the signed-in stage does.
+        let (core, pump) = ClientBuilder::<FakeTransport>::new(bundle(), NeverDial::default())
+            .signed_in(held("carol"))
+            .connect_with_pump()
+            .await
+            .expect("the build opens offline");
+        let pump = tokio::spawn(pump);
+
+        // The machines stand in for the platform's, each answering as the
+        // platform answers once its radio stands.
+        let (hotspot_tx, mut hotspot_rx) = mpsc::unbounded_channel();
+        let (bluetooth_tx, mut bluetooth_rx) = mpsc::unbounded_channel();
+        let (note_tx, mut note_rx) = mpsc::channel(8);
+        let machine = tokio::spawn(async move {
+            let gateway: std::net::IpAddr = "192.168.4.1".parse().expect("a private gateway");
+            let offer = crate::hotspot::HotspotOffer::new(
+                "camp",
+                "opensesame",
+                crate::hotspot::HotspotSecurity::Wpa2,
+                Some(5678),
+            );
+            loop {
+                tokio::select! {
+                    command = hotspot_rx.recv() => match command {
+                        Some(crate::hotspot::Command::Host(reply)) => {
+                            let _ = reply.send(Ok(offer.clone()));
+                        }
+                        Some(crate::hotspot::Command::Join { reply, .. }) => {
+                            let _ = reply.send(Ok(gateway));
+                        }
+                        Some(crate::hotspot::Command::StopHost) => {
+                            let _ = note_tx.send("stop").await;
+                        }
+                        Some(crate::hotspot::Command::Leave) => {
+                            let _ = note_tx.send("leave").await;
+                        }
+                        None => break,
+                    },
+                    command = bluetooth_rx.recv() => match command {
+                        Some(crate::bluetooth::Command::Enable(reply)) => {
+                            let _ = reply.send(Ok(()));
+                        }
+                        Some(crate::bluetooth::Command::JoinNearby { reply, .. }) => {
+                            let _ = reply.send(Ok(gateway));
+                        }
+                        Some(crate::bluetooth::Command::Fetch { reply, .. }) => {
+                            let _ = reply.send(Ok(offer.clone()));
+                        }
+                        Some(crate::bluetooth::Command::Host(reply)) => {
+                            let _ = reply.send(Ok(crate::bluetooth::Hosted {
+                                offer: offer.clone(),
+                                beacon: Ok(()),
+                            }));
+                        }
+                        Some(crate::bluetooth::Command::SetScan(on)) => {
+                            let _ = note_tx
+                                .send(if on { "scan true" } else { "scan false" })
+                                .await;
+                        }
+                        Some(crate::bluetooth::Command::SetAutojoin(on)) => {
+                            let _ = note_tx
+                                .send(if on { "autojoin true" } else { "autojoin false" })
+                                .await;
+                        }
+                        Some(crate::bluetooth::Command::SetPrompt(on)) => {
+                            let _ = note_tx
+                                .send(if on { "prompt true" } else { "prompt false" })
+                                .await;
+                        }
+                        None => break,
+                    },
+                }
+            }
+        });
+
+        // The device stands beside the core, the way the durable stage
+        // stands it, with the machines' channels in its place.
+        let now = SystemTime::now();
+        let root = RootCa::create(
+            DeploymentId::from_uuid(uuid::Uuid::from_u128(7)),
+            now - Duration::from_hours(10),
+            Duration::from_hours(3650 * 24),
+        )
+        .expect("the root issues");
+        let root_der = root.certificate().to_vec();
+        let (node_events, node_events_rx) = mpsc::unbounded_channel();
+        let node = connetto_peer::Node::new(
+            connetto_peer::Trust {
+                roots: vec![root_der],
+                accepted: AttestationLevel::ALL.to_vec(),
+            },
+            Arc::new(connetto_peer::SystemClock),
+            node_events,
+        )
+        .expect("the roots hold keys");
+        let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+        let discovery = connetto_peer::Discovery::new(node.clone(), false, discovery_events);
+        let peer = crate::enrolment::Peer {
+            node,
+            discovery,
+            listen: "127.0.0.1:0".parse().expect("loopback"),
+            events: node_events_rx,
+            discovery_events: discovery_events_rx,
+        };
+        let (enroller, device) = Enroller::new(
+            Arc::new(NowhereKeys),
+            None,
+            Vec::new(),
+            vec![],
+            None,
+            Vec::new(),
+            mpsc::unbounded_channel().1,
+            peer,
+            hotspot_tx,
+            bluetooth_tx,
+        );
+        drop(enroller);
+        let (_beacon, beacon_rx) = watch::channel(BeaconState::Advertising { prefix: [7; 8] });
+        let (readiness, _, _) = crate::bluetooth::unsupported_backends();
+        let client = NativeClient {
+            core,
+            #[cfg(feature = "native-auth")]
+            session: None,
+            #[cfg(feature = "native-auth")]
+            teardown: None,
+            #[cfg(feature = "device-identity")]
+            device: Some(device),
+            #[cfg(feature = "peer")]
+            beacon: Some(beacon_rx),
+            #[cfg(feature = "peer")]
+            bt_state: Some(readiness),
+        };
+
+        // The calls hand back what the machines answer.
+        let hosted = client.host_hotspot().await.expect("the machine answers");
+        assert_eq!(
+            hosted.offer.ssid, "camp",
+            "the machine's offer reaches the caller"
+        );
+        assert!(hosted.beacon.is_ok(), "the beacon stands beside the offer");
+        let offer = crate::hotspot::HotspotOffer::new(
+            "camp",
+            "opensesame",
+            crate::hotspot::HotspotSecurity::Wpa2,
+            Some(5678),
+        );
+        let gateway = client
+            .join_hotspot(&offer)
+            .await
+            .expect("the machine answers");
+        assert_eq!(
+            gateway,
+            "192.168.4.1"
+                .parse::<std::net::IpAddr>()
+                .expect("a private gateway"),
+            "the machine's gateway reaches the caller"
+        );
+        client
+            .enable_bluetooth()
+            .await
+            .expect("the machine answers");
+        let gateway = client.join_nearby(&9).await.expect("the machine answers");
+        assert_eq!(
+            gateway,
+            "192.168.4.1"
+                .parse::<std::net::IpAddr>()
+                .expect("a private gateway")
+        );
+        let fetched = client.fetch_offer(&9).await.expect("the machine answers");
+        assert_eq!(
+            fetched.ssid, "camp",
+            "the machine's offer reaches the caller"
+        );
+
+        // The standings read the machines', and the cancels and the run-time
+        // standings reach them.
+        assert_eq!(
+            client.bluetooth_state(),
+            BluetoothState::Unsupported,
+            "the readiness stands where the platform stands"
+        );
+        assert_eq!(
+            client.beacon_state(),
+            BeaconState::Advertising { prefix: [7; 8] },
+            "the beacon's standing stands beside the device"
+        );
+        client.stop_hotspot().await;
+        client.leave_hotspot().await;
+        client.set_hotspot_scan(true);
+        client.set_hotspot_autojoin(false);
+        client.set_bluetooth_prompt(true);
+        // The standings reach their machines, from the two machines' channels,
+        // so the order the notes come back in is not the order sent.
+        let mut noted: Vec<&str> = Vec::new();
+        for _ in 0..5 {
+            let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
+                .await
+                .expect("the machine notes the standing within its bound")
+                .expect("the machine is still running");
+            noted.push(got);
+        }
+        noted.sort_unstable();
+        assert_eq!(
+            noted,
+            [
+                "autojoin false",
+                "leave",
+                "prompt true",
+                "scan true",
+                "stop"
+            ],
+            "each standing reaches its machine"
+        );
+
+        // A certificate-less device refuses the peer's calls by its standing.
+        assert!(
+            client.peer_address().is_none(),
+            "nothing serves before the standing"
+        );
+        assert!(
+            client.device_certificate().is_none(),
+            "nothing is enrolled yet"
+        );
+        assert!(client.device_key_home().is_none());
+        let address: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback");
+        assert!(
+            matches!(
+                client.link_peer(address).await,
+                Err(crate::PeerError::NoIdentity)
+            ),
+            "the device holds no certificate to present"
+        );
+
+        tokio::time::timeout(Duration::from_secs(10), client.close())
+            .await
+            .expect("the client closes within its bound");
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(10), machine)
+            .await
+            .expect("the machine ends within its bound")
+            .expect("the machine ends");
+        tokio::time::timeout(Duration::from_secs(10), pump)
+            .await
+            .expect("the pump ends within its bound")
+            .expect("the pump ends");
+    }
 }

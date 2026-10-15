@@ -25,8 +25,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use super::Peer;
 use super::task::next_look;
 use super::{
-    Answer, CERTIFICATE_DDL, CertificateError, DeviceKeys, Enroller, Held, Intake, KeptList, Link,
-    ListInbox, Standing, TOLERANCE, delete, intake, load, run, store,
+    Answer, CERTIFICATE_DDL, CertificateError, DeviceKeys, EnrolHandle, Enroller, Held, Intake,
+    KeptList, Link, ListInbox, Standing, TOLERANCE, delete, intake, load, run, store,
 };
 use crate::ClientError;
 use crate::ClientEvent;
@@ -674,6 +674,8 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -686,6 +688,8 @@ async fn a_refused_attestation_is_raised_once_and_asks_again_only_on_the_next_co
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -767,6 +771,8 @@ async fn a_renewal_sends_no_attestation() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, _handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -779,6 +785,8 @@ async fn a_renewal_sends_no_attestation() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -824,6 +832,8 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -836,6 +846,8 @@ async fn a_reissue_refused_as_revoked_deletes_the_key_and_reports_revoked() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -884,6 +896,8 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -896,6 +910,8 @@ async fn a_reissue_refused_over_the_ceiling_reports_the_ceiling() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -937,6 +953,8 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -949,6 +967,8 @@ async fn a_reissue_refused_for_another_reason_reports_that_reason() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -989,6 +1009,8 @@ async fn a_reissue_with_no_answer_is_offline() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1001,6 +1023,8 @@ async fn a_reissue_with_no_answer_is_offline() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1043,6 +1067,8 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1055,6 +1081,8 @@ async fn a_reissue_lost_on_the_wire_is_offline() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1095,6 +1123,8 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1107,6 +1137,8 @@ async fn a_reissue_violating_the_protocol_is_a_device_error() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1279,6 +1311,8 @@ async fn a_fresh_device_serves_its_peer_listener_at_open() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1290,6 +1324,8 @@ async fn a_fresh_device_serves_its_peer_listener_at_open() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1332,6 +1368,8 @@ async fn an_expired_device_refuses_to_link_and_raises_the_event() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1343,6 +1381,8 @@ async fn an_expired_device_refuses_to_link_and_raises_the_event() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1403,6 +1443,8 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1414,6 +1456,8 @@ async fn a_clock_off_device_refuses_to_link_outside_its_window() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1481,6 +1525,8 @@ async fn a_grant_past_its_window_refuses_the_dial_as_a_window() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1492,6 +1538,8 @@ async fn a_grant_past_its_window_refuses_the_dial_as_a_window() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1553,6 +1601,8 @@ async fn a_certificate_less_device_refuses_to_link() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1564,6 +1614,8 @@ async fn a_certificate_less_device_refuses_to_link() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1621,6 +1673,8 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1632,6 +1686,8 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1720,6 +1776,8 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1731,6 +1789,8 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1827,6 +1887,8 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1838,6 +1900,8 @@ async fn a_peer_list_revoking_the_own_serial_revokes_the_device() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -1958,6 +2022,8 @@ async fn a_stale_peer_list_changes_nothing() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
         Some(HOUR),
@@ -1969,6 +2035,8 @@ async fn a_stale_peer_list_changes_nothing() {
         peer,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
 
@@ -2078,6 +2146,8 @@ async fn two_clients_discover_each_other_and_autolink() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller_a, _handle_a) = Enroller::new(
         Arc::new(RunKeys { der: der_a }),
         Some(HOUR),
@@ -2089,9 +2159,13 @@ async fn two_clients_discover_each_other_and_autolink() {
         peer_a,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller_b, _handle_b) = Enroller::new(
         Arc::new(RunKeys { der: der_b }),
         Some(HOUR),
@@ -2103,6 +2177,8 @@ async fn two_clients_discover_each_other_and_autolink() {
         peer_b,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run_a = tokio::spawn(run(link_a, enroller_a));
     let run_b = tokio::spawn(run(link_b, enroller_b));
@@ -2172,6 +2248,8 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
     };
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller_a, handle_a) = Enroller::new(
         Arc::new(RunKeys { der: der_a }),
         Some(HOUR),
@@ -2183,9 +2261,13 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         peer_a,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller_b, _handle_b) = Enroller::new(
         Arc::new(RunKeys { der: der_b }),
         Some(HOUR),
@@ -2197,6 +2279,8 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
         peer_b,
         #[cfg(feature = "peer")]
         hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
     );
     let run_a = tokio::spawn(run(link_a, enroller_a));
     let run_b = tokio::spawn(run(link_b, enroller_b));
@@ -2240,4 +2324,479 @@ async fn clients_without_autolink_report_and_link_only_on_the_call() {
     fin_tx.send(()).expect("the run ends");
     run_a.await.expect("the run ends");
     run_b.await.expect("the run ends");
+}
+
+/// A device key that will not open, for the refusal paths the task and the
+/// handle report (R76 slice 5a).
+struct RefusingKeys;
+
+impl DeviceKeys for RefusingKeys {
+    fn open(
+        &self,
+    ) -> Pin<Box<dyn Future<Output = Result<OpenedKey<Box<dyn DeviceKey>>, ClientError>> + Send + '_>>
+    {
+        Box::pin(async { Err(ClientError::Transport("the key will not open".into())) })
+    }
+
+    fn delete(&self) -> Pin<Box<dyn Future<Output = Result<(), ClientError>> + Send + '_>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+/// A handle beside the machines' command channels, for the handle's hotspot
+/// and Bluetooth calls (R76 slice 5a). The task runs no machines here, so a
+/// test answers the commands itself.
+#[cfg(feature = "peer")]
+async fn handle_with_machines() -> (
+    EnrolHandle,
+    mpsc::UnboundedReceiver<crate::hotspot::Command>,
+    mpsc::UnboundedReceiver<crate::bluetooth::Command>,
+) {
+    let authority = authority(whole_second()).await;
+    let (hotspot_tx, hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, bluetooth_rx) = mpsc::unbounded_channel();
+    let (_, handle) = Enroller::new(
+        Arc::new(RefusingKeys),
+        None,
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        peer(&authority),
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    (handle, hotspot_rx, bluetooth_rx)
+}
+
+/// The hotspot's call answers from the machine's answer, and a machine that
+/// drops the reply fails the call within its bound (R76).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_host_call_answers_from_the_machine_and_fails_when_the_machine_is_gone() {
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::Host(reply) = command else {
+            panic!("the host's request reaches the Bluetooth machine");
+        };
+        let offer = crate::hotspot::HotspotOffer::new(
+            "camp",
+            "opensesame",
+            crate::hotspot::HotspotSecurity::Wpa2,
+            Some(5678),
+        );
+        let _ = reply.send(Ok(crate::bluetooth::Hosted {
+            offer,
+            beacon: Ok(()),
+        }));
+    });
+    let hosted = handle.host_hotspot().await.expect("the machine answers");
+    assert_eq!(
+        hosted.offer.ssid, "camp",
+        "the machine's offer reaches the caller"
+    );
+    assert!(hosted.beacon.is_ok(), "the beacon stands beside the offer");
+    machine.await.expect("the machine ends");
+
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        // The machine dies without answering, so the reply is dropped.
+        drop(command);
+    });
+    let error = handle
+        .host_hotspot()
+        .await
+        .expect_err("the machine is gone");
+    assert!(
+        matches!(error, crate::hotspot::HotspotError::Failed),
+        "a gone machine fails the call, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// The join's call answers from the hotspot machine's gateway, and a machine
+/// that drops the reply fails the call within its bound (R76).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_join_call_answers_from_the_machine_and_fails_when_the_machine_is_gone() {
+    let (handle, mut hotspot, _bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = hotspot.recv().await.expect("the machine runs");
+        let crate::hotspot::Command::Join { reply, .. } = command else {
+            panic!("the join's request reaches the hotspot machine");
+        };
+        let _ = reply.send(Ok("192.168.4.1".parse().expect("a private gateway")));
+    });
+    let offer = crate::hotspot::HotspotOffer::new(
+        "camp",
+        "opensesame",
+        crate::hotspot::HotspotSecurity::Wpa2,
+        Some(5678),
+    );
+    let gateway = handle
+        .join_hotspot(&offer)
+        .await
+        .expect("the machine answers");
+    assert_eq!(
+        gateway,
+        "192.168.4.1"
+            .parse::<std::net::IpAddr>()
+            .expect("a private gateway"),
+        "the machine's gateway reaches the caller"
+    );
+    machine.await.expect("the machine ends");
+
+    let (handle, mut hotspot, _bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = hotspot.recv().await.expect("the machine runs");
+        drop(command);
+    });
+    let error = handle
+        .join_hotspot(&offer)
+        .await
+        .expect_err("the machine is gone");
+    assert!(
+        matches!(error, crate::hotspot::JoinError::Failed),
+        "a gone machine fails the join, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// The enable's call answers from the machine's answer, and a machine that
+/// drops the reply fails the call within its bound (R76 decision 21).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn an_enable_call_answers_from_the_machine_and_fails_when_the_machine_is_gone() {
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::Enable(reply) = command else {
+            panic!("the enable's request reaches the Bluetooth machine");
+        };
+        let _ = reply.send(Ok(()));
+    });
+    handle
+        .enable_bluetooth()
+        .await
+        .expect("the machine answers");
+    machine.await.expect("the machine ends");
+
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        drop(command);
+    });
+    let error = handle
+        .enable_bluetooth()
+        .await
+        .expect_err("the machine is gone");
+    assert!(
+        matches!(error, crate::bluetooth::BluetoothError::Failed(_)),
+        "a gone machine fails the enable, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// The nearby join's call answers from the machine's gateway, and a machine
+/// that drops the reply fails the call within its bound (R76 decision 19).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_join_nearby_call_answers_from_the_machine_and_fails_when_the_machine_is_gone() {
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::JoinNearby { host, reply, .. } = command else {
+            panic!("the nearby join's request reaches the Bluetooth machine");
+        };
+        assert_eq!(host, 9, "the request names the host");
+        let _ = reply.send(Ok("192.168.4.1".parse().expect("a private gateway")));
+    });
+    let gateway = handle.join_nearby(&9).await.expect("the machine answers");
+    assert_eq!(
+        gateway,
+        "192.168.4.1"
+            .parse::<std::net::IpAddr>()
+            .expect("a private gateway"),
+        "the machine's gateway reaches the caller"
+    );
+    machine.await.expect("the machine ends");
+
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        drop(command);
+    });
+    let error = handle
+        .join_nearby(&9)
+        .await
+        .expect_err("the machine is gone");
+    assert!(
+        matches!(
+            error,
+            crate::bluetooth::JoinNearbyError::Join(crate::hotspot::JoinError::Failed)
+        ),
+        "a gone machine fails the nearby join, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// The fetch's call answers from the machine's offer, and a machine that
+/// drops the reply fails the call within its bound (R76 decision 19).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_fetch_call_answers_from_the_machine_and_fails_when_the_machine_is_gone() {
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::Fetch { host, reply, .. } = command else {
+            panic!("the fetch's request reaches the Bluetooth machine");
+        };
+        assert_eq!(host, 3, "the request names the host");
+        let _ = reply.send(Ok(crate::hotspot::HotspotOffer::new(
+            "camp",
+            "opensesame",
+            crate::hotspot::HotspotSecurity::Wpa2,
+            Some(5678),
+        )));
+    });
+    let offer = handle.fetch_offer(&3).await.expect("the machine answers");
+    assert_eq!(offer.ssid, "camp", "the machine's offer reaches the caller");
+    machine.await.expect("the machine ends");
+
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        drop(command);
+    });
+    let error = handle
+        .fetch_offer(&3)
+        .await
+        .expect_err("the machine is gone");
+    assert!(
+        matches!(error, crate::bluetooth::BluetoothError::Failed(_)),
+        "a gone machine fails the fetch, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// A machine's typed refusal crosses the handle's call unchanged, so the
+/// app knows an exchange already runs when a fetch is refused (R76
+/// decision 19).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_machine_refusal_keeps_its_typed_reason() {
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::Fetch { reply, .. } = command else {
+            panic!("the fetch's request reaches the Bluetooth machine");
+        };
+        // An exchange already runs, so the machine answers `Busy`.
+        let _ = reply.send(Err(crate::bluetooth::BluetoothError::Busy));
+    });
+    let error = handle
+        .fetch_offer(&3)
+        .await
+        .expect_err("the exchange is running");
+    assert!(
+        matches!(error, crate::bluetooth::BluetoothError::Busy),
+        "the refusal keeps its typed reason, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// The runtime standings reach their machine with their values, and a stop
+/// and a leave each reach the hotspot machine (R76).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn the_runtime_standings_and_their_cancels_reach_their_machines() {
+    let (handle, mut hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::SetScan(on) = command else {
+            panic!("the scan's standing reaches the Bluetooth machine");
+        };
+        assert!(on);
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::SetAutojoin(on) = command else {
+            panic!("the autojoin's standing reaches the Bluetooth machine");
+        };
+        assert!(!on);
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::SetPrompt(on) = command else {
+            panic!("the prompt's standing reaches the Bluetooth machine");
+        };
+        assert!(on);
+        let command = hotspot.recv().await.expect("the machine runs");
+        assert!(
+            matches!(command, crate::hotspot::Command::StopHost),
+            "the stop reaches the hotspot machine"
+        );
+        let command = hotspot.recv().await.expect("the machine runs");
+        assert!(
+            matches!(command, crate::hotspot::Command::Leave),
+            "the leave reaches the hotspot machine"
+        );
+    });
+    handle.set_hotspot_scan(true);
+    handle.set_hotspot_autojoin(false);
+    handle.set_bluetooth_prompt(true);
+    handle.stop_hotspot();
+    handle.leave_hotspot();
+    machine.await.expect("the machine ends");
+}
+
+/// A device whose key will not open serves no peer listener, so the device
+/// dials but does not serve until the key stands (R76).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_device_without_a_usable_key_serves_no_peer_listener() {
+    let (key, _der) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RefusingKeys),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    // The fresh standing takes the serve path and the key opens nothing, so
+    // nothing serves for a bounded look.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        handle.peer_address().is_none(),
+        "the key will not open, so the listener waits"
+    );
+    assert!(
+        handle.peer_serving_fingerprint().is_none(),
+        "nothing is served to the machines"
+    );
+    assert!(
+        !state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PeerListenFailed { .. })),
+        "the key refusal is not a bind failure"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A peer listener that will not bind reports the failure to the
+/// application, so the device dials but does not serve (R76).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_peer_listener_that_will_not_bind_reports_the_failure() {
+    let (key, der) = attesting_key();
+    let now = whole_second();
+    let authority = authority(now).await;
+    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    // A listener on an address no interface holds, so the bind refuses.
+    let listen: std::net::SocketAddr = "192.0.2.1:443".parse().expect("a test-net address");
+    let (tx, rx) = mpsc::unbounded_channel();
+    let node = connetto_peer::Node::new(
+        connetto_peer::Trust {
+            roots: vec![authority.root.clone()],
+            accepted: AttestationLevel::ALL.to_vec(),
+        },
+        Arc::new(connetto_peer::SystemClock),
+        tx,
+    )
+    .expect("the roots hold keys");
+    let (discovery_events, discovery_events_rx) = mpsc::unbounded_channel();
+    let peer = Peer {
+        node: node.clone(),
+        discovery: connetto_peer::Discovery::new(node, true, discovery_events)
+            .with_mdns_port(fresh_mdns_port())
+            .loopback_only(),
+        listen,
+        events: rx,
+        discovery_events: discovery_events_rx,
+        #[cfg(all(feature = "peer", target_os = "android"))]
+        java: None,
+    };
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Lost,
+        gate: None,
+        grant_from: None,
+    };
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| {
+        state
+            .lock()
+            .emitted
+            .iter()
+            .any(|event| matches!(event, ClientEvent::PeerListenFailed { .. }))
+    })
+    .await;
+    let failed = state
+        .lock()
+        .emitted
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::PeerListenFailed { address, .. } => Some(*address),
+            _ => None,
+        })
+        .expect("the failure names its address");
+    assert_eq!(failed, listen, "the failure names the address it tried");
+    assert!(
+        handle.peer_address().is_none(),
+        "nothing serves a refused bind"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
 }

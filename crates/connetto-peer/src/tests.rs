@@ -95,6 +95,16 @@ impl Deployment {
         self.root.certificate().to_vec()
     }
 
+    /// The root as a signer, so a proof can mint a leaf under its own key.
+    pub(crate) fn root_signer(&self) -> DeviceIssuer {
+        DeviceIssuer::from_pkcs8(
+            self.root.certificate().to_vec(),
+            &self.root.private_key_der(),
+            self.root.certificate(),
+        )
+        .expect("the root signs its own name")
+    }
+
     /// Sign one more issuer, valid around `now`.
     pub(crate) fn add_issuer(&self, now: SystemTime, serial: [u8; 16]) -> Issuer {
         let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("the issuer key");
@@ -197,7 +207,7 @@ impl Deployment {
 
     /// An issuer-signed list `number` revoking `revoked`, dated at `now`.
     #[expect(clippy::unused_self, reason = "the issuer carries its own signer")]
-    fn issuer_list(
+    pub(crate) fn issuer_list(
         &self,
         issuer: &Issuer,
         number: u64,
@@ -248,7 +258,7 @@ impl Peer {
     }
 
     /// The key id, what the duplicate rule compares.
-    fn key_id(&self) -> connetto_core::device_cert::KeyId {
+    pub(crate) fn key_id(&self) -> connetto_core::device_cert::KeyId {
         key_id(&self.key)
     }
 }
@@ -2505,4 +2515,214 @@ async fn a_refusing_prep_refuses_the_dial_as_unreachable() {
         b.link(a_addr).await.expect("the link completes"),
         alice.identity
     );
+}
+
+/// Reproduction, on the plain link path: two devices from two different
+/// issuers of one deployment link while the dialer holds a list signed by
+/// its own issuer. The issuers share a subject DN, so webpki treats the
+/// kept list as authoritative for the peer's leaf and fails its signature
+/// against the peer's issuer key. Failing first: once the verifier
+/// disambiguates lists by the issuer's key, not its DN, the link completes.
+#[tokio::test]
+async fn a_kept_list_from_a_dn_sibling_issuer_does_not_refuse_the_link() {
+    let now = whole_second();
+    let deployment = Deployment::new(1, now);
+    // Two issuers under one deployment: the same subject DN, different keys
+    // and serials.
+    let issuer_a = deployment.add_issuer(now, [1; 16]);
+    let issuer_b = deployment.add_issuer(now, [2; 16]);
+    let alice = deployment.device(
+        &issuer_a,
+        "alice",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let bob = deployment.device(
+        &issuer_b,
+        "bob",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    // The dialer keeps a list signed by its own issuer, a sibling of the
+    // peer's issuer under the same root, and the link completes.
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    serve(&a, &alice);
+    let b_addr = serve(&b, &bob);
+    let (list, signer) = deployment.issuer_list(&issuer_a, 1, &[], now);
+    a.keep_list(list, signer);
+    let peer = a.link(b_addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+
+    // Control: the root's list names only the root's DN, so it applies to the
+    // peer's issuer, not the peer's leaf, and verifies under the root's key.
+    let (a_tx, _a_rx) = events();
+    let (b_tx, _b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+    serve(&a, &alice);
+    let b_addr = serve(&b, &bob);
+    let (list, signer) = deployment.root_list(1, &[], now);
+    a.keep_list(list, signer);
+    let peer = a.link(b_addr).await.expect("the link completes");
+    assert_eq!(peer, bob.identity);
+}
+
+/// A failure keeps its kind as either typed error, so the app names the
+/// refusal, the alert, the protocol break, the tls failure, or the io
+/// failure (R76 slice 5a).
+#[cfg(feature = "bluetooth")]
+#[test]
+fn a_failure_keeps_its_kind_in_both_typed_errors() {
+    use crate::error::ExchangeError;
+    use crate::frame::FrameError;
+    use crate::node::{classify_frame, classify_io, classify_rustls};
+
+    // An over-long frame names the ceiling, and an undecodable frame names
+    // the break, in both typed errors.
+    let link = LinkError::from(classify_frame(FrameError::TooLong));
+    assert!(
+        matches!(
+            &link,
+            LinkError::Protocol(message) if *message == "the frame exceeds the ceiling"
+        ),
+        "the ceiling stays named"
+    );
+    let exchange = ExchangeError::from(classify_frame(FrameError::TooLong));
+    assert!(
+        matches!(
+            &exchange,
+            ExchangeError::Protocol(message) if *message == "the frame exceeds the ceiling"
+        ),
+        "the ceiling stays named"
+    );
+    let link = LinkError::from(classify_frame(FrameError::Malformed));
+    assert!(
+        matches!(
+            &link,
+            LinkError::Protocol(message) if *message == "the frame does not decode"
+        ),
+        "the break stays named"
+    );
+    let exchange = ExchangeError::from(classify_frame(FrameError::Malformed));
+    assert!(
+        matches!(
+            &exchange,
+            ExchangeError::Protocol(message) if *message == "the frame does not decode"
+        ),
+        "the break stays named"
+    );
+
+    // A plain io failure keeps its kind end to end.
+    let link = LinkError::from(classify_io(io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "the socket is gone",
+    )));
+    assert!(
+        matches!(
+            &link,
+            LinkError::Unreachable(err) if err.kind() == io::ErrorKind::BrokenPipe
+        ),
+        "the kind stays"
+    );
+    let exchange = ExchangeError::from(classify_io(io::Error::new(
+        io::ErrorKind::BrokenPipe,
+        "the socket is gone",
+    )));
+    assert!(
+        matches!(
+            &exchange,
+            ExchangeError::Io(err) if err.kind() == io::ErrorKind::BrokenPipe
+        ),
+        "the kind stays"
+    );
+
+    // A rustls failure that is neither an alert nor a refusal keeps its
+    // kind, and an alert keeps its typed refusal.
+    let tls = rustls::Error::General("the handshake failed".into());
+    assert!(matches!(
+        LinkError::from(classify_rustls(tls.clone())),
+        LinkError::Tls(_)
+    ));
+    assert!(matches!(
+        ExchangeError::from(classify_rustls(tls.clone())),
+        ExchangeError::Tls(_)
+    ));
+    let alert = rustls::AlertDescription::CertificateUnknown;
+    assert!(matches!(
+        LinkError::from(classify_rustls(rustls::Error::AlertReceived(alert))),
+        LinkError::RefusedByPeer(got) if got == alert
+    ));
+    assert!(matches!(
+        ExchangeError::from(classify_rustls(rustls::Error::AlertReceived(alert))),
+        ExchangeError::RefusedByPeer(got) if got == alert
+    ));
+    let refusal = Refusal::Untrusted;
+    let other = || {
+        rustls::Error::InvalidCertificate(rustls::CertificateError::Other(rustls::OtherError(
+            Arc::new(Refusal::Untrusted),
+        )))
+    };
+    assert!(matches!(
+        LinkError::from(classify_rustls(other())),
+        LinkError::Refused(got) if got == refusal
+    ));
+    assert!(matches!(
+        ExchangeError::from(classify_rustls(other())),
+        ExchangeError::Refused(got) if got == refusal
+    ));
+}
+
+/// A link error keeps every kind as the exchange's typed error, so the app
+/// tells a refused bind from a refusal from a silence (R76 slice 5a).
+#[cfg(feature = "bluetooth")]
+#[test]
+fn a_link_error_keeps_its_kind_as_the_exchange_error() {
+    use crate::error::ExchangeError;
+
+    assert!(matches!(
+        ExchangeError::from(LinkError::NotServing),
+        ExchangeError::NotServing
+    ));
+    assert!(matches!(
+        ExchangeError::from(LinkError::Unreachable(io::Error::new(
+            io::ErrorKind::ConnectionRefused,
+            "nothing listens",
+        ))),
+        ExchangeError::Io(err) if err.kind() == io::ErrorKind::ConnectionRefused
+    ));
+    assert!(matches!(
+        ExchangeError::from(LinkError::Timeout),
+        ExchangeError::Timeout
+    ));
+    assert!(matches!(
+        ExchangeError::from(LinkError::Refused(Refusal::Expired)),
+        ExchangeError::Refused(Refusal::Expired)
+    ));
+    let alert = rustls::AlertDescription::BadCertificate;
+    assert!(matches!(
+        ExchangeError::from(LinkError::RefusedByPeer(alert)),
+        ExchangeError::RefusedByPeer(got) if got == alert
+    ));
+    assert!(matches!(
+        ExchangeError::from(LinkError::UnsupportedVersion { their: 2 }),
+        ExchangeError::UnsupportedVersion { their: 2 }
+    ));
+    let protocol = LinkError::Protocol("the frame breaks".into());
+    assert!(matches!(
+        ExchangeError::from(protocol),
+        ExchangeError::Protocol(message) if message == "the frame breaks"
+    ));
+    let tls = rustls::Error::General("the handshake failed".into());
+    assert!(matches!(
+        ExchangeError::from(LinkError::Tls(tls)),
+        ExchangeError::Tls(_)
+    ));
 }

@@ -103,3 +103,53 @@ pub enum LinkError {
     #[error("tls failed")]
     Tls(#[source] rustls::Error),
 }
+
+/// Why a Bluetooth exchange failed.
+#[cfg(feature = "bluetooth")]
+#[derive(Debug, thiserror::Error)]
+pub enum ExchangeError {
+    /// The node holds no identity to present.
+    #[error("the node holds no identity to present")]
+    NotServing,
+    /// The node's own verifier refused the peer's chain, with the reason.
+    #[error("the verifier refused the peer")]
+    Refused(Refusal),
+    /// The peer's TLS alert refused the exchange.
+    #[error("the peer refused the exchange")]
+    RefusedByPeer(AlertDescription),
+    /// The peer speaks a different frame version.
+    #[error("the peer speaks protocol version {their}")]
+    UnsupportedVersion {
+        /// The version the peer offered.
+        their: u16,
+    },
+    /// A frame broke the protocol.
+    #[error("the peer broke the frame protocol")]
+    Protocol(String),
+    /// The exchange ran out of its bound.
+    #[error("the exchange took too long to answer")]
+    Timeout,
+    /// A TLS failure without a typed reason.
+    #[error("tls failed")]
+    Tls(#[source] rustls::Error),
+    /// The exchange's I/O failed.
+    #[error("the exchange's I/O failed")]
+    Io(#[source] std::io::Error),
+}
+
+/// A link failure as the exchange's typed error, keeping every distinction.
+#[cfg(feature = "bluetooth")]
+impl From<LinkError> for ExchangeError {
+    fn from(error: LinkError) -> Self {
+        match error {
+            LinkError::NotServing => Self::NotServing,
+            LinkError::Unreachable(source) => Self::Io(source),
+            LinkError::Timeout => Self::Timeout,
+            LinkError::Refused(refusal) => Self::Refused(refusal),
+            LinkError::RefusedByPeer(alert) => Self::RefusedByPeer(alert),
+            LinkError::UnsupportedVersion { their } => Self::UnsupportedVersion { their },
+            LinkError::Protocol(message) => Self::Protocol(message),
+            LinkError::Tls(source) => Self::Tls(source),
+        }
+    }
+}
