@@ -194,6 +194,14 @@ pub struct Node {
     _lifetime: Arc<Lifetime>,
 }
 
+#[cfg(test)]
+impl Node {
+    /// The state the node's links run on.
+    pub(crate) fn state(&self) -> &Arc<NodeState> {
+        &self.state
+    }
+}
+
 /// Closes the listener and every link when the last `Node` handle drops.
 struct Lifetime(Arc<NodeState>);
 

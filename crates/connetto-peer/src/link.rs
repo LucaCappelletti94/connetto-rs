@@ -353,3 +353,103 @@ fn finish(state: &Arc<NodeState>, key: KeyId, seq: u64, reason: CloseReason) {
         state.events.send(PeerEvent::Unlinked { peer, reason }).ok();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use connetto_core::device_cert::KeyId;
+
+    use super::{DRAIN_BOUND, Stop, on_command, queued_close};
+    use crate::error::CloseReason;
+    use crate::frame::{FrameReader, PeerFrame, write_frame};
+    use crate::node::LinkCommand;
+    use crate::tests::{Deployment, events, node, whole_second};
+
+    /// The bytes a peer sent before its end went away.
+    async fn sent(frames: &[PeerFrame]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            write_frame(&mut bytes, frame)
+                .await
+                .expect("the frame encodes");
+        }
+        bytes
+    }
+
+    /// After a failed write, a `Duplicate` close the peer queued behind other
+    /// frames keeps its reason, and any other close, the stream's end or a
+    /// broken frame reads as `Closed`.
+    #[tokio::test]
+    async fn only_a_queued_duplicate_close_outlives_a_failed_write() {
+        let duplicate = PeerFrame::Close {
+            reason: CloseReason::Duplicate,
+        };
+        let withdrawn = PeerFrame::Close {
+            reason: CloseReason::Withdrawn,
+        };
+        let cases = [
+            (vec![PeerFrame::Ping, duplicate], CloseReason::Duplicate),
+            (vec![PeerFrame::Pong, withdrawn], CloseReason::Closed),
+            (vec![PeerFrame::Ping], CloseReason::Closed),
+        ];
+        for (frames, expected) in cases {
+            let bytes = sent(&frames).await;
+            assert_eq!(
+                queued_close(&mut FrameReader::default(), &mut bytes.as_slice()).await,
+                expected,
+                "{frames:?}"
+            );
+        }
+        // A one-byte body holding `0xc1`, which MessagePack never uses.
+        let broken: &[u8] = &[0, 0, 0, 1, 0xc1];
+        assert_eq!(
+            queued_close(&mut FrameReader::default(), &mut &broken[..]).await,
+            CloseReason::Closed
+        );
+    }
+
+    /// A peer that neither sends nor hangs up after a failed write reads as
+    /// `Closed` once the drain bound passes.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_peer_after_a_failed_write_reads_as_closed_at_the_bound() {
+        let (mut io, _peer) = tokio::io::duplex(64);
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            queued_close(&mut FrameReader::default(), &mut io).await,
+            CloseReason::Closed
+        );
+        assert!(started.elapsed() >= DRAIN_BOUND);
+    }
+
+    /// A list or a renewed chain the peer's end can no longer take stops the
+    /// link as a failed write, and a node that dropped the link's commands
+    /// closes it.
+    #[tokio::test]
+    async fn a_delivery_the_peer_cannot_take_stops_the_link() {
+        let deployment = Deployment::new(30, whole_second());
+        let (tx, _rx) = events();
+        let node = node(deployment.root_der(), tx);
+        let key = KeyId::from_bytes([7; 32]);
+        let (mut io, peer) = tokio::io::duplex(64);
+        drop(peer);
+        let list = LinkCommand::List {
+            list: vec![1; 8],
+            signer: vec![2; 8],
+            issuer: KeyId::from_bytes([8; 32]),
+            number: 1,
+        };
+        let certificate = LinkCommand::Certificate {
+            leaf: vec![3; 8],
+            issuer: vec![4; 8],
+        };
+        for command in [list, certificate] {
+            assert!(matches!(
+                on_command(node.state(), &mut io, key, 0, Some(command)).await,
+                Some(Stop::WriteFailed)
+            ));
+        }
+        assert!(matches!(
+            on_command(node.state(), &mut io, key, 0, None).await,
+            Some(Stop::Close(CloseReason::Closed))
+        ));
+    }
+}
