@@ -21,6 +21,8 @@ env:
 # Caches are saved only from main, which restores exact keys only, so a
 # tree saved after a Cargo.lock change holds none of the artifacts the
 # older lock left behind. Pull requests also restore the nearest older key.
+# Self-hosted runners skip these steps, since their host-mounted cargo
+# registry and sccache already hold the same work without a download.
 jobs:
   checks:
     name: Check ${{ matrix.name }}
@@ -64,6 +66,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -118,7 +121,7 @@ jobs:
               ${{ matrix.target }}
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -140,6 +143,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -185,7 +189,7 @@ jobs:
           fi
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -205,6 +209,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -235,7 +240,7 @@ jobs:
             --features mobile
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -515,6 +520,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -526,6 +532,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore rust test output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -601,7 +608,7 @@ jobs:
           rm -rf target/tmp
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -611,7 +618,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save rust test output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: target
@@ -627,6 +634,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -638,6 +646,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore native build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -694,7 +703,7 @@ jobs:
           rm -rf target/tmp
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -704,7 +713,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save native build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: target
@@ -730,6 +739,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -742,6 +752,7 @@ jobs:
 
       # The wasm tree in target-wasm is the one graph a shard still builds.
       - name: Restore wasm build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -787,7 +798,7 @@ jobs:
           rm -rf target-wasm/debug/incremental
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -797,7 +808,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save wasm build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: target-wasm
@@ -814,6 +825,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -829,6 +841,7 @@ jobs:
       # The cache matches paths without descending into them, so it lists the
       # target's children for the exclusion to apply.
       - name: Restore the demo's build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -936,7 +949,7 @@ jobs:
         run: find examples/dioxus-desktop-demo/target -type d -name incremental -prune -exec rm -rf {} +
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -946,7 +959,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save the demo's build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -962,6 +975,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -995,7 +1009,7 @@ jobs:
         run: wasm-pack test --headless --chrome crates/connetto-file-core
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -1012,6 +1026,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -1023,6 +1038,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore passkey build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -1062,7 +1078,7 @@ jobs:
           rm -rf examples/webauthn-unlock/target/wasm32-unknown-unknown/release/incremental
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -1072,7 +1088,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save passkey build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: examples/webauthn-unlock/target

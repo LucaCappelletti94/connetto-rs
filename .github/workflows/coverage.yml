@@ -68,6 +68,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -149,7 +150,7 @@ jobs:
           if-no-files-found: error
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -190,6 +191,7 @@ jobs:
           merge-multiple: true
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
