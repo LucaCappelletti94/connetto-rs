@@ -28,7 +28,10 @@ apt-get install -y --no-install-recommends \
   docker.io docker-buildx docker-compose-v2 \
   keyutils dbus dbus-x11 gnome-keyring libsecret-1-dev \
   libwebkit2gtk-4.1-dev libxdo-dev libayatana-appindicator3-dev librsvg2-dev \
-  openjdk-17-jdk-headless python3 python3-pip
+  openjdk-17-jdk-headless python3 python3-pip \
+  postgresql
+# Installed like GitHub's image, server programs present and the service off.
+systemctl disable --now postgresql
 
 echo "== runner account, uid $RUNNER_UID, passwordless sudo, docker and kvm"
 id "$RUNNER" >/dev/null 2>&1 || useradd --create-home --uid "$RUNNER_UID" --shell /bin/bash "$RUNNER"
@@ -88,6 +91,12 @@ cargo install wasm-pack --locked --version $WASM_PACK_VERSION
 # libgit2 needs shared mmap, which virtiofs refuses here.
 rm -rf ~/.cargo/registry
 ln -s $CACHE/cargo-registry ~/.cargo/registry
+# Every git dependency main locks, fetched into the image, so a job fetches only what moved since.
+git clone -q --depth 1 https://github.com/LucaCappelletti94/connetto-rs /tmp/connetto-rs
+for lock in /tmp/connetto-rs/Cargo.lock /tmp/connetto-rs/crates/*/Cargo.lock /tmp/connetto-rs/examples/*/Cargo.lock; do
+  (cd "\$(dirname "\$lock")" && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked)
+done
+rm -rf /tmp/connetto-rs
 EOF
 
 echo "== The GitHub Actions runner, extracted where GARM looks for a cached copy"
@@ -117,6 +126,8 @@ RUSTC_WRAPPER=/usr/local/bin/sccache
 SCCACHE_DIR=$CACHE/sccache
 SCCACHE_CACHE_SIZE=300G
 ACTIONS_RUNNER_ACTION_ARCHIVE_CACHE=$CACHE/actions
+CARGO_NET_GIT_FETCH_WITH_CLI=true
+CARGO_NET_RETRY=10
 EOF
 echo "/home/$RUNNER/.cargo/bin:$SDK/platform-tools:$SDK/cmdline-tools/latest/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
   > "$run_home/.path"
