@@ -793,9 +793,10 @@ async fn a_boot_waiting_on_the_user_is_not_timed_out() {
             format!("ready:{identity}"),
         ],
     );
-    // The user step runs from about 400 ms to 800 ms and the ready lands at about 1200 ms, well
-    // past a deadline counted from the start.
-    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 500.0)
+    // The user step runs from about 400 ms to 800 ms and the ready lands at about 1200 ms, past a
+    // 1000 ms deadline counted from the start. Each message keeps 600 ms of slack inside its
+    // window, and a delayed message only lands later, past the deadline still.
+    crate::workers::intake::await_db_worker_ready_bounded(hello, &[identity], 1000.0)
         .await
         .expect("the user step must pause the deadline");
 }
