@@ -12,7 +12,7 @@ pub enum WifiPayloadError {
     #[error("the string is not a WIFI: payload")]
     NotWifi,
     /// The payload ends before its closing `;;`, as a cut string does.
-    #[error("the payload ends before its closing ;;")]
+    #[error("the payload ends before the two semicolons that close it")]
     Unterminated,
     /// A field is not a letter, a colon and a value.
     #[error("a field of the payload is not a letter, a colon and a value")]
