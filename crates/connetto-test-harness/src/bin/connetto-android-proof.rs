@@ -81,8 +81,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::BluetoothState;
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
-use connetto_test_harness::linux_leg::{LegClient, run_leg};
-use connetto_test_harness::linux_proof::{
+use connetto_test_harness::leg::{LegClient, run_leg};
+use connetto_test_harness::leg_wire::{
     ADAPTER_OFF_BOUND, LegOffer, in_hotspot_subnet, parse_station_name, ss_remote_address,
 };
 use connetto_test_harness::peer_devices::{
@@ -1527,7 +1527,7 @@ impl LinuxSteps for RealSteps<'_> {
     type Leg = LegClient;
 
     async fn spawn_leg(&self, evidence: &Path) -> Result<LegClient> {
-        LegClient::spawn(evidence).await
+        LegClient::spawn(evidence, None).await
     }
 
     async fn ready(&self, leg: &LegClient) -> Result<(String, u16)> {
@@ -1841,7 +1841,7 @@ async fn phone_hosts_walk(
                 .context("the beacon line carries no prefix")?
                 .to_owned();
             step("find the beacon on linux");
-            let host = leg.wait_nearby(&prefix).await?;
+            let host = leg.wait_nearby(Some(&prefix)).await?;
             leg.join_nearby(&host).await?.1
         }
     };
