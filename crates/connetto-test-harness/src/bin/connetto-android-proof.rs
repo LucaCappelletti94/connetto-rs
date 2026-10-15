@@ -499,7 +499,7 @@ async fn joins_with_summary(
     joins: &[JoinBy],
     proved: &(Duration, Result<(), String>),
 ) -> Result<()> {
-    let reports = peer_proof(
+    let PeerOutcome { joins, teardown } = peer_proof(
         host,
         joiner,
         run.apk,
@@ -509,21 +509,25 @@ async fn joins_with_summary(
         joins,
     )
     .await;
-    let summary = summary(&commit().await, proved, reports.as_deref());
+    let summary = summary(
+        &commit().await,
+        proved,
+        joins.as_deref(),
+        teardown.as_ref().copied(),
+    );
     eprintln!("{summary}");
     tokio::fs::write(run.evidence.join("summary.txt"), &summary)
         .await
         .context("writing the summary")?;
-    let failed: Vec<&str> = reports?
+    let failed: Vec<&str> = joins?
         .iter()
         .filter(|report| report.outcome.is_err())
         .map(|report| report.join.name())
         .collect();
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!("the {} join failed", failed.join(", ")))
+    if !failed.is_empty() {
+        bail!("the {} join failed", failed.join(", "));
     }
+    teardown.context("restoring the second phone after the joins")
 }
 
 /// How the second phone learns the hotspot the first one hosts.
@@ -565,8 +569,18 @@ impl JoinBy {
 /// One join's result, for the run's summary.
 struct JoinReport {
     join: JoinBy,
-    took: Duration,
+    /// How long the join ran, or `None` for a join never started.
+    took: Option<Duration>,
     outcome: Result<()>,
+}
+
+/// What the peer proof ran, apart from the second phone's restore after it,
+/// so a failed restore never hides the joins that ran.
+struct PeerOutcome {
+    /// Each join's report, or why none ran.
+    joins: Result<Vec<JoinReport>>,
+    /// The second phone's log and its restored settings.
+    teardown: Result<()>,
 }
 
 /// The two-phone peer proof (R76 slice 4): `host` hosts a hotspot from the
@@ -582,12 +596,21 @@ async fn peer_proof(
     evidence: &Path,
     unlock: Unlock<'_>,
     joins: &[JoinBy],
-) -> Result<Vec<JoinReport>> {
+) -> PeerOutcome {
+    let unrun = |err: anyhow::Error| PeerOutcome {
+        joins: Err(err),
+        teardown: Ok(()),
+    };
     if !demo_has_device_identity() {
-        bail!("the peer proof needs a demo build with its device identity");
+        return unrun(anyhow!(
+            "the peer proof needs a demo build with its device identity"
+        ));
     }
     step("prepare the peer phone");
-    let (stay_on, previous_role) = prepare_joiner(joiner, &unlock).await?;
+    let (stay_on, previous_role) = match prepare_joiner(joiner, &unlock).await {
+        Ok(prepared) => prepared,
+        Err(err) => return unrun(err),
+    };
     // The joiner's usual network, read after the wireless reconnect, which
     // the cleanup must bring it back to. A failed read still runs the
     // cleanup below before it reports.
@@ -611,9 +634,9 @@ async fn peer_proof(
     // The joiner's log for the record, and its state, which the run leaves
     // as it found it.
     let log = joiner.adb(&["logcat", "-d"]).await.unwrap_or_default();
-    tokio::fs::write(evidence.join("peer-logcat.txt"), log)
+    let wrote_log = tokio::fs::write(evidence.join("peer-logcat.txt"), log)
         .await
-        .context("writing the peer phone's log")?;
+        .context("writing the peer phone's log");
     let restore_role = match &previous_role {
         Some(holder) => joiner.set_browser_role_holder(holder).await,
         None => joiner
@@ -634,10 +657,10 @@ async fn peer_proof(
     let _ = joiner.adb(&["forward", "--remove-all"]).await;
     let _ = joiner.adb(&["reverse", "--remove-all"]).await;
     let _ = joiner.adb(&["shell", "am", "force-stop", PACKAGE]).await;
-    let reports = result?;
-    restore_role?;
-    restore_stay?;
-    Ok(reports)
+    PeerOutcome {
+        joins: result,
+        teardown: wrote_log.and(restore_role).and(restore_stay),
+    }
 }
 
 /// Reconnect a wireless joiner over `adb connect`, hold it awake and
@@ -719,9 +742,23 @@ async fn run_peer_proof(
     let joiner_identity = own_identity(&mut peer_app).await?;
 
     let mut reports = Vec::with_capacity(joins.len());
+    // The join whose cleanup failed, after which no route starts, since
+    // the phones no longer stand where a join must begin.
+    let mut unclean: Option<JoinBy> = None;
     for &join in joins {
+        if let Some(previous) = unclean {
+            reports.push(JoinReport {
+                join,
+                took: None,
+                outcome: Err(anyhow!(
+                    "the {} join's cleanup failed, so the phones were not at rest",
+                    previous.name()
+                )),
+            });
+            continue;
+        }
         let started = Instant::now();
-        let outcome = one_join(
+        let Joined { walked, cleanup } = one_join(
             host,
             joiner,
             &mut app,
@@ -732,6 +769,10 @@ async fn run_peer_proof(
             join,
         )
         .await;
+        if cleanup.is_err() {
+            unclean = Some(join);
+        }
+        let outcome = walked.and(cleanup);
         if let Err(err) = &outcome {
             eprintln!("the {} join failed: {err:#}", join.name());
             let _ = host
@@ -743,11 +784,20 @@ async fn run_peer_proof(
         }
         reports.push(JoinReport {
             join,
-            took: started.elapsed(),
+            took: Some(started.elapsed()),
             outcome,
         });
     }
     Ok(reports)
+}
+
+/// One join's walk and the cleanup after it, apart, since a failed cleanup
+/// stops the routes after it.
+struct Joined {
+    /// The join from the hosted hotspot to the link's end.
+    walked: Result<()>,
+    /// The phones brought back to rest.
+    cleanup: Result<()>,
 }
 
 /// One join, from a hotspot hosted on the first phone to the link's end, and
@@ -765,7 +815,7 @@ async fn one_join(
     identities: (&str, &str),
     usual_ssid: Option<&String>,
     join: JoinBy,
-) -> Result<()> {
+) -> Joined {
     // The hotspot's ssid, once the host shows it, which the joiner's network
     // cleanup forgets.
     let mut offer_ssid = None;
@@ -824,11 +874,16 @@ async fn one_join(
         Some(ssid) => restore_joiner_networks(host, joiner, ssid, usual_ssid).await,
         None => Ok(()),
     };
-    walked.and(restored).and(bluetooth).and(networks)?;
-    joiner
-        .screenshot(evidence, &format!("{}-peer-clean", join.name()))
-        .await?;
-    Ok(())
+    let cleanup = restored.and(bluetooth).and(networks);
+    let cleanup = match cleanup {
+        Ok(()) => {
+            joiner
+                .screenshot(evidence, &format!("{}-peer-clean", join.name()))
+                .await
+        }
+        Err(err) => Err(err),
+    };
+    Joined { walked, cleanup }
 }
 
 /// Host on the first phone, join from the second, link, and end the link,
@@ -1412,7 +1467,9 @@ fn summary(
     commit: &str,
     (proof_took, proof): &(Duration, Result<(), String>),
     joins: Result<&[JoinReport], &anyhow::Error>,
+    restore: Result<(), &anyhow::Error>,
 ) -> String {
+    use std::fmt::Write as _;
     let line = |name: &str, took: Duration, outcome: Result<(), String>| match outcome {
         Ok(()) => format!("{name}: passed in {}s\n", took.as_secs()),
         Err(err) => format!("{name}: failed in {}s: {err}\n", took.as_secs()),
@@ -1422,21 +1479,30 @@ fn summary(
     match joins {
         Ok(reports) => {
             for report in reports {
-                text += &line(
-                    &format!("{} join", report.join.name()),
-                    report.took,
-                    report
-                        .outcome
-                        .as_ref()
-                        .map(drop)
-                        .map_err(|err| format!("{err:#}")),
-                );
+                let name = format!("{} join", report.join.name());
+                match (report.took, &report.outcome) {
+                    (Some(took), outcome) => {
+                        text += &line(
+                            &name,
+                            took,
+                            outcome.as_ref().map(drop).map_err(|err| format!("{err:#}")),
+                        );
+                    }
+                    (None, Err(err)) => {
+                        let _ = writeln!(text, "{name}: not run: {err:#}");
+                    }
+                    (None, Ok(())) => {
+                        let _ = writeln!(text, "{name}: not run");
+                    }
+                }
             }
         }
         Err(err) => {
-            use std::fmt::Write as _;
             let _ = writeln!(text, "joins: not run, the setup failed: {err:#}");
         }
+    }
+    if let Err(err) = restore {
+        let _ = writeln!(text, "restore: failed: {err:#}");
     }
     text
 }
@@ -2033,30 +2099,71 @@ mod tests {
         let reports = [
             super::JoinReport {
                 join: super::JoinBy::Form,
-                took: Duration::from_secs(201),
+                took: Some(Duration::from_secs(201)),
                 outcome: Ok(()),
             },
             super::JoinReport {
                 join: super::JoinBy::Beacon,
-                took: Duration::from_secs(95),
+                took: Some(Duration::from_secs(95)),
                 outcome: Err(anyhow::anyhow!(
                     "the second phone never saw the first phone's beacon"
                 )),
             },
+            super::JoinReport {
+                join: super::JoinBy::Payload,
+                took: None,
+                outcome: Err(anyhow::anyhow!("the beacon join's cleanup failed")),
+            },
         ];
         assert_eq!(
-            super::summary("c0626b2", &(Duration::from_secs(180), Ok(())), Ok(&reports)),
+            super::summary(
+                "c0626b2",
+                &(Duration::from_secs(180), Ok(())),
+                Ok(&reports),
+                Ok(())
+            ),
             "commit: c0626b2\n\
              single-phone proof: passed in 180s\n\
              form join: passed in 201s\n\
-             beacon join: failed in 95s: the second phone never saw the first phone's beacon\n"
+             beacon join: failed in 95s: the second phone never saw the first phone's beacon\n\
+             payload join: not run: the beacon join's cleanup failed\n"
         );
         let setup = anyhow::anyhow!("adb install exited with 1");
         assert_eq!(
-            super::summary("c0626b2", &(Duration::from_secs(180), Ok(())), Err(&setup)),
+            super::summary(
+                "c0626b2",
+                &(Duration::from_secs(180), Ok(())),
+                Err(&setup),
+                Ok(())
+            ),
             "commit: c0626b2\n\
              single-phone proof: passed in 180s\n\
              joins: not run, the setup failed: adb install exited with 1\n"
+        );
+    }
+
+    /// Joins that ran keep their lines when the run's own restore fails after
+    /// them, and the restore's failure gets its own line.
+    #[test]
+    fn a_failed_restore_keeps_the_joins_that_ran() {
+        use std::time::Duration;
+        let reports = [super::JoinReport {
+            join: super::JoinBy::Form,
+            took: Some(Duration::from_secs(201)),
+            outcome: Ok(()),
+        }];
+        let restore = anyhow::anyhow!("the browser role did not return");
+        assert_eq!(
+            super::summary(
+                "c0626b2",
+                &(Duration::from_secs(180), Ok(())),
+                Ok(&reports),
+                Err(&restore)
+            ),
+            "commit: c0626b2\n\
+             single-phone proof: passed in 180s\n\
+             form join: passed in 201s\n\
+             restore: failed: the browser role did not return\n"
         );
     }
 
