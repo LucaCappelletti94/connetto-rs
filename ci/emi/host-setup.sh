@@ -176,9 +176,9 @@ make_profile() {
     incus profile device remove "$name" "$dir" --project "$PROJECT" >/dev/null 2>&1 || true
   done
 }
-# 4 vCPUs and 16 GiB, the size of GitHub's hosted Linux runner.
-make_profile ci-light 4 16GiB
-make_profile ci-heavy 8 32GiB
+# 8 light and 6 heavy VMs fill the 256 GiB cap. The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
+make_profile ci-light 4 14GiB
+make_profile ci-heavy 8 24GiB
 
 log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"
 id "$RUNNER_USER" >/dev/null 2>&1 \
