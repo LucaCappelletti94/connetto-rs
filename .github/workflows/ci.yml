@@ -477,6 +477,13 @@ jobs:
     # Only pushes and same-repository pull requests may reach the self-hosted
     # runners on emi. LINUX_HEAVY names their scale set, and unset it means GitHub's.
     runs-on: &heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    # A same-repository pull request runs these suites once, instrumented, in
+    # coverage.yml. Forks and Dependabot get no Codecov token, and main runs
+    # them here in release.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      github.event.pull_request.user.login == 'dependabot[bot]'
     # The discovery proofs fail here, never skip, when loopback multicast is
     # missing (R76 slice 3).
     env:
@@ -543,8 +550,7 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
 
-      # dbus-daemon backs the fake Secret portal the client suite starts, and
-      # gnome-keyring the Secret Service group below (R71).
+      # dbus-daemon backs the fake Secret portal the client suite starts.
       - name: Install keyring helpers
         run: |
           sudo apt-get update
@@ -570,34 +576,6 @@ jobs:
       - name: Run Rust suite
         run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
-      # R71's groups that need a private session bus, root, or Docker.
-      - name: Run Secret Service custody tests
-        if: matrix.name == 'client'
-        run: scripts/linux-secret-store-tests.sh secret-service
-
-      - name: Run systemd unit custody tests
-        if: matrix.name == 'client'
-        run: scripts/linux-secret-store-tests.sh systemd
-
-      - name: Run container custody tests
-        if: matrix.name == 'client'
-        run: scripts/linux-secret-store-tests.sh container
-
-      # R71 proofs 4, 5 and 12: GNOME Keyring's and KDE Wallet's real dialogs
-      # answered on a virtual display, and a real Flatpak through the Secret portal.
-      - name: Run desktop custody proofs
-        if: matrix.name == 'client'
-        env:
-          DESKTOP_PROOF_OUT: ${{ runner.temp }}/desktop-proofs
-        run: scripts/linux-secret-store-tests.sh desktop
-
-      - uses: actions/upload-artifact@v7
-        if: always() && matrix.name == 'client'
-        with:
-          name: desktop-custody-proofs
-          path: ${{ runner.temp }}/desktop-proofs
-          if-no-files-found: ignore
-
       - name: Prune target cache
         if: always()
         run: |
@@ -618,6 +596,102 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save rust test output
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+  custody-tests:
+    # R71's Linux secret-store groups that need a private session bus, root,
+    # Docker or a virtual display, which every run keeps.
+    name: Custody tests
+    runs-on: *heavy-runner
+    env:
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: "0"
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        id: cache-1
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Restore custody test output
+        if: runner.environment == 'github-hosted'
+        id: cache-2
+        uses: actions/cache/restore@v6
+        with:
+          path: target
+          key: t-custody-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || '' }}
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install keyring helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y keyutils dbus gnome-keyring
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: ./.github/actions/pull-test-images
+
+      # coverage.yml runs this group instrumented whenever it runs the client suite.
+      - name: Run Secret Service custody tests
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name != github.repository ||
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        run: scripts/linux-secret-store-tests.sh secret-service
+
+      - name: Run systemd unit custody tests
+        run: scripts/linux-secret-store-tests.sh systemd
+
+      - name: Run container custody tests
+        run: scripts/linux-secret-store-tests.sh container
+
+      # R71 proofs 4, 5 and 12: GNOME Keyring's and KDE Wallet's real dialogs
+      # answered on a virtual display, and a real Flatpak through the Secret portal.
+      - name: Run desktop custody proofs
+        env:
+          DESKTOP_PROOF_OUT: ${{ runner.temp }}/desktop-proofs
+        run: scripts/linux-secret-store-tests.sh desktop
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: desktop-custody-proofs
+          path: ${{ runner.temp }}/desktop-proofs
+          if-no-files-found: ignore
+
+      - name: Prune target cache
+        if: always()
+        run: |
+          rm -rf "target/$CARGO_TEST_PROFILE/incremental"
+          rm -rf target/tmp
+
+      - name: Save cargo downloads
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save custody test output
         if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
