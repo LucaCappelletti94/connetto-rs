@@ -1287,6 +1287,7 @@ fn App() -> Element {
             spawn(async move {
                 loop {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                    tracing::debug!(target: "connetto_dioxus::away", "diagnostic: a dioxus task ran");
                     let label = device_label(&parts.0.native);
                     if *device.peek() != label {
                         device.set(label);
