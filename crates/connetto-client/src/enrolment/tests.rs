@@ -903,6 +903,92 @@ async fn a_grant_keeps_its_lists_before_publishing_the_certificate() {
     run.await.expect("the run ends");
 }
 
+/// A grant whose own lists revoke the certificate it carries revokes the
+/// device, and that certificate is never published.
+#[tokio::test]
+async fn a_grant_listing_its_own_certificate_revokes_the_device_unpublished() {
+    let (_, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // The fake link's first grant carries this serial.
+    let mut granted = [0x21_u8; 16];
+    granted[8..].fill(0);
+    let list = authority
+        .issuer
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: granted.to_vec(),
+                at: now,
+            }],
+            now,
+            now + 12 * HOUR,
+        )
+        .expect("the list signs");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let state = Arc::new(Mutex::new(FakeState {
+        grant_lists: vec![SignedList {
+            list,
+            signer: authority.certificate.clone(),
+        }],
+        list_gate: Some(Arc::clone(&gate)),
+        ..FakeState::default()
+    }));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| state.lock().list_stores == 1).await;
+    assert!(
+        handle.certificate().is_none(),
+        "the grant stays unpublished while its list is being kept"
+    );
+    gate.notify_one();
+    poll_until(|| state.lock().emitted.contains(&ClientEvent::DeviceRevoked)).await;
+    assert!(
+        handle.certificate().is_none(),
+        "the device holds no certificate"
+    );
+    assert!(
+        state.lock().stored.is_empty(),
+        "the stored certificate is deleted"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
 /// A reissue refused as revoked deletes the device's key, says so, and the
 /// caller gets the revocation.
 #[tokio::test]
