@@ -1897,6 +1897,15 @@ mod tests {
         );
         assert!(
             matches!(
+                client
+                    .host_personal_hotspot("iphone", "the passphrase")
+                    .await,
+                Err(crate::hotspot::HotspotError::Unsupported)
+            ),
+            "the build has no device identity to host personally"
+        );
+        assert!(
+            matches!(
                 client.join_hotspot(&offer).await,
                 Err(crate::hotspot::JoinError::Unsupported)
             ),
@@ -1926,6 +1935,10 @@ mod tests {
             "the build has no device identity to join nearby"
         );
         assert_eq!(client.bluetooth_state(), BluetoothState::Unsupported);
+        assert!(
+            client.personal_hotspot_name().is_none(),
+            "no personal hotspot name without the device"
+        );
         assert_eq!(
             client.beacon_state(),
             BeaconState::Off {
@@ -2011,8 +2024,17 @@ mod tests {
                         Some(crate::hotspot::Command::Leave) => {
                             let _ = note_tx.send("leave").await;
                         }
-                        // The personal hotspot is the iPhone's, which this test does not host.
-                        Some(_) => {}
+                        // The personal request the runner links stands
+                        // unanswered here, and the hand out notes its
+                        // arrival.
+                        Some(command) => {
+                            if matches!(
+                                command,
+                                crate::hotspot::Command::PersonalOfferHandedOut
+                            ) {
+                                let _ = note_tx.send("handed out").await;
+                            }
+                        }
                         None => break,
                     },
                     command = bluetooth_rx.recv() => match command {
@@ -2161,6 +2183,23 @@ mod tests {
             "the machine's offer reaches the caller"
         );
 
+        // The personal host's call reaches the Bluetooth machine, whose
+        // dropped reply fails it, and the hand out notes its arrival on
+        // the hotspot's side.
+        let error = client
+            .host_personal_hotspot("iphone", "the passphrase")
+            .await
+            .expect_err("the machine drops the personal host's reply");
+        assert!(
+            matches!(error, crate::hotspot::HotspotError::Failed),
+            "a machine that drops the reply fails the call, got {error:?}"
+        );
+        client
+            .device
+            .as_ref()
+            .expect("the device stands")
+            .personal_offer_handed_out();
+
         // The standings read the machines', and the cancels and the run-time
         // standings reach them.
         assert_eq!(
@@ -2181,7 +2220,7 @@ mod tests {
         // The standings reach their machines, from the two machines' channels,
         // so the order the notes come back in is not the order sent.
         let mut noted: Vec<&str> = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..6 {
             let got = tokio::time::timeout(Duration::from_secs(10), note_rx.recv())
                 .await
                 .expect("the machine notes the standing within its bound")
@@ -2193,6 +2232,7 @@ mod tests {
             noted,
             [
                 "autojoin false",
+                "handed out",
                 "leave",
                 "prompt true",
                 "scan true",

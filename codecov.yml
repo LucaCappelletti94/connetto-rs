@@ -3,14 +3,15 @@
 # binaries are outside that set: the browser stack only ever runs inside the
 # browser test workflow, which compiles for wasm and reports no native
 # coverage at all, and the demo stack and Android proof need a device. Their
-# shared provisioning module is reached from nothing else. The wasm crate, the
-# examples and the Rust that builds only for Android, iOS, Windows, macOS
+# shared provisioning module and phone-driving steps are reached from nothing
+# else. The wasm crate, the examples and the Rust that builds only for Android, iOS, Windows, macOS
 # or wasm are outside it too. So these lines are unreachable by any instrument, not missing tests.
 # sonar-project.properties excludes the same paths, which the two tools share.
 coverage:
   ignore:
     - crates/connetto-test-harness/src/bin/**
     - crates/connetto-test-harness/src/stack.rs
+    - crates/connetto-test-harness/src/peer_devices.rs
     - crates/connetto-web/**
     - examples/**
     - crates/connetto-app-attest/src/ios.rs

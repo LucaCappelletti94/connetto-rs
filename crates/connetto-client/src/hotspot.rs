@@ -1385,6 +1385,41 @@ mod tests {
         assert!(h.machine.hosting_offer().is_none());
     }
 
+    /// The personal host row `host_personal_hotspot | the system cannot
+    /// host a personal hotspot | the typed refusal stands, and its network
+    /// never lands` (R76 decision 26).
+    #[cfg(not(target_os = "ios"))]
+    #[test]
+    fn a_system_without_a_personal_hotspot_refuses_the_request() {
+        let backend = UnsupportedBackend;
+        assert!(!backend.personal_landed());
+        let mut machine = Machine::new(
+            Arc::new(backend) as Arc<dyn HotspotBackend>,
+            false,
+            Arc::new(|| Some(54321)),
+            Arc::new(|_subnet| {}),
+            Arc::new(|_addr, _answer| {}),
+            Arc::new(|_event| {}),
+        );
+        let (reply, mut answer) = oneshot::channel();
+        machine.handle(Command::PersonalHost {
+            ssid: "iphone".into(),
+            passphrase: "the passphrase".into(),
+            reply,
+        });
+        assert_eq!(answer.try_recv().unwrap(), Err(HotspotError::Unsupported));
+    }
+
+    /// The personal host row `an exchange hands the offer out | no personal
+    /// host stands | nothing starts` (R76 decision 26).
+    #[test]
+    fn a_handout_without_a_personal_host_starts_nothing() {
+        let mut h = Harness::new(true);
+        h.machine.handle(Command::PersonalOfferHandedOut);
+        h.machine.tick();
+        assert!(h.events.lock().is_empty());
+    }
+
     /// The join row `join_hotspot | Idle | a missing permission answers
     /// MissingPermission`, and the next request still goes.
     #[test]

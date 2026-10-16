@@ -2465,6 +2465,80 @@ async fn a_join_call_answers_from_the_machine_and_fails_when_the_machine_is_gone
     machine.await.expect("the machine ends");
 }
 
+/// The personal host's call answers from the machine's typed offer, the
+/// details as the caller typed them, and a machine that drops the reply
+/// fails the call within its bound (R76 decision 26).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_personal_host_call_answers_from_the_machine_and_fails_when_the_machine_is_gone() {
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        let crate::bluetooth::Command::PersonalHost {
+            ssid,
+            passphrase,
+            caller,
+        } = command
+        else {
+            panic!("the personal host's request reaches the Bluetooth machine");
+        };
+        assert_eq!(ssid, "iphone");
+        assert_eq!(passphrase, "the passphrase");
+        let offer = crate::hotspot::HotspotOffer::new(
+            "iphone",
+            "the passphrase",
+            crate::hotspot::HotspotSecurity::Wpa2,
+            Some(5678),
+        );
+        let _ = caller.send(Ok(crate::bluetooth::Hosted {
+            offer,
+            beacon: Ok(()),
+        }));
+    });
+    let hosted = handle
+        .host_personal_hotspot("iphone", "the passphrase")
+        .await
+        .expect("the machine answers");
+    assert_eq!(
+        hosted.offer.ssid, "iphone",
+        "the machine's typed offer reaches the caller"
+    );
+    assert!(hosted.beacon.is_ok(), "the beacon stands beside the offer");
+    machine.await.expect("the machine ends");
+
+    let (handle, _hotspot, mut bluetooth) = handle_with_machines().await;
+    let machine = tokio::spawn(async move {
+        let command = bluetooth.recv().await.expect("the machine runs");
+        // The machine dies without answering, so the reply is dropped.
+        drop(command);
+    });
+    let error = handle
+        .host_personal_hotspot("iphone", "the passphrase")
+        .await
+        .expect_err("the machine is gone");
+    assert!(
+        matches!(error, crate::hotspot::HotspotError::Failed),
+        "a gone machine fails the call, got {error:?}"
+    );
+    machine.await.expect("the machine ends");
+}
+
+/// The personal host's bound runs when the machine answers nothing (R76
+/// decision 26).
+#[cfg(feature = "peer")]
+#[tokio::test(start_paused = true)]
+async fn a_personal_host_call_answers_timed_out_when_the_machine_stays_silent() {
+    let (handle, _hotspot, _bluetooth) = handle_with_machines().await;
+    let error = handle
+        .host_personal_hotspot("iphone", "the passphrase")
+        .await
+        .expect_err("nothing answers the personal host");
+    assert!(
+        matches!(error, crate::hotspot::HotspotError::TimedOut),
+        "the bound runs, got {error:?}"
+    );
+}
+
 /// The enable's call answers from the machine's answer, and a machine that
 /// drops the reply fails the call within its bound (R76 decision 21).
 #[cfg(feature = "peer")]

@@ -46,10 +46,8 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
 use connetto_test_harness::ios_signing;
-use connetto_test_harness::peer_proof::{
-    HotspotOfferLines, JoinReport, commit, own_identity, read_hotspot_offer, summary,
-    wait_link_ends,
-};
+use connetto_test_harness::peer_devices::{own_identity, read_hotspot_offer, wait_link_ends};
+use connetto_test_harness::peer_proof::{HotspotOfferLines, JoinReport, commit, summary};
 use connetto_test_harness::relay::Relay;
 use connetto_test_harness::stack::{
     TLS_CERT_VAR, TLS_KEY_VAR, demo_has_device_identity, demo_mobile_features, now_millis,

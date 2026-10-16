@@ -2425,11 +2425,19 @@ mod tests {
     impl Harness {
         /// A harness at `state`, scanning, prompting and serving `fp(1)`.
         fn new(state: BluetoothState) -> Self {
-            Self::with(state, quiet_node(), true, false, true, Some(fp(1)))
+            Self::with(
+                state,
+                quiet_node(),
+                true,
+                false,
+                true,
+                Some(fp(1)),
+                Arc::new(Wire::new()),
+            )
         }
 
-        /// A harness over fresh fakes with the given standings and serving
-        /// fingerprint.
+        /// A harness over `wire`, fresh fakes and the given standings,
+        /// serving `serving`.
         fn with(
             state: BluetoothState,
             node: Node,
@@ -2437,8 +2445,8 @@ mod tests {
             autojoin: bool,
             prompt: bool,
             serving: Option<Fingerprint>,
+            wire: Arc<Wire>,
         ) -> Self {
-            let wire = Arc::new(Wire::new());
             let readiness = Arc::new(FakeReadiness::new(state));
             let peripheral = Arc::new(FakePeripheral::new(wire.clone()));
             let central = Arc::new(FakeCentral::new(wire));
@@ -2809,12 +2817,83 @@ mod tests {
         assert_eq!(*h.handed.lock(), 0);
     }
 
+    /// The host's row `the exchange's answer is Ok | the offer was handed
+    /// out`, the joiner a separate machine over the shared wire (R76
+    /// decision 26).
+    #[tokio::test]
+    async fn a_host_exchange_with_a_joiner_over_the_shared_wire_hands_its_offer_out() {
+        let d = Deployment::new();
+        let wire = Arc::new(Wire::new());
+        let host_node = serving_node(d.root.clone(), d.host_identity);
+        let joiner_node = serving_node(d.root.clone(), d.joiner_identity);
+        let host_fp = Fingerprint::of(&d.host_leaf);
+        let joiner_fp = Fingerprint::of(&d.joiner_leaf);
+        let mut h = Harness::with(
+            BluetoothState::Ready,
+            host_node,
+            false,
+            false,
+            true,
+            Some(host_fp),
+            wire.clone(),
+        );
+        // The machine plays no joiner, so the wire's joiner side stands to
+        // the joiner's central alone.
+        h.machine.starter = None;
+        h.tick(Some(&offer()));
+        let joiner_central = Arc::new(FakeCentral::new(wire.clone()));
+        let (mut joiner, _joiner_beacon) = Machine::new(
+            Arc::new(FakeReadiness::new(BluetoothState::Ready)),
+            Arc::new(FakePeripheral::new(Arc::new(Wire::new()))),
+            Some(instant_starter(Arc::clone(&joiner_central))),
+            joiner_node,
+            true,
+            false,
+            true,
+            Arc::new(move || Some(joiner_fp)),
+            Arc::new(|_offer, _reply| {}),
+            Arc::new(|_event| {}),
+            Arc::new(|| ()),
+        );
+        joiner.tick(None, false);
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+        joiner.tick(None, false);
+        let (reply, _reply_rx) = oneshot::channel();
+        joiner.handle(Command::JoinNearby { host: 7, reply });
+        h.peripheral.push(PeripheralEvent::Connected {
+            device: 7,
+            mtu: 517,
+        });
+        joiner_central.push(CentralEvent::Connected { host: 7, mtu: 517 });
+        let mut p = 0;
+        loop {
+            if *h.handed.lock() == 1 {
+                break;
+            }
+            p += 1;
+            assert!(p < 2000, "the exchange did not complete in time");
+            h.tick(Some(&offer()));
+            joiner.tick(None, false);
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert_eq!(*h.peripheral.disconnects.lock(), vec![7]);
+    }
+
     /// The hosted's row `the offer is in hand and the device does not
     /// serve | the beacon stands off, the caller's answer stands on its
     /// reason` (R76 decision 26).
     #[tokio::test]
     async fn a_hosted_call_on_a_not_serving_device_answers_its_beacon_off() {
-        let mut h = Harness::with(BluetoothState::Ready, quiet_node(), true, false, true, None);
+        let mut h = Harness::with(
+            BluetoothState::Ready,
+            quiet_node(),
+            true,
+            false,
+            true,
+            None,
+            Arc::new(Wire::new()),
+        );
         let (offer_tx, offer_rx) = oneshot::channel();
         let (reply_tx, mut reply_rx) = oneshot::channel();
         h.machine.hosted(offer_rx, reply_tx);
@@ -2833,6 +2912,24 @@ mod tests {
             Err(BluetoothError::BeaconOff(reason))
                 if reason == "the device does not serve its peer"
         ));
+    }
+
+    /// The machine's row `the host's answer stands linked by the runner`,
+    /// so the machine takes it on no one's behalf and answers no one.
+    #[test]
+    fn the_machine_takes_no_host_answer_on_its_own() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        let (reply, mut answer) = oneshot::channel();
+        h.machine.handle(Command::Host(reply));
+        let (personal, mut personal_answer) = oneshot::channel();
+        h.machine.handle(Command::PersonalHost {
+            ssid: "iphone".into(),
+            passphrase: "the passphrase".into(),
+            caller: personal,
+        });
+        assert!(answer.try_recv().is_err());
+        assert!(personal_answer.try_recv().is_err());
+        assert!(h.events.lock().is_empty());
     }
 
     #[tokio::test]
@@ -2856,7 +2953,15 @@ mod tests {
     async fn a_stalled_exchange_ends_at_its_bound() {
         let d = Deployment::new();
         let node = serving_node(d.root.clone(), d.host_identity);
-        let mut h = Harness::with(BluetoothState::Ready, node, true, false, true, Some(fp(1)));
+        let mut h = Harness::with(
+            BluetoothState::Ready,
+            node,
+            true,
+            false,
+            true,
+            Some(fp(1)),
+            Arc::new(Wire::new()),
+        );
         h.tick(Some(&offer()));
         h.peripheral.push(PeripheralEvent::Connected {
             device: 7,
@@ -3183,6 +3288,7 @@ mod tests {
             true,
             true,
             Some(fp(1)),
+            Arc::new(Wire::new()),
         );
         let weak = fp(10);
         let strong = fp(11);
@@ -3303,6 +3409,32 @@ mod tests {
         tokio::task::yield_now().await;
         h.tick(None);
         assert!(matches!(reply_rx.try_recv(), Ok(Err(_))));
+        assert!(h.strongest_untried().is_none());
+    }
+
+    /// The joiner's row `the autojoin's exchange ends without an offer |
+    /// the host stands tried, and the answer goes to no one` (R76
+    /// decision 19).
+    #[tokio::test]
+    async fn a_stalled_autojoin_ends_without_an_answer() {
+        let mut h = Harness::with(
+            BluetoothState::Ready,
+            quiet_node(),
+            true,
+            true,
+            true,
+            Some(fp(1)),
+            Arc::new(Wire::new()),
+        );
+        h.settle().await;
+        h.host_seen(7, &fp(7), -40);
+        h.tick(None);
+        assert_eq!(*h.central.connects.lock(), vec![7]);
+        // The host drops the connection before the stream runs, so the
+        // exchange ends by its error, with no caller to answer.
+        h.central.push(CentralEvent::Disconnected { host: 7 });
+        h.tick(None);
+        assert_eq!(*h.central.disconnects.lock(), vec![7]);
         assert!(h.strongest_untried().is_none());
     }
 

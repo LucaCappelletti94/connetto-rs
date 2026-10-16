@@ -64,9 +64,8 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
-use connetto_test_harness::peer_proof::{
-    JoinReport, commit, own_identity, read_hotspot_offer, summary, wait_link_ends,
-};
+use connetto_test_harness::peer_devices::{own_identity, read_hotspot_offer, wait_link_ends};
+use connetto_test_harness::peer_proof::{JoinReport, commit, summary};
 use connetto_test_harness::stack::{
     demo_has_device_identity, demo_mobile_features, now_millis, repo_path,
 };
