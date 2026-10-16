@@ -241,6 +241,35 @@ fn app_data_root() -> PathBuf {
     )
 }
 
+/// The log a phone build writes beside stdout, in the app's data directory,
+/// since a phone keeps no app's stdout and a device proof copies this file
+/// off the phone.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+const PHONE_LOG: &str = "connetto-demo.log";
+
+/// Log to stdout and to [`PHONE_LOG`], or to stdout alone where the file
+/// cannot be opened. `RUST_LOG` overrides the default filter.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+fn init_phone_logging() {
+    use tracing_subscriber::fmt::writer::MakeWriterExt as _;
+
+    let directives = std::env::var("RUST_LOG").unwrap_or_else(|_| LOG_FILTER.to_owned());
+    let root = app_data_root();
+    let file = std::fs::create_dir_all(&root).and_then(|()| {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(root.join(PHONE_LOG))
+    });
+    match file {
+        Ok(file) => connetto_core::logging::install(
+            std::io::stdout.and(std::sync::Mutex::new(file)),
+            &directives,
+        ),
+        Err(_) => connetto_core::logging::install(std::io::stdout, &directives),
+    }
+}
+
 fn export_path() -> PathBuf {
     data_dir().join("connetto-local-data.zip")
 }
@@ -263,6 +292,9 @@ fn publish_export(part: &Path) -> std::io::Result<PathBuf> {
 const LOG_FILTER: &str = "info,connetto_client::away=debug,connetto_dioxus::away=debug";
 
 fn main() {
+    #[cfg(any(target_os = "android", target_os = "ios"))]
+    init_phone_logging();
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     connetto_core::logging::init_stdout_with_default(LOG_FILTER);
     // Leaked so it outlives `launch`: every session's tasks run on it for the
     // life of the process.
@@ -758,6 +790,11 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let mut join_port: Signal<String> = use_signal(String::new);
     // A pasted or scanned `WIFI:` payload (R76 decision 24).
     let mut join_payload: Signal<String> = use_signal(String::new);
+    // The personal hotspot's form, the network name pre-filled from the
+    // device's user-set name where the platform answers one (R76 decision 26).
+    let mut personal_ssid: Signal<String> =
+        use_signal(|| parts.0.native.personal_hotspot_name().unwrap_or_default());
+    let mut personal_passphrase: Signal<String> = use_signal(String::new);
 
     // The link's and the hotspot's events, which the panel owns.
     let client = parts.0.client.clone();
@@ -807,6 +844,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
                             held.retain(|known| known.host != host);
                             nearby.set(held);
                         }
+                        ClientEvent::HotspotUnreached => {
+                            outcome.set("unreached".to_owned());
+                        }
                         _ => {}
                     }
                 }
@@ -845,6 +885,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let nearby_parts = parts.clone();
     let nearby_outcome = outcome;
     let nearby_hosts = nearby;
+    let personal_parts = parts.clone();
+    let personal_offer = offer;
+    let mut personal_outcome = outcome;
 
     let me = parts
         .0
@@ -859,6 +902,10 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let nearby_lines: Vec<String> = nearby().iter().map(NearbyHost::line).collect();
     let offer = offer();
     let outcome = outcome();
+    #[cfg(target_os = "ios")]
+    let personal_note: Option<&str> = Some("connetto cannot see whether Personal Hotspot is on");
+    #[cfg(not(target_os = "ios"))]
+    let personal_note: Option<&str> = None;
 
     rsx! {
         div {
@@ -868,6 +915,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
             p { {beacon_line()} }
             for line in peers.iter().cloned() {
                 p { {line} }
+            }
+            if let Some(note) = personal_note {
+                p { {note} }
             }
             for line in nearby_lines {
                 p { {line} }
@@ -941,6 +991,59 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     });
                 },
                 "Stop the hotspot"
+            }
+            if cfg!(target_os = "ios") {
+                input {
+                    r#type: "text",
+                    name: "personal-ssid",
+                    placeholder: "the personal hotspot's network name",
+                    value: "{personal_ssid}",
+                    oninput: move |event| personal_ssid.set(event.value()),
+                    style: "font-family: monospace;",
+                }
+                input {
+                    r#type: "text",
+                    name: "personal-passphrase",
+                    placeholder: "the personal hotspot's passphrase",
+                    value: "{personal_passphrase}",
+                    oninput: move |event| personal_passphrase.set(event.value()),
+                    style: "font-family: monospace;",
+                }
+                button {
+                    onclick: move |_| {
+                        let ssid = personal_ssid.peek().trim().to_owned();
+                        let passphrase = personal_passphrase.peek().clone();
+                        if ssid.is_empty() || passphrase.is_empty() {
+                            personal_outcome
+                                .set("the network name and the passphrase need filling".to_owned());
+                            return;
+                        }
+                        let parts = personal_parts.clone();
+                        let mut offer = personal_offer;
+                        let mut outcome = personal_outcome;
+                        spawn(async move {
+                            outcome.set("asking for the personal hotspot".to_owned());
+                            let result =
+                                parts.0.native.host_personal_hotspot(&ssid, &passphrase).await;
+                            match result {
+                                Ok(hosted) => {
+                                    offer.set(Some(OfferLines {
+                                        ssid: hosted.offer.ssid.clone(),
+                                        passphrase: hosted.offer.passphrase.clone(),
+                                        port: hosted.offer.port,
+                                        payload: hosted.offer.to_wifi_payload().to_string(),
+                                    }));
+                                    outcome.set(match hosted.beacon {
+                                        Ok(()) => "hosting".to_owned(),
+                                        Err(err) => format!("hosting, the beacon is off: {err}"),
+                                    });
+                                }
+                                Err(err) => outcome.set(err.to_string()),
+                            }
+                        });
+                    },
+                    "Host my Personal Hotspot"
+                }
             }
             input {
                 r#type: "text",
@@ -1079,8 +1182,11 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     spawn(async move {
                         outcome.set("joining the nearby host".to_owned());
                         match parts.0.native.join_nearby(&host).await {
-                            Ok(gateway) => {
-                                outcome.set(format!("joined through the gateway {gateway}"));
+                            Ok((identity, gateway)) => {
+                                outcome.set(format!(
+                                    "joined through the gateway {gateway} as {}",
+                                    short_identity(&identity)
+                                ));
                             }
                             Err(err) => outcome.set(err.to_string()),
                         }
@@ -1091,24 +1197,30 @@ fn PeerPanel(parts: SessionParts) -> Element {
         }
     }
 }
-
 /// A host whose beacon this device sees (R76).
 #[cfg(feature = "peer")]
 #[derive(Clone, PartialEq)]
 struct NearbyHost {
     host: connetto_client::HostId,
-    prefix: [u8; 8],
+    /// The beacon's prefix, where the beacon carries one (R76 decision 25).
+    prefix: Option<[u8; 8]>,
     rssi: Option<i16>,
 }
 
 #[cfg(feature = "peer")]
 impl NearbyHost {
-    /// The panel's line, `nearby: <prefix>` with the signal where known.
+    /// The panel's line, `nearby: <prefix>` or `nearby: no beacon prefix`
+    /// where the beacon carries none, with the signal where known.
     fn line(&self) -> String {
         use std::fmt::Write as _;
         let mut line = String::from("nearby: ");
-        for byte in self.prefix {
-            let _ = write!(line, "{byte:02x}");
+        match self.prefix {
+            Some(prefix) => {
+                for byte in prefix {
+                    let _ = write!(line, "{byte:02x}");
+                }
+            }
+            None => line.push_str("no beacon prefix"),
         }
         if let Some(rssi) = self.rssi {
             let _ = write!(line, " at {rssi} dBm");

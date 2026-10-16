@@ -365,6 +365,16 @@ impl HotspotBackend for AndroidHotspotBackend {
             _ => JoinStatus::Pending,
         }
     }
+
+    // Android hosts from the app, so a hand-started personal hotspot has no
+    // place here (R76 decision 26).
+    fn request_personal_host(&self, _ssid: &str, _passphrase: &str) -> Result<(), HotspotError> {
+        Err(HotspotError::Unsupported)
+    }
+
+    fn personal_landed(&self) -> bool {
+        false
+    }
 }
 
 /// The dials' bind to the joined network, for the targets it lies in (R76).

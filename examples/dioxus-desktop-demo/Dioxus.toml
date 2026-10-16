@@ -5,12 +5,24 @@ identifier = "dev.connetto.dioxusdemo"
 
 # The gate on the stored secrets (R51, R52). iOS offers Face ID only with the
 # usage description this writes, and Android needs `USE_BIOMETRIC` for the
-# unlock prompt.
+# unlock prompt. The peer link (R76) scans for and connects to nearby hosts
+# over Bluetooth and finds and links to devices on the local network.
 [permissions]
 biometrics = { description = "Unlock your synced data" }
+bluetooth = { description = "Find and link to nearby devices" }
+local_network = { description = "Find and link to nearby devices" }
+
+# The mDNS service the peer discovery advertises and browses (R76).
+[ios.plist]
+NSBonjourServices = ["_connetto-peer._tcp"]
 
 # App Attest vouches for this build at device enrolment (R74 decisions 32 and
-# 35). The development profile must carry the App Attest capability, which
-# `connetto-ios-signing` writes once it is enabled on the App ID.
+# 35). The development profile takes the entitlements from the App ID's
+# capabilities, which a human enables on the App ID, since the API keeps the
+# set read-only and `connetto-ios-signing` only names the portal step. The
+# Hotspot entitlement is required, since the joiner's
+# `NEHotspotConfiguration` join of the Personal Hotspot of the iPhone or
+# iPad host refuses without it (R76).
 [ios.entitlements]
 "com.apple.developer.devicecheck.appattest-environment" = "development"
+"com.apple.developer.networking.HotspotConfiguration" = true

@@ -43,9 +43,11 @@ type Queue = Arc<Mutex<Vec<CentralEvent>>>;
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CentralError {
     /// The platform's preparation of btleplug's thread failed.
+    #[cfg(target_os = "android")]
     #[error("btleplug's thread could not be prepared: {0}")]
     Prepare(String),
     /// The virtual machine refused a call while the thread was prepared.
+    #[cfg(target_os = "android")]
     #[error("the virtual machine refused: {0}")]
     Jni(#[from] connetto_peer_android::jni::errors::Error),
     /// btleplug refused a call.
@@ -179,6 +181,17 @@ fn prepare_thread() -> Result<(), CentralError> {
     })
 }
 
+/// The thread needs no preparation off Android, where btleplug is plain
+/// `CoreBluetooth` (R76).
+#[cfg(not(target_os = "android"))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Android's twin can fail, and the one caller answers both through ?"
+)]
+fn prepare_thread() -> Result<(), CentralError> {
+    Ok(())
+}
+
 /// The thread's loop: the machine's commands against btleplug, and
 /// btleplug's events back to the machine, until the client drops its end.
 async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>, queue: Queue) {
@@ -197,7 +210,15 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 let Some(command) = command else { break };
                 match command {
                     Command::StartScan => {
-                        if let Err(err) = adapter.start_scan(ScanFilter::default()).await {
+                        // iOS scans only connetto's service (R76 decision
+                        // 25), Android scans wide.
+                        #[cfg(target_os = "ios")]
+                        let filter = ScanFilter {
+                            services: vec![Uuid::from_bytes(SERVICE_UUID)],
+                        };
+                        #[cfg(not(target_os = "ios"))]
+                        let filter = ScanFilter::default();
+                        if let Err(err) = adapter.start_scan(filter).await {
                             tracing::warn!(%err, "the scan did not start");
                         }
                     }
@@ -238,12 +259,16 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 let Some(event) = event else { break };
                 match event {
                     BtEvent::ServiceDataAdvertisement { id, service_data } => {
-                        let Some(data) = service_data.get(&Uuid::from_bytes(SERVICE_UUID)) else {
-                            continue;
-                        };
-                        let rssi = rssi_of(&adapter, &id).await;
-                        let host = hosts.host(id);
-                        push(&queue, CentralEvent::Seen { host, service_data: data.clone(), rssi });
+                        if let Some(data) = service_data.get(&Uuid::from_bytes(SERVICE_UUID)) {
+                            report_seen(&adapter, &mut hosts, &queue, id, Some(data.clone())).await;
+                        }
+                    }
+                    // The advert carries connetto's UUID alone, the
+                    // iPhone's beacon (R76 decision 25).
+                    BtEvent::ServicesAdvertisement { id, services } => {
+                        if services.contains(&Uuid::from_bytes(SERVICE_UUID)) {
+                            report_seen(&adapter, &mut hosts, &queue, id, None).await;
+                        }
                     }
                     BtEvent::DeviceDisconnected(id) => {
                         if let Some(host) = hosts.known(&id) && links.remove(&host).is_some() {
@@ -256,6 +281,27 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
         }
     }
     let _ = adapter.stop_scan().await;
+}
+
+/// Report a peripheral advertising connetto's service as seen, with its
+/// signal where the platform reports one.
+async fn report_seen(
+    adapter: &Adapter,
+    hosts: &mut Hosts,
+    queue: &Queue,
+    id: PeripheralId,
+    service_data: Option<Vec<u8>>,
+) {
+    let rssi = rssi_of(adapter, &id).await;
+    let host = hosts.host(id);
+    push(
+        queue,
+        CentralEvent::Seen {
+            host,
+            service_data,
+            rssi,
+        },
+    );
 }
 
 /// The signal of the peripheral's last advertisement, where the platform

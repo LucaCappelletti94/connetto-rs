@@ -48,7 +48,13 @@ bot = ["dep:ring"]
 device-identity = ["native-auth", "connetto-core/device-cert", "dep:ring", "dep:core-foundation", "dep:rmp-serde", "dep:serde_bytes", "dep:connetto-app-attest"]
 # The peer link (R76): the device serves its identity to other devices over
 # a second, server-independent channel, and dials them.
-peer = ["device-identity", "dep:connetto-peer", "dep:btleplug", "dep:connetto-peer-android"]
+peer = [
+  "device-identity",
+  "dep:connetto-peer",
+  "dep:btleplug",
+  "dep:connetto-peer-android",
+  "dep:connetto-peer-apple",
+]
 native-auth = [
   "native-transport",
   "dep:reqwest",
@@ -217,6 +223,12 @@ apple-native-keyring-store = { version = "1.0.2", features = [
 ], optional = true }
 security-framework = { version = "3.7", optional = true }
 core-foundation = { version = "0.10", optional = true }
+# The peer's Apple bridge, the peripheral and the Network Extension join (R76).
+connetto-peer-apple = { path = "../connetto-peer-apple", optional = true }
+# The interfaces the personal hotspot's landing bound reads (R76 decision 26).
+if-addrs = "0.15"
+# The streams btleplug's central answers with (R76 decision 22).
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linux-keyutils-keyring-store = { version = "1.0.0", optional = true }
@@ -246,6 +258,9 @@ open = { version = "5.4", optional = true }
 # iOS.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
 webbrowser = { version = "1.2", optional = true }
+# The peer's Bluetooth, the central the joiner runs on Android and on the
+# Apple side through CoreBluetooth (R76 decision 22).
+btleplug = { version = "0.13.5", optional = true }
 
 # Android: the Keystore-backed store of the same family. The NDK ships no
 # OpenSSL headers, so SQLCipher builds its own from source here.
@@ -260,9 +275,6 @@ android_system_properties = { version = "0.1.6", optional = true }
 socket2 = "0.6"
 # The joined network's subnet, the targets its bind admits (R76).
 ipnet = "2.12"
-# The joiner's Bluetooth central (R76 decision 22), from the release whose
-# Android init resolves its classes through the context class loader.
-btleplug = { version = "0.13.5", optional = true }
 # The jni 0.22 virtual machine btleplug's init takes, and btleplug's Java
 # bundled in its Gradle module (R76 decision 22).
 connetto-peer-android = { path = "../connetto-peer-android", optional = true }

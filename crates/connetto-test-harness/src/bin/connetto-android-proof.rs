@@ -64,6 +64,8 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
+use connetto_test_harness::peer_devices::{own_identity, read_hotspot_offer, wait_link_ends};
+use connetto_test_harness::peer_proof::{JoinReport, commit, summary};
 use connetto_test_harness::stack::{
     demo_has_device_identity, demo_mobile_features, now_millis, repo_path,
 };
@@ -112,9 +114,6 @@ const DENY_BUTTONS: [&str; 6] = [
     "Ablehnen",
     "Nicht zulassen",
 ];
-/// The silence a link gets to end after the phones leave the hotspot, on
-/// either side.
-const LINK_END_BOUND: Duration = Duration::from_secs(120);
 /// The beacon's service-data UUID (R76), required in the host's dump.
 const BEACON_SERVICE_UUID: &str = "a9952637-85d5-4071-9ed8-c28bd7ba670c";
 /// The characteristic the joiner writes to (R76).
@@ -452,36 +451,6 @@ async fn recheck_after_time_away(
     device.screenshot(evidence, "unlocked").await
 }
 
-/// The offer a hosting phone shows, its lines read off the page.
-struct HotspotOfferLines {
-    /// The hotspot's ssid.
-    ssid: String,
-    /// The hotspot's passphrase.
-    passphrase: String,
-    /// The host's peer port.
-    port: u16,
-    /// The offer as one `WIFI:` payload, where the page shows it.
-    payload: Option<String>,
-}
-
-/// The offer a hosting phone shows, its lines read off the page, bounded.
-async fn read_hotspot_offer(app: &mut PageSession) -> Result<HotspotOfferLines> {
-    app.wait_for_text("hotspot ssid: ", Duration::from_secs(45))
-        .await
-        .context("the host never showed its offer")?;
-    let deadline = Instant::now() + Duration::from_secs(45);
-    loop {
-        let page = app.page_text().await?;
-        if let Some(offer) = parse_offer_lines(&page) {
-            return Ok(offer);
-        }
-        if Instant::now() >= deadline {
-            bail!("the offer's lines never finished showing, the page shows:\n{page}");
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
 /// What every join of a run shares: the build, the stack, the evidence
 /// folder and the unlock.
 struct PeerRun<'a> {
@@ -522,7 +491,7 @@ async fn joins_with_summary(
     let failed: Vec<&str> = joins?
         .iter()
         .filter(|report| report.outcome.is_err())
-        .map(|report| report.join.name())
+        .map(|report| report.name)
         .collect();
     if !failed.is_empty() {
         bail!("the {} join failed", failed.join(", "));
@@ -564,14 +533,6 @@ impl JoinBy {
             Self::Payload => "payload",
         }
     }
-}
-
-/// One join's result, for the run's summary.
-struct JoinReport {
-    join: JoinBy,
-    /// How long the join ran, or `None` for a join never started.
-    took: Option<Duration>,
-    outcome: Result<()>,
 }
 
 /// What the peer proof ran, apart from the second phone's restore after it,
@@ -748,7 +709,7 @@ async fn run_peer_proof(
     for &join in joins {
         if let Some(previous) = unclean {
             reports.push(JoinReport {
-                join,
+                name: join.name(),
                 took: None,
                 outcome: Err(anyhow!(
                     "the {} join's cleanup failed, so the phones were not at rest",
@@ -783,7 +744,7 @@ async fn run_peer_proof(
                 .await;
         }
         reports.push(JoinReport {
-            join,
+            name: join.name(),
             took: Some(started.elapsed()),
             outcome,
         });
@@ -1001,29 +962,6 @@ async fn host_and_link(
     Ok(())
 }
 
-/// The page's own peer identity, `account/key prefix`, from its listening
-/// line, which the wait polls until the line carries it.
-async fn own_identity(app: &mut PageSession) -> Result<String> {
-    // The peer panel updates the listening line on its own poll, which the
-    // device label does not wait for, so the wait polls the line itself.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let page = app.page_text().await?;
-        if let Some(identity) = page
-            .lines()
-            .find_map(|line| line.strip_prefix("peer: listening on "))
-            .and_then(|rest| rest.split_once(" as "))
-            .map(|(_, identity)| identity.trim().to_owned())
-        {
-            return Ok(identity);
-        }
-        if Instant::now() >= deadline {
-            bail!("the page names no peer identity");
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
 /// Sign the joiner in as its own account and wait for it to connect and
 /// certify, leaving its app page open.
 async fn sign_in_joiner(
@@ -1050,23 +988,6 @@ async fn sign_in_joiner(
         .await?;
     joiner.screenshot(evidence, "peer-signed-in").await?;
     Ok(peer_app)
-}
-
-/// Wait for both pages to drop their linked lines, which the leave and stop
-/// end the link.
-async fn wait_link_ends(app: &mut PageSession, peer_app: &mut PageSession) -> Result<()> {
-    let deadline = Instant::now() + LINK_END_BOUND;
-    loop {
-        let host_page = app.page_text().await?;
-        let peer_page = peer_app.page_text().await?;
-        if !host_page.contains("linked: ") && !peer_page.contains("linked: ") {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("the link did not end after the phones left the hotspot");
-        }
-        sleep(Duration::from_secs(2)).await;
-    }
 }
 
 /// Forget the hotspot's saved profile on both phones, best effort, and wait
@@ -1439,72 +1360,6 @@ fn cli_arguments() -> Result<Arguments> {
         bail!("--every-join runs every join, so --bluetooth and --payload name none");
     }
     Ok(arguments)
-}
-
-/// The commit the run built, marked `-dirty` over local changes, and
-/// `unknown` where git does not answer.
-async fn commit() -> String {
-    let Ok(root) = repo_path(&[]) else {
-        return "unknown".to_owned();
-    };
-    match Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["describe", "--always", "--dirty", "--abbrev=40"])
-        .output()
-        .await
-    {
-        Ok(output) if output.status.success() => {
-            String::from_utf8_lossy(&output.stdout).trim().to_owned()
-        }
-        _ => "unknown".to_owned(),
-    }
-}
-
-/// The run's summary: the commit, the single-phone proof, and each join with
-/// its time and, where it failed, why.
-fn summary(
-    commit: &str,
-    (proof_took, proof): &(Duration, Result<(), String>),
-    joins: Result<&[JoinReport], &anyhow::Error>,
-    restore: Result<(), &anyhow::Error>,
-) -> String {
-    use std::fmt::Write as _;
-    let line = |name: &str, took: Duration, outcome: Result<(), String>| match outcome {
-        Ok(()) => format!("{name}: passed in {}s\n", took.as_secs()),
-        Err(err) => format!("{name}: failed in {}s: {err}\n", took.as_secs()),
-    };
-    let mut text = format!("commit: {commit}\n");
-    text += &line("single-phone proof", *proof_took, proof.clone());
-    match joins {
-        Ok(reports) => {
-            for report in reports {
-                let name = format!("{} join", report.join.name());
-                match (report.took, &report.outcome) {
-                    (Some(took), outcome) => {
-                        text += &line(
-                            &name,
-                            took,
-                            outcome.as_ref().map(drop).map_err(|err| format!("{err:#}")),
-                        );
-                    }
-                    (None, Err(err)) => {
-                        let _ = writeln!(text, "{name}: not run: {err:#}");
-                    }
-                    (None, Ok(())) => {
-                        let _ = writeln!(text, "{name}: not run");
-                    }
-                }
-            }
-        }
-        Err(err) => {
-            let _ = writeln!(text, "joins: not run, the setup failed: {err:#}");
-        }
-    }
-    if let Err(err) = restore {
-        let _ = writeln!(text, "restore: failed: {err:#}");
-    }
-    text
 }
 
 /// Comma-separated `device:host` port pairs.
@@ -2046,27 +1901,6 @@ fn parse_bounds(text: &str) -> Option<(i32, i32, i32, i32)> {
     }
 }
 
-/// The offer's lines off a page's text, all three present and the port a
-/// number, or none while they are not.
-fn parse_offer_lines(page: &str) -> Option<HotspotOfferLines> {
-    let line = |label: &str| -> Option<String> {
-        page.lines()
-            .find_map(|line| line.strip_prefix(label).map(|rest| rest.trim().to_owned()))
-    };
-    let ssid = line("hotspot ssid: ")?;
-    let passphrase = line("hotspot passphrase: ")?;
-    let port = line("hotspot port: ")?;
-    if port == "none" {
-        return None;
-    }
-    Some(HotspotOfferLines {
-        ssid,
-        passphrase,
-        port: port.parse::<u16>().ok()?,
-        payload: line("hotspot payload: "),
-    })
-}
-
 /// The ssid a `dumpsys wifi` names as the connected one, absent while it
 /// names `<unknown>` or no line at all.
 fn parse_current_ssid(dump: &str) -> Option<String> {
@@ -2093,80 +1927,6 @@ fn saved_network_id(listing: &str, ssid: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn the_summary_names_every_step_and_why_a_join_failed() {
-        use std::time::Duration;
-        let reports = [
-            super::JoinReport {
-                join: super::JoinBy::Form,
-                took: Some(Duration::from_secs(201)),
-                outcome: Ok(()),
-            },
-            super::JoinReport {
-                join: super::JoinBy::Beacon,
-                took: Some(Duration::from_secs(95)),
-                outcome: Err(anyhow::anyhow!(
-                    "the second phone never saw the first phone's beacon"
-                )),
-            },
-            super::JoinReport {
-                join: super::JoinBy::Payload,
-                took: None,
-                outcome: Err(anyhow::anyhow!("the beacon join's cleanup failed")),
-            },
-        ];
-        assert_eq!(
-            super::summary(
-                "c0626b2",
-                &(Duration::from_secs(180), Ok(())),
-                Ok(&reports),
-                Ok(())
-            ),
-            "commit: c0626b2\n\
-             single-phone proof: passed in 180s\n\
-             form join: passed in 201s\n\
-             beacon join: failed in 95s: the second phone never saw the first phone's beacon\n\
-             payload join: not run: the beacon join's cleanup failed\n"
-        );
-        let setup = anyhow::anyhow!("adb install exited with 1");
-        assert_eq!(
-            super::summary(
-                "c0626b2",
-                &(Duration::from_secs(180), Ok(())),
-                Err(&setup),
-                Ok(())
-            ),
-            "commit: c0626b2\n\
-             single-phone proof: passed in 180s\n\
-             joins: not run, the setup failed: adb install exited with 1\n"
-        );
-    }
-
-    /// Joins that ran keep their lines when the run's own restore fails after
-    /// them, and the restore's failure gets its own line.
-    #[test]
-    fn a_failed_restore_keeps_the_joins_that_ran() {
-        use std::time::Duration;
-        let reports = [super::JoinReport {
-            join: super::JoinBy::Form,
-            took: Some(Duration::from_secs(201)),
-            outcome: Ok(()),
-        }];
-        let restore = anyhow::anyhow!("the browser role did not return");
-        assert_eq!(
-            super::summary(
-                "c0626b2",
-                &(Duration::from_secs(180), Ok(())),
-                Ok(&reports),
-                Err(&restore)
-            ),
-            "commit: c0626b2\n\
-             single-phone proof: passed in 180s\n\
-             form join: passed in 201s\n\
-             restore: failed: the browser role did not return\n"
-        );
-    }
-
     /// The demo's set and service as an A35 on Android 15 dumps them.
     const BEACON_DUMP: &str = "    dev.connetto.dioxusdemo
      Advertising ID                                     : 3
@@ -2218,7 +1978,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{Device, parse_current_ssid, parse_offer_lines, saved_network_id};
+    use super::{Device, parse_current_ssid, saved_network_id};
 
     /// A stand-in `adb` that runs `body` with `$state` naming a scratch directory.
     fn fake_adb(dir: &Path, body: &str) -> PathBuf {
@@ -2292,26 +2052,6 @@ echo "adb: device offline" >&2; exit 1"#,
         let calls = calls(dir.path());
         assert!(!calls.contains("reconnect"), "{calls}");
         assert_eq!(calls.matches("shell true").count(), 1, "{calls}");
-    }
-
-    #[test]
-    fn the_offer_lines_are_read_off_the_page() {
-        let page = "\npeer: listening on 41234\n\
-            hotspot ssid: My Hotspot\n\
-            hotspot passphrase: s3cr3t pass\n\
-            hotspot port: 41234\n\
-            hotspot payload: WIFI:T:WPA;S:My Hotspot;P:s3cr3t pass;X:41234;;\n\
-            hotspot: hosting\n";
-        let offer = parse_offer_lines(page).expect("all three lines are there");
-        assert_eq!(offer.ssid, "My Hotspot");
-        assert_eq!(offer.passphrase, "s3cr3t pass");
-        assert_eq!(offer.port, 41234);
-        assert_eq!(
-            offer.payload.as_deref(),
-            Some("WIFI:T:WPA;S:My Hotspot;P:s3cr3t pass;X:41234;;")
-        );
-        assert!(parse_offer_lines("hotspot ssid: only\n").is_none());
-        assert!(parse_offer_lines("hotspot port: none\n").is_none());
     }
 
     #[test]

@@ -1273,10 +1273,14 @@ pub enum ClientEvent {
         /// The instance's leaf fingerprint.
         fingerprint: connetto_peer::Fingerprint,
     },
-    /// The device's hotspot stopped hosting, by the system or the user (R76).
+    /// The hotspot stopped, on a system stop (R76).
     #[cfg(feature = "peer")]
     HotspotStopped,
-    /// The device left its joined hotspot (R76).
+    /// The personal hotspot's offer was handed out but no device landed on
+    /// the network within its bound (R76 decision 26).
+    #[cfg(feature = "peer")]
+    HotspotUnreached,
+    /// The joined network was left (R76).
     #[cfg(feature = "peer")]
     HotspotLeft,
     /// The redial to its joined hotspot's gateway passed its bound with no
@@ -1289,14 +1293,15 @@ pub enum ClientEvent {
         /// The standing the platform reports.
         state: crate::bluetooth::BluetoothState,
     },
-    /// A nearby host's beacon was seen, or its prefix changed (R76 decision
-    /// 19).
+    /// A nearby host's beacon was seen, or its beacon changed (R76
+    /// decisions 19 and 25).
     #[cfg(feature = "peer")]
     HostNearby {
         /// The host's device.
         host: crate::bluetooth::HostId,
-        /// The beacon's prefix.
-        prefix: [u8; 8],
+        /// The beacon's prefix, where the beacon carries one (R76 decision
+        /// 25).
+        prefix: Option<[u8; 8]>,
         /// The signal the beacon carried.
         rssi: Option<i16>,
     },

@@ -121,7 +121,12 @@ impl PageSession {
             .context("sending an inspector request")?;
         let deadline = Instant::now() + REPLY_BOUND;
         loop {
-            let message = next_json(&mut self.socket, deadline, &format!("request {id}")).await?;
+            let message = next_json(
+                &mut self.socket,
+                deadline,
+                &format!("request {id} ({method})"),
+            )
+            .await?;
             let reply = match self.route {
                 Route::Direct => message,
                 Route::Target(_) => {
@@ -244,8 +249,9 @@ impl PageSession {
         }
     }
 
-    /// Focus the input named `name` and type `text` into it, trusted input
-    /// the form's handler treats as the user's.
+    /// Focus the input named `name` and put `text` into it, typed as trusted
+    /// input over `DevTools` and set by the page with an `input` event over
+    /// `WebKit`.
     ///
     /// # Errors
     ///
@@ -257,8 +263,25 @@ impl PageSession {
         if self.evaluate(&script).await? != true {
             bail!("the page has no input named {name:?}")
         }
-        self.call("Input.insertText", serde_json::json!({ "text": text }))
-            .await?;
+        match self.route {
+            Route::Direct => {
+                self.call("Input.insertText", serde_json::json!({ "text": text }))
+                    .await?;
+            }
+            // WebKit has no `Input` domain, so the page sets the value through
+            // the element's own setter and raises the `input` event its
+            // handlers listen for.
+            Route::Target(_) => {
+                let fill = format!(
+                    "(() => {{ const input = document.querySelector('input[name={name:?}]'); \
+                     Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(input, {text:?}); \
+                     input.dispatchEvent(new Event('input', {{ bubbles: true }})); return true; }})()"
+                );
+                if self.evaluate(&fill).await? != true {
+                    bail!("the page did not fill the input named {name:?}")
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -327,6 +350,71 @@ mod tests {
             }
         });
         format!("ws://{address}")
+    }
+
+    /// A `WebKit` target endpoint, which has no `Input` domain, answering
+    /// `Runtime.evaluate` with `true` and recording each expression on
+    /// `seen`.
+    async fn webkit_endpoint(seen: tokio::sync::mpsc::UnboundedSender<String>) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let announce = serde_json::json!({
+                "method": "Target.targetCreated",
+                "params": { "targetInfo": { "targetId": "page-1" } },
+            });
+            socket
+                .send(Message::Text(announce.to_string()))
+                .await
+                .unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let inner: serde_json::Value =
+                    serde_json::from_str(frame["params"]["message"].as_str().unwrap()).unwrap();
+                let reply = if inner["method"] == "Runtime.evaluate" {
+                    let _ = seen.send(inner["params"]["expression"].as_str().unwrap().to_owned());
+                    serde_json::json!({
+                        "id": inner["id"],
+                        "result": { "result": { "type": "boolean", "value": true } },
+                    })
+                } else {
+                    serde_json::json!({
+                        "id": inner["id"],
+                        "error": { "code": -32601, "message": "'Input' domain was not found" },
+                    })
+                };
+                let wrapped = serde_json::json!({
+                    "method": "Target.dispatchMessageFromTarget",
+                    "params": { "targetId": "page-1", "message": reply.to_string() },
+                });
+                socket
+                    .send(Message::Text(wrapped.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        format!("ws://{address}")
+    }
+
+    /// `WebKit` has no `Input` domain, so a field is filled through the page,
+    /// the value set and an `input` event raised for the page's handlers.
+    #[tokio::test]
+    async fn a_webkit_field_is_filled_through_the_page() {
+        let (seen, mut expressions) = tokio::sync::mpsc::unbounded_channel();
+        let url = webkit_endpoint(seen).await;
+        let mut page = PageSession::webkit(&url).await.unwrap();
+        page.set_input("ssid", "iPhone di Luca").await.unwrap();
+        let mut all = Vec::new();
+        while let Ok(expression) = expressions.try_recv() {
+            all.push(expression);
+        }
+        assert!(
+            all.iter()
+                .any(|e| e.contains("\"iPhone di Luca\"") && e.contains("'input'")),
+            "{all:?}"
+        );
     }
 
     #[tokio::test]
