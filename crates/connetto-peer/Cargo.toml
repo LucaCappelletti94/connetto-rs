@@ -73,7 +73,8 @@ bluer = { version = "0.17.4", default-features = false, features = ["bluetoothd"
 # The proofs mint roots, issuers, lists and device certificates through the
 # same machinery the enrolment path uses.
 rcgen = { version = "0.14.10", default-features = false, features = ["ring", "x509-parser"] }
-# `time::pause` drives the 15/45 s liveness clocks in the proofs.
-tokio = { version = "1", default-features = false, features = ["test-util"] }
+# `time::pause` drives the 15/45 s liveness clocks in the proofs, and the
+# `BlueZ` probe waits its re-executed child through `process`.
+tokio = { version = "1", default-features = false, features = ["test-util", "process"] }
 
 uuid = { version = "1", default-features = false }

@@ -791,14 +791,32 @@ trait Wireless {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddRequest, Band, Ipv4Standing, NmEvent, NmIoError, Security, WIRELESS, WIRELESS_SECURITY,
-        WifiDevice, ZbusNm, first_router, host_settings, join_settings, options, pick_gateway,
+        AddError, AddRequest, Band, CAP_ACCESS_POINT, CAP_FREQ_5GHZ, Ipv4Standing, NmEvent, NmIo,
+        NmIoError, Security, WIRELESS, WIRELESS_SECURITY, WifiDevice, ZbusNm, first_router,
+        host_settings, join_settings, options, pick_gateway,
     };
+    use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use zbus::zvariant::{OwnedValue, Value};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::time::Duration;
+    use zbus::zvariant::{OwnedObjectPath, OwnedValue, Value};
 
     type Group = HashMap<String, Value<'static>>;
+
+    /// The settings and options as the bus answers them, owned values.
+    type OwnedSettings = HashMap<String, HashMap<String, OwnedValue>>;
+    type OwnedOptions = HashMap<String, OwnedValue>;
+
+    /// One recorded `AddAndActivateConnection2` call, settings, device,
+    /// saved connection and options.
+    type Call = (
+        OwnedSettings,
+        OwnedObjectPath,
+        OwnedObjectPath,
+        OwnedOptions,
+    );
 
     #[test]
     fn capability_bits() {
@@ -839,6 +857,12 @@ mod tests {
     /// The `Value`'s owned copy, for a downcast that consumes.
     fn owned(value: &Value<'static>) -> Value<'static> {
         (*value).clone()
+    }
+
+    /// The `String` of an owned wire value, the `None` the downcast's
+    /// refusal.
+    fn owned_str(value: &OwnedValue) -> Option<String> {
+        value.downcast_ref::<String>().ok()
     }
 
     #[test]
@@ -1203,5 +1227,503 @@ mod tests {
             names_free(&names, &created, std::time::Duration::from_secs(5)).await,
             "the dropped client retained its bus connection"
         );
+    }
+
+    const WIFI_DEVICE: &str = "/org/freedesktop/NetworkManager/devices/wifi_0";
+    const ETH_DEVICE: &str = "/org/freedesktop/NetworkManager/devices/eth_0";
+    const ACTIVE_CONNECTION: &str = "/org/freedesktop/NetworkManager/ActiveConnection/1";
+
+    const MODE_OK: u8 = 0;
+    const MODE_PERMISSION_DENIED: u8 = 1;
+    const MODE_FAILED: u8 = 2;
+
+    /// The manager's refusal, its names the polkit permission's and the
+    /// other failure's.
+    #[derive(Debug, zbus::DBusError)]
+    #[zbus(prefix = "org.freedesktop.NetworkManager")]
+    enum FakeRefusal {
+        /// The manager refuses for lack of a permission.
+        PermissionDenied,
+        /// The manager refuses for another reason.
+        Failed(String),
+    }
+
+    /// The fake `NetworkManager` the proofs answer on a private bus, the
+    /// `AddAndActivateConnection2` requests and the refusal mode kept.
+    struct FakeNm {
+        /// The requests, settings and options kept.
+        calls: Arc<Mutex<Vec<Call>>>,
+        /// The refusal mode, the proofs' switch.
+        mode: Arc<AtomicU8>,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager")]
+    impl FakeNm {
+        #[zbus(property)]
+        #[expect(
+            clippy::unused_self,
+            reason = "the zbus property signature keeps the manager reference"
+        )]
+        fn wireless_enabled(&self) -> bool {
+            true
+        }
+
+        #[expect(
+            clippy::unused_self,
+            reason = "the zbus method signature keeps the manager reference"
+        )]
+        fn get_devices(&self) -> Vec<OwnedObjectPath> {
+            [WIFI_DEVICE, ETH_DEVICE]
+                .iter()
+                .map(|path| OwnedObjectPath::try_from(*path).expect("the device path"))
+                .collect()
+        }
+
+        fn add_and_activate_connection2(
+            &self,
+            settings: OwnedSettings,
+            device: OwnedObjectPath,
+            saved: OwnedObjectPath,
+            options: OwnedOptions,
+        ) -> Result<
+            (
+                OwnedObjectPath,
+                OwnedObjectPath,
+                HashMap<String, OwnedValue>,
+            ),
+            FakeRefusal,
+        > {
+            let mode = self.mode.load(Ordering::Relaxed);
+            if mode == MODE_PERMISSION_DENIED {
+                return Err(FakeRefusal::PermissionDenied);
+            }
+            if mode == MODE_FAILED {
+                return Err(FakeRefusal::Failed("another refusal".into()));
+            }
+            self.calls.lock().push((settings, device, saved, options));
+            let saved = OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Connection/1")
+                .expect("the saved connection path");
+            let active = OwnedObjectPath::try_from(ACTIVE_CONNECTION).expect("the active path");
+            Ok((saved, active, HashMap::new()))
+        }
+    }
+
+    /// A `NetworkManager` device the proofs list, its `Device` interface
+    /// answering the type, the address and the managed flag.
+    struct FakeDevice {
+        device_type: u32,
+        hw_address: String,
+        managed: bool,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.Device")]
+    impl FakeDevice {
+        #[zbus(property)]
+        fn device_type(&self) -> u32 {
+            self.device_type
+        }
+
+        #[zbus(property)]
+        fn hw_address(&self) -> String {
+            self.hw_address.clone()
+        }
+
+        #[zbus(property)]
+        fn managed(&self) -> bool {
+            self.managed
+        }
+    }
+
+    /// The wireless interface the proofs read the capability bits from.
+    struct FakeWireless {
+        capabilities: u32,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.Device.Wireless")]
+    impl FakeWireless {
+        #[zbus(property)]
+        fn wireless_capabilities(&self) -> u32 {
+            self.capabilities
+        }
+    }
+
+    /// A `NetworkManager` whose answer sleeps past the client's bound, for
+    /// the timeout's proof.
+    struct SlowNm;
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager")]
+    impl SlowNm {
+        async fn get_devices(&self) -> Vec<OwnedObjectPath> {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            Vec::new()
+        }
+    }
+
+    /// Stand the fake `NetworkManager` on a private bus, the service
+    /// connection kept by the caller, the requests and the refusal mode
+    /// shared back.
+    async fn serve_fake_nm(
+        bus: &crate::linux::test_bus::PrivateBus,
+    ) -> (zbus::Connection, Arc<Mutex<Vec<Call>>>, Arc<AtomicU8>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let mode = Arc::new(AtomicU8::new(MODE_OK));
+        let server = zbus::connection::Builder::address(bus.address.as_str())
+            .expect("the bus address")
+            .name("org.freedesktop.NetworkManager")
+            .expect("the service name")
+            .serve_at(
+                "/org/freedesktop/NetworkManager",
+                FakeNm {
+                    calls: calls.clone(),
+                    mode: mode.clone(),
+                },
+            )
+            .expect("the manager")
+            .serve_at(
+                WIFI_DEVICE,
+                FakeDevice {
+                    device_type: 2,
+                    hw_address: "42:91:88:6f:0a:10".into(),
+                    managed: true,
+                },
+            )
+            .expect("the Wi-Fi device")
+            .serve_at(
+                WIFI_DEVICE,
+                FakeWireless {
+                    capabilities: CAP_ACCESS_POINT | CAP_FREQ_5GHZ,
+                },
+            )
+            .expect("the Wi-Fi capability")
+            .serve_at(
+                ETH_DEVICE,
+                FakeDevice {
+                    device_type: 1,
+                    hw_address: "42:91:88:6f:0a:11".into(),
+                    managed: true,
+                },
+            )
+            .expect("the Ethernet device")
+            .build()
+            .await
+            .expect("the fake manager");
+        (server, calls, mode)
+    }
+
+    /// Emit a signal on the fake's service connection, the client's match
+    /// rules its receiver.
+    async fn emit_signal(
+        bus: &zbus::Connection,
+        path: &str,
+        interface: &str,
+        member: &str,
+        body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+    ) {
+        let message = zbus::Message::signal(path, interface, member)
+            .expect("the signal stands")
+            .build(body)
+            .expect("the signal body serializes");
+        bus.send(&message)
+            .await
+            .expect("the signal reaches the bus");
+    }
+
+    /// The device listing keeps the Wi-Fi device and its fields, the
+    /// non-Wi-Fi device filtered out, over a fake `NetworkManager` on a
+    /// private bus.
+    #[tokio::test]
+    async fn the_listing_keeps_only_the_wifi_devices() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let _server = serve_fake_nm(&bus).await.0;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+        assert!(
+            io.wifi_enabled().await.expect("the read stands"),
+            "the manager says Wi-Fi is enabled"
+        );
+        let devices = io.wifi_devices().await.expect("the listing stands");
+        assert_eq!(devices.len(), 1, "the non-Wi-Fi device is filtered out");
+        let device = &devices[0];
+        assert_eq!(device.path, WIFI_DEVICE);
+        assert_eq!(device.hw_address, "42:91:88:6f:0a:10");
+        assert!(device.managed, "the device is managed");
+        assert!(device.is_access_point());
+        assert!(device.has_five_ghz());
+    }
+
+    /// The host and join requests reach the manager with their settings,
+    /// the answer the active connection's path, over a fake
+    /// `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_requests_reach_the_manager_and_answer_the_active_path() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (_server, calls, _mode) = serve_fake_nm(&bus).await;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+
+        let active = io
+            .add_and_activate(&AddRequest::Host {
+                device: WIFI_DEVICE.to_owned(),
+                band: Band::Five,
+                ssid: "connetto-1a2b".into(),
+                passphrase: "supersecret123".into(),
+            })
+            .await
+            .expect("the host request stands");
+        assert_eq!(active, ACTIVE_CONNECTION);
+
+        let (settings, device, _saved, opts) =
+            calls.lock().first().expect("the host call stands").clone();
+        assert_eq!(device.as_str(), WIFI_DEVICE);
+        let wifi = &settings[WIRELESS];
+        assert_eq!(
+            owned(&wifi["ssid"]).downcast::<Vec<u8>>().unwrap(),
+            b"connetto-1a2b".to_vec()
+        );
+        assert_eq!(owned_str(&wifi["mode"]), Some("ap".to_owned()));
+        assert_eq!(owned_str(&wifi["band"]), Some("a".to_owned()));
+        assert_eq!(
+            owned_str(&settings["connection"]["id"]),
+            Some("connetto-host".to_owned())
+        );
+        assert_eq!(owned_str(&opts["persist"]), Some("volatile".to_owned()));
+
+        let active = io
+            .add_and_activate(&AddRequest::Join {
+                device: WIFI_DEVICE.to_owned(),
+                ssid: "hostnet".into(),
+                passphrase: "hostpass".into(),
+                security: Security::Wpa3,
+            })
+            .await
+            .expect("the join request stands");
+        assert_eq!(active, ACTIVE_CONNECTION);
+
+        let (settings, device, _saved, _opts) =
+            calls.lock().last().expect("the join call stands").clone();
+        assert_eq!(device.as_str(), WIFI_DEVICE);
+        assert_eq!(
+            owned_str(&settings["connection"]["id"]),
+            Some("connetto-join".to_owned())
+        );
+        assert_eq!(
+            owned_str(&settings[WIRELESS]["mode"]),
+            Some("infrastructure".to_owned())
+        );
+        assert_eq!(
+            owned_str(&settings[WIRELESS_SECURITY]["key-mgmt"]),
+            Some("sae".to_owned())
+        );
+    }
+
+    /// A permission refusal maps to the missing permission, another
+    /// refusal to the failed reason, over a fake `NetworkManager` on a
+    /// private bus.
+    #[tokio::test]
+    async fn a_refusal_maps_to_its_reason() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (_server, _calls, mode) = serve_fake_nm(&bus).await;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+        let request = AddRequest::Host {
+            device: WIFI_DEVICE.to_owned(),
+            band: Band::Five,
+            ssid: "connetto-1a2b".into(),
+            passphrase: "supersecret123".into(),
+        };
+        mode.store(MODE_PERMISSION_DENIED, Ordering::Relaxed);
+        let err = io
+            .add_and_activate(&request)
+            .await
+            .expect_err("the refusal stands");
+        assert!(
+            matches!(err, AddError::PermissionDenied),
+            "the refusal is the missing permission, {err:?}"
+        );
+        mode.store(MODE_FAILED, Ordering::Relaxed);
+        let err = io
+            .add_and_activate(&request)
+            .await
+            .expect_err("the refusal stands");
+        assert!(
+            matches!(err, AddError::Failed(_)),
+            "the refusal is the failed reason, {err:?}"
+        );
+    }
+
+    /// Each `NetworkManager` signal arrives as its event, over a fake
+    /// `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_signals_arrive_as_their_events() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (server, _calls, _mode) = serve_fake_nm(&bus).await;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+
+        // The forwarders register their match rules on a spawned task, so
+        // each signal is emitted again until its event arrives, bounded.
+        let event = event_after(
+            &io,
+            || {
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.NetworkManager",
+                    "CheckPermissions",
+                    &(),
+                )
+            },
+            |event| matches!(event, NmEvent::CheckPermissions),
+        )
+        .await;
+        assert!(matches!(event, NmEvent::CheckPermissions));
+
+        let mut properties = HashMap::new();
+        properties.insert("WirelessEnabled".to_owned(), OwnedValue::from(false));
+        let invalidated: Vec<String> = Vec::new();
+        let changed = ("org.freedesktop.NetworkManager", &properties, &invalidated);
+        let event = event_after(
+            &io,
+            || {
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &changed,
+                )
+            },
+            |event| matches!(event, NmEvent::WirelessEnabled(_)),
+        )
+        .await;
+        assert!(
+            matches!(event, NmEvent::WirelessEnabled(false)),
+            "the wireless change is its event, {event:?}"
+        );
+
+        let event = event_after(
+            &io,
+            || {
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/NetworkManager/ActiveConnection/7",
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "StateChanged",
+                    &(3u32, 1u32),
+                )
+            },
+            |event| matches!(event, NmEvent::StateChanged { .. }),
+        )
+        .await;
+        assert!(
+            matches!(
+                &event,
+                NmEvent::StateChanged { active, state, reason }
+                    if active == "/org/freedesktop/NetworkManager/ActiveConnection/7"
+                        && *state == 3
+                        && *reason == 1
+            ),
+            "the state change is its event, {event:?}"
+        );
+    }
+
+    /// The first event of the kind `wanted` names, `emit` sent again until
+    /// it arrives within ten seconds, events of other kinds passed over.
+    async fn event_after<F: Future<Output = ()>>(
+        io: &ZbusNm,
+        emit: impl Fn() -> F,
+        wanted: impl Fn(&NmEvent) -> bool,
+    ) -> NmEvent {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the event did not arrive within its bound"
+            );
+            emit().await;
+            while let Ok(event) =
+                tokio::time::timeout(Duration::from_millis(200), io.next_event()).await
+            {
+                let event = event.expect("the event channel closed");
+                if wanted(&event) {
+                    return event;
+                }
+            }
+        }
+    }
+
+    /// An answer past the bound is the timeout's failure, over a slow
+    /// fake `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn a_slow_answer_times_out_on_the_call_bound() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let _server = zbus::connection::Builder::address(bus.address.as_str())
+            .expect("the bus address")
+            .name("org.freedesktop.NetworkManager")
+            .expect("the service name")
+            .serve_at("/org/freedesktop/NetworkManager", SlowNm)
+            .expect("the slow manager")
+            .build()
+            .await
+            .expect("the slow manager service");
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+        let err = io
+            .wifi_devices()
+            .await
+            .expect_err("the slow answer must time out");
+        assert!(
+            matches!(&err, NmIoError::Failed(text) if text.contains("timed out")),
+            "the failure is the timeout, {err:?}"
+        );
+    }
+
+    const NEW_PROBE_NAME: &str = "linux::nm::tests::new_reports_an_unreachable_system_bus";
+
+    /// The constructor reports an unreachable system bus. The `zbus`
+    /// system bus address reads the process's environment, so the
+    /// scenario runs in a re-executed child with the address pointed at
+    /// an absent socket, the child's environment the only one changed.
+    #[tokio::test]
+    async fn new_reports_an_unreachable_system_bus() {
+        if std::env::var_os("CONNETTO_NM_NEW_PROBE").is_some() {
+            let err = ZbusNm::new()
+                .await
+                .err()
+                .expect("the system bus is unreachable");
+            assert!(
+                matches!(err, NmIoError::Failed(_)),
+                "the failure is the failed reason, {err:?}"
+            );
+            return;
+        }
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", NEW_PROBE_NAME])
+                .env("CONNETTO_NM_NEW_PROBE", "1")
+                .env(
+                    "DBUS_SYSTEM_BUS_ADDRESS",
+                    "unix:path=/run/connetto-proof/absent-socket",
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
     }
 }

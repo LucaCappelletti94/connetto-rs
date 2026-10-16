@@ -518,37 +518,26 @@ mod tests {
             return;
         }
         let bus = crate::linux::test_bus::PrivateBus::start();
-        let mut child =
-            std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
                 .args(["--exact", PROBE_NAME])
                 .env("CONNETTO_BLUEZ_PROBE", "1")
                 .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
-                .spawn()
-                .expect("spawn the probe child");
-        let stdout = child.stdout.take().expect("the child's stdout");
-        let stderr = child.stderr.take().expect("the child's stderr");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let status = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status,
-                Ok(None) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
-                }
-                Ok(None) => {
-                    let _ = child.kill();
-                    panic!("the probe did not end within its bound");
-                }
-                Err(err) => panic!("waiting the probe child: {err}"),
-            }
-        };
-        let output = format!(
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
             "{}{}",
-            std::io::read_to_string(stdout).expect("the child's stdout"),
-            std::io::read_to_string(stderr).expect("the child's stderr"),
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
         );
-        assert!(status.success(), "the probe failed:\n{output}");
+        assert!(output.status.success(), "the probe failed:\n{text}");
     }
 
     #[expect(
