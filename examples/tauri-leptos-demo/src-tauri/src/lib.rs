@@ -2,7 +2,7 @@
 //!
 //! The client lives here, in the native core, which keeps running while the
 //! platform pauses the WebView. The core turns the client's state into one
-//! [`View`] and emits it to the Leptos UI on every change, and the UI calls
+//! `View` and emits it to the Leptos UI on every change, and the UI calls
 //! back through the commands below. The platform lifecycle drives the
 //! client's away input directly, with no UI engine in between.
 
@@ -350,11 +350,13 @@ mod android {
                 .filter(|byte| *byte != 0 && *byte != b'\n')
                 .collect();
             let message = std::ffi::CString::new(line).expect("NUL bytes were removed");
+            // The discriminants are logcat's priorities, 0 to 8, so the cast never truncates.
+            let priority = android_log_sys::LogPriority::INFO as std::ffi::c_int;
             // SAFETY: both pointers are NUL-terminated strings that live until
             // the call returns, and logcat only reads them.
             unsafe {
                 android_log_sys::__android_log_write(
-                    android_log_sys::LogPriority::INFO as std::ffi::c_int,
+                    priority,
                     c"RustStdoutStderr".as_ptr(),
                     message.as_ptr(),
                 );

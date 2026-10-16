@@ -1406,8 +1406,12 @@ fn cli_arguments() -> Result<Arguments> {
     if arguments.every_join && (arguments.bluetooth || arguments.payload) {
         bail!("--every-join runs every join, so --bluetooth and --payload name none");
     }
-    if arguments.peer_serial.is_some() && matches!(demo_app(), DemoApp::Tauri) {
-        bail!("--peer-serial needs the dioxus demo, whose panel holds the peer controls");
+    if (arguments.peer_serial.is_some() || arguments.bluetooth)
+        && matches!(demo_app(), DemoApp::Tauri)
+    {
+        bail!(
+            "--peer-serial and --bluetooth need the dioxus demo, whose panel holds the peer controls"
+        );
     }
     Ok(arguments)
 }

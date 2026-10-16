@@ -32,8 +32,8 @@ runs:
           "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v2.12.1/$tauri_archive"
         curl -fsSL -o "$dir/$trunk_archive" \
           "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/$trunk_archive"
-        # macOS ships shasum only, and a minimal Linux image may lack Perl's shasum.
-        if command -v sha256sum >/dev/null; then check=(sha256sum -c); else check=(shasum -a 256 -c); fi
+        # The macOS sha256sum is not GNU's and rejects -c on stdin, so macOS checks with shasum.
+        if [ "${RUNNER_OS}" = macOS ]; then check=(shasum -a 256 -c); else check=(sha256sum -c); fi
         printf '%s  %s\n%s  %s\n' "$tauri_sum" "$tauri_archive" "$trunk_sum" "$trunk_archive" \
           | (cd "$dir" && "${check[@]}")
         mkdir -p ~/.cargo/bin
