@@ -85,8 +85,9 @@ impl PageSession {
     }
 
     /// A session speaking the `WebKit` target protocol to the page at `url`,
-    /// on its committed target, since a page mid-navigation also announces
-    /// the provisional target of the process it is moving to.
+    /// on its committed page target. A page mid-navigation also announces the
+    /// provisional target of the process it is moving to, and iOS 26 announces
+    /// the main frame as a target of its own, whose `Runtime` domain is absent.
     ///
     /// # Errors
     ///
@@ -101,11 +102,13 @@ impl PageSession {
         loop {
             let message = next_json(&mut socket, deadline, "the target announcement").await?;
             note_target_event(&mut target_events, &message);
+            let info = &message["params"]["targetInfo"];
             let committed = match message["method"].as_str() {
                 Some("Target.targetCreated")
-                    if message["params"]["targetInfo"]["isProvisional"] != true =>
+                    if info["isProvisional"] != true
+                        && matches!(info["type"].as_str(), None | Some("page")) =>
                 {
-                    &message["params"]["targetInfo"]["targetId"]
+                    &info["targetId"]
                 }
                 Some("Target.didCommitProvisionalTarget") => &message["params"]["newTargetId"],
                 _ => continue,
@@ -599,6 +602,42 @@ mod tests {
                 vec![serde_json::json!({
                     "method": "Target.didCommitProvisionalTarget",
                     "params": { "oldTargetId": "page-1", "newTargetId": "page-2" },
+                })]
+            },
+        )
+        .await;
+        let mut page = PageSession::webkit(&url).await.unwrap();
+        page.wait_for_text("status: connected", Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    /// `WebKit` on iOS 26 announces the page's main frame as its own target
+    /// before the page target, and only the page target has `Runtime`.
+    #[tokio::test]
+    async fn a_webkit_session_attaches_to_the_page_not_its_frame() {
+        let url = scripted_webkit_endpoint(
+            vec![
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "frame-1", "type": "frame" } },
+                }),
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "page-8", "type": "page" } },
+                }),
+            ],
+            |target, inner| {
+                if target == "page-8" {
+                    return vec![page_reply(target, inner, "status: connected")];
+                }
+                let refusal = serde_json::json!({
+                    "id": inner["id"],
+                    "error": { "code": -32601, "message": "'Runtime' domain was not found" },
+                });
+                vec![serde_json::json!({
+                    "method": "Target.dispatchMessageFromTarget",
+                    "params": { "targetId": target, "message": refusal.to_string() },
                 })]
             },
         )
