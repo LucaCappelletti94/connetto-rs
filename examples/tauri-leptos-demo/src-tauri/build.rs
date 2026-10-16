@@ -16,7 +16,14 @@ fn main() {
 
     if std::env::var_os("CARGO_FEATURE_DEVICE_IDENTITY").is_some() {
         println!("cargo:rerun-if-env-changed={DEVICE_ROOT}");
-        let Some(path) = std::env::var_os(DEVICE_ROOT) else {
+        // Xcode's build phase does not pass the environment through, so an
+        // iOS build reads the root the demo stack mints under target/.
+        let minted = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/demo-device-ca/root.der");
+        let Some(path) = std::env::var_os(DEVICE_ROOT)
+            .map(std::path::PathBuf::from)
+            .or_else(|| minted.exists().then_some(minted))
+        else {
             panic!("the device-identity feature ships a deployment root: set {DEVICE_ROOT}");
         };
         println!(

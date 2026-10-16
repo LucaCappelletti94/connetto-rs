@@ -35,8 +35,9 @@ const DEFAULT_AUTH_ORIGIN: &str = "http://127.0.0.1:7777";
 const DEFAULT_PG: &str = "postgres://postgres:postgres@127.0.0.1:55456/postgres";
 const AUTH_PROVIDER: &str = "dev-idp";
 const KEYRING_SERVICE: &str = "connetto-tauri-demo";
-/// The login redirect, whose scheme is the Android applicationId.
-#[cfg(target_os = "android")]
+/// The login redirect, whose scheme is the Android applicationId and the
+/// iOS bundle identifier.
+#[cfg(any(target_os = "android", target_os = "ios"))]
 const APP_REDIRECT: &str = "dev.connetto.tauridemo:/oauth2redirect";
 /// The demo's re-check grace, matching the dioxus demo's.
 const RECHECK_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
@@ -188,21 +189,53 @@ fn endpoint(runtime: Option<String>, built: Option<&'static str>, default: &str)
 
 #[cfg(target_os = "android")]
 fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
-    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(android::TabSession))
+    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(mobile::TabSession))
         .with_keystore_prompt(Arc::new(android::KeystoreUnlock))
 }
 
-#[cfg(not(target_os = "android"))]
+#[cfg(target_os = "ios")]
+fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
+    auth.with_claimed_redirect(APP_REDIRECT, Arc::new(mobile::TabSession))
+}
+
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 fn platform_sign_in(auth: KeyringAuth) -> KeyringAuth {
     auth
+}
+
+#[cfg(any(target_os = "android", target_os = "ios"))]
+mod mobile {
+    use connetto_client::ClientError;
+
+    /// How long a login in the browser tab may take.
+    const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
+
+    /// The Custom Tab on Android or the authentication session on iOS, and
+    /// the app's redirect, through `connetto-auth-session`.
+    pub(crate) struct TabSession;
+
+    impl connetto_client::AuthorizationSession for TabSession {
+        fn authorize(&self, url: String) -> connetto_client::SessionFuture {
+            Box::pin(async move {
+                connetto_auth_session::authorize(&url, LOGIN_WINDOW)
+                    .await
+                    .map_err(|err| ClientError::Auth(err.to_string()))
+            })
+        }
+
+        fn delivered(&self) -> Option<String> {
+            connetto_auth_session::delivered().unwrap_or_else(|err| {
+                tracing::warn!(error = %err, "reading a delivered login redirect");
+                None
+            })
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
 mod android {
     use connetto_client::ClientError;
 
-    /// How long a login in the browser tab may take.
-    const LOGIN_WINDOW: std::time::Duration = std::time::Duration::from_secs(600);
     /// How long the unlock prompt may stay up.
     const UNLOCK_WINDOW: std::time::Duration = std::time::Duration::from_secs(120);
 
@@ -223,27 +256,6 @@ mod android {
             .map_err(|err| ClientError::Auth(err.to_string()))
         }
     }
-
-    /// The Custom Tab and the app's redirect, through `connetto-auth-session`.
-    pub(crate) struct TabSession;
-
-    impl connetto_client::AuthorizationSession for TabSession {
-        fn authorize(&self, url: String) -> connetto_client::SessionFuture {
-            Box::pin(async move {
-                connetto_auth_session::authorize(&url, LOGIN_WINDOW)
-                    .await
-                    .map_err(|err| ClientError::Auth(err.to_string()))
-            })
-        }
-
-        fn delivered(&self) -> Option<String> {
-            connetto_auth_session::delivered().unwrap_or_else(|err| {
-                tracing::warn!(error = %err, "reading a delivered login redirect");
-                None
-            })
-        }
-    }
-
     /// Writes each formatted log line to logcat, since an Android app's
     /// stdout goes nowhere.
     pub(crate) struct Logcat;
@@ -511,7 +523,24 @@ async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Re
 fn init_logging() {
     #[cfg(target_os = "android")]
     connetto_core::logging::install(|| android::Logcat, LOG_FILTER);
-    #[cfg(not(target_os = "android"))]
+    // The iOS proof reads the app's log from this file in its data container.
+    #[cfg(target_os = "ios")]
+    {
+        let file = std::env::var_os("HOME").and_then(|home| {
+            let dir = PathBuf::from(home).join("Library/Application Support");
+            std::fs::create_dir_all(&dir).ok()?;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(dir.join("connetto-demo.log"))
+                .ok()
+        });
+        match file {
+            Some(file) => connetto_core::logging::install(std::sync::Mutex::new(file), LOG_FILTER),
+            None => connetto_core::logging::init_stdout_with_default(LOG_FILTER),
+        }
+    }
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
     connetto_core::logging::init_stdout_with_default(LOG_FILTER);
 }
 
