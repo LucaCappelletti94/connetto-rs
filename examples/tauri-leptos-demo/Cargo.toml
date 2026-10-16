@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = ["src-tauri", "ui"]
+
+# Verbatim mirror of the root workspace patch blocks. Cargo patches do not
+# cross workspaces, so the demo needs the same routing or the diesel backed
+# graph will not resolve. The sources and revisions must match the root ones
+# exactly.
+[patch.crates-io]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
+sqlparser = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", branch = "main" }
+apple-native-keyring-store = { git = "https://github.com/LucaCappelletti94/apple-native-keyring-store", rev = "0cbad3f4f8a67491455a838e842476c9b5be07a4" }
+security-framework = { git = "https://github.com/LucaCappelletti94/rust-security-framework", rev = "6ac1b8a3a396d69c9a7fbddc9a9e8b3cc89322c9" }
+android-native-keyring-store = { git = "https://github.com/LucaCappelletti94/android-native-keyring-store", rev = "d82b446a99102f44829d17c39671adffba57a64e" }
+windows-native-keyring-store = { git = "https://github.com/LucaCappelletti94/windows-native-keyring-store", rev = "8a8ffde9913b36bd464c8cd5dd24bf80e39dce37" }
+
+[patch."https://github.com/diesel-rs/diesel"]
+diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }

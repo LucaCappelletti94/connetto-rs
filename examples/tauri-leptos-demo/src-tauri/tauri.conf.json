@@ -1,0 +1,30 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "connetto-tauri-demo",
+  "version": "0.0.1",
+  "identifier": "dev.connetto.tauridemo",
+  "build": {
+    "beforeBuildCommand": {
+      "script": "env -u NO_COLOR trunk build",
+      "cwd": "../ui"
+    },
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      {
+        "title": "connetto tauri demo",
+        "width": 760,
+        "height": 1000
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all"
+  }
+}

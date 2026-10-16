@@ -1,0 +1,262 @@
+---
+name: Android spike (diagnostic)
+on:
+  push:
+    branches:
+    - spike/tauri-leptos
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+jobs:
+  browser-build:
+    name: Browser stack build
+    runs-on: emi-heavy
+    env:
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: '0'
+    timeout-minutes: 45
+    steps:
+    - uses: actions/checkout@v7
+    - name: Restore cargo downloads
+      if: runner.environment == 'github-hosted'
+      id: cache-1
+      uses: actions/cache/restore@v6
+      with:
+        path: '~/.cargo/registry/index
+
+          ~/.cargo/registry/cache
+
+          ~/.cargo/git/db
+
+          '
+        key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+    - name: Restore native build output
+      if: runner.environment == 'github-hosted'
+      id: cache-2
+      uses: actions/cache/restore@v6
+      with:
+        path: target
+        key: t-browser-native-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-native-{0}-', runner.os) || '' }}
+    - name: Install stable browser toolchain
+      run: rustup toolchain install stable --profile minimal
+    - name: Build the browser stack
+      run: "cargo +stable run \\\n  --profile \"$CARGO_TEST_PROFILE\" \\\n  -p connetto-test-harness \\\n  --bin connetto-browser-stack \\\n  -- \\\n  --build-only browser-bins\n"
+    - name: Build the Android proof
+      run: "cargo +stable build \\\n  --profile \"$CARGO_TEST_PROFILE\" \\\n  -p connetto-test-harness \\\n  --bin connetto-demo-stack \\\n  --bin connetto-android-proof\nmkdir android-bins\ncp \"target/$CARGO_TEST_PROFILE/connetto-demo-stack\"\
+        \ \"target/$CARGO_TEST_PROFILE/connetto-android-proof\" android-bins/\n"
+    - name: Strip debug sections from the prebuilt binaries
+      run: strip --strip-debug browser-bins/* android-bins/*
+    - uses: ./.github/actions/put-files
+      with:
+        name: browser-bins
+        path: browser-bins
+    - uses: ./.github/actions/put-files
+      with:
+        name: android-bins
+        path: android-bins
+    - name: Prune target cache
+      if: always()
+      run: 'rm -rf target/debug/incremental
+
+        rm -rf "target/$CARGO_TEST_PROFILE/incremental"
+
+        rm -rf target/tmp
+
+        '
+    - name: Save cargo downloads
+      if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: '~/.cargo/registry/index
+
+          ~/.cargo/registry/cache
+
+          ~/.cargo/git/db
+
+          '
+        key: ${{ steps.cache-1.outputs.cache-primary-key }}
+    - name: Save native build output
+      if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v6
+      with:
+        path: target
+        key: ${{ steps.cache-2.outputs.cache-primary-key }}
+  apk-build:
+    name: Build both APKs
+    needs: browser-build
+    runs-on: emi-heavy
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v7
+    - name: Restore cargo downloads
+      if: runner.environment == 'github-hosted'
+      id: cache-1
+      uses: actions/cache/restore@v6
+      with:
+        path: '~/.cargo/registry/index
+
+          ~/.cargo/registry/cache
+
+          ~/.cargo/git/db
+
+          '
+        key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+    - name: Restore the demo's build output
+      if: runner.environment == 'github-hosted'
+      id: cache-2
+      uses: actions/cache/restore@v6
+      with:
+        path: 'examples/dioxus-desktop-demo/target/*
+
+          !examples/dioxus-desktop-demo/target/dx
+
+          '
+        key: t-android-emulator-lines-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
+        restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-lines-{0}-', runner.os) || '' }}
+    - uses: ./.github/actions/get-files
+      with:
+        name: browser-bins
+        path: browser-bins
+    - uses: ./.github/actions/get-files
+      with:
+        name: android-bins
+        path: android-bins
+    - name: Mark the prebuilt binaries executable
+      run: chmod +x browser-bins/* android-bins/*
+    - name: Install stable toolchain with the emulator's target
+      run: 'rustup toolchain install stable --profile minimal
+
+        rustup target add x86_64-linux-android --toolchain stable
+
+        '
+    - name: Install dx
+      run: "base=https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10\ncurl -fsSLO \"$base/dx-x86_64-unknown-linux-gnu.tar.gz\"\ncurl -fsSL \"$base/dx-x86_64-unknown-linux-gnu.sha256\" \\\n  | grep ' dx-x86_64-unknown-linux-gnu.tar.gz$'\
+        \ \\\n  | sha256sum --check\ntar xzf dx-x86_64-unknown-linux-gnu.tar.gz -C ~/.cargo/bin dx\nrm dx-x86_64-unknown-linux-gnu.tar.gz\ndx --version\n"
+    - name: Point dx at the runner's Android SDK
+      run: 'ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
+
+        echo "ANDROID_NDK_HOME=$ndk" >> "${GITHUB_ENV}"
+
+        echo "NDK_HOME=$ndk" >> "${GITHUB_ENV}"
+
+        echo "${ANDROID_HOME}/platform-tools" >> "${GITHUB_PATH}"
+
+        '
+    - name: Mint the demo's device CA
+      run: echo "CONNETTO_DEMO_BUILD_DEVICE_ROOT=$(android-bins/connetto-demo-stack --mint-device-ca)" >> "${GITHUB_ENV}"
+    - name: Build the demo's APK
+      working-directory: examples/dioxus-desktop-demo
+      env:
+        CARGO_PROFILE_ANDROID_DEV_DEBUG: line-tables-only
+      run: "dx build \\\n  --android \\\n  --target x86_64-linux-android \\\n  --no-default-features \\\n  --features mobile,device-identity\n"
+    - name: Install trunk and the Tauri CLI
+      run: cargo install --locked trunk@0.21.14 tauri-cli@2.12.3
+    - name: Add the wasm target
+      run: rustup target add wasm32-unknown-unknown --toolchain stable
+    - name: Build the Tauri demo's APK
+      working-directory: examples/tauri-leptos-demo/src-tauri
+      run: 'ndkb="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+
+        export AR_x86_64_linux_android="$ndkb/llvm-ar" RANLIB_x86_64_linux_android="$ndkb/llvm-ranlib" PATH="$ndkb:$PATH"
+
+        cargo tauri android build --debug --target x86_64 --apk --features device-identity
+
+        '
+    - name: Gather the APKs and the device CA
+      run: 'mkdir -p spike-apks
+
+        cp examples/dioxus-desktop-demo/target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk spike-apks/dioxus.apk
+
+        cp examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk spike-apks/tauri.apk
+
+        cp -r target/demo-device-ca spike-apks/demo-device-ca
+
+        '
+    - uses: ./.github/actions/put-files
+      with:
+        name: spike-apks
+        path: spike-apks
+  proof:
+    name: Android proof ${{ matrix.app }} ${{ matrix.repeat }}
+    needs: apk-build
+    runs-on: emi-heavy
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        app:
+        - dioxus
+        - tauri
+        repeat:
+        - 1
+        - 2
+        - 3
+        - 4
+        - 5
+        - 6
+        - 7
+        - 8
+        - 9
+        - 10
+        - 11
+        - 12
+        - 13
+        - 14
+        - 15
+        - 16
+    steps:
+    - uses: actions/checkout@v7
+    - uses: ./.github/actions/get-files
+      with:
+        name: browser-bins
+        path: browser-bins
+    - uses: ./.github/actions/get-files
+      with:
+        name: android-bins
+        path: android-bins
+    - uses: ./.github/actions/get-files
+      with:
+        name: spike-apks
+        path: spike-apks
+    - name: Restore the device CA and mark the binaries executable
+      run: 'chmod +x browser-bins/* android-bins/*
+
+        mkdir -p target && cp -r spike-apks/demo-device-ca target/demo-device-ca
+
+        echo "CONNETTO_DEMO_BUILD_DEVICE_ROOT=$PWD/target/demo-device-ca/root.der" >> "$GITHUB_ENV"
+
+        '
+    - uses: ./.github/actions/pull-test-images
+    - name: Enable KVM
+      run: "echo 'KERNEL==\"kvm\", GROUP=\"kvm\", MODE=\"0666\", OPTIONS+=\"static_node=kvm\"' \\\n  | sudo tee /etc/udev/rules.d/99-kvm4all.rules\nsudo udevadm control --reload-rules\nsudo udevadm trigger --name-match=kvm\n"
+    - name: Walk the proof on an emulator
+      uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
+      env:
+        CONNETTO_SERVER_BIN: ${{ github.workspace }}/browser-bins/connetto-server
+      with:
+        api-level: 35
+        target: google_apis
+        arch: x86_64
+        emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -logcat *:v -logcat-output ${{ runner.temp }}/emulator-logcat.txt
+        script: 'adb -s emulator-5554 shell locksettings set-pin 2580
+
+          android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app ${{ matrix.app }} --apk spike-apks/${{ matrix.app }}.apk
+
+          '
+    - uses: actions/upload-artifact@v7
+      if: failure()
+      with:
+        name: android-proof-evidence-${{ matrix.app }}-${{ matrix.repeat }}
+        path: 'target/android-proof
+
+          ${{ runner.temp }}/emulator-logcat.txt
+
+          /tmp/adb.*.log
+
+          '
+        retention-days: 7

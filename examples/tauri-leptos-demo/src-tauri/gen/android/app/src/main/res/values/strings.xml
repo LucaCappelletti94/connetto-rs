@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">"connetto-tauri-demo"</string>
+    <string name="main_activity_title">"connetto-tauri-demo"</string>
+</resources>

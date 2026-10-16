@@ -72,10 +72,7 @@ use connetto_test_harness::stack::{
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
 
-const PACKAGE: &str = "dev.connetto.dioxusdemo";
-const ACTIVITY: &str = "dev.dioxus.main.MainActivity";
 const BROWSER: &str = "com.android.chrome";
-const DEMO_DIR: [&str; 2] = ["examples", "dioxus-desktop-demo"];
 const USER: &str = "alice";
 /// The device port the demo's WebSocket dials, removed to take it offline.
 const SYNC_PORT: u16 = 7777;
@@ -93,10 +90,54 @@ const STAY_ON: &str = "stay_on_while_plugged_in";
 const HIDE_ERROR_DIALOGS: &str = "hide_error_dialogs";
 /// The log targets of the demo's away and return inputs and of its gate,
 /// printed when the proof fails.
-const GATE_TRACE_TARGETS: [&str; 2] = [
+const GATE_TRACE_TARGETS: [&str; 3] = [
     "\"target\":\"connetto_client::away\"",
     "\"target\":\"connetto_dioxus::away\"",
+    "\"target\":\"connetto_tauri_demo::away\"",
 ];
+
+/// The demo the proof deploys, `--app dioxus` (the default) or `--app tauri`
+/// (the Tauri + Leptos spike, `examples/tauri-leptos-demo`).
+#[derive(Clone, Copy, Default)]
+enum DemoApp {
+    #[default]
+    Dioxus,
+    Tauri,
+}
+
+impl DemoApp {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "dioxus" => Ok(Self::Dioxus),
+            "tauri" => Ok(Self::Tauri),
+            other => bail!("unknown app {other}, expected dioxus or tauri"),
+        }
+    }
+}
+
+/// The demo this run deploys, set once from the command line.
+static APP: std::sync::OnceLock<DemoApp> = std::sync::OnceLock::new();
+
+fn demo_app() -> DemoApp {
+    APP.get().copied().unwrap_or_default()
+}
+
+/// The demo's Android package.
+fn package() -> &'static str {
+    match demo_app() {
+        DemoApp::Dioxus => "dev.connetto.dioxusdemo",
+        DemoApp::Tauri => "dev.connetto.tauridemo",
+    }
+}
+
+/// The demo's launch activity.
+fn activity() -> &'static str {
+    match demo_app() {
+        DemoApp::Dioxus => "dev.dioxus.main.MainActivity",
+        DemoApp::Tauri => "dev.connetto.tauridemo.MainActivity",
+    }
+}
+
 /// The second phone's account in the peer proof, so each page's `linked:`
 /// line names the other phone unambiguously.
 const PEER_USER: &str = "bob";
@@ -212,7 +253,7 @@ async fn main() -> Result<()> {
     }
     let _ = device.adb(&["forward", "--remove-all"]).await;
     let _ = device.adb(&["reverse", "--remove-all"]).await;
-    let _ = device.adb(&["shell", "am", "force-stop", PACKAGE]).await;
+    let _ = device.adb(&["shell", "am", "force-stop", package()]).await;
     let restored = match previous.as_deref() {
         Some(holder) => device.set_browser_role_holder(holder).await,
         None => device
@@ -284,7 +325,7 @@ async fn prove(
     device
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
         .await?;
-    device.adb(&["shell", "pm", "clear", PACKAGE]).await?;
+    device.adb(&["shell", "pm", "clear", package()]).await?;
     device.adb(&["logcat", "-c"]).await?;
     device.adb(&["reverse", "--remove-all"]).await?;
     for (device_port, host_port) in &stack.reverse {
@@ -357,9 +398,12 @@ async fn prove(
     wait_for_count(&stack.pg_url, offline + 1).await?;
     device.screenshot(evidence, "uploaded").await?;
     recheck_after_time_away(device, evidence, unlock).await?;
-    let mut app = device.app().await?;
-    sign_out(device, &mut app, evidence).await?;
-    sign_in_across_a_killed_process(device, &stack.issuer, evidence, unlock).await?;
+    // The spike has no session panel, so its proof ends at the re-check.
+    if let DemoApp::Dioxus = demo_app() {
+        let mut app = device.app().await?;
+        sign_out(device, &mut app, evidence).await?;
+        sign_in_across_a_killed_process(device, &stack.issuer, evidence, unlock).await?;
+    }
     step("proof complete");
     Ok(())
 }
@@ -393,13 +437,13 @@ async fn sign_in_across_a_killed_process(
 ) -> Result<()> {
     step("sign in across a killed process");
     let mut tab = device.login_tab(issuer).await?;
-    let killed = device.adb(&["shell", "pidof", PACKAGE]).await?;
+    let killed = device.adb(&["shell", "pidof", package()]).await?;
     let deadline = Instant::now() + Duration::from_secs(10);
     // `am kill` spares a visible process, and the app stays visible briefly after the tab opens.
     loop {
-        device.adb(&["shell", "am", "kill", PACKAGE]).await?;
+        device.adb(&["shell", "am", "kill", package()]).await?;
         sleep(Duration::from_millis(250)).await;
-        if device.adb(&["shell", "pidof", PACKAGE]).await.is_err() {
+        if device.adb(&["shell", "pidof", package()]).await.is_err() {
             break;
         }
         if Instant::now() >= deadline {
@@ -617,7 +661,7 @@ async fn peer_proof(
         .await;
     let _ = joiner.adb(&["forward", "--remove-all"]).await;
     let _ = joiner.adb(&["reverse", "--remove-all"]).await;
-    let _ = joiner.adb(&["shell", "am", "force-stop", PACKAGE]).await;
+    let _ = joiner.adb(&["shell", "am", "force-stop", package()]).await;
     PeerOutcome {
         joins: result,
         teardown: wrote_log.and(restore_role).and(restore_stay),
@@ -676,7 +720,7 @@ async fn run_peer_proof(
     joiner
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
         .await?;
-    joiner.adb(&["shell", "pm", "clear", PACKAGE]).await?;
+    joiner.adb(&["shell", "pm", "clear", package()]).await?;
     joiner.adb(&["reverse", "--remove-all"]).await?;
     for (device_port, host_port) in &stack.reverse {
         joiner.reverse(*device_port, *host_port).await?;
@@ -690,7 +734,7 @@ async fn run_peer_proof(
             .chain(["android.permission.NEARBY_WIFI_DEVICES"])
         {
             phone
-                .adb(&["shell", "pm", "grant", PACKAGE, permission])
+                .adb(&["shell", "pm", "grant", package(), permission])
                 .await?;
         }
     }
@@ -1105,14 +1149,14 @@ async fn run_bluetooth_proof(host: &Device, evidence: &Path) -> Result<()> {
 
     step("grant the Bluetooth permissions");
     for permission in BT_PERMISSIONS {
-        host.adb(&["shell", "pm", "grant", PACKAGE, permission])
+        host.adb(&["shell", "pm", "grant", package(), permission])
             .await?;
     }
     host.adb(&[
         "shell",
         "pm",
         "grant",
-        PACKAGE,
+        package(),
         "android.permission.NEARBY_WIFI_DEVICES",
     ])
     .await?;
@@ -1160,7 +1204,7 @@ async fn host_with_beacon(host: &Device, evidence: &Path) -> Result<()> {
 /// the service data UUID past its first group.
 fn check_beacon_dump(dump: &str) -> Result<()> {
     let set = dump
-        .split_once(&format!("    {PACKAGE}\n"))
+        .split_once(&format!("    {}\n", package()))
         .map(|(_, rest)| rest)
         .context("the dump lists no advertising set of the demo")?;
     let set: Vec<&str> = set
@@ -1345,6 +1389,9 @@ fn cli_arguments() -> Result<Arguments> {
         match arg.as_str() {
             "--serial" => arguments.serial = Some(value),
             "--apk" => arguments.apk = Some(PathBuf::from(value)),
+            "--app" => APP
+                .set(DemoApp::parse(&value)?)
+                .map_err(|_| anyhow!("--app given twice"))?,
             "--unlock-pin" => arguments.unlock_pin = Some(value),
             "--peer-serial" => arguments.peer_serial = Some(value),
             other => bail!("unknown argument {other}"),
@@ -1389,8 +1436,14 @@ async fn restart_adb_server() -> Result<()> {
 }
 
 async fn build_apk(target: &str) -> Result<PathBuf> {
+    if let DemoApp::Tauri = demo_app() {
+        bail!(
+            "the Tauri demo is built with `cargo tauri android build --debug --apk` in \
+             examples/tauri-leptos-demo/src-tauri, pass its APK with --apk"
+        );
+    }
     step("build");
-    let demo = repo_path(&DEMO_DIR)?;
+    let demo = repo_path(&["examples", "dioxus-desktop-demo"])?;
     let status = Command::new("dx")
         .args([
             "build",
@@ -1744,7 +1797,7 @@ impl Device {
             "start",
             "-W",
             "-n",
-            &format!("{PACKAGE}/{ACTIVITY}"),
+            &format!("{}/{}", package(), activity()),
         ])
         .await
         .map(drop)
@@ -1859,7 +1912,7 @@ impl Device {
     /// A `DevTools` session on the demo's `WebView`, over a forward that lives
     /// until [`main`] removes every forward.
     async fn app(&self) -> Result<PageSession> {
-        let pid = self.adb(&["shell", "pidof", PACKAGE]).await?;
+        let pid = self.adb(&["shell", "pidof", package()]).await?;
         let port = self
             .forward(&format!("webview_devtools_remote_{}", pid.trim()))
             .await?;
