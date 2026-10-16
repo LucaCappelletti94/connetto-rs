@@ -44,6 +44,26 @@ pub struct PageSession {
     socket: Socket,
     route: Route,
     next_id: u64,
+    /// The `WebKit` target events the session saw, the first
+    /// [`TARGET_EVENTS_KEPT`], which a failed request reports.
+    target_events: Vec<String>,
+}
+
+/// How many target events a session keeps for its failure reports.
+const TARGET_EVENTS_KEPT: usize = 16;
+
+/// Keep `message` on `events` when it is a `WebKit` target event other than a
+/// wrapped reply.
+fn note_target_event(events: &mut Vec<String>, message: &serde_json::Value) {
+    let Some(method) = message["method"].as_str() else {
+        return;
+    };
+    if method.starts_with("Target.")
+        && method != "Target.dispatchMessageFromTarget"
+        && events.len() < TARGET_EVENTS_KEPT
+    {
+        events.push(format!("{method} {}", message["params"]));
+    }
 }
 
 impl PageSession {
@@ -60,6 +80,7 @@ impl PageSession {
             socket,
             route: Route::Direct,
             next_id: 0,
+            target_events: Vec::new(),
         })
     }
 
@@ -76,8 +97,10 @@ impl PageSession {
             .await
             .context("opening the WebKit inspector session")?;
         let deadline = Instant::now() + REPLY_BOUND;
+        let mut target_events = Vec::new();
         loop {
             let message = next_json(&mut socket, deadline, "the target announcement").await?;
+            note_target_event(&mut target_events, &message);
             let committed = match message["method"].as_str() {
                 Some("Target.targetCreated")
                     if message["params"]["targetInfo"]["isProvisional"] != true =>
@@ -95,6 +118,7 @@ impl PageSession {
                 socket,
                 route: Route::Target(target),
                 next_id: 0,
+                target_events,
             });
         }
     }
@@ -139,6 +163,7 @@ impl PageSession {
             let reply = match &mut self.route {
                 Route::Direct => message,
                 Route::Target(target) => {
+                    note_target_event(&mut self.target_events, &message);
                     if let Some(error) = message.get("error") {
                         bail!("inspector request {id} was refused: {error}");
                     }
@@ -162,7 +187,13 @@ impl PageSession {
             };
             if reply["id"] == id {
                 if let Some(error) = reply.get("error") {
-                    let failure = anyhow!("inspector request {id} failed: {error}");
+                    let failure = match &self.route {
+                        Route::Direct => anyhow!("inspector request {id} failed: {error}"),
+                        Route::Target(target) => anyhow!(
+                            "inspector request {id} to target {target} failed: {error}, after the target events {:?}",
+                            self.target_events
+                        ),
+                    };
                     let navigated = NAVIGATED.contains(&error["message"].as_str().unwrap_or(""));
                     return Err(if navigated {
                         failure.context(Navigated)
