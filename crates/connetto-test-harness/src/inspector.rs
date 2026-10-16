@@ -99,18 +99,25 @@ impl PageSession {
             .context("opening the WebKit inspector session")?;
         let deadline = Instant::now() + REPLY_BOUND;
         let mut target_events = Vec::new();
+        // Frames commit provisional targets too, so only a page's commit is followed.
+        let mut provisional_pages = Vec::new();
         loop {
             let message = next_json(&mut socket, deadline, "the target announcement").await?;
             note_target_event(&mut target_events, &message);
             let info = &message["params"]["targetInfo"];
             let committed = match message["method"].as_str() {
-                Some("Target.targetCreated")
-                    if info["isProvisional"] != true
-                        && matches!(info["type"].as_str(), None | Some("page")) =>
-                {
+                Some("Target.targetCreated") if info["type"] == "page" => {
+                    if info["isProvisional"] == true {
+                        provisional_pages.push(info["targetId"].clone());
+                        continue;
+                    }
                     &info["targetId"]
                 }
-                Some("Target.didCommitProvisionalTarget") => &message["params"]["newTargetId"],
+                Some("Target.didCommitProvisionalTarget")
+                    if provisional_pages.contains(&message["params"]["newTargetId"]) =>
+                {
+                    &message["params"]["newTargetId"]
+                }
                 _ => continue,
             };
             let target = committed
@@ -417,7 +424,7 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let announce = serde_json::json!({
                 "method": "Target.targetCreated",
-                "params": { "targetInfo": { "targetId": "page-1" } },
+                "params": { "targetInfo": { "targetId": "page-1", "type": "page" } },
             });
             socket
                 .send(Message::Text(announce.to_string()))
@@ -603,8 +610,9 @@ mod tests {
             .unwrap();
     }
 
-    /// `WebKit` on iOS 26 announces the page's main frame as its own target
-    /// before the page target, and only the page target has `Runtime`.
+    /// `WebKit` on iOS 26 announces the page's main frame as its own target,
+    /// which can commit provisional targets of its own, before the page
+    /// target, and only the page target has `Runtime`.
     #[tokio::test]
     async fn a_webkit_session_attaches_to_the_page_not_its_frame() {
         let url = scripted_webkit_endpoint(
@@ -612,6 +620,14 @@ mod tests {
                 serde_json::json!({
                     "method": "Target.targetCreated",
                     "params": { "targetInfo": { "targetId": "frame-1", "type": "frame" } },
+                }),
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "frame-2", "type": "frame", "isProvisional": true } },
+                }),
+                serde_json::json!({
+                    "method": "Target.didCommitProvisionalTarget",
+                    "params": { "oldTargetId": "frame-1", "newTargetId": "frame-2" },
                 }),
                 serde_json::json!({
                     "method": "Target.targetCreated",
