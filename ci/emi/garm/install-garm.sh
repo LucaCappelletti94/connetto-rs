@@ -9,14 +9,17 @@ BRIDGE_IP=10.77.0.1
 GARM_PORT=9997
 home=$HOME/garm
 
+# A private directory, so no other account on emi can swap an archive between its check and its unpacking.
+downloads=$(mktemp -d)
+trap 'rm -rf "$downloads"' EXIT
+
 fetch() {
   local repo=$1 version=$2 asset=$3 dest=$4
   local base=https://github.com/cloudbase/$repo/releases/download/$version
-  curl -fsSL "$base/$asset" -o "/tmp/$asset"
-  curl -fsSL "$base/$asset.sha256" -o "/tmp/$asset.sha256"
-  (cd /tmp && sha256sum -c --status <(awk -v f="$asset" '{ print $1 "  " f }' "$asset.sha256"))
-  tar xzf "/tmp/$asset" -C "$dest"
-  rm -f "/tmp/$asset" "/tmp/$asset.sha256"
+  curl -fsSL "$base/$asset" -o "$downloads/$asset"
+  curl -fsSL "$base/$asset.sha256" -o "$downloads/$asset.sha256"
+  (cd "$downloads" && sha256sum -c --status <(awk -v f="$asset" '{ print $1 "  " f }' "$asset.sha256"))
+  tar xzf "$downloads/$asset" -C "$dest"
 }
 
 mkdir -p "$home/bin" "$home/providers.d" "$HOME/.config/systemd/user"

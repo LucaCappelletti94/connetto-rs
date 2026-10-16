@@ -700,7 +700,10 @@ jobs:
 
   browser-build:
     name: Browser stack build
-    runs-on: *heavy-runner
+    # This job hands its binaries to the shards and the Android proof, so all
+    # of them run on emi only while both scale-set variables name emi pools,
+    # since put-files and get-files must pick the same store.
+    runs-on: &paired-heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-latest' }}
     # The server and the topology test binary, built once here instead of in
     # every shard, where they were most of the budget. Pull requests build
     # them in testfast like the Rust test jobs, and the harness reads the same
@@ -798,7 +801,7 @@ jobs:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
     # Light VMs sit idle once the checks finish, while the heavy ones still run the suites.
-    runs-on: *light-runner
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     # A shard runs a quarter of the suites against its own machine-local
     # stack from the prebuilt binaries, so the serial rule inside one process
     # holds while the wall clock divides by four.
@@ -896,7 +899,7 @@ jobs:
     name: Android emulator proof
     needs: browser-build
     # On a light VM the proof timed out at the browser tab and at the keyguard.
-    runs-on: *heavy-runner
+    runs-on: *paired-heavy-runner
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7

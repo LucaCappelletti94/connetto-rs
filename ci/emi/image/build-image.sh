@@ -5,6 +5,9 @@ set -euo pipefail
 
 here=$(cd "$(dirname "$0")" && pwd)
 alias=ci-ubuntu-2404
+# One build at a time, since a second one would share the minute stamp, delete this one's VMs and race the alias move.
+exec 9>"$here/.build.lock"
+flock -n 9 || { echo "another image build is running" >&2; exit 1; }
 stamp=$(date -u +%Y%m%d%H%M)
 builder=image-build-$stamp
 smoke=image-smoke-$stamp

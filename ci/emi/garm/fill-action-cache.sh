@@ -46,6 +46,7 @@ uses_in "$work"/* | sort -u > "$work/queue"
 
 echo "== archives, nested composite actions included"
 : > "$work/seen"
+failed=0
 while [ -s "$work/queue" ]; do
   next=$(head -n 1 "$work/queue")
   sed -i 1d "$work/queue"
@@ -58,9 +59,16 @@ while [ -s "$work/queue" ]; do
   dest="$CACHE/${owner_repo//\//_}/$sha.tar.gz"
   if [ ! -s "$dest" ]; then
     mkdir -p "$(dirname "$dest")"
-    api "https://api.github.com/repos/$owner_repo/tarball/$sha" -o "$dest.part"
-    mv "$dest.part" "$dest"
-    echo "fetched $owner_repo@$sha"
+    # The tarball redirects to codeload without the token, where emi's address meets 429s, so retry and move on.
+    if api --retry 5 --retry-delay 30 "https://api.github.com/repos/$owner_repo/tarball/$sha" -o "$dest.part"; then
+      mv "$dest.part" "$dest"
+      echo "fetched $owner_repo@$sha"
+    else
+      rm -f "$dest.part"
+      echo "could not fetch $owner_repo@$sha" >&2
+      failed=$((failed + 1))
+      continue
+    fi
   fi
   # A composite action's own `uses:` lines need their archives too.
   mkdir -p "$work/x"
@@ -69,3 +77,5 @@ while [ -s "$work/queue" ]; do
   rm -rf "$work/x"
 done
 echo "== cache holds $(find "$CACHE" -name '*.tar.gz' | wc -l) archives, $(du -sh "$CACHE" | cut -f1)"
+# The next timer run fetches what failed here.
+[ "$failed" -eq 0 ] || { echo "$failed archives could not be fetched" >&2; exit 1; }

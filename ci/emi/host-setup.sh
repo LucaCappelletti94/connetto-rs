@@ -66,19 +66,24 @@ incus network show "$BRIDGE" >/dev/null 2>&1 \
   || incus network create "$BRIDGE" ipv4.address="$BRIDGE_CIDR" ipv4.nat=true ipv6.address=none
 
 log "Egress firewall: the internet, plus GARM and the image mirror on the host, nothing else local"
-if ! incus network acl show "$ACL" >/dev/null 2>&1; then
-  incus network acl create "$ACL"
-  # 10.0.0.0/8 except 10.77.0.0/16, the CI bridge's own range.
-  for cidr in 10.0.0.0/10 10.64.0.0/13 10.72.0.0/14 10.76.0.0/16 10.78.0.0/15 10.80.0.0/12 10.96.0.0/11 10.128.0.0/9 \
+incus network acl show "$ACL" >/dev/null 2>&1 || incus network acl create "$ACL"
+# The whole rule set is written on every run, so a run that stopped halfway or an older rule set is replaced.
+{
+  echo "egress:"
+  # 10.0.0.0/8 except 10.77.0.0/24, the CI bridge itself, plus the other private, shared and campus ranges.
+  for cidr in 10.0.0.0/10 10.64.0.0/13 10.72.0.0/14 10.76.0.0/16 \
+      10.77.1.0/24 10.77.2.0/23 10.77.4.0/22 10.77.8.0/21 10.77.16.0/20 10.77.32.0/19 10.77.64.0/18 10.77.128.0/17 \
+      10.78.0.0/15 10.80.0.0/12 10.96.0.0/11 10.128.0.0/9 \
       172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 169.254.0.0/16 134.21.0.0/16; do
-    incus network acl rule add "$ACL" egress action=drop destination="$cidr"
+    printf -- '- action: drop\n  destination: %s\n  state: enabled\n' "$cidr"
   done
-  # The host itself, every port but GARM's callback and the image mirror (DHCP and DNS are allowed before any ACL).
-  incus network acl rule add "$ACL" egress action=drop destination="$BRIDGE_IP" protocol=tcp \
-    destination_port="1-$((MIRROR_PORT - 1)),$((MIRROR_PORT + 1))-$((GARM_PORT - 1)),$((GARM_PORT + 1))-65535"
-  incus network acl rule add "$ACL" egress action=drop destination="$BRIDGE_IP" protocol=udp destination_port=1-65535
-  incus network acl rule add "$ACL" egress action=allow destination=0.0.0.0/0
-fi
+  # The host itself, every port but the image mirror and GARM's callback (DHCP and DNS are allowed before any ACL).
+  printf -- '- action: drop\n  destination: %s\n  protocol: tcp\n  destination_port: %s\n  state: enabled\n' \
+    "$BRIDGE_IP" "1-$((MIRROR_PORT - 1)),$((MIRROR_PORT + 1))-$((GARM_PORT - 1)),$((GARM_PORT + 1))-65535"
+  printf -- '- action: drop\n  destination: %s\n  protocol: udp\n  destination_port: 1-65535\n  state: enabled\n' "$BRIDGE_IP"
+  printf -- '- action: allow\n  destination: 0.0.0.0/0\n  state: enabled\n'
+  echo "ingress: []"
+} | incus network acl edit "$ACL"
 incus network set "$BRIDGE" security.acls="$ACL"
 
 log "ufw lets the CI bridge reach DHCP, DNS, the mirror and GARM on the host, and route out"
@@ -195,9 +200,6 @@ make_profile() {
   done
   incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
     || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
-  for dir in cargo-git targets; do
-    incus profile device remove "$name" "$dir" --project "$PROJECT" >/dev/null 2>&1 || true
-  done
 }
 # 10 light and 6 heavy VMs fit the 256 GiB cap. The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
 make_profile ci-light 4 12GiB

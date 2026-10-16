@@ -150,7 +150,10 @@ jobs:
   # the archive.
   coverage-server-build:
     name: Coverage server build
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    # The partitions read this job's archive, so both run on emi only while
+    # both scale-set variables name emi pools, since put-files and get-files
+    # must pick the same store.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-latest' }}
     timeout-minutes: 60
     if: >-
       github.event_name == 'push' ||
@@ -203,7 +206,7 @@ jobs:
     name: Coverage server ${{ matrix.partition }}/${{ strategy.job-total }}
     needs: coverage-server-build
     # Running the archive compiles nothing, so a light VM is enough.
-    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     env:
       CONNETTO_REQUIRE_MULTICAST: "1"
     timeout-minutes: 60
@@ -211,7 +214,7 @@ jobs:
       fail-fast: false
       # One suite layout on both runner kinds, with more partitions on emi.
       matrix:
-        partition: ${{ fromJSON(vars.LINUX_LIGHT && '[1, 2, 3, 4]' || '[1, 2, 3]') }}
+        partition: ${{ fromJSON(vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY && '[1, 2, 3, 4]' || '[1, 2, 3]') }}
     steps:
       - uses: actions/checkout@v7
 
