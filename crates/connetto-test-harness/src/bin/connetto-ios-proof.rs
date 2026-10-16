@@ -1,5 +1,6 @@
 //! Deploys `examples/dioxus-desktop-demo` to an iOS simulator or a paired
-//! iPhone or iPad and walks R88's proof on it, which is sign in, sync, write
+//! iPhone or iPad, or with `--demo tauri` `examples/tauri-leptos-demo` to a
+//! simulator, and walks R88's proof on it, which is sign in, sync, write
 //! offline and upload on reconnect, then R51's re-check after time away.
 //!
 //! With `--peer-device UDID --every-join --hotspot-passphrase PASS` a second
@@ -15,15 +16,17 @@
 //! ```text
 //! cargo build -p connetto-test-harness --bin connetto-ios-proof
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
-//!   target/debug/connetto-ios-proof [--simulator UDID | --device UDID --identity SHA1] [--app PATH]
+//!   target/debug/connetto-ios-proof [--simulator UDID | --device UDID --identity SHA1] \
+//!     [--demo dioxus|tauri] [--app PATH] \
 //!     [--peer-device UDID --every-join --hotspot-passphrase PASS]
 //! ```
 //!
-//! A simulator build links the keychain entitlements into the executable as
-//! Xcode does, under the team ID `CONNETTO_IOS_TEAM_ID` names or else the
-//! team prefix of the Mac's Apple Development certificate. The simulator
-//! checks no signature against that ID, so any ID serves a Mac without the
-//! certificate. A device build is signed with the identity
+//! A simulator build carries the keychain entitlements under the team ID
+//! `CONNETTO_IOS_TEAM_ID` names or else the team prefix of the Mac's Apple
+//! Development certificate, linked into the executable for the dioxus demo
+//! and embedded by Xcode from the development team for the Tauri demo. The
+//! simulator checks no signature against that ID, so any ID serves a Mac
+//! without the certificate. A device build is signed with the identity
 //! `connetto-ios-signing` prepared, whose keychain the driver unlocks, and a
 //! device run needs the stack on a host the device reaches, which on the
 //! maintainer's tailnet is `CONNETTO_STACK_PUBLIC_HOST` with TLS. The demo and
@@ -58,10 +61,52 @@ use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
 use tokio::time::{Instant, sleep, timeout};
 
-const BUNDLE: &str = "dev.connetto.dioxusdemo";
-const PROCESS: &str = "connetto-dioxus-desktop-demo";
 const DEMO_DIR: [&str; 2] = ["examples", "dioxus-desktop-demo"];
 const APP: &str = "target/dx/connetto-dioxus-desktop-demo/debug/ios/ConnettoDioxusDesktopDemo.app";
+const TAURI_DIR: [&str; 3] = ["examples", "tauri-leptos-demo", "src-tauri"];
+/// Where `cargo tauri ios build` leaves a simulator build.
+const TAURI_APP: &str = "gen/apple/build/arm64-sim/connetto-tauri-demo.app";
+
+/// The demo the proof deploys, `--demo dioxus` (the default) or `--demo
+/// tauri` (`examples/tauri-leptos-demo`).
+#[derive(Clone, Copy, Default)]
+enum Demo {
+    #[default]
+    Dioxus,
+    Tauri,
+}
+
+/// The demo this run deploys, set once from the command line.
+static DEMO: std::sync::OnceLock<Demo> = std::sync::OnceLock::new();
+
+fn demo() -> Demo {
+    DEMO.get().copied().unwrap_or_default()
+}
+
+/// The demo's bundle identifier.
+fn bundle() -> &'static str {
+    match demo() {
+        Demo::Dioxus => "dev.connetto.dioxusdemo",
+        Demo::Tauri => "dev.connetto.tauridemo",
+    }
+}
+
+/// The demo's executable, which names its process.
+fn process() -> &'static str {
+    match demo() {
+        Demo::Dioxus => "connetto-dioxus-desktop-demo",
+        Demo::Tauri => "connetto-tauri-demo",
+    }
+}
+
+/// Whether a page URL is the demo's own page rather than the login.
+fn is_demo_page(url: &str) -> bool {
+    match demo() {
+        Demo::Dioxus => url.starts_with("dioxus://"),
+        Demo::Tauri => url.starts_with("tauri://"),
+    }
+}
+
 const USER: &str = "alice";
 /// The simulator a run uses when none is named.
 const DEFAULT_SIMULATOR: &str = "iPhone 17 Pro";
@@ -353,7 +398,7 @@ async fn sign_in(
         {
             target.screenshot(evidence, "login-page").await?;
             submit_login(&mut login).await?;
-            let mut app = inspector.page(|url| url.starts_with("dioxus://")).await?;
+            let mut app = inspector.page(is_demo_page).await?;
             app.wait_for_text("status: connected", Duration::from_secs(90))
                 .await?;
             // The simulator creates gated keychain items without enforcing
@@ -366,10 +411,7 @@ async fn sign_in(
             .await?;
             return Ok(app);
         }
-        if let Some(mut app) = inspector
-            .try_page(|url| url.starts_with("dioxus://"))
-            .await?
-        {
+        if let Some(mut app) = inspector.try_page(is_demo_page).await? {
             // A page that does not answer is looked for again through a fresh
             // proxy, since a relaunched app's inspector can stall once.
             match app.page_text().await {
@@ -414,7 +456,7 @@ async fn sign_out(app: &mut PageSession) -> Result<()> {
 /// uninstall while each run's provider names a new account.
 async fn leave_signed_out(phone: &Target, evidence: &Path) -> Result<()> {
     let mut inspector = Inspector::start(phone, evidence).await?;
-    let mut app = inspector.page(|url| url.starts_with("dioxus://")).await?;
+    let mut app = inspector.page(is_demo_page).await?;
     if app.page_text().await?.contains("Signed in as:") {
         sign_out(&mut app).await?;
     }
@@ -454,8 +496,8 @@ async fn recheck_after_time_away(
     step("re-check after time away");
     target.bring_to_front(SETTINGS).await?;
     sleep(RECHECK_AFTER + Duration::from_secs(5)).await;
-    target.bring_to_front(BUNDLE).await?;
-    let mut app = inspector.page(|url| url.starts_with("dioxus://")).await?;
+    target.bring_to_front(bundle()).await?;
+    let mut app = inspector.page(is_demo_page).await?;
     if let Target::Device { .. } = target {
         app.wait_for_text("gate: locked", Duration::from_secs(30))
             .await?;
@@ -508,6 +550,15 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
             "--app" => {
                 arguments.app = Some(PathBuf::from(argument_value(&mut args, arg)?.to_owned()));
             }
+            "--demo" => {
+                let chosen = match argument_value(&mut args, arg)? {
+                    "dioxus" => Demo::Dioxus,
+                    "tauri" => Demo::Tauri,
+                    other => bail!("unknown demo {other:?}, expected dioxus or tauri"),
+                };
+                DEMO.set(chosen)
+                    .map_err(|_| anyhow!("--demo given twice"))?;
+            }
             "--peer-device" => {
                 arguments.peer = Some(argument_value(&mut args, arg)?.to_owned());
             }
@@ -546,6 +597,9 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
     {
         bail!("--peer-device names the same device as --device");
     }
+    if arguments.every_join && matches!(demo(), Demo::Tauri) {
+        bail!("--every-join needs the dioxus demo, whose panel holds the peer controls");
+    }
     Ok(arguments)
 }
 
@@ -581,6 +635,9 @@ impl Target {
     }
 
     async fn build(&self, evidence: &Path) -> Result<PathBuf> {
+        if let Demo::Tauri = demo() {
+            return self.build_tauri().await;
+        }
         let demo = repo_path(&DEMO_DIR)?;
         step("build");
         let mut dx = Command::new("dx");
@@ -628,12 +685,42 @@ impl Target {
         Ok(app)
     }
 
+    /// Build the Tauri demo for the simulator. Xcode embeds the application
+    /// identifier the keychain needs from the development team.
+    async fn build_tauri(&self) -> Result<PathBuf> {
+        let Self::Simulator { .. } = self else {
+            bail!("the Tauri demo is proven on a simulator only");
+        };
+        let demo = repo_path(&TAURI_DIR)?;
+        step("build");
+        let mut cargo = Command::new("cargo");
+        cargo
+            .current_dir(&demo)
+            .args([
+                "tauri",
+                "ios",
+                "build",
+                "--debug",
+                "--target",
+                "aarch64-sim",
+            ])
+            .env("APPLE_DEVELOPMENT_TEAM", signing_team().await?);
+        if demo_has_device_identity() {
+            cargo.args(["--features", "device-identity"]);
+        }
+        let status = cargo.status().await.context("starting cargo tauri")?;
+        if !status.success() {
+            bail!("cargo tauri ios build failed with {status}");
+        }
+        Ok(demo.join(TAURI_APP))
+    }
+
     /// Install the app afresh.
     async fn install(&self, app: &Path) -> Result<()> {
         let app = app.display().to_string();
         match self {
             Self::Simulator { udid } => {
-                let _ = xcrun(&["simctl", "uninstall", udid, BUNDLE]).await;
+                let _ = xcrun(&["simctl", "uninstall", udid, bundle()]).await;
                 xcrun(&["simctl", "keychain", udid, "reset"]).await?;
                 xcrun(&["simctl", "install", udid, &app]).await.map(drop)
             }
@@ -645,7 +732,7 @@ impl Target {
                     "app",
                     "--device",
                     udid,
-                    BUNDLE,
+                    bundle(),
                 ])
                 .await;
                 xcrun(&[
@@ -668,7 +755,7 @@ impl Target {
         match self {
             Self::Simulator { udid } => {
                 let output = Command::new("xcrun")
-                    .args(["simctl", "launch", udid, BUNDLE])
+                    .args(["simctl", "launch", udid, bundle()])
                     .envs(
                         env.iter()
                             .map(|(key, value)| (format!("SIMCTL_CHILD_{key}"), *value)),
@@ -702,7 +789,7 @@ impl Target {
                     "--terminate-existing",
                     "--environment-variables",
                     &env,
-                    BUNDLE,
+                    bundle(),
                 ])
                 .await
                 .map(drop)
@@ -730,7 +817,7 @@ impl Target {
 
     async fn terminate(&self) -> Result<()> {
         match self {
-            Self::Simulator { udid } => xcrun(&["simctl", "terminate", udid, BUNDLE])
+            Self::Simulator { udid } => xcrun(&["simctl", "terminate", udid, bundle()])
                 .await
                 .map(drop),
             Self::Device { .. } => Ok(()),
@@ -787,7 +874,7 @@ impl Target {
                 "--domain-type",
                 "appDataContainer",
                 "--domain-identifier",
-                BUNDLE,
+                bundle(),
                 "--source",
                 source,
                 "--destination",
@@ -816,7 +903,7 @@ impl Target {
             "--style",
             "compact",
             "--predicate",
-            &format!("process == \"{PROCESS}\""),
+            &format!("process == \"{}\"", process()),
         ])
         .await
     }
@@ -1635,7 +1722,7 @@ fn organizational_unit(subject: &str) -> Option<&str> {
 }
 
 fn simulator_entitlements(team: &str) -> String {
-    let id = format!("{team}.{BUNDLE}");
+    let id = format!("{team}.{}", bundle());
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -1751,7 +1838,7 @@ impl Inspector {
     async fn reattach(&mut self) -> Result<PageSession> {
         self.restart_at = Instant::now();
         self.keep_alive().await?;
-        self.page(|url| url.starts_with("dioxus://")).await
+        self.page(is_demo_page).await
     }
 
     /// Restart the proxy after [`PROXY_RESTART`] without a match.
