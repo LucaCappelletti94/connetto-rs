@@ -378,8 +378,8 @@ pub async fn spawn_server(
     Ok(child)
 }
 
-/// Build the release `connetto-server` unless `CONNETTO_SERVER_BIN` names
-/// one, and return its path.
+/// Build `connetto-server` in the [`test_profile`] unless `CONNETTO_SERVER_BIN`
+/// names one, and return its path.
 ///
 /// # Errors
 ///
@@ -392,16 +392,18 @@ pub async fn ensure_server_bin() -> Result<PathBuf> {
         }
         return Err(anyhow!("CONNETTO_SERVER_BIN names a missing file"));
     }
-    let candidate = target_dir()?
-        .join("release")
-        .join(exe_name("connetto-server"));
+    let profile = test_profile();
+    // Cargo writes the dev profile to target/debug and every other profile under its own name.
+    let output = if profile == "dev" { "debug" } else { &profile };
+    let candidate = target_dir()?.join(output).join(exe_name("connetto-server"));
     // The build runs even when the binary exists. A cached tree can hold a
     // server from another commit, and cargo's fingerprinting makes the warm
     // case a no-op while a stale exists() shortcut cannot.
     let args = strings(&[
         "+stable",
         "build",
-        "--release",
+        "--profile",
+        &profile,
         "--all-features",
         "-p",
         "connetto-server",
@@ -654,6 +656,12 @@ pub fn exe_name(base: &str) -> String {
 /// Owned process arguments.
 pub fn strings(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
+}
+
+/// The cargo profile the harness builds binaries in, which
+/// `CARGO_TEST_PROFILE` names and which defaults to `release`.
+pub fn test_profile() -> String {
+    std::env::var("CARGO_TEST_PROFILE").unwrap_or_else(|_| "release".to_owned())
 }
 
 /// A command line for logs.

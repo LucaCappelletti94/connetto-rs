@@ -1,0 +1,31 @@
+name: Take files from an earlier job
+description: >-
+  Fetches a directory an earlier job of this run stored with put-files, from
+  the host's handoff mount on emi or from the run's artifacts on a hosted
+  runner, where the files lose their executable bit.
+inputs:
+  name:
+    description: The name put-files stored the directory under.
+    required: true
+  path:
+    description: Where the directory's contents land.
+    required: true
+runs:
+  using: composite
+  steps:
+    - if: runner.environment == 'github-hosted'
+      uses: actions/download-artifact@v8
+      with:
+        name: ${{ inputs.name }}
+        path: ${{ inputs.path }}
+
+    - if: runner.environment != 'github-hosted'
+      shell: bash
+      env:
+        NAME: ${{ inputs.name }}
+        TARGET: ${{ inputs.path }}
+      run: |
+        source="/srv/cache/handoff/${GITHUB_REPOSITORY//\//-}-$GITHUB_RUN_ID/$NAME"
+        test -d "$source" || { echo "::error::no files named $NAME were handed over in run $GITHUB_RUN_ID"; exit 1; }
+        mkdir -p "$TARGET"
+        cp -a "$source/." "$TARGET/"

@@ -21,10 +21,14 @@ env:
 # Caches are saved only from main, which restores exact keys only, so a
 # tree saved after a Cargo.lock change holds none of the artifacts the
 # older lock left behind. Pull requests also restore the nearest older key.
+# Self-hosted runners skip these steps, since their host-mounted cargo
+# registry and sccache already hold the same work without a download.
 jobs:
   checks:
     name: Check ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    # Only pushes and same-repository pull requests may reach the self-hosted
+    # runners on emi. LINUX_LIGHT names their scale set, and unset it means GitHub's.
+    runs-on: &light-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     timeout-minutes: 40
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. These jobs never run the demo, so any file serves.
@@ -62,6 +66,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -116,7 +121,7 @@ jobs:
               ${{ matrix.target }}
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -127,7 +132,7 @@ jobs:
 
   nightly-lint:
     name: Nightly lint
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 45
     # --all-features turns on the demo's device-identity feature, whose build
     # embeds a deployment root. This job never runs the demo, so any file serves.
@@ -138,6 +143,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -183,7 +189,7 @@ jobs:
           fi
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -197,12 +203,13 @@ jobs:
     # device. Its own job because the matrix legs pass --all-features, which
     # would switch the desktop renderer on for the phone.
     name: Build dioxus-desktop-demo android
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -233,7 +240,7 @@ jobs:
             --features mobile
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -467,11 +474,25 @@ jobs:
 
   rust-tests:
     name: Rust tests ${{ matrix.name }}
-    runs-on: ubuntu-latest
+    # Only pushes and same-repository pull requests may reach the self-hosted
+    # runners on emi. LINUX_HEAVY names their scale set, and unset it means GitHub's.
+    runs-on: &heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    # A same-repository pull request runs these suites once, instrumented, in
+    # coverage.yml. Forks and Dependabot get no Codecov token, and main runs
+    # them here in release.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name != github.repository ||
+      github.event.pull_request.user.login == 'dependabot[bot]'
     # The discovery proofs fail here, never skip, when loopback multicast is
     # missing (R76 slice 3).
     env:
       CONNETTO_REQUIRE_MULTICAST: "1"
+      # Pull requests build tests without thin LTO and with 16 codegen units.
+      # Pushes to main keep the release profile, so a thin-LTO-only bug still
+      # fails there. The secret-store script reads the same variable.
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: "0"
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -483,7 +504,7 @@ jobs:
         include:
           - name: server
             packages: -p connetto-server
-            # The e2e tests spawn both binaries from the release target dir,
+            # The e2e tests spawn both binaries from the test profile's target dir,
             # and neither cargo test nor nextest builds another package's bin.
             bins: -p connetto-server -p connetto-client
           - name: client
@@ -506,6 +527,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -517,6 +539,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore rust test output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -527,8 +550,7 @@ jobs:
       - name: Install stable toolchain
         run: rustup toolchain install stable --profile minimal
 
-      # dbus-daemon backs the fake Secret portal the client suite starts, and
-      # gnome-keyring the Secret Service group below (R71).
+      # dbus-daemon backs the fake Secret portal the client suite starts.
       - name: Install keyring helpers
         run: |
           sudo apt-get update
@@ -543,7 +565,7 @@ jobs:
 
       - name: Build spawned binaries
         if: matrix.bins != ''
-        run: cargo +stable build --release --all-features --bins ${{ matrix.bins }}
+        run: cargo +stable build --profile "$CARGO_TEST_PROFILE" --all-features --bins ${{ matrix.bins }}
 
       - uses: ./.github/actions/pull-test-images
 
@@ -552,35 +574,7 @@ jobs:
       # log-capture isolation, and a wedged test is killed and named instead
       # of holding the shard to the job timeout.
       - name: Run Rust suite
-        run: keyctl session -- cargo +stable nextest run --release --all-features --test-threads 4 ${{ matrix.packages }}
-
-      # R71's groups that need a private session bus, root, or Docker.
-      - name: Run Secret Service custody tests
-        if: matrix.name == 'client'
-        run: scripts/linux-secret-store-tests.sh secret-service
-
-      - name: Run systemd unit custody tests
-        if: matrix.name == 'client'
-        run: scripts/linux-secret-store-tests.sh systemd
-
-      - name: Run container custody tests
-        if: matrix.name == 'client'
-        run: scripts/linux-secret-store-tests.sh container
-
-      # R71 proofs 4, 5 and 12: GNOME Keyring's and KDE Wallet's real dialogs
-      # answered on a virtual display, and a real Flatpak through the Secret portal.
-      - name: Run desktop custody proofs
-        if: matrix.name == 'client'
-        env:
-          DESKTOP_PROOF_OUT: ${{ runner.temp }}/desktop-proofs
-        run: scripts/linux-secret-store-tests.sh desktop
-
-      - uses: actions/upload-artifact@v7
-        if: always() && matrix.name == 'client'
-        with:
-          name: desktop-custody-proofs
-          path: ${{ runner.temp }}/desktop-proofs
-          if-no-files-found: ignore
+        run: keyctl session -- cargo +stable nextest run --cargo-profile "$CARGO_TEST_PROFILE" --all-features --test-threads 4 ${{ matrix.packages }}
 
       - name: Prune target cache
         if: always()
@@ -592,7 +586,7 @@ jobs:
           rm -rf target/tmp
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -602,7 +596,103 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save rust test output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: target
+          key: ${{ steps.cache-2.outputs.cache-primary-key }}
+
+  custody-tests:
+    # R71's Linux secret-store groups that need a private session bus, root,
+    # Docker or a virtual display, which every run keeps.
+    name: Custody tests
+    runs-on: *heavy-runner
+    env:
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: "0"
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        id: cache-1
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      - name: Restore custody test output
+        if: runner.environment == 'github-hosted'
+        id: cache-2
+        uses: actions/cache/restore@v6
+        with:
+          path: target
+          key: t-custody-tests-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-custody-tests-{0}-', runner.os) || '' }}
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal
+
+      - name: Install keyring helpers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y keyutils dbus gnome-keyring
+
+      - uses: taiki-e/install-action@nextest
+
+      - uses: ./.github/actions/pull-test-images
+
+      # coverage.yml runs this group instrumented whenever it runs the client suite.
+      - name: Run Secret Service custody tests
+        if: >-
+          github.event_name != 'pull_request' ||
+          github.event.pull_request.head.repo.full_name != github.repository ||
+          github.event.pull_request.user.login == 'dependabot[bot]'
+        run: scripts/linux-secret-store-tests.sh secret-service
+
+      - name: Run systemd unit custody tests
+        run: scripts/linux-secret-store-tests.sh systemd
+
+      - name: Run container custody tests
+        run: scripts/linux-secret-store-tests.sh container
+
+      # R71 proofs 4, 5 and 12: GNOME Keyring's and KDE Wallet's real dialogs
+      # answered on a virtual display, and a real Flatpak through the Secret portal.
+      - name: Run desktop custody proofs
+        env:
+          DESKTOP_PROOF_OUT: ${{ runner.temp }}/desktop-proofs
+        run: scripts/linux-secret-store-tests.sh desktop
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: desktop-custody-proofs
+          path: ${{ runner.temp }}/desktop-proofs
+          if-no-files-found: ignore
+
+      - name: Prune target cache
+        if: always()
+        run: |
+          rm -rf "target/$CARGO_TEST_PROFILE/incremental"
+          rm -rf target/tmp
+
+      - name: Save cargo downloads
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
+      - name: Save custody test output
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: target
@@ -610,14 +700,23 @@ jobs:
 
   browser-build:
     name: Browser stack build
-    runs-on: ubuntu-latest
-    # The release server and the release topology test binary, built once
-    # here instead of in every shard, where they were most of the budget.
+    # This job hands its binaries to the shards and the Android proof, so all
+    # of them run on emi only while both scale-set variables name emi pools,
+    # since put-files and get-files must pick the same store.
+    runs-on: &paired-heavy-runner ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_LIGHT && vars.LINUX_HEAVY || 'ubuntu-latest' }}
+    # The server and the topology test binary, built once here instead of in
+    # every shard, where they were most of the budget. Pull requests build
+    # them in testfast like the Rust test jobs, and the harness reads the same
+    # variable for the builds it starts.
+    env:
+      CARGO_TEST_PROFILE: ${{ github.event_name == 'pull_request' && 'testfast' || 'release' }}
+      CARGO_INCREMENTAL: "0"
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -629,6 +728,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore native build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -642,7 +742,7 @@ jobs:
       - name: Build the browser stack
         run: |
           cargo +stable run \
-            --release \
+            --profile "$CARGO_TEST_PROFILE" \
             -p connetto-test-harness \
             --bin connetto-browser-stack \
             -- \
@@ -652,40 +752,36 @@ jobs:
       - name: Build the Android proof
         run: |
           cargo +stable build \
-            --release \
+            --profile "$CARGO_TEST_PROFILE" \
             -p connetto-test-harness \
             --bin connetto-demo-stack \
             --bin connetto-android-proof
           mkdir android-bins
-          cp target/release/connetto-demo-stack target/release/connetto-android-proof android-bins/
+          cp "target/$CARGO_TEST_PROFILE/connetto-demo-stack" "target/$CARGO_TEST_PROFILE/connetto-android-proof" android-bins/
 
       # Panic locations do not need the DWARF sections.
       - name: Strip debug sections from the prebuilt binaries
         run: strip --strip-debug browser-bins/* android-bins/*
 
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/put-files
         with:
           name: browser-bins
           path: browser-bins
-          retention-days: 1
-          if-no-files-found: error
 
-      - uses: actions/upload-artifact@v7
+      - uses: ./.github/actions/put-files
         with:
           name: android-bins
           path: android-bins
-          retention-days: 1
-          if-no-files-found: error
 
       - name: Prune target cache
         if: always()
         run: |
           rm -rf target/debug/incremental
-          rm -rf target/release/incremental
+          rm -rf "target/$CARGO_TEST_PROFILE/incremental"
           rm -rf target/tmp
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -695,7 +791,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save native build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: target
@@ -704,7 +800,8 @@ jobs:
   browser-tests:
     name: Browser tests ${{ matrix.shard }}/4
     needs: browser-build
-    runs-on: ubuntu-latest
+    # Light VMs sit idle once the checks finish, while the heavy ones still run the suites.
+    runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && vars.LINUX_LIGHT != 'ubuntu-latest' && vars.LINUX_HEAVY != 'ubuntu-latest' && vars.LINUX_HEAVY && vars.LINUX_LIGHT || 'ubuntu-latest' }}
     # A shard runs a quarter of the suites against its own machine-local
     # stack from the prebuilt binaries, so the serial rule inside one process
     # holds while the wall clock divides by four.
@@ -721,6 +818,7 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -733,6 +831,7 @@ jobs:
 
       # The wasm tree in target-wasm is the one graph a shard still builds.
       - name: Restore wasm build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -740,7 +839,7 @@ jobs:
           key: t-browser-wasm-lines-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-browser-wasm-lines-{0}-', runner.os) || '' }}
 
-      - uses: actions/download-artifact@v8
+      - uses: ./.github/actions/get-files
         with:
           name: browser-bins
           path: browser-bins
@@ -778,7 +877,7 @@ jobs:
           rm -rf target-wasm/debug/incremental
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -788,7 +887,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save wasm build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: target-wasm
@@ -799,12 +898,14 @@ jobs:
     # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
     name: Android emulator proof
     needs: browser-build
-    runs-on: ubuntu-latest
+    # On a light VM the proof timed out at the browser tab and at the keyguard.
+    runs-on: *paired-heavy-runner
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -820,6 +921,7 @@ jobs:
       # The cache matches paths without descending into them, so it lists the
       # target's children for the exclusion to apply.
       - name: Restore the demo's build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -829,12 +931,12 @@ jobs:
           key: t-android-emulator-lines-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-lines-{0}-', runner.os) || '' }}
 
-      - uses: actions/download-artifact@v8
+      - uses: ./.github/actions/get-files
         with:
           name: browser-bins
           path: browser-bins
 
-      - uses: actions/download-artifact@v8
+      - uses: ./.github/actions/get-files
         with:
           name: android-bins
           path: android-bins
@@ -927,7 +1029,7 @@ jobs:
         run: find examples/dioxus-desktop-demo/target -type d -name incremental -prune -exec rm -rf {} +
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -937,7 +1039,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save the demo's build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -947,12 +1049,13 @@ jobs:
 
   file-core-wasm:
     name: File core wasm
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -986,7 +1089,7 @@ jobs:
         run: wasm-pack test --headless --chrome crates/connetto-file-core
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -997,12 +1100,13 @@ jobs:
 
   passkey-gate:
     name: Passkey gate
-    runs-on: ubuntu-latest
+    runs-on: *light-runner
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
       - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
         id: cache-1
         uses: actions/cache/restore@v6
         with:
@@ -1014,6 +1118,7 @@ jobs:
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
       - name: Restore passkey build output
+        if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
@@ -1053,7 +1158,7 @@ jobs:
           rm -rf examples/webauthn-unlock/target/wasm32-unknown-unknown/release/incremental
 
       - name: Save cargo downloads
-        if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: |
@@ -1063,7 +1168,7 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
       - name: Save passkey build output
-        if: github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
           path: examples/webauthn-unlock/target
