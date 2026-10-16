@@ -1,0 +1,48 @@
+name: Install the Tauri demo's tools
+description: >-
+  Installs the Tauri CLI at the version that generated the Tauri demo's
+  Android and Xcode projects, and trunk, which builds its Leptos UI, both
+  checked against pinned digests, plus the wasm target the UI compiles to.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        case "${RUNNER_OS}-${RUNNER_ARCH}" in
+          Linux-X64)
+            triple=x86_64-unknown-linux-gnu
+            tauri_archive=cargo-tauri-$triple.tgz
+            tauri_sum=04ef3a9a2ed7b7dc479bef08ab40deee80065c99fc778f79ebce775eb72bbeff
+            trunk_sum=f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b
+            ;;
+          macOS-ARM64)
+            triple=aarch64-apple-darwin
+            tauri_archive=cargo-tauri-$triple.zip
+            tauri_sum=ee35ee364a0c626df7852d9a5bc0c5394b6440772e9864cfb9b11dcb8d33f527
+            trunk_sum=764e299dd50d89442a4e96a236349f57961984b701e74d3dbdb39cd1c9f5101e
+            ;;
+          *)
+            echo "::error::no Tauri tools are pinned for ${RUNNER_OS}-${RUNNER_ARCH}"
+            exit 1
+            ;;
+        esac
+        trunk_archive=trunk-$triple.tar.gz
+        dir="$(mktemp -d)"
+        curl -fsSL -o "$dir/$tauri_archive" \
+          "https://github.com/tauri-apps/tauri/releases/download/tauri-cli-v2.12.1/$tauri_archive"
+        curl -fsSL -o "$dir/$trunk_archive" \
+          "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/$trunk_archive"
+        # macOS ships shasum only, and a minimal Linux image may lack Perl's shasum.
+        if command -v sha256sum >/dev/null; then check=(sha256sum -c); else check=(shasum -a 256 -c); fi
+        printf '%s  %s\n%s  %s\n' "$tauri_sum" "$tauri_archive" "$trunk_sum" "$trunk_archive" \
+          | (cd "$dir" && "${check[@]}")
+        mkdir -p ~/.cargo/bin
+        case "$tauri_archive" in
+          *.zip) unzip -q -o "$dir/$tauri_archive" cargo-tauri -d ~/.cargo/bin ;;
+          *) tar xzf "$dir/$tauri_archive" -C ~/.cargo/bin cargo-tauri ;;
+        esac
+        tar xzf "$dir/$trunk_archive" -C ~/.cargo/bin trunk
+        rm -rf "$dir"
+        rustup target add wasm32-unknown-unknown --toolchain stable
+        cargo tauri --version
+        trunk --version

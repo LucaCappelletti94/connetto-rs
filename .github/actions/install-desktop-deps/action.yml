@@ -1,7 +1,8 @@
 name: Install the desktop dependencies
 description: >-
-  Installs the system libraries the Dioxus desktop renderer links, the
-  webview stack connetto-dioxus's desktop feature and the desktop demo pull.
+  Installs the system libraries the Dioxus desktop renderer and Tauri link,
+  the webview stack connetto-dioxus's desktop feature and both desktop demos
+  pull.
 runs:
   using: composite
   steps:
