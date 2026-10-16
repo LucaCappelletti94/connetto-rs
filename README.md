@@ -67,4 +67,4 @@ The drawing below is the whole system coloured by build status. It is too dense 
 | `connetto-file-core`, `connetto-file-server`, `connetto-file-client` | The file stack, which depends on connetto and never the reverse |
 | `connetto-test-harness` | The in-process CDC loop and the browser stack runner behind the tests |
 
-`examples/` holds a Dioxus demo for desktop, Android and iOS, Dioxus and Yew web demos sharing one deployment, the browser smoke suite, and the passkey unlock proof.
+`examples/` holds a Dioxus demo for desktop, Android and iOS, the same demo on Tauri with a Leptos UI, Dioxus and Yew web demos sharing one deployment, the browser smoke suite, and the passkey unlock proof.

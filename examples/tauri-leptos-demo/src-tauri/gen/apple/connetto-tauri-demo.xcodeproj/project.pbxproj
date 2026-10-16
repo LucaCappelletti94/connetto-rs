@@ -1,0 +1,620 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 77;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		01A12D9897FBD8F3B0853E31 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 4FCEB0307C5AF4BB10CB822A /* Assets.xcassets */; };
+		11245FAD97927F4DEBF40F46 /* DioxusSwiftPlugins.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1A9A719832D86B6AA9F859B9 /* DioxusSwiftPlugins.framework */; };
+		1FBFFC836A0A1E7F1554733D /* libapp.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 191904205107476C4636B0D5 /* libapp.a */; };
+		34AC60788DB898F5640F22D2 /* Security.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = DA0370C0146D8F4FDCD92EF0 /* Security.framework */; };
+		46695DEAAFE1CC31E0CFE5A0 /* Metal.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 860EA9257DEC2511DC5FB27D /* Metal.framework */; };
+		477439B47113E6722C95A8E5 /* DeviceCheck.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = AB4EC1316B82FBB8DAEA4A45 /* DeviceCheck.framework */; };
+		4FADDC710C2989F2C515F20F /* SystemConfiguration.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1FB610430CBFAC19877C7222 /* SystemConfiguration.framework */; };
+		685650EB5E44872DBC3D49E2 /* WebKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 263EB690C4CB2C14BF96BB34 /* WebKit.framework */; };
+		6EEFDEB9F7D9412D6F20D665 /* UIKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = EE8E36A367F81B75970DF0D3 /* UIKit.framework */; };
+		76B5866912DC698851857734 /* main.mm in Sources */ = {isa = PBXBuildFile; fileRef = 312D30AFC46A2B4D116442D2 /* main.mm */; };
+		7AAB187C0A8D2721B723D0F4 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = CAED1ED81FF9D6D0411BF070 /* LaunchScreen.storyboard */; };
+		7D19A9FFD4FFC5FAABF58CD0 /* DioxusSwiftPlugins.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 1A9A719832D86B6AA9F859B9 /* DioxusSwiftPlugins.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		9707B2B7286246A617DA2A5B /* QuartzCore.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 93F242372AF98321DEE6AD68 /* QuartzCore.framework */; };
+		985DE7989F8BC128005A2FE0 /* CoreGraphics.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 2AED0C088BB2AB9F87A0ABBE /* CoreGraphics.framework */; };
+		A46BF1A591F781A60C679743 /* MetalKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 6C3FB2434BA7F2109C0E155C /* MetalKit.framework */; };
+		BA1B7BC9E638E824495395CA /* assets in Resources */ = {isa = PBXBuildFile; fileRef = 52E60E28205DE506BBE10345 /* assets */; };
+		D3819C48DC617EAA6C437DE9 /* AuthSessionPlugin.swift in Sources */ = {isa = PBXBuildFile; fileRef = BF7866A1157BA3AA96936688 /* AuthSessionPlugin.swift */; };
+		F130A12868571D1D32D98673 /* LocalAuthentication.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 1F53D73CA573CBD5514B0F2E /* LocalAuthentication.framework */; };
+		F693152E882AEDE4889C7F11 /* AuthenticationServices.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 377A5500819D6C386EDBCE9A /* AuthenticationServices.framework */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXContainerItemProxy section */
+		85FD1C9FD10BA96C0013F79A /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = 6036F21C2BAEA84A9181F8EE /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = 9AB2945BF7200D099410A30E;
+			remoteInfo = DioxusSwiftPlugins;
+		};
+/* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		FE9E8941B03F05365D6E3174 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				7D19A9FFD4FFC5FAABF58CD0 /* DioxusSwiftPlugins.framework in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
+
+/* Begin PBXFileReference section */
+		191904205107476C4636B0D5 /* libapp.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; path = libapp.a; sourceTree = "<group>"; };
+		1A9A719832D86B6AA9F859B9 /* DioxusSwiftPlugins.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = DioxusSwiftPlugins.framework; sourceTree = BUILT_PRODUCTS_DIR; };
+		1F53D73CA573CBD5514B0F2E /* LocalAuthentication.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = LocalAuthentication.framework; path = System/Library/Frameworks/LocalAuthentication.framework; sourceTree = SDKROOT; };
+		1FB610430CBFAC19877C7222 /* SystemConfiguration.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemConfiguration.framework; path = System/Library/Frameworks/SystemConfiguration.framework; sourceTree = SDKROOT; };
+		263EB690C4CB2C14BF96BB34 /* WebKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = WebKit.framework; path = System/Library/Frameworks/WebKit.framework; sourceTree = SDKROOT; };
+		2AED0C088BB2AB9F87A0ABBE /* CoreGraphics.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = CoreGraphics.framework; path = System/Library/Frameworks/CoreGraphics.framework; sourceTree = SDKROOT; };
+		2C8DD751CF132F16DC75D624 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		312D30AFC46A2B4D116442D2 /* main.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = main.mm; sourceTree = "<group>"; };
+		377A5500819D6C386EDBCE9A /* AuthenticationServices.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = AuthenticationServices.framework; path = System/Library/Frameworks/AuthenticationServices.framework; sourceTree = SDKROOT; };
+		4972BA8F13C4FD257801AF53 /* connetto-tauri-demo_iOS.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = "connetto-tauri-demo_iOS.entitlements"; sourceTree = "<group>"; };
+		4E9514C9F8C4B07532D3D487 /* connetto-tauri-demo_iOS.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = "connetto-tauri-demo_iOS.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		4FCEB0307C5AF4BB10CB822A /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		52E60E28205DE506BBE10345 /* assets */ = {isa = PBXFileReference; lastKnownFileType = folder; path = assets; sourceTree = SOURCE_ROOT; };
+		6C3FB2434BA7F2109C0E155C /* MetalKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = MetalKit.framework; path = System/Library/Frameworks/MetalKit.framework; sourceTree = SDKROOT; };
+		860EA9257DEC2511DC5FB27D /* Metal.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Metal.framework; path = System/Library/Frameworks/Metal.framework; sourceTree = SDKROOT; };
+		93F242372AF98321DEE6AD68 /* QuartzCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = QuartzCore.framework; path = System/Library/Frameworks/QuartzCore.framework; sourceTree = SDKROOT; };
+		AB4EC1316B82FBB8DAEA4A45 /* DeviceCheck.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DeviceCheck.framework; path = System/Library/Frameworks/DeviceCheck.framework; sourceTree = SDKROOT; };
+		B6F1DE6DF2010663A55DA038 /* main.rs */ = {isa = PBXFileReference; path = main.rs; sourceTree = "<group>"; };
+		BF7866A1157BA3AA96936688 /* AuthSessionPlugin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthSessionPlugin.swift; sourceTree = "<group>"; };
+		CAED1ED81FF9D6D0411BF070 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		D8B3C784323A2E7BE218A5B2 /* lib.rs */ = {isa = PBXFileReference; path = lib.rs; sourceTree = "<group>"; };
+		DA0370C0146D8F4FDCD92EF0 /* Security.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Security.framework; path = System/Library/Frameworks/Security.framework; sourceTree = SDKROOT; };
+		DC48A172090F1A98C631A276 /* bindings.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = bindings.h; sourceTree = "<group>"; };
+		EE8E36A367F81B75970DF0D3 /* UIKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = UIKit.framework; path = System/Library/Frameworks/UIKit.framework; sourceTree = SDKROOT; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		2A622FC5C9DF614D0C06CC53 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				1FBFFC836A0A1E7F1554733D /* libapp.a in Frameworks */,
+				985DE7989F8BC128005A2FE0 /* CoreGraphics.framework in Frameworks */,
+				46695DEAAFE1CC31E0CFE5A0 /* Metal.framework in Frameworks */,
+				A46BF1A591F781A60C679743 /* MetalKit.framework in Frameworks */,
+				9707B2B7286246A617DA2A5B /* QuartzCore.framework in Frameworks */,
+				477439B47113E6722C95A8E5 /* DeviceCheck.framework in Frameworks */,
+				F130A12868571D1D32D98673 /* LocalAuthentication.framework in Frameworks */,
+				34AC60788DB898F5640F22D2 /* Security.framework in Frameworks */,
+				4FADDC710C2989F2C515F20F /* SystemConfiguration.framework in Frameworks */,
+				6EEFDEB9F7D9412D6F20D665 /* UIKit.framework in Frameworks */,
+				685650EB5E44872DBC3D49E2 /* WebKit.framework in Frameworks */,
+				11245FAD97927F4DEBF40F46 /* DioxusSwiftPlugins.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		9B04C48D15F405C1881F1C15 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				F693152E882AEDE4889C7F11 /* AuthenticationServices.framework in Frameworks */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		10178B1A5957A5C7E3C6BBE6 /* bindings */ = {
+			isa = PBXGroup;
+			children = (
+				DC48A172090F1A98C631A276 /* bindings.h */,
+			);
+			path = bindings;
+			sourceTree = "<group>";
+		};
+		2314C6526AF3282D6747BB71 /* connetto-tauri-demo */ = {
+			isa = PBXGroup;
+			children = (
+				312D30AFC46A2B4D116442D2 /* main.mm */,
+				10178B1A5957A5C7E3C6BBE6 /* bindings */,
+			);
+			path = "connetto-tauri-demo";
+			sourceTree = "<group>";
+		};
+		29D6A62872BB49A66C162E1A = {
+			isa = PBXGroup;
+			children = (
+				52E60E28205DE506BBE10345 /* assets */,
+				4FCEB0307C5AF4BB10CB822A /* Assets.xcassets */,
+				CAED1ED81FF9D6D0411BF070 /* LaunchScreen.storyboard */,
+				6E8833FC5E6501F8A58B8ED1 /* connetto-tauri-demo_iOS */,
+				458727F574D24A40CA5B728A /* Externals */,
+				7C3073439BBD9C894A085C93 /* Sources */,
+				6E0296E3E16B447D1AE7ADED /* Sources */,
+				A3383AE112A9B66B7181094D /* src */,
+				8E725266E62A036D718BBE01 /* Frameworks */,
+				40FB1CBB06917A4DBD613B4E /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		40FB1CBB06917A4DBD613B4E /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				4E9514C9F8C4B07532D3D487 /* connetto-tauri-demo_iOS.app */,
+				1A9A719832D86B6AA9F859B9 /* DioxusSwiftPlugins.framework */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		458727F574D24A40CA5B728A /* Externals */ = {
+			isa = PBXGroup;
+			children = (
+			);
+			path = Externals;
+			sourceTree = "<group>";
+		};
+		6E0296E3E16B447D1AE7ADED /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				BF7866A1157BA3AA96936688 /* AuthSessionPlugin.swift */,
+			);
+			name = Sources;
+			path = "../../../../../crates/connetto-auth-session/ios/Sources";
+			sourceTree = "<group>";
+		};
+		6E8833FC5E6501F8A58B8ED1 /* connetto-tauri-demo_iOS */ = {
+			isa = PBXGroup;
+			children = (
+				4972BA8F13C4FD257801AF53 /* connetto-tauri-demo_iOS.entitlements */,
+				2C8DD751CF132F16DC75D624 /* Info.plist */,
+			);
+			path = "connetto-tauri-demo_iOS";
+			sourceTree = "<group>";
+		};
+		7C3073439BBD9C894A085C93 /* Sources */ = {
+			isa = PBXGroup;
+			children = (
+				2314C6526AF3282D6747BB71 /* connetto-tauri-demo */,
+			);
+			path = Sources;
+			sourceTree = "<group>";
+		};
+		8E725266E62A036D718BBE01 /* Frameworks */ = {
+			isa = PBXGroup;
+			children = (
+				377A5500819D6C386EDBCE9A /* AuthenticationServices.framework */,
+				2AED0C088BB2AB9F87A0ABBE /* CoreGraphics.framework */,
+				AB4EC1316B82FBB8DAEA4A45 /* DeviceCheck.framework */,
+				191904205107476C4636B0D5 /* libapp.a */,
+				1F53D73CA573CBD5514B0F2E /* LocalAuthentication.framework */,
+				860EA9257DEC2511DC5FB27D /* Metal.framework */,
+				6C3FB2434BA7F2109C0E155C /* MetalKit.framework */,
+				93F242372AF98321DEE6AD68 /* QuartzCore.framework */,
+				DA0370C0146D8F4FDCD92EF0 /* Security.framework */,
+				1FB610430CBFAC19877C7222 /* SystemConfiguration.framework */,
+				EE8E36A367F81B75970DF0D3 /* UIKit.framework */,
+				263EB690C4CB2C14BF96BB34 /* WebKit.framework */,
+			);
+			name = Frameworks;
+			sourceTree = "<group>";
+		};
+		A3383AE112A9B66B7181094D /* src */ = {
+			isa = PBXGroup;
+			children = (
+				D8B3C784323A2E7BE218A5B2 /* lib.rs */,
+				B6F1DE6DF2010663A55DA038 /* main.rs */,
+			);
+			name = src;
+			path = ../../src;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		9AB2945BF7200D099410A30E /* DioxusSwiftPlugins */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = 1940C3861D7DCF6EE09BF68B /* Build configuration list for PBXNativeTarget "DioxusSwiftPlugins" */;
+			buildPhases = (
+				AE2EA6388A44B902AF195DB5 /* Sources */,
+				9B04C48D15F405C1881F1C15 /* Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = DioxusSwiftPlugins;
+			packageProductDependencies = (
+			);
+			productName = DioxusSwiftPlugins;
+			productReference = 1A9A719832D86B6AA9F859B9 /* DioxusSwiftPlugins.framework */;
+			productType = "com.apple.product-type.framework";
+		};
+		DD06849975224DD51AF5208C /* connetto-tauri-demo_iOS */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = C3781BB9B497FBB57277BCC1 /* Build configuration list for PBXNativeTarget "connetto-tauri-demo_iOS" */;
+			buildPhases = (
+				78FDB94CAA6C98C6B65C46A1 /* Build Rust Code */,
+				13D4B3C5B6720574F0F0327F /* Sources */,
+				22EEF7EEE393A4B6020095BE /* Resources */,
+				2A622FC5C9DF614D0C06CC53 /* Frameworks */,
+				FE9E8941B03F05365D6E3174 /* Embed Frameworks */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+				D200DDD7966E9491C33DBA1D /* PBXTargetDependency */,
+			);
+			name = "connetto-tauri-demo_iOS";
+			packageProductDependencies = (
+			);
+			productName = "connetto-tauri-demo_iOS";
+			productReference = 4E9514C9F8C4B07532D3D487 /* connetto-tauri-demo_iOS.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		6036F21C2BAEA84A9181F8EE /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = YES;
+				LastUpgradeCheck = 1430;
+				TargetAttributes = {
+				};
+			};
+			buildConfigurationList = 5604AD4B4D9FE4E69E3F73C8 /* Build configuration list for PBXProject "connetto-tauri-demo" */;
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				Base,
+				en,
+			);
+			mainGroup = 29D6A62872BB49A66C162E1A;
+			minimizedProjectReferenceProxies = 1;
+			preferredProjectObjectVersion = 77;
+			productRefGroup = 40FB1CBB06917A4DBD613B4E /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				DD06849975224DD51AF5208C /* connetto-tauri-demo_iOS */,
+				9AB2945BF7200D099410A30E /* DioxusSwiftPlugins */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		22EEF7EEE393A4B6020095BE /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				01A12D9897FBD8F3B0853E31 /* Assets.xcassets in Resources */,
+				7AAB187C0A8D2721B723D0F4 /* LaunchScreen.storyboard in Resources */,
+				BA1B7BC9E638E824495395CA /* assets in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		78FDB94CAA6C98C6B65C46A1 /* Build Rust Code */ = {
+			isa = PBXShellScriptBuildPhase;
+			alwaysOutOfDate = 1;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+			);
+			name = "Build Rust Code";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(SRCROOT)/Externals/x86_64/${CONFIGURATION}/libapp.a",
+				"$(SRCROOT)/Externals/arm64/${CONFIGURATION}/libapp.a",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "cargo tauri ios xcode-script -v --platform \"${PLATFORM_DISPLAY_NAME:?}\" --sdk-root \"${SDKROOT:?}\" --framework-search-paths \"${FRAMEWORK_SEARCH_PATHS:?}\" --header-search-paths \"${HEADER_SEARCH_PATHS:?}\" --gcc-preprocessor-definitions \"${GCC_PREPROCESSOR_DEFINITIONS:-}\" --configuration \"${CONFIGURATION:?}\" ${FORCE_COLOR} ${ARCHS:?}\n";
+		};
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		13D4B3C5B6720574F0F0327F /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				76B5866912DC698851857734 /* main.mm in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		AE2EA6388A44B902AF195DB5 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				D3819C48DC617EAA6C437DE9 /* AuthSessionPlugin.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXTargetDependency section */
+		D200DDD7966E9491C33DBA1D /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = 9AB2945BF7200D099410A30E /* DioxusSwiftPlugins */;
+			targetProxy = 85FD1C9FD10BA96C0013F79A /* PBXContainerItemProxy */;
+		};
+/* End PBXTargetDependency section */
+
+/* Begin XCBuildConfiguration section */
+		57BF329F3EB6B7BBB249C940 /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "";
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				GENERATE_INFOPLIST_FILE = YES;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.connetto.tauridemo.swiftplugins;
+				PRODUCT_NAME = DioxusSwiftPlugins;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = release;
+		};
+		8FBDCA4CC22506C1571C6A62 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"$(inherited)",
+					"DEBUG=1",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = DEBUG;
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+				SWIFT_VERSION = 5.0;
+			};
+			name = debug;
+		};
+		A210D713BF3BE9DA8E74F0DA /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "connetto-tauri-demo_iOS/connetto-tauri-demo_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "connetto-tauri-demo_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.connetto.tauridemo;
+				PRODUCT_NAME = "connetto-tauri-demo";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = release;
+		};
+		B27DC07B7D8C9C67A9699C9E /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				CODE_SIGN_IDENTITY = "";
+				CURRENT_PROJECT_VERSION = 1;
+				DEFINES_MODULE = YES;
+				DYLIB_COMPATIBILITY_VERSION = 1;
+				DYLIB_CURRENT_VERSION = 1;
+				DYLIB_INSTALL_NAME_BASE = "@rpath";
+				GENERATE_INFOPLIST_FILE = YES;
+				INSTALL_PATH = "$(LOCAL_LIBRARY_DIR)/Frameworks";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				PRODUCT_BUNDLE_IDENTIFIER = dev.connetto.tauridemo.swiftplugins;
+				PRODUCT_NAME = DioxusSwiftPlugins;
+				SDKROOT = iphoneos;
+				SKIP_INSTALL = YES;
+				SWIFT_VERSION = 5.0;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VERSIONING_SYSTEM = "apple-generic";
+			};
+			name = debug;
+		};
+		F047D1E8595D280BF01C3C62 /* debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_EMBED_SWIFT_STANDARD_LIBRARIES = YES;
+				ARCHS = (
+					arm64,
+				);
+				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
+				CODE_SIGN_ENTITLEMENTS = "connetto-tauri-demo_iOS/connetto-tauri-demo_iOS.entitlements";
+				CODE_SIGN_IDENTITY = "iPhone Developer";
+				ENABLE_BITCODE = NO;
+				"EXCLUDED_ARCHS[sdk=iphoneos*]" = x86_64;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"\".\"",
+				);
+				INFOPLIST_FILE = "connetto-tauri-demo_iOS/Info.plist";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+				);
+				"LIBRARY_SEARCH_PATHS[arch=arm64]" = "$(inherited) $(PROJECT_DIR)/Externals/arm64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				"LIBRARY_SEARCH_PATHS[arch=x86_64]" = "$(inherited) $(PROJECT_DIR)/Externals/x86_64/$(CONFIGURATION) $(SDKROOT)/usr/lib/swift $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift/$(PLATFORM_NAME) $(DEVELOPER_DIR)/Toolchains/XcodeDefault.xctoolchain/usr/lib/swift-5.0/$(PLATFORM_NAME)";
+				PRODUCT_BUNDLE_IDENTIFIER = dev.connetto.tauridemo;
+				PRODUCT_NAME = "connetto-tauri-demo";
+				SDKROOT = iphoneos;
+				TARGETED_DEVICE_FAMILY = "1,2";
+				VALID_ARCHS = arm64;
+			};
+			name = debug;
+		};
+		F948B9B22C79F5784D6C64DF /* release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++14";
+				CLANG_CXX_LIBRARY = "libc++";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu11;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SDKROOT = iphoneos;
+				SWIFT_COMPILATION_MODE = wholemodule;
+				SWIFT_OPTIMIZATION_LEVEL = "-O";
+				SWIFT_VERSION = 5.0;
+			};
+			name = release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		1940C3861D7DCF6EE09BF68B /* Build configuration list for PBXNativeTarget "DioxusSwiftPlugins" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				B27DC07B7D8C9C67A9699C9E /* debug */,
+				57BF329F3EB6B7BBB249C940 /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		5604AD4B4D9FE4E69E3F73C8 /* Build configuration list for PBXProject "connetto-tauri-demo" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				8FBDCA4CC22506C1571C6A62 /* debug */,
+				F948B9B22C79F5784D6C64DF /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+		C3781BB9B497FBB57277BCC1 /* Build configuration list for PBXNativeTarget "connetto-tauri-demo_iOS" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				F047D1E8595D280BF01C3C62 /* debug */,
+				A210D713BF3BE9DA8E74F0DA /* release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = debug;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = 6036F21C2BAEA84A9181F8EE /* Project object */;
+}
