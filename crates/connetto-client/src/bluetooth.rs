@@ -306,10 +306,10 @@ pub trait CentralBackend: Send + Sync {
 }
 
 /// The backends on a system with no Bluetooth.
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 pub struct UnsupportedBackend;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 impl ReadinessBackend for UnsupportedBackend {
     fn state(&self) -> BluetoothState {
         BluetoothState::Unsupported
@@ -328,7 +328,7 @@ impl ReadinessBackend for UnsupportedBackend {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 impl PeripheralBackend for UnsupportedBackend {
     fn start(&self, _beacon: [u8; 9]) -> Result<(), BluetoothError> {
         Err(BluetoothError::Unsupported)
@@ -349,7 +349,7 @@ impl PeripheralBackend for UnsupportedBackend {
 
 /// A system's readiness, its peripheral, and its central's starter where it
 /// runs one.
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 pub(crate) type Backends = (
     Arc<dyn ReadinessBackend>,
     Arc<dyn PeripheralBackend>,
@@ -357,7 +357,7 @@ pub(crate) type Backends = (
 );
 
 /// The backends on a system with no Bluetooth, which runs no central.
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 pub(crate) fn unsupported_backends() -> Backends {
     (
         Arc::new(UnsupportedBackend) as Arc<dyn ReadinessBackend>,
@@ -1144,10 +1144,11 @@ impl Machine {
                         self.peripheral.disconnect(device);
                     }
                 }
-                // The platform's failure stands logged, the exchanges end by
-                // their own bound.
+                // The platform's failure stands logged, the host's column Off,
+                // so the next look restarts the beacon.
                 PeripheralEvent::Failed(reason) => {
                     tracing::warn!(%reason, "the platform's Bluetooth failed");
+                    self.host = HostBtState::Off;
                 }
             }
         }
@@ -2717,6 +2718,35 @@ mod tests {
         assert_eq!(h.peripheral.started.lock().len(), 1);
         let prefix = fp(1).prefix();
         assert_eq!(h.beacon_state(), BeaconState::Advertising { prefix });
+    }
+
+    /// The platform's refusal stands the host Off, so the next look
+    /// restarts the beacon while the hotspot stands.
+    #[tokio::test]
+    async fn a_failed_bluetooth_standings_move_the_host_off_and_retry() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        assert_eq!(
+            h.beacon_state(),
+            BeaconState::Advertising {
+                prefix: fp(1).prefix()
+            }
+        );
+        // The platform's refusal, the beacon down while the hotspot stands.
+        h.peripheral
+            .push(PeripheralEvent::Failed("the refusal".into()));
+        h.tick(Some(&offer()));
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+        // The next look restarts the beacon.
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 2);
+        assert_eq!(
+            h.beacon_state(),
+            BeaconState::Advertising {
+                prefix: fp(1).prefix()
+            }
+        );
     }
 
     #[tokio::test]

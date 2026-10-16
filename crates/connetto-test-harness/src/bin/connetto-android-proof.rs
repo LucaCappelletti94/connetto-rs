@@ -81,9 +81,9 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::BluetoothState;
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
+use connetto_test_harness::linux_leg::{LegClient, run_leg};
 use connetto_test_harness::linux_proof::{
-    ADAPTER_OFF_BOUND, LegClient, LegOffer, in_hotspot_subnet, parse_station_name, run_leg,
-    ss_remote_address,
+    ADAPTER_OFF_BOUND, LegOffer, in_hotspot_subnet, parse_station_name, ss_remote_address,
 };
 use connetto_test_harness::peer_devices::{
     LINK_END_BOUND, own_identity, read_hotspot_offer, wait_link_ends,
@@ -1469,41 +1469,148 @@ async fn linux_peer_proof(phone: &Device, evidence: &Path) -> Result<Vec<JoinRep
     eprintln!(
         "the phone holds {phone_usual:?} and pippo holds {pippo_usual} until the run restores them"
     );
-    // The phone leaves the home LAN for the whole section, so the LAN never
-    // links the two by discovery; its demo reaches the server over adb
-    // reverse.
+    // The phone leaves the home LAN for the whole section, so the LAN
+    // never links the two by discovery. Its demo reaches the server over
+    // adb reverse.
     step("take the phone off its network");
     phone.adb(&["shell", "svc", "wifi", "disable"]).await?;
     sleep(Duration::from_secs(5)).await;
-    let leg = LegClient::spawn(evidence).await?;
-    let (linux_identity, _) = leg.wait_ready().await?;
-    let mut app = phone.app().await?;
-    app.wait_for_text("device: certified until", Duration::from_secs(60))
-        .await?;
-    let phone_identity = own_identity(&mut app).await?;
-    let result = run_linux_joins(
+    let steps = RealSteps {
         phone,
-        &mut app,
-        &leg,
-        &phone_identity,
-        &linux_identity,
-        &pippo_usual,
-        evidence,
-    )
-    .await;
+        phone_usual: phone_usual.clone(),
+        pippo_usual: pippo_usual.clone(),
+    };
+    let reports = linux_section(&steps, evidence).await?;
+    Ok(reports)
+}
 
-    let leg_log = leg.take_log();
-    tokio::fs::write(evidence.join("linux-leg.log"), leg_log)
+/// The linux section's resource steps, the phone and the leg behind them
+/// for the setup-failure unit test.
+trait LinuxSteps: Send {
+    /// The leg's handle, the real client or the test's stand-in.
+    type Leg: Send;
+    /// Stand the leg.
+    fn spawn_leg(&self, evidence: &Path) -> impl Future<Output = Result<Self::Leg>> + Send;
+    /// Wait for the leg's ready line.
+    fn ready(&self, leg: &Self::Leg) -> impl Future<Output = Result<(String, u16)>> + Send;
+    /// The walk itself, the phone's identity read and the joins in turn.
+    fn walk(
+        &self,
+        leg: &Self::Leg,
+        linux_identity: &str,
+        evidence: &Path,
+    ) -> impl Future<Output = Result<Vec<JoinReport>>> + Send;
+    /// Write the leg's log to the evidence.
+    fn write_leg_log(
+        &self,
+        leg: &Self::Leg,
+        evidence: &Path,
+    ) -> impl Future<Output = Result<()>> + Send;
+    /// Power the leg's adapter off.
+    fn adapter_off(&self, leg: &Self::Leg) -> impl Future<Output = Result<()>> + Send;
+    /// Close the leg.
+    fn close_leg(&self, leg: &Self::Leg) -> impl Future<Output = Result<()>> + Send;
+    /// Bring the phone back to its usual network.
+    fn restore_network(&self) -> impl Future<Output = Result<()>> + Send;
+    /// Turn the phone's Bluetooth off.
+    fn bluetooth_off(&self) -> impl Future<Output = Result<()>> + Send;
+}
+
+/// The steps over the real phone and leg.
+struct RealSteps<'a> {
+    phone: &'a Device,
+    phone_usual: Option<String>,
+    pippo_usual: String,
+}
+
+impl LinuxSteps for RealSteps<'_> {
+    type Leg = LegClient;
+
+    async fn spawn_leg(&self, evidence: &Path) -> Result<LegClient> {
+        LegClient::spawn(evidence).await
+    }
+
+    async fn ready(&self, leg: &LegClient) -> Result<(String, u16)> {
+        leg.wait_ready().await
+    }
+
+    async fn walk(
+        &self,
+        leg: &LegClient,
+        linux_identity: &str,
+        evidence: &Path,
+    ) -> Result<Vec<JoinReport>> {
+        let mut app = self.phone.app().await?;
+        app.wait_for_text("device: certified until", Duration::from_secs(60))
+            .await?;
+        let phone_identity = own_identity(&mut app).await?;
+        run_linux_joins(
+            self.phone,
+            &mut app,
+            leg,
+            &phone_identity,
+            linux_identity,
+            &self.pippo_usual,
+            evidence,
+        )
         .await
-        .context("writing the linux leg's log")?;
+    }
+
+    async fn write_leg_log(&self, leg: &LegClient, evidence: &Path) -> Result<()> {
+        let leg_log = leg.take_log();
+        tokio::fs::write(evidence.join("linux-leg.log"), leg_log)
+            .await
+            .context("writing the linux leg's log")
+    }
+
+    async fn adapter_off(&self, leg: &LegClient) -> Result<()> {
+        linux_adapter_off(leg).await
+    }
+
+    async fn close_leg(&self, leg: &LegClient) -> Result<()> {
+        leg.close().await
+    }
+
+    async fn restore_network(&self) -> Result<()> {
+        restore_phone_network(self.phone, self.phone_usual.as_ref()).await
+    }
+
+    async fn bluetooth_off(&self) -> Result<()> {
+        bluetooth_off(self.phone).await
+    }
+}
+
+/// The section after the phone's network leaves. Every fallible step
+/// stands in the setup, so the restore and the leg cleanup run before the
+/// result returns, whatever the step meets.
+async fn linux_section<S: LinuxSteps>(steps: &S, evidence: &Path) -> Result<Vec<JoinReport>> {
+    let (result, leg): (Result<Vec<JoinReport>>, Option<S::Leg>) =
+        match steps.spawn_leg(evidence).await {
+            Err(err) => (Err(err), None),
+            Ok(leg) => {
+                let setup = async {
+                    let (linux_identity, _) = steps.ready(&leg).await?;
+                    let reports = steps.walk(&leg, &linux_identity, evidence).await?;
+                    steps.write_leg_log(&leg, evidence).await?;
+                    Ok(reports)
+                }
+                .await;
+                (setup, Some(leg))
+            }
+        };
     // The adapter power-off talks to the leg, so it runs before the close.
-    let adapter = linux_adapter_off(&leg).await;
-    let leg_closed = leg.close().await;
-    let phone_back = restore_phone_network(phone, phone_usual.as_ref()).await;
-    let bluetooth = bluetooth_off(phone).await;
-    let reports = result?;
-    // The joins' outcomes stand whatever the cleanup meets, so a cleanup
-    // that fails is reported beside them and leaves the summary whole.
+    let adapter = match &leg {
+        Some(leg) => steps.adapter_off(leg).await,
+        None => Ok(()),
+    };
+    let leg_closed = match &leg {
+        Some(leg) => steps.close_leg(leg).await,
+        None => Ok(()),
+    };
+    let phone_back = steps.restore_network().await;
+    let bluetooth = steps.bluetooth_off().await;
+    // The walk's outcome stands whatever the cleanup meets, so a cleanup
+    // that fails is reported beside it and leaves the summary whole.
     for (what, outcome) in [
         ("powering the linux adapter off", adapter),
         ("closing the linux leg", leg_closed),
@@ -1514,7 +1621,7 @@ async fn linux_peer_proof(phone: &Device, evidence: &Path) -> Result<Vec<JoinRep
             eprintln!("the cleanup failed {what}: {err:#}");
         }
     }
-    Ok(reports)
+    result
 }
 
 /// The walk itself: each join in turn, every one recorded, with the
@@ -3160,5 +3267,141 @@ echo "adb: device offline" >&2; exit 1"#,
 10-17 11:34:10.446  4447  4447 I wm_on_create_called: [211010611,dev.connetto.authsession.RedirectActivity,performCreate,108]
 ";
         assert!(!rebuilt_in(events, "4447", TAURI_ACTIVITY));
+    }
+
+    /// The resource step the test refuses.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum FakeRefusal {
+        /// The leg's launch.
+        Spawn,
+        /// The leg's ready line.
+        Ready,
+        /// The leg's log write.
+        Log,
+    }
+
+    /// The cleanup calls the section made.
+    #[derive(Clone, Default)]
+    #[expect(
+        clippy::struct_excessive_bools,
+        reason = "the flags stand the section's four cleanup steps, one per resource"
+    )]
+    struct FakeFlags {
+        adapter_off: bool,
+        close: bool,
+        restore: bool,
+        bluetooth_off: bool,
+    }
+
+    /// The section's steps, the failures injected and the cleanup calls
+    /// recorded.
+    struct FakeSteps {
+        refusal: FakeRefusal,
+        flags: parking_lot::Mutex<FakeFlags>,
+    }
+
+    impl FakeSteps {
+        fn new(refusal: FakeRefusal) -> Self {
+            Self {
+                refusal,
+                flags: parking_lot::Mutex::new(FakeFlags::default()),
+            }
+        }
+
+        fn flags(&self) -> FakeFlags {
+            self.flags.lock().clone()
+        }
+    }
+
+    struct FakeLeg;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the fake steps answer without a device or bus round trip"
+    )]
+    impl super::LinuxSteps for FakeSteps {
+        type Leg = FakeLeg;
+
+        async fn spawn_leg(&self, _evidence: &Path) -> anyhow::Result<FakeLeg> {
+            if self.refusal == FakeRefusal::Spawn {
+                anyhow::bail!("the injected leg launch failure");
+            }
+            Ok(FakeLeg)
+        }
+
+        async fn ready(&self, _leg: &FakeLeg) -> anyhow::Result<(String, u16)> {
+            if self.refusal == FakeRefusal::Ready {
+                anyhow::bail!("the injected readiness failure");
+            }
+            Ok(("linux".into(), 8080))
+        }
+
+        async fn walk(
+            &self,
+            _leg: &FakeLeg,
+            _linux_identity: &str,
+            _evidence: &Path,
+        ) -> anyhow::Result<Vec<connetto_test_harness::peer_proof::JoinReport>> {
+            Ok(Vec::new())
+        }
+
+        async fn write_leg_log(&self, _leg: &FakeLeg, _evidence: &Path) -> anyhow::Result<()> {
+            if self.refusal == FakeRefusal::Log {
+                anyhow::bail!("the injected evidence write failure");
+            }
+            Ok(())
+        }
+
+        async fn adapter_off(&self, _leg: &FakeLeg) -> anyhow::Result<()> {
+            self.flags.lock().adapter_off = true;
+            Ok(())
+        }
+
+        async fn close_leg(&self, _leg: &FakeLeg) -> anyhow::Result<()> {
+            self.flags.lock().close = true;
+            Ok(())
+        }
+
+        async fn restore_network(&self) -> anyhow::Result<()> {
+            self.flags.lock().restore = true;
+            Ok(())
+        }
+
+        async fn bluetooth_off(&self) -> anyhow::Result<()> {
+            self.flags.lock().bluetooth_off = true;
+            Ok(())
+        }
+    }
+
+    /// A setup failure leaves the phone back on its network, its Bluetooth
+    /// off, and the leg's cleanup run once the leg stood.
+    #[tokio::test]
+    async fn setup_failures_leave_the_phone_restored_and_the_leg_released() {
+        for (refusal, leg_up) in [
+            (FakeRefusal::Spawn, false),
+            (FakeRefusal::Ready, true),
+            (FakeRefusal::Log, true),
+        ] {
+            let steps = FakeSteps::new(refusal);
+            let result = super::linux_section(&steps, Path::new("evidence")).await;
+            assert!(result.is_err(), "the {refusal:?} refusal stands");
+            let flags = steps.flags();
+            assert!(
+                flags.restore,
+                "the {refusal:?} refusal left the phone off its network"
+            );
+            assert!(
+                flags.bluetooth_off,
+                "the {refusal:?} refusal left the phone's Bluetooth on"
+            );
+            assert_eq!(
+                flags.adapter_off, leg_up,
+                "the {refusal:?} refusal mis-ran the adapter power-off"
+            );
+            assert_eq!(
+                flags.close, leg_up,
+                "the {refusal:?} refusal mis-ran the leg close"
+            );
+        }
     }
 }

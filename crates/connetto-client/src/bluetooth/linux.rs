@@ -20,8 +20,9 @@ use super::{
 
 /// What the machine's polled calls ask of the thread.
 enum Command {
-    /// The peripheral table's start row, under the beacon.
-    Start([u8; 9]),
+    /// The peripheral table's start row, the request's generation under the
+    /// beacon.
+    Start(u64, [u8; 9]),
     /// The peripheral table's stop row.
     Stop,
     /// The readiness table's prompt row.
@@ -53,6 +54,8 @@ struct State {
     sessions: BTreeSet<DeviceKey>,
     /// The prompt's outcome, once the action stands.
     prompt: Option<PromptOutcome>,
+    /// The start request's generation, the stale answers' refusal.
+    start_gen: u64,
 }
 
 impl Default for State {
@@ -62,6 +65,7 @@ impl Default for State {
             column: Advertising::Off,
             sessions: BTreeSet::new(),
             prompt: None,
+            start_gen: 0,
         }
     }
 }
@@ -151,14 +155,11 @@ impl LinuxBluetoothBackend {
                 break;
             };
             match item {
-                Item::Command(Command::Start(beacon)) => {
-                    start_row(io, &standing, &events, beacon).await;
+                Item::Command(Command::Start(generation, beacon)) => {
+                    start_row(io, &standing, &events, beacon, generation).await;
                 }
                 Item::Command(Command::Stop) => {
                     io.stop().await;
-                    let mut s = standing.lock();
-                    s.column = Advertising::Off;
-                    s.sessions.clear();
                 }
                 Item::Command(Command::Prompt) => prompt_row(io, &standing).await,
                 Item::Command(Command::Notify(device, bytes)) => {
@@ -195,17 +196,20 @@ async fn next_item<IO: BluezIo>(
     }
 }
 
-/// The peripheral table's start row: the GATT application and the
-/// advertisement under the beacon, the column standing the thread's answer.
-async fn start_row<IO: BluezIo>(io: &IO, standing: &Standing, events: &Queue, beacon: [u8; 9]) {
+/// The peripheral table's start row, which stands the `GATT` application
+/// and the advertisement under the beacon. The column takes the answer of
+/// the current generation, and a stale answer orphans without touching it.
+async fn start_row<IO: BluezIo>(
+    io: &IO,
+    standing: &Standing,
+    events: &Queue,
+    beacon: [u8; 9],
+    generation: u64,
+) {
     let outcome = io.start(beacon).await;
     let (orphaned, refused) = {
         let mut s = standing.lock();
-        if matches!(s.column, Advertising::Off) {
-            // The column moved to the stop, so the start's objects orphan
-            // to it, the refusal's no-objects a no-op.
-            (true, false)
-        } else {
+        if s.start_gen == generation {
             match &outcome {
                 Ok(()) => {
                     s.column = Advertising::Running(beacon);
@@ -223,6 +227,10 @@ async fn start_row<IO: BluezIo>(io: &IO, standing: &Standing, events: &Queue, be
                     (false, fresh)
                 }
             }
+        } else {
+            // A later row superseded this start, so its objects orphan
+            // to the stop, the stale refusal's new row owning the answer.
+            (true, false)
         }
     };
     if orphaned && outcome.is_ok() {
@@ -281,6 +289,9 @@ async fn handle_answer<IO: BluezIo>(
                     let running = !matches!(s.column, Advertising::Off);
                     if running {
                         s.column = Advertising::Off;
+                        // The power-off supersedes the in-flight start, its
+                        // stale answer orphaning without the column.
+                        s.start_gen += 1;
                     }
                     running
                 }
@@ -330,9 +341,9 @@ impl ReadinessBackend for LinuxBluetoothBackend {
 
 impl PeripheralBackend for LinuxBluetoothBackend {
     fn start(&self, beacon: [u8; 9]) -> Result<(), BluetoothError> {
-        let send = {
+        let (send, generation) = {
             let mut s = self.standing.lock();
-            match s.column {
+            let send = match s.column {
                 // The advertisement already stands the beacon's service
                 // data.
                 Advertising::Running(standing_beacon) if standing_beacon == beacon => false,
@@ -341,10 +352,14 @@ impl PeripheralBackend for LinuxBluetoothBackend {
                     true
                 }
                 Advertising::Starting(_) | Advertising::Running(_) => true,
+            };
+            if send {
+                s.start_gen += 1;
             }
+            (send, s.start_gen)
         };
         if send {
-            self.send(Command::Start(beacon));
+            self.send(Command::Start(generation, beacon));
         }
         Ok(())
     }
@@ -353,8 +368,11 @@ impl PeripheralBackend for LinuxBluetoothBackend {
         let send = {
             let mut s = self.standing.lock();
             let send = !matches!(s.column, Advertising::Off);
-            s.column = Advertising::Off;
-            s.sessions.clear();
+            if send {
+                s.start_gen += 1;
+                s.column = Advertising::Off;
+                s.sessions.clear();
+            }
             send
         };
         if send {
@@ -966,6 +984,65 @@ mod tests {
             .expect("the event goes in");
         pump_until(|| !h.backend.poll().is_empty()).await;
         assert!(h.backend.notify(DEVICE, &[1]).is_ok());
+    }
+
+    /// The stop's queue ahead of the start's answer, the new beacon's
+    /// standing kept by the start's own generation.
+    #[tokio::test]
+    async fn a_stop_then_a_start_stands_the_new_beacon() {
+        tokio::time::pause();
+        let h = harness(AdapterStanding::Powered(true));
+        pump_until(|| h.backend.state() == BluetoothState::Ready).await;
+        assert!(h.backend.start(BEACON).is_ok());
+        pump_until(|| beacon(&h).len() == 1).await;
+        // The stop queues before the start's answer, and the thread
+        // answers the rows in order.
+        h.backend.stop();
+        assert!(h.backend.start(BEACON_RENEWED).is_ok());
+        pump_until(|| beacon(&h).len() == 2).await;
+        pump_until(|| {
+            matches!(
+                h.backend.standing.lock().column,
+                Advertising::Running(BEACON_RENEWED)
+            )
+        })
+        .await;
+    }
+
+    /// The stale start's success orphaned to the stop, the fresh start's
+    /// refusal standing the column Off and the machine's `Failed`.
+    #[tokio::test]
+    async fn a_stale_success_and_a_fresh_refusal_stand_the_refusal() {
+        tokio::time::pause();
+        let h = harness(AdapterStanding::Powered(true));
+        pump_until(|| h.backend.state() == BluetoothState::Ready).await;
+        let gate = h.fake.hold_start();
+        assert!(h.backend.start(BEACON).is_ok());
+        pump_until(|| beacon(&h).len() == 1).await;
+        h.backend.stop();
+        // The stale start's answer is the success, the fresh start's
+        // the refusal, in the thread's order.
+        h.fake.start_answers.lock().push_back(Ok(()));
+        h.fake
+            .start_answers
+            .lock()
+            .push_back(Err(BluezError::Refused("the refusal".into())));
+        assert!(h.backend.start(BEACON_RENEWED).is_ok());
+        gate.send(()).expect("the gate opens");
+        // The stale start's objects release, then the stop's row runs.
+        pump_until(|| h.fake.stops() == 2).await;
+        pump_until(|| {
+            h.backend
+                .poll()
+                .iter()
+                .any(|event| matches!(event, PeripheralEvent::Failed(_)))
+        })
+        .await;
+        assert!(matches!(h.backend.standing.lock().column, Advertising::Off));
+        assert!(matches!(
+            h.backend.notify(DEVICE, &[1]),
+            Err(BluetoothError::Failed(_))
+        ));
     }
 
     #[tokio::test]
