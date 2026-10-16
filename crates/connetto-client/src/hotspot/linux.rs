@@ -1341,12 +1341,10 @@ mod tests {
         }
     }
 
-    /// The pump's bound, the rows that stand done already.
+    /// One look for the thread, a bounded step of the virtual clock far
+    /// inside the `5 GHz` bound.
     async fn pump() {
-        let start = std::time::Instant::now();
-        while start.elapsed() < Duration::from_millis(20) {
-            tokio::time::sleep(Duration::from_millis(1)).await;
-        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 
     // The host table.

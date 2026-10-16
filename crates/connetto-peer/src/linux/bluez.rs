@@ -352,15 +352,20 @@ impl BluezIo for BluerBluez {
             self.adv.lock().replace(handle);
             return Ok(());
         }
+        // The handle stands local until the advertisement stands, so a
+        // refusal unregisters the application and the retry's stand is
+        // complete.
         let (app, control) = gatt_app(&self.events);
-        let handle = bounded(CALL_BOUND, adapter.serve_gatt_application(app)).await?;
-        self.app.lock().replace(handle);
+        let app_handle = bounded(CALL_BOUND, adapter.serve_gatt_application(app)).await?;
         let advertisement = advertisement(beacon);
         let handle = bounded(CALL_BOUND, adapter.advertise(advertisement)).await?;
+        self.app.lock().replace(app_handle);
         self.adv.lock().replace(handle);
-        let sessions = self.sessions.clone();
-        let events = self.events.clone();
-        tokio::spawn(drive_control(control, sessions, events));
+        tokio::spawn(drive_control(
+            control,
+            self.sessions.clone(),
+            self.events.clone(),
+        ));
         Ok(())
     }
 
@@ -436,8 +441,14 @@ fn advertisement(beacon: [u8; 9]) -> Advertisement {
 
 #[cfg(test)]
 mod tests {
-    use super::{PeripheralAnswer, address_of, advertisement, key};
+    use super::{BluerBluez, BluezIo, PeripheralAnswer, address_of, advertisement, key};
     use bluer::{Address, Uuid};
+    use parking_lot::Mutex;
+    use std::collections::HashMap;
+    use std::io::Read as _;
+    use std::sync::Arc;
+    use zbus::message::Header;
+    use zbus::zvariant::{ObjectPath, OwnedFd, OwnedObjectPath, OwnedValue};
 
     #[test]
     fn the_key_folds_the_address_big_endian() {
@@ -486,6 +497,262 @@ mod tests {
                 assert_eq!(mtu, 247);
             }
             other => panic!("the answer is not a connect, {other:?}"),
+        }
+    }
+
+    const PROBE_NAME: &str =
+        "linux::bluez::tests::a_refused_advertisement_restands_its_control_stream";
+
+    /// A refused advertisement's retry restands the control stream, the
+    /// notify session and the delivery onto it, over a fake `BlueZ` on a
+    /// private bus.
+    ///
+    /// The `bluer` session connects to whatever `DBUS_SYSTEM_BUS_ADDRESS`
+    /// names and the process's environment stays fixed, so the scenario
+    /// runs in a re-executed child of this binary, the child's bus the
+    /// private daemon's.
+    #[tokio::test]
+    async fn a_refused_advertisement_restands_its_control_stream() {
+        if std::env::var_os("CONNETTO_BLUEZ_PROBE").is_some() {
+            bluez_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let mut child =
+            std::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", PROBE_NAME])
+                .env("CONNETTO_BLUEZ_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .expect("spawn the probe child");
+        let stdout = child.stdout.take().expect("the child's stdout");
+        let stderr = child.stderr.take().expect("the child's stderr");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(None) => {
+                    let _ = child.kill();
+                    panic!("the probe did not end within its bound");
+                }
+                Err(err) => panic!("waiting the probe child: {err}"),
+            }
+        };
+        let output = format!(
+            "{}{}",
+            std::io::read_to_string(stdout).expect("the child's stdout"),
+            std::io::read_to_string(stderr).expect("the child's stderr"),
+        );
+        assert!(status.success(), "the probe failed:\n{output}");
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the probe runs the whole scenario as one straight line"
+    )]
+    /// The probe's scenario, the fake `BlueZ` standing on the private bus
+    /// the parent pointed `DBUS_SYSTEM_BUS_ADDRESS` at.
+    async fn bluez_probe() {
+        let registration: Arc<Mutex<Option<(String, OwnedObjectPath)>>> =
+            Arc::new(Mutex::new(None));
+        let unregisters: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let attempts: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .serve_at("/org/bluez/hci0", FakeAdapter)
+            .expect("the adapter")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeGatt {
+                    registration: registration.clone(),
+                    unregisters: unregisters.clone(),
+                },
+            )
+            .expect("the gatt manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAds {
+                    attempts: attempts.clone(),
+                },
+            )
+            .expect("the advertisement manager")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let io = BluerBluez::new().await.expect("the bluez client");
+        assert!(
+            io.start([1; 9]).await.is_err(),
+            "the first advertisement stands"
+        );
+        the_refusal_unregisters(&unregisters).await;
+        io.start([2; 9])
+            .await
+            .expect("the retry's advertisement stands");
+
+        let (sender, application) = registration.lock().clone().expect("the gatt application");
+        let manager = zbus::fdo::ObjectManagerProxy::builder(&server)
+            .destination(sender.as_str())
+            .expect("the application owner")
+            .path(application.as_str())
+            .expect("the application path")
+            .build()
+            .await
+            .expect("the application manager proxy");
+        let outbox = manager
+            .get_managed_objects()
+            .await
+            .expect("the application objects")
+            .into_iter()
+            .find_map(|(path, interfaces)| {
+                let props = interfaces.get("org.bluez.GattCharacteristic1")?;
+                let flags = Vec::<String>::try_from(props.get("Flags")?.try_clone().ok()?).ok()?;
+                flags.iter().any(|flag| flag == "notify").then_some(path)
+            })
+            .expect("the outbox characteristic");
+        let proxy = zbus::Proxy::new(
+            &server,
+            sender.as_str(),
+            outbox.as_str(),
+            "org.bluez.GattCharacteristic1",
+        )
+        .await
+        .expect("the outbox proxy");
+        let options = HashMap::from([
+            (
+                "device".to_owned(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+                        .expect("the device path"),
+                ),
+            ),
+            ("mtu".to_owned(), OwnedValue::from(64_u16)),
+        ]);
+        let (fd, _mtu): (OwnedFd, u16) = proxy
+            .call("AcquireNotify", &(options,))
+            .await
+            .expect("acquire the notify session");
+
+        let device = loop {
+            let answer = tokio::time::timeout(std::time::Duration::from_secs(10), io.next_event())
+                .await
+                .expect("no peripheral event within the bound");
+            if let PeripheralAnswer::Connected { device, .. } = answer {
+                break device;
+            }
+        };
+        assert_eq!(device, key(Address([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])));
+
+        io.notify(device, b"ping")
+            .await
+            .expect("the delivery stands");
+        let fd = std::os::fd::OwnedFd::from(fd);
+        let mut file = std::fs::File::from(fd);
+        let mut bytes = [0_u8; 4];
+        file.read_exact(&mut bytes)
+            .expect("the bytes reach the central");
+        assert_eq!(&bytes, b"ping");
+
+        io.stop().await;
+    }
+
+    /// Polls the `unregisters` count past zero until its bound.
+    async fn the_refusal_unregisters(unregisters: &Arc<Mutex<u32>>) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while *unregisters.lock() == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the refusal unregisters the gatt application");
+    }
+
+    struct FakeAdapter;
+
+    #[zbus::interface(name = "org.bluez.Adapter1")]
+    impl FakeAdapter {
+        #[zbus(property)]
+        #[expect(clippy::unused_self, reason = "the zbus property reads the adapter")]
+        fn powered(&self) -> bool {
+            true
+        }
+    }
+
+    struct FakeGatt {
+        registration: Arc<Mutex<Option<(String, OwnedObjectPath)>>>,
+        unregisters: Arc<Mutex<u32>>,
+    }
+
+    #[zbus::interface(name = "org.bluez.GattManager1")]
+    impl FakeGatt {
+        #[expect(
+            clippy::needless_pass_by_value,
+            reason = "the zbus header attribute takes the header by value"
+        )]
+        fn register_application(
+            &self,
+            application: OwnedObjectPath,
+            options: HashMap<String, OwnedValue>,
+            #[zbus(header)] header: Header<'_>,
+        ) {
+            std::mem::drop(options);
+            let sender = header.sender().expect("the request sender").to_string();
+            self.registration.lock().replace((sender, application));
+        }
+
+        fn unregister_application(&self, application: OwnedObjectPath) {
+            std::mem::drop(application);
+            *self.unregisters.lock() += 1;
+            self.registration.lock().take();
+        }
+    }
+
+    #[derive(Debug, zbus::DBusError)]
+    #[zbus(prefix = "org.bluez.Error")]
+    enum ProbeRefusal {
+        Failed(String),
+    }
+
+    struct FakeAds {
+        attempts: Arc<Mutex<u32>>,
+    }
+
+    #[zbus::interface(name = "org.bluez.LEAdvertisingManager1")]
+    impl FakeAds {
+        fn register_advertisement(
+            &self,
+            advertisement: OwnedObjectPath,
+            options: HashMap<String, OwnedValue>,
+        ) -> Result<(), ProbeRefusal> {
+            std::mem::drop(advertisement);
+            std::mem::drop(options);
+            let mut attempts = self.attempts.lock();
+            *attempts += 1;
+            if *attempts == 1 {
+                Err(ProbeRefusal::Failed(
+                    "the first advertisement refused".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        #[expect(
+            clippy::unused_self,
+            reason = "the zbus signature keeps the manager reference"
+        )]
+        fn unregister_advertisement(&self, advertisement: OwnedObjectPath) {
+            std::mem::drop(advertisement);
         }
     }
 }

@@ -10,6 +10,7 @@
 coverage:
   ignore:
     - crates/connetto-test-harness/src/bin/**
+    - crates/connetto-test-harness/src/linux_leg.rs
     - crates/connetto-test-harness/src/stack.rs
     - crates/connetto-test-harness/src/peer_devices.rs
     - crates/connetto-web/**

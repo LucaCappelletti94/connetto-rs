@@ -201,14 +201,38 @@ impl ZbusNm {
                 NmIoError::Failed("the system bus did not answer within its bound".into())
             })?
             .map_err(|err| NmIoError::Failed(err.to_string()))?;
+        Self::new_with_connection(bus).await
+    }
+
+    /// Subscribe on a given bus connection, the seam the proofs' private
+    /// buses stand.
+    ///
+    /// # Errors
+    ///
+    /// [`NmIoError`] when the state subscription will not stand within its
+    /// bound.
+    pub async fn new_with_connection(bus: zbus::Connection) -> Result<Self, NmIoError> {
         let (tx, rx) = tokio::sync::mpsc::channel(64);
-        // Every active connection's state change, subscribed before `new`
-        // answers, so no activation can settle ahead of the match rule.
+        // Every active connection's state change, subscribed before the
+        // constructor answers, so no activation can settle ahead of the
+        // match rule.
         let states = active_states(&bus).await?;
-        // The signals, each on its own task, into the one event channel.
-        tokio::spawn(forward_check_permissions(bus.clone(), tx.clone()));
-        tokio::spawn(forward_wireless(bus.clone(), tx.clone()));
-        tokio::spawn(forward_active_states(states, tx));
+        // The signals into the one event channel, the row ending when the
+        // event receiver closes, so the bus connection's lifetime ends with
+        // the backend.
+        let signal_bus = bus.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                () = tx.closed() => {}
+                () = async {
+                    tokio::join!(
+                        forward_check_permissions(signal_bus.clone(), tx.clone()),
+                        forward_wireless(signal_bus, tx.clone()),
+                        forward_active_states(states, tx.clone()),
+                    );
+                } => {}
+            }
+        });
         Ok(Self {
             bus,
             events: Mutex::new(rx),
@@ -228,13 +252,15 @@ where
     }
 }
 
+/// Whether a D-Bus refusal's name is the polkit permission's.
+fn denied_name(name: &str) -> bool {
+    name.ends_with("AccessDenied") || name.ends_with("PermissionDenied")
+}
+
 /// Whether a D-Bus refusal is the polkit permission's.
 fn is_permission_denied(err: &zbus::Error) -> bool {
-    fn denied(name: &str) -> bool {
-        name.ends_with("AccessDenied") || name.ends_with("PermissionsDenied")
-    }
     match err {
-        zbus::Error::MethodError(name, _, _) => denied(name.as_str()),
+        zbus::Error::MethodError(name, _, _) => denied_name(name.as_str()),
         other => other.to_string().contains("AccessDenied"),
     }
 }
@@ -452,10 +478,7 @@ impl NmIo for ZbusNm {
             .and_then(|value| value.downcast_ref::<String>().ok())
             .and_then(|text| text.parse::<Ipv4Addr>().ok())
             .ok_or_else(|| NmIoError::Failed("the network's address is not IPv4".into()))?;
-        let prefix = first
-            .get("prefix")
-            .and_then(|value| value.downcast_ref::<u8>().ok())
-            .unwrap_or(0);
+        let prefix = prefix_of(first)?;
         let gateway = call(ip4.gateway()).await?;
         let routers = dhcp4_routers(&self.bus, &active_proxy).await;
         Ok(Ipv4Standing {
@@ -612,9 +635,53 @@ fn options() -> Options {
     options
 }
 
-/// The login the connection is restricted to.
+/// The login the connection is restricted to, the process's real uid and
+/// its passwd name, the `USER` environment never read.
 fn login() -> String {
-    std::env::var("USER").unwrap_or_else(|_| "root".into())
+    // The bus authenticates the process's real uid, so the profile stands
+    // the caller's identity.
+    let status = std::fs::read_to_string("/proc/self/status").ok();
+    let Some(uid) = status.as_deref().and_then(real_uid_of) else {
+        // The uid is unreadable, so the profile names no login and the
+        // activation fails cleanly.
+        tracing::warn!("the process's uid is unreadable, the profile names no login");
+        return "unknown".to_owned();
+    };
+    let passwd = std::fs::read_to_string("/etc/passwd").ok();
+    if let Some(name) = passwd.as_deref().and_then(|text| name_of_uid(text, uid)) {
+        return name;
+    }
+    tracing::warn!(%uid, "the uid has no passwd name, the profile names the uid");
+    uid.to_string()
+}
+
+/// The status text's `Uid:` field, the real uid.
+fn real_uid_of(status: &str) -> Option<u32> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|fields| fields.split_whitespace().next())
+        .and_then(|uid| uid.parse::<u32>().ok())
+}
+
+/// The passwd text's line for the uid, the name field.
+fn name_of_uid(passwd: &str, uid: u32) -> Option<String> {
+    passwd.lines().find_map(|line| {
+        let mut fields = line.splitn(4, ':');
+        let name = fields.next()?;
+        fields.next()?;
+        let uid_field = fields.next()?;
+        (uid_field == uid.to_string()).then(|| name.to_owned())
+    })
+}
+
+/// The address data entry's `prefix` field, a valid length.
+fn prefix_of(entry: &HashMap<String, OwnedValue>) -> Result<u8, NmIoError> {
+    entry
+        .get("prefix")
+        .and_then(|value| value.downcast_ref::<u32>().ok())
+        .and_then(|prefix| u8::try_from(prefix).ok())
+        .ok_or_else(|| NmIoError::Failed("the network's prefix is invalid".into()))
 }
 
 /// The `NetworkManager`'s main interface.
@@ -724,12 +791,12 @@ trait Wireless {
 #[cfg(test)]
 mod tests {
     use super::{
-        AddRequest, Band, Ipv4Standing, NmEvent, Security, WIRELESS, WIRELESS_SECURITY, WifiDevice,
-        first_router, host_settings, join_settings, options, pick_gateway,
+        AddRequest, Band, Ipv4Standing, NmEvent, NmIoError, Security, WIRELESS, WIRELESS_SECURITY,
+        WifiDevice, ZbusNm, first_router, host_settings, join_settings, options, pick_gateway,
     };
     use std::collections::HashMap;
     use std::net::{IpAddr, Ipv4Addr};
-    use zbus::zvariant::Value;
+    use zbus::zvariant::{OwnedValue, Value};
 
     type Group = HashMap<String, Value<'static>>;
 
@@ -774,8 +841,65 @@ mod tests {
         (*value).clone()
     }
 
-    fn login_for_test() -> String {
-        std::env::var("USER").unwrap_or_else(|_| "root".into())
+    #[test]
+    fn the_status_uid_field_parses() {
+        let status = "Name:\tnm\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
+        assert_eq!(super::real_uid_of(status), Some(1000));
+        assert_eq!(
+            super::real_uid_of("Name:\tnm\nGid:\t1000\t1000\t1000\t1000\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_passwd_name_stands_the_uid_line() {
+        let passwd = "root:x:0:0:root:/root:/bin/bash\nluca:x:1000:1000:Luca:/home/luca:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
+        assert_eq!(super::name_of_uid(passwd, 0), Some("root".to_owned()));
+        assert_eq!(super::name_of_uid(passwd, 1000), Some("luca".to_owned()));
+        assert_eq!(super::name_of_uid(passwd, 1234), None);
+    }
+
+    #[test]
+    fn the_profile_names_the_process_identity() {
+        let status = std::fs::read_to_string("/proc/self/status").expect("the status stands");
+        let uid = super::real_uid_of(&status).expect("the uid field stands");
+        let passwd = std::fs::read_to_string("/etc/passwd").expect("the passwd stands");
+        let expected = super::name_of_uid(&passwd, uid).unwrap_or_else(|| uid.to_string());
+        assert_eq!(super::login(), expected);
+    }
+
+    #[test]
+    fn the_prefix_stands_the_u32_wire_value() {
+        let mut entry = HashMap::new();
+        entry.insert("prefix".to_owned(), OwnedValue::from(24u32));
+        assert!(matches!(super::prefix_of(&entry), Ok(prefix) if prefix == 24));
+        let mut wide = HashMap::new();
+        wide.insert("prefix".to_owned(), OwnedValue::from(256u32));
+        assert!(matches!(super::prefix_of(&wide), Err(NmIoError::Failed(_))));
+
+        let mut narrow = HashMap::new();
+        narrow.insert("prefix".to_owned(), OwnedValue::from(24u8));
+        assert!(matches!(
+            super::prefix_of(&narrow),
+            Err(NmIoError::Failed(_))
+        ));
+
+        let none = HashMap::new();
+        assert!(matches!(super::prefix_of(&none), Err(NmIoError::Failed(_))));
+    }
+
+    #[test]
+    fn the_permission_names_map_to_the_permission() {
+        assert!(super::denied_name(
+            "org.freedesktop.NetworkManager.PermissionDenied"
+        ));
+        assert!(super::denied_name(
+            "org.freedesktop.DBus.Error.AccessDenied"
+        ));
+        assert!(!super::denied_name(
+            "org.freedesktop.NetworkManager.PermissionsDenied"
+        ));
+        assert!(!super::denied_name("org.freedesktop.NetworkManager.Failed"));
     }
 
     #[test]
@@ -790,7 +914,7 @@ mod tests {
             owned(&connection["permissions"])
                 .downcast::<Vec<String>>()
                 .unwrap(),
-            vec![format!("user:{}:", login_for_test())]
+            vec![format!("user:{}:", super::login())]
         );
         assert_eq!(
             str_of(&connection["type"], "connection", "type"),
@@ -854,7 +978,7 @@ mod tests {
             owned(&connection["permissions"])
                 .downcast::<Vec<String>>()
                 .unwrap(),
-            vec![format!("user:{}:", login_for_test())]
+            vec![format!("user:{}:", super::login())]
         );
 
         let wifi = group(&settings, WIRELESS);
@@ -1003,5 +1127,81 @@ mod tests {
             }
             other => panic!("the event is not a state change, {other:?}"),
         }
+    }
+
+    async fn bus_names(names: &zbus::fdo::DBusProxy<'_>) -> std::collections::BTreeSet<String> {
+        names
+            .list_names()
+            .await
+            .expect("the bus's names")
+            .into_iter()
+            .map(|name| name.to_string())
+            .collect()
+    }
+
+    /// Poll the bus's names until at least one name beyond `baseline`
+    /// stands, or `bound` stands, the standing names returned.
+    async fn names_stand(
+        names: &zbus::fdo::DBusProxy<'_>,
+        baseline: &std::collections::BTreeSet<String>,
+        bound: std::time::Duration,
+    ) -> std::collections::BTreeSet<String> {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            let standing = bus_names(names).await;
+            if standing.difference(baseline).count() > 0 {
+                return standing;
+            }
+            if std::time::Instant::now() >= deadline {
+                return standing;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+    /// Poll the bus's names until `gone` are all free, or `bound` stands.
+    async fn names_free(
+        names: &zbus::fdo::DBusProxy<'_>,
+        gone: &std::collections::BTreeSet<String>,
+        bound: std::time::Duration,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + bound;
+        loop {
+            let standing = bus_names(names).await;
+            if gone.iter().all(|name| !standing.contains(name)) {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A dropped client releases its bus connection, the daemon keeping the
+    /// client's unique name free, the runtime standing.
+    #[tokio::test]
+    async fn a_dropped_client_releases_its_bus_connection() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let observer = bus.connect().await;
+        let names = zbus::fdo::DBusProxy::new(&observer)
+            .await
+            .expect("the bus proxy");
+        let baseline = bus_names(&names).await;
+        let client = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+        let standing = names_stand(&names, &baseline, std::time::Duration::from_secs(5)).await;
+        let created: std::collections::BTreeSet<String> =
+            standing.difference(&baseline).cloned().collect();
+        assert_ne!(
+            created.len(),
+            0,
+            "the client's connection did not stand within its bound"
+        );
+        drop(client);
+        assert!(
+            names_free(&names, &created, std::time::Duration::from_secs(5)).await,
+            "the dropped client retained its bus connection"
+        );
     }
 }
