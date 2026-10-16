@@ -155,7 +155,7 @@ jobs:
         CARGO_PROFILE_ANDROID_DEV_DEBUG: line-tables-only
       run: "dx build \\\n  --android \\\n  --target x86_64-linux-android \\\n  --no-default-features \\\n  --features mobile,device-identity\n"
     - name: Install trunk and the Tauri CLI
-      run: cargo install --locked trunk@0.21.14 tauri-cli@2.12.3
+      run: cargo install --locked trunk@0.21.14 tauri-cli@2.12.1
     - name: Add the wasm target
       run: rustup target add wasm32-unknown-unknown --toolchain stable
     - name: Build the Tauri demo's APK

@@ -16,6 +16,14 @@ allprojects {
     }
 }
 
+// The tauri-android library is built from its sources in cargo's registry,
+// which the emi runner VMs share, so its output goes under this project.
+subprojects {
+    if (name == "tauri-android") {
+        layout.buildDirectory.set(rootProject.layout.buildDirectory.dir("tauri-android"))
+    }
+}
+
 tasks.register("clean").configure {
     delete("build")
 }
