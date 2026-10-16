@@ -833,9 +833,17 @@ struct Shared<T: Transport> {
     /// The watch grace every watcher defaults to, cached from the config at
     /// build so the default site and the pump share one value.
     grace: Duration,
+    /// Diagnostic: the code location that last took the state lock.
+    holder: parking_lot::Mutex<&'static core::panic::Location<'static>>,
 }
 
 impl<T: Transport> Shared<T> {
+    /// Diagnostic: record the caller as the state lock's holder.
+    #[track_caller]
+    fn note_holder(&self) {
+        *self.holder.lock() = core::panic::Location::caller();
+    }
+
     /// Take the state lock, interrupting the pump's idle wait.
     ///
     /// Queue first, then wake: the fair mutex hands the pump's released lock
@@ -844,15 +852,36 @@ impl<T: Transport> Shared<T> {
     /// its cycle, re-acquire the lock, and park on a fresh wake future all
     /// inside the caller's descheduling window, after which the caller queues
     /// on a lock the idle pump holds forever. CPU-starved CI hit exactly that.
-    async fn lock_interrupting(&self) -> tokio::sync::MutexGuard<'_, State<T>> {
-        let mut lock = core::pin::pin!(self.state.lock());
-        let first = core::future::poll_fn(|cx| Poll::Ready(lock.as_mut().poll(cx))).await;
-        match first {
-            Poll::Ready(guard) => guard,
-            Poll::Pending => {
-                self.wake.notify_one();
-                lock.await
-            }
+    #[track_caller]
+    fn lock_interrupting(
+        &self,
+    ) -> impl Future<Output = tokio::sync::MutexGuard<'_, State<T>>> + '_ {
+        let caller = core::panic::Location::caller();
+        async move {
+            let mut lock = core::pin::pin!(self.state.lock());
+            let first = core::future::poll_fn(|cx| Poll::Ready(lock.as_mut().poll(cx))).await;
+            let guard = match first {
+                Poll::Ready(guard) => guard,
+                Poll::Pending => {
+                    self.wake.notify_one();
+                    let holder = *self.holder.lock();
+                    tracing::debug!(
+                        target: "connetto_client::away",
+                        waiter = %caller,
+                        holder = %holder,
+                        "a state lock wait started"
+                    );
+                    let guard = lock.await;
+                    tracing::debug!(
+                        target: "connetto_client::away",
+                        waiter = %caller,
+                        "a state lock wait ended"
+                    );
+                    guard
+                }
+            };
+            *self.holder.lock() = caller;
+            guard
         }
     }
 }
@@ -1333,6 +1362,7 @@ where
     #[cfg(feature = "native-auth")]
     pub(crate) async fn release_replica(&self) -> Result<(), ClientError> {
         let mut state = self.shared.state.lock().await;
+        self.shared.note_holder();
         let emptied = state.conn.emptied()?;
         drop(std::mem::replace(&mut state.conn, emptied));
         Ok(())
@@ -1400,6 +1430,7 @@ where
                 wake: Notify::new(),
             },
             grace,
+            holder: parking_lot::Mutex::new(core::panic::Location::caller()),
         });
         let token = Arc::new(ClientToken { wake });
         let driver = pump(Arc::clone(&shared), Arc::downgrade(&token), reconnect);
@@ -2388,6 +2419,7 @@ where
     /// set. Anonymous and gate-less clients ignore it, a locked client's
     /// pending prompt stays pending, and no grace means once per launch.
     pub async fn away(&self, at: Moment) {
+        tracing::debug!(target: "connetto_client::away", ?at, "away waits for the state lock");
         let _state = self.shared.lock_interrupting().await;
         self.shared.gate.away(at);
     }
@@ -2398,6 +2430,7 @@ where
     /// gated, open client clears the pending moment and re-checks when the
     /// time away exceeds the grace, or on every return with a zero grace.
     pub async fn back(&self, at: Moment) {
+        tracing::debug!(target: "connetto_client::away", ?at, "back waits for the state lock");
         let _state = self.shared.lock_interrupting().await;
         // Let the pump pick up a started prompt promptly.
         if self.shared.gate.back(at) {
@@ -2782,6 +2815,7 @@ async fn pump<T, F, S>(
         }
 
         let mut state = shared.state.lock().await;
+        shared.note_holder();
 
         match drain_and_flush(&mut state, &shared, reconnect.is_some()).await {
             PumpFlow::Proceed => {}
@@ -2806,6 +2840,7 @@ async fn pump<T, F, S>(
         // Drive the gate's prompt, if one is pending, alongside the frame wait.
         let mut ask = shared.gate.take_ask();
         let mut ask_outcome = None;
+        shared.note_holder();
         let stepped = step_or_resend(
             &mut state.conn,
             &shared.wake,
@@ -2819,6 +2854,7 @@ async fn pump<T, F, S>(
         // never strands the gate mid-prompt. Approval resumes access and held
         // refreshes, and a dismissal stays locked for the next return or
         // unlock call.
+        shared.note_holder();
         shared.gate.apply_outcome(&mut ask, ask_outcome);
         if let Some(ask) = ask {
             shared.gate.restore_ask(ask);
@@ -2981,6 +3017,7 @@ where
     T::Error: core::fmt::Display,
 {
     let mut state = shared.state.lock().await;
+    shared.note_holder();
     // A write made just before the close is queued before the socket goes.
     if let Err(err) = state.conn.flush().await {
         tracing::warn!(error = %err, "queueing the last writes at close failed");
@@ -3380,6 +3417,7 @@ where
             shared.gate.restore_ask(ask);
         }
         let mut state = shared.state.lock().await;
+        shared.note_holder();
         // A write made offline is queued durably now, not at the next attach.
         if let Err(err) = state.conn.flush().await {
             tracing::warn!(error = %err, "queueing an offline write failed");
@@ -3423,6 +3461,7 @@ where
             continue;
         };
         let mut state = shared.state.lock().await;
+        shared.note_holder();
         match state.conn.attach(transport).await {
             Ok(()) => {}
             // A rejected credential is not a transport blip: stop the backoff
