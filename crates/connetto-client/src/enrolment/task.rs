@@ -844,8 +844,12 @@ impl<L: Link> Run<L> {
         };
         match outcome {
             Ok((key, chain, lists)) => {
-                self.keep(&*key, chain, lifetime).await?;
+                let standing = self.keep(&*key, chain, lifetime).await?;
                 self.take_lists(lists).await;
+                // A list naming the new certificate has already revoked or withdrawn it.
+                if self.held.is_some() {
+                    self.announce(standing).await;
+                }
                 Ok(())
             }
             Err(Failed::Refused(EnrolRefusal::Revoked)) => {
@@ -864,14 +868,14 @@ impl<L: Link> Run<L> {
         }
     }
 
-    /// Store the granted chain, after checking it certifies this device's key
-    /// (lifecycle row "Grant received").
+    /// Store the granted chain, after checking it certifies this device's key,
+    /// and return where the local clock puts it (lifecycle row "Grant received").
     async fn keep(
         &mut self,
         key: &dyn DeviceKey,
         mut chain: Vec<Vec<u8>>,
         lifetime: Option<Duration>,
-    ) -> Result<(), CertificateError> {
+    ) -> Result<Standing, CertificateError> {
         let protocol = |detail: &str| {
             CertificateError::Device(ClientError::Protocol(format!(
                 "the granted certificate {detail}"
@@ -901,9 +905,15 @@ impl<L: Link> Run<L> {
             .map_err(CertificateError::Device)?;
         let standing = Standing::of(Some(&held), SystemTime::now());
         self.held = Some(held);
+        Ok(standing)
+    }
+
+    /// Publish the certificate just kept, check its window and start the peer
+    /// link (lifecycle row "Grant received").
+    async fn announce(&mut self, standing: Standing) {
         self.publish();
         // The server just issued it, so a window that does not hold it now
-        // says the local clock is off (lifecycle row "Grant received").
+        // says the local clock is off.
         match standing {
             Standing::ClockOff => self.clock_outside(false),
             Standing::Expired => self.clock_outside(true),
@@ -911,7 +921,6 @@ impl<L: Link> Run<L> {
         }
         #[cfg(feature = "peer")]
         self.peer_transition(standing).await;
-        Ok(())
     }
 
     /// Delete a certificate whose issuer the root revoked, keep the key, and

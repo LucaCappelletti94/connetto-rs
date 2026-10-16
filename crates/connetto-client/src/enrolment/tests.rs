@@ -11,7 +11,9 @@ use connetto_core::device_cert::{
     DeviceCertificate, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RevocationList, Revoked,
     RootCa, public_key_info,
 };
-use connetto_core::messages::{ControlMessage, DeviceAttestation, EnrolRefusal, SyncStatus};
+use connetto_core::messages::{
+    ControlMessage, DeviceAttestation, EnrolRefusal, SignedList, SyncStatus,
+};
 use diesel::Connection as _;
 use diesel::connection::SimpleConnection as _;
 use diesel::sqlite::SqliteConnection;
@@ -397,6 +399,13 @@ struct FakeState {
     /// The lists the run stored.
     lists: Vec<KeptList>,
     serials: u64,
+    /// The lists a grant hands over beside its chain.
+    grant_lists: Vec<SignedList>,
+    /// Storing a list waits on it first, so a test sees what the run
+    /// published while the list is not yet kept.
+    list_gate: Option<Arc<tokio::sync::Notify>>,
+    /// How many list stores have started.
+    list_stores: usize,
 }
 
 /// How the fake link drives one enrolment.
@@ -508,7 +517,7 @@ impl Link for FakeLink {
                                     AttestationLevel::Unproven,
                                 )
                                 .expect("the grant issues");
-                            Answer::Grant(vec![leaf, certificate], Vec::new())
+                            Answer::Grant(vec![leaf, certificate], state.grant_lists.clone())
                         }
                     };
                     let _ = tx.send(answer);
@@ -542,6 +551,14 @@ impl Link for FakeLink {
     fn store_list(&self, kept: KeptList) -> impl Future<Output = Result<(), ClientError>> + Send {
         let state = Arc::clone(&self.state);
         Box::pin(async move {
+            let gate = {
+                let mut state = state.lock();
+                state.list_stores += 1;
+                state.list_gate.clone()
+            };
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             state.lock().lists.push(kept);
             Ok(())
         })
@@ -804,6 +821,83 @@ async fn a_renewal_sends_no_attestation() {
             "the renewal replaces the certificate"
         );
     }
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// A grant's lists are kept before its certificate is published, so a
+/// caller that sees the certificate also finds the lists the handshake
+/// handed over, and the peer link starts with them.
+#[tokio::test]
+async fn a_grant_keeps_its_lists_before_publishing_the_certificate() {
+    let (_, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let list = authority
+        .issuer
+        .sign_list(
+            1,
+            &[Revoked {
+                serial: positive_serial(9).as_bytes().to_vec(),
+                at: now,
+            }],
+            now,
+            now + 12 * HOUR,
+        )
+        .expect("the list signs");
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let state = Arc::new(Mutex::new(FakeState {
+        grant_lists: vec![SignedList {
+            list,
+            signer: authority.certificate.clone(),
+        }],
+        list_gate: Some(Arc::clone(&gate)),
+        ..FakeState::default()
+    }));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    #[cfg(feature = "peer")]
+    let peer = peer(&authority);
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Grant,
+        gate: None,
+        grant_from: None,
+    };
+    #[cfg(feature = "peer")]
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    #[cfg(feature = "peer")]
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        None,
+        Vec::new(),
+        inbox(),
+        #[cfg(feature = "peer")]
+        peer,
+        #[cfg(feature = "peer")]
+        hotspot_tx,
+        #[cfg(feature = "peer")]
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+
+    poll_until(|| state.lock().list_stores == 1).await;
+    assert!(
+        handle.certificate().is_none(),
+        "the certificate stays unpublished while the grant's list is being kept"
+    );
+    gate.notify_one();
+    poll_until(|| handle.certificate().is_some()).await;
+    assert_eq!(state.lock().lists.len(), 1, "the grant's list is kept");
 
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
