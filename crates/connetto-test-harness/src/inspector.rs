@@ -550,10 +550,10 @@ mod tests {
         })
     }
 
-    /// A page mid-navigation announces its provisional target beside the
-    /// committed one, and only the committed one has a `Runtime` domain.
+    /// A page mid-navigation announces the provisional target of the process
+    /// it moves to, which has no `Runtime` domain until it commits.
     #[tokio::test]
-    async fn a_webkit_session_attaches_to_the_committed_target() {
+    async fn a_webkit_session_attaches_to_a_provisional_target_once_committed() {
         let url = scripted_webkit_endpoint(
             vec![
                 serde_json::json!({
@@ -561,22 +561,13 @@ mod tests {
                     "params": { "targetInfo": { "targetId": "page-2", "type": "page", "isProvisional": true } },
                 }),
                 serde_json::json!({
-                    "method": "Target.targetCreated",
-                    "params": { "targetInfo": { "targetId": "page-1", "type": "page" } },
+                    "method": "Target.didCommitProvisionalTarget",
+                    "params": { "oldTargetId": "page-1", "newTargetId": "page-2" },
                 }),
             ],
             |target, inner| {
-                if target == "page-1" {
-                    return vec![page_reply(target, inner, "status: connected")];
-                }
-                let refusal = serde_json::json!({
-                    "id": inner["id"],
-                    "error": { "code": -32601, "message": "'Runtime' domain was not found" },
-                });
-                vec![serde_json::json!({
-                    "method": "Target.dispatchMessageFromTarget",
-                    "params": { "targetId": target, "message": refusal.to_string() },
-                })]
+                assert_eq!(target, "page-2", "a request reached a target without Runtime");
+                vec![page_reply(target, inner, "status: connected")]
             },
         )
         .await;
@@ -628,17 +619,11 @@ mod tests {
                 }),
             ],
             |target, inner| {
-                if target == "page-8" {
-                    return vec![page_reply(target, inner, "status: connected")];
-                }
-                let refusal = serde_json::json!({
-                    "id": inner["id"],
-                    "error": { "code": -32601, "message": "'Runtime' domain was not found" },
-                });
-                vec![serde_json::json!({
-                    "method": "Target.dispatchMessageFromTarget",
-                    "params": { "targetId": target, "message": refusal.to_string() },
-                })]
+                assert_eq!(
+                    target, "page-8",
+                    "a request reached a target without Runtime"
+                );
+                vec![page_reply(target, inner, "status: connected")]
             },
         )
         .await;
