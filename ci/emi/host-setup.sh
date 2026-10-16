@@ -165,7 +165,7 @@ if [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' ci-registry-mirror 2>/de
     registry:2
 fi
 
-log "Project $PROJECT, confined: its own pool and bridge, cache paths only, 256 GiB and 14 VMs at most"
+log "Project $PROJECT, confined: its own pool and bridge, cache paths only, 256 GiB and 16 VMs at most"
 incus project show "$PROJECT" >/dev/null 2>&1 || incus project create "$PROJECT" \
   -c features.images=true -c features.profiles=true -c features.storage.volumes=true -c features.networks=false
 incus project set "$PROJECT" \
@@ -175,7 +175,7 @@ incus project set "$PROJECT" \
   restricted.networks.access="$BRIDGE" \
   restricted.storage-pools.access="$POOL" \
   limits.memory=256GiB \
-  limits.virtual-machines=14 \
+  limits.virtual-machines=16 \
   limits.containers=0
 # Incus 7.0.1 refuses to launch the project's own published images while this option is set (upstream/incus-restricted-image-servers-blocks-local-images.md).
 incus project unset "$PROJECT" restricted.images.servers
@@ -199,9 +199,9 @@ make_profile() {
     incus profile device remove "$name" "$dir" --project "$PROJECT" >/dev/null 2>&1 || true
   done
 }
-# 8 light and 6 heavy VMs fill the 256 GiB cap. The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
-make_profile ci-light 4 14GiB
-make_profile ci-heavy 8 24GiB
+# 10 light and 6 heavy VMs fit the 256 GiB cap. The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
+make_profile ci-light 4 12GiB
+make_profile ci-heavy 8 22GiB
 
 log "Account $RUNNER_USER, which runs GARM and holds the GitHub App key"
 id "$RUNNER_USER" >/dev/null 2>&1 \
