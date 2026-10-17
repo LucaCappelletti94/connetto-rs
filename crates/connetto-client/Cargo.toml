@@ -325,6 +325,9 @@ diesel-async = { version = "0.9", default-features = false, features = [
 ] }
 subql = { workspace = true, features = ["sqlite-cdc", "pg-sqlite-emu"] }
 tempfile = "3"
+# Generated replica DDL for the property that stripping synced references
+# keeps every other part of a table (R92).
+proptest = { version = "1", default-features = false, features = ["std"] }
 # Building a NaiveDateTime the emulator connector returns as a re-executed
 # timestamp aggregate, so the typed live() path decodes a temporal scalar.
 chrono = "0.4"

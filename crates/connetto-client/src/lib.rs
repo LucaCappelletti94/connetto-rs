@@ -102,6 +102,7 @@ mod multicast;
 pub mod reconnect;
 pub mod replica;
 mod subscriptions;
+mod synced_schema;
 
 #[cfg(feature = "peer")]
 pub use bluetooth::{
@@ -202,6 +203,10 @@ pub enum ClientError {
     /// Applying a server patch to the local replica failed.
     #[error("apply error: {0}")]
     Apply(String),
+    /// The replica's schema did not parse as SQLite, so its synced tables'
+    /// references could not be removed.
+    #[error("replica schema: {0}")]
+    Schema(String),
     /// A local database operation failed.
     #[error(transparent)]
     Db(#[from] diesel::result::Error),
@@ -2729,6 +2734,10 @@ where
         // Before any statement carrying outside input, and before the first
         // attach: R18's hardening surface, one helper for both open paths.
         harden::harden_replica_connection(&mut db)?;
+        // Connection state, so every open sets it. Native SQLite enforces by
+        // compile default and the browser build does not, and the tier's
+        // references have no enforcer but this one (R92 decision 2).
+        db.set_foreign_keys_enabled(true)?;
         // Register app-supplied functions before any DDL or insert, so a
         // column DEFAULT that calls one fires on the first write.
         config
@@ -2753,7 +2762,7 @@ where
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
         if let Some(ddl) = sqlite_ddl {
-            db.batch_execute(ddl)?;
+            db.batch_execute(&synced_schema::without_references(ddl)?)?;
         }
         // After the schema exists, whether this open created it or a previous
         // run did: the views are what the map has to agree with.
@@ -3503,6 +3512,10 @@ where
             // capture a second write of the same rows.
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
             self.db.transaction::<(), ClientError, _>(|db| {
+                // Checked at the commit, so neither table order nor row order
+                // inside a self-referencing table can refuse a whole archive,
+                // and an orphan still aborts the import (R92 decision 3).
+                db.batch_execute("PRAGMA defer_foreign_keys = ON")?;
                 for row in &plan.rows {
                     if choices.answer(row.collision) == Keep::Mine {
                         outcome.rows_kept += 1;

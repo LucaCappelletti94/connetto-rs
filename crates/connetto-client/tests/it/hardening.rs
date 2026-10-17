@@ -121,7 +121,6 @@ async fn every_configured_knob_holds_on_a_fresh_replica() {
     );
 
     assert_eq!(db.get_limit(SqliteLimit::FunctionArg), 8, "function arity");
-    assert_eq!(db.get_limit(SqliteLimit::TriggerDepth), 10, "trigger depth");
     assert_eq!(
         db.get_limit(SqliteLimit::VdbeOp),
         25_000,
@@ -149,6 +148,10 @@ async fn every_configured_knob_holds_on_a_fresh_replica() {
     assert!(
         db.get_limit(SqliteLimit::Length) >= 1_000_000_000,
         "a stored document exceeds a megabyte"
+    );
+    assert!(
+        db.get_limit(SqliteLimit::TriggerDepth) >= 1_000,
+        "each foreign-key cascade level counts one frame, and a tier hierarchy runs deep"
     );
     assert!(
         db.get_limit(SqliteLimit::CompoundSelect) >= 500,

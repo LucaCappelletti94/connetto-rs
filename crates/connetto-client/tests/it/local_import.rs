@@ -476,8 +476,7 @@ async fn restoring_a_clashing_row_updates_it_rather_than_replacing_it() {
         .conn
         .conn()
         .batch_execute(
-            "PRAGMA foreign_keys = ON;
-             INSERT INTO drafts (id, body) VALUES (7, 'my version');
+            "INSERT INTO drafts (id, body) VALUES (7, 'my version');
              INSERT INTO notes (id, draft, body) VALUES (1, 7, 'a child of the draft');",
         )
         .expect("seed the target");
