@@ -35,13 +35,20 @@ struct Item {
 }
 
 /// A transport handing out queued frames, idling when none are queued, and
-/// recording the subscriptions it was sent and whether it was closed.
+/// recording the subscriptions it was sent and whether it was closed. Once
+/// told to drop, every send fails the way a dead socket does.
 #[derive(Clone, Default)]
 struct Script {
     frames: Arc<Mutex<VecDeque<IncomingFrame>>>,
     subscribed: Arc<Mutex<Vec<String>>>,
     closed: Arc<AtomicBool>,
+    dropped: Arc<AtomicBool>,
 }
+
+/// The failure a send reports once the socket is gone.
+#[derive(Debug, thiserror::Error)]
+#[error("the socket is gone")]
+struct Gone;
 
 impl Script {
     fn say(&self, frame: IncomingFrame) {
@@ -56,10 +63,18 @@ impl Script {
             .cloned()
             .expect("the client subscribed")
     }
+
+    fn sent(&self) -> Result<(), Gone> {
+        if self.dropped.load(Ordering::Relaxed) {
+            Err(Gone)
+        } else {
+            Ok(())
+        }
+    }
 }
 
 impl Transport for Script {
-    type Error = std::convert::Infallible;
+    type Error = Gone;
 
     fn send_control(
         &mut self,
@@ -71,14 +86,14 @@ impl Transport for Script {
                 .expect("script lock")
                 .push(subscribe.sub_id);
         }
-        ready(Ok(()))
+        ready(self.sent())
     }
 
     fn send_bulk(
         &mut self,
         _message: BulkMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
-        ready(Ok(()))
+        ready(self.sent())
     }
 
     fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
@@ -320,6 +335,44 @@ async fn a_local_fault_on_the_drain_side_stops_the_pump_the_same_way() {
     tokio::time::timeout(BOUND, client.close())
         .await
         .expect("close returns at once after the stop");
+}
+
+/// Every event up to the driver's first redial, refusing a stop on the way.
+async fn until_reconnecting(events: &mut tokio::sync::broadcast::Receiver<ClientEvent>) {
+    let mut seen = Vec::new();
+    loop {
+        let event = tokio::time::timeout(BOUND, events.recv())
+            .await
+            .unwrap_or_else(|_| panic!("the driver redials in time, saw {seen:?}"))
+            .expect("the event stream stays open");
+        assert!(
+            !matches!(event, ClientEvent::Stopped { .. } | ClientEvent::Closed),
+            "a lost socket is recovered, never a stop, saw {seen:?} then {event:?}"
+        );
+        if matches!(event, ClientEvent::Reconnecting { .. }) {
+            return;
+        }
+        seen.push(event);
+    }
+}
+
+/// The socket dies as a local write is uploaded. That is a transport to go
+/// and find, so the driver redials and the pump never announces a stop.
+#[tokio::test]
+async fn a_socket_lost_while_uploading_a_write_is_recovered() {
+    let (client, script, _dir, _pump) = client().await;
+    let mut events = client.events();
+    script.dropped.store(true, Ordering::Relaxed);
+    client
+        .with_conn(|conn| {
+            diesel::insert_into(items::table)
+                .values((items::id.eq(1), items::label.eq("offline")))
+                .execute(conn.conn())
+                .expect("write the row")
+        })
+        .await
+        .expect("the write lands locally");
+    until_reconnecting(&mut events).await;
 }
 
 /// The server ends the session with no reconnect driver to resume it, so the
