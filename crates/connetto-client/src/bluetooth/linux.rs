@@ -216,15 +216,15 @@ async fn start_row<IO: BluezIo>(
                     (false, false)
                 }
                 Err(err) => {
-                    // The fresh start's refusal stands the column Off and
-                    // the machine's look the refusal's event, the renewal's
-                    // refusal keeps the old advertisement standing.
-                    let fresh = matches!(s.column, Advertising::Starting(_));
-                    if fresh {
+                    // A fresh start's refusal stands the column Off, and a
+                    // renewal's keeps the old advertisement until its
+                    // replacement stands. Both reach the machine, whose next
+                    // look retries under the current certificate.
+                    if matches!(s.column, Advertising::Starting(_)) {
                         s.column = Advertising::Off;
                     }
                     tracing::warn!(%err, "the beacon could not stand");
-                    (false, fresh)
+                    (false, true)
                 }
             }
         } else {
@@ -972,8 +972,19 @@ mod tests {
             .push_back(Err(BluezError::Refused("the refusal".into())));
         assert!(h.backend.start(BEACON_RENEWED).is_ok());
         pump_until(|| beacon(&h).len() == 2).await;
-        pump().await;
-        assert!(h.backend.poll().is_empty());
+        // The refusal reaches the machine, so its next look retries the
+        // renewal.
+        pump_until(|| {
+            h.backend
+                .poll()
+                .iter()
+                .any(|event| matches!(event, PeripheralEvent::Failed(_)))
+        })
+        .await;
+        assert!(matches!(
+            h.backend.standing.lock().column,
+            Advertising::Running(BEACON)
+        ));
         // The column keeps the old beacon's standing, the notify's rows
         // the old session's.
         h.events
@@ -984,6 +995,73 @@ mod tests {
             .expect("the event goes in");
         pump_until(|| !h.backend.poll().is_empty()).await;
         assert!(h.backend.notify(DEVICE, &[1]).is_ok());
+    }
+
+    /// A refused renewal, through the real machine over this backend, is
+    /// retried until the current certificate's beacon replaces the old one.
+    #[tokio::test]
+    async fn a_refused_renewal_is_retried_under_the_current_certificate() {
+        use crate::bluetooth::tests::{fp, offer, quiet_node};
+        use crate::bluetooth::{Machine, PeripheralBackend, ReadinessBackend};
+        use connetto_peer::Beacon;
+
+        let (fake, _events) = FakeBluez::new(AdapterStanding::Powered(true));
+        // The first beacon stands, the renewal is refused once, and every
+        // later start stands.
+        fake.start_answers.lock().extend([
+            Ok(()),
+            Err(BluezError::Refused("the renewal's refusal".into())),
+        ]);
+        let backend = Arc::new(LinuxBluetoothBackend::new(Arc::clone(&fake)));
+        let serving = Arc::new(Mutex::new(Some(fp(1))));
+        let (mut machine, _beacon) = Machine::new(
+            Arc::clone(&backend) as Arc<dyn ReadinessBackend>,
+            Arc::clone(&backend) as Arc<dyn PeripheralBackend>,
+            None,
+            quiet_node(),
+            false,
+            false,
+            false,
+            Arc::new({
+                let serving = Arc::clone(&serving);
+                move || *serving.lock()
+            }),
+            Arc::new(|_offer, _reply| {}),
+            Arc::new(|_event| {}),
+            Arc::new(|| {}),
+        );
+        let first = Beacon::of(&fp(1)).to_service_data();
+        let renewed = Beacon::of(&fp(2)).to_service_data();
+        let hosting = offer();
+        let tick_until = |machine: &mut Machine, done: &dyn Fn() -> bool, what: &str| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !done() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} within the bound"
+                );
+                machine.tick(Some(&hosting), false);
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        tick_until(
+            &mut machine,
+            &|| matches!(backend.standing.lock().column, Advertising::Running(b) if b == first),
+            "the first beacon stands",
+        );
+        *serving.lock() = Some(fp(2));
+        tick_until(
+            &mut machine,
+            &|| matches!(backend.standing.lock().column, Advertising::Running(b) if b == renewed),
+            "the renewed beacon replaces the old one",
+        );
+        let started = fake.started.lock().clone();
+        assert_eq!(started.first(), Some(&first));
+        assert_eq!(started.last(), Some(&renewed));
+        assert!(
+            started.len() >= 3,
+            "the refused renewal was retried, {started:?}"
+        );
     }
 
     /// The stop's queue ahead of the start's answer, the new beacon's

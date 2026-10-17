@@ -2159,7 +2159,7 @@ mod tests {
     }
 
     /// A node with no identity, so its exchanges answer `NotServing`.
-    fn quiet_node() -> Node {
+    pub(super) fn quiet_node() -> Node {
         let (tx, _rx) = mpsc::unbounded_channel::<PeerEvent>();
         Node::new(
             Trust {
@@ -2418,12 +2418,12 @@ mod tests {
         beacon: watch::Receiver<BeaconState>,
     }
 
-    fn fp(seed: u8) -> Fingerprint {
+    pub(super) fn fp(seed: u8) -> Fingerprint {
         Fingerprint::of(&[seed; 32])
     }
 
     /// The offer the fakes' hotspot hands out.
-    fn offer() -> HotspotOffer {
+    pub(super) fn offer() -> HotspotOffer {
         HotspotOffer::new("hotspot", "secret", HotspotSecurity::Wpa2, Some(54321))
     }
 
