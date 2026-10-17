@@ -58,12 +58,13 @@ const DEMO_SYNC_PORT: u16 = 7777;
 const PROVIDER: &str = "dev-idp";
 /// The port in the demo's default `CONNETTO_DEMO_PG`.
 const DEMO_PG_PORT: u16 = 55456;
-/// The demo's redirect on a phone, its bundle identifier as the scheme. The
-/// server lists it by exact match, as RFC 8252 section 7.1 has an operator
-/// register an app's scheme.
-const APP_REDIRECT: &str = "dev.connetto.dioxusdemo:/oauth2redirect";
-/// The demo's bundle identifier, the App ID App Attest names after the team.
-const DEMO_BUNDLE: &str = "dev.connetto.dioxusdemo";
+/// The demos' redirects on a phone, each bundle identifier as the scheme:
+/// the dioxus demo and the Tauri demo. The server lists them by exact match,
+/// as RFC 8252 section 7.1 has an operator register an app's scheme.
+const APP_REDIRECTS: &str =
+    "dev.connetto.dioxusdemo:/oauth2redirect,dev.connetto.tauridemo:/oauth2redirect";
+/// The demos' bundle identifiers, the App IDs App Attest names after the team.
+const DEMO_BUNDLES: [&str; 2] = ["dev.connetto.dioxusdemo", "dev.connetto.tauridemo"];
 
 const DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../../examples/dioxus-desktop-demo/schema.sql"),
@@ -121,7 +122,7 @@ async fn main() -> Result<()> {
     envs.extend(idp.env_pairs(PROVIDER, &format!("{base}/auth/callback")));
     envs.push((
         "CONNETTO_AUTH_REDIRECT_ALLOWLIST".to_owned(),
-        APP_REDIRECT.to_owned(),
+        APP_REDIRECTS.to_owned(),
     ));
     let _server = spawn_server(&server_bin, &envs, &server_bind).await?;
     let _tls = match &tls {
@@ -205,7 +206,9 @@ fn device_env(device_ca: &DemoDeviceCa) -> Vec<(String, String)> {
     if let Ok(team) = std::env::var("CONNETTO_IOS_TEAM_ID") {
         envs.push((
             "CONNETTO_DEVICE_APP_ATTEST_APP_IDS".to_owned(),
-            format!("{team}.{DEMO_BUNDLE}"),
+            DEMO_BUNDLES
+                .map(|bundle| format!("{team}.{bundle}"))
+                .join(","),
         ));
         envs.push((
             "CONNETTO_DEVICE_APP_ATTEST_ENVIRONMENT".to_owned(),

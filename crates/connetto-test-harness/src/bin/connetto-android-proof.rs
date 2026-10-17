@@ -1,6 +1,7 @@
-//! Deploys `examples/dioxus-desktop-demo` to an attached Android device or
-//! emulator and walks R88's proof on it, which is sign in, sync, write
-//! offline and upload on reconnect.
+//! Deploys `examples/dioxus-desktop-demo`, or with `--app tauri`
+//! `examples/tauri-leptos-demo`, to an attached Android device or emulator
+//! and walks R88's proof on it, which is sign in, sync, write offline and
+//! upload on reconnect.
 //!
 //! It runs as the command of `connetto-demo-stack`, which provides the stack
 //! and the environment naming it.
@@ -8,7 +9,7 @@
 //! ```text
 //! cargo build -p connetto-test-harness --bin connetto-android-proof
 //! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
-//!   target/debug/connetto-android-proof [--serial SERIAL] [--apk PATH] \
+//!   target/debug/connetto-android-proof [--serial SERIAL] [--app dioxus|tauri] [--apk PATH] \
 //!     [--unlock-pin PIN] [--peer-serial SECOND]
 //! ```
 //!
@@ -19,7 +20,8 @@
 //! run may know. Without it a person approves each prompt on the phone, by
 //! fingerprint or PIN, while the driver waits and says so.
 //!
-//! Without `--apk` it builds the APK with `dx` for the device's ABI. The demo
+//! Without `--apk` it builds the APK for the device's ABI, with `dx` or with
+//! `cargo tauri android build`. The demo
 //! and the device's browser are read and driven over the `DevTools` protocol,
 //! because neither exposes web content to `uiautomator`. The demo opens the
 //! login in a Custom Tab, where the driver types the user with trusted input,
@@ -31,7 +33,8 @@
 //! session's forwards and reverses on this machine too. A wireless serial
 //! (`host:port`) is reconnected after the restart.
 //!
-//! With `--peer-serial` a second attached phone joins the proof. The main
+//! With `--peer-serial` a second attached phone joins the proof, on the dioxus
+//! demo, whose panel holds the peer controls. The main
 //! phone hosts a hotspot from the demo and the second signs in as its own
 //! account and joins it through the demo's join form, the driver tapping the
 //! system's approval in place of the user (R76 decision 16). Each phone's
@@ -72,10 +75,7 @@ use connetto_test_harness::stack::{
 use tokio::process::Command;
 use tokio::time::{Instant, sleep};
 
-const PACKAGE: &str = "dev.connetto.dioxusdemo";
-const ACTIVITY: &str = "dev.dioxus.main.MainActivity";
 const BROWSER: &str = "com.android.chrome";
-const DEMO_DIR: [&str; 2] = ["examples", "dioxus-desktop-demo"];
 const USER: &str = "alice";
 /// The device port the demo's WebSocket dials, removed to take it offline.
 const SYNC_PORT: u16 = 7777;
@@ -93,10 +93,54 @@ const STAY_ON: &str = "stay_on_while_plugged_in";
 const HIDE_ERROR_DIALOGS: &str = "hide_error_dialogs";
 /// The log targets of the demo's away and return inputs and of its gate,
 /// printed when the proof fails.
-const GATE_TRACE_TARGETS: [&str; 2] = [
+const GATE_TRACE_TARGETS: [&str; 3] = [
     "\"target\":\"connetto_client::away\"",
     "\"target\":\"connetto_dioxus::away\"",
+    "\"target\":\"connetto_tauri_demo::away\"",
 ];
+
+/// The demo the proof deploys, `--app dioxus` (the default) or `--app tauri`
+/// (`examples/tauri-leptos-demo`).
+#[derive(Clone, Copy, Default)]
+enum DemoApp {
+    #[default]
+    Dioxus,
+    Tauri,
+}
+
+impl DemoApp {
+    fn parse(name: &str) -> Result<Self> {
+        match name {
+            "dioxus" => Ok(Self::Dioxus),
+            "tauri" => Ok(Self::Tauri),
+            other => bail!("unknown app {other}, expected dioxus or tauri"),
+        }
+    }
+}
+
+/// The demo this run deploys, set once from the command line.
+static APP: std::sync::OnceLock<DemoApp> = std::sync::OnceLock::new();
+
+fn demo_app() -> DemoApp {
+    APP.get().copied().unwrap_or_default()
+}
+
+/// The demo's Android package.
+fn package() -> &'static str {
+    match demo_app() {
+        DemoApp::Dioxus => "dev.connetto.dioxusdemo",
+        DemoApp::Tauri => "dev.connetto.tauridemo",
+    }
+}
+
+/// The demo's launch activity.
+fn activity() -> &'static str {
+    match demo_app() {
+        DemoApp::Dioxus => "dev.dioxus.main.MainActivity",
+        DemoApp::Tauri => "dev.connetto.tauridemo.MainActivity",
+    }
+}
+
 /// The second phone's account in the peer proof, so each page's `linked:`
 /// line names the other phone unambiguously.
 const PEER_USER: &str = "bob";
@@ -212,7 +256,7 @@ async fn main() -> Result<()> {
     }
     let _ = device.adb(&["forward", "--remove-all"]).await;
     let _ = device.adb(&["reverse", "--remove-all"]).await;
-    let _ = device.adb(&["shell", "am", "force-stop", PACKAGE]).await;
+    let _ = device.adb(&["shell", "am", "force-stop", package()]).await;
     let restored = match previous.as_deref() {
         Some(holder) => device.set_browser_role_holder(holder).await,
         None => device
@@ -284,7 +328,7 @@ async fn prove(
     device
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
         .await?;
-    device.adb(&["shell", "pm", "clear", PACKAGE]).await?;
+    device.adb(&["shell", "pm", "clear", package()]).await?;
     device.adb(&["logcat", "-c"]).await?;
     device.adb(&["reverse", "--remove-all"]).await?;
     for (device_port, host_port) in &stack.reverse {
@@ -393,13 +437,13 @@ async fn sign_in_across_a_killed_process(
 ) -> Result<()> {
     step("sign in across a killed process");
     let mut tab = device.login_tab(issuer).await?;
-    let killed = device.adb(&["shell", "pidof", PACKAGE]).await?;
+    let killed = device.adb(&["shell", "pidof", package()]).await?;
     let deadline = Instant::now() + Duration::from_secs(10);
     // `am kill` spares a visible process, and the app stays visible briefly after the tab opens.
     loop {
-        device.adb(&["shell", "am", "kill", PACKAGE]).await?;
+        device.adb(&["shell", "am", "kill", package()]).await?;
         sleep(Duration::from_millis(250)).await;
-        if device.adb(&["shell", "pidof", PACKAGE]).await.is_err() {
+        if device.adb(&["shell", "pidof", package()]).await.is_err() {
             break;
         }
         if Instant::now() >= deadline {
@@ -617,7 +661,7 @@ async fn peer_proof(
         .await;
     let _ = joiner.adb(&["forward", "--remove-all"]).await;
     let _ = joiner.adb(&["reverse", "--remove-all"]).await;
-    let _ = joiner.adb(&["shell", "am", "force-stop", PACKAGE]).await;
+    let _ = joiner.adb(&["shell", "am", "force-stop", package()]).await;
     PeerOutcome {
         joins: result,
         teardown: wrote_log.and(restore_role).and(restore_stay),
@@ -676,7 +720,7 @@ async fn run_peer_proof(
     joiner
         .adb(&["install", "-r", "-t", &apk.display().to_string()])
         .await?;
-    joiner.adb(&["shell", "pm", "clear", PACKAGE]).await?;
+    joiner.adb(&["shell", "pm", "clear", package()]).await?;
     joiner.adb(&["reverse", "--remove-all"]).await?;
     for (device_port, host_port) in &stack.reverse {
         joiner.reverse(*device_port, *host_port).await?;
@@ -690,7 +734,7 @@ async fn run_peer_proof(
             .chain(["android.permission.NEARBY_WIFI_DEVICES"])
         {
             phone
-                .adb(&["shell", "pm", "grant", PACKAGE, permission])
+                .adb(&["shell", "pm", "grant", package(), permission])
                 .await?;
         }
     }
@@ -1105,14 +1149,14 @@ async fn run_bluetooth_proof(host: &Device, evidence: &Path) -> Result<()> {
 
     step("grant the Bluetooth permissions");
     for permission in BT_PERMISSIONS {
-        host.adb(&["shell", "pm", "grant", PACKAGE, permission])
+        host.adb(&["shell", "pm", "grant", package(), permission])
             .await?;
     }
     host.adb(&[
         "shell",
         "pm",
         "grant",
-        PACKAGE,
+        package(),
         "android.permission.NEARBY_WIFI_DEVICES",
     ])
     .await?;
@@ -1160,7 +1204,7 @@ async fn host_with_beacon(host: &Device, evidence: &Path) -> Result<()> {
 /// the service data UUID past its first group.
 fn check_beacon_dump(dump: &str) -> Result<()> {
     let set = dump
-        .split_once(&format!("    {PACKAGE}\n"))
+        .split_once(&format!("    {}\n", package()))
         .map(|(_, rest)| rest)
         .context("the dump lists no advertising set of the demo")?;
     let set: Vec<&str> = set
@@ -1345,6 +1389,9 @@ fn cli_arguments() -> Result<Arguments> {
         match arg.as_str() {
             "--serial" => arguments.serial = Some(value),
             "--apk" => arguments.apk = Some(PathBuf::from(value)),
+            "--app" => APP
+                .set(DemoApp::parse(&value)?)
+                .map_err(|_| anyhow!("--app given twice"))?,
             "--unlock-pin" => arguments.unlock_pin = Some(value),
             "--peer-serial" => arguments.peer_serial = Some(value),
             other => bail!("unknown argument {other}"),
@@ -1358,6 +1405,13 @@ fn cli_arguments() -> Result<Arguments> {
     }
     if arguments.every_join && (arguments.bluetooth || arguments.payload) {
         bail!("--every-join runs every join, so --bluetooth and --payload name none");
+    }
+    if (arguments.peer_serial.is_some() || arguments.bluetooth)
+        && matches!(demo_app(), DemoApp::Tauri)
+    {
+        bail!(
+            "--peer-serial and --bluetooth need the dioxus demo, whose panel holds the peer controls"
+        );
     }
     Ok(arguments)
 }
@@ -1390,7 +1444,10 @@ async fn restart_adb_server() -> Result<()> {
 
 async fn build_apk(target: &str) -> Result<PathBuf> {
     step("build");
-    let demo = repo_path(&DEMO_DIR)?;
+    if let DemoApp::Tauri = demo_app() {
+        return build_tauri_apk(target).await;
+    }
+    let demo = repo_path(&["examples", "dioxus-desktop-demo"])?;
     let status = Command::new("dx")
         .args([
             "build",
@@ -1411,6 +1468,28 @@ async fn build_apk(target: &str) -> Result<PathBuf> {
     Ok(demo.join(
         "target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk",
     ))
+}
+
+/// Build the Tauri demo's debug APK for the one ABI of `target`.
+async fn build_tauri_apk(target: &str) -> Result<PathBuf> {
+    let abi = match target {
+        "aarch64-linux-android" => "aarch64",
+        "x86_64-linux-android" => "x86_64",
+        other => bail!("the Tauri build names no ABI for {other}"),
+    };
+    let demo = repo_path(&["examples", "tauri-leptos-demo", "src-tauri"])?;
+    let mut cargo = Command::new("cargo");
+    cargo.current_dir(&demo).args([
+        "tauri", "android", "build", "--debug", "--apk", "--target", abi,
+    ]);
+    if demo_has_device_identity() {
+        cargo.args(["--features", "device-identity"]);
+    }
+    let status = cargo.status().await.context("starting cargo tauri")?;
+    if !status.success() {
+        bail!("cargo tauri android build exited with {status}");
+    }
+    Ok(demo.join("gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk"))
 }
 
 struct Device {
@@ -1744,7 +1823,7 @@ impl Device {
             "start",
             "-W",
             "-n",
-            &format!("{PACKAGE}/{ACTIVITY}"),
+            &format!("{}/{}", package(), activity()),
         ])
         .await
         .map(drop)
@@ -1859,7 +1938,7 @@ impl Device {
     /// A `DevTools` session on the demo's `WebView`, over a forward that lives
     /// until [`main`] removes every forward.
     async fn app(&self) -> Result<PageSession> {
-        let pid = self.adb(&["shell", "pidof", PACKAGE]).await?;
+        let pid = self.adb(&["shell", "pidof", package()]).await?;
         let port = self
             .forward(&format!("webview_devtools_remote_{}", pid.trim()))
             .await?;

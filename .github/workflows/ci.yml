@@ -62,6 +62,12 @@ jobs:
           - name: dioxus-desktop-demo native
             cwd: examples/dioxus-desktop-demo
             target: ""
+          - name: tauri-leptos-demo native
+            cwd: examples/tauri-leptos-demo
+            target: ""
+          - name: tauri-leptos-demo ui wasm
+            cwd: examples/tauri-leptos-demo/ui
+            target: --target wasm32-unknown-unknown
     steps:
       - uses: actions/checkout@v7
 
@@ -88,10 +94,16 @@ jobs:
         run: rustup target add wasm32-unknown-unknown --toolchain stable
 
       # The root legs pass --all-features, which turns on connetto-dioxus's
-      # desktop feature and its webview stack.
+      # desktop feature and its webview stack, and Tauri links the same one.
       - name: Install desktop dependencies
-        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == '.'
+        if: matrix.cwd == 'examples/dioxus-desktop-demo' || matrix.cwd == 'examples/tauri-leptos-demo' || matrix.cwd == '.'
         uses: ./.github/actions/install-desktop-deps
+
+      # Tauri's context macro needs the UI's output directory, which only the
+      # Tauri CLI fills, and a check never serves the UI.
+      - name: Stand in for the Tauri demo's UI build
+        if: matrix.cwd == 'examples/tauri-leptos-demo'
+        run: mkdir -p examples/tauri-leptos-demo/ui/dist
 
       - name: Check formatting
         working-directory: ${{ matrix.cwd }}
@@ -164,6 +176,11 @@ jobs:
       - name: Install desktop dependencies
         uses: ./.github/actions/install-desktop-deps
 
+      # Tauri's context macro needs the UI's output directory, which only the
+      # Tauri CLI fills, and a lint never serves the UI.
+      - name: Stand in for the Tauri demo's UI build
+        run: mkdir -p examples/tauri-leptos-demo/ui/dist
+
       # Every workspace runs even after one fails, so one report lists them all.
       - name: Run nightly clippy
         run: |
@@ -182,6 +199,8 @@ jobs:
           examples/yew-web-demo --target=wasm32-unknown-unknown
           examples/webauthn-unlock --target=wasm32-unknown-unknown
           examples/dioxus-desktop-demo
+          examples/tauri-leptos-demo
+          examples/tauri-leptos-demo/ui --target=wasm32-unknown-unknown
           EOF
           if [ "${#failed[@]}" -gt 0 ]; then
             echo "::error::nightly clippy failed in ${failed[*]}"
@@ -296,9 +315,10 @@ jobs:
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
   ios-simulator:
-    # R88's proof, walked on an iOS simulator. The runner cannot run Docker,
-    # so the backend runs as plain processes and the simulator build carries
-    # an invented team ID, which the simulator does not check.
+    # R88's proof, walked on an iOS simulator with the Tauri demo. The runner
+    # cannot run Docker, so the backend runs as plain processes and the
+    # simulator build carries an invented team ID, which the simulator does
+    # not check.
     name: iOS simulator proof
     runs-on: macos-latest
     timeout-minutes: 60
@@ -328,25 +348,16 @@ jobs:
         id: cache-3
         uses: actions/cache/restore@v6
         with:
-          path: examples/dioxus-desktop-demo/target
-          key: t-ios-simulator-demo-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-demo-{0}-', runner.os) || '' }}
+          path: examples/tauri-leptos-demo/target
+          key: t-ios-simulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-ios-simulator-tauri-{0}-', runner.os) || '' }}
 
       - name: Install stable toolchain with the simulator target
         run: |
           rustup toolchain install stable --profile minimal
           rustup target add aarch64-apple-ios-sim --toolchain stable
 
-      - name: Install dx
-        run: |
-          base=https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10
-          curl -fsSLO "$base/dx-aarch64-apple-darwin.tar.gz"
-          curl -fsSL "$base/dx-aarch64-apple-darwin.sha256" \
-            | grep ' dx-aarch64-apple-darwin.tar.gz$' \
-            | shasum -a 256 -c
-          tar xzf dx-aarch64-apple-darwin.tar.gz -C ~/.cargo/bin dx
-          rm dx-aarch64-apple-darwin.tar.gz
-          dx --version
+      - uses: ./.github/actions/install-tauri-tools
 
       # The proof reads the simulator's pages through ios_webkit_debug_proxy.
       - name: Install ios_webkit_debug_proxy
@@ -360,11 +371,12 @@ jobs:
 
       - uses: ./.github/actions/start-native-services
 
+      # The proof builds the demo with `cargo tauri ios build` once the stack has minted its device CA.
       - name: Walk the proof on a simulator
         env:
           CONNETTO_SERVER_BIN: ${{ github.workspace }}/target/release/connetto-server
           CONNETTO_IOS_TEAM_ID: ABCDE12345
-        run: target/release/connetto-demo-stack target/release/connetto-ios-proof
+        run: target/release/connetto-demo-stack target/release/connetto-ios-proof --demo tauri
 
       - uses: actions/upload-artifact@v7
         if: failure()
@@ -379,7 +391,7 @@ jobs:
         if: always()
         run: |
           rm -rf target/release/incremental
-          find examples/dioxus-desktop-demo/target -type d -name incremental -prune -exec rm -rf {} +
+          find examples/tauri-leptos-demo/target -type d -name incremental -prune -exec rm -rf {} +
 
       - name: Save cargo downloads
         if: github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
@@ -402,7 +414,7 @@ jobs:
         if: github.event_name == 'push' && steps.cache-3.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: examples/dioxus-desktop-demo/target
+          path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-3.outputs.cache-primary-key }}
 
   ios-crate-tests:
@@ -894,7 +906,7 @@ jobs:
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
   android-emulator:
-    # R88's proof, walked on an emulator from the APK dx bundles, so the
+    # R88's proof, walked on an emulator with the Tauri demo's APK, so the
     # Gradle build, the Kotlin sign-in plugin and the app itself run in CI.
     name: Android emulator proof
     needs: browser-build
@@ -916,20 +928,14 @@ jobs:
           key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
 
-      # The dx bundle beside the Rust artifacts holds several copies of the
-      # debug library, and Gradle rebuilds it in seconds from that library.
-      # The cache matches paths without descending into them, so it lists the
-      # target's children for the exclusion to apply.
       - name: Restore the demo's build output
         if: runner.environment == 'github-hosted'
         id: cache-2
         uses: actions/cache/restore@v6
         with:
-          path: |
-            examples/dioxus-desktop-demo/target/*
-            !examples/dioxus-desktop-demo/target/dx
-          key: t-android-emulator-lines-${{ runner.os }}-${{ hashFiles('examples/dioxus-desktop-demo/Cargo.lock') }}
-          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-lines-{0}-', runner.os) || '' }}
+          path: examples/tauri-leptos-demo/target
+          key: t-android-emulator-tauri-${{ runner.os }}-${{ hashFiles('examples/tauri-leptos-demo/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('t-android-emulator-tauri-{0}-', runner.os) || '' }}
 
       - uses: ./.github/actions/get-files
         with:
@@ -950,23 +956,21 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup target add x86_64-linux-android --toolchain stable
 
-      - name: Install dx
-        run: |
-          base=https://github.com/DioxusLabs/dioxus/releases/download/v0.7.10
-          curl -fsSLO "$base/dx-x86_64-unknown-linux-gnu.tar.gz"
-          curl -fsSL "$base/dx-x86_64-unknown-linux-gnu.sha256" \
-            | grep ' dx-x86_64-unknown-linux-gnu.tar.gz$' \
-            | sha256sum --check
-          tar xzf dx-x86_64-unknown-linux-gnu.tar.gz -C ~/.cargo/bin dx
-          rm dx-x86_64-unknown-linux-gnu.tar.gz
-          dx --version
+      - uses: ./.github/actions/install-tauri-tools
 
-      - name: Point dx at the runner's Android SDK
+      # Vendored OpenSSL looks for a target-prefixed ar and ranlib the NDK no longer ships.
+      - name: Point the Tauri CLI at the runner's Android SDK
         run: |
           ndk="${ANDROID_NDK_LATEST_HOME:-$ANDROID_NDK_HOME}"
-          echo "ANDROID_NDK_HOME=$ndk" >> "${GITHUB_ENV}"
-          echo "NDK_HOME=$ndk" >> "${GITHUB_ENV}"
+          bin="$ndk/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          {
+            echo "ANDROID_NDK_HOME=$ndk"
+            echo "NDK_HOME=$ndk"
+            echo "AR_x86_64_linux_android=$bin/llvm-ar"
+            echo "RANLIB_x86_64_linux_android=$bin/llvm-ranlib"
+          } >> "${GITHUB_ENV}"
           echo "${ANDROID_HOME}/platform-tools" >> "${GITHUB_PATH}"
+          echo "$bin" >> "${GITHUB_PATH}"
 
       # The demo's device CA, which the APK ships and the stack reuses (R74
       # decision 30).
@@ -977,15 +981,10 @@ jobs:
       # emulator boots so the emulator's time goes to the proof. Line tables
       # keep a panic's file and line and halve the APK and the cached tree.
       - name: Build the demo's APK
-        working-directory: examples/dioxus-desktop-demo
+        working-directory: examples/tauri-leptos-demo/src-tauri
         env:
-          CARGO_PROFILE_ANDROID_DEV_DEBUG: line-tables-only
-        run: |
-          dx build \
-            --android \
-            --target x86_64-linux-android \
-            --no-default-features \
-            --features mobile,device-identity
+          CARGO_PROFILE_DEV_DEBUG: line-tables-only
+        run: cargo tauri android build --debug --apk --target x86_64 --features device-identity
 
       - uses: ./.github/actions/pull-test-images
 
@@ -1010,7 +1009,7 @@ jobs:
           # The Keystore gate (R52) needs a secure lock screen, so the run sets a throwaway PIN and types it.
           script: |
             adb -s emulator-5554 shell locksettings set-pin 2580
-            android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --apk examples/dioxus-desktop-demo/target/dx/connetto-dioxus-desktop-demo/debug/android/app/app/build/outputs/apk/debug/app-debug.apk
+            android-bins/connetto-demo-stack android-bins/connetto-android-proof --serial emulator-5554 --unlock-pin 2580 --app tauri --apk examples/tauri-leptos-demo/src-tauri/gen/android/app/build/outputs/apk/universal/debug/app-universal-debug.apk
 
       # The adb server's own log records every change of the device's
       # transport, such as it going offline.
@@ -1026,7 +1025,7 @@ jobs:
 
       - name: Prune the demo's target cache
         if: always()
-        run: find examples/dioxus-desktop-demo/target -type d -name incremental -prune -exec rm -rf {} +
+        run: find examples/tauri-leptos-demo/target -type d -name incremental -prune -exec rm -rf {} +
 
       - name: Save cargo downloads
         if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
@@ -1042,9 +1041,7 @@ jobs:
         if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-2.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         with:
-          path: |
-            examples/dioxus-desktop-demo/target/*
-            !examples/dioxus-desktop-demo/target/dx
+          path: examples/tauri-leptos-demo/target
           key: ${{ steps.cache-2.outputs.cache-primary-key }}
 
   file-core-wasm:

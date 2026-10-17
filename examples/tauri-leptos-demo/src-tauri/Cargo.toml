@@ -1,0 +1,48 @@
+[package]
+name = "connetto-tauri-demo"
+description = "The connetto demo as a Tauri 2 app, the client in the native core and a Leptos UI in the WebView."
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[lib]
+name = "connetto_tauri_demo_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+connetto-client = { path = "../../../crates/connetto-client", features = ["native-auth"] }
+connetto-core = { path = "../../../crates/connetto-core", features = ["logging"] }
+diesel = { version = "2", features = ["sqlite", "chrono"] }
+diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
+parking_lot = "0.12"
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres"] }
+serde = { version = "1", features = ["derive"] }
+tauri = { version = "2.12", features = [] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+thiserror = "2"
+
+[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
+# Sign-in through the Custom Tab or the authentication session and the app's
+# own redirect, reused unchanged from the dioxus demo.
+connetto-auth-session = { path = "../../../crates/connetto-auth-session" }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# The Keystore unlock prompt's JNI types and the Activity lookup.
+manganis = "0.7.10"
+android_log-sys = "0.3.2"
+# The activity, published to ndk-context in place of the Application tao
+# publishes, since connetto-auth-session's Kotlin needs an Activity.
+ndk-context = "0.1.1"
+
+[features]
+# Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
+# names at build time, as the dioxus demo's feature does.
+device-identity = ["connetto-client/device-identity", "connetto-auth-session/device-identity"]
+
+[build-dependencies]
+connetto-schema = { path = "../../../crates/connetto-schema" }
+tauri-build = { version = "2.7", features = [] }

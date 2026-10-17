@@ -44,6 +44,26 @@ pub struct PageSession {
     socket: Socket,
     route: Route,
     next_id: u64,
+    /// The `WebKit` target events the session saw, the first
+    /// [`TARGET_EVENTS_KEPT`], which a failed request reports.
+    target_events: Vec<String>,
+}
+
+/// How many target events a session keeps for its failure reports.
+const TARGET_EVENTS_KEPT: usize = 16;
+
+/// Keep `message` on `events` when it is a `WebKit` target event other than a
+/// wrapped reply.
+fn note_target_event(events: &mut Vec<String>, message: &serde_json::Value) {
+    let Some(method) = message["method"].as_str() else {
+        return;
+    };
+    if method.starts_with("Target.")
+        && method != "Target.dispatchMessageFromTarget"
+        && events.len() < TARGET_EVENTS_KEPT
+    {
+        events.push(format!("{method} {}", message["params"]));
+    }
 }
 
 impl PageSession {
@@ -60,33 +80,56 @@ impl PageSession {
             socket,
             route: Route::Direct,
             next_id: 0,
+            target_events: Vec::new(),
         })
     }
 
-    /// A session speaking the `WebKit` target protocol to the page at `url`.
+    /// A session speaking the `WebKit` target protocol to the page at `url`,
+    /// on its committed page target. A page mid-navigation also announces the
+    /// provisional target of the process it is moving to, and iOS 26 announces
+    /// the main frame as a target of its own, whose `Runtime` domain is absent.
     ///
     /// # Errors
     ///
-    /// When the socket does not open or announces no page within
+    /// When the socket does not open or announces no committed page within
     /// [`REPLY_BOUND`].
     pub async fn webkit(url: &str) -> Result<Self> {
         let (mut socket, _) = tokio_tungstenite::connect_async(url)
             .await
             .context("opening the WebKit inspector session")?;
         let deadline = Instant::now() + REPLY_BOUND;
+        let mut target_events = Vec::new();
+        // Frames commit provisional targets too, so only a page's commit is followed.
+        let mut provisional_pages = Vec::new();
         loop {
             let message = next_json(&mut socket, deadline, "the target announcement").await?;
-            if message["method"] == "Target.targetCreated" {
-                let target = message["params"]["targetInfo"]["targetId"]
-                    .as_str()
-                    .ok_or_else(|| anyhow!("a target announcement without an id: {message}"))?
-                    .to_owned();
-                return Ok(Self {
-                    socket,
-                    route: Route::Target(target),
-                    next_id: 0,
-                });
-            }
+            note_target_event(&mut target_events, &message);
+            let info = &message["params"]["targetInfo"];
+            let committed = match message["method"].as_str() {
+                Some("Target.targetCreated") if info["type"] == "page" => {
+                    if info["isProvisional"] == true {
+                        provisional_pages.push(info["targetId"].clone());
+                        continue;
+                    }
+                    &info["targetId"]
+                }
+                Some("Target.didCommitProvisionalTarget")
+                    if provisional_pages.contains(&message["params"]["newTargetId"]) =>
+                {
+                    &message["params"]["newTargetId"]
+                }
+                _ => continue,
+            };
+            let target = committed
+                .as_str()
+                .ok_or_else(|| anyhow!("a target announcement without an id: {message}"))?
+                .to_owned();
+            return Ok(Self {
+                socket,
+                route: Route::Target(target),
+                next_id: 0,
+                target_events,
+            });
         }
     }
 
@@ -127,11 +170,23 @@ impl PageSession {
                 &format!("request {id} ({method})"),
             )
             .await?;
-            let reply = match self.route {
+            let reply = match &mut self.route {
                 Route::Direct => message,
-                Route::Target(_) => {
+                Route::Target(target) => {
+                    note_target_event(&mut self.target_events, &message);
                     if let Some(error) = message.get("error") {
                         bail!("inspector request {id} was refused: {error}");
+                    }
+                    // The old target drops the request, so the caller asks the new one again.
+                    if message["method"] == "Target.didCommitProvisionalTarget"
+                        && message["params"]["oldTargetId"] == target.as_str()
+                    {
+                        let new = message["params"]["newTargetId"]
+                            .as_str()
+                            .ok_or_else(|| anyhow!("a target commit without an id: {message}"))?;
+                        new.clone_into(target);
+                        return Err(anyhow!("request {id} went to a target the page left")
+                            .context(Navigated));
                     }
                     if message["method"] != "Target.dispatchMessageFromTarget" {
                         continue;
@@ -142,7 +197,13 @@ impl PageSession {
             };
             if reply["id"] == id {
                 if let Some(error) = reply.get("error") {
-                    let failure = anyhow!("inspector request {id} failed: {error}");
+                    let failure = match &self.route {
+                        Route::Direct => anyhow!("inspector request {id} failed: {error}"),
+                        Route::Target(target) => anyhow!(
+                            "inspector request {id} to target {target} failed: {error}, after the target events {:?}",
+                            self.target_events
+                        ),
+                    };
                     let navigated = NAVIGATED.contains(&error["message"].as_str().unwrap_or(""));
                     return Err(if navigated {
                         failure.context(Navigated)
@@ -363,7 +424,7 @@ mod tests {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let announce = serde_json::json!({
                 "method": "Target.targetCreated",
-                "params": { "targetInfo": { "targetId": "page-1" } },
+                "params": { "targetInfo": { "targetId": "page-1", "type": "page" } },
             });
             socket
                 .send(Message::Text(announce.to_string()))
@@ -448,5 +509,143 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("wasn't found"), "{error:#}");
+    }
+
+    /// A `WebKit` target endpoint that first sends `announcements`, then
+    /// answers each wrapped request with the frames `respond` returns for its
+    /// target and inner message.
+    async fn scripted_webkit_endpoint(
+        announcements: Vec<serde_json::Value>,
+        respond: fn(&str, &serde_json::Value) -> Vec<serde_json::Value>,
+    ) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for announcement in announcements {
+                socket
+                    .send(Message::Text(announcement.to_string()))
+                    .await
+                    .unwrap();
+            }
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let frame: serde_json::Value = serde_json::from_str(&text).unwrap();
+                let target = frame["params"]["targetId"].as_str().unwrap().to_owned();
+                let inner: serde_json::Value =
+                    serde_json::from_str(frame["params"]["message"].as_str().unwrap()).unwrap();
+                for outgoing in respond(&target, &inner) {
+                    socket
+                        .send(Message::Text(outgoing.to_string()))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        format!("ws://{address}")
+    }
+
+    /// The wrapped reply `target` gives to `inner`, the page text `text`.
+    fn page_reply(target: &str, inner: &serde_json::Value, text: &str) -> serde_json::Value {
+        let reply = serde_json::json!({
+            "id": inner["id"],
+            "result": { "result": { "type": "string", "value": text } },
+        });
+        serde_json::json!({
+            "method": "Target.dispatchMessageFromTarget",
+            "params": { "targetId": target, "message": reply.to_string() },
+        })
+    }
+
+    /// A page mid-navigation announces the provisional target of the process
+    /// it moves to, which has no `Runtime` domain until it commits.
+    #[tokio::test]
+    async fn a_webkit_session_attaches_to_a_provisional_target_once_committed() {
+        let url = scripted_webkit_endpoint(
+            vec![
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "page-2", "type": "page", "isProvisional": true } },
+                }),
+                serde_json::json!({
+                    "method": "Target.didCommitProvisionalTarget",
+                    "params": { "oldTargetId": "page-1", "newTargetId": "page-2" },
+                }),
+            ],
+            |target, inner| {
+                assert_eq!(target, "page-2", "a request reached a target without Runtime");
+                vec![page_reply(target, inner, "status: connected")]
+            },
+        )
+        .await;
+        let mut page = PageSession::webkit(&url).await.unwrap();
+        page.wait_for_text("status: connected", Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    /// A navigation that swaps the page's process commits a new target, and
+    /// the request the old target dropped is asked again of the new one.
+    #[tokio::test]
+    async fn a_webkit_wait_follows_a_committed_provisional_target() {
+        let url = scripted_webkit_endpoint(
+            vec![serde_json::json!({
+                "method": "Target.targetCreated",
+                "params": { "targetInfo": { "targetId": "page-1", "type": "page" } },
+            })],
+            |target, inner| {
+                if target == "page-2" {
+                    return vec![page_reply(target, inner, "status: connected")];
+                }
+                vec![serde_json::json!({
+                    "method": "Target.didCommitProvisionalTarget",
+                    "params": { "oldTargetId": "page-1", "newTargetId": "page-2" },
+                })]
+            },
+        )
+        .await;
+        let mut page = PageSession::webkit(&url).await.unwrap();
+        page.wait_for_text("status: connected", Duration::from_secs(5))
+            .await
+            .unwrap();
+    }
+
+    /// `WebKit` on iOS 26 announces the page's main frame as its own target,
+    /// which can commit provisional targets of its own, before the page
+    /// target, and only the page target has `Runtime`.
+    #[tokio::test]
+    async fn a_webkit_session_attaches_to_the_page_not_its_frame() {
+        let url = scripted_webkit_endpoint(
+            vec![
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "frame-1", "type": "frame" } },
+                }),
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "frame-2", "type": "frame", "isProvisional": true } },
+                }),
+                serde_json::json!({
+                    "method": "Target.didCommitProvisionalTarget",
+                    "params": { "oldTargetId": "frame-1", "newTargetId": "frame-2" },
+                }),
+                serde_json::json!({
+                    "method": "Target.targetCreated",
+                    "params": { "targetInfo": { "targetId": "page-8", "type": "page" } },
+                }),
+            ],
+            |target, inner| {
+                assert_eq!(
+                    target, "page-8",
+                    "a request reached a target without Runtime"
+                );
+                vec![page_reply(target, inner, "status: connected")]
+            },
+        )
+        .await;
+        let mut page = PageSession::webkit(&url).await.unwrap();
+        page.wait_for_text("status: connected", Duration::from_secs(5))
+            .await
+            .unwrap();
     }
 }
