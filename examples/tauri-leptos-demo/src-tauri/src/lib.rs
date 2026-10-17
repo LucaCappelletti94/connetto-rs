@@ -397,44 +397,6 @@ mod android {
             Ok(())
         }
     }
-
-    /// The activity `MainActivity` published, kept alive for the process.
-    static ACTIVITY: std::sync::OnceLock<manganis::jni::objects::GlobalRef> =
-        std::sync::OnceLock::new();
-
-    /// Whether the activity is published, which setup waits for.
-    pub(crate) fn activity_published() -> bool {
-        ACTIVITY.get().is_some()
-    }
-
-    /// Called by `MainActivity.onCreate` after Tauri's own setup: puts the
-    /// activity into ndk-context in place of the Application tao published,
-    /// since connetto-auth-session constructs its Kotlin plugins with it.
-    #[unsafe(no_mangle)]
-    pub extern "system" fn Java_dev_connetto_tauridemo_MainActivity_publishActivity(
-        env: manganis::jni::JNIEnv<'_>,
-        _this: manganis::jni::objects::JObject<'_>,
-        activity: manganis::jni::objects::JObject<'_>,
-    ) {
-        let (Ok(vm), Ok(global)) = (env.get_java_vm(), env.new_global_ref(&activity)) else {
-            tracing::error!("the activity could not be kept");
-            return;
-        };
-        let raw = global.as_obj().as_raw();
-        if ACTIVITY.set(global).is_err() {
-            // A second activity in the same process leaves the first in ndk-context.
-            return;
-        }
-        // SAFETY: tao initialised ndk-context with the Application before
-        // `super.onCreate` returned, so a context is present to release, and
-        // no connetto code reads it yet, since setup waits for this call.
-        unsafe { ndk_context::release_android_context() };
-        // SAFETY: `vm` is this process's Java VM and `raw` the activity's
-        // global reference, which `ACTIVITY` keeps alive for the process.
-        unsafe {
-            ndk_context::initialize_android_context(vm.get_java_vm_pointer().cast(), raw.cast());
-        }
-    }
 }
 
 fn status_label(event: &ClientEvent) -> Option<String> {
@@ -497,18 +459,6 @@ fn device_label(_native: &NativeClient<Ws>) -> String {
 /// Sign in, open the replica and start the pump, then feed the view.
 async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Result<()> {
     use anyhow::Context as _;
-    // The sign-in tab and the unlock prompt need the activity in ndk-context.
-    #[cfg(target_os = "android")]
-    {
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-        while !android::activity_published() {
-            if tokio::time::Instant::now() >= deadline {
-                anyhow::bail!("MainActivity never published itself");
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        }
-    }
-
     let server = endpoint(
         std::env::var("CONNETTO_DEMO_WS").ok(),
         option_env!("CONNETTO_DEMO_BUILD_WS"),

@@ -10,7 +10,7 @@ use tokio::time::{Instant, sleep};
 use crate::AuthSessionError;
 
 // Declared for `dx`, which builds and bundles the Kotlin module this names.
-// The plugin is constructed through the Activity's class loader below, since
+// The plugin is constructed through the context's class loader below, since
 // a thread Dioxus attached to the VM cannot find app classes with `FindClass`.
 #[manganis::ffi("android")]
 extern "Kotlin" {
@@ -25,6 +25,9 @@ const POLL: Duration = Duration::from_millis(250);
 const PENDING: i32 = 0;
 const APPROVED: i32 = 1;
 const CANCELED: i32 = 3;
+const NO_SCREEN: i32 = 5;
+/// `AuthSessionPlugin.TAB_NO_SCREEN`, a tab that found no screen to open on.
+const TAB_NO_SCREEN: i32 = 2;
 /// A prompt the system cancels this soon after showing it, as it does to an
 /// app launched while the phone settles, is shown again once.
 const EARLY_CANCEL: Duration = Duration::from_secs(1);
@@ -43,8 +46,18 @@ pub(crate) async fn authorize(url: &str, timeout: Duration) -> Result<String, Au
     })?;
     let deadline = Instant::now() + timeout;
     loop {
-        if let Some(redirect) = jni_call(|env, _| take_redirect(env, plugin.as_obj()))? {
+        let (redirect, tab) = jni_call(|env, _| {
+            let redirect = take_redirect(env, plugin.as_obj())?;
+            let tab = env
+                .call_method(plugin.as_obj(), "tabState", "()I", &[])?
+                .i()?;
+            Ok((redirect, tab))
+        })?;
+        if let Some(redirect) = redirect {
             return Ok(redirect);
+        }
+        if tab == TAB_NO_SCREEN {
+            return Err(AuthSessionError::NoScreen);
         }
         if Instant::now() >= deadline {
             return Err(AuthSessionError::TimedOut(timeout));
@@ -98,6 +111,9 @@ pub(crate) fn approve_unlock(
             }
             std::thread::sleep(POLL);
         };
+        if outcome == NO_SCREEN {
+            return Err(AuthSessionError::NoScreen);
+        }
         if outcome == CANCELED && !retried && shown.elapsed() < EARLY_CANCEL {
             retried = true;
             continue;
@@ -110,11 +126,13 @@ fn construct() -> Result<AuthSessionPlugin, AuthSessionError> {
     construct_class(PLUGIN_CLASS).map(AuthSessionPlugin::from_global_ref)
 }
 
-/// An instance of the bundled class `name`, built on the Activity.
+/// An instance of the bundled class `name`, loaded through the context's class
+/// loader. The plugins look the screen up themselves, so the context only
+/// needs to belong to this app.
 fn construct_class(name: &str) -> Result<GlobalRef, AuthSessionError> {
-    jni_call(|env, activity| {
+    jni_call(|env, context| {
         let loader = env
-            .call_method(activity, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
+            .call_method(context, "getClassLoader", "()Ljava/lang/ClassLoader;", &[])?
             .l()?;
         let name = env.new_string(name)?;
         let class = env
@@ -125,11 +143,7 @@ fn construct_class(name: &str) -> Result<GlobalRef, AuthSessionError> {
                 &[JValue::Object(&name)],
             )?
             .l()?;
-        let instance = env.new_object(
-            JClass::from(class),
-            "(Landroid/app/Activity;)V",
-            &[JValue::Object(activity)],
-        )?;
+        let instance = env.new_object(JClass::from(class), "()V", &[])?;
         env.new_global_ref(instance)
     })
 }
@@ -148,21 +162,41 @@ fn take_redirect(
     Ok(Some(env.get_string(&value)?.into()))
 }
 
-/// Run `f` with a JNI environment attached to this thread and the Activity.
+/// Run `f` with a JNI environment attached to this thread and the context
+/// manganis took from `ndk-context` on its first call, kept for the process.
 fn jni_call<R>(
     f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> manganis::jni::errors::Result<R>,
 ) -> Result<R, AuthSessionError> {
-    with_activity(|env, activity| Some(f(env, activity)))
-        .ok_or_else(|| AuthSessionError::Bridge("no Android activity".to_owned()))?
-        .map_err(|err| AuthSessionError::Bridge(err.to_string()))
+    with_activity(|env, context| Some(f(env, context).map_err(|err| bridge_error(env, &err))))
+        .ok_or_else(|| AuthSessionError::Bridge("no Android context".to_owned()))?
 }
 
-/// The Java VM reached through the Activity, for the device key.
+/// The bridge error for `err`. A Java exception is cleared and reported by its
+/// description, since one left pending makes the thread's next JNI call illegal.
+fn bridge_error(env: &mut JNIEnv<'_>, err: &manganis::jni::errors::Error) -> AuthSessionError {
+    let manganis::jni::errors::Error::JavaException = err else {
+        return AuthSessionError::Bridge(err.to_string());
+    };
+    let Ok(thrown) = env.exception_occurred() else {
+        return AuthSessionError::Bridge(err.to_string());
+    };
+    let _ = env.exception_clear();
+    let described = env
+        .call_method(&thrown, "toString", "()Ljava/lang/String;", &[])
+        .and_then(manganis::jni::objects::JValueGen::l)
+        .and_then(|text| env.get_string(&JString::from(text)).map(String::from));
+    if described.is_err() {
+        let _ = env.exception_clear();
+    }
+    AuthSessionError::Bridge(described.unwrap_or_else(|_| err.to_string()))
+}
+
+/// The Java VM reached through `ndk-context`, for the device key.
 #[cfg(feature = "device-identity")]
-pub(crate) struct ActivityJava;
+pub(crate) struct ContextJava;
 
 #[cfg(feature = "device-identity")]
-impl connetto_client::device_key::JavaAccess for ActivityJava {
+impl connetto_client::device_key::JavaAccess for ContextJava {
     fn with_env(
         &self,
         body: &mut dyn FnMut(&mut JNIEnv<'_>),
@@ -173,7 +207,7 @@ impl connetto_client::device_key::JavaAccess for ActivityJava {
         })
         .ok_or_else(|| {
             connetto_client::ClientError::DeviceChip(
-                connetto_client::device_key::ChipError::Failed("no Android activity".into()),
+                connetto_client::device_key::ChipError::Failed("no Android context".into()),
             )
         })
     }

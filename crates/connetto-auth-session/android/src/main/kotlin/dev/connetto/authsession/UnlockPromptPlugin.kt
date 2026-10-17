@@ -8,6 +8,8 @@ import android.hardware.biometrics.BiometricManager
 import android.hardware.biometrics.BiometricPrompt
 import android.os.Build
 import android.os.CancellationSignal
+import android.os.Handler
+import android.os.Looper
 import android.view.ViewTreeObserver
 import java.util.concurrent.atomic.AtomicInteger
 import javax.crypto.Cipher
@@ -18,51 +20,75 @@ import javax.crypto.Cipher
  * device has the secure lock screen such a key needs.
  *
  * The prompt is the framework's own, so the module needs no androidx.biometric
- * and the host Activity need not be a FragmentActivity. The cipher rides the
+ * and the screen in front need not be a FragmentActivity. The cipher rides the
  * prompt as its CryptoObject, which is what authorizes the key for the one
  * operation the store runs with it. A strong biometric or the device
  * credential is accepted, never a biometric alone, since re-registering a
  * finger destroys a key that accepts only that.
  */
-class UnlockPromptPlugin(private val activity: Activity) {
+class UnlockPromptPlugin {
     fun deviceSecure(): Boolean =
-        (activity.getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager).isDeviceSecure
+        (CurrentActivity.application().getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager)
+            .isDeviceSecure
 
     fun begin(cipher: Cipher, title: String) {
+        CurrentActivity.requireInstalled()
         outcome.set(PENDING)
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             outcome.set(UNAVAILABLE)
             return
         }
-        activity.runOnUiThread { whenFocused { show(cipher, title) } }
+        Handler(Looper.getMainLooper()).post { promptOnScreenInFront(cipher, title) }
+    }
+
+    /** Show the prompt once the screen in front holds focus. Main thread only. */
+    private fun promptOnScreenInFront(cipher: Cipher, title: String) {
+        val activity = CurrentActivity.get()
+        if (activity == null) {
+            outcome.set(NO_SCREEN)
+            return
+        }
+        whenFocused(activity, rebuilt = { promptOnScreenInFront(cipher, title) }) {
+            show(activity, cipher, title)
+        }
     }
 
     /**
-     * Runs [action] once the app's window holds focus. A prompt asked while
+     * Runs [action] once [activity]'s window holds focus. A prompt asked while
      * another app is in front, as the login tab is for a moment after the
      * redirect, is taken for a background request and never shown on Samsung.
+     * A screen destroyed before it gains focus never will, so [rebuilt] runs
+     * instead, posted so it runs after the relaunch that created the screen
+     * replacing it.
      */
-    private fun whenFocused(action: () -> Unit) {
+    private fun whenFocused(activity: Activity, rebuilt: () -> Unit, action: () -> Unit) {
         val decor = activity.window.decorView
         if (decor.hasWindowFocus()) {
             action()
             return
         }
-        val observer = decor.viewTreeObserver
-        observer.addOnWindowFocusChangeListener(object : ViewTreeObserver.OnWindowFocusChangeListener {
+        val listener = object : ViewTreeObserver.OnWindowFocusChangeListener {
+            lateinit var cancelDestroyWait: () -> Unit
+
             override fun onWindowFocusChanged(hasFocus: Boolean) {
                 if (hasFocus) {
                     decor.viewTreeObserver.removeOnWindowFocusChangeListener(this)
+                    cancelDestroyWait()
                     action()
                 }
             }
-        })
+        }
+        listener.cancelDestroyWait = CurrentActivity.onDestroyed(activity) {
+            decor.viewTreeObserver.removeOnWindowFocusChangeListener(listener)
+            Handler(Looper.getMainLooper()).post(rebuilt)
+        }
+        decor.viewTreeObserver.addOnWindowFocusChangeListener(listener)
     }
 
     fun takeOutcome(): Int = outcome.get()
 
     @TargetApi(Build.VERSION_CODES.R)
-    private fun show(cipher: Cipher, title: String) {
+    private fun show(activity: Activity, cipher: Cipher, title: String) {
         val prompt = BiometricPrompt.Builder(activity)
             .setTitle(title)
             .setAllowedAuthenticators(
@@ -92,6 +118,7 @@ class UnlockPromptPlugin(private val activity: Activity) {
         const val DISMISSED = 2
         const val CANCELED = 3
         const val UNAVAILABLE = 4
+        const val NO_SCREEN = 5
         private val outcome = AtomicInteger(PENDING)
     }
 }
