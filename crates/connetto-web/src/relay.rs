@@ -3121,6 +3121,12 @@ fn render_delete(
 /// here can ride an upload: the capture session is bound to `main` and these
 /// tables are not in it.
 ///
+/// The worker is the tier's one enforcer of references, since a tab mirror
+/// holds only what its subscriptions cover and carries none (R92). They are
+/// checked at the commit, so the order a tab touched its tables in cannot
+/// refuse a valid write, and a violation still standing there rejects the
+/// whole mutation back to its author.
+///
 /// The payload then fans out to every tab with a subscription reading a
 /// touched table, the originator included: its re-apply is idempotent under
 /// the client's conflict policy and converges every mirror on the hub's
@@ -3166,6 +3172,7 @@ where
         return Ok(());
     }
     let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
+        conn.batch_execute("PRAGMA defer_foreign_keys = ON")?;
         apply_local_changeset(conn, changeset)?;
         {
             use local_schema::_connetto_tab_mutations::dsl as wm;
@@ -3195,6 +3202,18 @@ where
                     },
                 },
             )));
+            return Ok(());
+        }
+        // A reference still broken at the commit refuses the write, not the hub.
+        Err(TabApplyError::Db(diesel::result::Error::DatabaseError(
+            diesel::result::DatabaseErrorKind::ForeignKeyViolation,
+            info,
+        ))) => {
+            reject_mutation(
+                &out,
+                tab_seq,
+                format!("local tier apply failed: {}", info.message()),
+            );
             return Ok(());
         }
         Err(TabApplyError::Db(err)) => return Err(RelayError::from(err).into()),
@@ -5507,5 +5526,243 @@ mod tests {
             matches!(step, TransferStep::Event(Some(HubEvent::Kill(9)))),
             "a queued event must be served before a transfer that is also ready"
         );
+    }
+
+    /// The tier tables the hub tests below serve. `folders.id` keys the
+    /// reference, so a note cascades away with its folder on the worker.
+    mod tier {
+        diesel::table! {
+            /// The tier parent.
+            folders (id) {
+                /// Row key.
+                id -> BigInt,
+            }
+        }
+
+        diesel::table! {
+            /// The tier child.
+            notes (id) {
+                /// Row key.
+                id -> BigInt,
+                /// The folder it sits in.
+                folder -> BigInt,
+            }
+        }
+    }
+
+    /// The device-private tier the hub tests serve: a note cascades away with
+    /// its folder.
+    const FOLDERS_TIER: &str = "CREATE TABLE folders (id INTEGER PRIMARY KEY); \
+        CREATE TABLE notes (id INTEGER PRIMARY KEY, \
+        folder INTEGER NOT NULL REFERENCES folders(id) ON DELETE CASCADE)";
+
+    /// The same tables as a tab mirror holds them, with no references.
+    const FOLDERS_MIRROR: &str = "CREATE TABLE folders (id INTEGER PRIMARY KEY); \
+        CREATE TABLE notes (id INTEGER PRIMARY KEY, folder INTEGER NOT NULL)";
+
+    /// Folder 1 holding notes 10 and 11.
+    fn seed_folders(conn: &mut SqliteConnection) {
+        use diesel::ExpressionMethods;
+        diesel::insert_into(tier::folders::table)
+            .values(tier::folders::id.eq(1))
+            .execute(conn)
+            .expect("seed the folder");
+        diesel::insert_into(tier::notes::table)
+            .values(&vec![
+                (tier::notes::id.eq(10), tier::notes::folder.eq(1)),
+                (tier::notes::id.eq(11), tier::notes::folder.eq(1)),
+            ])
+            .execute(conn)
+            .expect("seed the notes");
+    }
+
+    /// A worker whose tier holds [`seed_folders`], a hub state serving that
+    /// tier, and one tab reading each table: tab 1 the folders, tab 2 the
+    /// notes.
+    fn folders_hub() -> (
+        connetto_client::ConnettoConnection<connetto_core::test_support::FakeTransport>,
+        super::HubState,
+        tokio::sync::mpsc::UnboundedReceiver<super::TabOut>,
+        tokio::sync::mpsc::UnboundedReceiver<super::TabOut>,
+    ) {
+        let mut worker = connetto_client::ClientBuilder::new(
+            connetto_client::SyncSchema::new(connetto_core::schema::SchemaBundle::new(
+                "",
+                "",
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                Some(FOLDERS_TIER),
+            )),
+            || async { Err::<connetto_core::test_support::FakeTransport, _>("offline") },
+        )
+        .open_driven()
+        .expect("the worker opens offline");
+        worker
+            .conn()
+            .batch_execute(super::LOCAL_META_DDL)
+            .expect("the tier watermark");
+        seed_folders(worker.conn());
+        let mut state = super::HubState {
+            local_tables: ["folders", "notes"].map(str::to_owned).into(),
+            ..super::HubState::default()
+        };
+        let (author, author_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (sibling, sibling_rx) = tokio::sync::mpsc::unbounded_channel();
+        for (id, out, table) in [(1, author, "folders"), (2, sibling, "notes")] {
+            super::attach_tab(&mut state, id, out);
+            let tab = state.tabs.get_mut(&id).expect("the tab just attached");
+            tab.handshaken = true;
+            tab.client_id = Some(rosetta_uuid::Uuid::new_v4());
+            tab.subs.push(super::TabSub {
+                sub_id: table.to_owned(),
+                tables: [table.to_owned()].into(),
+                priority: connetto_core::messages::SubscriptionPriority::default(),
+            });
+        }
+        (worker, state, author_rx, sibling_rx)
+    }
+
+    /// The changeset a tab mirror captures for `write`, run against the
+    /// worker's starting rows.
+    fn mirror_changeset(write: impl FnOnce(&mut SqliteConnection)) -> Vec<u8> {
+        let mut mirror = SqliteConnection::establish(":memory:").expect("open");
+        mirror
+            .batch_execute(FOLDERS_MIRROR)
+            .expect("the mirror schema");
+        seed_folders(&mut mirror);
+        let mut session = mirror.create_session().expect("session");
+        session.attach_all().expect("attach");
+        write(&mut mirror);
+        session.changeset().expect("changeset")
+    }
+
+    /// Hand `changeset` to the hub as tab 1's mutation `seq`.
+    fn author_writes(
+        worker: &mut connetto_client::ConnettoConnection<
+            connetto_core::test_support::FakeTransport,
+        >,
+        state: &mut super::HubState,
+        seq: u64,
+        changeset: &[u8],
+    ) {
+        let tables = super::changeset_tables(changeset).expect("the tables it names");
+        let payload = zstd::encode_all(changeset, super::ZSTD_LEVEL).expect("compress");
+        assert!(
+            super::handle_local_mutation(worker, state, 1, seq, changeset, &tables, &payload)
+                .is_ok(),
+            "the hub serves the mutation"
+        );
+    }
+
+    /// Every row operation the live patches in `rx` carry, as table and verb.
+    fn delivered(
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::TabOut>,
+    ) -> Vec<(String, &'static str)> {
+        use sqlite_diff_rs::{ChangesetOp, ParsedDiffSet};
+        let mut ops = Vec::new();
+        while let Ok(frame) = rx.try_recv() {
+            let super::TabOut::Bulk(connetto_core::messages::BulkMessage::LivePatch(patch)) = frame
+            else {
+                continue;
+            };
+            let bytes = zstd::decode_all(patch.patchset_zstd.as_slice()).expect("decompress");
+            let Ok(ParsedDiffSet::Changeset(set)) = ParsedDiffSet::parse(&bytes) else {
+                panic!("a tier fan-out is a changeset");
+            };
+            for op in set.iter() {
+                let verb = match op {
+                    ChangesetOp::Insert { .. } => "insert",
+                    ChangesetOp::Update { .. } => "update",
+                    ChangesetOp::Delete { .. } => "delete",
+                };
+                ops.push((op.table().name().to_owned(), verb));
+            }
+        }
+        ops.sort_unstable();
+        ops
+    }
+
+    /// Whether `rx` holds a refusal.
+    fn rejected(rx: &mut tokio::sync::mpsc::UnboundedReceiver<super::TabOut>) -> bool {
+        core::iter::from_fn(|| rx.try_recv().ok()).any(|frame| {
+            matches!(
+                frame,
+                super::TabOut::Control(connetto_core::messages::ControlMessage::MutationReject(_))
+            )
+        })
+    }
+
+    fn note_count(
+        worker: &mut connetto_client::ConnettoConnection<
+            connetto_core::test_support::FakeTransport,
+        >,
+    ) -> i64 {
+        use diesel::QueryDsl;
+        tier::notes::table
+            .count()
+            .get_result(worker.conn())
+            .expect("count notes")
+    }
+
+    /// A tab's changeset lists its tables in the order it first touched them,
+    /// so a child ahead of its parent is checked at the commit, not row by row.
+    #[wasm_bindgen_test]
+    fn a_child_written_before_its_parent_in_one_mutation_lands() {
+        use diesel::ExpressionMethods;
+        let (mut worker, mut state, mut author, _sibling) = folders_hub();
+        author_writes(
+            &mut worker,
+            &mut state,
+            1,
+            &mirror_changeset(|db| {
+                diesel::insert_into(tier::notes::table)
+                    .values((tier::notes::id.eq(12), tier::notes::folder.eq(2)))
+                    .execute(db)
+                    .expect("the tab's note");
+                diesel::insert_into(tier::folders::table)
+                    .values(tier::folders::id.eq(2))
+                    .execute(db)
+                    .expect("the tab's folder");
+            }),
+        );
+        assert!(!rejected(&mut author), "the mutation is accepted");
+        assert_eq!(note_count(&mut worker), 3, "the note landed");
+    }
+
+    /// A note naming a folder the tier does not hold is refused back to its
+    /// author, the worker is left as it was, and the next write commits.
+    #[wasm_bindgen_test]
+    fn an_orphan_is_refused_back_to_its_author() {
+        use diesel::ExpressionMethods;
+        let (mut worker, mut state, mut author, mut sibling) = folders_hub();
+        author_writes(
+            &mut worker,
+            &mut state,
+            1,
+            &mirror_changeset(|db| {
+                diesel::insert_into(tier::notes::table)
+                    .values((tier::notes::id.eq(12), tier::notes::folder.eq(9)))
+                    .execute(db)
+                    .expect("the tab's orphan");
+            }),
+        );
+        assert!(rejected(&mut author), "the author is refused");
+        assert_eq!(note_count(&mut worker), 2, "the worker holds what it held");
+        assert!(delivered(&mut sibling).is_empty(), "nothing fans out");
+
+        author_writes(
+            &mut worker,
+            &mut state,
+            2,
+            &mirror_changeset(|db| {
+                diesel::insert_into(tier::notes::table)
+                    .values((tier::notes::id.eq(13), tier::notes::folder.eq(1)))
+                    .execute(db)
+                    .expect("the tab's next note");
+            }),
+        );
+        assert!(!rejected(&mut author), "the next write is accepted");
+        assert_eq!(note_count(&mut worker), 3, "the next write committed");
     }
 }

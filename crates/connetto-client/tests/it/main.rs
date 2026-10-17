@@ -70,6 +70,8 @@ mod offline_start;
 
 mod reconnect_live;
 
+mod references;
+
 mod residual;
 
 mod retention;
@@ -87,7 +89,11 @@ mod schema_handshake;
 mod secret_stores;
 
 mod sql_functions;
+
+mod synced_references;
+
 mod support;
+mod synced_schema;
 
 #[cfg(feature = "native-auth")]
 mod teardown;

@@ -217,7 +217,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-10-03 when R96 landed | nothing. Its login route and registry cache go on R96's server builder. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
-| R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
+| R92 synced tables carry no local references | BUILT 2026-10-16 on `feat/r92-synced-references`, minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | nothing since R94 (2026-09-30). One decision and one open question in the section | no |
@@ -3968,7 +3968,7 @@ Applied by `harden_replica_connection` in `crates/connetto-client/src/harden.rs`
 | `attach_write` | off at rest, on only in a write window | Measured attach-time only: turning it off leaves databases already attached writable, so the tier keeps working while a later attach lands read-only. |
 | `Attached` | the live attached count, per D3 | At rest no further database fits at all, so an attach is only possible inside a window connetto opened. 0 for a replica with no tier, 1 with one, 2 for the browser worker and 3 once the relay's scratch database appears. |
 | `FunctionArg` | 8 | Every function registered here takes zero or one argument, and the caller function takes none, so a wider one is a schema surprise. No measured application shape reaches it. |
-| `TriggerDepth` | 10 | Trigger recursion is controlled by whatever schema is attached, and connetto's own translation nests one deep. Every foreign-key cascade level also counts one frame against it, so R92's step 0 measures a deep tier cascade and moves this row to stock under D5 if 10 refuses it. |
+| `TriggerDepth` | stock | Per D5 and R92's step 0 (2026-10-16). Every foreign-key cascade level counts one frame against it, and a ten-frame bound refuses a device-local tier cascading twelve levels deep with "too many levels of trigger recursion". connetto's own translation nests one deep. |
 | `VdbeOp` | 25,000 | Bounds one statement's compiled program, which is what a giant expression inside an attached database's view would otherwise buy cheaply. Measured to accept a 5,000-bind key list and a three-way join with a subquery, a group by and an order by, and to refuse a 20,000-literal `IN` list, which it reports as "out of memory". |
 | `WorkerThreads` | 0 | SQLite's default too, set rather than inherited so the value is pinned by the assertion test. |
 | `Length` | stock | Per D6. A 1 MB cap refuses a 1.5 MB value, and file sync's own chunk size is 1 MiB. |
@@ -5774,9 +5774,9 @@ The template's scripted, semantics, property and bench targets pass in CI, the t
 
 ## R92: synced tables carry no local references
 
-**Status.** NOT STARTED, designed 2026-09-22. Minted the same day by R21's decision 8.
+**Status.** BUILT 2026-10-16 on `feat/r92-synced-references`, designed 2026-09-22. Minted the same day by R21's decision 8.
 
-**Blocked on nothing.** Four decisions were taken with the maintainer on 2026-09-22, listed below.
+**Blocked on nothing.** Every lock sits at the git `main` tips with sqlparser at apache `7b5821dd`, where #2575 accepts `WITHOUT ROWID, STRICT`. Reaching it took five upstream fixes, all merged: sqlparser-canonicalize #24 and subql #201 for the `global` field ClickHouse `GLOBAL IN` added (`upstream/sqlparser-canonicalize-global-in.md`, `upstream/subql-global-in.md`), sql-traits #103 and pg2sqlite #122 for the `JOIN USING` alias apache#2492 added, #122 also for the table-options list #2575 introduced (`upstream/sql-traits-join-using-alias.md`, `upstream/pg2sqlite-join-using-alias.md`, `upstream/pg2sqlite-sqlite-table-options.md`), and diesel #5241, which rolls back a SQLite transaction whose `COMMIT` fails. rls2fga `main` needed nothing. Six decisions, listed below, four taken with the maintainer on 2026-09-22 and two on 2026-09-23.
 
 ### Purpose
 
@@ -5784,16 +5784,18 @@ SQLite's foreign-key enforcement is one switch per connection, native enforces b
 
 ### Decisions
 
-1. **Synced tables carry no local references** (2026-09-22). connetto parses the replica DDL with sqlparser at replica creation, drops every column `REFERENCES` and table `FOREIGN KEY` clause through `VisitorMut`, and runs the rendered result, so baked and hand-written DDL are covered alike. The server stays the only enforcer for synced data, as it already is in the browser. Tier DDL is left untouched. Rejected: pg2sqlite emitting the synced document without them, which leaves hand-written replica DDL exposed to the partial-replica refusals.
-2. **Foreign keys are on at every open on both backends, and this phase owns the setting** (2026-09-22). `PRAGMA foreign_keys = ON` runs on the replica connection and on the browser's separate tier connection. SQLite then enforces tier references natively, all five actions, cascades at any depth because `OP_Program` disallows recursion only for a real trigger and never for a foreign-key action, and per-constraint `DEFERRABLE INITIALLY DEFERRED` (`FKey.isDeferred`, checked at commit). A tier reference can never reach a synced table, since SQLite foreign keys do not cross attached schemas and pg2sqlite refuses a cross-document reference. Rejected: enforcement off with tier references re-implemented by generated triggers, which cascade one level deep without `recursive_triggers`, cannot honour deferred constraints, and need a guard table for the import.
+1. **Synced tables carry no local references** (2026-09-22). connetto parses the replica DDL with sqlparser at replica creation, drops every column `REFERENCES` and table `FOREIGN KEY` clause from each parsed `CREATE TABLE`, and runs the rendered result, so baked and hand-written DDL are covered alike. Every other statement reaches SQLite as its source text. The server stays the only enforcer for synced data, as it already is in the browser. Tier DDL is left untouched. Rejected: pg2sqlite emitting the synced document without them, which leaves hand-written replica DDL exposed to the partial-replica refusals.
+2. **Foreign keys are on at every open on both backends, and this phase owns the setting** (2026-09-22). `PRAGMA foreign_keys = ON` runs on the replica connection, which is the connection the device-local tier is attached to on both backends (R43 gave the browser tier one handle, the worker's attachment). SQLite then enforces tier references natively, all five actions, cascades at any depth because `OP_Program` disallows recursion only for a real trigger and never for a foreign-key action, and per-constraint `DEFERRABLE INITIALLY DEFERRED` (`FKey.isDeferred`, checked at commit). A tier reference can never reach a synced table, since SQLite foreign keys do not cross attached schemas and pg2sqlite refuses a cross-document reference. Rejected: enforcement off with tier references re-implemented by generated triggers, which cascade one level deep without `recursive_triggers`, cannot honour deferred constraints, and need a guard table for the import.
 3. **The import defers every check to its commit** (2026-09-22). `apply_import_with_bookkeeping` sets `PRAGMA defer_foreign_keys = ON` inside its transaction, SQLite checks at commit, and a violation aborts the import. Table order and self-references stop mattering.
 4. **Trigger depth follows a measurement, under R18's D5** (2026-09-22). Every nested frame, a foreign-key action included, counts against `SQLITE_LIMIT_TRIGGER_DEPTH`, which R18 sets to 10. When step 0 shows a tier cascade failing at that bound, R18's row moves to SQLite's stock 1000, as D5 prescribes for a limit measurement forces open.
+5. **A replica created before this phase keeps its references, and no code handles it** (2026-09-23, with the maintainer). Stripping acts only when a table is created, so such a file still enforces the server's references. It is a pre-alpha development file, and the fix is to delete it and resync, as R21 decision 3 records for its own break. Rejected: a refuse-at-open check and an in-place rebuild, both code only broken pre-alpha files would ever exercise.
+6. **In the browser the worker is the tier's one enforcer, and the hub fans out what the worker changed** (2026-09-23, with the maintainer). A tab's mirror holds replica and tier in `main`, opens through the same stripping path, and so carries no references, which is decision 1's rule applied to a partial copy of the tier. The relay hub replays a tab's tier changeset with `PRAGMA defer_foreign_keys = ON`, records the worker's effect through a session on `connetto_local`, cascades, `SET NULL` and `SET DEFAULT` included, and fans that effect out to every tab reading a touched table instead of the tab's own bytes. A violation at the commit rejects the mutation back to its author. Rejected: tabs enforcing too, where a tab subscribed to a child but not its parent refuses the hub's own valid fan-out and two enforcers replay each other's cascades into missing rows. Rejected: deferring the fan-out to a later phase, which leaves tabs diverging after any tier cascade.
 
 ### Steps
 
-0. **Measure today's code before any change.** Natively, record whether each succeeds. (a) A server patch carrying a synced child whose parent the caller cannot see. (b) A tier cascade 12 levels deep. (c) An import whose child table sorts before its parent, since the export orders tables by name. A failure in (a) or (c) is a live defect, and its reproduction becomes a regression test here.
+0. **Measure today's code before any change.** Natively, record whether each succeeds. (a) A server patch carrying a synced child whose parent the caller cannot see. (b) A tier cascade 12 levels deep. (c) An import whose child table was created before its parent, since the export writes tables in creation order (`schema_ddl_rows ... ORDER BY rowid`), and one whose self-referencing rows arrive child first. A failure in (a) or (c) is a live defect, and its reproduction becomes a regression test here.
 1. Strip synced references at replica creation on both backends (decision 1).
-2. Turn enforcement on at every open on both backends, the browser's tier connection included (decision 2).
+2. Turn enforcement on at every open on both backends (decision 2).
 3. Defer the import's checks to its commit (decision 3).
 4. Move R18's trigger depth if step 0 forces it, amending R18's knob row and `hardening.rs` (decision 4).
 5. Drop the hand-set `PRAGMA foreign_keys = ON` from `local_import.rs`, which enforcement at every open makes redundant.
@@ -5807,8 +5809,24 @@ Each of these is a test on both backends.
 3. `PRAGMA foreign_keys` reads 1 on every connection connetto opens.
 4. A server patch carrying a child whose parent is absent applies, and a local write of such a child goes up and the server settles it.
 5. Each of the five actions applies on delete and on update, a NULL reference column skips the check, composite references and cross-table chains hold, a self-referencing hierarchy 12 levels deep cascades fully, and a deferred constraint broken mid-transaction and repaired before commit succeeds while one still broken at commit fails.
-6. An import whose child table sorts before its parent and one holding reverse-ordered self-referencing rows succeed, an archive holding an orphan aborts and leaves the tier untouched, and the next ordinary statement after the import is checked immediately.
+6. An import whose child table was created before its parent and one holding reverse-ordered self-referencing rows succeed, an archive holding an orphan aborts and leaves the tier untouched, and the next ordinary statement after the import is checked immediately.
 7. When decision 4 moved the bound, the 12-level cascade passes and `hardening.rs` asserts the stock value.
+8. In the browser, a folder a tab deletes cascades its notes away on the worker and the tab reading the notes hears both deletes, a child written ahead of its parent in one mutation lands, and an orphan is rejected back to its author with the worker unchanged and its next write committing.
+
+### Step 0, measured 2026-10-16 on `origin/main` `9d9feb7` with diesel at `0c16ef3`
+
+(a) The snapshot and a live change each landed a note whose folder the caller cannot see. A local write of a note into that folder failed with `FOREIGN KEY constraint failed`, because pg2sqlite carries the server's `REFERENCES` into the baked replica DDL. Live defect, now `synced_references::a_child_whose_parent_is_invisible_lands_and_uploads` (Docker).
+
+(b) Deleting the root of a 12-level tier hierarchy failed with `too many levels of trigger recursion`. Decision 4 therefore moved R18's `TriggerDepth` row to stock.
+
+(c) An import whose child table was created first failed with `FOREIGN KEY constraint failed`, and so did one whose self-referencing rows arrive child first. Both are live defects, now `references::an_import_of_a_child_table_created_first_restores` and `references::an_import_of_reverse_ordered_self_references_restores`. A child table that merely sorts first by name imports, since the export writes tables in creation order.
+
+### Slices
+
+1. The pin refresh, every workspace lock moved to the `main` tip of each git dependency once subql, pg2sqlite and sql-traits carry their fixes for sqlparser `main`.
+2. The client, steps 1 to 5 with proofs 1 to 7 on both backends (`connetto-client`, the shared proof bodies in `crates/connetto-client/tests/shared/references.rs` and their browser runner in `crates/connetto-web/tests/references.rs`).
+3. The relay hub, decision 6 with proof 8 (`crates/connetto-web/src/relay.rs`).
+4. The chapters and the status views.
 
 ### Done when
 
