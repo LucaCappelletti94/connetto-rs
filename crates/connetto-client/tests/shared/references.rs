@@ -131,8 +131,8 @@ impl TransportFactory for Offline {
     }
 }
 
-/// An in-memory replica over `synced`, with `tier` as its device-local tier.
-fn open_with(synced: &str, tier: Option<&str>) -> Conn {
+/// Open an in-memory replica over `synced`, with `tier` as its device-local tier.
+fn try_open_with(synced: &str, tier: Option<&str>) -> Result<Conn, ClientError> {
     let schema = SyncSchema::new(SchemaBundle::new(
         "",
         "",
@@ -141,14 +141,26 @@ fn open_with(synced: &str, tier: Option<&str>) -> Conn {
         Vec::<String>::new(),
         tier,
     ));
-    ClientBuilder::new(schema, Offline)
-        .open_driven()
-        .expect("the replica opens")
+    ClientBuilder::new(schema, Offline).open_driven()
+}
+
+/// An in-memory replica over `synced`, with `tier` as its device-local tier.
+fn open_with(synced: &str, tier: Option<&str>) -> Conn {
+    try_open_with(synced, tier).expect("the replica opens")
 }
 
 /// An in-memory replica over [`SYNCED_DDL`] with `tier` as its tier.
 fn open(tier: &str) -> Conn {
     open_with(SYNCED_DDL, Some(tier))
+}
+
+/// Replica DDL that does not parse as SQLite refuses the open, since its
+/// references could not be removed.
+pub fn an_unparsable_replica_schema_refuses_the_open() {
+    assert!(matches!(
+        try_open_with("CREATE TABLE notes (id INTEGER PRIMARY KEY,", None),
+        Err(ClientError::Schema(_))
+    ));
 }
 
 /// How many references SQLite records for `table` in `schema`. Raw because a

@@ -16,6 +16,11 @@ fn stripping_keeps_the_rest_of_each_table() {
 }
 
 #[wasm_bindgen_test]
+fn an_unparsable_replica_schema_refuses_the_open() {
+    cases::an_unparsable_replica_schema_refuses_the_open();
+}
+
+#[wasm_bindgen_test]
 fn the_tier_keeps_its_references_and_synced_tables_lose_theirs() {
     cases::the_tier_keeps_its_references_and_synced_tables_lose_theirs();
 }
