@@ -195,6 +195,11 @@ async fn a_fault_that_stops_the_pump_is_announced_and_releases_waiting_handles()
         .await
         .expect("watch the synced table");
     let waiting = tokio::spawn(async move { query.changed().await });
+    tokio::task::yield_now().await;
+    assert!(
+        !waiting.is_finished(),
+        "the handle is waiting before the fault"
+    );
 
     script.say(IncomingFrame::Bulk(BulkMessage::LivePatch(LivePatch::new(
         script.last_subscribed(),
