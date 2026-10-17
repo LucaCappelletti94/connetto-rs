@@ -711,27 +711,46 @@ impl NativeAuthenticator {
     ///
     /// # Errors
     ///
+    /// [`ClientError::Auth`] if the store cannot be read or cleared, and else
     /// [`ClientError::Transport`] or [`ClientError::Auth`] if the revoke fails,
-    /// after the local clear. [`ClientError::Auth`] if the store cannot be read
-    /// or cleared.
+    /// after the local clear.
     pub async fn logout(&self) -> Result<(), ClientError> {
+        let signed_out = self.sign_out().await;
+        signed_out.credential.and(signed_out.revoke)
+    }
+
+    /// [`Self::logout`] with the clear and the revoke reported apart.
+    pub(crate) async fn sign_out(&self) -> SignedOut {
         // Signing out is per account: any other stored credential survives, and
         // the marker is left naming an account with none, which the next start
         // answers with an interactive login rather than by picking somebody else.
         let Some(account) = self.account() else {
-            return Ok(());
+            return SignedOut::default();
         };
-        let Some(refresh) = self.store.load(&account).await? else {
-            return Ok(());
+        let refresh = match self.store.load(&account).await {
+            Ok(Some(refresh)) => refresh,
+            Ok(None) => return SignedOut::default(),
+            Err(err) => {
+                return SignedOut {
+                    credential: Err(err),
+                    revoke: Err(ClientError::Auth(
+                        "the stored credential could not be read, so the session was not revoked"
+                            .to_owned(),
+                    )),
+                };
+            }
         };
-        let revoked = self
+        let revoke = self
             .post(
                 &format!("{}/auth/logout", self.server_base),
                 &serde_json::json!({ "refresh_token": refresh }),
             )
-            .await;
-        self.store.clear(&account).await?;
-        revoked.map(drop)
+            .await
+            .map(drop);
+        SignedOut {
+            credential: self.store.clear(&account).await,
+            revoke,
+        }
     }
 
     async fn post_json<R: DeserializeOwned>(
@@ -774,6 +793,24 @@ impl NativeAuthenticator {
             });
         }
         Ok(response)
+    }
+}
+
+/// How each half of a sign-out went.
+#[derive(Debug)]
+pub(crate) struct SignedOut {
+    /// Reading and clearing the stored credential.
+    pub(crate) credential: Result<(), ClientError>,
+    /// Revoking the session on the server.
+    pub(crate) revoke: Result<(), ClientError>,
+}
+
+impl Default for SignedOut {
+    fn default() -> Self {
+        Self {
+            credential: Ok(()),
+            revoke: Ok(()),
+        }
     }
 }
 
@@ -1100,5 +1137,93 @@ mod tests {
             store.load("replica-b").await.unwrap(),
             Some(key_from_byte(0x22))
         );
+    }
+
+    /// A refresh store holding one token whose reads or clears fail as told.
+    struct BrokenRefresh {
+        load_fails: bool,
+    }
+
+    impl connetto_core::traits::RefreshTokenStore for BrokenRefresh {
+        type Error = crate::ClientError;
+
+        fn load<'a>(
+            &'a self,
+            _account: &'a str,
+        ) -> connetto_core::traits::RefreshFuture<'a, Option<String>, crate::ClientError> {
+            let token = if self.load_fails {
+                Err(crate::ClientError::Auth(
+                    "the store cannot be read".to_owned(),
+                ))
+            } else {
+                Ok(Some("session-id.secret".to_owned()))
+            };
+            Box::pin(std::future::ready(token))
+        }
+
+        fn store<'a>(
+            &'a self,
+            _account: &'a str,
+            _token: &'a str,
+        ) -> connetto_core::traits::RefreshFuture<'a, (), crate::ClientError> {
+            Box::pin(std::future::ready(Ok(())))
+        }
+
+        fn clear<'a>(
+            &'a self,
+            _account: &'a str,
+        ) -> connetto_core::traits::RefreshFuture<'a, (), crate::ClientError> {
+            Box::pin(std::future::ready(Err(crate::ClientError::Auth(
+                "the store cannot be cleared".to_owned(),
+            ))))
+        }
+
+        fn accounts(
+            &self,
+        ) -> connetto_core::traits::RefreshFuture<'_, Vec<String>, crate::ClientError> {
+            Box::pin(std::future::ready(Ok(vec!["account".to_owned()])))
+        }
+
+        fn protection(&self) -> crate::Custody {
+            crate::Custody::Unverified(crate::NoGate::Unsupported)
+        }
+    }
+
+    /// An authenticator over `store` whose server is unreachable, since
+    /// nothing listens on port 1.
+    fn offline_authenticator(store: BrokenRefresh) -> super::NativeAuthenticator {
+        super::NativeAuthenticator::new(
+            "http://127.0.0.1:1",
+            "dev-idp",
+            std::sync::Arc::new(store),
+            Some("account".to_owned()),
+        )
+    }
+
+    /// A credential that cannot be cleared is reported as kept, apart from
+    /// the revoke, which fails on its own.
+    #[tokio::test]
+    async fn a_failed_clear_reports_the_credential_apart_from_the_revoke() {
+        let signed_out = offline_authenticator(BrokenRefresh { load_fails: false })
+            .sign_out()
+            .await;
+        assert!(
+            matches!(&signed_out.credential, Err(crate::ClientError::Auth(message)) if message.contains("cleared")),
+            "the clear failed, got {signed_out:?}"
+        );
+        assert!(
+            matches!(signed_out.revoke, Err(crate::ClientError::Transport(_))),
+            "and the revoke failed on the unreachable server"
+        );
+    }
+
+    /// A credential that cannot be read cannot be revoked either.
+    #[tokio::test]
+    async fn an_unreadable_credential_is_neither_cleared_nor_revoked() {
+        let signed_out = offline_authenticator(BrokenRefresh { load_fails: true })
+            .sign_out()
+            .await;
+        assert!(signed_out.credential.is_err(), "the read failed");
+        assert!(signed_out.revoke.is_err(), "so nothing could be revoked");
     }
 }

@@ -220,62 +220,142 @@ where
     purge_replica(db_path, unsynced, force)
 }
 
-/// Failure to forget a device.
+/// Failure to forget a device, split by whether the client still works.
 #[cfg(feature = "native-auth")]
 #[derive(Debug, thiserror::Error)]
 pub enum ForgetError {
-    /// The data teardown failed, so the replica may still be present.
+    /// Nothing was destroyed and the client still works, so the application
+    /// keeps it.
     #[error(transparent)]
-    Purge(#[from] PurgeError),
-    /// The local credential was cleared but the server was not reached, so the
-    /// session stays live until it expires on its own.
-    #[error("logged out locally but the session was not revoked: {0}")]
-    NotRevoked(String),
+    Refused(#[from] ForgetRefusal),
+    /// The client is closed and part of the teardown failed. The application
+    /// drops the client and signs in again.
+    #[error(transparent)]
+    Incomplete(Box<ForgetIncomplete>),
+}
+
+/// Why a forget destroyed nothing.
+#[cfg(feature = "native-auth")]
+#[derive(Debug, thiserror::Error)]
+pub enum ForgetRefusal {
     /// The build kept no replica on this device, so there is nothing to forget.
     #[error("the build kept no replica on this device")]
     NoReplica,
-    /// The client could not read the writes the server has not acknowledged,
-    /// so nothing was destroyed.
+    /// The replica holds writes the server has not acknowledged and `force`
+    /// was not set.
+    #[error("{} unsynced mutation(s) would be lost", .0.len())]
+    Unsynced(Vec<UnsyncedWrite>),
+    /// The client could not read the writes the server has not acknowledged.
     #[error("reading the unsynced writes: {0}")]
-    Client(#[from] crate::ClientError),
+    Unreadable(crate::ClientError),
 }
 
-/// Both destructive axes under one guard: revoke and clear the credential, then
-/// destroy the key and delete the replica.
+/// What failed in a forget that went past closing the client. Every part runs
+/// even when an earlier one failed, except the share keys and the device key,
+/// which go only once the wipe stands. A part is `None` when it succeeded or
+/// had nothing to do, and `share_keys` and `device_key` are also `None` when
+/// a failed wipe kept them.
+#[cfg(feature = "native-auth")]
+#[derive(Debug, Default)]
+#[non_exhaustive]
+pub struct ForgetIncomplete {
+    /// Releasing the replica's file handles failed, so a platform that refuses
+    /// to delete an open file keeps the replica.
+    pub release: Option<crate::ClientError>,
+    /// Reading or clearing the stored credential failed, so it may remain.
+    pub credential: Option<crate::ClientError>,
+    /// The server was not reached, so the session stays live until it
+    /// expires on its own.
+    pub revoke: Option<crate::ClientError>,
+    /// The replica's key or files could not be removed.
+    pub wipe: Option<PurgeError>,
+    /// The share keys could not be cleared, so they may remain.
+    pub share_keys: Option<crate::ClientError>,
+    /// The device key could not be deleted.
+    pub device_key: Option<crate::ClientError>,
+}
+
+#[cfg(feature = "native-auth")]
+impl ForgetIncomplete {
+    /// Whether every part succeeded.
+    pub(crate) fn is_complete(&self) -> bool {
+        self.release.is_none()
+            && self.credential.is_none()
+            && self.revoke.is_none()
+            && self.wipe.is_none()
+            && self.share_keys.is_none()
+            && self.device_key.is_none()
+    }
+}
+
+#[cfg(feature = "native-auth")]
+impl core::fmt::Display for ForgetIncomplete {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("the client is closed, but")?;
+        let parts: [(&str, Option<&dyn core::fmt::Display>); 6] = [
+            (
+                "releasing the replica",
+                self.release.as_ref().map(|err| err as _),
+            ),
+            (
+                "clearing the stored credential",
+                self.credential.as_ref().map(|err| err as _),
+            ),
+            (
+                "revoking the session",
+                self.revoke.as_ref().map(|err| err as _),
+            ),
+            ("wiping the replica", self.wipe.as_ref().map(|err| err as _)),
+            (
+                "clearing the share keys",
+                self.share_keys.as_ref().map(|err| err as _),
+            ),
+            (
+                "deleting the device key",
+                self.device_key.as_ref().map(|err| err as _),
+            ),
+        ];
+        let mut first = true;
+        for (part, err) in parts {
+            if let Some(err) = err {
+                let joint = if first { " " } else { ", and " };
+                write!(f, "{joint}{part} failed: {err}")?;
+                first = false;
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(feature = "native-auth")]
+impl std::error::Error for ForgetIncomplete {}
+
+/// Revoke and clear the credential, then destroy the key and delete the
+/// replica, filling in the parts of `report` that fail. Both run even when the
+/// other fails: a revoke that never reached the server does not keep the data,
+/// and data that could not be wiped does not keep the session.
 ///
-/// The one convenience this module offers, and it exists for the ordering rather
-/// than the line count. The unsynced guard is checked **first**, before the
-/// credential is destroyed, because once the refresh token is gone the queued
-/// writes can no longer be uploaded and the guard would be protecting nothing.
-///
-/// A revoke that never reached the server does not abort the wipe: the local
-/// credential is already gone and the caller asked for the data to go too. The
-/// wipe failure wins the report if both fail, because leftover data is the more
-/// serious outcome, and [`ForgetError::NotRevoked`] surfaces only once the data
-/// is confirmed gone.
-///
-/// # Errors
-///
-/// [`ForgetError::Purge`] if the guard refuses or the wipe fails, or
-/// [`ForgetError::NotRevoked`] if the wipe succeeded but the revoke did not.
+/// The unsynced guard is the caller's, run before the client closed, because
+/// once the refresh token is gone the queued writes can no longer be uploaded.
 #[cfg(feature = "native-auth")]
 pub(crate) async fn forget_device<S>(
-    authenticator: &crate::auth::NativeAuthenticator,
+    authenticator: Option<&crate::auth::NativeAuthenticator>,
     db_path: &std::path::Path,
     key_store: &S,
     key_name: &str,
     unsynced: &[UnsyncedWrite],
-    force: bool,
-) -> Result<(), ForgetError>
-where
+    report: &mut ForgetIncomplete,
+) where
     S: connetto_core::traits::ReplicaKeyStore,
 {
-    if !unsynced.is_empty() && !force {
-        return Err(ForgetError::Purge(PurgeError::Unsynced(unsynced.to_vec())));
+    if let Some(authenticator) = authenticator {
+        let signed_out = authenticator.sign_out().await;
+        report.credential = signed_out.credential.err();
+        report.revoke = signed_out.revoke.err();
     }
-    let revoked = authenticator.logout().await;
-    wipe_replica(db_path, key_store, key_name, unsynced, force).await?;
-    revoked.map_err(|err| ForgetError::NotRevoked(err.to_string()))
+    report.wipe = wipe_replica(db_path, key_store, key_name, unsynced, true)
+        .await
+        .err();
 }
 
 #[cfg(all(test, feature = "native-transport"))]

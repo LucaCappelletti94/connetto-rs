@@ -9,7 +9,7 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 
-use connetto_client::teardown::{ForgetError, PurgeError};
+use connetto_client::teardown::{ForgetError, ForgetRefusal};
 use connetto_client::{
     Auth, ClientError, ClientEvent, ConnettoClient, Gate, KeyringAuth, LiveHandle as _, Moment,
     NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning, SystemClock,
@@ -69,6 +69,8 @@ struct View {
     /// A live query or write that failed.
     error: Option<String>,
     wipe: Wipe,
+    /// What a sign-out that closed the client left undone, shown while signing in again.
+    notice: Option<String>,
 }
 
 impl Default for View {
@@ -84,6 +86,7 @@ impl Default for View {
             count: None,
             error: None,
             wipe: Wipe::Idle,
+            notice: None,
         }
     }
 }
@@ -243,7 +246,9 @@ async fn unlock(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError> {
 }
 
 /// Revoke the session, wipe the replica and sign in again. Unsynced writes
-/// block the wipe until `discard_unsynced` confirms losing them.
+/// block the wipe until `discard_unsynced` confirms losing them. A refused
+/// sign-out keeps the session, and one that closed the client signs in again
+/// whatever it left undone.
 #[tauri::command(rename_all = "snake_case")]
 async fn sign_out(
     app: AppHandle,
@@ -251,28 +256,32 @@ async fn sign_out(
     discard_unsynced: bool,
 ) -> Result<(), CommandError> {
     let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
-    match session.native.forget_device(discard_unsynced).await {
-        Ok(()) => {
-            *core.slot.lock() = Slot::Empty;
-            drop(session);
-            core.update(&app, |view| *view = View::default());
-            start(app, Arc::clone(&core));
-        }
-        Err(err) => {
-            let wipe = match err {
-                ForgetError::Purge(PurgeError::Unsynced(unsynced)) if !discard_unsynced => {
-                    Wipe::ConfirmForce {
-                        unsynced: unsynced.len(),
-                    }
-                }
-                err => Wipe::Failed {
-                    message: format!("logout error: {err}"),
+    let notice = match session.native.forget_device(discard_unsynced).await {
+        Ok(()) => None,
+        Err(ForgetError::Incomplete(report)) => Some(format!("logout error: {report}")),
+        Err(ForgetError::Refused(refusal)) => {
+            let wipe = match refusal {
+                ForgetRefusal::Unsynced(unsynced) if !discard_unsynced => Wipe::ConfirmForce {
+                    unsynced: unsynced.len(),
+                },
+                refusal => Wipe::Failed {
+                    message: format!("logout error: {refusal}"),
                 },
             };
             *core.slot.lock() = Slot::Ready(session);
             core.update(&app, |view| view.wipe = wipe);
+            return Ok(());
         }
-    }
+    };
+    *core.slot.lock() = Slot::Empty;
+    drop(session);
+    core.update(&app, |view| {
+        *view = View {
+            notice,
+            ..View::default()
+        };
+    });
+    start(app, Arc::clone(&core));
     Ok(())
 }
 

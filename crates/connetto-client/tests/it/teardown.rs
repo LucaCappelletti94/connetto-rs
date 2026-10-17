@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use connetto_client::teardown::{
-    ForgetError, PurgeError, content_dir, purge_replica, wipe_replica,
+    ForgetError, ForgetRefusal, PurgeError, content_dir, purge_replica, wipe_replica,
 };
 use connetto_client::{
     ClientBuilder, ClientError, DataDir, Gate, MemoryRefreshStore, NativeClientBuilder, ReplicaKey,
@@ -484,8 +484,10 @@ async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
     .await
     .expect("the offline write is queued");
     match client.forget_device(false).await {
-        Err(ForgetError::Purge(PurgeError::Unsynced(blocked))) => assert_eq!(blocked, queued),
-        Err(other) => panic!("expected a blocked forget, got {other:?}"),
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(blocked))) => {
+            assert_eq!(blocked, queued);
+        }
+        Err(other) => panic!("expected a refused forget, got {other:?}"),
         Ok(()) => panic!("forget_device must not silently drop queued writes"),
     }
     assert!(path.exists(), "the refused forget leaves the replica");
@@ -509,6 +511,82 @@ async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
         open_handles_to(&path),
         0,
         "the live client keeps no handle on the deleted replica, which Windows needs to delete it"
+    );
+}
+
+/// A key store whose records cannot be cleared, so a wipe fails after the
+/// client closed.
+#[derive(Clone, Default)]
+struct KeysThatStay(super::support::SharedKeys);
+
+impl ReplicaKeyStore for KeysThatStay {
+    type Error = ClientError;
+
+    async fn load(&self, name: &str) -> Result<Option<ReplicaKey>, ClientError> {
+        self.0.load(name).await
+    }
+
+    async fn store(&self, name: &str, key: &ReplicaKey) -> Result<(), ClientError> {
+        self.0.store(name, key).await
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this one refuses at once"
+    )]
+    async fn clear(&self, _name: &str) -> Result<(), ClientError> {
+        Err(ClientError::Auth(
+            "the key store refused the clear".to_owned(),
+        ))
+    }
+
+    fn protection(&self) -> connetto_client::Custody {
+        self.0.protection()
+    }
+}
+
+/// A forget that fails after the client closed says so by kind, names the
+/// part that failed, and leaves what that part did not remove.
+#[tokio::test]
+async fn a_wipe_failing_after_the_close_reports_an_incomplete_forget() {
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let keys = KeysThatStay::default();
+    let credential = super::support::held("alice");
+    let record = credential.replica_name().to_owned();
+    let path = dir.path().join(&record);
+    keys.store(&record, &connetto_core::test_support::replica_key())
+        .await
+        .expect("seed the key");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+            .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+            .signed_in(credential)
+            .durable(dir.path(), keys.clone(), MemoryRefreshStore::default())
+            .with_gate(Gate::off())
+            .connect(),
+    )
+    .await
+    .expect("the durable client opens offline");
+
+    let Err(ForgetError::Incomplete(report)) = client.forget_device(true).await else {
+        panic!("a wipe failing after the close is an incomplete forget");
+    };
+    assert!(
+        matches!(report.wipe, Some(PurgeError::KeyStore(_))),
+        "the wipe is the part that failed, got {report:?}"
+    );
+    assert!(report.release.is_none(), "the replica was released");
+    assert!(
+        report.credential.is_none() && report.revoke.is_none(),
+        "a held credential has no session to revoke"
+    );
+    assert!(
+        path.exists(),
+        "the replica stays, since its key could not go"
+    );
+    assert!(
+        keys.load(&record).await.expect("load").is_some(),
+        "and so does its key"
     );
 }
 
@@ -581,7 +659,7 @@ async fn an_in_memory_client_has_no_device_to_forget() {
     assert!(
         matches!(
             client.forget_device(true).await,
-            Err(ForgetError::NoReplica)
+            Err(ForgetError::Refused(ForgetRefusal::NoReplica))
         ),
         "an in-memory build refuses to forget"
     );
