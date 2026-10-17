@@ -383,6 +383,8 @@ enum TabApplyError {
     Apply(String),
     /// The replica or watermark storage failed: hub-fatal.
     Db(diesel::result::Error),
+    /// Recording what the apply changed failed: hub-fatal.
+    Session(String),
 }
 
 impl From<diesel::result::Error> for TabApplyError {
@@ -2845,15 +2847,7 @@ where
         return Ok(());
     }
     if local_hit > 0 {
-        return handle_local_mutation(
-            worker,
-            state,
-            id,
-            tab_seq,
-            &changeset,
-            &tables,
-            &patch.patchset_zstd,
-        );
+        return handle_local_mutation(worker, state, id, tab_seq, &changeset);
     }
     // Content rides a mutation that names it: a changeset carrying a staged
     // file's identity commits the manifest, the upload queue entry and the
@@ -3112,7 +3106,7 @@ fn render_delete(
     ))
 }
 
-/// Apply one pure local tier mutation and fan it out.
+/// Apply one pure local tier mutation and fan out what it changed.
 ///
 /// The changeset commits into the attached device-private tables together
 /// with the tab's durable watermark, in one transaction on the worker
@@ -3127,18 +3121,16 @@ fn render_delete(
 /// refuse a valid write, and a violation still standing there rejects the
 /// whole mutation back to its author.
 ///
-/// The payload then fans out to every tab with a subscription reading a
-/// touched table, the originator included: its re-apply is idempotent under
-/// the client's conflict policy and converges every mirror on the hub's
-/// serialization order.
+/// What the worker changed, cascades included, fans out to every tab with a
+/// subscription reading a table it touched, the originator included: its
+/// re-apply is idempotent under the client's conflict policy and converges
+/// every mirror on the hub's serialization order.
 fn handle_local_mutation<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     id: TabId,
     tab_seq: u64,
     changeset: &[u8],
-    tables: &HashSet<String>,
-    payload: &[u8],
 ) -> Result<(), TabFault>
 where
     U: Transport,
@@ -3173,7 +3165,15 @@ where
     }
     let applied = worker.conn().transaction::<_, TabApplyError, _>(|conn| {
         conn.batch_execute("PRAGMA defer_foreign_keys = ON")?;
-        apply_local_changeset(conn, changeset)?;
+        let effect = {
+            let session_err =
+                |err: diesel_sqlite_session::SessionError| TabApplyError::Session(err.to_string());
+            let mut record = conn.create_session_on(LOCAL_SCHEMA).map_err(session_err)?;
+            record.attach_all().map_err(session_err)?;
+            apply_local_changeset(conn, changeset)?;
+            // Taken before the watermark write, which lives in the same schema.
+            record.changeset().map_err(session_err)?
+        };
         {
             use local_schema::_connetto_tab_mutations::dsl as wm;
             // MAX(a, b) as a 2-arg scalar is not in diesel's aggregate DSL;
@@ -3189,19 +3189,12 @@ where
                 )
                 .execute(conn)?;
         }
-        Ok(())
+        Ok(effect)
     });
-    match applied {
-        Ok(()) => {}
+    let effect = match applied {
+        Ok(effect) => effect,
         Err(TabApplyError::Apply(detail)) => {
-            let _ = out.send(TabOut::Control(ControlMessage::MutationReject(
-                MutationReject {
-                    client_seq: tab_seq,
-                    reason: MutationRejectReason::Other {
-                        detail: format!("local tier apply failed: {detail}"),
-                    },
-                },
-            )));
+            reject_mutation(&out, tab_seq, format!("local tier apply failed: {detail}"));
             return Ok(());
         }
         // A reference still broken at the commit refuses the write, not the hub.
@@ -3217,7 +3210,8 @@ where
             return Ok(());
         }
         Err(TabApplyError::Db(err)) => return Err(RelayError::from(err).into()),
-    }
+        Err(TabApplyError::Session(detail)) => return Err(RelayError::Session(detail).into()),
+    };
     if let Some(tab) = state.tabs.get_mut(&id) {
         tab.local_watermark = Some(tab_seq);
     }
@@ -3226,17 +3220,22 @@ where
             client_seq: tab_seq,
         },
     )));
+    if effect.is_empty() {
+        return Ok(());
+    }
+    let tables = changeset_tables(&effect)?;
+    let payload = zstd::encode_all(effect.as_slice(), ZSTD_LEVEL).map_err(RelayError::from)?;
     // The worker's own cursor stamps the fan-out. Read here rather than passed
     // in, because this tier has no upstream leg that could advance it.
     let cursor = relay_cursor(worker);
     for tab in state.tabs.values_mut() {
-        let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(tables)) else {
+        let Some(sub) = tab.subs.iter().find(|sub| !sub.tables.is_disjoint(&tables)) else {
             continue;
         };
         let msg = BulkMessage::LivePatch(LivePatch::new(
             sub.sub_id.clone(),
             cursor.clone(),
-            payload.to_vec(),
+            payload.clone(),
         ));
         enqueue_tab_frame(tab, TabDeliverable::Rows(msg));
     }
@@ -3338,6 +3337,9 @@ where
                 return Ok(());
             }
             Err(TabApplyError::Db(err)) => return Err(RelayError::from(err).into()),
+            Err(TabApplyError::Session(detail)) => {
+                return Err(RelayError::Session(detail).into());
+            }
         }
     }
     if let Some(tab) = state.tabs.get_mut(&id) {
@@ -5637,20 +5639,16 @@ mod tests {
         session.changeset().expect("changeset")
     }
 
-    /// Hand `changeset` to the hub as tab 1's mutation `seq`.
+    /// Hand `changeset` to the hub as tab 1's first tier mutation.
     fn author_writes(
         worker: &mut connetto_client::ConnettoConnection<
             connetto_core::test_support::FakeTransport,
         >,
         state: &mut super::HubState,
-        seq: u64,
         changeset: &[u8],
     ) {
-        let tables = super::changeset_tables(changeset).expect("the tables it names");
-        let payload = zstd::encode_all(changeset, super::ZSTD_LEVEL).expect("compress");
         assert!(
-            super::handle_local_mutation(worker, state, 1, seq, changeset, &tables, &payload)
-                .is_ok(),
+            super::handle_local_mutation(worker, state, 1, 1, changeset).is_ok(),
             "the hub serves the mutation"
         );
     }
@@ -5705,6 +5703,40 @@ mod tests {
             .expect("count notes")
     }
 
+    /// A folder a tab deletes takes its notes with it on the worker, and every
+    /// tab reading a table the worker touched hears the whole effect, the
+    /// cascaded notes included, although its author never wrote them.
+    #[wasm_bindgen_test]
+    fn a_tier_cascade_reaches_the_tabs_reading_what_it_removed() {
+        use diesel::{ExpressionMethods, QueryDsl};
+        let (mut worker, mut state, mut author, mut sibling) = folders_hub();
+        author_writes(
+            &mut worker,
+            &mut state,
+            &mirror_changeset(|db| {
+                diesel::delete(tier::folders::table.filter(tier::folders::id.eq(1)))
+                    .execute(db)
+                    .expect("the tab's delete");
+            }),
+        );
+        assert_eq!(note_count(&mut worker), 0, "the worker cascaded");
+        let effect = vec![
+            ("folders".to_owned(), "delete"),
+            ("notes".to_owned(), "delete"),
+            ("notes".to_owned(), "delete"),
+        ];
+        assert_eq!(
+            delivered(&mut sibling),
+            effect,
+            "the notes tab hears of both cascaded notes"
+        );
+        assert_eq!(
+            delivered(&mut author),
+            effect,
+            "the author hears what the worker did beyond its own write"
+        );
+    }
+
     /// A tab's changeset lists its tables in the order it first touched them,
     /// so a child ahead of its parent is checked at the commit, not row by row.
     #[wasm_bindgen_test]
@@ -5714,7 +5746,6 @@ mod tests {
         author_writes(
             &mut worker,
             &mut state,
-            1,
             &mirror_changeset(|db| {
                 diesel::insert_into(tier::notes::table)
                     .values((tier::notes::id.eq(12), tier::notes::folder.eq(2)))
@@ -5739,7 +5770,6 @@ mod tests {
         author_writes(
             &mut worker,
             &mut state,
-            1,
             &mirror_changeset(|db| {
                 diesel::insert_into(tier::notes::table)
                     .values((tier::notes::id.eq(12), tier::notes::folder.eq(9)))
@@ -5751,16 +5781,21 @@ mod tests {
         assert_eq!(note_count(&mut worker), 2, "the worker holds what it held");
         assert!(delivered(&mut sibling).is_empty(), "nothing fans out");
 
-        author_writes(
-            &mut worker,
-            &mut state,
-            2,
-            &mirror_changeset(|db| {
-                diesel::insert_into(tier::notes::table)
-                    .values((tier::notes::id.eq(13), tier::notes::folder.eq(1)))
-                    .execute(db)
-                    .expect("the tab's next note");
-            }),
+        assert!(
+            super::handle_local_mutation(
+                &mut worker,
+                &mut state,
+                1,
+                2,
+                &mirror_changeset(|db| {
+                    diesel::insert_into(tier::notes::table)
+                        .values((tier::notes::id.eq(13), tier::notes::folder.eq(1)))
+                        .execute(db)
+                        .expect("the tab's next note");
+                }),
+            )
+            .is_ok(),
+            "the hub serves the next mutation"
         );
         assert!(!rejected(&mut author), "the next write is accepted");
         assert_eq!(note_count(&mut worker), 3, "the next write committed");
