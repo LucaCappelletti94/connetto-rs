@@ -366,18 +366,28 @@ async fn next_json(
     }
 }
 
-/// The pages an inspector endpoint on `port` lists.
+/// The pages an inspector endpoint on `port` lists, within [`REPLY_BOUND`].
 ///
 /// # Errors
 ///
-/// When the endpoint does not answer with a JSON list.
+/// When the endpoint does not answer with a JSON list within [`REPLY_BOUND`].
 pub async fn list_pages(port: u16) -> Result<Vec<serde_json::Value>> {
-    openidconnect::reqwest::get(format!("http://127.0.0.1:{port}/json"))
+    list_pages_within(port, REPLY_BOUND).await
+}
+
+/// An `adb forward` with no browser behind it accepts the connection and never answers.
+async fn list_pages_within(port: u16, bound: Duration) -> Result<Vec<serde_json::Value>> {
+    let listed = async {
+        openidconnect::reqwest::get(format!("http://127.0.0.1:{port}/json"))
+            .await
+            .context("listing inspector pages")?
+            .json()
+            .await
+            .context("reading inspector pages")
+    };
+    timeout(bound, listed)
         .await
-        .context("listing inspector pages")?
-        .json()
-        .await
-        .context("reading inspector pages")
+        .map_err(|_| anyhow!("the inspector page list got no reply within {bound:?}"))?
 }
 
 #[cfg(test)]
@@ -647,5 +657,25 @@ mod tests {
         page.wait_for_text("status: connected", Duration::from_secs(5))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_page_list_that_never_answers_fails_within_its_bound() {
+        // Like an `adb forward` with no browser behind it, the connection is accepted and never answered.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _held = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let bound = Duration::from_millis(200);
+        let listed = timeout(Duration::from_secs(5), list_pages_within(port, bound))
+            .await
+            .expect("the page list returned within its bound");
+        let error = listed.expect_err("an endpoint that never answers lists no pages");
+        assert!(
+            format!("{error:#}").contains("no reply within 200ms"),
+            "{error:#}"
+        );
     }
 }
