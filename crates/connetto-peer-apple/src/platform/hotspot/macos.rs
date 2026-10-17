@@ -121,16 +121,22 @@ pub(crate) fn leave(_ssid: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// The Mac's Wi-Fi interface, read by its BSD name.
+/// The Mac's default Wi-Fi interface, whatever its BSD name.
 fn interface() -> Result<Retained<CWInterface>, Error> {
     // SAFETY: the class method answers the shared client the platform owns
     // for the process.
     let client = unsafe { CWWiFiClient::sharedWiFiClient() };
-    let name = NSString::from_str(super::WIFI.to_str().unwrap_or("en0"));
-    // SAFETY: the name is a valid string the platform only reads, and the
-    // call answers the interface the caller owns.
-    unsafe { client.interfaceWithName(Some(&name)) }
-        .ok_or_else(|| Error::Missing("the Wi-Fi interface".to_owned()))
+    // SAFETY: the call answers the default Wi-Fi interface the caller owns,
+    // or none.
+    unsafe { client.interface() }.ok_or_else(|| Error::Missing("the Wi-Fi interface".to_owned()))
+}
+
+/// The BSD name of the Mac's default Wi-Fi interface, which the joined
+/// network's address and gateway are read on.
+pub(crate) fn wifi_name() -> Option<String> {
+    let interface = interface().ok()?;
+    // SAFETY: the platform answers the interface's BSD name, or none.
+    unsafe { interface.interfaceName() }.map(|name| name.to_string())
 }
 
 /// The worker's work, the directed scan for the SSID and its association.
