@@ -640,7 +640,16 @@ fn options() -> Options {
 /// it, the `USER` environment never read.
 fn login() -> String {
     let uid = nix::unistd::getuid();
-    match nix::unistd::User::from_uid(uid) {
+    login_name(uid, nix::unistd::User::from_uid(uid))
+}
+
+/// The login name from the user database's answer, the numeric uid where
+/// the database names no user.
+fn login_name(
+    uid: nix::unistd::Uid,
+    user: Result<Option<nix::unistd::User>, nix::Error>,
+) -> String {
+    match user {
         Ok(Some(user)) => user.name,
         Ok(None) => {
             tracing::warn!(%uid, "the uid has no user name, the profile names the uid");
@@ -1194,6 +1203,8 @@ mod tests {
     const WIFI_DEVICE: &str = "/org/freedesktop/NetworkManager/devices/wifi_0";
     const ETH_DEVICE: &str = "/org/freedesktop/NetworkManager/devices/eth_0";
     const ACTIVE_CONNECTION: &str = "/org/freedesktop/NetworkManager/ActiveConnection/1";
+    const IP4_CONFIG: &str = "/org/freedesktop/NetworkManager/IP4Config/1";
+    const DHCP4_CONFIG: &str = "/org/freedesktop/NetworkManager/DHCP4Config/1";
 
     const MODE_OK: u8 = 0;
     const MODE_PERMISSION_DENIED: u8 = 1;
@@ -1211,12 +1222,15 @@ mod tests {
     }
 
     /// The fake `NetworkManager` the proofs answer on a private bus, the
-    /// `AddAndActivateConnection2` requests and the refusal mode kept.
+    /// `AddAndActivateConnection2` requests, the refusal mode and the
+    /// deactivated connections kept.
     struct FakeNm {
         /// The requests, settings and options kept.
         calls: Arc<Mutex<Vec<Call>>>,
         /// The refusal mode, the proofs' switch.
         mode: Arc<AtomicU8>,
+        /// The `DeactivateConnection` calls kept.
+        deactivated: Arc<Mutex<Vec<OwnedObjectPath>>>,
     }
 
     #[zbus::interface(name = "org.freedesktop.NetworkManager")]
@@ -1268,6 +1282,10 @@ mod tests {
             let active = OwnedObjectPath::try_from(ACTIVE_CONNECTION).expect("the active path");
             Ok((saved, active, HashMap::new()))
         }
+
+        fn deactivate_connection(&self, active: OwnedObjectPath) {
+            self.deactivated.lock().push(active);
+        }
     }
 
     /// A `NetworkManager` device the proofs list, its `Device` interface
@@ -1309,6 +1327,63 @@ mod tests {
         }
     }
 
+    /// The active connection the proofs read the standing from, the
+    /// `IP4Config` and `DHCP4Config` paths named.
+    struct FakeActive {
+        ip4_config: String,
+        dhcp4_config: String,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.Connection.Active")]
+    impl FakeActive {
+        #[zbus(property)]
+        fn ip4_config(&self) -> OwnedObjectPath {
+            OwnedObjectPath::try_from(self.ip4_config.as_str()).expect("the IP4 config path")
+        }
+
+        #[zbus(property)]
+        fn dhcp4_config(&self) -> OwnedObjectPath {
+            OwnedObjectPath::try_from(self.dhcp4_config.as_str()).expect("the DHCP4 config path")
+        }
+    }
+
+    /// The `IP4Config` the proofs read the address and the gateway from.
+    struct FakeIp4 {
+        address_data: Vec<HashMap<String, OwnedValue>>,
+        gateway: String,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.IP4Config")]
+    impl FakeIp4 {
+        #[zbus(property)]
+        fn address_data(&self) -> Vec<HashMap<String, OwnedValue>> {
+            self.address_data.clone()
+        }
+
+        #[zbus(property)]
+        fn gateway(&self) -> String {
+            self.gateway.clone()
+        }
+    }
+
+    /// The `DHCP4Config` the proofs read the routers from.
+    struct FakeDhcp4 {
+        routers: String,
+    }
+
+    #[zbus::interface(name = "org.freedesktop.NetworkManager.DHCP4Config")]
+    impl FakeDhcp4 {
+        #[zbus(property)]
+        fn options(&self) -> HashMap<String, OwnedValue> {
+            let mut options = HashMap::new();
+            options.insert(
+                "routers".to_owned(),
+                OwnedValue::from(zbus::zvariant::Str::from(self.routers.clone())),
+            );
+            options
+        }
+    }
+
     /// A `NetworkManager` whose answer sleeps past the client's bound, for
     /// the timeout's proof.
     struct SlowNm;
@@ -1319,16 +1394,43 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(6)).await;
             Vec::new()
         }
+
+        async fn add_and_activate_connection2(
+            &self,
+            settings: OwnedSettings,
+            device: OwnedObjectPath,
+            saved: OwnedObjectPath,
+            options: OwnedOptions,
+        ) -> (
+            OwnedObjectPath,
+            OwnedObjectPath,
+            HashMap<String, OwnedValue>,
+        ) {
+            let _ = (settings, device, saved, options);
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            (
+                OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Connection/1")
+                    .expect("the saved connection path"),
+                OwnedObjectPath::try_from(ACTIVE_CONNECTION).expect("the active path"),
+                HashMap::new(),
+            )
+        }
     }
 
     /// Stand the fake `NetworkManager` on a private bus, the service
-    /// connection kept by the caller, the requests and the refusal mode
-    /// shared back.
+    /// connection kept by the caller, the requests, the refusal mode and
+    /// the deactivated connections shared back.
     async fn serve_fake_nm(
         bus: &crate::linux::test_bus::PrivateBus,
-    ) -> (zbus::Connection, Arc<Mutex<Vec<Call>>>, Arc<AtomicU8>) {
+    ) -> (
+        zbus::Connection,
+        Arc<Mutex<Vec<Call>>>,
+        Arc<AtomicU8>,
+        Arc<Mutex<Vec<OwnedObjectPath>>>,
+    ) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let mode = Arc::new(AtomicU8::new(MODE_OK));
+        let deactivated = Arc::new(Mutex::new(Vec::new()));
         let server = zbus::connection::Builder::address(bus.address.as_str())
             .expect("the bus address")
             .name("org.freedesktop.NetworkManager")
@@ -1338,6 +1440,7 @@ mod tests {
                 FakeNm {
                     calls: calls.clone(),
                     mode: mode.clone(),
+                    deactivated: deactivated.clone(),
                 },
             )
             .expect("the manager")
@@ -1369,7 +1472,63 @@ mod tests {
             .build()
             .await
             .expect("the fake manager");
-        (server, calls, mode)
+        (server, calls, mode, deactivated)
+    }
+
+    /// One `AddressData` entry, the address string and the prefix kept.
+    fn address_entry(address: &str, prefix: u32) -> HashMap<String, OwnedValue> {
+        let mut entry = HashMap::new();
+        entry.insert(
+            "address".to_owned(),
+            OwnedValue::from(zbus::zvariant::Str::from(address.to_owned())),
+        );
+        entry.insert("prefix".to_owned(), OwnedValue::from(prefix));
+        entry
+    }
+
+    /// Stand the active connection's standing on a private bus, the
+    /// service connection kept by the caller, the address entries, the
+    /// `IP4Config` gateway and the `DHCP4Config` routers where they stand.
+    async fn serve_standing(
+        bus: &crate::linux::test_bus::PrivateBus,
+        entries: Vec<HashMap<String, OwnedValue>>,
+        gateway: &str,
+        routers: Option<&str>,
+    ) -> zbus::Connection {
+        let builder = zbus::connection::Builder::address(bus.address.as_str())
+            .expect("the bus address")
+            .name("org.freedesktop.NetworkManager")
+            .expect("the service name")
+            .serve_at(
+                ACTIVE_CONNECTION,
+                FakeActive {
+                    ip4_config: IP4_CONFIG.to_owned(),
+                    dhcp4_config: DHCP4_CONFIG.to_owned(),
+                },
+            )
+            .expect("the active connection")
+            .serve_at(
+                IP4_CONFIG,
+                FakeIp4 {
+                    address_data: entries,
+                    gateway: gateway.to_owned(),
+                },
+            )
+            .expect("the IP4 config");
+        match routers {
+            Some(routers) => builder
+                .serve_at(
+                    DHCP4_CONFIG,
+                    FakeDhcp4 {
+                        routers: routers.to_owned(),
+                    },
+                )
+                .expect("the DHCP4 config")
+                .build()
+                .await
+                .expect("the standing service"),
+            None => builder.build().await.expect("the standing service"),
+        }
     }
 
     /// Emit a signal on the fake's service connection, the client's match
@@ -1420,7 +1579,7 @@ mod tests {
     #[tokio::test]
     async fn the_requests_reach_the_manager_and_answer_the_active_path() {
         let bus = crate::linux::test_bus::PrivateBus::start();
-        let (_server, calls, _mode) = serve_fake_nm(&bus).await;
+        let (_server, calls, _mode, _deactivated) = serve_fake_nm(&bus).await;
         let io = ZbusNm::new_with_connection(bus.connect().await)
             .await
             .expect("the network manager client");
@@ -1486,7 +1645,7 @@ mod tests {
     #[tokio::test]
     async fn a_refusal_maps_to_its_reason() {
         let bus = crate::linux::test_bus::PrivateBus::start();
-        let (_server, _calls, mode) = serve_fake_nm(&bus).await;
+        let (_server, _calls, mode, _deactivated) = serve_fake_nm(&bus).await;
         let io = ZbusNm::new_with_connection(bus.connect().await)
             .await
             .expect("the network manager client");
@@ -1521,7 +1680,7 @@ mod tests {
     #[tokio::test]
     async fn the_signals_arrive_as_their_events() {
         let bus = crate::linux::test_bus::PrivateBus::start();
-        let (server, _calls, _mode) = serve_fake_nm(&bus).await;
+        let (server, _calls, _mode, _deactivated) = serve_fake_nm(&bus).await;
         let io = ZbusNm::new_with_connection(bus.connect().await)
             .await
             .expect("the network manager client");
@@ -1618,6 +1777,30 @@ mod tests {
         }
     }
 
+    /// The first event of the kind `wanted` names, `emit` sent again until
+    /// it arrives within ten seconds, over a bare event receiver.
+    async fn event_after_rx<F: Future<Output = ()>>(
+        rx: &mut tokio::sync::mpsc::Receiver<NmEvent>,
+        emit: impl Fn() -> F,
+        wanted: impl Fn(&NmEvent) -> bool,
+    ) -> NmEvent {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the event did not arrive within its bound"
+            );
+            emit().await;
+            while let Ok(event) = tokio::time::timeout(Duration::from_millis(200), rx.recv()).await
+            {
+                let event = event.expect("the event channel closed");
+                if wanted(&event) {
+                    return event;
+                }
+            }
+        }
+    }
+
     /// An answer past the bound is the timeout's failure, over a slow
     /// fake `NetworkManager` on a private bus.
     #[tokio::test]
@@ -1642,6 +1825,552 @@ mod tests {
         assert!(
             matches!(&err, NmIoError::Failed(text) if text.contains("timed out")),
             "the failure is the timeout, {err:?}"
+        );
+    }
+
+    /// The joined network's standing stands the address, the prefix and
+    /// the gateway, the empty gateway answered by the `DHCP4Config`
+    /// routers, over a fake `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_standing_stands_the_address_the_prefix_and_the_gateway() {
+        // The `IP4Config` gateway stands, the `DHCP4Config` routers behind it.
+        {
+            let bus = crate::linux::test_bus::PrivateBus::start();
+            let _server = serve_standing(
+                &bus,
+                vec![address_entry("10.42.0.10", 24)],
+                "192.168.43.1",
+                Some("10.42.0.1 10.42.0.2"),
+            )
+            .await;
+            let io = ZbusNm::new_with_connection(bus.connect().await)
+                .await
+                .expect("the network manager client");
+            let standing = io
+                .ipv4(ACTIVE_CONNECTION)
+                .await
+                .expect("the standing stands");
+            assert_eq!(standing.address, Ipv4Addr::new(10, 42, 0, 10));
+            assert_eq!(standing.prefix, 24);
+            assert_eq!(
+                standing.gateway,
+                Some(IpAddr::from(Ipv4Addr::new(192, 168, 43, 1))),
+                "the IP4Config gateway stands"
+            );
+        }
+        // The empty gateway stands the first router.
+        {
+            let bus = crate::linux::test_bus::PrivateBus::start();
+            let _server = serve_standing(
+                &bus,
+                vec![address_entry("10.42.0.10", 24)],
+                "",
+                Some("10.42.0.1 10.42.0.2"),
+            )
+            .await;
+            let io = ZbusNm::new_with_connection(bus.connect().await)
+                .await
+                .expect("the network manager client");
+            let standing = io
+                .ipv4(ACTIVE_CONNECTION)
+                .await
+                .expect("the standing stands");
+            assert_eq!(
+                standing.gateway,
+                Some(IpAddr::from(Ipv4Addr::new(10, 42, 0, 1))),
+                "the first router stands the empty gateway"
+            );
+        }
+        // A missing `DHCP4Config` leaves the gateway to the `IP4Config`.
+        {
+            let bus = crate::linux::test_bus::PrivateBus::start();
+            let _server = serve_standing(
+                &bus,
+                vec![address_entry("10.42.0.10", 24)],
+                "192.168.43.1",
+                None,
+            )
+            .await;
+            let io = ZbusNm::new_with_connection(bus.connect().await)
+                .await
+                .expect("the network manager client");
+            let standing = io
+                .ipv4(ACTIVE_CONNECTION)
+                .await
+                .expect("the standing stands");
+            assert_eq!(
+                standing.gateway,
+                Some(IpAddr::from(Ipv4Addr::new(192, 168, 43, 1))),
+                "the IP4Config gateway stands"
+            );
+        }
+    }
+
+    /// The standing is refused on a network with no address and on an
+    /// address that is not `IPv4`, over a fake `NetworkManager` on a
+    /// private bus.
+    #[tokio::test]
+    async fn the_standing_refuses_a_network_without_an_ipv4_address() {
+        {
+            let bus = crate::linux::test_bus::PrivateBus::start();
+            let _server = serve_standing(&bus, Vec::new(), "192.168.43.1", Some("10.42.0.1")).await;
+            let io = ZbusNm::new_with_connection(bus.connect().await)
+                .await
+                .expect("the network manager client");
+            let err = io
+                .ipv4(ACTIVE_CONNECTION)
+                .await
+                .expect_err("the refusal stands");
+            assert!(
+                matches!(&err, NmIoError::Failed(text) if text.contains("no address")),
+                "the network has no address, {err:?}"
+            );
+        }
+        {
+            let bus = crate::linux::test_bus::PrivateBus::start();
+            let _server = serve_standing(
+                &bus,
+                vec![address_entry("not-an-ip", 24)],
+                "192.168.43.1",
+                Some("10.42.0.1"),
+            )
+            .await;
+            let io = ZbusNm::new_with_connection(bus.connect().await)
+                .await
+                .expect("the network manager client");
+            let err = io
+                .ipv4(ACTIVE_CONNECTION)
+                .await
+                .expect_err("the refusal stands");
+            assert!(
+                matches!(&err, NmIoError::Failed(text) if text.contains("not IPv4")),
+                "the address is not IPv4, {err:?}"
+            );
+        }
+    }
+
+    /// The deactivation reaches the manager with the active connection's
+    /// path, over a fake `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_deactivation_reaches_the_manager() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (_server, _calls, _mode, deactivated) = serve_fake_nm(&bus).await;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+
+        io.deactivate(ACTIVE_CONNECTION)
+            .await
+            .expect("the deactivation stands");
+        let kept = deactivated.lock().clone();
+        assert_eq!(kept.len(), 1, "the manager kept the one deactivation");
+        assert_eq!(kept[0].as_str(), ACTIVE_CONNECTION);
+    }
+
+    /// An invalid object path is refused before it reaches the manager,
+    /// over an absent fake `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn an_invalid_object_path_is_refused() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+
+        let err = io
+            .ipv4("not a path")
+            .await
+            .expect_err("the path is refused");
+        assert!(
+            matches!(&err, NmIoError::Failed(text) if text.contains("not a valid object path")),
+            "the refusal is the invalid path, {err:?}"
+        );
+        let err = io
+            .deactivate("not a path")
+            .await
+            .expect_err("the path is refused");
+        assert!(
+            matches!(&err, NmIoError::Failed(text) if text.contains("not a valid object path")),
+            "the refusal is the invalid path, {err:?}"
+        );
+    }
+
+    /// The signals of the wrong shape, the unrelated interface and the
+    /// wrong path are passed over, the expected one arrives, over a fake
+    /// `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_unrelated_and_malformed_signals_produce_no_event() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (server, _calls, _mode, _deactivated) = serve_fake_nm(&bus).await;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+
+        // Each kind lands once, so the match rules are registered before
+        // the filtered signals are sent.
+        land_each_signal_kind(&io, &server).await;
+
+        // The wrong shapes, the unrelated interface and the wrong path,
+        // then the queue must stand empty.
+        emit_filtered_signals(&server).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), io.next_event())
+                .await
+                .is_err(),
+            "the filtered signals must produce no event"
+        );
+
+        let properties = wireless_change(false);
+        let invalidated: Vec<String> = Vec::new();
+        let changed = ("org.freedesktop.NetworkManager", &properties, &invalidated);
+        let event = event_after(
+            &io,
+            || {
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &changed,
+                )
+            },
+            |event| matches!(event, NmEvent::WirelessEnabled(_)),
+        )
+        .await;
+        assert!(matches!(event, NmEvent::WirelessEnabled(false)));
+    }
+
+    /// The `PropertiesChanged` body the wireless proof sends, the
+    /// `WirelessEnabled` value kept.
+    fn wireless_change(on: bool) -> HashMap<String, OwnedValue> {
+        let mut properties = HashMap::new();
+        properties.insert("WirelessEnabled".to_owned(), OwnedValue::from(on));
+        properties
+    }
+
+    /// Land each signal kind once, the forwarders' match rules standing
+    /// before the filtered signals are sent.
+    async fn land_each_signal_kind(io: &ZbusNm, server: &zbus::Connection) {
+        let _ = event_after(
+            io,
+            || {
+                emit_signal(
+                    server,
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.NetworkManager",
+                    "CheckPermissions",
+                    &(),
+                )
+            },
+            |event| matches!(event, NmEvent::CheckPermissions),
+        )
+        .await;
+
+        let properties = wireless_change(true);
+        let invalidated: Vec<String> = Vec::new();
+        let changed = ("org.freedesktop.NetworkManager", &properties, &invalidated);
+        let _ = event_after(
+            io,
+            || {
+                emit_signal(
+                    server,
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &changed,
+                )
+            },
+            |event| matches!(event, NmEvent::WirelessEnabled(_)),
+        )
+        .await;
+
+        let _ = event_after(
+            io,
+            || {
+                emit_signal(
+                    server,
+                    "/org/freedesktop/NetworkManager/ActiveConnection/9",
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "StateChanged",
+                    &(1u32, 0u32),
+                )
+            },
+            |event| matches!(event, NmEvent::StateChanged { .. }),
+        )
+        .await;
+    }
+
+    /// The signals the forwarders must pass over, the wrong shapes, the
+    /// unrelated interface and the wrong path.
+    async fn emit_filtered_signals(server: &zbus::Connection) {
+        emit_signal(
+            server,
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &"the body is not a change",
+        )
+        .await;
+        emit_signal(
+            server,
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &(
+                "org.freedesktop.WiFi",
+                &HashMap::<String, OwnedValue>::new(),
+                &Vec::<String>::new(),
+            ),
+        )
+        .await;
+        emit_signal(
+            server,
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &(
+                "org.freedesktop.NetworkManager",
+                &HashMap::<String, OwnedValue>::new(),
+                &Vec::<String>::new(),
+            ),
+        )
+        .await;
+        emit_signal(
+            server,
+            "/org/freedesktop/NetworkManager/ActiveConnection/9",
+            "org.freedesktop.NetworkManager.Connection.Active",
+            "StateChanged",
+            &"the body is not a state",
+        )
+        .await;
+        emit_signal(
+            server,
+            "/org/freedesktop/NetworkManager/devices/wifi_0",
+            "org.freedesktop.NetworkManager.Connection.Active",
+            "StateChanged",
+            &(1u32, 0u32),
+        )
+        .await;
+    }
+
+    /// Wait for the forwarder task to stand down, within its bound.
+    async fn forwarder_ends(forwarder: tokio::task::JoinHandle<()>) {
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), forwarder)
+                .await
+                .expect("the forwarder ends within its bound")
+                .is_ok(),
+            "the forwarder task stands"
+        );
+    }
+
+    /// The signal forwarders break once their event receiver is gone, over
+    /// a fake `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_forwarders_end_when_their_receiver_is_gone() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (server, _calls, _mode, _deactivated) = serve_fake_nm(&bus).await;
+
+        // The `CheckPermissions` signal lands once, the receiver goes, and
+        // the next signal breaks the loop.
+        let check_permissions = || {
+            emit_signal(
+                &server,
+                "/org/freedesktop/NetworkManager",
+                "org.freedesktop.NetworkManager",
+                "CheckPermissions",
+                &(),
+            )
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let forwarder = tokio::spawn(super::forward_check_permissions(
+            bus.connect().await,
+            tx.clone(),
+        ));
+        event_after_rx(&mut rx, &check_permissions, |event| {
+            matches!(event, NmEvent::CheckPermissions)
+        })
+        .await;
+        drop(rx);
+        check_permissions().await;
+        forwarder_ends(forwarder).await;
+
+        // The same over the wireless forwarder and `PropertiesChanged`.
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let forwarder = tokio::spawn(super::forward_wireless(bus.connect().await, tx.clone()));
+        let on_properties = wireless_change(true);
+        let off_properties = wireless_change(false);
+        let invalidated: Vec<String> = Vec::new();
+        let wireless_on = (
+            "org.freedesktop.NetworkManager",
+            &on_properties,
+            &invalidated,
+        );
+        let wireless_off = (
+            "org.freedesktop.NetworkManager",
+            &off_properties,
+            &invalidated,
+        );
+        event_after_rx(
+            &mut rx,
+            || {
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/NetworkManager",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &wireless_on,
+                )
+            },
+            |event| matches!(event, NmEvent::WirelessEnabled(_)),
+        )
+        .await;
+        drop(rx);
+        emit_signal(
+            &server,
+            "/org/freedesktop/NetworkManager",
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            &wireless_off,
+        )
+        .await;
+        forwarder_ends(forwarder).await;
+
+        // The same over the active states forwarder and `StateChanged`.
+        let conn = bus.connect().await;
+        let states = super::active_states(&conn)
+            .await
+            .expect("the state subscription stands");
+        let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+        let forwarder = tokio::spawn(super::forward_active_states(states, tx.clone()));
+        event_after_rx(
+            &mut rx,
+            || {
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/NetworkManager/ActiveConnection/8",
+                    "org.freedesktop.NetworkManager.Connection.Active",
+                    "StateChanged",
+                    &(2u32, 0u32),
+                )
+            },
+            |event| matches!(event, NmEvent::StateChanged { .. }),
+        )
+        .await;
+        drop(rx);
+        emit_signal(
+            &server,
+            "/org/freedesktop/NetworkManager/ActiveConnection/8",
+            "org.freedesktop.NetworkManager.Connection.Active",
+            "StateChanged",
+            &(3u32, 0u32),
+        )
+        .await;
+        forwarder_ends(forwarder).await;
+    }
+
+    /// The event stream ends once the bus is closed, over a fake
+    /// `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn the_events_end_when_the_bus_is_closed() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let _server = serve_fake_nm(&bus).await.0;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+
+        drop(bus);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        let ended = loop {
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if left.is_zero() {
+                break false;
+            }
+            match tokio::time::timeout(left, io.next_event()).await {
+                Ok(None) => break true,
+                Err(_) => break false,
+                Ok(Some(_)) => {}
+            }
+        };
+        assert!(ended, "the events did not end within their bound");
+    }
+
+    /// A slow `AddAndActivateConnection2` is the timeout's failure, over a
+    /// slow fake `NetworkManager` on a private bus.
+    #[tokio::test]
+    async fn a_slow_activation_times_out_on_the_call_bound() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let _server = zbus::connection::Builder::address(bus.address.as_str())
+            .expect("the bus address")
+            .name("org.freedesktop.NetworkManager")
+            .expect("the service name")
+            .serve_at("/org/freedesktop/NetworkManager", SlowNm)
+            .expect("the slow manager")
+            .build()
+            .await
+            .expect("the slow manager service");
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+        let err = io
+            .add_and_activate(&AddRequest::Host {
+                device: WIFI_DEVICE.to_owned(),
+                band: Band::Five,
+                ssid: "connetto-1a2b".into(),
+                passphrase: "supersecret123".into(),
+            })
+            .await
+            .expect_err("the slow answer must time out");
+        assert!(
+            matches!(&err, AddError::Failed(text) if text.contains("timed out")),
+            "the failure is the timeout, {err:?}"
+        );
+    }
+
+    #[test]
+    fn the_login_name_falls_back_to_the_numeric_uid() {
+        let uid = nix::unistd::Uid::from_raw(1000);
+        let user = nix::unistd::User {
+            name: "luca".to_owned(),
+            passwd: std::ffi::CString::new("").expect("the empty password stands"),
+            uid,
+            gid: nix::unistd::Gid::from_raw(1000),
+            dir: std::path::PathBuf::new(),
+            gecos: std::ffi::CString::new("").expect("the empty gecos stands"),
+            shell: std::path::PathBuf::new(),
+        };
+        assert_eq!(super::login_name(uid, Ok(Some(user))), "luca");
+        assert_eq!(
+            super::login_name(uid, Ok(None)),
+            "1000",
+            "the nameless uid names itself"
+        );
+        assert_eq!(
+            super::login_name(uid, Err(nix::Error::EACCES)),
+            "1000",
+            "the refused lookup names the uid"
+        );
+    }
+
+    #[test]
+    fn a_denial_outside_a_method_error_reads_the_error_text() {
+        assert!(
+            super::is_permission_denied(&zbus::Error::Failure(
+                "org.freedesktop.DBus.Error.AccessDenied: no access".to_owned(),
+            )),
+            "the denial in the text is the denial"
+        );
+        assert!(
+            !super::is_permission_denied(&zbus::Error::Failure("another failure".to_owned(),)),
+            "the other failure is not the denial"
+        );
+    }
+
+    #[test]
+    fn a_dbus_failure_maps_to_the_io_failure() {
+        let err = super::dbus_error(zbus::Error::Failure("the bus went away".to_owned()));
+        assert!(
+            matches!(&err, NmIoError::Failed(text) if text.contains("the bus went away")),
+            "the failure keeps the reason, {err:?}"
         );
     }
 
