@@ -38,13 +38,18 @@ class UnlockPromptPlugin {
             outcome.set(UNAVAILABLE)
             return
         }
-        Handler(Looper.getMainLooper()).post {
-            val activity = CurrentActivity.get()
-            if (activity == null) {
-                outcome.set(NO_SCREEN)
-            } else {
-                whenFocused(activity) { show(activity, cipher, title) }
-            }
+        Handler(Looper.getMainLooper()).post { promptOnScreenInFront(cipher, title) }
+    }
+
+    /** Show the prompt once the screen in front holds focus. Main thread only. */
+    private fun promptOnScreenInFront(cipher: Cipher, title: String) {
+        val activity = CurrentActivity.get()
+        if (activity == null) {
+            outcome.set(NO_SCREEN)
+            return
+        }
+        whenFocused(activity, rebuilt = { promptOnScreenInFront(cipher, title) }) {
+            show(activity, cipher, title)
         }
     }
 
@@ -52,10 +57,11 @@ class UnlockPromptPlugin {
      * Runs [action] once [activity]'s window holds focus. A prompt asked while
      * another app is in front, as the login tab is for a moment after the
      * redirect, is taken for a background request and never shown on Samsung.
-     * A screen destroyed before it gains focus never will, so the wait ends as
-     * dismissed and the app may ask again on the screen that replaced it.
+     * A screen destroyed before it gains focus never will, so [rebuilt] runs
+     * instead, posted so it runs after the relaunch that created the screen
+     * replacing it.
      */
-    private fun whenFocused(activity: Activity, action: () -> Unit) {
+    private fun whenFocused(activity: Activity, rebuilt: () -> Unit, action: () -> Unit) {
         val decor = activity.window.decorView
         if (decor.hasWindowFocus()) {
             action()
@@ -74,7 +80,7 @@ class UnlockPromptPlugin {
         }
         listener.cancelDestroyWait = CurrentActivity.onDestroyed(activity) {
             decor.viewTreeObserver.removeOnWindowFocusChangeListener(listener)
-            outcome.set(DISMISSED)
+            Handler(Looper.getMainLooper()).post(rebuilt)
         }
         decor.viewTreeObserver.addOnWindowFocusChangeListener(listener)
     }
