@@ -484,6 +484,7 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::ServerClosed { reason } => {
             Some(format!("server closed the session: {reason:?}"))
         }
+        ClientEvent::Stopped { detail } => Some(format!("the client stopped: {detail}")),
         ClientEvent::Closed => Some("connection closed".to_owned()),
         _ => None,
     }
@@ -757,6 +758,11 @@ fn use_boot_window_effect(
                     while let Ok(event) = events.recv().await {
                         if let Some(label) = status_label(&event) {
                             status.set(label);
+                        }
+                        // The stop names its cause, and the `Closed` that
+                        // follows it would only replace that.
+                        if matches!(event, ClientEvent::Stopped { .. }) {
+                            break;
                         }
                     }
                 }

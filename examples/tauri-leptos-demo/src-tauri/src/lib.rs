@@ -418,6 +418,7 @@ fn status_label(event: &ClientEvent) -> Option<String> {
             ),
             other => format!("server closed the connection: {other:?}"),
         }),
+        ClientEvent::Stopped { detail } => Some(format!("the client stopped: {detail}")),
         ClientEvent::Closed => Some("connection closed".to_owned()),
         ClientEvent::AuthenticationRequired => {
             Some("session expired, sign out and sign in again".to_owned())
@@ -550,6 +551,11 @@ async fn feed_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>
                 view.status = status;
             }
         });
+        // The stop names its cause, and the `Closed` that follows it would
+        // only replace that.
+        if matches!(event, ClientEvent::Stopped { .. }) {
+            break;
+        }
     }
 }
 
