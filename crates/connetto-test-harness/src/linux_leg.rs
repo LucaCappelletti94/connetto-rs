@@ -10,9 +10,10 @@
 //! directory, and serves a line-based JSON protocol on its standard
 //! streams. The proof sends one line per command, each carrying an id, and
 //! reads one line per answer, matched by the id, plus a fatal event line
-//! when the client stands down. The waits the walk drives over the leg
-//! poll the client's standing rather than events, so a missed broadcast
-//! event cannot hold one open.
+//! when the client stands down. The `linked` and `nearby` answers read the
+//! client's own standing, so a missed broadcast event leaves nothing
+//! stale, and the pump keeps the one-shot fatal notices, logging a lag's
+//! missed count and going on.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
@@ -24,14 +25,16 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::{
-    AccountChoice, Auth, BeaconState, BluetoothState, BrowserOpener, ClientEvent, HotspotOffer,
-    HotspotSecurity, NativeClient, NativeClientBuilder, NativeTransport, SyncSchema,
+    AccountChoice, Auth, BeaconState, BluetoothError, BluetoothState, BrowserOpener, ClientEvent,
+    HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinNearbyError, NativeClient,
+    NativeClientBuilder, NativeTransport, SyncSchema, WifiPayloadError,
 };
 use parking_lot::Mutex as Lock;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin};
 use tokio::sync::Mutex as AsyncLock;
+use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, sleep, timeout};
 use uuid::Uuid;
 
@@ -142,15 +145,21 @@ pub async fn run_leg() -> Result<()> {
 ///
 /// When the command stream breaks or the leg's answer stream closes.
 async fn serve(client: NativeClient<NativeTransport>) -> Result<()> {
-    let state = Arc::new(LegState::default());
     let (fatal, mut fatal_rx) = tokio::sync::mpsc::unbounded_channel();
     let events = client.client().events();
-    let pump_state = Arc::clone(&state);
     let pump_fatal = fatal.clone();
     let pump = tokio::spawn(async move {
         let mut events = events;
-        while let Ok(event) = events.recv().await {
-            pump_event(event, &pump_state, &pump_fatal);
+        loop {
+            match events.recv().await {
+                Ok(event) => pump_event(event, &pump_fatal),
+                // A missed event leaves nothing stale, the queries read the
+                // client's standing and every wait polls one.
+                Err(RecvError::Lagged(n)) => {
+                    eprintln!("[leg] {n} of the client's events were missed");
+                }
+                Err(RecvError::Closed) => break,
+            }
         }
     });
 
@@ -173,7 +182,7 @@ async fn serve(client: NativeClient<NativeTransport>) -> Result<()> {
                     let _ = write_line(&mut out, &json!({"error": "the leg read no JSON line"})).await;
                     continue;
                 };
-                let reply = handle_command(&client, &state, &command).await;
+                let reply = handle_command(&client, &command).await;
                 if write_line(&mut out, &reply).await.is_err() {
                     return Err(anyhow!("the proof stopped reading the leg's answers"));
                 }
@@ -216,7 +225,6 @@ async fn write_line(
 /// field.
 async fn handle_command(
     client: &NativeClient<NativeTransport>,
-    state: &LegState,
     command: &serde_json::Value,
 ) -> serde_json::Value {
     let id = command
@@ -226,68 +234,107 @@ async fn handle_command(
     let cmd = command.get("cmd").and_then(serde_json::Value::as_str);
     let answer = match cmd {
         Some("identity" | "serving" | "beacon" | "bluetooth" | "linked" | "nearby" | "state") => {
-            handle_query(client, state, cmd)
+            handle_query(client, cmd)
         }
         _ => handle_action(client, command).await,
     };
+    answer_line(&id, &answer)
+}
+
+/// The line the command's answer stands, its refusal's text in the line's
+/// `error` field.
+fn answer_line(
+    id: &serde_json::Value,
+    answer: &Result<serde_json::Value, LegCommandError>,
+) -> serde_json::Value {
     match answer {
         Ok(value) => json!({ "id": id, "ok": true, "result": value }),
-        Err(reason) => json!({ "id": id, "ok": false, "error": reason }),
+        Err(reason) => json!({ "id": id, "ok": false, "error": reason.to_string() }),
     }
 }
 
-/// The answers that only read the client's standing and the leg's state.
+/// The leg's command refusals, which the answer line's `error` field
+/// carries.
+#[derive(Debug, thiserror::Error)]
+enum LegCommandError {
+    /// The command is not one the leg answers.
+    #[error("an unknown leg command")]
+    Unknown,
+    /// The command names no field the call reads.
+    #[error("the {command} command names no {field}")]
+    MissingField {
+        /// The command's name.
+        command: &'static str,
+        /// The field's name.
+        field: &'static str,
+    },
+    /// The payload the command names does not parse.
+    #[error("the payload does not parse: {0}")]
+    Payload(#[from] WifiPayloadError),
+    /// The client holds no certificate yet.
+    #[error("the device holds no certificate yet")]
+    NoCertificate,
+    /// The client serves no peer listener yet.
+    #[error("the device does not serve its peer listener yet")]
+    NoListener,
+    /// The client's hotspot host refused.
+    #[error(transparent)]
+    Host(#[from] HotspotError),
+    /// The client's Bluetooth call refused.
+    #[error(transparent)]
+    Bluetooth(#[from] BluetoothError),
+    /// The client's hotspot join refused.
+    #[error(transparent)]
+    Join(#[from] JoinError),
+    /// The client's nearby join refused.
+    #[error(transparent)]
+    NearbyJoin(#[from] JoinNearbyError),
+}
+
+/// The answers that read the client's standing.
 ///
 /// # Errors
 ///
-/// When the client holds no certificate or serves no listener yet.
+/// When the client holds no certificate or serves no listener yet, or the
+/// command is unknown.
 fn handle_query(
     client: &NativeClient<NativeTransport>,
-    state: &LegState,
     cmd: Option<&str>,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LegCommandError> {
     match cmd {
         Some("identity") => client
             .device_certificate()
             .map(|cert| json!({ "identity": short_identity(cert.identity()) }))
-            .ok_or_else(|| "the device holds no certificate yet".to_owned()),
+            .ok_or(LegCommandError::NoCertificate),
         Some("serving") => client
             .peer_address()
             .map(|address| json!({ "port": address.port() }))
-            .ok_or_else(|| "the device does not serve its peer listener yet".to_owned()),
+            .ok_or(LegCommandError::NoListener),
         Some("beacon") => Ok(beacon_json(&client.beacon_state())),
         Some("bluetooth") => Ok(json!({ "state": client.bluetooth_state().to_string() })),
-        Some("linked") => {
-            let linked = state.linked.lock();
-            serde_json::to_value(&**linked)
-                .map(|value| json!({ "linked": value }))
-                .map_err(|err| err.to_string())
-        }
-        Some("nearby") => {
-            let nearby = state.nearby.lock();
-            serde_json::to_value(&**nearby)
-                .map(|value| json!({ "nearby": value }))
-                .map_err(|err| err.to_string())
-        }
+        Some("linked") => Ok(json!({
+            "linked": client.linked_peers().iter().map(short_identity).collect::<Vec<_>>(),
+        })),
+        Some("nearby") => Ok(json!({ "nearby": nearby_entries(&client.nearby_hosts()) })),
         Some("state") => {
-            let linked = state.linked.lock();
-            let nearby = state.nearby.lock();
             let identity = client
                 .device_certificate()
                 .map(|cert| short_identity(cert.identity()));
             let port = client.peer_address().map(|address| address.port());
-            let linked = serde_json::to_value(&**linked).expect("a list of names serializes");
-            let nearby = serde_json::to_value(&**nearby).expect("the nearby standing serializes");
             Ok(json!({
                 "identity": identity,
                 "port": port,
                 "bluetooth": client.bluetooth_state().to_string(),
                 "beacon": beacon_json(&client.beacon_state()),
-                "linked": linked,
-                "nearby": nearby,
+                "linked": client
+                    .linked_peers()
+                    .iter()
+                    .map(short_identity)
+                    .collect::<Vec<_>>(),
+                "nearby": nearby_entries(&client.nearby_hosts()),
             }))
         }
-        _ => Err("an unknown leg command".to_owned()),
+        _ => Err(LegCommandError::Unknown),
     }
 }
 
@@ -295,11 +342,12 @@ fn handle_query(
 ///
 /// # Errors
 ///
-/// When the network will not answer or the command is malformed.
+/// When the client's call refuses, a field or payload is missing or
+/// unparseable, or the command is unknown.
 async fn handle_action(
     client: &NativeClient<NativeTransport>,
     command: &serde_json::Value,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LegCommandError> {
     match command.get("cmd").and_then(serde_json::Value::as_str) {
         Some("host") => match client.host_hotspot().await {
             Ok(hosted) => Ok(json!({
@@ -309,7 +357,7 @@ async fn handle_action(
                 "payload": hosted.offer.to_wifi_payload().to_string(),
                 "beacon_off": hosted.beacon.map_err(|err| err.to_string()).ok(),
             })),
-            Err(err) => Err(err.to_string()),
+            Err(err) => Err(err.into()),
         },
         Some("stop") => {
             client.stop_hotspot().await;
@@ -322,7 +370,7 @@ async fn handle_action(
         Some("enable-bt") => client
             .enable_bluetooth()
             .await
-            .map_err(|err| err.to_string())
+            .map_err(LegCommandError::Bluetooth)
             .map(|()| json!({})),
         Some("join-form") => {
             let ssid = command
@@ -344,15 +392,21 @@ async fn handle_action(
                         HotspotOffer::new(ssid, passphrase, HotspotSecurity::Wpa2, Some(port));
                     join_gateway(client, &offer).await
                 }
-                None => Err("the join-form command names no port".to_owned()),
+                None => Err(LegCommandError::MissingField {
+                    command: "join-form",
+                    field: "port",
+                }),
             }
         }
         Some("join-payload") => match command.get("payload").and_then(serde_json::Value::as_str) {
             Some(payload) => match HotspotOffer::from_wifi_payload(payload) {
                 Ok(offer) => join_gateway(client, &offer).await,
-                Err(err) => Err(format!("the payload does not parse: {err}")),
+                Err(err) => Err(err.into()),
             },
-            None => Err("the join-payload command names no payload".to_owned()),
+            None => Err(LegCommandError::MissingField {
+                command: "join-payload",
+                field: "payload",
+            }),
         },
         Some("join-nearby") => match command.get("host").and_then(serde_json::Value::as_u64) {
             Some(host) => match client.join_nearby(&host).await {
@@ -360,12 +414,15 @@ async fn handle_action(
                     "identity": short_identity(&peer),
                     "gateway": gateway.to_string(),
                 })),
-                Err(err) => Err(err.to_string()),
+                Err(err) => Err(err.into()),
             },
-            None => Err("the join-nearby command names no host".to_owned()),
+            None => Err(LegCommandError::MissingField {
+                command: "join-nearby",
+                field: "host",
+            }),
         },
         Some("close") => Ok(json!({})),
-        _ => Err("an unknown leg command".to_owned()),
+        _ => Err(LegCommandError::Unknown),
     }
 }
 
@@ -377,48 +434,21 @@ async fn handle_action(
 async fn join_gateway(
     client: &NativeClient<NativeTransport>,
     offer: &HotspotOffer,
-) -> Result<serde_json::Value, String> {
+) -> Result<serde_json::Value, LegCommandError> {
     client
         .join_hotspot(offer)
         .await
         .map(|gateway| json!({ "gateway": gateway.to_string() }))
-        .map_err(|err| err.to_string())
+        .map_err(LegCommandError::Join)
 }
 
-/// One event of the client's event stream, kept in the leg's standing for
-/// the proof to poll.
-fn pump_event(
-    event: ClientEvent,
-    state: &LegState,
-    fatal: &tokio::sync::mpsc::UnboundedSender<String>,
-) {
+/// The one-shot fatal notices the leg reports as its fatal lines, the rest
+/// of the events read the client's standing and carry nothing here.
+fn pump_event(event: ClientEvent, fatal: &tokio::sync::mpsc::UnboundedSender<String>) {
     let fatal_line = |line: String| {
         let _ = fatal.send(line);
     };
     match event {
-        ClientEvent::PeerLinked { peer } => {
-            state.linked.lock().push(short_identity(&peer));
-        }
-        ClientEvent::PeerUnlinked { peer, .. } => {
-            let held = short_identity(&peer);
-            state.linked.lock().retain(|name| *name != held);
-        }
-        ClientEvent::HostNearby { host, prefix, rssi } => {
-            let entry = NearbyHost {
-                host,
-                prefix: prefix.map(hex_prefix),
-                rssi,
-            };
-            let mut nearby = state.nearby.lock();
-            if let Some(same) = nearby.iter_mut().find(|held| held.host == host) {
-                *same = entry;
-            } else {
-                nearby.push(entry);
-            }
-        }
-        ClientEvent::HostGone { host } => {
-            state.nearby.lock().retain(|held| held.host != host);
-        }
         ClientEvent::PeerListenFailed { address, error } => {
             fatal_line(format!(
                 "the peer listener could not bind {address}: {error}"
@@ -460,6 +490,21 @@ fn beacon_json(state: &BeaconState) -> serde_json::Value {
         BeaconState::Advertising { prefix } => json!({ "prefix": hex_prefix(*prefix) }),
         BeaconState::Off { reason } => json!({ "beacon_off": reason }),
     }
+}
+
+/// The `nearby` answer's hosts, each with its beacon's prefix in hex and
+/// its last signal.
+fn nearby_entries(hosts: &[connetto_client::NearbyHost]) -> Vec<serde_json::Value> {
+    hosts
+        .iter()
+        .map(|host| {
+            json!({
+                "host": host.host,
+                "prefix": host.prefix.map(hex_prefix),
+                "rssi": host.rssi,
+            })
+        })
+        .collect()
 }
 
 /// A browser opener that walks the real OIDC chain for `subject`, posting
@@ -534,13 +579,6 @@ fn fake_browser(subject: &str, failure: Arc<Lock<Option<String>>>) -> BrowserOpe
         });
         Ok(())
     })
-}
-
-/// The leg's standing the proof polls between commands.
-#[derive(Default)]
-struct LegState {
-    linked: Lock<Vec<String>>,
-    nearby: Lock<Vec<NearbyHost>>,
 }
 
 impl LegClient {
@@ -1069,4 +1107,111 @@ fn gateway(answer: &serde_json::Value) -> Result<IpAddr> {
         .ok_or_else(|| anyhow!("the join answer names no gateway"))?;
     text.parse()
         .map_err(|err| anyhow!("the join answer names no gateway address: {err}"))
+}
+
+#[cfg(test)]
+mod tests {
+    /// The answer line's `error` field stands the refusal's text, so each
+    /// variant's line stays the wire's.
+    #[test]
+    fn the_command_errors_stand_their_answer_lines() {
+        use super::LegCommandError;
+
+        let line = super::answer_line(&serde_json::json!("7"), &Err(LegCommandError::Unknown));
+        assert_eq!(line["id"], "7");
+        assert_eq!(line["ok"], false);
+        assert_eq!(line["error"], "an unknown leg command");
+
+        for (error, text) in [
+            (
+                LegCommandError::MissingField {
+                    command: "join-form",
+                    field: "port",
+                },
+                "the join-form command names no port",
+            ),
+            (
+                LegCommandError::MissingField {
+                    command: "join-payload",
+                    field: "payload",
+                },
+                "the join-payload command names no payload",
+            ),
+            (
+                LegCommandError::MissingField {
+                    command: "join-nearby",
+                    field: "host",
+                },
+                "the join-nearby command names no host",
+            ),
+            (
+                LegCommandError::NoCertificate,
+                "the device holds no certificate yet",
+            ),
+            (
+                LegCommandError::NoListener,
+                "the device does not serve its peer listener yet",
+            ),
+            (
+                LegCommandError::Payload(connetto_client::WifiPayloadError::NotWifi),
+                "the payload does not parse: the string is not a WIFI: payload",
+            ),
+            (
+                LegCommandError::Host(connetto_client::HotspotError::NoChannel),
+                "no channel is available for the hotspot",
+            ),
+            (
+                LegCommandError::Bluetooth(connetto_client::BluetoothError::Unsupported),
+                "this system has no Bluetooth",
+            ),
+            (
+                LegCommandError::Join(connetto_client::JoinError::Declined),
+                "the network is not available to this device",
+            ),
+            (
+                LegCommandError::NearbyJoin(connetto_client::JoinNearbyError::Bluetooth(
+                    connetto_client::BluetoothError::Busy,
+                )),
+                "an exchange is already running",
+            ),
+        ] {
+            let line = super::answer_line(&serde_json::json!("7"), &Err(error));
+            assert_eq!(line["ok"], false, "the {text} line");
+            assert_eq!(line["error"], text, "the {text} line");
+        }
+
+        let line = super::answer_line(
+            &serde_json::json!("7"),
+            &Ok(serde_json::json!({ "port": 8080 })),
+        );
+        assert_eq!(line["id"], "7");
+        assert_eq!(line["ok"], true);
+        assert_eq!(line["result"], serde_json::json!({ "port": 8080 }));
+    }
+
+    /// The nearby answer's hosts carry the beacon's prefix in hex and the
+    /// signal, and an empty scan stands an empty list.
+    #[test]
+    fn the_nearby_answer_stands_the_hosts_with_their_hex_prefix() {
+        let hosts = [
+            connetto_client::NearbyHost {
+                host: 7,
+                prefix: Some([9; 8]),
+                rssi: Some(-55),
+            },
+            connetto_client::NearbyHost {
+                host: 8,
+                prefix: None,
+                rssi: None,
+            },
+        ];
+        assert_eq!(
+            super::nearby_entries(&hosts),
+            vec![
+                serde_json::json!({ "host": 7, "prefix": "0909090909090909", "rssi": -55 }),
+                serde_json::json!({ "host": 8, "prefix": null, "rssi": null }),
+            ]
+        );
+        assert_eq!(super::nearby_entries(&[]), Vec::<serde_json::Value>::new());
+    }
 }

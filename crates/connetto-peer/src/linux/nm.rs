@@ -635,44 +635,22 @@ fn options() -> Options {
     options
 }
 
-/// The login the connection is restricted to, the process's real uid and
-/// its passwd name, the `USER` environment never read.
+/// The login the connection is restricted to, the name the system's user
+/// database (NSS) gives the process's real uid, as `NetworkManager` resolves
+/// it, the `USER` environment never read.
 fn login() -> String {
-    // The bus authenticates the process's real uid, so the profile stands
-    // the caller's identity.
-    let status = std::fs::read_to_string("/proc/self/status").ok();
-    let Some(uid) = status.as_deref().and_then(real_uid_of) else {
-        // The uid is unreadable, so the profile names no login and the
-        // activation fails cleanly.
-        tracing::warn!("the process's uid is unreadable, the profile names no login");
-        return "unknown".to_owned();
-    };
-    let passwd = std::fs::read_to_string("/etc/passwd").ok();
-    if let Some(name) = passwd.as_deref().and_then(|text| name_of_uid(text, uid)) {
-        return name;
+    let uid = nix::unistd::getuid();
+    match nix::unistd::User::from_uid(uid) {
+        Ok(Some(user)) => user.name,
+        Ok(None) => {
+            tracing::warn!(%uid, "the uid has no user name, the profile names the uid");
+            uid.to_string()
+        }
+        Err(err) => {
+            tracing::warn!(%uid, %err, "the user database did not answer, the profile names the uid");
+            uid.to_string()
+        }
     }
-    tracing::warn!(%uid, "the uid has no passwd name, the profile names the uid");
-    uid.to_string()
-}
-
-/// The status text's `Uid:` field, the real uid.
-fn real_uid_of(status: &str) -> Option<u32> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("Uid:"))
-        .and_then(|fields| fields.split_whitespace().next())
-        .and_then(|uid| uid.parse::<u32>().ok())
-}
-
-/// The passwd text's line for the uid, the name field.
-fn name_of_uid(passwd: &str, uid: u32) -> Option<String> {
-    passwd.lines().find_map(|line| {
-        let mut fields = line.splitn(4, ':');
-        let name = fields.next()?;
-        fields.next()?;
-        let uid_field = fields.next()?;
-        (uid_field == uid.to_string()).then(|| name.to_owned())
-    })
 }
 
 /// The address data entry's `prefix` field, a valid length.
@@ -866,30 +844,14 @@ mod tests {
     }
 
     #[test]
-    fn the_status_uid_field_parses() {
-        let status = "Name:\tnm\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\n";
-        assert_eq!(super::real_uid_of(status), Some(1000));
-        assert_eq!(
-            super::real_uid_of("Name:\tnm\nGid:\t1000\t1000\t1000\t1000\n"),
-            None
-        );
-    }
-
-    #[test]
-    fn the_passwd_name_stands_the_uid_line() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\nluca:x:1000:1000:Luca:/home/luca:/bin/bash\nnobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin\n";
-        assert_eq!(super::name_of_uid(passwd, 0), Some("root".to_owned()));
-        assert_eq!(super::name_of_uid(passwd, 1000), Some("luca".to_owned()));
-        assert_eq!(super::name_of_uid(passwd, 1234), None);
-    }
-
-    #[test]
     fn the_profile_names_the_process_identity() {
-        let status = std::fs::read_to_string("/proc/self/status").expect("the status stands");
-        let uid = super::real_uid_of(&status).expect("the uid field stands");
-        let passwd = std::fs::read_to_string("/etc/passwd").expect("the passwd stands");
-        let expected = super::name_of_uid(&passwd, uid).unwrap_or_else(|| uid.to_string());
-        assert_eq!(super::login(), expected);
+        // `id -un` resolves the real uid through the same user database.
+        let id = std::process::Command::new("id")
+            .arg("-un")
+            .output()
+            .expect("id runs");
+        let expected = String::from_utf8(id.stdout).expect("the name is UTF-8");
+        assert_eq!(super::login(), expected.trim());
     }
 
     #[test]

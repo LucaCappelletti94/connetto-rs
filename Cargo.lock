@@ -1466,6 +1466,7 @@ dependencies = [
  "connetto-core",
  "futures-util",
  "mdns-sd",
+ "nix",
  "parking_lot",
  "rcgen",
  "ring",

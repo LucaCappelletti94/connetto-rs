@@ -305,6 +305,8 @@ where
                 #[cfg(feature = "peer")]
                 beacon: None,
                 #[cfg(feature = "peer")]
+                nearby: None,
+                #[cfg(feature = "peer")]
                 bt_state: None,
             },
             pump,
@@ -792,6 +794,10 @@ where
             tokio::sync::watch::Receiver<crate::bluetooth::BeaconState>,
         > = None;
         #[cfg(feature = "peer")]
+        let mut nearby: Option<
+            tokio::sync::watch::Receiver<Vec<crate::bluetooth::NearbyHost>>,
+        > = None;
+        #[cfg(feature = "peer")]
         let mut bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>> = None;
         #[cfg(feature = "device-identity")]
         let (device, pump) = match keys {
@@ -853,7 +859,7 @@ where
                 );
                 let enrolment = core.client().enrolment(enroller);
                 #[cfg(feature = "peer")]
-                let (runner, beacon_rx, bt_backend) = Box::pin(async {
+                let (runner, beacon_rx, nearby_rx, bt_backend) = Box::pin(async {
                     let backend: Arc<dyn crate::hotspot::HotspotBackend> = {
                         #[cfg(target_os = "android")]
                         {
@@ -1028,6 +1034,7 @@ where
                     (
                         crate::bluetooth::run(machine, hotspot_rx, bt_machine.0, bluetooth_rx),
                         bt_machine.1,
+                        bt_machine.2,
                         bt_state,
                     )
                 }).await;
@@ -1042,6 +1049,7 @@ where
                 #[cfg(feature = "peer")]
                 {
                     beacon = Some(beacon_rx);
+                    nearby = Some(nearby_rx);
                     bt_state = Some(bt_backend);
                 }
                 (Some(handle), pump)
@@ -1059,6 +1067,8 @@ where
                 device,
                 #[cfg(feature = "peer")]
                 beacon,
+                #[cfg(feature = "peer")]
+                nearby,
                 #[cfg(feature = "peer")]
                 bt_state,
             },
@@ -1122,6 +1132,9 @@ pub struct NativeClient<T: Transport, C = ()> {
     #[cfg(feature = "peer")]
     /// The host's beacon standing, for the application's panel (R76).
     beacon: Option<tokio::sync::watch::Receiver<crate::bluetooth::BeaconState>>,
+    #[cfg(feature = "peer")]
+    /// The nearby hosts' standing, for the application's panel (R76).
+    nearby: Option<tokio::sync::watch::Receiver<Vec<crate::bluetooth::NearbyHost>>>,
     #[cfg(feature = "peer")]
     /// The platform's Bluetooth standing, readable at any time (R76).
     bt_state: Option<Arc<dyn crate::bluetooth::ReadinessBackend>>,
@@ -1239,6 +1252,16 @@ where
     #[must_use]
     pub fn peer_address(&self) -> Option<SocketAddr> {
         self.device.as_ref().and_then(EnrolHandle::peer_address)
+    }
+
+    /// The peers this device's node reports linked, an empty list without a
+    /// device or for a build without the `peer` feature (R76).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn linked_peers(&self) -> Vec<connetto_core::device_cert::DeviceIdentity> {
+        self.device
+            .as_ref()
+            .map_or_else(Vec::new, EnrolHandle::linked_peers)
     }
 
     /// Dial `addr`, refusing by this device's standing before any socket
@@ -1394,6 +1417,17 @@ where
                 reason: "no bluetooth on this system",
             },
         }
+    }
+
+    /// The nearby hosts the Bluetooth scan stands on, each with its host
+    /// key, beacon prefix and last signal, an empty list without a device
+    /// or without Bluetooth (R76).
+    #[cfg(feature = "peer")]
+    #[must_use]
+    pub fn nearby_hosts(&self) -> Vec<crate::bluetooth::NearbyHost> {
+        self.nearby
+            .as_ref()
+            .map_or_else(Vec::new, |receiver| receiver.borrow().clone())
     }
 
     /// Enable Bluetooth, the platform's action inside the call, within the
@@ -1696,6 +1730,8 @@ impl<T: Transport, C> NativeClient<T, C> {
             #[cfg(feature = "peer")]
             beacon: None,
             #[cfg(feature = "peer")]
+            nearby: None,
+            #[cfg(feature = "peer")]
             bt_state: None,
         }
     }
@@ -1990,6 +2026,14 @@ mod tests {
             client.peer_address().is_none(),
             "nothing serves without the device"
         );
+        assert!(
+            client.linked_peers().is_empty(),
+            "nothing links without the device"
+        );
+        assert!(
+            client.nearby_hosts().is_empty(),
+            "no nearby host without the device"
+        );
         assert!(client.device_certificate().is_none());
         assert!(client.device_key_home().is_none());
         let address: std::net::SocketAddr = "127.0.0.1:0".parse().expect("loopback");
@@ -2160,6 +2204,12 @@ mod tests {
         );
         drop(enroller);
         let (_beacon, beacon_rx) = watch::channel(BeaconState::Advertising { prefix: [7; 8] });
+        let (nearby_tx, nearby_rx) = watch::channel(Vec::new());
+        nearby_tx.send_replace(vec![crate::bluetooth::NearbyHost {
+            host: 9,
+            prefix: Some([3; 8]),
+            rssi: Some(-55),
+        }]);
         let (readiness, _, _) = crate::bluetooth::unsupported_backends();
         let client = NativeClient {
             core,
@@ -2171,6 +2221,8 @@ mod tests {
             device: Some(device),
             #[cfg(feature = "peer")]
             beacon: Some(beacon_rx),
+            #[cfg(feature = "peer")]
+            nearby: Some(nearby_rx),
             #[cfg(feature = "peer")]
             bt_state: Some(readiness),
         };
@@ -2252,6 +2304,19 @@ mod tests {
             client.beacon_state(),
             BeaconState::Advertising { prefix: [7; 8] },
             "the beacon's standing stands beside the device"
+        );
+        assert_eq!(
+            client.nearby_hosts(),
+            vec![crate::bluetooth::NearbyHost {
+                host: 9,
+                prefix: Some([3; 8]),
+                rssi: Some(-55)
+            }],
+            "the nearby read stands beside the device"
+        );
+        assert!(
+            client.linked_peers().is_empty(),
+            "nothing links before the device serves a link"
         );
         client.stop_hotspot().await;
         client.leave_hotspot().await;

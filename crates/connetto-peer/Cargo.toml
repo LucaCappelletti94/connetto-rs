@@ -67,6 +67,8 @@ socket2 = "0.6"
 zbus = { version = "5.12", default-features = false, features = ["tokio"] }
 futures-util = { version = "0.3", default-features = false, features = ["std"] }
 bluer = { version = "0.17.4", default-features = false, features = ["bluetoothd"] }
+# The NetworkManager profile names the caller as NSS resolves its uid.
+nix = { version = "0.29", default-features = false, features = ["user"] }
 
 
 [dev-dependencies]
