@@ -2792,16 +2792,12 @@ async fn pump<T, F, S>(
         let mut state = shared.state.lock().await;
 
         match drain_and_flush(&mut state, &shared, reconnect.is_some()).await {
-            PumpFlow::Proceed => {}
-            PumpFlow::Recover => {
+            Drained::Step => {}
+            Drained::Recover => {
                 needs_recovery = true;
                 continue;
             }
-            PumpFlow::Exit => {
-                end_unresumed(&mut state, &shared).await;
-                return;
-            }
-            PumpFlow::Fail(err) => {
+            Drained::Fail(err) => {
                 drop(state);
                 pump_fail(&shared, err).await;
                 return;
@@ -2992,6 +2988,17 @@ enum PumpFlow {
     Fail(ClientError),
 }
 
+/// What the pump does once dropped handles are drained and local writes
+/// flushed. A session only ends on a step, so draining never ends the pump.
+enum Drained {
+    /// Take the pump step.
+    Step,
+    /// The transport is gone. Recover at the top of the next iteration.
+    Recover,
+    /// A fault no reconnect can cure ended the pump.
+    Fail(ClientError),
+}
+
 /// Queue the writes made meanwhile for the next run, then end the pump, when
 /// the session ended with no driver to resume it.
 async fn end_unresumed<T>(state: &mut State<T>, shared: &Shared<T>)
@@ -3088,7 +3095,7 @@ async fn drain_and_flush<T>(
     state: &mut State<T>,
     shared: &Arc<Shared<T>>,
     has_driver: bool,
-) -> PumpFlow
+) -> Drained
 where
     T: Transport + MaybeSend + 'static,
     T::Error: core::fmt::Display,
@@ -3099,25 +3106,25 @@ where
     // nothing re-declares it.
     if let Err(err) = drain_dropped(&mut *state, &shared.reaper).await {
         if is_disconnect(&err) {
-            return PumpFlow::Recover;
+            return Drained::Recover;
         }
-        return PumpFlow::Fail(err);
+        return Drained::Fail(err);
     }
     // Auto-submit local writes committed since the last step. With no socket
     // this only queues them durably, which must not wait for a server.
     if let Err(err) = state.conn.flush().await {
         if is_disconnect(&err) {
-            return PumpFlow::Recover;
+            return Drained::Recover;
         }
-        return PumpFlow::Fail(err);
+        return Drained::Fail(err);
     }
     // No socket and a driver to find one, so go and find it. With no driver
     // there is nothing to recover to, so the pump falls through and parks,
     // which keeps device-private queries refreshing with no server at all.
     if has_driver && !state.conn.is_connected() {
-        return PumpFlow::Recover;
+        return Drained::Recover;
     }
-    PumpFlow::Proceed
+    Drained::Step
 }
 
 /// Route one pump step's result. A deliberate close tells the app why and
