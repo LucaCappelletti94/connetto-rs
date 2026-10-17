@@ -568,8 +568,23 @@ async fn a_wipe_failing_after_the_close_reports_an_incomplete_forget() {
     .await
     .expect("the durable client opens offline");
 
-    let Err(ForgetError::Incomplete(report)) = client.forget_device(true).await else {
+    let Err(error @ ForgetError::Incomplete(_)) = client.forget_device(true).await else {
         panic!("a wipe failing after the close is an incomplete forget");
+    };
+    let message = error.to_string();
+    assert!(
+        message.contains("wiping the replica failed")
+            && message.contains("the key store refused the clear"),
+        "the message names the failed part and its cause, got {message:?}"
+    );
+    assert!(
+        ["releasing", "credential", "revoking", "device key"]
+            .iter()
+            .all(|part| !message.contains(part)),
+        "and no part that succeeded, got {message:?}"
+    );
+    let ForgetError::Incomplete(report) = error else {
+        unreachable!("matched above");
     };
     assert!(
         matches!(report.wipe, Some(PurgeError::KeyStore(_))),
