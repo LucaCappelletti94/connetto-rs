@@ -163,13 +163,32 @@ fn take_redirect(
 }
 
 /// Run `f` with a JNI environment attached to this thread and the context
-/// `ndk-context` holds, the Application or an Activity depending on the host.
+/// manganis took from `ndk-context` on its first call, kept for the process.
 fn jni_call<R>(
     f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> manganis::jni::errors::Result<R>,
 ) -> Result<R, AuthSessionError> {
-    with_activity(|env, context| Some(f(env, context)))
+    with_activity(|env, context| Some(f(env, context).map_err(|err| bridge_error(env, &err))))
         .ok_or_else(|| AuthSessionError::Bridge("no Android context".to_owned()))?
-        .map_err(|err| AuthSessionError::Bridge(err.to_string()))
+}
+
+/// The bridge error for `err`. A Java exception is cleared and reported by its
+/// description, since one left pending makes the thread's next JNI call illegal.
+fn bridge_error(env: &mut JNIEnv<'_>, err: &manganis::jni::errors::Error) -> AuthSessionError {
+    let manganis::jni::errors::Error::JavaException = err else {
+        return AuthSessionError::Bridge(err.to_string());
+    };
+    let Ok(thrown) = env.exception_occurred() else {
+        return AuthSessionError::Bridge(err.to_string());
+    };
+    let _ = env.exception_clear();
+    let described = env
+        .call_method(&thrown, "toString", "()Ljava/lang/String;", &[])
+        .and_then(manganis::jni::objects::JValueGen::l)
+        .and_then(|text| env.get_string(&JString::from(text)).map(String::from));
+    if described.is_err() {
+        let _ = env.exception_clear();
+    }
+    AuthSessionError::Bridge(described.unwrap_or_else(|_| err.to_string()))
 }
 
 /// The Java VM reached through `ndk-context`, for the device key.

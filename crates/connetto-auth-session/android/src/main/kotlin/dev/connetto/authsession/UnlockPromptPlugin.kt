@@ -32,6 +32,7 @@ class UnlockPromptPlugin {
             .isDeviceSecure
 
     fun begin(cipher: Cipher, title: String) {
+        CurrentActivity.requireInstalled()
         outcome.set(PENDING)
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
             outcome.set(UNAVAILABLE)

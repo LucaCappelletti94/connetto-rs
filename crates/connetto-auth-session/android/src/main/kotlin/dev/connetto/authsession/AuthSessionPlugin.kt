@@ -18,6 +18,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class AuthSessionPlugin {
     fun begin(url: String) {
+        CurrentActivity.requireInstalled()
         pending.set(null)
         tab.set(TAB_PENDING)
         val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))

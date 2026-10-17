@@ -42,6 +42,14 @@ object CurrentActivity : Application.ActivityLifecycleCallbacks {
         )
 
     /**
+     * Throws on the calling thread, so the bridge reports it, when the tracker
+     * was never installed, rather than every screen lookup finding none.
+     */
+    internal fun requireInstalled() {
+        application()
+    }
+
+    /**
      * Run [action] on the main thread once [activity] is destroyed, unless the
      * returned function cancels it first. Main thread only.
      */
