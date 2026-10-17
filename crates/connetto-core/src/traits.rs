@@ -240,6 +240,14 @@ pub trait RefreshTokenStore {
 /// device keep separate keys and a wipe of one cannot reach the other. A literal
 /// name is equally valid and is how the browser addresses the device key it
 /// needs before any identity exists.
+///
+/// Separate keys are not separation between accounts. Every record lives in
+/// the same OS login's keychain, or the same browser profile's origin storage,
+/// so any account running under that login can load any other account's key
+/// by name. The encryption protects a device's replicas from whoever lacks the
+/// login and does not protect accounts under one login from each other,
+/// whether one person or two use them. Separating people is the operating
+/// system's user boundary.
 pub trait ReplicaKeyStore {
     /// Store-specific error.
     type Error: core::fmt::Debug + core::fmt::Display + Send + Sync + 'static;
