@@ -441,12 +441,16 @@ fn advertisement(beacon: [u8; 9]) -> Advertisement {
 
 #[cfg(test)]
 mod tests {
-    use super::{BluerBluez, BluezIo, PeripheralAnswer, address_of, advertisement, key};
+    use super::{
+        AdapterStanding, BluerBluez, BluezError, BluezIo, CALL_BOUND, PeripheralAnswer, address_of,
+        advertisement, key,
+    };
     use bluer::{Address, Uuid};
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::io::Read as _;
     use std::sync::Arc;
+    use std::time::Duration;
     use zbus::message::Header;
     use zbus::zvariant::{ObjectPath, OwnedFd, OwnedObjectPath, OwnedValue};
 
@@ -540,6 +544,665 @@ mod tests {
         assert!(output.status.success(), "the probe failed:\n{text}");
     }
 
+    const STANDING_PROBE_NAME: &str =
+        "linux::bluez::tests::the_standing_reads_the_power_and_the_events_follow_the_adapter";
+
+    /// The standing reads the adapter's power, a set stands on the
+    /// fake and reports its change, and a removed device arrives as
+    /// its disconnect, over a fake `BlueZ` on a private bus.
+    #[tokio::test]
+    async fn the_standing_reads_the_power_and_the_events_follow_the_adapter() {
+        if std::env::var_os("CONNETTO_BLUEZ_STANDING_PROBE").is_some() {
+            standing_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", STANDING_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_STANDING_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// The probe's scenario, the fake `BlueZ` standing on the private
+    /// bus the parent pointed `DBUS_SYSTEM_BUS_ADDRESS` at.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the probe runs the scenario as one straight line"
+    )]
+    async fn standing_probe() {
+        let powered = Arc::new(Mutex::new(false));
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAdapter {
+                    powered: powered.clone(),
+                },
+            )
+            .expect("the adapter")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let io = BluerBluez::new().await.expect("the bluez client");
+        assert_eq!(
+            io.standing().await,
+            AdapterStanding::Powered(false),
+            "the standing reads the power"
+        );
+
+        io.set_powered(true).await.expect("the set stands");
+        assert!(*powered.lock(), "the fake recorded the set");
+        assert_eq!(
+            io.standing().await,
+            AdapterStanding::Powered(true),
+            "the standing follows the set"
+        );
+
+        let mut changed = HashMap::new();
+        changed.insert("Powered".to_owned(), OwnedValue::from(true));
+        let invalidated: Vec<String> = Vec::new();
+        let change = ("org.bluez.Adapter1", &changed, &invalidated);
+        let answer = answer_after(
+            &io,
+            Duration::from_secs(10),
+            || {
+                emit_signal(
+                    &server,
+                    "/org/bluez/hci0",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &change,
+                )
+            },
+            |answer| matches!(answer, PeripheralAnswer::Powered(true)),
+        )
+        .await;
+        assert!(
+            matches!(answer, PeripheralAnswer::Powered(true)),
+            "the powered change is its answer"
+        );
+
+        io.set_powered(false).await.expect("the set stands");
+        assert!(!*powered.lock(), "the fake recorded the set");
+        assert_eq!(
+            io.standing().await,
+            AdapterStanding::Powered(false),
+            "the standing follows the set"
+        );
+
+        changed.insert("Powered".to_owned(), OwnedValue::from(false));
+        let change = ("org.bluez.Adapter1", &changed, &invalidated);
+        let answer = answer_after(
+            &io,
+            Duration::from_secs(10),
+            || {
+                emit_signal(
+                    &server,
+                    "/org/bluez/hci0",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &change,
+                )
+            },
+            |answer| matches!(answer, PeripheralAnswer::Powered(false)),
+        )
+        .await;
+        assert!(
+            matches!(answer, PeripheralAnswer::Powered(false)),
+            "the powered change is its answer"
+        );
+
+        // The other property change passes over, the removal arrives
+        // as its disconnect.
+        let mut other = HashMap::new();
+        other.insert("Discovering".to_owned(), OwnedValue::from(true));
+        let change = ("org.bluez.Adapter1", &other, &invalidated);
+        let removed = (
+            ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF").expect("the device path"),
+            vec!["org.bluez.Device1".to_owned()],
+        );
+        let answer = answer_after(
+            &io,
+            Duration::from_secs(10),
+            || async {
+                emit_signal(
+                    &server,
+                    "/org/bluez/hci0",
+                    "org.freedesktop.DBus.Properties",
+                    "PropertiesChanged",
+                    &change,
+                )
+                .await;
+                emit_signal(
+                    &server,
+                    "/org/freedesktop/DBus/ObjectManager",
+                    "org.freedesktop.DBus.ObjectManager",
+                    "InterfacesRemoved",
+                    &removed,
+                )
+                .await;
+            },
+            |answer| matches!(answer, PeripheralAnswer::Disconnected { .. }),
+        )
+        .await;
+        let device = key(Address([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert!(
+            matches!(&answer, PeripheralAnswer::Disconnected { device: other } if *other == device),
+            "the removal is its disconnect, {answer:?}"
+        );
+    }
+
+    const NO_ADAPTER_PROBE_NAME: &str =
+        "linux::bluez::tests::the_missing_adapter_stands_none_and_refuses_the_calls";
+
+    /// The missing adapter stands the none standing and refuses the
+    /// power and start calls, over a `BlueZ` service with no adapter
+    /// on a private bus.
+    #[tokio::test]
+    async fn the_missing_adapter_stands_none_and_refuses_the_calls() {
+        if std::env::var_os("CONNETTO_BLUEZ_NO_ADAPTER_PROBE").is_some() {
+            missing_adapter_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", NO_ADAPTER_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_NO_ADAPTER_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// The probe's scenario, the `BlueZ` service with no adapter on
+    /// the private bus.
+    async fn missing_adapter_probe() {
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let _server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let io = BluerBluez::new()
+            .await
+            .expect("the client stands without an adapter");
+        assert_eq!(
+            io.standing().await,
+            AdapterStanding::None,
+            "the standing is the missing adapter"
+        );
+        let err = io.set_powered(true).await.expect_err("the set is refused");
+        assert!(
+            matches!(err, BluezError::Refused(_)),
+            "the refusal is the missing adapter, {err:?}"
+        );
+        let err = io.start([1; 9]).await.expect_err("the start is refused");
+        assert!(
+            matches!(err, BluezError::Refused(_)),
+            "the refusal is the missing adapter, {err:?}"
+        );
+        io.disconnect(0).await;
+        let err = io
+            .notify(0, b"none")
+            .await
+            .expect_err("the notify is refused");
+        assert!(
+            matches!(err, BluezError::Closed),
+            "the refusal is the closed session, {err:?}"
+        );
+    }
+
+    const RESTART_PROBE_NAME: &str =
+        "linux::bluez::tests::a_second_start_readvertises_under_the_standing_application";
+
+    /// A second start restands the advertisement under the standing
+    /// GATT application, the application itself kept, over a fake
+    /// `BlueZ` on a private bus.
+    #[tokio::test]
+    async fn a_second_start_readvertises_under_the_standing_application() {
+        if std::env::var_os("CONNETTO_BLUEZ_RESTART_PROBE").is_some() {
+            restart_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", RESTART_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_RESTART_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// The probe's scenario, the standing application and the two
+    /// advertisements, over a fake `BlueZ` on the private bus the
+    /// parent pointed `DBUS_SYSTEM_BUS_ADDRESS` at.
+    async fn restart_probe() {
+        let registration = Arc::new(Mutex::new(None));
+        let unregisters = Arc::new(Mutex::new(0));
+        let registers = Arc::new(Mutex::new(0));
+        let attempts = Arc::new(Mutex::new(0));
+        let adv_unregisters = Arc::new(Mutex::new(0));
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let _server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAdapter {
+                    powered: Arc::new(Mutex::new(true)),
+                },
+            )
+            .expect("the adapter")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeGatt {
+                    registration: registration.clone(),
+                    unregisters: unregisters.clone(),
+                    registers: registers.clone(),
+                },
+            )
+            .expect("the gatt manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAds {
+                    attempts: attempts.clone(),
+                    refuse_first: false,
+                    adv_unregisters: adv_unregisters.clone(),
+                },
+            )
+            .expect("the advertisement manager")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let io = BluerBluez::new().await.expect("the bluez client");
+        io.start([1; 9]).await.expect("the first start stands");
+        io.start([2; 9]).await.expect("the second start stands");
+        assert_eq!(*registers.lock(), 1, "the application stands once");
+        assert_eq!(*attempts.lock(), 2, "the advertisement stands twice");
+        io.stop().await;
+    }
+
+    const SESSIONS_PROBE_NAME: &str =
+        "linux::bluez::tests::the_central_write_and_the_sessions_drive_their_answers";
+
+    /// The central's write arrives as its chunk, the notify sessions
+    /// hand their MTUs and end as their disconnects, a write past the
+    /// session's MTU or without a session is refused, a dropped
+    /// session's device gets its disconnect, and a full delivery
+    /// queue times out, over a fake `BlueZ` on a private bus.
+    #[tokio::test]
+    async fn the_central_write_and_the_sessions_drive_their_answers() {
+        if std::env::var_os("CONNETTO_BLUEZ_SESSIONS_PROBE").is_some() {
+            sessions_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", SESSIONS_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_SESSIONS_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    #[expect(
+        clippy::too_many_lines,
+        reason = "the probe runs the whole scenario as one straight line"
+    )]
+    /// The probe's scenario, the fake `BlueZ` standing on the private
+    /// bus the parent pointed `DBUS_SYSTEM_BUS_ADDRESS` at.
+    async fn sessions_probe() {
+        let registration = Arc::new(Mutex::new(None));
+        let unregisters = Arc::new(Mutex::new(0));
+        let registers = Arc::new(Mutex::new(0));
+        let attempts = Arc::new(Mutex::new(0));
+        let disconnects_aa = Arc::new(Mutex::new(0));
+        let disconnects_bb = Arc::new(Mutex::new(0));
+        let adv_unregisters = Arc::new(Mutex::new(0));
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAdapter {
+                    powered: Arc::new(Mutex::new(true)),
+                },
+            )
+            .expect("the adapter")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeGatt {
+                    registration: registration.clone(),
+                    unregisters: unregisters.clone(),
+                    registers: registers.clone(),
+                },
+            )
+            .expect("the gatt manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAds {
+                    attempts: attempts.clone(),
+                    refuse_first: false,
+                    adv_unregisters: adv_unregisters.clone(),
+                },
+            )
+            .expect("the advertisement manager")
+            .serve_at(
+                "/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF",
+                FakeDevice {
+                    disconnects: disconnects_aa.clone(),
+                },
+            )
+            .expect("the device")
+            .serve_at(
+                "/org/bluez/hci0/dev_11_22_33_44_55_66",
+                FakeDevice {
+                    disconnects: disconnects_bb.clone(),
+                },
+            )
+            .expect("the device")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let io = BluerBluez::new().await.expect("the bluez client");
+        io.start([1; 9]).await.expect("the start stands");
+
+        let (sender, application) = registration.lock().clone().expect("the gatt application");
+        let manager = zbus::fdo::ObjectManagerProxy::builder(&server)
+            .destination(sender.as_str())
+            .expect("the application owner")
+            .path(application.as_str())
+            .expect("the application path")
+            .build()
+            .await
+            .expect("the application manager proxy");
+        let paths: Vec<(String, Vec<String>)> = manager
+            .get_managed_objects()
+            .await
+            .expect("the application objects")
+            .into_iter()
+            .filter_map(|(path, interfaces)| {
+                let props = interfaces.get("org.bluez.GattCharacteristic1")?;
+                let flags = Vec::<String>::try_from(props.get("Flags")?.try_clone().ok()?).ok()?;
+                Some((path.to_string(), flags))
+            })
+            .collect();
+        let outbox = paths
+            .iter()
+            .find(|(_, flags)| flags.iter().any(|flag| flag == "notify"))
+            .expect("the outbox characteristic")
+            .0
+            .clone();
+        let inbox = paths
+            .iter()
+            .find(|(_, flags)| flags.iter().any(|flag| flag == "write"))
+            .expect("the inbox characteristic")
+            .0
+            .clone();
+
+        let device_aa = key(Address([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        let device_bb = key(Address([0x11, 0x22, 0x33, 0x44, 0x55, 0x66]));
+
+        let outbox_proxy = zbus::Proxy::new(
+            &server,
+            sender.as_str(),
+            outbox.as_str(),
+            "org.bluez.GattCharacteristic1",
+        )
+        .await
+        .expect("the outbox proxy");
+        let options = HashMap::from([
+            (
+                "device".to_owned(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+                        .expect("the device path"),
+                ),
+            ),
+            ("mtu".to_owned(), OwnedValue::from(64_u16)),
+        ]);
+        let read: Vec<u8> = outbox_proxy
+            .call("ReadValue", &(&options,))
+            .await
+            .expect("the read stands");
+        assert!(read.is_empty(), "the read answers empty");
+
+        let inbox_proxy = zbus::Proxy::new(
+            &server,
+            sender.as_str(),
+            inbox.as_str(),
+            "org.bluez.GattCharacteristic1",
+        )
+        .await
+        .expect("the inbox proxy");
+        let inbox_options = HashMap::from([
+            (
+                "device".to_owned(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+                        .expect("the device path"),
+                ),
+            ),
+            ("mtu".to_owned(), OwnedValue::from(23_u16)),
+        ]);
+        inbox_proxy
+            .call::<_, _, ()>("WriteValue", &(vec![1_u8, 2, 3], &inbox_options))
+            .await
+            .expect("the write stands");
+
+        let answer = answer_bounded(&io).await;
+        assert!(
+            matches!(&answer, PeripheralAnswer::Chunk { device, bytes } if *device == device_aa && *bytes == [1, 2, 3]),
+            "the write is its chunk, {answer:?}"
+        );
+
+        let (fd, _mtu): (OwnedFd, u16) = outbox_proxy
+            .call("AcquireNotify", &(options,))
+            .await
+            .expect("acquire the notify session");
+
+        let answer = answer_bounded(&io).await;
+        assert!(
+            matches!(&answer, PeripheralAnswer::Connected { device, mtu } if *device == device_aa && *mtu == 59),
+            "the session is its connect, {answer:?}"
+        );
+
+        io.notify(device_aa, b"ping")
+            .await
+            .expect("the delivery stands");
+        let fd = std::os::fd::OwnedFd::from(fd);
+        let mut file = std::fs::File::from(fd);
+        let mut bytes = [0_u8; 4];
+        file.read_exact(&mut bytes)
+            .expect("the bytes reach the central");
+        assert_eq!(&bytes, b"ping");
+
+        // The session's end arrives as its disconnect.
+        drop(file);
+        let answer = answer_bounded(&io).await;
+        assert!(
+            matches!(&answer, PeripheralAnswer::Disconnected { device } if *device == device_aa),
+            "the session's end is its disconnect, {answer:?}"
+        );
+
+        let err = io
+            .notify(device_aa, b"none")
+            .await
+            .expect_err("the refusal stands");
+        assert!(
+            matches!(err, BluezError::Closed),
+            "the refusal is the closed session, {err:?}"
+        );
+
+        // A session below the write's length refuses the delivery.
+        let options = HashMap::from([
+            (
+                "device".to_owned(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_11_22_33_44_55_66")
+                        .expect("the device path"),
+                ),
+            ),
+            ("mtu".to_owned(), OwnedValue::from(5_u16)),
+        ]);
+        let (_fd, _mtu): (OwnedFd, u16) = outbox_proxy
+            .call("AcquireNotify", &(options,))
+            .await
+            .expect("acquire the session");
+
+        let answer = answer_bounded(&io).await;
+        assert!(
+            matches!(&answer, PeripheralAnswer::Connected { device, mtu } if *device == device_bb && *mtu == 0),
+            "the session is its connect, {answer:?}"
+        );
+
+        let err = io
+            .notify(device_bb, b"ping")
+            .await
+            .expect_err("the refusal stands");
+        assert!(
+            matches!(err, BluezError::Closed),
+            "the refusal is the closed write, {err:?}"
+        );
+
+        // The disconnect ends the session and calls the device's
+        // disconnect.
+        io.disconnect(device_bb).await;
+        assert_eq!(*disconnects_bb.lock(), 1, "the device's disconnect stands");
+        let err = io
+            .notify(device_bb, b"none")
+            .await
+            .expect_err("the refusal stands");
+        assert!(
+            matches!(err, BluezError::Closed),
+            "the refusal is the dropped session, {err:?}"
+        );
+
+        // A delivery past the bound is the timeout's refusal, the
+        // central's queue full.
+        let options = HashMap::from([
+            (
+                "device".to_owned(),
+                OwnedValue::from(
+                    ObjectPath::try_from("/org/bluez/hci0/dev_AA_BB_CC_DD_EE_FF")
+                        .expect("the device path"),
+                ),
+            ),
+            ("mtu".to_owned(), OwnedValue::from(64_u16)),
+        ]);
+        let (fd, _mtu): (OwnedFd, u16) = outbox_proxy
+            .call("AcquireNotify", &(options,))
+            .await
+            .expect("acquire the session");
+
+        let answer = answer_bounded(&io).await;
+        assert!(
+            matches!(&answer, PeripheralAnswer::Connected { device, mtu } if *device == device_aa && *mtu == 59),
+            "the session is its connect, {answer:?}"
+        );
+
+        let chunk: [u8; 59] = [0xab; 59];
+        let mut timed_out = false;
+        for _ in 0..10000 {
+            match io.notify(device_aa, &chunk).await {
+                Ok(()) => {}
+                Err(BluezError::TimedOut(bound)) => {
+                    assert_eq!(bound, CALL_BOUND, "the bound is the call's");
+                    timed_out = true;
+                    break;
+                }
+                Err(other) => panic!("the delivery is refused, {other:?}"),
+            }
+        }
+        assert!(timed_out, "the full queue does not stall the delivery");
+        drop(fd);
+        io.stop().await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while *adv_unregisters.lock() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the stop unregisters the advertisement");
+    }
+
     #[expect(
         clippy::too_many_lines,
         reason = "the probe runs the whole scenario as one straight line"
@@ -551,6 +1214,8 @@ mod tests {
             Arc::new(Mutex::new(None));
         let unregisters: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let attempts: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let registers: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
+        let adv_unregisters: Arc<Mutex<u32>> = Arc::new(Mutex::new(0));
         let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
         let server = zbus::connection::Builder::address(address.as_str())
             .expect("the bus address")
@@ -558,13 +1223,19 @@ mod tests {
             .expect("the service name")
             .serve_at("/", zbus::fdo::ObjectManager)
             .expect("the object manager")
-            .serve_at("/org/bluez/hci0", FakeAdapter)
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAdapter {
+                    powered: Arc::new(Mutex::new(true)),
+                },
+            )
             .expect("the adapter")
             .serve_at(
                 "/org/bluez/hci0",
                 FakeGatt {
                     registration: registration.clone(),
                     unregisters: unregisters.clone(),
+                    registers: registers.clone(),
                 },
             )
             .expect("the gatt manager")
@@ -572,6 +1243,8 @@ mod tests {
                 "/org/bluez/hci0",
                 FakeAds {
                     attempts: attempts.clone(),
+                    refuse_first: true,
+                    adv_unregisters: adv_unregisters.clone(),
                 },
             )
             .expect("the advertisement manager")
@@ -666,20 +1339,337 @@ mod tests {
         .expect("the refusal unregisters the gatt application");
     }
 
-    struct FakeAdapter;
+    const SLOW_PROBE_NAME: &str = "linux::bluez::tests::a_slow_answer_times_out_on_the_call_bound";
+
+    /// A slow adapter's answer times out the call bound in the
+    /// constructor, over a slow fake `BlueZ` on a private bus.
+    #[tokio::test]
+    async fn a_slow_answer_times_out_on_the_call_bound() {
+        if std::env::var_os("CONNETTO_BLUEZ_SLOW_PROBE").is_some() {
+            slow_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", SLOW_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_SLOW_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// The probe's scenario, the slow fake adapter on the private bus
+    /// the parent pointed `DBUS_SYSTEM_BUS_ADDRESS` at.
+    async fn slow_probe() {
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let _server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .serve_at("/org/bluez/hci0", SlowAdapter)
+            .expect("the adapter")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let Err(err) = BluerBluez::new().await else {
+            panic!("the session stands over a slow adapter")
+        };
+        assert!(
+            matches!(err, BluezError::TimedOut(CALL_BOUND)),
+            "the slow answer times out the call bound, {err:?}"
+        );
+    }
+
+    const BROKEN_OM_PROBE_NAME: &str =
+        "linux::bluez::tests::a_missing_object_manager_refuses_the_constructor";
+
+    /// The constructor refuses a `BlueZ` without its object manager,
+    /// the adapter standing alone on the private bus.
+    #[tokio::test]
+    async fn a_missing_object_manager_refuses_the_constructor() {
+        if std::env::var_os("CONNETTO_BLUEZ_BROKEN_OM_PROBE").is_some() {
+            broken_om_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", BROKEN_OM_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_BROKEN_OM_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// The probe's scenario, the fake `BlueZ` standing without its
+    /// object manager on the private bus.
+    async fn broken_om_probe() {
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let _server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at(
+                "/org/bluez/hci0",
+                FakeAdapter {
+                    powered: Arc::new(Mutex::new(true)),
+                },
+            )
+            .expect("the adapter")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let Err(err) = BluerBluez::new().await else {
+            panic!("the session stands over a missing object manager")
+        };
+        assert!(
+            matches!(err, BluezError::Refused(_)),
+            "the refusal is the missing object manager, {err:?}"
+        );
+    }
+
+    const SLOW_SET_PROBE_NAME: &str = "linux::bluez::tests::a_slow_set_times_out_on_the_call_bound";
+
+    /// A slow set times out the call bound, the standing still reading,
+    /// over a slow-setter fake `BlueZ` on a private bus.
+    #[tokio::test]
+    async fn a_slow_set_times_out_on_the_call_bound() {
+        if std::env::var_os("CONNETTO_BLUEZ_SLOW_SET_PROBE").is_some() {
+            slow_set_probe().await;
+            return;
+        }
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", SLOW_SET_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_SLOW_SET_PROBE", "1")
+                .env("DBUS_SYSTEM_BUS_ADDRESS", bus.address.as_str())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// The probe's scenario, the slow-setter fake adapter on the
+    /// private bus the parent pointed `DBUS_SYSTEM_BUS_ADDRESS` at.
+    async fn slow_set_probe() {
+        let address = std::env::var("DBUS_SYSTEM_BUS_ADDRESS").expect("the probe's bus address");
+        let _server = zbus::connection::Builder::address(address.as_str())
+            .expect("the bus address")
+            .name("org.bluez")
+            .expect("the service name")
+            .serve_at("/", zbus::fdo::ObjectManager)
+            .expect("the object manager")
+            .serve_at(
+                "/org/bluez/hci0",
+                SlowSetterAdapter {
+                    powered: Arc::new(Mutex::new(true)),
+                },
+            )
+            .expect("the adapter")
+            .build()
+            .await
+            .expect("the bluez service");
+
+        let io = BluerBluez::new().await.expect("the bluez client");
+        assert_eq!(
+            io.standing().await,
+            AdapterStanding::Powered(true),
+            "the standing reads the fast property"
+        );
+        let err = io.set_powered(false).await.expect_err("the set times out");
+        assert!(
+            matches!(err, BluezError::TimedOut(CALL_BOUND)),
+            "the slow set times out the call bound, {err:?}"
+        );
+    }
+
+    const NEW_PROBE_NAME: &str = "linux::bluez::tests::new_refuses_an_unreachable_system_bus";
+
+    /// The constructor refuses an unreachable system bus. The `bluer`
+    /// session reads the process's `DBUS_SYSTEM_BUS_ADDRESS`, so the
+    /// scenario runs in a re-executed child pointed at an absent
+    /// socket, the child's environment the only one changed.
+    #[tokio::test]
+    async fn new_refuses_an_unreachable_system_bus() {
+        if std::env::var_os("CONNETTO_BLUEZ_NEW_PROBE").is_some() {
+            let Err(err) = BluerBluez::new().await else {
+                panic!("the session stands over an absent bus")
+            };
+            assert!(
+                matches!(err, BluezError::Refused(_)),
+                "the refusal is the unreachable bus, {err:?}"
+            );
+            return;
+        }
+        let output = tokio::time::timeout(
+            Duration::from_secs(60),
+            tokio::process::Command::new(std::env::current_exe().expect("the test binary"))
+                .args(["--exact", NEW_PROBE_NAME])
+                .env("CONNETTO_BLUEZ_NEW_PROBE", "1")
+                .env(
+                    "DBUS_SYSTEM_BUS_ADDRESS",
+                    "unix:path=/run/connetto-proof/absent-socket",
+                )
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await
+        .expect("the probe did not end within its bound")
+        .expect("the probe's output");
+        let text = format!(
+            "{}{}",
+            String::from_utf8(output.stdout).expect("the child's stdout"),
+            String::from_utf8(output.stderr).expect("the child's stderr"),
+        );
+        assert!(output.status.success(), "the probe failed:\n{text}");
+    }
+
+    /// Emit a signal on the fake's service connection, the client's
+    /// match rules its receiver.
+    async fn emit_signal(
+        bus: &zbus::Connection,
+        path: &str,
+        interface: &str,
+        member: &str,
+        body: &(impl serde::Serialize + zbus::zvariant::DynamicType),
+    ) {
+        let message = zbus::Message::signal(path, interface, member)
+            .expect("the signal stands")
+            .build(body)
+            .expect("the signal body serializes");
+        bus.send(&message)
+            .await
+            .expect("the signal reaches the bus");
+    }
+
+    /// The first answer of the kind `wanted` names, `emit` sent again
+    /// until it arrives within its bound, answers of other kinds
+    /// passed over.
+    async fn answer_after<F: Future<Output = ()>>(
+        io: &BluerBluez,
+        bound: Duration,
+        emit: impl Fn() -> F,
+        wanted: impl Fn(&PeripheralAnswer) -> bool,
+    ) -> PeripheralAnswer {
+        let deadline = tokio::time::Instant::now() + bound;
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the answer did not arrive within its bound"
+            );
+            emit().await;
+            while let Ok(answer) =
+                tokio::time::timeout(Duration::from_millis(200), io.next_event()).await
+            {
+                if wanted(&answer) {
+                    return answer;
+                }
+            }
+        }
+    }
+
+    /// The next answer within its bound, the bound's end a failure.
+    async fn answer_bounded(io: &BluerBluez) -> PeripheralAnswer {
+        tokio::time::timeout(Duration::from_secs(5), io.next_event())
+            .await
+            .expect("no answer within the bound")
+    }
+
+    struct FakeAdapter {
+        powered: Arc<Mutex<bool>>,
+    }
 
     #[zbus::interface(name = "org.bluez.Adapter1")]
     impl FakeAdapter {
         #[zbus(property)]
-        #[expect(clippy::unused_self, reason = "the zbus property reads the adapter")]
         fn powered(&self) -> bool {
+            *self.powered.lock()
+        }
+
+        #[zbus(property)]
+        fn set_powered(&self, value: bool) {
+            *self.powered.lock() = value;
+        }
+    }
+
+    struct SlowAdapter;
+
+    #[zbus::interface(name = "org.bluez.Adapter1")]
+    impl SlowAdapter {
+        #[zbus(property)]
+        async fn powered(&self) -> bool {
+            tokio::time::sleep(Duration::from_secs(6)).await;
             true
+        }
+    }
+
+    struct SlowSetterAdapter {
+        powered: Arc<Mutex<bool>>,
+    }
+
+    #[zbus::interface(name = "org.bluez.Adapter1")]
+    impl SlowSetterAdapter {
+        #[zbus(property)]
+        fn powered(&self) -> bool {
+            *self.powered.lock()
+        }
+
+        #[zbus(property)]
+        async fn set_powered(&self, value: bool) {
+            *self.powered.lock() = value;
+            tokio::time::sleep(Duration::from_secs(6)).await;
         }
     }
 
     struct FakeGatt {
         registration: Arc<Mutex<Option<(String, OwnedObjectPath)>>>,
         unregisters: Arc<Mutex<u32>>,
+        registers: Arc<Mutex<u32>>,
     }
 
     #[zbus::interface(name = "org.bluez.GattManager1")]
@@ -694,6 +1684,7 @@ mod tests {
             options: HashMap<String, OwnedValue>,
             #[zbus(header)] header: Header<'_>,
         ) {
+            *self.registers.lock() += 1;
             std::mem::drop(options);
             let sender = header.sender().expect("the request sender").to_string();
             self.registration.lock().replace((sender, application));
@@ -714,6 +1705,8 @@ mod tests {
 
     struct FakeAds {
         attempts: Arc<Mutex<u32>>,
+        refuse_first: bool,
+        adv_unregisters: Arc<Mutex<u32>>,
     }
 
     #[zbus::interface(name = "org.bluez.LEAdvertisingManager1")]
@@ -727,7 +1720,7 @@ mod tests {
             std::mem::drop(options);
             let mut attempts = self.attempts.lock();
             *attempts += 1;
-            if *attempts == 1 {
+            if self.refuse_first && *attempts == 1 {
                 Err(ProbeRefusal::Failed(
                     "the first advertisement refused".into(),
                 ))
@@ -736,12 +1729,20 @@ mod tests {
             }
         }
 
-        #[expect(
-            clippy::unused_self,
-            reason = "the zbus signature keeps the manager reference"
-        )]
         fn unregister_advertisement(&self, advertisement: OwnedObjectPath) {
+            *self.adv_unregisters.lock() += 1;
             std::mem::drop(advertisement);
+        }
+    }
+
+    struct FakeDevice {
+        disconnects: Arc<Mutex<u32>>,
+    }
+
+    #[zbus::interface(name = "org.bluez.Device1")]
+    impl FakeDevice {
+        fn disconnect(&self) {
+            *self.disconnects.lock() += 1;
         }
     }
 }
