@@ -324,7 +324,7 @@ The replica filename is `prefix-sha256(canonical(user_id))` truncated to 128 bit
 
 **Not a stolen powered-off device, in practice.** Current iOS, Android, macOS and Windows encrypt the whole disk by default, so the marginal protection over the platform is small and claiming it here would overstate the mechanism.
 
-**Not separation between accounts on one device**, per the threat model in chapter 12: several accounts belong to one person, and separation between different people is the operating system's user boundary.
+**Not separation between accounts under one OS login.** Every replica key sits in that login's keychain, or in the browser profile's origin storage, so any account running under the login can load any other account's key by name, whether one person or two use them. Encryption protects a device's data from whoever lacks the login and never one account from another under it. Separation between different people is the operating system's user boundary (chapter 12). The shared public store's device-scoped key (R11) sits in the same store, so it draws the same boundary.
 
 **Not an attacker already resident in the process**, who can drive the open connection and read decrypted pages regardless of how they were stored.
 
