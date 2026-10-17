@@ -114,31 +114,42 @@ struct Session {
     _tasks: JoinSet<()>,
 }
 
+/// Where the core's session stands, as `plans/tauri-leptos-demos.md` tables it.
+/// Starting and failed setups both hold no session and serve the same inputs.
+#[derive(Default)]
+enum Slot {
+    #[default]
+    Empty,
+    Ready(Arc<Session>),
+    /// `forget_device` runs on the session, which only the lifecycle reaches.
+    SigningOut(Arc<Session>),
+}
+
 /// The core's state, managed by Tauri.
 #[derive(Default)]
 struct Core {
     view: Mutex<View>,
-    session: Mutex<Option<Arc<Session>>>,
+    slot: Mutex<Slot>,
 }
 
 impl Core {
-    /// Change the view and emit it when it changed.
+    /// Change the view and emit it when it changed. The emission happens under
+    /// the view lock, so two tasks' views reach the UI in the order they changed.
     fn update(&self, app: &AppHandle, change: impl FnOnce(&mut View)) {
-        let emitted = {
-            let mut view = self.view.lock();
-            let before = view.clone();
-            change(&mut view);
-            (*view != before).then(|| view.clone())
-        };
-        if let Some(view) = emitted
-            && let Err(err) = app.emit("view", view)
-        {
-            tracing::warn!(error = %err, "emitting the view");
+        let mut view = self.view.lock();
+        let before = view.clone();
+        change(&mut view);
+        if *view != before {
+            emit_view(app, &view);
         }
     }
 
+    /// The session, while it is ready to serve commands.
     fn session(&self) -> Option<Arc<Session>> {
-        self.session.lock().clone()
+        match &*self.slot.lock() {
+            Slot::Ready(session) => Some(Arc::clone(session)),
+            Slot::Empty | Slot::SigningOut(_) => None,
+        }
     }
 
     fn client(&self) -> Option<ConnettoClient<Ws>> {
@@ -146,19 +157,32 @@ impl Core {
             .map(|session| session.native.client().clone())
     }
 
-    /// Drop `ended` when it is still the current session, then show the
-    /// sign-in screen.
-    fn end_session(&self, app: &AppHandle, ended: &Arc<Session>) {
-        {
-            let mut current = self.session.lock();
-            if current
-                .as_ref()
-                .is_some_and(|session| Arc::ptr_eq(session, ended))
-            {
-                *current = None;
+    /// The client the lifecycle reaches, which a sign-out still in progress keeps.
+    fn lifecycle_client(&self) -> Option<ConnettoClient<Ws>> {
+        match &*self.slot.lock() {
+            Slot::Ready(session) | Slot::SigningOut(session) => {
+                Some(session.native.client().clone())
             }
+            Slot::Empty => None,
         }
-        self.update(app, |view| *view = View::default());
+    }
+
+    /// Move a ready session to signing out and hand it over, or `None` when
+    /// no session is ready, a sign-out already in progress included.
+    fn begin_sign_out(&self) -> Option<Arc<Session>> {
+        let mut slot = self.slot.lock();
+        let Slot::Ready(session) = &*slot else {
+            return None;
+        };
+        let session = Arc::clone(session);
+        *slot = Slot::SigningOut(Arc::clone(&session));
+        Some(session)
+    }
+}
+
+fn emit_view(app: &AppHandle, view: &View) {
+    if let Err(err) = app.emit("view", view) {
+        tracing::warn!(error = %err, "emitting the view");
     }
 }
 
@@ -181,9 +205,11 @@ impl Serialize for CommandError {
     }
 }
 
+/// Emit the current view through the event every change takes, since a
+/// returned value travels apart from events and could land after a newer one.
 #[tauri::command]
-fn view(core: tauri::State<'_, Arc<Core>>) -> View {
-    core.view.lock().clone()
+fn view(app: AppHandle, core: tauri::State<'_, Arc<Core>>) {
+    emit_view(&app, &core.view.lock());
 }
 
 #[tauri::command]
@@ -224,25 +250,28 @@ async fn sign_out(
     core: tauri::State<'_, Arc<Core>>,
     discard_unsynced: bool,
 ) -> Result<(), CommandError> {
-    let session = core.session().ok_or(CommandError::NotReady)?;
+    let session = core.begin_sign_out().ok_or(CommandError::NotReady)?;
     match session.native.forget_device(discard_unsynced).await {
         Ok(()) => {
-            core.end_session(&app, &session);
+            *core.slot.lock() = Slot::Empty;
             drop(session);
+            core.update(&app, |view| *view = View::default());
             start(app, Arc::clone(&core));
         }
-        Err(ForgetError::Purge(PurgeError::Unsynced(unsynced))) if !discard_unsynced => {
-            core.update(&app, |view| {
-                view.wipe = Wipe::ConfirmForce {
-                    unsynced: unsynced.len(),
-                };
-            });
-        }
-        Err(err) => core.update(&app, |view| {
-            view.wipe = Wipe::Failed {
-                message: format!("logout error: {err}"),
+        Err(err) => {
+            let wipe = match err {
+                ForgetError::Purge(PurgeError::Unsynced(unsynced)) if !discard_unsynced => {
+                    Wipe::ConfirmForce {
+                        unsynced: unsynced.len(),
+                    }
+                }
+                err => Wipe::Failed {
+                    message: format!("logout error: {err}"),
+                },
             };
-        }),
+            *core.slot.lock() = Slot::Ready(session);
+            core.update(&app, |view| view.wipe = wipe);
+        }
     }
     Ok(())
 }
@@ -543,11 +572,12 @@ async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Re
             _tasks: tasks,
         }
     });
-    let mut current = core.session.lock();
-    if current.is_some() {
+    let mut slot = core.slot.lock();
+    // Only setup fills an empty slot, and only one setup runs at a time.
+    if !matches!(*slot, Slot::Empty) {
         anyhow::bail!("a second session started");
     }
-    *current = Some(session);
+    *slot = Slot::Ready(session);
     Ok(())
 }
 
@@ -694,7 +724,7 @@ fn feed_away(core: &Arc<Core>, event: &WindowEvent) {
     };
     let at = Moment::now(&SystemClock);
     tracing::debug!(target: "connetto_tauri_demo::away", ?at, away, "the platform reported the lifecycle");
-    let Some(client) = core.client() else {
+    let Some(client) = core.lifecycle_client() else {
         return;
     };
     tauri::async_runtime::spawn(async move {

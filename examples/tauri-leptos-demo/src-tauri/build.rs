@@ -16,10 +16,15 @@ fn main() {
 
     if std::env::var_os("CARGO_FEATURE_DEVICE_IDENTITY").is_some() {
         println!("cargo:rerun-if-env-changed={DEVICE_ROOT}");
-        // Xcode's build phase does not pass the environment through, so an
-        // iOS build reads the root the demo stack mints under target/.
+        // The Tauri CLI hands Xcode's build only CARGO_, RUST_ and TAURI
+        // variables, so an iOS build reads the root the demo stack mints in
+        // the cargo target directory, a relative one taken from the repository
+        // root as the stack takes it.
+        let target = std::env::var_os("CARGO_TARGET_DIR").unwrap_or_else(|| "target".into());
         let minted = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../target/demo-device-ca/root.der");
+            .join("../../..")
+            .join(target)
+            .join("demo-device-ca/root.der");
         let Some(path) = std::env::var_os(DEVICE_ROOT)
             .map(std::path::PathBuf::from)
             .or_else(|| minted.exists().then_some(minted))

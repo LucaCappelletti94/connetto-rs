@@ -89,7 +89,8 @@ fn web_sys_log(message: &str) {
 fn App() -> impl IntoView {
     let (view, set_view) = signal(View::default());
 
-    // The first view, then every change the core emits.
+    // Every view arrives as the `view` event, the first one too, which the
+    // `view` command emits once the listener stands.
     wasm_bindgen_futures::spawn_local(async move {
         let handler = Closure::<dyn FnMut(JsValue)>::new(move |event: JsValue| {
             match serde_wasm_bindgen::from_value::<Event>(event) {
@@ -99,12 +100,8 @@ fn App() -> impl IntoView {
         });
         listen("view", &handler).await;
         handler.forget();
-        match invoke("view", JsValue::UNDEFINED)
-            .await
-            .map(serde_wasm_bindgen::from_value::<View>)
-        {
-            Ok(Ok(first)) => set_view.set(first),
-            other => web_sys_log(&format!("reading the first view: {other:?}")),
+        if let Err(err) = invoke("view", JsValue::UNDEFINED).await {
+            web_sys_log(&format!("asking for the first view: {err:?}"));
         }
     });
 
