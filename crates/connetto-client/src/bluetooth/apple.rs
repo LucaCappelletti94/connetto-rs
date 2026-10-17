@@ -2,7 +2,8 @@
 //!
 //! The readiness stands on the platform's `CBPeripheralManager`, the
 //! service on its GATT service and advert, and the joiner's central stays
-//! btleplug's, over the same platform.
+//! btleplug's, over the same platform. On the Mac the service stands
+//! refused, since the Mac never hosts (R76 decision 1).
 
 use connetto_peer_apple::bluetooth as apple;
 

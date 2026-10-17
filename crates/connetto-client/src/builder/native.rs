@@ -870,7 +870,7 @@ where
                                 None => Arc::new(crate::hotspot::UnsupportedBackend),
                             }
                         }
-                        #[cfg(target_os = "ios")]
+                        #[cfg(any(target_os = "ios", target_os = "macos"))]
                         {
                             Arc::new(crate::hotspot::AppleHotspotBackend::new())
                         }
@@ -889,7 +889,8 @@ where
                         #[cfg(not(any(
                             target_os = "android",
                             target_os = "ios",
-                            target_os = "linux"
+                            target_os = "linux",
+                            target_os = "macos"
                         )))]
                         {
                             Arc::new(crate::hotspot::UnsupportedBackend)
@@ -962,7 +963,7 @@ where
                         }
                         None => crate::bluetooth::unsupported_backends(),
                     };
-                    #[cfg(target_os = "ios")]
+                    #[cfg(any(target_os = "ios", target_os = "macos"))]
                     let (bt_readiness, bt_peripheral, bt_starter) = {
                         let backend = Arc::new(crate::bluetooth::AppleBluetoothBackend::new());
                         (
@@ -995,7 +996,8 @@ where
                     #[cfg(not(any(
                         target_os = "android",
                         target_os = "ios",
-                        target_os = "linux"
+                        target_os = "linux",
+                        target_os = "macos"
                     )))]
                     let (bt_readiness, bt_peripheral, bt_starter) =
                         crate::bluetooth::unsupported_backends();
