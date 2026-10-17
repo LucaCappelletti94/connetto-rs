@@ -63,6 +63,15 @@ pub(crate) fn completion() -> Option<Result<Joining, Error>> {
     STANDING.lock().completion.clone()
 }
 
+/// The BSD name of the Wi-Fi interface, which iOS always names `en0`.
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the macos side answers none where no Wi-Fi interface stands"
+)]
+pub(crate) fn wifi_name() -> Option<String> {
+    Some("en0".to_owned())
+}
+
 /// Release the system's standing for a network.
 #[expect(
     clippy::unnecessary_wraps,
