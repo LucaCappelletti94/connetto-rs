@@ -2291,6 +2291,8 @@ mod tests {
         wire: Arc<Wire>,
         started: Mutex<Vec<[u8; 9]>>,
         stopped: Mutex<usize>,
+        /// Whether `start` refuses, the test's switch.
+        start_refuse: Mutex<bool>,
         disconnects: Mutex<Vec<u64>>,
         notifies: Mutex<Vec<(u64, usize)>>,
         queue: Mutex<VecDeque<PeripheralEvent>>,
@@ -2303,6 +2305,7 @@ mod tests {
                 wire,
                 started: Mutex::new(Vec::new()),
                 stopped: Mutex::new(0),
+                start_refuse: Mutex::new(false),
                 disconnects: Mutex::new(Vec::new()),
                 notifies: Mutex::new(Vec::new()),
                 queue: Mutex::new(VecDeque::new()),
@@ -2318,6 +2321,11 @@ mod tests {
     impl PeripheralBackend for FakePeripheral {
         fn start(&self, beacon: [u8; 9]) -> Result<(), BluetoothError> {
             self.started.lock().push(beacon);
+            if *self.start_refuse.lock() {
+                return Err(BluetoothError::Failed(
+                    "the platform will not advertise".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -2863,6 +2871,55 @@ mod tests {
         // The restarted beacon stops as any other when the hotspot goes.
         h.tick(None);
         assert_eq!(*h.peripheral.stopped.lock(), 1);
+    }
+
+    /// The platform's refusal from Off leaves the beacon down, so the
+    /// next look with a willing platform advertises.
+    #[tokio::test]
+    async fn a_refused_beacon_start_stays_off_and_retries() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        *h.peripheral.start_refuse.lock() = true;
+        h.tick(Some(&offer()));
+        // The attempt went out, but the platform refused the
+        // advertisement.
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+        assert_eq!(*h.peripheral.stopped.lock(), 0);
+        // The platform wills, and the next look advertises.
+        *h.peripheral.start_refuse.lock() = false;
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 2);
+        assert_eq!(
+            h.beacon_state(),
+            BeaconState::Advertising {
+                prefix: fp(1).prefix()
+            }
+        );
+    }
+
+    /// A platform failure while no beacon stands leaves the host and the
+    /// beacon unchanged, with no stop or disconnect to issue.
+    #[tokio::test]
+    async fn a_failure_without_a_beacon_leaves_the_host_unchanged() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        // The platform fails, so the host stands Failed.
+        h.peripheral
+            .push(PeripheralEvent::Failed("the platform dropped".into()));
+        h.tick(Some(&offer()));
+        // The hotspot goes, so the Failed row stops the standing
+        // advertisement.
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+        // A second failure while no beacon stands changes nothing.
+        h.peripheral
+            .push(PeripheralEvent::Failed("the platform dropped again".into()));
+        h.tick(None);
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+        assert!(h.peripheral.disconnects.lock().is_empty());
+        assert_eq!(h.peripheral.started.lock().len(), 1);
     }
 
     #[tokio::test]
