@@ -27,6 +27,7 @@ struct View {
     count: Option<i64>,
     error: Option<String>,
     wipe: Wipe,
+    notice: Option<String>,
 }
 
 /// The core's `Wipe`, where signing out stands.
@@ -173,6 +174,7 @@ fn App() -> impl IntoView {
                 _ => view! {
                     <div>
                         <h2>"Signing in"</h2>
+                        <p style="color: #a33;">{move || view.get().notice.unwrap_or_default()}</p>
                         <p>"A browser page opens for the login. Come back here once you have signed in."</p>
                     </div>
                 }
