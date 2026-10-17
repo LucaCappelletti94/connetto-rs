@@ -105,7 +105,8 @@ mod subscriptions;
 
 #[cfg(feature = "peer")]
 pub use bluetooth::{
-    BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, PromptOutcome,
+    BeaconState, BluetoothError, BluetoothState, HostId, Hosted, JoinNearbyError, NearbyHost,
+    PromptOutcome,
 };
 #[cfg(feature = "device-identity")]
 pub use enrolment::{CertificateError, DeviceEntry};

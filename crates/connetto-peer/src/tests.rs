@@ -2849,3 +2849,225 @@ fn a_link_error_keeps_its_kind_as_the_exchange_error() {
         ExchangeError::Tls(_)
     ));
 }
+
+/// The node's `linked` read stands its live peers, and a close drops the
+/// peer with the close (R76).
+#[tokio::test]
+async fn linked_stands_its_live_peers_and_a_close_drops_one() {
+    let now = whole_second();
+    let deployment = Deployment::new(23, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let alpha = deployment.device(
+        &issuer,
+        "alpha",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let beta = deployment.device(
+        &issuer,
+        "beta",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (a_tx, mut a_rx) = events();
+    let (b_tx, mut b_rx) = events();
+    let a = node(deployment.root_der(), a_tx);
+    let b = node(deployment.root_der(), b_tx);
+
+    assert!(a.linked().is_empty(), "nothing links before the links");
+    assert!(b.linked().is_empty(), "nothing links before the links");
+    let a_addr = serve(&a, &alpha);
+    let b_addr = serve(&b, &beta);
+
+    // The two link both ways, and the duplicate rule keeps one link each.
+    let (a_to_b, b_to_a) = tokio::join!(a.link(b_addr), b.link(a_addr));
+    assert_eq!(a_to_b.as_ref().ok(), Some(&beta.identity));
+    assert_eq!(b_to_a.as_ref().ok(), Some(&alpha.identity));
+    assert_eq!(
+        next_events(&mut a_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: beta.identity.clone()
+        }]
+    );
+    assert_eq!(
+        next_events(&mut b_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: alpha.identity.clone()
+        }]
+    );
+    assert_eq!(a.linked(), vec![beta.identity.clone()]);
+    assert_eq!(b.linked(), vec![alpha.identity.clone()]);
+
+    // B stops, the link closes, and A's read drops B with the close.
+    b.stop(CloseReason::Closed);
+    await_event(&mut a_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert!(
+        a.linked().is_empty(),
+        "the closed link's peer drops out of the read"
+    );
+    no_events(&mut a_rx, Duration::from_millis(500)).await;
+    a.stop(CloseReason::Closed);
+}
+
+/// A duplicate close holds the peer in the node's `linked` read while its
+/// keeper registers, and the kept link's close drops the peer (R76).
+#[tokio::test]
+async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
+    let now = whole_second();
+    let deployment = Deployment::new(24, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let gone = deployment.device(
+        &issuer,
+        "gone",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // The live link's peer stands in the read.
+    let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
+    assert_eq!(
+        next_events(&mut h_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: gone.identity.clone()
+        }]
+    );
+    assert_eq!(host_node.linked(), vec![gone.identity.clone()]);
+
+    // The duplicate close holds the peer in the read while its kept link
+    // registers, which raises no second event for the same peer.
+    write_frame(
+        &mut raw,
+        &PeerFrame::Close {
+            reason: CloseReason::Duplicate,
+        },
+    )
+    .await
+    .expect("the close writes");
+    drop(raw);
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+    assert_eq!(
+        host_node.linked(),
+        vec![gone.identity.clone()],
+        "the held peer stays in the read"
+    );
+    let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+    assert_eq!(
+        host_node.linked(),
+        vec![gone.identity.clone()],
+        "the keeper's link stands the peer live again"
+    );
+
+    // The kept link's close drops the peer from the read.
+    write_frame(
+        &mut raw,
+        &PeerFrame::Close {
+            reason: CloseReason::Closed,
+        },
+    )
+    .await
+    .expect("the close writes");
+    drop(raw);
+    await_event(&mut h_rx, Duration::from_secs(10), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert!(
+        host_node.linked().is_empty(),
+        "the closed link's peer drops out of the read"
+    );
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+    host_node.stop(CloseReason::Closed);
+}
+
+/// A duplicate close's held peer stays in the node's `linked` read until the
+/// hello bound passes without a keeper, and the bound's drop empties the
+/// read (R76).
+#[tokio::test]
+async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
+    let now = whole_second();
+    let deployment = Deployment::new(25, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let gone = deployment.device(
+        &issuer,
+        "gone",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+    let (h_tx, mut h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    let host_addr = serve(&host_node, &host);
+
+    // The live link's peer stands in the read, and the pause stands before
+    // the close, so the keeper's wait runs on the paused clock.
+    let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
+    assert_eq!(
+        next_events(&mut h_rx, 1).await,
+        vec![PeerEvent::Linked {
+            peer: gone.identity.clone()
+        }]
+    );
+    assert_eq!(host_node.linked(), vec![gone.identity.clone()]);
+    time::pause();
+    let started = time::Instant::now();
+    write_frame(
+        &mut raw,
+        &PeerFrame::Close {
+            reason: CloseReason::Duplicate,
+        },
+    )
+    .await
+    .expect("the close writes");
+    drop(raw);
+    no_events(&mut h_rx, Duration::from_millis(500)).await;
+    assert_eq!(
+        host_node.linked(),
+        vec![gone.identity.clone()],
+        "the held peer stays in the read"
+    );
+    await_event(&mut h_rx, Duration::from_secs(60), |event| {
+        matches!(event, PeerEvent::Unlinked { .. })
+    })
+    .await;
+    assert!(
+        started.elapsed() >= crate::node::HELLO_TIMEOUT,
+        "the peer stays reported linked for the hello bound"
+    );
+    time::resume();
+    assert!(
+        host_node.linked().is_empty(),
+        "the bound drops the peer the keeper never kept"
+    );
+    host_node.stop(CloseReason::Closed);
+}

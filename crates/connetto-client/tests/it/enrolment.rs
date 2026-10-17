@@ -136,7 +136,7 @@ async fn enrolment_phase() {
         return;
     };
     match phase.as_str() {
-        "first" => first_connect().await,
+        "first" => Box::pin(first_connect()).await,
         "renewal" => Box::pin(renewal()).await,
         "reissue" => Box::pin(reissue()).await,
         "cap" => cap().await,
