@@ -170,7 +170,7 @@ if [ "$(docker inspect -f '{{.HostConfig.NetworkMode}}' ci-registry-mirror 2>/de
     registry:2
 fi
 
-log "Project $PROJECT, confined: its own pool and bridge, cache paths only, 256 GiB and 16 VMs at most"
+log "Project $PROJECT, confined: its own pool and bridge, cache paths only, 440 GiB and 28 VMs at most"
 incus project show "$PROJECT" >/dev/null 2>&1 || incus project create "$PROJECT" \
   -c features.images=true -c features.profiles=true -c features.storage.volumes=true -c features.networks=false
 incus project set "$PROJECT" \
@@ -179,8 +179,8 @@ incus project set "$PROJECT" \
   restricted.devices.disk.paths="$CACHE_ROOT" \
   restricted.networks.access="$BRIDGE" \
   restricted.storage-pools.access="$POOL" \
-  limits.memory=256GiB \
-  limits.virtual-machines=16 \
+  limits.memory=440GiB \
+  limits.virtual-machines=28 \
   limits.containers=0
 # Incus 7.0.1 refuses to launch the project's own published images while this option is set (upstream/incus-restricted-image-servers-blocks-local-images.md).
 incus project unset "$PROJECT" restricted.images.servers
@@ -201,7 +201,8 @@ make_profile() {
   incus profile device show "$name" --project "$PROJECT" | grep -q "^actions:" \
     || incus profile device add "$name" actions disk source="$CACHE_ROOT/actions" path=/srv/cache/actions readonly=true --project "$PROJECT"
 }
-# 10 light and 6 heavy VMs fit the 256 GiB cap. The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
+# 18 light and 10 heavy VMs fit the 440 GiB cap, which leaves about 60 GiB of emi's 503 GiB to the host.
+# The largest measured peaks are 9.3 GiB light and 19.1 GiB heavy.
 make_profile ci-light 4 12GiB
 make_profile ci-heavy 8 22GiB
 
