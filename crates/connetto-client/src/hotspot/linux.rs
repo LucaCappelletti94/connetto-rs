@@ -1173,6 +1173,8 @@ mod tests {
         add_gate: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
         adds_sent: Mutex<Vec<AddRequest>>,
         deactivates: Mutex<Vec<String>>,
+        /// Whether `deactivate` refuses, the test's switch.
+        deactivate_refuse: Mutex<bool>,
         ipv4: Mutex<HashMap<String, Ipv4Standing>>,
         env_reads: AtomicUsize,
         env_ready: AtomicBool,
@@ -1195,6 +1197,7 @@ mod tests {
                     add_gate: Mutex::new(None),
                     adds_sent: Mutex::new(Vec::new()),
                     deactivates: Mutex::new(Vec::new()),
+                    deactivate_refuse: Mutex::new(false),
                     ipv4: Mutex::new(HashMap::new()),
                     env_reads: AtomicUsize::new(0),
                     env_ready: AtomicBool::new(false),
@@ -1246,6 +1249,11 @@ mod tests {
 
         fn deactivate(&self, active: &str) -> impl Future<Output = Result<(), NmIoError>> {
             self.deactivates.lock().push(active.to_string());
+            if *self.deactivate_refuse.lock() {
+                return std::future::ready(Err(NmIoError::Failed(
+                    "the active connection will not deactivate".into(),
+                )));
+            }
             std::future::ready(Ok(()))
         }
 
@@ -1308,6 +1316,17 @@ mod tests {
             AddRequest::Host { band, .. } => Some(*band),
             AddRequest::Join { .. } => None,
         }
+    }
+
+    fn awaiting_gateway(h: &Harness) -> bool {
+        matches!(
+            h.backend.standing.lock().join,
+            JoinStanding::Requesting {
+                awaiting_gateway: true,
+                active: Some(_),
+                ..
+            }
+        )
     }
 
     fn activated_event(events: &mpsc::UnboundedSender<NmEvent>) {
@@ -1768,6 +1787,220 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn host_stop_resets_the_failed() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        h.fake
+            .adds
+            .lock()
+            .push_back(Err(AddError::Failed("the refusal".to_string())));
+        assert_eq!(h.backend.request_host(), Ok(()));
+        pump_until(|| matches!(h.backend.host_status(), HostStatus::Failed(_))).await;
+        h.backend.stop_host();
+        // The Ended column resets to Idle, with nothing to deactivate.
+        assert!(matches!(h.backend.host_status(), HostStatus::Pending));
+        assert_eq!(deactivates(&h), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn host_stop_survives_a_refused_deactivate() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(h.backend.request_host(), Ok(()));
+        pump_until(|| sent(&h).len() == 1).await;
+        activated_event(&h.events);
+        pump_until(|| matches!(h.backend.host_status(), HostStatus::Started { .. })).await;
+        *h.fake.deactivate_refuse.lock() = true;
+        h.backend.stop_host();
+        // The refusal does not stop the drain, which still settles Idle.
+        pump_until(|| deactivates(&h).len() == 1).await;
+        assert_eq!(deactivates(&h), vec![ACTIVE_PATH.to_string()]);
+        pump_until(|| matches!(h.backend.host_status(), HostStatus::Pending)).await;
+    }
+
+    #[tokio::test]
+    async fn host_five_ghz_bound_survives_a_refused_deactivate() {
+        tokio::time::pause();
+        let h = harness(
+            vec![device(AP_FLAG | FIVE_FLAG)],
+            granted_permissions(),
+            true,
+        );
+        pump_until(|| h.fake.env_ready()).await;
+        *h.fake.deactivate_refuse.lock() = true;
+        h.fake.adds.lock().push_back(Ok(ACTIVE_PATH.to_string()));
+        h.fake
+            .adds
+            .lock()
+            .push_back(Err(AddError::Failed("the band bg refusal".to_string())));
+        assert_eq!(h.backend.request_host(), Ok(()));
+        pump_until(|| sent(&h).len() == 1).await;
+        // The bound's run finds the deactivate and the band-`bg` request
+        // both refused.
+        tokio::time::sleep(FIVE_GHZ_BOUND + Duration::from_millis(100)).await;
+        pump_until(|| matches!(h.backend.host_status(), HostStatus::Failed(_))).await;
+        assert_eq!(
+            h.backend.host_status(),
+            HostStatus::Failed(HotspotError::Failed)
+        );
+        assert_eq!(deactivates(&h), vec![ACTIVE_PATH.to_string()]);
+        assert_eq!(sent(&h).len(), 2);
+        assert_eq!(band_of(&sent(&h), 1), Some(Band::Two));
+    }
+
+    #[tokio::test]
+    async fn host_stale_refusal_leaves_the_column() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        let gate = h.fake.hold_add();
+        h.fake
+            .adds
+            .lock()
+            .push_back(Err(AddError::Failed("the stale refusal".to_string())));
+        assert_eq!(h.backend.request_host(), Ok(()));
+        pump_until(|| sent(&h).len() == 1).await;
+        h.backend.stop_host();
+        assert_eq!(h.backend.request_host(), Ok(()));
+        gate.send(()).expect("the gate opens");
+        // The stale refusal leaves the newer column standing.
+        pump_until(|| sent(&h).len() == 2).await;
+        assert!(matches!(h.backend.host_status(), HostStatus::Pending));
+        assert_eq!(deactivates(&h), Vec::<String>::new());
+    }
+
+    /// The bound's row is a no-op where the column stands no `5 GHz`
+    /// attempt, so nothing deactivates or sends.
+    #[tokio::test]
+    async fn five_ghz_bound_row_without_the_column() {
+        tokio::time::pause();
+        let (fake, _events) = FakeNm::new(
+            vec![device(AP_FLAG | FIVE_FLAG)],
+            granted_permissions(),
+            true,
+        );
+        let (backend, _receiver) = LinuxHotspotBackend::unstarted();
+        let standing = backend.standing.clone();
+        five_ghz_bound_row(fake.as_ref(), &standing).await;
+        assert!(matches!(standing.lock().host, HostStanding::Idle));
+        assert!(fake.adds_sent.lock().is_empty());
+        assert!(fake.deactivates.lock().is_empty());
+    }
+
+    /// The band-`Five` refusal's row is a no-op where the column stands
+    /// `2.4 GHz`, so no band-`bg` retry goes out.
+    #[tokio::test]
+    async fn host_band_five_refusal_leaves_the_two_ghz_column() {
+        tokio::time::pause();
+        let (fake, _events) = FakeNm::new(
+            vec![device(AP_FLAG | FIVE_FLAG)],
+            granted_permissions(),
+            true,
+        );
+        let (backend, _receiver) = LinuxHotspotBackend::unstarted();
+        let standing = backend.standing.clone();
+        {
+            let mut s = standing.lock();
+            s.host = HostStanding::Two {
+                generation: 1,
+                active: None,
+                ssid: "the-ssid".to_string(),
+                passphrase: "the-passphrase".to_string(),
+            };
+        }
+        let req = AddRequest::Host {
+            device: DEVICE_PATH.to_string(),
+            band: Band::Five,
+            ssid: "the-ssid".to_string(),
+            passphrase: "the-passphrase".to_string(),
+        };
+        host_add_refused(
+            fake.as_ref(),
+            &standing,
+            &req,
+            1,
+            AddError::Failed("the refusal".to_string()),
+        )
+        .await;
+        assert!(matches!(
+            standing.lock().host,
+            HostStanding::Two {
+                generation: 1,
+                active: None,
+                ..
+            }
+        ));
+        assert!(fake.adds_sent.lock().is_empty());
+        assert!(fake.deactivates.lock().is_empty());
+    }
+
+    #[tokio::test]
+    async fn host_other_state_leaves_the_column() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(h.backend.request_host(), Ok(()));
+        pump_until(|| sent(&h).len() == 1).await;
+        h.events
+            .send(NmEvent::StateChanged {
+                active: ACTIVE_PATH.to_string(),
+                state: 1,
+                reason: 0,
+            })
+            .expect("the event goes in");
+        pump().await;
+        assert!(matches!(
+            h.backend.standing.lock().host,
+            HostStanding::Two {
+                active: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(deactivates(&h), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn check_permissions_rereads_the_permission_table() {
+        tokio::time::pause();
+        let mut permissions = granted_permissions();
+        permissions.remove(WIFI_SHARE_PROTECTED);
+        let h = harness(vec![device(AP_FLAG)], permissions, true);
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(
+            h.backend.request_host(),
+            Err(HotspotError::MissingPermission(
+                WIFI_SHARE_PROTECTED.to_string()
+            ))
+        );
+        // The right stands granted, and the signal tells the thread to
+        // re-read the table.
+        h.fake
+            .permissions
+            .lock()
+            .insert(WIFI_SHARE_PROTECTED.to_string(), "yes".to_string());
+        h.events
+            .send(NmEvent::CheckPermissions)
+            .expect("the event goes in");
+        pump_until(|| h.backend.request_host().is_ok()).await;
+        pump_until(|| sent(&h).len() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn wireless_enabled_stands_the_flag() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), false);
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(h.backend.request_host(), Err(HotspotError::Disallowed));
+        h.events
+            .send(NmEvent::WirelessEnabled(true))
+            .expect("the event goes in");
+        pump_until(|| h.backend.request_host().is_ok()).await;
+        pump_until(|| sent(&h).len() == 1).await;
+    }
+
+    #[tokio::test]
     async fn host_request_after_the_stop_starts_fresh() {
         tokio::time::pause();
         let h = harness(
@@ -2180,6 +2413,238 @@ mod tests {
         // The activated connection deactivates as the leave's.
         pump_until(|| deactivates(&h).len() == 1).await;
         assert_eq!(deactivates(&h), vec![ACTIVE_PATH.to_string()]);
+        assert!(matches!(h.backend.join_status(), JoinStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn join_gateway_repoll_stands_joined() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        h.fake
+            .ipv4
+            .lock()
+            .insert(ACTIVE_PATH.to_string(), ipv4_standing(None));
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        activated_event(&h.events);
+        // The activated row's standing holds no gateway, so the column
+        // stands it awaiting, and the repoll's deadline stands.
+        pump_until(|| awaiting_gateway(&h)).await;
+        // The deadline's look runs, and the gateway arrives on the later
+        // look, whose repoll stands the join.
+        tokio::time::sleep(TICK + Duration::from_millis(50)).await;
+        h.fake.ipv4.lock().insert(
+            ACTIVE_PATH.to_string(),
+            ipv4_standing(Some(IpAddr::V4(Ipv4Addr::new(10, 42, 0, 1)))),
+        );
+        pump_until(|| matches!(h.backend.join_status(), JoinStatus::Available { .. })).await;
+        let JoinStatus::Available {
+            address,
+            prefix,
+            gateway,
+        } = h.backend.join_status()
+        else {
+            panic!("the join side stands available");
+        };
+        assert_eq!(address, Ipv4Addr::new(10, 42, 0, 2));
+        assert_eq!(prefix, 24);
+        assert_eq!(gateway, IpAddr::V4(Ipv4Addr::new(10, 42, 0, 1)));
+    }
+
+    #[tokio::test]
+    async fn join_without_a_gateway_stays_awaiting() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        h.fake
+            .ipv4
+            .lock()
+            .insert(ACTIVE_PATH.to_string(), ipv4_standing(None));
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        activated_event(&h.events);
+        pump_until(|| awaiting_gateway(&h)).await;
+        // The repoll's standing stands no gateway, so the column keeps
+        // waiting.
+        tokio::time::sleep(TICK * 2).await;
+        assert!(awaiting_gateway(&h));
+        assert!(matches!(h.backend.join_status(), JoinStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn join_activated_without_an_ipv4_standing() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        // No IPv4 standing for the activated row to read.
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        activated_event(&h.events);
+        // The read's refusal stands the column awaiting the gateway.
+        pump_until(|| awaiting_gateway(&h)).await;
+        // The deadline's look re-reads, and the standing arrives on the
+        // later look, whose repoll stands the join.
+        tokio::time::sleep(TICK + Duration::from_millis(50)).await;
+        h.fake.ipv4.lock().insert(
+            ACTIVE_PATH.to_string(),
+            ipv4_standing(Some(IpAddr::V4(Ipv4Addr::new(10, 42, 0, 1)))),
+        );
+        pump_until(|| matches!(h.backend.join_status(), JoinStatus::Available { .. })).await;
+    }
+
+    #[tokio::test]
+    async fn join_request_failed() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        h.fake
+            .adds
+            .lock()
+            .push_back(Err(AddError::Failed("the refusal".to_string())));
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| matches!(h.backend.join_status(), JoinStatus::Unavailable)).await;
+        assert_eq!(sent(&h).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn join_stale_refusal_leaves_the_column() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        let gate = h.fake.hold_add();
+        h.fake
+            .adds
+            .lock()
+            .push_back(Err(AddError::Failed("the stale refusal".to_string())));
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-first", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        // The newer offer replaces the column while the earlier stands.
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-second", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        gate.send(()).expect("the gate opens");
+        // The stale refusal leaves the newer column standing.
+        pump_until(|| sent(&h).len() == 2).await;
+        let AddRequest::Join { ssid, .. } = &sent(&h)[1] else {
+            panic!("the request is the join's");
+        };
+        assert_eq!(ssid, "the-second");
+        assert!(matches!(h.backend.join_status(), JoinStatus::Pending));
+        assert_eq!(band_of(&sent(&h), 0), None);
+        assert_eq!(band_of(&sent(&h), 5), None);
+    }
+
+    /// The replacing request has no device to send to, so it refuses
+    /// unsupported, the column left standing.
+    #[test]
+    fn join_request_replacing_without_a_device() {
+        let (backend, _receiver) = LinuxHotspotBackend::unstarted();
+        {
+            let mut s = backend.standing.lock();
+            s.join = JoinStanding::Requesting {
+                generation: 1,
+                active: None,
+                awaiting_gateway: false,
+            };
+        }
+        assert_eq!(
+            backend.request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Err(JoinError::Unsupported)
+        );
+        assert!(matches!(
+            backend.standing.lock().join,
+            JoinStanding::Requesting { generation: 1, .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn join_request_without_the_access_point_flag() {
+        tokio::time::pause();
+        let h = harness(vec![device(0)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        let AddRequest::Join { device, .. } = &sent(&h)[0] else {
+            panic!("the request is the join's");
+        };
+        assert_eq!(device, DEVICE_PATH);
+    }
+
+    #[tokio::test]
+    async fn join_leave_deactivates_the_joined() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        h.fake.ipv4.lock().insert(
+            ACTIVE_PATH.to_string(),
+            ipv4_standing(Some(IpAddr::V4(Ipv4Addr::new(10, 42, 0, 1)))),
+        );
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        activated_event(&h.events);
+        pump_until(|| matches!(h.backend.join_status(), JoinStatus::Available { .. })).await;
+        h.backend.leave_join();
+        pump_until(|| deactivates(&h).len() == 1).await;
+        assert_eq!(deactivates(&h), vec![ACTIVE_PATH.to_string()]);
+        assert!(matches!(h.backend.join_status(), JoinStatus::Pending));
+    }
+
+    #[tokio::test]
+    async fn join_stale_add_survives_a_refused_deactivate() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        let gate = h.fake.hold_add();
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 1).await;
+        *h.fake.deactivate_refuse.lock() = true;
+        h.backend.leave_join();
+        gate.send(()).expect("the gate opens");
+        // The orphan's refused deactivate does not stop the driver.
+        pump_until(|| deactivates(&h).len() == 1).await;
+        assert_eq!(deactivates(&h), vec![ACTIVE_PATH.to_string()]);
+        // The driver still answers the machine's next request.
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-second", HotspotSecurity::Wpa2)),
+            Ok(())
+        );
+        pump_until(|| sent(&h).len() == 2).await;
         assert!(matches!(h.backend.join_status(), JoinStatus::Pending));
     }
 }

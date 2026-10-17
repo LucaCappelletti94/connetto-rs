@@ -44,17 +44,13 @@ pub struct LegOffer {
 /// listing, absent while no connected Wi-Fi line names one.
 pub fn parse_station_name(status: &str) -> Option<String> {
     status.lines().find_map(|line| {
-        // A predicate split yields an empty field per run of spaces, so the
-        // tokens come off one by one, the rest trimmed after each.
-        let mut rest = line.trim_start();
-        let device = rest.split(char::is_whitespace).next()?;
-        rest = rest[device.len()..].trim_start();
-        let kind = rest.split(char::is_whitespace).next()?;
-        rest = rest[kind.len()..].trim_start();
-        let state = rest.split(char::is_whitespace).next()?;
-        rest = rest[state.len()..].trim_start();
+        // The tokens come off one by one, the rest trimmed after each.
+        let (_, rest) = line.trim_start().split_once(char::is_whitespace)?;
+        let (kind, rest) = rest.trim_start().split_once(char::is_whitespace)?;
+        let (state, rest) = rest.trim_start().split_once(char::is_whitespace)?;
         // The connection name may hold spaces, so it is the whole rest.
-        (kind == "wifi" && state == "connected" && !rest.is_empty()).then(|| rest.to_owned())
+        let name = rest.trim_start();
+        (kind == "wifi" && state == "connected" && !name.is_empty()).then(|| name.to_owned())
     })
 }
 
@@ -248,6 +244,16 @@ wlp39s0          wifi      disconnected           --
         assert_eq!(ss_remote_address(""), None);
         assert_eq!(ss_remote_address("tcp   ESTAB  0      0"), None);
         assert_eq!(ss_remote_address("u_str ESTAB  0      0      u_str"), None);
+    }
+
+    #[test]
+    fn ss_remote_refuses_an_unparseable_endpoint() {
+        let line = "tcp   ESTAB  0      0      192.168.1.145:51234  999.999.0.2:37105";
+        assert_eq!(ss_remote_address(line), None);
+        assert_eq!(
+            ss_remote_address("tcp   ESTAB  0      0      [::1]:4242  [not-an-address]:37105"),
+            None
+        );
     }
 
     #[test]
