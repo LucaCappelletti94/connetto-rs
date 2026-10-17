@@ -248,7 +248,8 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated =
-        Translated::of::<String>(SCHEMA, &policies(), "app.user_id").expect("translates");
+        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
+            .expect("translates");
     let mut setup = OpenFgaServiceClient::new(channel.clone());
     let model = translated
         .install_model(&mut setup, &store)
@@ -281,11 +282,12 @@ async fn an_adopted_boot_reconciles_a_store_left_at_another_point() {
     }
     drop(conn);
 
-    let adopted = Translated::of::<String>(SCHEMA, &policies(), "app.user_id")
-        .expect("translates")
-        .install_model(&mut setup, &store)
-        .await
-        .expect("adopted");
+    let adopted =
+        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
+            .expect("translates")
+            .install_model(&mut setup, &store)
+            .await
+            .expect("adopted");
     assert_eq!(adopted, ModelState::Adopted(model.id().to_owned()));
     let (added, removed) = translated
         .reconcile_store(&pool, &loader)
@@ -322,7 +324,8 @@ async fn an_adopted_boot_that_cannot_reconcile_refuses() {
     let (channel, store) = fixture.fga_store().await;
 
     let translated =
-        Translated::of::<String>(SCHEMA, &policies(), "app.user_id").expect("translates");
+        Translated::of::<String, connetto_core::bots::TextIds>(SCHEMA, &policies(), "app.user_id")
+            .expect("translates");
     let mut setup = OpenFgaServiceClient::new(channel);
     let model = translated
         .install_model(&mut setup, &store)
