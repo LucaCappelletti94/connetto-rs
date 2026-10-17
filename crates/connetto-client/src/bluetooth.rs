@@ -436,6 +436,9 @@ struct HostExchange {
 enum HostBtState {
     /// Not advertising.
     Off,
+    /// Off after a platform failure, whose advertisement may still stand,
+    /// since a refused renewal keeps the old one.
+    Failed,
     /// Advertising under `prefix`, with the running exchanges.
     Advertising {
         /// The beacon's prefix the advertisement carries.
@@ -1075,29 +1078,33 @@ impl Machine {
         hosting: Option<&HotspotOffer>,
         serving: Option<&Fingerprint>,
     ) {
-        match &mut self.host {
-            // The device hosts a hotspot and serves, so the beacon starts.
-            HostBtState::Off if state == BluetoothState::Ready => {
-                if let (Some(_), Some(fingerprint)) = (hosting, serving) {
-                    let beacon = Beacon::of(fingerprint);
-                    if self.peripheral.start(beacon.to_service_data()).is_ok() {
-                        self.host = HostBtState::Advertising {
-                            prefix: beacon.prefix,
-                            exchanges: HashMap::new(),
-                        };
-                    } else {
-                        // The platform will not advertise, so the standing
-                        // retries on its next look.
-                        tracing::warn!(
-                            "the beacon could not start, so it retries on the next look"
-                        );
-                    }
+        let ready = state == BluetoothState::Ready && hosting.is_some();
+        match (&mut self.host, serving) {
+            // The device hosts a hotspot and serves, so the beacon starts,
+            // over any advertisement a failure left standing.
+            (HostBtState::Off | HostBtState::Failed, Some(fingerprint)) if ready => {
+                let beacon = Beacon::of(fingerprint);
+                if self.peripheral.start(beacon.to_service_data()).is_ok() {
+                    self.host = HostBtState::Advertising {
+                        prefix: beacon.prefix,
+                        exchanges: HashMap::new(),
+                    };
+                } else {
+                    // The platform will not advertise, so the standing
+                    // retries on its next look.
+                    tracing::warn!("the beacon could not start, so it retries on the next look");
                 }
             }
-            HostBtState::Advertising { prefix, exchanges } => {
+            // The beacon would not restart, so an advertisement a failure
+            // left standing stops.
+            (HostBtState::Failed, _) => {
+                self.peripheral.stop();
+                self.host = HostBtState::Off;
+            }
+            (HostBtState::Advertising { prefix, exchanges }, _) => {
                 // The hotspot stops, the device stops serving, or Bluetooth
                 // leaves Ready, so the beacon stops with its exchanges.
-                if state != BluetoothState::Ready || hosting.is_none() || serving.is_none() {
+                if !ready || serving.is_none() {
                     self.peripheral.stop();
                     self.host = HostBtState::Off;
                     return;
@@ -1123,7 +1130,7 @@ impl Machine {
                     }
                 }
             }
-            HostBtState::Off => {}
+            (HostBtState::Off, _) => {}
         }
         // The service's events.
         for event in self.peripheral.poll() {
@@ -1171,11 +1178,11 @@ impl Machine {
                 // exchanges' devices leave.
                 PeripheralEvent::Failed(reason) => {
                     tracing::warn!(%reason, "the platform's Bluetooth failed");
-                    let replaced = core::mem::replace(&mut self.host, HostBtState::Off);
-                    if let HostBtState::Advertising { exchanges, .. } = replaced {
-                        for device in exchanges.into_keys() {
+                    if let HostBtState::Advertising { exchanges, .. } = &mut self.host {
+                        for device in core::mem::take(exchanges).into_keys() {
                             self.peripheral.disconnect(device);
                         }
+                        self.host = HostBtState::Failed;
                     }
                 }
             }
@@ -1819,7 +1826,7 @@ impl Machine {
     fn update_beacon(&mut self, state: BluetoothState, hosting: bool, serving: bool) {
         let beacon = match &self.host {
             HostBtState::Advertising { prefix, .. } => BeaconState::Advertising { prefix: *prefix },
-            HostBtState::Off => BeaconState::Off {
+            HostBtState::Off | HostBtState::Failed => BeaconState::Off {
                 reason: Self::beacon_reason(state, hosting, serving),
             },
         };
@@ -2822,6 +2829,40 @@ mod tests {
         h.tick(Some(&offer()));
         assert_eq!(*h.peripheral.disconnects.lock(), vec![7]);
         assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+    }
+
+    /// A platform failure leaves an advertisement that may still stand,
+    /// which the next look stops once the hotspot is gone.
+    #[tokio::test]
+    async fn a_failure_then_a_stopped_hotspot_stops_the_standing_advertisement() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        h.peripheral
+            .push(PeripheralEvent::Failed("the renewal's refusal".into()));
+        h.tick(Some(&offer()));
+        assert_eq!(*h.peripheral.stopped.lock(), 0);
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1, "the stop runs once");
+    }
+
+    /// A platform failure with the hotspot still up restarts the beacon
+    /// over the standing advertisement, with no stop in between.
+    #[tokio::test]
+    async fn a_failure_with_the_hotspot_up_restarts_without_a_stop() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        h.peripheral
+            .push(PeripheralEvent::Failed("the renewal's refusal".into()));
+        h.tick(Some(&offer()));
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 2);
+        assert_eq!(*h.peripheral.stopped.lock(), 0);
+        // The restarted beacon stops as any other when the hotspot goes.
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
     }
 
     #[tokio::test]

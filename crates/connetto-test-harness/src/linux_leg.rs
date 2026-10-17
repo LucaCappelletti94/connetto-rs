@@ -12,11 +12,12 @@
 //! reads one line per answer, matched by the id, plus a fatal event line
 //! when the client stands down. The `linked` and `nearby` answers read the
 //! client's own standing, so a missed broadcast event leaves nothing
-//! stale, and the pump keeps the one-shot fatal notices, logging a lag's
-//! missed count and going on.
+//! stale, and the pump keeps the one-shot fatal notices. A lag is itself
+//! a fatal line, since a missed fatal notice cannot be read back.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -150,17 +151,7 @@ async fn serve(client: NativeClient<NativeTransport>) -> Result<()> {
     let pump_fatal = fatal.clone();
     let pump = tokio::spawn(async move {
         let mut events = events;
-        loop {
-            match events.recv().await {
-                Ok(event) => pump_event(event, &pump_fatal),
-                // A missed event leaves nothing stale, the queries read the
-                // client's standing and every wait polls one.
-                Err(RecvError::Lagged(n)) => {
-                    eprintln!("[leg] {n} of the client's events were missed");
-                }
-                Err(RecvError::Closed) => break,
-            }
-        }
+        while pump_received(events.recv().await, &pump_fatal).is_continue() {}
     });
 
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
@@ -440,6 +431,25 @@ async fn join_gateway(
         .await
         .map(|gateway| json!({ "gateway": gateway.to_string() }))
         .map_err(LegCommandError::Join)
+}
+
+/// One receive of the client's event stream. A lag is a fatal line, since a
+/// missed one-shot fatal notice cannot be read back, and a close ends the
+/// pump.
+fn pump_received(
+    received: Result<ClientEvent, RecvError>,
+    fatal: &tokio::sync::mpsc::UnboundedSender<String>,
+) -> ControlFlow<()> {
+    match received {
+        Ok(event) => pump_event(event, fatal),
+        Err(RecvError::Lagged(n)) => {
+            let _ = fatal.send(format!(
+                "the leg missed {n} of the client's events and may have lost a fatal notice"
+            ));
+        }
+        Err(RecvError::Closed) => return ControlFlow::Break(()),
+    }
+    ControlFlow::Continue(())
 }
 
 /// The one-shot fatal notices the leg reports as its fatal lines, the rest
@@ -1111,6 +1121,21 @@ fn gateway(answer: &serde_json::Value) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    /// A lagged stream is a fatal line, since a missed one-shot fatal
+    /// notice cannot be read back, and a closed one ends the pump.
+    #[test]
+    fn a_lag_stands_the_leg_down_and_a_close_ends_the_pump() {
+        use tokio::sync::broadcast::error::RecvError;
+        let (fatal, mut lines) = tokio::sync::mpsc::unbounded_channel();
+        assert!(super::pump_received(Err(RecvError::Lagged(3)), &fatal).is_continue());
+        assert_eq!(
+            lines.try_recv().ok().as_deref(),
+            Some("the leg missed 3 of the client's events and may have lost a fatal notice")
+        );
+        assert!(super::pump_received(Err(RecvError::Closed), &fatal).is_break());
+        assert!(lines.try_recv().is_err());
+    }
+
     /// The answer line's `error` field stands the refusal's text, so each
     /// variant's line stays the wire's.
     #[test]
