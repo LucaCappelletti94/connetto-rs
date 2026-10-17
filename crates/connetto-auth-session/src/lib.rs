@@ -15,7 +15,11 @@
 //!
 //! On Android it also hosts the prompt a Keystore-gated store unlocks through
 //! (`device_secure`, `approve_unlock`), since the store is pure JNI and
-//! cannot receive the prompt's callback itself.
+//! cannot receive the prompt's callback itself. The tab and the prompt open
+//! on the app's screen in front, which the bundled `CurrentActivityProvider`
+//! follows from process start, so a screen Android rebuilds inside the running
+//! process is followed too. An app whose build does not merge the module's
+//! manifest declares that provider itself.
 
 use std::time::Duration;
 
@@ -36,6 +40,9 @@ pub enum AuthSessionError {
     /// No redirect arrived within the bound.
     #[error("no redirect arrived within {0:?}")]
     TimedOut(Duration),
+    /// The app shows no screen to open the tab or the prompt on.
+    #[error("the app shows no screen to open on")]
+    NoScreen,
 }
 
 /// Open `url` in the platform's in-app browser tab and resolve to the redirect
@@ -47,8 +54,10 @@ pub enum AuthSessionError {
 /// # Errors
 ///
 /// [`AuthSessionError::Unsupported`] off Android and iOS,
-/// [`AuthSessionError::Bridge`] when the tab cannot be opened or read, and
-/// [`AuthSessionError::TimedOut`] when the user never finishes the login.
+/// [`AuthSessionError::Bridge`] when the tab cannot be opened or read,
+/// [`AuthSessionError::NoScreen`] when an Android app shows no screen to open
+/// the tab on, and [`AuthSessionError::TimedOut`] when the user never finishes
+/// the login.
 #[cfg_attr(
     not(any(target_os = "android", target_os = "ios")),
     expect(
@@ -84,12 +93,12 @@ pub fn delivered() -> Result<Option<String>, AuthSessionError> {
 }
 
 /// The JNI access an Android build's device key needs, reaching the Java VM
-/// through the Activity Dioxus holds, for
-/// `NativeDurable::with_java_access` (R74 decision 20).
+/// through `ndk-context`, for `NativeDurable::with_java_access` (R74
+/// decision 20).
 #[cfg(all(target_os = "android", feature = "device-identity"))]
 #[must_use]
 pub fn java_access() -> std::sync::Arc<dyn connetto_client::device_key::JavaAccess> {
-    std::sync::Arc::new(android::ActivityJava)
+    std::sync::Arc::new(android::ContextJava)
 }
 
 /// Whether the device has a secure lock screen, which a key held behind the
@@ -110,8 +119,9 @@ pub fn device_secure() -> Result<bool, AuthSessionError> {
 ///
 /// # Errors
 ///
-/// [`AuthSessionError::Bridge`] when the prompt cannot be shown, and
-/// [`AuthSessionError::TimedOut`] when nobody answers within the bound.
+/// [`AuthSessionError::Bridge`] when the prompt cannot be shown,
+/// [`AuthSessionError::NoScreen`] when the app shows no screen to show it on,
+/// and [`AuthSessionError::TimedOut`] when nobody answers within the bound.
 #[cfg(target_os = "android")]
 pub fn approve_unlock(
     cipher: &manganis::jni::objects::JObject<'_>,

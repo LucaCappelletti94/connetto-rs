@@ -986,7 +986,6 @@ dependencies = [
  "diesel",
  "diesel-async",
  "manganis",
- "ndk-context",
  "parking_lot",
  "rosetta-uuid",
  "serde",

@@ -31,12 +31,9 @@ thiserror = "2"
 connetto-auth-session = { path = "../../../crates/connetto-auth-session" }
 
 [target.'cfg(target_os = "android")'.dependencies]
-# The Keystore unlock prompt's JNI types and the Activity lookup.
+# The Keystore unlock prompt's JNI types.
 manganis = "0.7.10"
 android_log-sys = "0.3.2"
-# The activity, published to ndk-context in place of the Application tao
-# publishes, since connetto-auth-session's Kotlin needs an Activity.
-ndk-context = "0.1.1"
 
 [features]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`

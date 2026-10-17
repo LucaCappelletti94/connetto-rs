@@ -16,5 +16,11 @@
                 <data android:scheme="${applicationId}" />
             </intent-filter>
         </activity>
+        <!-- Follows the app's screens from process start, so the sign-in tab
+             and the unlock prompt open on the screen in front. -->
+        <provider
+            android:name="dev.connetto.authsession.CurrentActivityProvider"
+            android:authorities="${applicationId}.connetto-current-activity"
+            android:exported="false" />
     </application>
 </manifest>

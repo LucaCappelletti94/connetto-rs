@@ -46,6 +46,13 @@
             </intent-filter>
         </activity>
 
+        <!-- Follows the app's screens for the sign-in tab and the unlock
+             prompt, as connetto-auth-session's own manifest declares it. -->
+        <provider
+            android:name="dev.connetto.authsession.CurrentActivityProvider"
+            android:authorities="${applicationId}.connetto-current-activity"
+            android:exported="false" />
+
         <provider
           android:name="androidx.core.content.FileProvider"
           android:authorities="${applicationId}.fileprovider"

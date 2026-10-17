@@ -400,6 +400,10 @@ async fn prove(
     .await?;
     wait_for_count(&stack.pg_url, offline + 1).await?;
     device.screenshot(evidence, "uploaded").await?;
+    // dioxus-desktop 0.7.10 aborts on any screen rebuild, so only the Tauri demo can show one.
+    if let DemoApp::Tauri = demo_app() {
+        rebuild_the_screen(device).await?;
+    }
     recheck_after_time_away(device, evidence, unlock).await?;
     let mut app = device.app().await?;
     sign_out(device, &mut app, evidence).await?;
@@ -469,6 +473,53 @@ async fn sign_in_across_a_killed_process(
     app.wait_for_text("status: connected", Duration::from_secs(90))
         .await?;
     device.screenshot(evidence, "resumed").await
+}
+
+/// The system setting whose change rebuilds the demo's screen, which the
+/// demo's manifest leaves out of the configuration changes it handles itself.
+const FONT_SCALE: &str = "font_scale";
+/// How long Android may take to rebuild the screen after the text size changes.
+const REBUILD_WITHIN: Duration = Duration::from_secs(30);
+
+/// Change the text size and change it back. Android rebuilds the demo's screen
+/// inside the running process each time, and the re-check after time away
+/// that follows then has to prompt on the rebuilt screen. The step fails when
+/// no rebuild shows in the events buffer, so it never passes unexercised.
+async fn rebuild_the_screen(device: &Device) -> Result<()> {
+    step("rebuild the screen");
+    let pid = device.adb(&["shell", "pidof", package()]).await?;
+    let pid = pid.trim();
+    let original = device.system_setting(FONT_SCALE).await?;
+    let larger = if original.as_deref() == Some("1.15") {
+        "1.3"
+    } else {
+        "1.15"
+    };
+    device.adb(&["logcat", "-b", "events", "-c"]).await?;
+    device
+        .adb(&["shell", "settings", "put", "system", FONT_SCALE, larger])
+        .await?;
+    let rebuilt = device.wait_for_rebuild(pid).await;
+    // The device's text size comes back even when the rebuild was not seen.
+    let cleared = device.adb(&["logcat", "-b", "events", "-c"]).await;
+    let restored = device
+        .restore_system_setting(FONT_SCALE, original.as_deref())
+        .await;
+    rebuilt?;
+    cleared?;
+    restored?;
+    device.wait_for_rebuild(pid).await
+}
+
+/// Whether `events`, the events buffer, shows `activity` destroyed and then
+/// created again in process `pid`.
+fn rebuilt_in(events: &str, pid: &str, activity: &str) -> bool {
+    let in_process = |line: &&str| {
+        line.split_whitespace().nth(2) == Some(pid) && line.contains(&format!(",{activity},"))
+    };
+    let mut lines = events.lines().filter(in_process);
+    lines.any(|line| line.contains("wm_on_destroy_called:"))
+        && lines.any(|line| line.contains("wm_on_create_called:"))
 }
 
 /// The demo's re-check grace, `RECHECK_AFTER` in its source.
@@ -1652,6 +1703,49 @@ impl Device {
         .map(drop)
     }
 
+    /// The device's own value of a system setting, `None` when it holds none.
+    async fn system_setting(&self, name: &str) -> Result<Option<String>> {
+        let value = self
+            .adb(&["shell", "settings", "get", "system", name])
+            .await?;
+        Ok(Some(value.trim())
+            .filter(|value| *value != "null")
+            .map(ToOwned::to_owned))
+    }
+
+    /// Put back a system setting read by [`Self::system_setting`].
+    async fn restore_system_setting(&self, name: &str, value: Option<&str>) -> Result<()> {
+        match value {
+            Some(value) => {
+                self.adb(&["shell", "settings", "put", "system", name, value])
+                    .await
+            }
+            None => {
+                self.adb(&["shell", "settings", "delete", "system", name])
+                    .await
+            }
+        }
+        .map(drop)
+    }
+
+    /// Wait until the events buffer shows the demo's screen destroyed and
+    /// created again inside process `pid`.
+    async fn wait_for_rebuild(&self, pid: &str) -> Result<()> {
+        let deadline = Instant::now() + REBUILD_WITHIN;
+        loop {
+            let events = self.adb(&["logcat", "-b", "events", "-d"]).await?;
+            if rebuilt_in(&events, pid, activity()) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "the demo's screen was not rebuilt in process {pid} within {REBUILD_WITHIN:?}"
+                );
+            }
+            sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     /// Keep crash and freeze dialogs off the screen and close any already showing.
     async fn hide_error_dialogs(&self) -> Result<()> {
         self.adb(&[
@@ -2057,7 +2151,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
-    use super::{Device, parse_current_ssid, saved_network_id};
+    use super::{Device, parse_current_ssid, rebuilt_in, saved_network_id};
 
     /// A stand-in `adb` that runs `body` with `$state` naming a scratch directory.
     fn fake_adb(dir: &Path, body: &str) -> PathBuf {
@@ -2152,5 +2246,46 @@ echo "adb: device offline" >&2; exit 1"#,
             Some("0".to_owned())
         );
         assert_eq!(saved_network_id(listing, "Absent"), None);
+    }
+
+    const TAURI_ACTIVITY: &str = "dev.connetto.tauridemo.MainActivity";
+
+    #[test]
+    fn a_rebuild_is_a_destroy_then_a_create_in_the_same_process() {
+        let events = "\
+10-17 11:35:38.696  4447  4447 I wm_on_create_called: [58122755,dev.connetto.tauridemo.MainActivity,performCreate,115]
+10-17 11:35:54.520   571   599 I wm_relaunch_resume_activity: [0,58122755,94,dev.connetto.tauridemo/.MainActivity,40000000]
+10-17 11:35:54.534  4447  4447 I wm_on_destroy_called: [58122755,dev.connetto.tauridemo.MainActivity,performDestroy,4]
+10-17 11:35:54.565  4447  4447 I wm_on_create_called: [58122755,dev.connetto.tauridemo.MainActivity,performCreate,10]
+";
+        assert!(rebuilt_in(events, "4447", TAURI_ACTIVITY));
+    }
+
+    #[test]
+    fn a_back_press_is_no_rebuild() {
+        let events = "\
+10-17 11:39:15.002  5214  5214 I wm_on_create_called: [60563097,dev.connetto.tauridemo.MainActivity,performCreate,74]
+10-17 11:39:44.218  5214  5214 I wm_on_stop_called: [60563097,dev.connetto.tauridemo.MainActivity,LIFECYCLER_STOP_ACTIVITY,1]
+10-17 11:39:44.229  5214  5214 I wm_on_destroy_called: [60563097,dev.connetto.tauridemo.MainActivity,performDestroy,10]
+";
+        assert!(!rebuilt_in(events, "5214", TAURI_ACTIVITY));
+    }
+
+    #[test]
+    fn a_create_in_a_new_process_is_no_rebuild() {
+        let events = "\
+10-17 11:39:44.229  5214  5214 I wm_on_destroy_called: [60563097,dev.connetto.tauridemo.MainActivity,performDestroy,10]
+10-17 11:39:48.308  5361  5361 I wm_on_create_called: [198079543,dev.connetto.tauridemo.MainActivity,performCreate,73]
+";
+        assert!(!rebuilt_in(events, "5214", TAURI_ACTIVITY));
+    }
+
+    #[test]
+    fn another_screens_rebuild_is_not_the_demos() {
+        let events = "\
+10-17 11:34:10.298  4447  4447 I wm_on_destroy_called: [211010610,dev.connetto.authsession.RedirectActivity,performDestroy,4]
+10-17 11:34:10.446  4447  4447 I wm_on_create_called: [211010611,dev.connetto.authsession.RedirectActivity,performCreate,108]
+";
+        assert!(!rebuilt_in(events, "4447", TAURI_ACTIVITY));
     }
 }
