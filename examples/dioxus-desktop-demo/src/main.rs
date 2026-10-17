@@ -1273,6 +1273,11 @@ fn App() -> Element {
                 if let Some(label) = status_label(&event) {
                     status.set(label);
                 }
+                // The stop names its cause, and the `Closed` that follows it
+                // would only replace that.
+                if matches!(event, ClientEvent::Stopped { .. }) {
+                    break;
+                }
             }
         })
     });

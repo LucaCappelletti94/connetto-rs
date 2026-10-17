@@ -759,6 +759,11 @@ fn use_boot_window_effect(
                         if let Some(label) = status_label(&event) {
                             status.set(label);
                         }
+                        // The stop names its cause, and the `Closed` that
+                        // follows it would only replace that.
+                        if matches!(event, ClientEvent::Stopped { .. }) {
+                            break;
+                        }
                     }
                 }
                 Err(err) => status.set(format!("boot failed: {err:?}")),

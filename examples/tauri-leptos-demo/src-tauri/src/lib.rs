@@ -601,6 +601,11 @@ async fn feed_events(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>
                 view.status = status;
             }
         });
+        // The stop names its cause, and the `Closed` that follows it would
+        // only replace that.
+        if matches!(event, ClientEvent::Stopped { .. }) {
+            break;
+        }
     }
 }
 

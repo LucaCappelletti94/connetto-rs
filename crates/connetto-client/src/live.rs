@@ -3029,6 +3029,9 @@ where
         tracing::warn!(error = %err, "queueing the last writes at the fault failed");
     }
     let _ = state.conn.close().await;
+    // The closed socket is gone, so nothing later sends on it or reads the
+    // connection as live.
+    state.conn.disconnect();
     state.registry.clear();
     state.values.clear();
     state.computed.clear();

@@ -8,10 +8,11 @@ use connetto_core::messages::{
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
+use parking_lot::Mutex;
 use std::collections::VecDeque;
 use std::future::ready;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::tempdir;
 
@@ -52,20 +53,20 @@ struct Gone;
 
 impl Script {
     fn say(&self, frame: IncomingFrame) {
-        self.frames.lock().expect("script lock").push_back(frame);
+        self.frames.lock().push_back(frame);
     }
 
     fn last_subscribed(&self) -> String {
         self.subscribed
             .lock()
-            .expect("script lock")
             .last()
             .cloned()
             .expect("the client subscribed")
     }
 
+    /// A send fails once the socket is dropped or closed, as a real one does.
     fn sent(&self) -> Result<(), Gone> {
-        if self.dropped.load(Ordering::Relaxed) {
+        if self.dropped.load(Ordering::Acquire) || self.closed.load(Ordering::Acquire) {
             Err(Gone)
         } else {
             Ok(())
@@ -81,10 +82,7 @@ impl Transport for Script {
         message: ControlMessage,
     ) -> impl Future<Output = Result<(), Self::Error>> {
         if let ControlMessage::Subscribe(subscribe) = message {
-            self.subscribed
-                .lock()
-                .expect("script lock")
-                .push(subscribe.sub_id);
+            self.subscribed.lock().push(subscribe.sub_id);
         }
         ready(self.sent())
     }
@@ -100,7 +98,7 @@ impl Transport for Script {
         let frames = Arc::clone(&self.frames);
         async move {
             loop {
-                if let Some(frame) = frames.lock().expect("script lock").pop_front() {
+                if let Some(frame) = frames.lock().pop_front() {
                     return Ok(Some(frame));
                 }
                 tokio::task::yield_now().await;
@@ -109,7 +107,7 @@ impl Transport for Script {
     }
 
     fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> {
-        self.closed.store(true, Ordering::Relaxed);
+        self.closed.store(true, Ordering::Release);
         ready(Ok(()))
     }
 }
@@ -241,12 +239,13 @@ async fn a_fault_that_stops_the_pump_is_announced_and_releases_waiting_handles()
         "the waiter learns the pump stopped, got {outcome:?}"
     );
     assert!(
-        script.closed.load(Ordering::Relaxed),
+        script.closed.load(Ordering::Acquire),
         "the transport is closed"
     );
 
+    // A query the server never saw, so nothing already on the wire serves it.
     let mut late = client
-        .watch::<_, Item>(items::table.order(items::id))
+        .watch::<_, Item>(items::table.filter(items::id.gt(0)).order(items::id))
         .await
         .expect("a watch after the stop still answers locally");
     let late_outcome = tokio::time::timeout(BOUND, late.changed())
@@ -319,7 +318,7 @@ async fn a_local_fault_on_the_drain_side_stops_the_pump_the_same_way() {
         "got {outcome:?}"
     );
     assert!(
-        script.closed.load(Ordering::Relaxed),
+        script.closed.load(Ordering::Acquire),
         "the transport is closed"
     );
     let rows: Vec<Item> = client
@@ -362,7 +361,7 @@ async fn until_reconnecting(events: &mut tokio::sync::broadcast::Receiver<Client
 async fn a_socket_lost_while_uploading_a_write_is_recovered() {
     let (client, script, _dir, _pump) = client().await;
     let mut events = client.events();
-    script.dropped.store(true, Ordering::Relaxed);
+    script.dropped.store(true, Ordering::Release);
     client
         .with_conn(|conn| {
             diesel::insert_into(items::table)
@@ -472,7 +471,7 @@ async fn a_handle_outliving_every_clone_falls_back_to_the_driver_stop() {
     );
     assert_eq!(query.rows().len(), 1, "the last rows stay readable");
     assert!(
-        script.closed.load(Ordering::Relaxed),
+        script.closed.load(Ordering::Acquire),
         "the transport is closed"
     );
 }
