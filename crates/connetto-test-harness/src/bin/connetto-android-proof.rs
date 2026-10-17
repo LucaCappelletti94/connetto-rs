@@ -1588,14 +1588,16 @@ async fn linux_section<S: LinuxSteps>(steps: &S, evidence: &Path) -> Result<Vec<
         match steps.spawn_leg(evidence).await {
             Err(err) => (Err(err), None),
             Ok(leg) => {
+                // The log stands after the setup whatever it meets, so the
+                // evidence holds it on the failure cases, and the setup's
+                // error stands over a log-write error.
                 let setup = async {
                     let (linux_identity, _) = steps.ready(&leg).await?;
-                    let reports = steps.walk(&leg, &linux_identity, evidence).await?;
-                    steps.write_leg_log(&leg, evidence).await?;
-                    Ok(reports)
+                    steps.walk(&leg, &linux_identity, evidence).await
                 }
                 .await;
-                (setup, Some(leg))
+                let log = steps.write_leg_log(&leg, evidence).await;
+                (setup.and_then(|reports| log.map(|()| reports)), Some(leg))
             }
         };
     // The adapter power-off talks to the leg, so it runs before the close.
@@ -2419,6 +2421,12 @@ fn cli_arguments() -> Result<Arguments> {
             other => bail!("unknown argument {other}"),
         }
     }
+    validate_arguments(&arguments, demo_app())?;
+    Ok(arguments)
+}
+
+/// The argument rules, checked before the run starts.
+fn validate_arguments(arguments: &Arguments, app: DemoApp) -> Result<()> {
     if arguments.linux_peer && arguments.peer_serial.is_some() {
         bail!("--linux-peer and --peer-serial name the same side twice, pick one");
     }
@@ -2437,14 +2445,14 @@ fn cli_arguments() -> Result<Arguments> {
     if arguments.every_join && (arguments.bluetooth || arguments.payload) {
         bail!("--every-join runs every join, so --bluetooth and --payload name none");
     }
-    if (arguments.peer_serial.is_some() || arguments.bluetooth)
-        && matches!(demo_app(), DemoApp::Tauri)
+    if (arguments.peer_serial.is_some() || arguments.bluetooth || arguments.linux_peer)
+        && matches!(app, DemoApp::Tauri)
     {
         bail!(
-            "--peer-serial and --bluetooth need the dioxus demo, whose panel holds the peer controls"
+            "--peer-serial, --linux-peer and --bluetooth need the dioxus demo, whose panel holds the peer controls"
         );
     }
-    Ok(arguments)
+    Ok(())
 }
 
 /// Comma-separated `device:host` port pairs.
@@ -3276,17 +3284,21 @@ echo "adb: device offline" >&2; exit 1"#,
         Spawn,
         /// The leg's ready line.
         Ready,
+        /// The six-join walk.
+        Walk,
         /// The leg's log write.
         Log,
     }
 
-    /// The cleanup calls the section made.
+    /// The calls the section made, its setup and its cleanup.
     #[derive(Clone, Default)]
     #[expect(
         clippy::struct_excessive_bools,
-        reason = "the flags stand the section's four cleanup steps, one per resource"
+        reason = "the flags record the section's six calls, one per step"
     )]
     struct FakeFlags {
+        walk: bool,
+        log: bool,
         adapter_off: bool,
         close: bool,
         restore: bool,
@@ -3342,10 +3354,15 @@ echo "adb: device offline" >&2; exit 1"#,
             _linux_identity: &str,
             _evidence: &Path,
         ) -> anyhow::Result<Vec<connetto_test_harness::peer_proof::JoinReport>> {
+            self.flags.lock().walk = true;
+            if self.refusal == FakeRefusal::Walk {
+                anyhow::bail!("the injected walk failure");
+            }
             Ok(Vec::new())
         }
 
         async fn write_leg_log(&self, _leg: &FakeLeg, _evidence: &Path) -> anyhow::Result<()> {
+            self.flags.lock().log = true;
             if self.refusal == FakeRefusal::Log {
                 anyhow::bail!("the injected evidence write failure");
             }
@@ -3374,13 +3391,15 @@ echo "adb: device offline" >&2; exit 1"#,
     }
 
     /// A setup failure leaves the phone back on its network, its Bluetooth
-    /// off, and the leg's cleanup run once the leg stood.
+    /// off, and the leg's cleanup run once the leg stood, and the leg's log
+    /// stands whatever the setup meets.
     #[tokio::test]
     async fn setup_failures_leave_the_phone_restored_and_the_leg_released() {
-        for (refusal, leg_up) in [
-            (FakeRefusal::Spawn, false),
-            (FakeRefusal::Ready, true),
-            (FakeRefusal::Log, true),
+        for (refusal, leg_up, walk_ran, log_written) in [
+            (FakeRefusal::Spawn, false, false, false),
+            (FakeRefusal::Ready, true, false, true),
+            (FakeRefusal::Walk, true, true, true),
+            (FakeRefusal::Log, true, true, true),
         ] {
             let steps = FakeSteps::new(refusal);
             let result = super::linux_section(&steps, Path::new("evidence")).await;
@@ -3402,6 +3421,36 @@ echo "adb: device offline" >&2; exit 1"#,
                 flags.close, leg_up,
                 "the {refusal:?} refusal mis-ran the leg close"
             );
+            assert_eq!(
+                flags.walk, walk_ran,
+                "the {refusal:?} refusal mis-ran the walk"
+            );
+            assert_eq!(
+                flags.log, log_written,
+                "the {refusal:?} refusal mis-wrote the leg's log"
+            );
         }
+    }
+
+    /// The walk's mode needs the dioxus panel, so `--linux-peer` with the
+    /// Tauri demo is refused before the run starts.
+    #[test]
+    fn linux_peer_with_the_tauri_demo_is_refused() {
+        let arguments = super::Arguments {
+            linux_peer: true,
+            every_join: true,
+            ..Default::default()
+        };
+        assert!(
+            super::validate_arguments(&arguments, super::DemoApp::Dioxus).is_ok(),
+            "the dioxus demo carries the peer panel"
+        );
+        let err = super::validate_arguments(&arguments, super::DemoApp::Tauri)
+            .expect_err("the tauri demo has no peer panel");
+        let text = format!("{err:#}");
+        assert!(
+            text.contains("--peer-serial, --linux-peer and --bluetooth"),
+            "{text}"
+        );
     }
 }

@@ -432,6 +432,12 @@ impl EnrolHandle {
         self.peer.local_addr()
     }
 
+    /// The peers the device's node reports linked (R76).
+    #[cfg(feature = "peer")]
+    pub(crate) fn linked_peers(&self) -> Vec<DeviceIdentity> {
+        self.peer.linked()
+    }
+
     /// Dial `addr`, refusing by the device's standing before any socket
     /// opens and handing back the peer's identity once the link is live
     /// (R76).

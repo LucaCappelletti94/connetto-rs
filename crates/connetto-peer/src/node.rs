@@ -361,6 +361,22 @@ impl Node {
         self.state.listener.read().as_ref().map(|slot| slot.addr)
     }
 
+    /// The identities the node reports linked, the live links' peers and,
+    /// among them, a duplicate close's peer while it waits for its keeper,
+    /// whose `PeerUnlinked` has not been emitted yet (R76).
+    #[must_use]
+    pub fn linked(&self) -> Vec<DeviceIdentity> {
+        self.state
+            .links
+            .lock()
+            .values()
+            .map(|slot_state| match slot_state {
+                SlotState::Live(slot) => slot.peer.clone(),
+                SlotState::AwaitingKeeper(peer) => peer.clone(),
+            })
+            .collect()
+    }
+
     /// The fingerprint the live link to `peer` carries, for discovery's
     /// mapping of the node's events to its instances.
     #[cfg(feature = "discovery")]

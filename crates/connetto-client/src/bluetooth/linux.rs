@@ -1014,7 +1014,7 @@ mod tests {
         ]);
         let backend = Arc::new(LinuxBluetoothBackend::new(Arc::clone(&fake)));
         let serving = Arc::new(Mutex::new(Some(fp(1))));
-        let (mut machine, _beacon) = Machine::new(
+        let (mut machine, _beacon, _nearby) = Machine::new(
             Arc::clone(&backend) as Arc<dyn ReadinessBackend>,
             Arc::clone(&backend) as Arc<dyn PeripheralBackend>,
             None,
