@@ -59,7 +59,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use connetto_client::teardown::{ForgetError, PurgeError, expiry_warning};
+use connetto_client::teardown::{ForgetError, ForgetRefusal, expiry_warning};
 use connetto_client::{
     AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, Gate, ImportChoices,
     KeyringAuth, NativeClient, NativeClientBuilder, NativeTransport, SyncSchema, SyncTuning,
@@ -351,12 +351,20 @@ impl PartialEq for SessionParts {
 struct Restart {
     generation: Signal<u64>,
     choice: Signal<AccountChoice>,
+    /// What the session that ended left undone, shown while signing in again.
+    notice: Signal<Option<String>>,
 }
 
 impl Restart {
     /// Start over as the account last used.
     fn request(self) {
         self.request_as(AccountChoice::LastUsed);
+    }
+
+    /// Start over as the account last used, showing `notice` while signing in.
+    fn request_noting(mut self, notice: String) {
+        self.notice.set(Some(notice));
+        self.request();
     }
 
     /// Start over as `choice`.
@@ -379,7 +387,12 @@ enum Stage {
 fn Shell() -> Element {
     let generation = use_signal(|| 0_u64);
     let choice = use_signal(|| AccountChoice::LastUsed);
-    let restart = Restart { generation, choice };
+    let mut notice = use_signal(|| None::<String>);
+    let restart = Restart {
+        generation,
+        choice,
+        notice,
+    };
     let mut stage = use_signal(|| Stage::Starting);
     use_context_provider(|| restart);
     let runtime = use_hook(tokio::runtime::Handle::current);
@@ -407,7 +420,10 @@ fn Shell() -> Element {
                 ))
                 .await;
             stage.set(match outcome {
-                Ok(Ok(parts)) => Stage::Ready(SessionParts(Rc::new(parts))),
+                Ok(Ok(parts)) => {
+                    notice.set(None);
+                    Stage::Ready(SessionParts(Rc::new(parts)))
+                }
                 Ok(Err(err)) => Stage::Failed(
                     err.chain()
                         .map(ToString::to_string)
@@ -426,6 +442,9 @@ fn Shell() -> Element {
             div {
                 style: "font-family: system-ui; padding: 20px; line-height: 1.5;",
                 h2 { "Signing in" }
+                if let Some(notice) = notice() {
+                    p { style: "color: #a33;", {notice} }
+                }
                 p { "A browser page opens for the login. Come back here once you have signed in." }
             }
         },
@@ -1520,7 +1539,9 @@ fn grouped_label(counts: &HashMap<i64, i64>) -> String {
         .join(", ")
 }
 
-/// Sign out of this account, wiping the replica, and start over.
+/// Sign out of this account, wiping the replica, and start over. A refused
+/// sign-out keeps the session, and one that closed the client starts over
+/// whatever it left undone.
 async fn sign_out(
     parts: &SessionParts,
     discard_unsynced: bool,
@@ -1529,12 +1550,17 @@ async fn sign_out(
 ) {
     match parts.0.native.forget_device(discard_unsynced).await {
         Ok(()) => restart.request(),
-        Err(ForgetError::Purge(PurgeError::Unsynced(seqs))) if !discard_unsynced => {
+        Err(ForgetError::Refused(ForgetRefusal::Unsynced(seqs))) if !discard_unsynced => {
             wipe_state.set(WipeState::ConfirmForce {
                 unsynced_count: seqs.len(),
             });
         }
-        Err(err) => wipe_state.set(WipeState::Error(format!("logout error: {err}"))),
+        Err(ForgetError::Refused(refusal)) => {
+            wipe_state.set(WipeState::Error(format!("logout error: {refusal}")));
+        }
+        Err(ForgetError::Incomplete(report)) => {
+            restart.request_noting(format!("logout error: {report}"));
+        }
     }
 }
 
