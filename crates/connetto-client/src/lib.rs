@@ -4411,13 +4411,14 @@ where
                 })
             }
             ControlMessage::FullResyncRequired(resync) => {
-                self.clear_subscription_rows(&resync.sub_id, &resync.reason)?;
-                // The replacement snapshot is on its way, and the pending writes
-                // this clear just took off the replica go back after it ends
-                // rather than now: a snapshot row landing on top under
-                // `server_wins` would take the local edit off the screen again
-                // (R48 decision 3).
-                self.resyncing.insert(resync.sub_id.clone());
+                let aggregate = self.clear_subscription_rows(&resync.sub_id, &resync.reason)?;
+                // The replacement snapshot lands after this, so the pending writes
+                // this clear took off the replica go back on its `SnapshotEnd`, not
+                // now: a snapshot row under `server_wins` would take a local edit off
+                // screen (R48 decision 3). An aggregate names no snapshot.
+                if !aggregate {
+                    self.resyncing.insert(resync.sub_id.clone());
+                }
                 Ok(ClientEvent::FullResync {
                     sub_id: resync.sub_id,
                     reason: resync.reason,
@@ -4522,22 +4523,15 @@ where
         }
     }
 
-    /// Drop a row subscription's tables ahead of a full-resync snapshot,
-    /// sparing every row a sibling subscription still covers.
-    ///
-    /// The fresh snapshot carries only the resyncing subscription's currently
-    /// authorized rows, so an insert-only apply over an unwiped table would
-    /// leave rows deleted during the outage behind, and wiping the whole table
-    /// destroys a sibling's rows over it. [`delete_uncovered`](Self::delete_uncovered)
-    /// deletes the complement of what the survivors want instead. A truncate
-    /// empties the named table whatever the survivors claim (R48). Pending
-    /// writes are not spared here: [`reapply_pending`](Self::reapply_pending)
-    /// puts them back after the replacement snapshot lands.
+    /// Drop the replica rows a full-resync snapshot will replace, or, for a
+    /// named aggregate, its whole resting answer (R95). Returns whether the
+    /// notice named an aggregate, so the caller keeps its label out of
+    /// `resyncing`.
     fn clear_subscription_rows(
         &mut self,
         sub_id: &str,
         reason: &FullResyncReason,
-    ) -> Result<(), ClientError> {
+    ) -> Result<bool, ClientError> {
         let declared = subscriptions::declared(&mut self.db)?;
         let beyond_history = *reason == FullResyncReason::CursorBeyondHistory;
         // A hidden membership subscription has no declared record to take its tables from.
@@ -4555,31 +4549,53 @@ where
                 }
             }
             self.delete_uncovered(&scope, None, &Stale::Everything, &HashMap::new())?;
-            return Ok(());
+            return Ok(false);
         }
         if let Some(table) = membership {
             let scope = HashSet::from([table]);
             self.delete_uncovered(&scope, None, &Stale::Nothing, &HashMap::new())?;
-            return Ok(());
+            return Ok(false);
         }
-        let Some(resyncing) = declared
-            .iter()
-            .find(|record| record.sub_id == sub_id)
-            .and_then(|record| crate::live::coverage_of(&record.spec).transpose())
-            .transpose()?
-        else {
+        let Some(record) = declared.iter().find(|record| record.sub_id == sub_id) else {
+            return Ok(false);
+        };
+        match crate::live::coverage_of(&record.spec)? {
+            // No replica rows for a named aggregate; drop its resting answer so the re-bootstrap rebuilds it (R95).
+            None => {
+                self.clear_aggregate_resting(sub_id)?;
+                Ok(true)
+            }
+            Some(resyncing) => {
+                let stale = match reason {
+                    // Compared case-insensitively because the server names it from the
+                    // catalog and a subscription names it as its query spelled it.
+                    FullResyncReason::TableTruncated { table } => {
+                        Stale::Table(table.to_lowercase())
+                    }
+                    FullResyncReason::CursorOutsideRetention
+                    | FullResyncReason::AuthorizationChange
+                    | FullResyncReason::SnapshotInterrupted
+                    | FullResyncReason::CursorBeyondHistory => Stale::Nothing,
+                };
+                self.delete_uncovered(&resyncing.tables, Some(sub_id), &stale, &HashMap::new())?;
+                Ok(false)
+            }
+        }
+    }
+
+    /// Drop every row of the aggregate `sub_id` names, under the query identity
+    /// its frames rest under (R95). A notice with no subscription on record
+    /// clears nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError::Session`] when the replica cannot be read or written.
+    fn clear_aggregate_resting(&mut self, sub_id: &str) -> Result<(), ClientError> {
+        let Some((query_id, binds)) = subscriptions::identity_of(&mut self.db, sub_id)? else {
             return Ok(());
         };
-        let stale = match reason {
-            // Compared case-insensitively because the server names it from the
-            // catalog and a subscription names it as its query spelled it.
-            FullResyncReason::TableTruncated { table } => Stale::Table(table.to_lowercase()),
-            FullResyncReason::CursorOutsideRetention
-            | FullResyncReason::AuthorizationChange
-            | FullResyncReason::SnapshotInterrupted
-            | FullResyncReason::CursorBeyondHistory => Stale::Nothing,
-        };
-        self.delete_uncovered(&resyncing.tables, Some(sub_id), &stale, &HashMap::new())?;
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        aggregates::clear(&mut self.db, query_id, &binds)?;
         Ok(())
     }
 

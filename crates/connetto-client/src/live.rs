@@ -3175,6 +3175,19 @@ where
                     state.held.push(push);
                 }
             }
+            if let ClientEvent::FullResync { sub_id, .. } = &event {
+                // A resync of a watched aggregate cleared its resting answer, so the handles re-read the table until the re-bootstrap rebuilds it (R95).
+                let cleared = state.values.iter().any(|e| e.wire_id == *sub_id)
+                    || state.computed.iter().any(|e| e.wire_id == *sub_id);
+                if cleared && !shared.gate.is_locked() {
+                    route_aggregate(state, &shared.events, sub_id, true);
+                } else if cleared {
+                    let push = (sub_id.clone(), true);
+                    if !state.held.contains(&push) {
+                        state.held.push(push);
+                    }
+                }
+            }
             if !apply_relayed_gate(&shared.gate, &event) {
                 let _ = shared.events.send(event);
             }
