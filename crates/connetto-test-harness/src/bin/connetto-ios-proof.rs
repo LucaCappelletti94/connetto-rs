@@ -2041,7 +2041,13 @@ mod tests {
     #[tokio::test]
     async fn a_device_refuses_a_plain_stack() {
         let plain = stack(echo().await, "http://127.0.0.1:7777");
-        assert!(relay_for(&device(), &plain).await.is_err());
+        let Err(refusal) = relay_for(&device(), &plain).await else {
+            panic!("a device run started a relay before a plain stack");
+        };
+        assert!(
+            refusal.to_string().contains("needs the stack on TLS"),
+            "the refusal is the TLS guard's, got {refusal:#}"
+        );
     }
 
     /// Both subject spellings `openssl x509 -subject` prints yield the team.
