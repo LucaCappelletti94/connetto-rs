@@ -270,6 +270,25 @@ A local tier must be first-booted through the replica connection, which is what 
 
 ---
 
+## Codec and pragma API ownership
+
+R11's device-key slice may land with connetto's local codec statements. Their removal is required once [`diesel-sqlite-cipher`](https://github.com/LucaCappelletti94/diesel-sqlite-cipher) and Diesel's [typed SQLite pragmas](https://github.com/diesel-rs/diesel/pull/5259) are usable together in connetto's dependency pins on native and browser targets. The prerequisite includes borrowed quoted text and secret-safe query diagnostics. Compatible fork pins can satisfy it without a published Diesel release.
+
+| Owner | Required cleanup |
+|---|---|
+| `diesel-sqlite-cipher` | Replace `cipher.rs`'s `raw_key_literal`, `unlock_statement`, `CIPHER_PRAGMAS` and raw codec probes with typed codec operations. Remove the local key formatting and codec-specific pragma SQL. |
+| `diesel-sqlite-cipher` | Replace the raw keyed attachment statement inside `harden::attach_keyed_in_window`. Keep connetto's attachment permission window and resealing on success and failure. |
+| Diesel | Replace raw `journal_mode`, `case_sensitive_like` and `defer_foreign_keys` statements in `connetto-client/src/lib.rs`, and the `schema_cookie` and `harden::attached_count` pragma queries, with typed APIs. Remove obsolete pragma result structs and formatting. |
+| Diesel | Replace `table_info` in `connetto-web/src/relay.rs`'s `tier_columns` and its transaction's `defer_foreign_keys` statement with typed APIs. Remove obsolete pragma result structs and formatting. |
+
+Connetto retains key custody, store naming, unlock ordering, wrong-key validation, attachment hardening and browser VFS selection. Existing typed Diesel calls stay typed. Deployment DDL emitted by pg2sqlite remains pg2sqlite's responsibility. Remove obsolete helpers and comments throughout the consumers without retaining a parallel raw-SQL path.
+
+The local key statements can expose key material through Diesel instrumentation or debug query formatting. Zeroizing rendered text and binding the attachment key do not provide diagnostic redaction. Adoption must prove that key literals and binds stay absent from debug output, errors and instrumentation, including instrumentation installed at connection establishment.
+
+Completion requires native and headless-browser proof of encrypted replica opens, two identities reading and writing one independently keyed store, rejection of wrong keys without occupying the attachment name, and resealing after failed attachment. Preserve missing-codec rejection, codec compatibility, per-open connection settings and transaction-scoped foreign-key deferral.
+
+---
+
 ## How a replica is named
 
 **Built.** `connetto_client::replica::replica_db_name(prefix: &str, user_id: &Id)` in `crates/connetto-client/src/replica.rs` derives the replica filename before any transport opens. The derivation runs a SHA-256 over the identity's own serde encoding and encodes the first 128 bits as hex, producing `{prefix}-{32 hex chars}`. The derivation is deterministic: the same identity always selects the same file, and distinct identities produce distinct files.
