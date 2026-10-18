@@ -1496,6 +1496,39 @@ where
         Ok(matched.then_some(departing))
     }
 
+    /// Which of `consumers` a logged event reaches on replay, each with whether
+    /// as a departure, in ascending consumer order.
+    ///
+    /// One read-only evaluation of the event through the table's index for
+    /// every consumer it reaches, the catch-up walk's counterpart of
+    /// [`replay_match`](Self::replay_match): no aggregate folds, no
+    /// re-execution triggers, no membership or activity movement, so a replay
+    /// in any order leaves the engine as it found it.
+    ///
+    /// # Errors
+    ///
+    /// [`MaterializerError::Dispatch`] when the event cannot be matched.
+    pub fn replay_matches(
+        &mut self,
+        event: &PgChangeEvent,
+        consumers: &HashSet<u64>,
+    ) -> Result<Vec<(u64, bool)>, MaterializerError> {
+        let reached = self.engine.match_rows(event)?;
+        let update = matches!(event.kind(), EventKind::Update);
+        let mut matched: std::collections::BTreeMap<u64, bool> = std::collections::BTreeMap::new();
+        for &consumer in reached.inserted().iter().chain(reached.updated()) {
+            if consumers.contains(&consumer) {
+                matched.entry(consumer).or_insert(false);
+            }
+        }
+        for &consumer in reached.deleted() {
+            if consumers.contains(&consumer) {
+                matched.insert(consumer, update);
+            }
+        }
+        Ok(matched.into_iter().collect())
+    }
+
     /// The compressed departure notice for the row `event` moved out of a
     /// window, the same bytes the live path sends a departing consumer.
     ///

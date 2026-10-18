@@ -916,6 +916,15 @@ type ScriptedManager =
 
 /// Open a session on the scripted manager, printing the error it ends with, and read the ack.
 async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> LoopbackTransport {
+    open_scripted_as(manager, "client-a", resume).await
+}
+
+/// [`open_scripted`] as the caller `name`.
+async fn open_scripted_as(
+    manager: &Arc<ScriptedManager>,
+    name: &str,
+    resume: Cursor,
+) -> LoopbackTransport {
     let (server_transport, mut client) = loopback();
     let server = Arc::clone(manager);
     tokio::spawn(async move {
@@ -923,10 +932,8 @@ async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> Loopba
             eprintln!("session ended with an error: {err}");
         }
     });
-    let handshake = Handshake::new(PROTOCOL_VERSION, "client-a")
-        .with_grant(connetto_core::messages::Grant::new(
-            "user:client-a".to_owned(),
-        ))
+    let handshake = Handshake::new(PROTOCOL_VERSION, name)
+        .with_grant(connetto_core::messages::Grant::new(format!("user:{name}")))
         .with_cursor(resume)
         .with_cursor_subjects(core::iter::empty::<&str>());
     client
@@ -953,13 +960,32 @@ async fn scripted(
     Vec<PgChangeEvent>,
     PgSqliteEmuSource,
 ) {
+    scripted_for(fixture, config, &["client-a"]).await
+}
+
+/// [`scripted`] granting every caller in `names`.
+async fn scripted_for(
+    fixture: &Fixture,
+    config: SessionConfig,
+    names: &[&str],
+) -> (
+    Arc<ScriptedManager>,
+    Arc<std::sync::Mutex<Script>>,
+    Vec<PgChangeEvent>,
+    PgSqliteEmuSource,
+) {
     let script = Arc::new(std::sync::Mutex::new(Script::default()));
+    let roster = names[1..]
+        .iter()
+        .fold(RosterAuth::granting(names[0]), |roster, name| {
+            roster.and(*name)
+        });
     let manager = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .build()
             .expect("build materializer"),
         SeedSnapshot,
-        RosterAuth::granting("client-a"),
+        roster,
         test_verifier(),
         NoConnector,
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
@@ -1168,6 +1194,130 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
     };
     assert_eq!(patch.cursor, cursor_of(&live[0]));
     expect_idle(&mut client).await;
+}
+
+/// Wait until the scripted log has served `read` at least `count` times since it was armed.
+async fn wait_for_reads(script: &std::sync::Mutex<Script>, read: &str, count: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let seen = {
+            let script = script.lock().expect("script");
+            script
+                .reads
+                .iter()
+                .filter(|served| **served == read)
+                .count()
+        };
+        if seen >= count {
+            // The resume that read last enrolls in the same poll, with no await between.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{read} was served {seen} times, expected {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Read the live patches `client` receives for `expected`, in order.
+async fn expect_patches(client: &mut LoopbackTransport, expected: &[PgChangeEvent]) {
+    for event in expected {
+        let BulkMessage::LivePatch(patch) = next_bulk(client).await else {
+            panic!("expected a catchup live patch");
+        };
+        assert_eq!(patch.cursor, cursor_of(event));
+    }
+    expect_idle(client).await;
+}
+
+/// Resumes that arrive while a catchup walks the log wait for that walk to end and then share one walk of the log, each receiving exactly what it missed, and one of them closing meanwhile leaves the others served.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resumes_arriving_during_a_walk_share_the_next_one() {
+    let fixture = Fixture::acquire().await;
+    let names = ["client-a", "client-b", "client-c", "client-d"];
+    let (manager, script, events, _source) =
+        scripted_for(&fixture, SessionConfig::default(), &names).await;
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    arm(&script, &[], true, None);
+    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+
+    let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[0])).await;
+    subscribe(&mut a).await;
+    arrived.notified().await;
+
+    // Each resume reads the current position at the handshake, for the catchup decision and for its ceiling.
+    let mut b = open_scripted_as(&manager, "client-b", cursor_of(&events[0])).await;
+    subscribe(&mut b).await;
+    let mut c = open_scripted_as(&manager, "client-c", cursor_of(&events[1])).await;
+    subscribe(&mut c).await;
+    let mut d = open_scripted_as(&manager, "client-d", cursor_of(&events[0])).await;
+    subscribe(&mut d).await;
+    wait_for_reads(&script, "current_position", 12).await;
+    d.close().await.expect("close d");
+    release.notify_one();
+
+    expect_patches(&mut a, &events[1..]).await;
+    expect_patches(&mut b, &events[1..]).await;
+    expect_patches(&mut c, &events[2..]).await;
+    let walks = {
+        let script = script.lock().expect("script");
+        script
+            .reads
+            .iter()
+            .filter(|read| **read == "entries_since")
+            .count()
+    };
+    assert_eq!(
+        walks, 2,
+        "the first resume's walk, then one walk shared by the three that arrived during it"
+    );
+}
+
+/// Retention passing one resume's cursor while it waits for a walk replaces that subscription alone, and the resume sharing its walk still catches up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_walk_resyncs_only_the_resume_retention_passed() {
+    let fixture = Fixture::acquire().await;
+    let names = ["client-a", "client-b", "client-c"];
+    let (manager, script, mut events, mut source) =
+        scripted_for(&fixture, SessionConfig::default(), &names).await;
+    events.extend(
+        drive(
+            &mut source,
+            &manager,
+            "INSERT INTO orders (id, price, quantity, status) VALUES (4, 1.0, 4, 'row')",
+        )
+        .await,
+    );
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    // The held walk's read is refused once, and the log is pruned through the second change meanwhile.
+    let second = events[1].checkpoint().expect("a checkpoint");
+    arm(&script, &["entries_since"], true, Some(second));
+    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+
+    let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[2])).await;
+    subscribe(&mut a).await;
+    arrived.notified().await;
+    let mut b = open_scripted_as(&manager, "client-b", cursor_of(&events[0])).await;
+    subscribe(&mut b).await;
+    let mut c = open_scripted_as(&manager, "client-c", cursor_of(&events[2])).await;
+    subscribe(&mut c).await;
+    wait_for_reads(&script, "current_position", 9).await;
+    release.notify_one();
+
+    expect_patches(&mut a, &events[3..]).await;
+    let ControlMessage::FullResyncRequired(resync) = next_control(&mut b).await else {
+        panic!("expected the resume whose changes were pruned to be replaced");
+    };
+    assert_eq!(resync.reason, FullResyncReason::CursorOutsideRetention);
+    expect_patches(&mut c, &events[3..]).await;
 }
 
 /// Its own log table, shared by the manager before the restart and the one after it.
