@@ -1820,6 +1820,10 @@ async fn a_certificate_less_device_refuses_to_link() {
 /// links and the listener (R76 proof 5).
 #[cfg(feature = "peer")]
 #[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the enrolment, the live link and the closing look are one scenario, in the order the expiry crosses them"
+)]
 async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     let (key, der) = attesting_key();
     let now = SystemTime::now();
@@ -1888,6 +1892,20 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
             .any(|event| matches!(event, ClientEvent::PeerLinked { .. }))
     })
     .await;
+    let linked_peer = state
+        .lock()
+        .emitted
+        .iter()
+        .find_map(|event| match event {
+            ClientEvent::PeerLinked { peer } => Some(peer.clone()),
+            _ => None,
+        })
+        .expect("the link reports its peer");
+    assert_eq!(
+        handle.linked_peers(),
+        vec![linked_peer],
+        "the device's node reports its live peer"
+    );
 
     // The look wakes at the expiry plus the tolerance and closes the link.
     tokio::time::sleep(

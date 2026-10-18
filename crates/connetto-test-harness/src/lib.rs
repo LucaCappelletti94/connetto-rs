@@ -66,6 +66,8 @@ pub mod demo;
 pub mod fanout;
 pub mod inspector;
 pub mod ios_signing;
+pub mod linux_leg;
+pub mod linux_proof;
 pub mod peer_devices;
 pub mod peer_proof;
 pub mod relay;

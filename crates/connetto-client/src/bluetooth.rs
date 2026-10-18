@@ -31,15 +31,19 @@ use crate::hotspot::{
 mod android;
 #[cfg(target_os = "ios")]
 mod apple;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
 mod central;
+#[cfg(target_os = "linux")]
+mod linux;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::AndroidBluetoothBackend;
 #[cfg(target_os = "ios")]
 pub(crate) use apple::AppleBluetoothBackend;
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
 pub(crate) use central::BtleplugCentral;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::LinuxBluetoothBackend;
 
 /// The pace of the machine's look while an exchange runs.
 const FAST_TICK: Duration = Duration::from_millis(20);
@@ -184,9 +188,21 @@ pub enum BeaconState {
     },
 }
 
+/// A nearby host the scan stands on, for the application's panel (R76).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NearbyHost {
+    /// The host's device, the key the scan stands on.
+    pub host: HostId,
+    /// The beacon's prefix last seen, where the beacon carries one (R76
+    /// decision 25).
+    pub prefix: Option<[u8; 8]>,
+    /// The signal last seen.
+    pub rssi: Option<i16>,
+}
+
 /// An event the host's GATT service reports (R76).
 #[cfg_attr(
-    not(any(target_os = "android", target_os = "ios")),
+    not(any(target_os = "android", target_os = "ios", target_os = "linux")),
     expect(
         dead_code,
         reason = "the platform backends construct these events, a non-Apple build reads them through the tables only"
@@ -219,7 +235,7 @@ pub enum PeripheralEvent {
 
 /// An event the joiner's central reports (R76).
 #[cfg_attr(
-    not(any(test, target_os = "android", target_os = "ios")),
+    not(any(test, target_os = "android", target_os = "ios", target_os = "linux")),
     expect(
         dead_code,
         reason = "btleplug's central runs on Android and iOS, so elsewhere only the proofs construct these events"
@@ -302,10 +318,10 @@ pub trait CentralBackend: Send + Sync {
 }
 
 /// The backends on a system with no Bluetooth.
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 pub struct UnsupportedBackend;
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 impl ReadinessBackend for UnsupportedBackend {
     fn state(&self) -> BluetoothState {
         BluetoothState::Unsupported
@@ -324,7 +340,7 @@ impl ReadinessBackend for UnsupportedBackend {
     }
 }
 
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 impl PeripheralBackend for UnsupportedBackend {
     fn start(&self, _beacon: [u8; 9]) -> Result<(), BluetoothError> {
         Err(BluetoothError::Unsupported)
@@ -345,7 +361,7 @@ impl PeripheralBackend for UnsupportedBackend {
 
 /// A system's readiness, its peripheral, and its central's starter where it
 /// runs one.
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 pub(crate) type Backends = (
     Arc<dyn ReadinessBackend>,
     Arc<dyn PeripheralBackend>,
@@ -353,7 +369,7 @@ pub(crate) type Backends = (
 );
 
 /// The backends on a system with no Bluetooth, which runs no central.
-#[cfg(not(target_os = "ios"))]
+#[cfg(any(test, not(target_os = "ios")))]
 pub(crate) fn unsupported_backends() -> Backends {
     (
         Arc::new(UnsupportedBackend) as Arc<dyn ReadinessBackend>,
@@ -420,6 +436,9 @@ struct HostExchange {
 enum HostBtState {
     /// Not advertising.
     Off,
+    /// Off after a platform failure, whose advertisement may still stand,
+    /// since a refused renewal keeps the old one.
+    Failed,
     /// Advertising under `prefix`, with the running exchanges.
     Advertising {
         /// The beacon's prefix the advertisement carries.
@@ -581,7 +600,7 @@ pub(crate) type CentralStarter = Arc<dyn Fn() -> CentralStart + Send + Sync>;
 
 /// btleplug's central as the machine's starter, which the machine runs once
 /// Bluetooth reads Ready and again after a failed start (R76 decision 22).
-#[cfg(any(target_os = "android", target_os = "ios"))]
+#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
 pub(crate) fn btleplug_starter() -> CentralStarter {
     Arc::new(|| -> CentralStart {
         Box::pin(async {
@@ -641,6 +660,8 @@ pub(crate) struct Machine {
     /// The calls waiting for the platform's action to start.
     action_waiters: Vec<PromptPending>,
     beacon: watch::Sender<BeaconState>,
+    /// The nearby hosts' standing, beside the beacon's, for the panel (R76).
+    nearby: watch::Sender<Vec<NearbyHost>>,
     /// The personal hotspot's landing bound, started when an exchange
     /// hands the offer out (R76 decision 26).
     handed_out: Arc<dyn Fn() + Send + Sync>,
@@ -649,8 +670,8 @@ pub(crate) struct Machine {
 impl Machine {
     /// The machine over the backends, the central's starter where the system
     /// runs one, the peer node, the scan and autojoin standings, the prompt
-    /// standing, and the serving, join and event seams. The receiver stands
-    /// the host's beacon for the panel.
+    /// standing, and the serving, join and event seams. The receivers stand
+    /// the host's beacon and the nearby hosts for the panel.
     #[expect(
         clippy::too_many_arguments,
         reason = "the three backends and the three seams join the node and its three standings, and a config struct would hide the same arity behind another type"
@@ -667,11 +688,16 @@ impl Machine {
         join: JoinSeam,
         emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
         handed_out: Arc<dyn Fn() + Send + Sync>,
-    ) -> (Self, watch::Receiver<BeaconState>) {
+    ) -> (
+        Self,
+        watch::Receiver<BeaconState>,
+        watch::Receiver<Vec<NearbyHost>>,
+    ) {
         let serving_present = (serving)().is_some();
         let (beacon, beacon_rx) = watch::channel(BeaconState::Off {
             reason: Self::beacon_reason(readiness.state(), false, serving_present),
         });
+        let (nearby, nearby_rx) = watch::channel(Vec::new());
         (
             Self {
                 readiness,
@@ -696,8 +722,10 @@ impl Machine {
                 prompting: None,
                 action_waiters: Vec::new(),
                 beacon,
+                nearby,
             },
             beacon_rx,
+            nearby_rx,
         )
     }
 
@@ -988,6 +1016,7 @@ impl Machine {
         self.answer_hosted(state);
         self.answer_joined(now);
         self.update_beacon(state, hosting.is_some(), serving.is_some());
+        self.update_nearby();
     }
 
     /// The central's rows (R76 central table).
@@ -1049,29 +1078,33 @@ impl Machine {
         hosting: Option<&HotspotOffer>,
         serving: Option<&Fingerprint>,
     ) {
-        match &mut self.host {
-            // The device hosts a hotspot and serves, so the beacon starts.
-            HostBtState::Off if state == BluetoothState::Ready => {
-                if let (Some(_), Some(fingerprint)) = (hosting, serving) {
-                    let beacon = Beacon::of(fingerprint);
-                    if self.peripheral.start(beacon.to_service_data()).is_ok() {
-                        self.host = HostBtState::Advertising {
-                            prefix: beacon.prefix,
-                            exchanges: HashMap::new(),
-                        };
-                    } else {
-                        // The platform will not advertise, so the standing
-                        // retries on its next look.
-                        tracing::warn!(
-                            "the beacon could not start, so it retries on the next look"
-                        );
-                    }
+        let ready = state == BluetoothState::Ready && hosting.is_some();
+        match (&mut self.host, serving) {
+            // The device hosts a hotspot and serves, so the beacon starts,
+            // over any advertisement a failure left standing.
+            (HostBtState::Off | HostBtState::Failed, Some(fingerprint)) if ready => {
+                let beacon = Beacon::of(fingerprint);
+                if self.peripheral.start(beacon.to_service_data()).is_ok() {
+                    self.host = HostBtState::Advertising {
+                        prefix: beacon.prefix,
+                        exchanges: HashMap::new(),
+                    };
+                } else {
+                    // The platform will not advertise, so the standing
+                    // retries on its next look.
+                    tracing::warn!("the beacon could not start, so it retries on the next look");
                 }
             }
-            HostBtState::Advertising { prefix, exchanges } => {
+            // The beacon would not restart, so an advertisement a failure
+            // left standing stops.
+            (HostBtState::Failed, _) => {
+                self.peripheral.stop();
+                self.host = HostBtState::Off;
+            }
+            (HostBtState::Advertising { prefix, exchanges }, _) => {
                 // The hotspot stops, the device stops serving, or Bluetooth
                 // leaves Ready, so the beacon stops with its exchanges.
-                if state != BluetoothState::Ready || hosting.is_none() || serving.is_none() {
+                if !ready || serving.is_none() {
                     self.peripheral.stop();
                     self.host = HostBtState::Off;
                     return;
@@ -1097,7 +1130,7 @@ impl Machine {
                     }
                 }
             }
-            HostBtState::Off => {}
+            (HostBtState::Off, _) => {}
         }
         // The service's events.
         for event in self.peripheral.poll() {
@@ -1140,10 +1173,17 @@ impl Machine {
                         self.peripheral.disconnect(device);
                     }
                 }
-                // The platform's failure stands logged, the exchanges end by
-                // their own bound.
+                // The platform's failure stands logged, the host's column
+                // Off, so the next look restarts the beacon, and the
+                // exchanges' devices leave.
                 PeripheralEvent::Failed(reason) => {
                     tracing::warn!(%reason, "the platform's Bluetooth failed");
+                    if let HostBtState::Advertising { exchanges, .. } = &mut self.host {
+                        for device in core::mem::take(exchanges).into_keys() {
+                            self.peripheral.disconnect(device);
+                        }
+                        self.host = HostBtState::Failed;
+                    }
                 }
             }
         }
@@ -1786,12 +1826,29 @@ impl Machine {
     fn update_beacon(&mut self, state: BluetoothState, hosting: bool, serving: bool) {
         let beacon = match &self.host {
             HostBtState::Advertising { prefix, .. } => BeaconState::Advertising { prefix: *prefix },
-            HostBtState::Off => BeaconState::Off {
+            HostBtState::Off | HostBtState::Failed => BeaconState::Off {
                 reason: Self::beacon_reason(state, hosting, serving),
             },
         };
         if *self.beacon.borrow() != beacon {
             self.beacon.send_replace(beacon);
+        }
+    }
+
+    /// The nearby hosts' standing, for the panel, published whenever the
+    /// scan's host map changes (R76).
+    fn update_nearby(&self) {
+        let nearby: Vec<NearbyHost> = self
+            .hosts
+            .iter()
+            .map(|(host, record)| NearbyHost {
+                host: *host,
+                prefix: record.prefix,
+                rssi: record.rssi,
+            })
+            .collect();
+        if *self.nearby.borrow() != nearby {
+            self.nearby.send_replace(nearby);
         }
     }
 
@@ -1819,6 +1876,7 @@ impl Machine {
         // The beacon's standing settles, for the panel.
         let state = self.readiness.state();
         self.update_beacon(state, false, (self.serving)().is_some());
+        self.update_nearby();
     }
 
     /// Whether an exchange runs, so the loop's pace tightens.
@@ -2154,7 +2212,7 @@ mod tests {
     }
 
     /// A node with no identity, so its exchanges answer `NotServing`.
-    fn quiet_node() -> Node {
+    pub(super) fn quiet_node() -> Node {
         let (tx, _rx) = mpsc::unbounded_channel::<PeerEvent>();
         Node::new(
             Trust {
@@ -2233,6 +2291,8 @@ mod tests {
         wire: Arc<Wire>,
         started: Mutex<Vec<[u8; 9]>>,
         stopped: Mutex<usize>,
+        /// Whether `start` refuses, the test's switch.
+        start_refuse: Mutex<bool>,
         disconnects: Mutex<Vec<u64>>,
         notifies: Mutex<Vec<(u64, usize)>>,
         queue: Mutex<VecDeque<PeripheralEvent>>,
@@ -2245,6 +2305,7 @@ mod tests {
                 wire,
                 started: Mutex::new(Vec::new()),
                 stopped: Mutex::new(0),
+                start_refuse: Mutex::new(false),
                 disconnects: Mutex::new(Vec::new()),
                 notifies: Mutex::new(Vec::new()),
                 queue: Mutex::new(VecDeque::new()),
@@ -2260,6 +2321,11 @@ mod tests {
     impl PeripheralBackend for FakePeripheral {
         fn start(&self, beacon: [u8; 9]) -> Result<(), BluetoothError> {
             self.started.lock().push(beacon);
+            if *self.start_refuse.lock() {
+                return Err(BluetoothError::Failed(
+                    "the platform will not advertise".into(),
+                ));
+            }
             Ok(())
         }
 
@@ -2411,14 +2477,16 @@ mod tests {
         /// The landing's bound starts, counted (R76 decision 26).
         handed: Arc<Mutex<usize>>,
         beacon: watch::Receiver<BeaconState>,
+        /// The nearby hosts' standing, beside the beacon's.
+        nearby: watch::Receiver<Vec<NearbyHost>>,
     }
 
-    fn fp(seed: u8) -> Fingerprint {
+    pub(super) fn fp(seed: u8) -> Fingerprint {
         Fingerprint::of(&[seed; 32])
     }
 
     /// The offer the fakes' hotspot hands out.
-    fn offer() -> HotspotOffer {
+    pub(super) fn offer() -> HotspotOffer {
         HotspotOffer::new("hotspot", "secret", HotspotSecurity::Wpa2, Some(54321))
     }
 
@@ -2458,7 +2526,7 @@ mod tests {
             let joins: Joins = Arc::new(Mutex::new(Vec::new()));
             let events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
             let handed: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-            let (machine, beacon) = Machine::new(
+            let (machine, beacon, nearby) = Machine::new(
                 Arc::clone(&readiness) as Arc<dyn ReadinessBackend>,
                 Arc::clone(&peripheral) as Arc<dyn PeripheralBackend>,
                 Some({
@@ -2507,11 +2575,17 @@ mod tests {
                 events,
                 handed,
                 beacon,
+                nearby,
             }
         }
 
         fn beacon_state(&self) -> BeaconState {
             self.beacon.borrow().clone()
+        }
+
+        /// The nearby hosts' standing, beside the beacon's.
+        fn nearby_hosts(&self) -> Vec<NearbyHost> {
+            self.nearby.borrow().clone()
         }
 
         /// Tick the machine once, hosting `hosting` and joined to nothing.
@@ -2608,7 +2682,7 @@ mod tests {
             let h_serving = Arc::new(Mutex::new(Some(host_fp)));
             let h_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
             let handed: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-            let (host, _h_beacon) = Machine::new(
+            let (host, _h_beacon, _h_nearby) = Machine::new(
                 h_readiness,
                 h_peripheral.clone(),
                 None,
@@ -2637,7 +2711,7 @@ mod tests {
             let joins: Arc<Mutex<Vec<(HotspotOffer, JoinReply)>>> =
                 Arc::new(Mutex::new(Vec::new()));
             let j_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-            let (mut joiner, _j_beacon) = Machine::new(
+            let (mut joiner, _j_beacon, _j_nearby) = Machine::new(
                 j_readiness,
                 j_peripheral,
                 Some(instant_starter(Arc::clone(&j_central))),
@@ -2713,6 +2787,139 @@ mod tests {
         assert_eq!(h.peripheral.started.lock().len(), 1);
         let prefix = fp(1).prefix();
         assert_eq!(h.beacon_state(), BeaconState::Advertising { prefix });
+    }
+
+    /// The platform's refusal stands the host Off, so the next look
+    /// restarts the beacon while the hotspot stands.
+    #[tokio::test]
+    async fn a_failed_bluetooth_standings_move_the_host_off_and_retry() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        assert_eq!(
+            h.beacon_state(),
+            BeaconState::Advertising {
+                prefix: fp(1).prefix()
+            }
+        );
+        // The platform's refusal, the beacon down while the hotspot stands.
+        h.peripheral
+            .push(PeripheralEvent::Failed("the refusal".into()));
+        h.tick(Some(&offer()));
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+        // The next look restarts the beacon.
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 2);
+        assert_eq!(
+            h.beacon_state(),
+            BeaconState::Advertising {
+                prefix: fp(1).prefix()
+            }
+        );
+    }
+
+    /// A platform failure while an exchange runs disconnects the
+    /// exchange's device, so the joiner does not stay attached to a dead
+    /// host.
+    #[tokio::test]
+    async fn a_platform_failure_while_an_exchange_runs_disconnects_the_exchange() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        h.peripheral.push(PeripheralEvent::Connected {
+            device: 7,
+            mtu: 517,
+        });
+        h.tick(Some(&offer()));
+        // The exchange runs, so the platform still serves the device.
+        assert!(h.peripheral.disconnects.lock().is_empty());
+        h.peripheral
+            .push(PeripheralEvent::Failed("the platform dropped".into()));
+        h.tick(Some(&offer()));
+        assert_eq!(*h.peripheral.disconnects.lock(), vec![7]);
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+    }
+
+    /// A platform failure leaves an advertisement that may still stand,
+    /// which the next look stops once the hotspot is gone.
+    #[tokio::test]
+    async fn a_failure_then_a_stopped_hotspot_stops_the_standing_advertisement() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        h.peripheral
+            .push(PeripheralEvent::Failed("the renewal's refusal".into()));
+        h.tick(Some(&offer()));
+        assert_eq!(*h.peripheral.stopped.lock(), 0);
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1, "the stop runs once");
+    }
+
+    /// A platform failure with the hotspot still up restarts the beacon
+    /// over the standing advertisement, with no stop in between.
+    #[tokio::test]
+    async fn a_failure_with_the_hotspot_up_restarts_without_a_stop() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        h.peripheral
+            .push(PeripheralEvent::Failed("the renewal's refusal".into()));
+        h.tick(Some(&offer()));
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 2);
+        assert_eq!(*h.peripheral.stopped.lock(), 0);
+        // The restarted beacon stops as any other when the hotspot goes.
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+    }
+
+    /// The platform's refusal from Off leaves the beacon down, so the
+    /// next look with a willing platform advertises.
+    #[tokio::test]
+    async fn a_refused_beacon_start_stays_off_and_retries() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        *h.peripheral.start_refuse.lock() = true;
+        h.tick(Some(&offer()));
+        // The attempt went out, but the platform refused the
+        // advertisement.
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+        assert_eq!(*h.peripheral.stopped.lock(), 0);
+        // The platform wills, and the next look advertises.
+        *h.peripheral.start_refuse.lock() = false;
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 2);
+        assert_eq!(
+            h.beacon_state(),
+            BeaconState::Advertising {
+                prefix: fp(1).prefix()
+            }
+        );
+    }
+
+    /// A platform failure while no beacon stands leaves the host and the
+    /// beacon unchanged, with no stop or disconnect to issue.
+    #[tokio::test]
+    async fn a_failure_without_a_beacon_leaves_the_host_unchanged() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        h.tick(Some(&offer()));
+        assert_eq!(h.peripheral.started.lock().len(), 1);
+        // The platform fails, so the host stands Failed.
+        h.peripheral
+            .push(PeripheralEvent::Failed("the platform dropped".into()));
+        h.tick(Some(&offer()));
+        // The hotspot goes, so the Failed row stops the standing
+        // advertisement.
+        h.tick(None);
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+        // A second failure while no beacon stands changes nothing.
+        h.peripheral
+            .push(PeripheralEvent::Failed("the platform dropped again".into()));
+        h.tick(None);
+        assert!(matches!(h.beacon_state(), BeaconState::Off { .. }));
+        assert_eq!(*h.peripheral.stopped.lock(), 1);
+        assert!(h.peripheral.disconnects.lock().is_empty());
+        assert_eq!(h.peripheral.started.lock().len(), 1);
     }
 
     #[tokio::test]
@@ -2842,7 +3049,7 @@ mod tests {
         h.machine.starter = None;
         h.tick(Some(&offer()));
         let joiner_central = Arc::new(FakeCentral::new(wire.clone()));
-        let (mut joiner, _joiner_beacon) = Machine::new(
+        let (mut joiner, _joiner_beacon, _joiner_nearby) = Machine::new(
             Arc::new(FakeReadiness::new(BluetoothState::Ready)),
             Arc::new(FakePeripheral::new(Arc::new(Wire::new()))),
             Some(instant_starter(Arc::clone(&joiner_central))),
@@ -3264,6 +3471,72 @@ mod tests {
             h.host_nearby(),
             vec![(1, None), (1, Some(host_fp.prefix()))]
         );
+    }
+
+    /// The nearby read stands the scan's hosts with their beacon prefix and
+    /// signal, follows a refresh and a changed beacon, and drops a host when
+    /// it goes or the machine closes (R76).
+    #[tokio::test(start_paused = true)]
+    async fn the_nearby_read_follows_the_scan_hosts() {
+        let mut h = Harness::new(BluetoothState::Ready);
+        let host_fp = fp(9);
+        h.settle().await;
+        assert!(
+            h.nearby_hosts().is_empty(),
+            "nothing stands before the scan sees a beacon"
+        );
+        h.host_seen(1, &host_fp, -70);
+        h.tick(None);
+        assert_eq!(
+            h.nearby_hosts(),
+            vec![NearbyHost {
+                host: 1,
+                prefix: Some(host_fp.prefix()),
+                rssi: Some(-70)
+            }],
+            "a seen beacon stands with its prefix and signal"
+        );
+        // A known beacon refreshes its signal.
+        h.host_seen(1, &host_fp, -60);
+        h.tick(None);
+        assert_eq!(
+            h.nearby_hosts(),
+            vec![NearbyHost {
+                host: 1,
+                prefix: Some(host_fp.prefix()),
+                rssi: Some(-60)
+            }],
+            "the refresh moves the signal"
+        );
+        // A second beacon stands beside the first.
+        h.host_seen(2, &fp(4), -50);
+        h.tick(None);
+        assert_eq!(h.nearby_hosts().len(), 2, "both hosts stand");
+        // A changed beacon stands the host's new prefix and signal beside
+        // its first host.
+        h.host_seen(1, &fp(5), -65);
+        h.tick(None);
+        let hosts = h.nearby_hosts();
+        assert_eq!(hosts.len(), 2, "the hosts stand by their address");
+        let changed = hosts
+            .iter()
+            .find(|host| host.host == 1)
+            .expect("the host stands under its address");
+        assert_eq!(changed.prefix, Some(fp(5).prefix()));
+        assert_eq!(changed.rssi, Some(-65));
+        // A host unseen for its bound leaves the read.
+        tokio::time::sleep(GONE_AFTER + Duration::from_secs(1)).await;
+        h.tick(None);
+        assert!(
+            h.nearby_hosts().is_empty(),
+            "the gone bound drops every host"
+        );
+        // The machine's close clears the read.
+        h.host_seen(3, &fp(6), -40);
+        h.tick(None);
+        assert_eq!(h.nearby_hosts().len(), 1, "a host stands again");
+        h.machine.close();
+        assert!(h.nearby_hosts().is_empty(), "the close clears the read");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3697,7 +3970,7 @@ mod tests {
         let h_peripheral = Arc::new(FakePeripheral::new(wire.clone()));
         let h_serving = Arc::new(Mutex::new(Some(fp(1))));
         let h_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let (bt_machine, _bt_beacon) = Machine::new(
+        let (bt_machine, _bt_beacon, _bt_nearby) = Machine::new(
             h_readiness,
             h_peripheral,
             None,
@@ -3767,7 +4040,7 @@ mod tests {
         let h_central = Arc::new(FakeCentral::new(wire));
         let h_serving = Arc::new(Mutex::new(Some(fp(1))));
         let h_events: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
-        let (bt_machine, _bt_beacon) = Machine::new(
+        let (bt_machine, _bt_beacon, _bt_nearby) = Machine::new(
             h_readiness,
             h_peripheral,
             Some(instant_starter(h_central)),
@@ -3844,7 +4117,7 @@ mod tests {
     #[test]
     fn a_dropped_runner_clears_the_dial_bind() {
         let wire = Arc::new(Wire::new());
-        let (bt_machine, _bt_beacon) = Machine::new(
+        let (bt_machine, _bt_beacon, _bt_nearby) = Machine::new(
             Arc::new(FakeReadiness::new(BluetoothState::Ready)),
             Arc::new(FakePeripheral::new(wire)),
             None,
