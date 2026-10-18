@@ -27,12 +27,12 @@ pub enum AttachPermits {
 /// then) and after the journal mode. Both the native and the browser path reach
 /// it through the same open, so the two agree on every value by construction.
 ///
-/// Only four of SQLite's recommended limits are set. The rest of that table is
+/// Only three of SQLite's recommended limits are set. The rest of that table is
 /// written for a process running nothing but untrusted SQL, and this connection
 /// also runs the application's own diesel queries: measured against the full
 /// set, a four-row batch insert, an eleven-key lookup, a twelve-term filter
-/// chain and a 1.5 MB value are all refused. The four kept here are the ones no
-/// application shape reached.
+/// chain, a 1.5 MB value and a twelve-level foreign-key cascade are all
+/// refused. The three kept here are the ones no application shape reached.
 ///
 /// # Errors
 ///
@@ -46,12 +46,6 @@ pub fn harden_replica_connection(conn: &mut SqliteConnection) -> QueryResult<()>
     conn.set_limit(
         SqliteLimit::FunctionArg,
         SqliteLimit::SAFE_FUNCTION_ARG_LIMIT,
-    );
-    // Trigger recursion is controlled by whatever schema is attached, and
-    // connetto's own translation nests one deep.
-    conn.set_limit(
-        SqliteLimit::TriggerDepth,
-        SqliteLimit::SAFE_TRIGGER_DEPTH_LIMIT,
     );
     // Bounds one statement's compiled program, which is what a giant expression
     // inside an attached database's view would otherwise buy cheaply. Measured

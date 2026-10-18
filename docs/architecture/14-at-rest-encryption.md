@@ -258,13 +258,15 @@ The browser codec intercepts as a VFS shim, so a database must be opened through
 
 **Built (2026-09-16).** `PRAGMA case_sensitive_like = 1` follows the journal mode on every open, reconnects included. pg2sqlite leads every script it emits with that pragma, as part of declaring that its schema is Postgres's dialect, where `LIKE` is case sensitive. A pragma is connection state, so the copy inside the DDL covers only the first boot that runs the DDL, and `connect_existing` and `open_existing` run none. The tier script carries the same pragma, and `with_tier` passes a `PRAGMA` through unqualified while still requalifying every `CREATE TABLE` into the tier schema.
 
+**Built (R92).** `PRAGMA foreign_keys = ON` follows R18's hardening on every open, reconnects included, through `SqliteConnection::set_foreign_keys_enabled` in `open_inner`, and before the first statement that writes a row. Enforcement is connection state, and native SQLite enforces by compile default while the browser build does not, so connetto sets it on both. It precedes the replica DDL, which runs with every synced `REFERENCES` and `FOREIGN KEY` clause removed (R92 decision 1), so it governs the device-local tier's references alone. Two transactions move every check to their commit with `PRAGMA defer_foreign_keys = ON`, which SQLite clears at the commit or the rollback. They are the archive import (`apply_import_with_bookkeeping`) and the relay hub's replay of a tab's tier mutation.
+
 **Built.** An attached database inherits the connection's derived key, not a key the `ATTACH` statement names. This was measured rather than assumed (see `Replica::with_tier` in `crates/connetto-client/src/replica.rs` and the tests in `crates/connetto-client/tests/encrypted_replica.rs`). Two consequences:
 
 A local tier must be first-booted through the replica connection, which is what `Replica::with_tier` asks for, so both databases share the same key salt. A tier file created by any other connection carries its own salt and will fail to decrypt through the replica connection. A later run says `with_existing_tier` and it works because the salt already matches from the first boot. **Built (R3):** the tier is named on the replica rather than attached afterwards, which is what makes a durable tier beside an unkeyed replica unrepresentable.
 
 `PRAGMA key` in raw hex form cannot re-key an attached database to a different key. Only a passphrase form re-derives from the attached file's own salt, and the per-replica key is raw bytes, not a passphrase.
 
-**Browser constraint (Built).** `sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore a separate connection carrying the same key explicitly rather than being attached.
+**Browser constraint (Built).** `sqlite-wasm-rs` allows one connection per database and the sahpool VFS keys its bookkeeping by name, so two live connections to one OPFS file trip a `debug_assert`. The browser local tier is therefore attached to the DB worker's replica connection, exactly as natively, and nothing else opens it (R43, `crates/connetto-web/tests/local_tier_one_handle.rs`). It inherits the replica connection's key and its enforcement of references with the attachment.
 
 ---
 

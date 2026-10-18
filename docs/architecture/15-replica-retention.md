@@ -151,9 +151,9 @@ This constraint has no urgency today. The workspace is at `version = "0.0.0"`, u
 
 1. `cipher::unlock` (the key pragma, must be the first SQL statement on any encrypted connection)
 2. `PRAGMA journal_mode=WAL`
-3. `harden::harden_replica_connection` (R18: defensive mode, trusted schema off, four limits, and the attach lockdown)
+3. `harden::harden_replica_connection` (R18: defensive mode, trusted schema off, three limits, and the attach lockdown), then `PRAGMA foreign_keys = ON` (R92)
 4. `SqlFunctions` installation
-5. Application DDL (`sqlite_ddl`)
+5. Application DDL (`sqlite_ddl`), run without its synced references (R92)
 6. `META_DDL` (connetto's `_connetto_meta` and `_connetto_pending` tables)
 
 **Decided (R15).** `PRAGMA auto_vacuum = INCREMENTAL` joins this sequence after step 2 and before step 5. After step 2 because the key pragma in step 1 must precede any statement that reads the database header, and WAL is established immediately after it. Before step 5 because both the application DDL and `META_DDL` create tables, and the mode must precede the first `CREATE TABLE`. On the `connect_existing` path the database already has its schema and the mode is already stored in the file from the original create, so the pragma applies only on the `connect` path.
