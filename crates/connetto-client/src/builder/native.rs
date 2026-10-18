@@ -993,11 +993,23 @@ where
                             }
                         }
                     };
+                    #[cfg(target_os = "windows")]
+                    let (bt_readiness, bt_peripheral, bt_starter) = {
+                        let readiness =
+                            Arc::new(crate::bluetooth::WindowsBluetoothReadiness::new());
+                        (
+                            Arc::clone(&readiness) as Arc<dyn crate::bluetooth::ReadinessBackend>,
+                            Arc::new(crate::bluetooth::UnsupportedBackend)
+                                as Arc<dyn crate::bluetooth::PeripheralBackend>,
+                            Some(crate::bluetooth::btleplug_starter()),
+                        )
+                    };
                     #[cfg(not(any(
                         target_os = "android",
                         target_os = "ios",
                         target_os = "linux",
-                        target_os = "macos"
+                        target_os = "macos",
+                        target_os = "windows"
                     )))]
                     let (bt_readiness, bt_peripheral, bt_starter) =
                         crate::bluetooth::unsupported_backends();

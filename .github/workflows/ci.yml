@@ -314,6 +314,65 @@ jobs:
             ~/.cargo/git/db
           key: ${{ steps.cache-1.outputs.cache-primary-key }}
 
+  windows:
+    # R76 decision 41. Test targets stay out until testcontainers builds on Windows.
+    name: Windows check
+    runs-on: windows-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Restore cargo downloads
+        if: runner.environment == 'github-hosted'
+        id: cache-1
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: dl-${{ runner.os }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ github.event_name == 'pull_request' && format('dl-{0}-', runner.os) || '' }}
+
+      # Git Bash's Perl writes POSIX paths, which OpenSSL's MSVC build rejects.
+      - name: Point openssl-src at a Windows Perl
+        shell: pwsh
+        run: |
+          $perl = Get-Command perl -All | Where-Object { $_.Source -notlike '*\Git\*' } | Select-Object -First 1
+          if (-not $perl) { throw 'no Windows Perl on PATH' }
+          "OPENSSL_SRC_PERL=$($perl.Source)" >> $env:GITHUB_ENV
+
+      - name: Install stable toolchain
+        run: rustup toolchain install stable --profile minimal --component clippy
+
+      # The bundled SQLCipher's bindgen needs libclang.
+      - name: Install clang if the image lacks it
+        shell: pwsh
+        run: |
+          if (-not (Get-Command clang.exe -ErrorAction SilentlyContinue)) {
+            choco install -y clang
+          }
+
+      - name: Run clippy
+        run: cargo +stable clippy --locked --lib --bins -p connetto-client -p connetto-dioxus --all-features -- -D warnings
+
+      - name: Check docs
+        if: ${{ !cancelled() }}
+        run: RUSTDOCFLAGS="-D warnings" cargo +stable doc --locked --no-deps -p connetto-client -p connetto-dioxus --all-features
+
+      - name: Save cargo downloads
+        if: runner.environment == 'github-hosted' && github.event_name == 'push' && steps.cache-1.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+          key: ${{ steps.cache-1.outputs.cache-primary-key }}
+
   ios-simulator:
     # R88's proof, walked on an iOS simulator with the Tauri demo. The runner
     # cannot run Docker, so the backend runs as plain processes and the

@@ -35,12 +35,14 @@ mod apple;
     target_os = "android",
     target_os = "ios",
     target_os = "linux",
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "windows"
 ))]
 mod central;
 #[cfg(target_os = "linux")]
 mod linux;
-
+#[cfg(target_os = "windows")]
+mod windows;
 #[cfg(target_os = "android")]
 pub(crate) use android::AndroidBluetoothBackend;
 #[cfg(any(target_os = "ios", target_os = "macos"))]
@@ -49,11 +51,14 @@ pub(crate) use apple::AppleBluetoothBackend;
     target_os = "android",
     target_os = "ios",
     target_os = "linux",
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "windows"
 ))]
 pub(crate) use central::BtleplugCentral;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::LinuxBluetoothBackend;
+#[cfg(target_os = "windows")]
+pub(crate) use windows::WindowsBluetoothReadiness;
 
 /// The pace of the machine's look while an exchange runs.
 const FAST_TICK: Duration = Duration::from_millis(20);
@@ -255,11 +260,12 @@ pub enum PeripheralEvent {
         target_os = "android",
         target_os = "ios",
         target_os = "linux",
-        target_os = "macos"
+        target_os = "macos",
+        target_os = "windows"
     )),
     expect(
         dead_code,
-        reason = "btleplug's central runs on Android and iOS, so elsewhere only the proofs construct these events"
+        reason = "btleplug's central runs on these platforms, so elsewhere only the proofs construct these events"
     )
 )]
 #[derive(Clone, Debug)]
@@ -382,7 +388,10 @@ impl PeripheralBackend for UnsupportedBackend {
 
 /// A system's readiness, its peripheral, and its central's starter where it
 /// runs one.
-#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(any(
+    test,
+    not(any(target_os = "ios", target_os = "macos", target_os = "windows"))
+))]
 pub(crate) type Backends = (
     Arc<dyn ReadinessBackend>,
     Arc<dyn PeripheralBackend>,
@@ -390,7 +399,10 @@ pub(crate) type Backends = (
 );
 
 /// The backends on a system with no Bluetooth, which runs no central.
-#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
+#[cfg(any(
+    test,
+    not(any(target_os = "ios", target_os = "macos", target_os = "windows"))
+))]
 pub(crate) fn unsupported_backends() -> Backends {
     (
         Arc::new(UnsupportedBackend) as Arc<dyn ReadinessBackend>,
@@ -625,7 +637,8 @@ pub(crate) type CentralStarter = Arc<dyn Fn() -> CentralStart + Send + Sync>;
     target_os = "android",
     target_os = "ios",
     target_os = "linux",
-    target_os = "macos"
+    target_os = "macos",
+    target_os = "windows"
 ))]
 pub(crate) fn btleplug_starter() -> CentralStarter {
     Arc::new(|| -> CentralStart {

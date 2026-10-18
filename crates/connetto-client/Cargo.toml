@@ -54,6 +54,7 @@ peer = [
   "dep:btleplug",
   "dep:connetto-peer-android",
   "dep:connetto-peer-apple",
+  "dep:windows",
 ]
 native-auth = [
   "native-transport",
@@ -250,6 +251,11 @@ windows-native-keyring-store = { version = "1.1.0", optional = true }
 libsqlite3-sys = { version = ">=0.38, <0.39", features = [
   "bundled-sqlcipher-vendored-openssl",
 ] }
+# The radio's standing the readiness re-reads, the same crate btleplug's
+# Windows half stands on (R76 decision 21).
+windows = { version = "0.62", features = ["Devices_Radios"], optional = true }
+# The streams btleplug's central answers with (R76 decision 22).
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 
 # Every other native target launches the browser through `open`.
 [target.'cfg(not(any(target_os = "android", target_os = "ios", all(target_family = "wasm", target_os = "unknown"))))'.dependencies]
@@ -262,9 +268,9 @@ open = { version = "5.4", optional = true }
 webbrowser = { version = "1.2", optional = true }
 
 # The peer's Bluetooth, the central the joiner runs on Android and on the
-# Apple side through CoreBluetooth, and on Linux through btleplug's BlueZ
-# half (R76 decisions 17 and 22).
-[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos"))'.dependencies]
+# Apple side through CoreBluetooth, on Linux through btleplug's BlueZ half,
+# and on Windows through btleplug's winrtble half (R76 decisions 17 and 22).
+[target.'cfg(any(target_os = "android", target_os = "ios", target_os = "linux", target_os = "macos", target_os = "windows"))'.dependencies]
 btleplug = { version = "0.13.5", optional = true }
 
 # Android: the Keystore-backed store of the same family. The NDK ships no
