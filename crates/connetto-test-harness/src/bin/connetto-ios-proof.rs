@@ -1970,7 +1970,85 @@ fn free_port() -> Result<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::organizational_unit;
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use tokio::net::{TcpListener, TcpStream};
+
+    use super::{Stack, Target, organizational_unit, relay_for};
+
+    /// An upstream that echoes every byte back.
+    async fn echo() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind echo");
+        let address = listener.local_addr().expect("echo address").to_string();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let (mut read, mut write) = socket.split();
+                    let _ = tokio::io::copy(&mut read, &mut write).await;
+                });
+            }
+        });
+        address
+    }
+
+    fn stack(server: String, auth_origin: &str) -> Stack {
+        Stack {
+            server,
+            auth_origin: auth_origin.to_owned(),
+            pg_url: String::new(),
+            issuer: String::new(),
+        }
+    }
+
+    fn device() -> Target {
+        Target::Device {
+            udid: String::new(),
+            identity: String::new(),
+        }
+    }
+
+    /// The stack's listener terminates TLS itself, so the relay in front of
+    /// it hands the app's bytes over untouched and the app dials it in `wss`
+    /// by the stack's host name, which its certificate names.
+    #[tokio::test]
+    async fn a_relay_before_a_tls_stack_passes_the_bytes_through() {
+        let server = echo().await;
+        let port = server.rsplit_once(':').expect("port").1.to_owned();
+        let host_stack = stack(server, &format!("https://127.0.0.1:{port}"));
+        let (relay, url) = relay_for(&device(), &host_stack).await.expect("relay");
+        assert_eq!(
+            url,
+            format!(
+                "wss://127.0.0.1:{}{}",
+                relay.address().port(),
+                connetto_server::SYNC_PATH
+            )
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", relay.address().port()))
+            .await
+            .expect("connect");
+        stream.write_all(&[0x16, 0x03, 0x01]).await.expect("write");
+        let mut back = [0; 3];
+        tokio::time::timeout(Duration::from_secs(2), stream.read_exact(&mut back))
+            .await
+            .expect("no echo within its bound")
+            .expect("read");
+        assert_eq!(back, [0x16, 0x03, 0x01]);
+    }
+
+    /// A device dials only `wss`, which a plain stack cannot serve.
+    #[tokio::test]
+    async fn a_device_refuses_a_plain_stack() {
+        let plain = stack(echo().await, "http://127.0.0.1:7777");
+        let Err(refusal) = relay_for(&device(), &plain).await else {
+            panic!("a device run started a relay before a plain stack");
+        };
+        assert!(
+            refusal.to_string().contains("needs the stack on TLS"),
+            "the refusal is the TLS guard's, got {refusal:#}"
+        );
+    }
 
     /// Both subject spellings `openssl x509 -subject` prints yield the team.
     #[test]
