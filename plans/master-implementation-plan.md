@@ -5960,7 +5960,7 @@ Seven pull requests, each building and passing CI on its own.
 4. The swap on request. `ReplaceShareKeys` with its metering and answer, and the stated-set comparison at resume (decisions 2, 5, 6 and 9).
 5. The native client. The add and remove call, persistence beside the refresh token under the gate, the recorded acknowledged set, the re-render and the client expiry timer.
 6. The browser. The worker's call, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
-6. The documents. Chapters 12 and 13 with the carrying guidance.
+7. The documents. Chapters 12 and 13 with the carrying guidance.
 
 ### Proof
 
