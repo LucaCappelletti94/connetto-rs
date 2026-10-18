@@ -229,6 +229,12 @@ impl<Id, Key> Principal<Id, Key> {
         }
     }
 
+    /// Take the capability set out, consuming the caller.
+    #[must_use]
+    pub fn into_capabilities(self) -> Vec<CapabilitySubject<Key>> {
+        self.capabilities
+    }
+
     /// The durable handle for this run, minted or from the auth store.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {

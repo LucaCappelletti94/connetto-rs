@@ -1942,6 +1942,26 @@ impl Client {
             .expect("send unsubscribe");
     }
 
+    /// Replace the share keys the session holds with `keys` (R95).
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `ReplaceShareKeys` frame fails on the transport.
+    pub async fn replace_share_keys(&mut self, request_id: &str, keys: &[&str]) {
+        self.transport
+            .send_control(ControlMessage::ReplaceShareKeys(
+                connetto_core::messages::ReplaceShareKeys {
+                    request_id: request_id.to_owned(),
+                    keys: keys
+                        .iter()
+                        .map(|key| connetto_core::messages::Grant::new(*key))
+                        .collect(),
+                },
+            ))
+            .await
+            .expect("send replace share keys");
+    }
+
     /// Upload one mutation: a header naming the op count, then the compressed
     /// changeset patch.
     ///

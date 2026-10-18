@@ -18,7 +18,7 @@
 //! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
 //! write applies to the source Postgres under the caller's RLS context.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -30,12 +30,12 @@ use connetto_core::messages::{
     AggregateUpdate, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ContentTicketGrant, ContentTicketRequest, ContentVerb,
     ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal,
-    EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Handshake,
-    HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict, MutationHeader,
-    MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause, Pong,
-    RateLimited, RegisterBot, RevocationUpdate, RevokeDeviceRequest, SUBSCRIPTION_REFUSED,
-    SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
-    bot_registration_message,
+    EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant,
+    Handshake, HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict,
+    MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause,
+    Pong, RateLimited, RegisterBot, ReplaceShareKeys, RevocationUpdate, RevokeDeviceRequest,
+    SUBSCRIPTION_REFUSED, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch,
+    Subscribe, SubscriptionSpec, bot_registration_message,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -1106,6 +1106,42 @@ const fn subject_kind<Id, Key>(subject: &Subject<Id, Key>) -> &'static str {
     }
 }
 
+/// Where a list of grants came from, which names the refusal's log line.
+#[derive(Clone, Copy)]
+enum GrantSource<'a> {
+    /// A handshake, by the client's correlation label.
+    Handshake(&'a str),
+    /// A key swap, by its request id (R95).
+    Swap(&'a str),
+}
+
+impl GrantSource<'_> {
+    /// Record one refused grant, the only place a refusal is visible.
+    fn log_refusal(self, position: u64, reason: &str, detail: &str) {
+        match self {
+            Self::Handshake(client_id) => tracing::warn!(
+                client_id = %client_id,
+                grant = position,
+                reason,
+                detail,
+                "grant refused"
+            ),
+            Self::Swap(request_id) => tracing::warn!(
+                request_id = %request_id,
+                grant = position,
+                reason,
+                detail,
+                "grant refused"
+            ),
+        }
+    }
+}
+
+/// The renderings of a set of held keys, as a policy compares them.
+fn rendered_keys<Key: CapabilityKey>(keys: &[CapabilitySubject<Key>]) -> BTreeSet<String> {
+    keys.iter().map(|key| key.key().to_string()).collect()
+}
+
 /// What a list of grants resolved to.
 struct ResolvedGrants<Id, Key> {
     /// The caller the grants name, on the handle they were checked for.
@@ -1275,6 +1311,8 @@ struct HandshakeOutcome<Id, Key> {
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     /// When each held share key dies, by its rendering.
     key_expiry: BTreeMap<String, u64>,
+    /// The share-key subjects the client's resume cursor was taken under.
+    cursor_subjects: BTreeSet<String>,
 }
 
 /// One item waiting on the outbound queue.
@@ -1569,6 +1607,10 @@ struct SessionState<Id, Key> {
     resume: Resume,
     /// What is left of the connection's wait on reconnect-log reads, which every catchup draws from.
     resume_read_budget: Duration,
+    /// The share-key subjects the handshake said its cursor was taken under, so
+    /// a resumed subscription a difference reaches is replaced rather than
+    /// caught up (R95).
+    cursor_subjects: BTreeSet<String>,
     /// When each held share key dies, in Unix seconds by the key's rendering,
     /// which the run loop sleeps until (R95).
     key_expiry: BTreeMap<String, u64>,
@@ -3463,7 +3505,11 @@ where
             refusals: refused_grants,
             wait: grant_wait,
         } = self
-            .resolve_grants(handle, &handshake)
+            .resolve_grants(
+                handle,
+                &handshake.grants,
+                GrantSource::Handshake(&handshake.client_id),
+            )
             .instrument(span.clone())
             .await;
         if let Some(identity) = principal.identity() {
@@ -3580,6 +3626,7 @@ where
             outbound_tx,
             outbound_rx,
             key_expiry,
+            cursor_subjects: handshake.cursor_subjects.into_iter().collect(),
         }))
     }
     /// Refuse a caller that is over a rate limit, reporting whether it was.
@@ -3907,10 +3954,14 @@ where
     /// grants as fit in a frame, so continuing would buy the caller every
     /// remaining signature check after the limit already said no, and the
     /// connection is closed on the returned wait regardless.
+    ///
+    /// A key swap keeps the identity the handshake resolved, so a grant naming
+    /// a person there is refused like one that fails to check.
     async fn resolve_grants(
         &self,
         handle: SessionId,
-        handshake: &Handshake,
+        grants: &[Grant],
+        source: GrantSource<'_>,
     ) -> ResolvedGrants<Id, Key> {
         let mut resolved = ResolvedGrants {
             principal: Principal::unidentified(handle),
@@ -3918,9 +3969,16 @@ where
             refusals: 0,
             wait: None,
         };
-        for (position, grant) in handshake.grants.iter().enumerate() {
+        for (position, grant) in grants.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
             let refused = match self.authority.check_grant(grant).await {
+                Ok(CheckedGrant {
+                    subject: Subject::Identity(_),
+                    ..
+                }) if matches!(source, GrantSource::Swap(_)) => {
+                    source.log_refusal(position, "identity", "a key swap keeps its identity");
+                    true
+                }
                 Ok(CheckedGrant {
                     subject,
                     expires_at,
@@ -3932,13 +3990,7 @@ where
                     };
                     let ambiguous = resolved.principal.accept(subject).is_err();
                     if ambiguous {
-                        tracing::warn!(
-                            client_id = %handshake.client_id,
-                            grant = position,
-                            kind,
-                            reason = "ambiguous",
-                            "grant refused"
-                        );
+                        source.log_refusal(position, "ambiguous", kind);
                     } else if let (Some(key), Some(expires_at)) = (key, expires_at) {
                         // A key presented twice dies at the later of its two expiries.
                         let at = resolved.key_expiry.entry(key).or_insert(expires_at);
@@ -3947,13 +3999,7 @@ where
                     ambiguous
                 }
                 Err(refusal) => {
-                    tracing::warn!(
-                        client_id = %handshake.client_id,
-                        grant = position,
-                        reason = refusal.reason(),
-                        detail = %refusal,
-                        "grant refused"
-                    );
+                    source.log_refusal(position, refusal.reason(), &refusal.to_string());
                     true
                 }
             };
@@ -4010,6 +4056,7 @@ where
             outbound_tx,
             mut outbound_rx,
             key_expiry,
+            cursor_subjects,
         } = outcome;
         let session_id = principal.session_id();
         tracing::info!(?resume, "connection established");
@@ -4036,6 +4083,7 @@ where
             applied_watermark,
             resume,
             resume_read_budget,
+            cursor_subjects,
             key_expiry,
             closing: refused == Reaction::Close,
             enrol_challenge: None,
@@ -4192,6 +4240,65 @@ where
         self.upkeep
             .as_deref()
             .map(crate::openfga::StoreUpkeep::key_tables)
+    }
+
+    /// Replace the share keys this session holds with the set a client sent (R95).
+    ///
+    /// The grants are checked and metered as a handshake's are, and crossing
+    /// the refused-grant limit closes the session as it closes a handshake. A
+    /// change costs one subscription allowance per subscription it reaches, and
+    /// its answer is queued behind their resends.
+    async fn replace_share_keys(&self, req: ReplaceShareKeys, state: &mut SessionState<Id, Key>) {
+        let ReplaceShareKeys { request_id, keys } = req;
+        let resolved = self
+            .resolve_grants(state.session_id, &keys, GrantSource::Swap(&request_id))
+            .await;
+        let reaction = self
+            .guard
+            .refused_grants(Self::caller(&state.principal), resolved.refusals);
+        if reaction == Reaction::Close {
+            state.closing = true;
+        }
+        if let Some(wait) = resolved.wait {
+            let _ = state.outbound.send(Outbound::Fatal(FatalError::new(
+                FatalErrorReason::RateLimited {
+                    retry_after_ms: retry_ms(wait),
+                },
+            )));
+            return;
+        }
+        let next = state
+            .principal
+            .with_capabilities(resolved.principal.into_capabilities());
+        if rendered_keys(next.capabilities()) != rendered_keys(state.principal.capabilities()) {
+            let reached = self.reached_by_keys(state);
+            let tier = Tier::of(&state.principal);
+            let refused = reached
+                .0
+                .iter()
+                .chain(&reached.1)
+                .find_map(|_| self.guard.subscription(state.session_id, tier));
+            if let Some(wait) = refused {
+                let retry_after_ms = retry_ms(wait);
+                tracing::warn!(%request_id, retry_after_ms, "key swap refused, rate limit reached");
+                let _ = state
+                    .outbound
+                    .send(Outbound::Control(ControlMessage::RateLimited(
+                        RateLimited {
+                            related_to: Some(request_id),
+                            retry_after_ms,
+                        },
+                    )));
+                return;
+            }
+            self.swap_keys(state, next, reached).await;
+        }
+        state.key_expiry = resolved.key_expiry;
+        let _ = state
+            .outbound
+            .send(Outbound::Control(ControlMessage::ShareKeysReplaced(
+                ShareKeysReplaced { request_id },
+            )));
     }
 
     /// Drop every held key whose expiry has passed (R95).
@@ -4732,6 +4839,10 @@ where
             }
             ControlMessage::RevokeDeviceRequest(req) => {
                 self.handle_revoke_request(transport, req, state).await
+            }
+            ControlMessage::ReplaceShareKeys(req) => {
+                self.replace_share_keys(req, state).await;
+                Ok(())
             }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
@@ -5443,6 +5554,14 @@ where
         let resync = match state.resume.clone() {
             Resume::Fresh => None,
             Resume::BeyondHistory => Some(FullResyncReason::CursorBeyondHistory),
+            // A catch-up never shows or hides a row that did not change, so keys
+            // that changed since the cursor need the whole set again (R95).
+            Resume::At(..)
+                if state.cursor_subjects != rendered_keys(state.principal.capabilities())
+                    && key_change_reaches(&reg, self.key_tables()) =>
+            {
+                Some(FullResyncReason::AuthorizationChange)
+            }
             Resume::At(at, fence) => {
                 let min = read_log::<O, _, _>(&mut state.resume_read_budget, || {
                     self.oplog.min_position()

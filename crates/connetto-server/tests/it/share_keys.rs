@@ -1,5 +1,5 @@
-//! Share keys on a running session (R95): a held key leaves the session at its
-//! expiry, and every subscription it reached is resent under the keys left.
+//! Share keys changed on a running session (R95): the live swap, its metering,
+//! a key dying at its expiry, and a resume whose keys changed while away.
 //!
 //! The snapshot stub writes the keys each read ran under into its patchset, so
 //! a delivered page says which set it was read for. Needs Docker for the write
@@ -11,16 +11,20 @@ use std::time::{Duration, SystemTime};
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, Grant,
-    Handshake, Subscribe, SubscriptionSpec,
+    Handshake, Ping, RateLimited, ReplaceShareKeys, Subscribe, SubscriptionSpec,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
 use connetto_server::{
-    LoopbackTransport, ManagerBuilder, Materializer, NoConnector, PageSpec, SessionConfig,
-    SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource, loopback, pg_write_target,
+    AbuseConfig, InMemoryOplog, LoopbackTransport, ManagerBuilder, Materializer, NoConnector,
+    PageSpec, Position, RequestGuard, SessionConfig, SessionManager, SnapshotEstimate,
+    SnapshotPage, SnapshotSource, ThrottleConfig, TierLimits, TimelineHistory, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use subql::backend::CdcEvent;
+use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
@@ -33,6 +37,10 @@ struct KeyedSnapshot {
 }
 
 impl KeyedSnapshot {
+    fn reads(&self) -> usize {
+        self.callers.lock().expect("capture lock").len()
+    }
+
     fn last(&self) -> Principal {
         self.callers
             .lock()
@@ -101,8 +109,16 @@ impl SnapshotSource for KeyedSnapshot {
 
 type Manager = Arc<SessionManager<KeyedSnapshot, RosterAuth, ConnettoDefaults>>;
 
-fn manager(fixture: &Fixture, snapshot: &KeyedSnapshot, initial_credits: Option<u32>) -> Manager {
-    let builder = ManagerBuilder::new(
+/// What one test changes about an otherwise default manager.
+#[derive(Default)]
+struct Settings {
+    throttle: Option<ThrottleConfig>,
+    initial_credits: Option<u32>,
+    oplog: Option<InMemoryOplog>,
+}
+
+fn manager(fixture: &Fixture, snapshot: &KeyedSnapshot, settings: Settings) -> Manager {
+    let mut builder = ManagerBuilder::new(
         Materializer::builder(PG_DDL)
             .build()
             .expect("build materializer"),
@@ -113,10 +129,17 @@ fn manager(fixture: &Fixture, snapshot: &KeyedSnapshot, initial_credits: Option<
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     );
-    match initial_credits {
-        Some(credits) => builder
-            .with_session(SessionConfig::new().with_initial_credits(credits))
-            .build(),
+    if let Some(throttle) = settings.throttle {
+        builder = builder.with_guard(Arc::new(RequestGuard::new(
+            throttle,
+            AbuseConfig::default(),
+        )));
+    }
+    if let Some(credits) = settings.initial_credits {
+        builder = builder.with_session(SessionConfig::new().with_initial_credits(credits));
+    }
+    match settings.oplog {
+        Some(oplog) => builder.with_oplog(oplog).build(),
         None => builder.build(),
     }
 }
@@ -137,14 +160,24 @@ async fn next_control<T: Transport>(transport: &mut T) -> ControlMessage {
     }
 }
 
-async fn connect(manager: &Manager, grants: &[&str]) -> LoopbackTransport {
+/// Handshake with `grants`, resuming from `resume` taken under `cursor_subjects`.
+async fn connect(
+    manager: &Manager,
+    grants: &[&str],
+    resume: Option<(Cursor, &[&str])>,
+) -> LoopbackTransport {
     let (server_end, mut client) = loopback();
     let server = Arc::clone(manager);
     tokio::spawn(
         async move { server.serve(server_end).await }.instrument(tracing::Span::current()),
     );
-    let handshake = Handshake::new(PROTOCOL_VERSION, "share-keys")
+    let mut handshake = Handshake::new(PROTOCOL_VERSION, "share-keys")
         .with_grants(grants.iter().map(|grant| Grant::new(*grant)));
+    if let Some((cursor, subjects)) = resume {
+        handshake = handshake
+            .with_cursor(cursor)
+            .with_cursor_subjects(subjects.iter().copied());
+    }
     client
         .send_control(ControlMessage::Handshake(handshake))
         .await
@@ -168,6 +201,16 @@ async fn subscribe<T: Transport>(client: &mut T, label: &str) {
         .expect("send subscribe");
 }
 
+async fn swap<T: Transport>(client: &mut T, request_id: &str, keys: &[&str]) {
+    client
+        .send_control(ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
+            request_id: request_id.to_owned(),
+            keys: keys.iter().map(|key| Grant::new(*key)).collect(),
+        }))
+        .await
+        .expect("send swap");
+}
+
 /// The control frames up to and including the first `stop` accepts.
 async fn controls_until<T: Transport>(
     client: &mut T,
@@ -182,6 +225,10 @@ async fn controls_until<T: Transport>(
             return seen;
         }
     }
+}
+
+fn is_answer(request_id: &str) -> impl Fn(&ControlMessage) -> bool + '_ {
+    move |msg| matches!(msg, ControlMessage::ShareKeysReplaced(answer) if answer.request_id == request_id)
 }
 
 fn is_end(msg: &ControlMessage) -> bool {
@@ -203,9 +250,117 @@ fn kinds(frames: &[ControlMessage]) -> Vec<&'static str> {
             ControlMessage::FullResyncRequired(_) => "resync",
             ControlMessage::SnapshotBegin(_) => "begin",
             ControlMessage::SnapshotEnd(_) => "end",
+            ControlMessage::ShareKeysReplaced(_) => "answer",
+            ControlMessage::RateLimited(_) => "limited",
+            ControlMessage::NonFatalError(_) => "refused",
+            ControlMessage::Pong(_) => "pong",
             _ => "other",
         })
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_swap_resends_the_subscription_under_the_new_keys_before_answering() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let manager = manager(&fixture, &snapshot, Settings::default());
+    let mut client = connect(&manager, &["user:alice", "key:a"], None).await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    swap(&mut client, "swap-1", &["key:b"]).await;
+    let frames = controls_until(&mut client, is_answer("swap-1")).await;
+
+    assert_eq!(kinds(&frames), ["resync", "begin", "end", "answer"]);
+    assert_eq!(frames[0], resync_of("items"));
+    let caller = snapshot.last();
+    assert_eq!(keys_of(&caller), ["key:b"]);
+    assert_eq!(
+        caller.identity().map(|identity| identity.user_id.as_str()),
+        Some("alice"),
+        "a swap keeps the identity the handshake resolved"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unchanged_key_set_is_answered_without_a_resend() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let manager = manager(&fixture, &snapshot, Settings::default());
+    let mut client = connect(&manager, &["key:a", "key:b"], None).await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+    let reads = snapshot.reads();
+
+    swap(&mut client, "same", &["key:b", "key:a", "key:a"]).await;
+
+    assert_eq!(
+        kinds(&controls_until(&mut client, is_answer("same")).await),
+        ["answer"]
+    );
+    assert_eq!(snapshot.reads(), reads, "nothing was read again");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_grant_in_a_swap_is_dropped_without_a_word() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let manager = manager(&fixture, &snapshot, Settings::default());
+    let mut client = connect(&manager, &["user:alice", "key:a"], None).await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    swap(
+        &mut client,
+        "mixed",
+        &["not-a-grant", "user:mallory", "key:b"],
+    )
+    .await;
+    let frames = controls_until(&mut client, is_answer("mixed")).await;
+
+    assert_eq!(kinds(&frames), ["resync", "begin", "end", "answer"]);
+    let caller = snapshot.last();
+    assert_eq!(keys_of(&caller), ["key:b"]);
+    assert_eq!(
+        caller.identity().map(|identity| identity.user_id.as_str()),
+        Some("alice"),
+        "a person named in a swap does not replace the one signed in"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_swap_over_the_subscription_limit_keeps_the_old_keys() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let window = Duration::from_secs(600);
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            throttle: Some(
+                ThrottleConfig::new()
+                    .with_anonymous(TierLimits::anonymous().with_subscriptions(1, window)),
+            ),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(&manager, &["key:a"], None).await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    swap(&mut client, "over", &["key:b"]).await;
+    let refusal = next_control(&mut client).await;
+    let ControlMessage::RateLimited(RateLimited { related_to, .. }) = refusal else {
+        panic!("expected the swap to be limited, got {refusal:?}");
+    };
+    assert_eq!(related_to.as_deref(), Some("over"));
+
+    // The old set still stands, so presenting it again changes nothing.
+    swap(&mut client, "again", &["key:a"]).await;
+    assert_eq!(
+        kinds(&controls_until(&mut client, is_answer("again")).await),
+        ["answer"]
+    );
 }
 
 /// A grant naming `key` that dies two seconds from now.
@@ -221,8 +376,8 @@ fn dying_in_two_seconds(key: &str) -> String {
 async fn a_held_key_leaves_the_session_at_its_expiry() {
     let fixture = Fixture::acquire().await;
     let snapshot = KeyedSnapshot::default();
-    let manager = manager(&fixture, &snapshot, None);
-    let mut client = connect(&manager, &[&dying_in_two_seconds("key:a"), "key:b"]).await;
+    let manager = manager(&fixture, &snapshot, Settings::default());
+    let mut client = connect(&manager, &[&dying_in_two_seconds("key:a"), "key:b"], None).await;
     subscribe(&mut client, "items").await;
     controls_until(&mut client, is_end).await;
 
@@ -237,8 +392,15 @@ async fn a_held_key_leaves_the_session_at_its_expiry() {
 async fn queued_frames_of_an_expired_key_never_follow_the_resend() {
     let fixture = Fixture::acquire().await;
     let snapshot = KeyedSnapshot::default();
-    let manager = manager(&fixture, &snapshot, Some(0));
-    let mut client = connect(&manager, &[&dying_in_two_seconds("key:a"), "key:b"]).await;
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            initial_credits: Some(0),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(&manager, &[&dying_in_two_seconds("key:a"), "key:b"], None).await;
     subscribe(&mut client, "items").await;
     // With no credit the page and its end wait in the queue behind the begin.
     let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
@@ -271,4 +433,69 @@ async fn queued_frames_of_an_expired_key_never_follow_the_resend() {
         ["key:b"],
         "only the page read under the keys left arrives"
     );
+}
+
+/// A cursor at the first change the oplog holds, so a resume catches up.
+async fn resumable(manager: &Manager) -> Cursor {
+    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    source
+        .execute_sql("INSERT INTO items (id, label) VALUES (1, 'one')")
+        .expect("execute dml");
+    let mut first = None;
+    while let Some(item) = source.next_item().await.expect("poll source") {
+        let SourceItem::Event(event) = item else {
+            continue;
+        };
+        manager.dispatch_event(&event).await.expect("dispatch");
+        first = first.or_else(|| event.checkpoint());
+    }
+    Cursor::new(
+        Position {
+            system: TimelineHistory::default().system(),
+            timeline: 1,
+            at: first.expect("one event"),
+        }
+        .to_cursor_bytes(),
+    )
+}
+
+/// The control frames a subscribe produced, up to the pong a ping behind it draws.
+async fn subscribe_and_settle<T: Transport>(client: &mut T) -> Vec<ControlMessage> {
+    subscribe(client, "items").await;
+    client
+        .send_control(ControlMessage::Ping(Ping { nonce: 7 }))
+        .await
+        .expect("send ping");
+    controls_until(client, |msg| matches!(msg, ControlMessage::Pong(_))).await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_under_other_keys_resends_instead_of_catching_up() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            oplog: Some(InMemoryOplog::default()),
+            ..Settings::default()
+        },
+    );
+    let cursor = resumable(&manager).await;
+
+    let mut changed = connect(&manager, &["key:b"], Some((cursor.clone(), &["key:a"]))).await;
+    let frames = subscribe_and_settle(&mut changed).await;
+    assert_eq!(kinds(&frames), ["resync", "begin", "end", "pong"]);
+    assert_eq!(frames[0], resync_of("items"));
+    drop(changed);
+
+    let reads = snapshot.reads();
+    let mut same = connect(&manager, &["key:b"], Some((cursor, &["key:b"]))).await;
+    let frames = subscribe_and_settle(&mut same).await;
+    assert_eq!(
+        kinds(&frames),
+        ["pong"],
+        "the same keys catch up from the log"
+    );
+    assert_eq!(snapshot.reads(), reads);
 }
