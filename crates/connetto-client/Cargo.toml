@@ -88,8 +88,9 @@ name = "secret_store_probe"
 required-features = ["native-auth"]
 
 [dependencies]
-# Wire types and framing. The native transports ride the feature above.
-connetto-core.workspace = true
+# Wire types and framing. The native transports ride the feature above. The
+# tier shape is what the R31 tier migration checks a migrated tier against.
+connetto-core = { workspace = true, features = ["sqlite-shape"] }
 # The `uuidv4()` installer the builder registers: the translated DDL may call
 # it, and the v5 id the native-auth tests mint stays covered here. `js`
 # supplies the v4 randomness on wasm32-unknown-unknown (Web Crypto); on

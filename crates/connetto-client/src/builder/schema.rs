@@ -1,13 +1,30 @@
 //! The schema half of a client build.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
+use connetto_core::Major;
 use connetto_core::schema::SchemaBundle;
 use connetto_core::schema::UUID_FUNCTION;
 
 use crate::PolicyTables;
 use crate::SqlFunctions;
+use crate::tier_migration::{TierPlan, TierStep};
+
+/// A data step registered for a boundary this build carries no generated
+/// step for, so it could never run.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "a tier step starts at major {from}, outside the boundaries this build carries, from {oldest} up to {build}"
+)]
+pub struct TierStepOutside {
+    /// The major the step starts at.
+    pub from: Major,
+    /// The oldest major the build migrates from.
+    pub oldest: Major,
+    /// The build's major.
+    pub build: Major,
+}
 
 /// A translated schema and the client-side registrations its DDL reaches, as
 /// one value.
@@ -24,6 +41,9 @@ pub struct SyncSchema {
     unrecorded: HashSet<String>,
     /// Both tiers as one main-schema DDL, for a relay tab's mirror.
     mirror_ddl: Option<String>,
+    /// The application's data step for each tier boundary, keyed by the
+    /// major it starts at (R31).
+    tier_steps: BTreeMap<Major, Arc<dyn TierStep>>,
 }
 
 impl SyncSchema {
@@ -43,6 +63,7 @@ impl SyncSchema {
             sql_functions: uuidv4_installer(),
             unrecorded: HashSet::new(),
             mirror_ddl: None,
+            tier_steps: BTreeMap::new(),
         }
     }
 
@@ -51,6 +72,43 @@ impl SyncSchema {
     pub fn with_sql_functions(mut self, functions: SqlFunctions) -> Self {
         self.sql_functions = self.sql_functions.merged(functions);
         self
+    }
+
+    /// Register the application's data step for the tier boundary starting at
+    /// `from`, run after the structural step the build generated for it, in
+    /// the same transaction (R31).
+    ///
+    /// # Errors
+    ///
+    /// [`TierStepOutside`] when `from` is not a boundary this build carries,
+    /// one from the oldest exported major up to the major before its own.
+    pub fn with_tier_step(
+        mut self,
+        from: Major,
+        step: impl TierStep,
+    ) -> Result<Self, TierStepOutside> {
+        let history = self.bundle.tier_history();
+        let build = self.bundle.major();
+        if from < history.oldest() || from >= build {
+            return Err(TierStepOutside {
+                from,
+                oldest: history.oldest(),
+                build,
+            });
+        }
+        self.tier_steps.insert(from, Arc::new(step));
+        Ok(self)
+    }
+
+    /// What brings an existing device-private tier to this build's major,
+    /// absent when the build has no tier or is a relay mirror.
+    pub(crate) fn tier_plan(&self) -> Option<TierPlan> {
+        self.local_tier_ddl().map(|ddl| TierPlan {
+            build: self.bundle.major(),
+            ddl: ddl.to_owned(),
+            history: self.bundle.tier_history().clone(),
+            steps: Arc::new(self.tier_steps.clone()),
+        })
     }
 
     /// Name the tables whose missing key is intentional, so connetto records

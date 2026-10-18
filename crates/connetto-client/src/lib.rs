@@ -92,6 +92,7 @@ pub mod replica;
 pub mod share_keys;
 mod subscriptions;
 mod synced_schema;
+mod tier_migration;
 
 #[cfg(feature = "peer")]
 pub use bluetooth::{
@@ -131,7 +132,7 @@ pub use builder::sign_in::{AccountChooser, Keyring, KeyringAuth, StoredAuth};
 pub use builder::sign_in::{NativeSignIn, NoKeyring};
 pub use builder::{
     AttachContent, ClientBuilder, ContentPlace, CoreClient, CoreDurable, CorePump, CoreSignedIn,
-    Gate, Located, REPLICA_PREFIX, ReplicaPlace, SyncSchema, SyncTuning,
+    Gate, Located, REPLICA_PREFIX, ReplicaPlace, SyncSchema, SyncTuning, TierStepOutside,
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;
@@ -158,6 +159,8 @@ pub use replica::{
     Encrypted, IDENTITY_RECORD, InMemory, Replica, ReplicaStorage, Tier, decode_identity,
     device_key_record, encode_identity, is_reserved_record, replica_db_name, shared_store_name,
 };
+use tier_migration::TierPlan;
+pub use tier_migration::{TierFailure, TierStep, TierStepError};
 
 /// Zstd level for outbound mutation payloads. Level 3 is the library default.
 const ZSTD_LEVEL: i32 = 3;
@@ -291,6 +294,38 @@ pub enum ClientError {
         archive: Option<Major>,
         /// This build's major.
         build: Option<Major>,
+    },
+    /// The device-private tier records a newer application schema major than
+    /// this build (R31).
+    #[error("the device-private tier records major {recorded}, newer than this build's {build}")]
+    TierNewer {
+        /// The major the tier records.
+        recorded: Major,
+        /// This build's major.
+        build: Major,
+    },
+    /// The device-private tier records a major older than any this build
+    /// carries a step from (R31).
+    #[error(
+        "the device-private tier records major {recorded}, older than the oldest this build migrates from, {oldest}"
+    )]
+    TierTooOld {
+        /// The major the tier records.
+        recorded: Major,
+        /// The oldest major this build migrates from.
+        oldest: Major,
+    },
+    /// Crossing one boundary of the device-private tier's migration failed,
+    /// so that boundary rolled back and the open was refused (R31).
+    #[error("migrating the device-private tier from major {from} to {to} failed: {cause}")]
+    TierMigration {
+        /// The major the failed boundary starts at.
+        from: Major,
+        /// The major it would have reached.
+        to: Major,
+        /// Why it failed.
+        #[source]
+        cause: TierFailure,
     },
     /// The operation needs a server and this connection has none.
     ///
@@ -951,6 +986,9 @@ pub(crate) struct ClientConfig {
     /// land, so reporting anything stronger would claim protection connetto
     /// does not yet provide.
     custody: Custody,
+    /// What brings an existing device-private tier to this build's major,
+    /// `None` for a build declaring no major (R31).
+    tier_plan: Option<TierPlan>,
 }
 
 impl ClientConfig {
@@ -970,6 +1008,7 @@ impl ClientConfig {
             subjects: None,
             tuning: SyncTuning::default(),
             custody: Custody::Unverified(NoGate::Unsupported),
+            tier_plan: None,
         }
     }
 
@@ -1111,6 +1150,13 @@ impl ClientConfig {
     #[must_use]
     pub fn with_custody(mut self, custody: Custody) -> Self {
         self.custody = custody;
+        self
+    }
+
+    /// What brings an existing device-private tier to this build's major.
+    #[must_use]
+    pub(crate) fn with_tier_plan(mut self, tier_plan: Option<TierPlan>) -> Self {
+        self.tier_plan = tier_plan;
         self
     }
 }
@@ -3717,7 +3763,9 @@ where
         register_write_exemption(&mut db, &write_exempt)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
-        install_replica_schema(&mut db, boot, config)?;
+        // The major the replica recorded before this open, which the tier
+        // reads to tell a tier a later major introduced from a lost one.
+        let prior = install_replica_schema(&mut db, boot, config)?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
         // OPFS import) continues where the previous run stopped. The writer
@@ -3826,7 +3874,7 @@ where
             #[cfg(feature = "device-identity")]
             list_sink: None,
         };
-        conn.attach_tier(replica.tier())?;
+        conn.attach_tier(replica.tier(), replica.key(), prior)?;
         conn.refresh_share_key_expiry();
         conn.recompute_share_key_deadline();
         Ok(conn)
@@ -3845,34 +3893,41 @@ where
     /// database's derived key. One device, one key, because two would double the
     /// lost-key failure modes and isolate nothing, since both entries would sit
     /// in the same key store behind the same wrap.
-    fn attach_tier(&mut self, tier: &Tier<'_>) -> Result<(), ClientError> {
+    ///
+    /// A tier behind the build's application schema major is migrated on a
+    /// connection of its own before it is attached for good (R31). `prior` is
+    /// the major the replica recorded before this open, which tells a tier a
+    /// later major introduced from one that was lost.
+    fn attach_tier(
+        &mut self,
+        tier: &Tier<'_>,
+        key: Option<&ReplicaKey>,
+        prior: Option<Major>,
+    ) -> Result<(), ClientError> {
         match tier {
             Tier::None => return Ok(()),
             Tier::Existing { path } => {
                 // Write allowed so the tier stays writable, creation refused so
                 // a missing tier file fails instead of starting an empty one.
-                harden::attach_in_window(
+                let attached = harden::attach_in_window(
                     &mut self.db,
                     path,
                     LOCAL_SCHEMA,
                     harden::AttachPermits::Write,
-                )?;
-            }
-            Tier::Create { path, ddl } => {
-                harden::attach_in_window(
-                    &mut self.db,
-                    path,
-                    LOCAL_SCHEMA,
-                    harden::AttachPermits::CreateAndWrite,
-                )?;
-                // An attached database with no tables is a fresh one, on every
-                // target and with no filesystem probe, which wasm does not have.
-                if local_tier_tables(&mut self.db)?.is_empty() {
-                    for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-                        self.db.batch_execute(&qualify_tier_statement(statement)?)?;
-                    }
+                );
+                let introduced = match (&self.config.tier_plan, prior) {
+                    (Some(plan), Some(prior)) => plan.introduced_after(prior),
+                    _ => false,
+                };
+                match attached {
+                    Ok(()) => self.reconcile_tier(path, key)?,
+                    // The replica predates the first major with a tier, so the
+                    // file was never created rather than lost.
+                    Err(_) if introduced => self.create_tier(path, None, key)?,
+                    Err(err) => return Err(err.into()),
                 }
             }
+            Tier::Create { path, ddl } => self.create_tier(path, Some(ddl), key)?,
         }
         self.local_tables = local_tier_tables(&mut self.db)?;
         // The tier needs keys as much as the replica does: a browser tab reads
@@ -3880,6 +3935,69 @@ where
         // one delivers nothing to a sibling tab (R62).
         check_recorded_tables(&mut self.db, LOCAL_SCHEMA, &self.config.unrecorded_tables)?;
         self.tier_schema = Some(schema_cookie(&mut self.db, LOCAL_SCHEMA)?);
+        Ok(())
+    }
+
+    /// Attach the tier at `path` allowing creation, and give an empty one the
+    /// tier DDL and the build's major. `ddl` defaults to the build's own.
+    fn create_tier(
+        &mut self,
+        path: &str,
+        ddl: Option<&str>,
+        key: Option<&ReplicaKey>,
+    ) -> Result<(), ClientError> {
+        harden::attach_in_window(
+            &mut self.db,
+            path,
+            LOCAL_SCHEMA,
+            harden::AttachPermits::CreateAndWrite,
+        )?;
+        // An attached database with no tables is a fresh one, on every
+        // target and with no filesystem probe, which wasm does not have.
+        if !local_tier_tables(&mut self.db)?.is_empty() {
+            return self.reconcile_tier(path, key);
+        }
+        let plan = self.config.tier_plan.clone();
+        let ddl = match (ddl, &plan) {
+            (Some(ddl), _) => ddl.to_owned(),
+            (None, Some(plan)) => plan.ddl.clone(),
+            (None, None) => String::new(),
+        };
+        for statement in ddl.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+            self.db.batch_execute(&qualify_tier_statement(statement)?)?;
+        }
+        if let Some(plan) = plan {
+            tier_migration::stamp(&mut self.db, LOCAL_SCHEMA, plan.build)?;
+        }
+        Ok(())
+    }
+
+    /// Bring the attached tier to the build's major: stamp one made before
+    /// majors existed, refuse one this build cannot reach, and migrate one
+    /// behind on its own connection before attaching it again.
+    fn reconcile_tier(&mut self, path: &str, key: Option<&ReplicaKey>) -> Result<(), ClientError> {
+        let Some(plan) = self.config.tier_plan.clone() else {
+            return Ok(());
+        };
+        let recorded = tier_migration::recorded(&mut self.db, LOCAL_SCHEMA)?;
+        match tier_migration::needed(recorded, &plan)? {
+            tier_migration::Needed::Nothing => {}
+            tier_migration::Needed::Stamp => {
+                tier_migration::stamp(&mut self.db, LOCAL_SCHEMA, plan.build)?;
+            }
+            tier_migration::Needed::Migrate(from) => {
+                // Released before the tier opens alone, so one file never has
+                // two live handles.
+                self.db.batch_execute("DETACH DATABASE connetto_local")?;
+                tier_migration::migrate_alone(path, key, &self.config.sql_functions, &plan, from)?;
+                harden::attach_in_window(
+                    &mut self.db,
+                    path,
+                    LOCAL_SCHEMA,
+                    harden::AttachPermits::Write,
+                )?;
+            }
+        }
         Ok(())
     }
 
