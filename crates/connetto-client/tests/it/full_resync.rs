@@ -12,8 +12,8 @@
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired, HandshakeAck, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    AggregateUpdate, BulkMessage, ControlMessage, FullResyncReason, FullResyncRequired,
+    HandshakeAck, SnapshotBegin, SnapshotEnd, SnapshotPatch, SubscriptionPriority,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::{LoopbackTransport, loopback};
@@ -24,6 +24,8 @@ const SQLITE_DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
 const QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 const SUB: &str = "orders";
+const AGG_QUERY: &str = "SELECT status, COUNT(*) AS count FROM orders GROUP BY status";
+const AGG_SUB: &str = "by-status";
 
 diesel::table! {
     /// Orders table, primary key id.
@@ -36,6 +38,26 @@ diesel::table! {
         quantity -> diesel::sql_types::BigInt,
         /// Order state as a string.
         status -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    /// The client's resting table for server-computed values, read back to assert
+    /// what a full-resync clear left behind.
+    #[sql_name = "_connetto_aggregates"]
+    rested (query_id, binds, group_key) {
+        /// The query-text row id.
+        query_id -> diesel::sql_types::Integer,
+        /// The canonical binds blob.
+        binds -> diesel::sql_types::Binary,
+        /// The opaque group key, or the empty blob for a scalar.
+        group_key -> diesel::sql_types::Binary,
+        /// The decoded group values, or NULL.
+        group_values_json -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        /// The value body.
+        result_json -> diesel::sql_types::Text,
+        /// The as-of time.
+        updated_at -> diesel::sql_types::BigInt,
     }
 }
 
@@ -194,5 +216,119 @@ async fn full_resync_drops_rows_deleted_during_the_outage() {
             .collect::<Vec<_>>(),
         vec![2],
         "the full-resync snapshot drops the row deleted during the outage",
+    );
+}
+
+/// Send one grouped aggregate frame for `group_key` carrying `result`.
+async fn send_aggregate(
+    server: &mut LoopbackTransport,
+    group_key: &[u8],
+    group_values: &str,
+    result: &str,
+) {
+    let _ = server
+        .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
+            sub_id: AGG_SUB.to_owned(),
+            group_key: Some(group_key.to_vec()),
+            group_values_json: Some(group_values.to_owned()),
+            result_json: Some(result.to_owned()),
+            is_full_result: true,
+        }))
+        .await;
+}
+
+/// A fake server that bootstraps a grouped aggregate with two groups, orders a
+/// full resync for it, then re-bootstraps a single group.
+fn aggregate_resync_server() -> LoopbackTransport {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        let _ = server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "agg-resync".to_owned(),
+                session_token: "agg-resync".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                resume_token: "agg-resync".to_owned(),
+                schema_version: None,
+                initial_credits: 64,
+                last_applied_seq: None,
+            }))
+            .await;
+        loop {
+            match server.recv().await {
+                Ok(Some(IncomingFrame::Control(ControlMessage::Subscribe(_)))) => break,
+                Ok(Some(_)) => {}
+                _ => return,
+            }
+        }
+        send_aggregate(&mut server, b"a", "[\"a\"]", "10").await;
+        send_aggregate(&mut server, b"b", "[\"b\"]", "20").await;
+        let _ = server
+            .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+                sub_id: AGG_SUB.to_owned(),
+                reason: FullResyncReason::AuthorizationChange,
+            }))
+            .await;
+        send_aggregate(&mut server, b"a", "[\"a\"]", "10").await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+    client_end
+}
+
+/// Every rested group key, ordered by stored key.
+fn rested_groups<T>(conn: &mut ConnettoConnection<T>) -> Vec<Vec<u8>>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    rested::table
+        .order(rested::group_key.asc())
+        .select(rested::group_key)
+        .load(conn.conn())
+        .expect("read the resting table")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_resync_drops_the_aggregate_resting_answer() {
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(aggregate_resync_server()),
+    )
+    .signed_in(super::support::held("token"))
+    .connect_driven()
+    .await
+    .expect("connect");
+    conn.subscribe(AGG_SUB, AGG_QUERY).await.expect("subscribe");
+
+    // The two bootstrap groups rest, then the resync notice lands.
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::FullResync { .. } => break,
+            ClientEvent::Closed => panic!("closed before the resync notice"),
+            _ => {}
+        }
+    }
+    // The re-bootstrap's single group rests on top of the cleared table.
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::Aggregate { .. } => break,
+            ClientEvent::Closed => panic!("closed before the re-bootstrap"),
+            _ => {}
+        }
+    }
+
+    let rows = rested_groups(&mut conn);
+    assert_eq!(
+        rows.len(),
+        1,
+        "the resync clear dropped the group the removed key revealed"
+    );
+    assert_eq!(
+        rows[0],
+        b"a".to_vec(),
+        "only the re-bootstrapped group rests"
     );
 }

@@ -183,6 +183,28 @@ fn remove(
     Ok(())
 }
 
+/// Delete every row of the statistic under `query_id` and `binds`, the whole
+/// resting answer a full-resync notice takes before the re-bootstrap rebuilds
+/// it (R95).
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica rejects the delete.
+pub(crate) fn clear(
+    conn: &mut SqliteConnection,
+    query_id: i32,
+    binds: &[BindValue],
+) -> Result<(), ClientError> {
+    let binds_blob = encode_binds(binds);
+    diesel::delete(
+        aggregate::table
+            .filter(aggregate::query_id.eq(query_id))
+            .filter(aggregate::binds.eq(&binds_blob)),
+    )
+    .execute(conn)?;
+    Ok(())
+}
+
 /// Replace every row of the statistic with the elements of a whole-result
 /// JSON array, keyed by position. This is the resting form of a re-executed
 /// row set (a demoted grouped fold or a join re-read): the array is the whole
