@@ -2147,7 +2147,6 @@ mod tests {
         }
     }
 
-    use std::os::unix::fs::PermissionsExt as _;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
 
@@ -2155,16 +2154,33 @@ mod tests {
 
     /// A stand-in `adb` that runs `body` with `$state` naming a scratch directory.
     fn fake_adb(dir: &Path, body: &str) -> PathBuf {
+        use std::io::Write as _;
         let path = dir.join("adb");
-        std::fs::write(
-            &path,
-            format!(
-                "#!/bin/sh\nstate={}\necho \"$*\" >>\"$state/calls\"\n{body}\n",
-                dir.display()
-            ),
-        )
-        .expect("write the fake adb");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        // Single-quoted, so a path with spaces or shell characters stays one
+        // word, and each quote inside it closes, escapes and reopens.
+        let state = dir.display().to_string().replace('\'', r"'\''");
+        let script =
+            format!("#!/bin/sh\nstate='{state}'\necho \"$*\" >>\"$state/calls\"\n{body}\n");
+        // A child process writes the script, so no descriptor open for
+        // writing it lives in this process, where another test's fork could
+        // inherit it and make the exec fail with "Text file busy".
+        let mut writer = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("cat >\"$0\" && chmod 755 \"$0\"")
+            .arg(&path)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .expect("start the writer");
+        writer
+            .stdin
+            .take()
+            .expect("the writer's input")
+            .write_all(script.as_bytes())
+            .expect("write the fake adb");
+        assert!(
+            writer.wait().expect("the writer ends").success(),
+            "the writer fails"
+        );
         path
     }
 
