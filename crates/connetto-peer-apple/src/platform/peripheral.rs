@@ -1,8 +1,13 @@
 //! The host's GATT service and beacon advertisement, over the process-wide
-//! peripheral manager on its one serial queue (R76).
+//! peripheral manager on its one serial queue (R76). On the Mac the service
+//! stands refused, and the manager stands the Bluetooth readiness alone,
+//! since the Mac never hosts (R76 decision 1).
 
 use std::collections::{HashMap, VecDeque};
-use std::sync::{LazyLock, mpsc};
+use std::sync::LazyLock;
+#[cfg(target_os = "ios")]
+use std::sync::mpsc;
+#[cfg(target_os = "ios")]
 use std::time::Duration;
 
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -10,12 +15,13 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, ProtocolObject};
 use objc2::{AnyThread, Message, define_class, msg_send};
 use objc2_core_bluetooth::{
-    CBATTError, CBATTRequest, CBAdvertisementDataServiceUUIDsKey, CBAttributePermissions,
-    CBCentral, CBCharacteristic, CBCharacteristicProperties, CBError, CBManager,
-    CBManagerAuthorization, CBManagerState, CBMutableCharacteristic, CBMutableService,
+    CBATTError, CBATTRequest, CBAdvertisementDataServiceUUIDsKey, CBCentral, CBCharacteristic,
+    CBManager, CBManagerAuthorization, CBManagerState, CBMutableCharacteristic, CBMutableService,
     CBPeripheralManager, CBPeripheralManagerDelegate, CBPeripheralManagerOptionShowPowerAlertKey,
     CBService, CBUUID,
 };
+#[cfg(target_os = "ios")]
+use objc2_core_bluetooth::{CBAttributePermissions, CBCharacteristicProperties, CBError};
 use objc2_foundation::{
     NSArray, NSData, NSDictionary, NSError, NSNumber, NSObject, NSObjectProtocol, NSString, NSUUID,
 };
@@ -23,10 +29,13 @@ use parking_lot::Mutex;
 
 use connetto_peer::{INBOX_UUID, OUTBOX_UUID, SERVICE_UUID};
 
+#[cfg(target_os = "ios")]
+use crate::HOP_WITHIN;
 use crate::bluetooth::{Event, PromptOutcome, State};
-use crate::{Error, HOP_WITHIN, key_from_uuid_text};
+use crate::{Error, key_from_uuid_text};
 
 /// The bound one hop onto the manager's queue gets.
+#[cfg(target_os = "ios")]
 const HOP: Duration = HOP_WITHIN;
 
 /// What the manager's queue and its delegate stand at.
@@ -65,6 +74,7 @@ enum Registration {
     #[default]
     Absent,
     /// A service add is in flight on the platform's queue.
+    #[cfg(target_os = "ios")]
     Adding,
     /// The service is registered.
     Registered,
@@ -131,6 +141,7 @@ pub(crate) fn prompt_outcome() -> Option<PromptOutcome> {
 }
 
 /// Open the GATT service and begin its beacon advertisement.
+#[cfg(target_os = "ios")]
 pub(crate) fn start() -> Result<(), Error> {
     ensure_manager(false, true);
     hop(|standing| {
@@ -153,7 +164,14 @@ pub(crate) fn start() -> Result<(), Error> {
     .and_then(|answer| answer)
 }
 
+/// The Mac never hosts, so its service stands refused (R76 decision 1).
+#[cfg(target_os = "macos")]
+pub(crate) fn start() -> Result<(), Error> {
+    Err(Error::Unsupported)
+}
+
 /// Stop the advertisement and close the service.
+#[cfg(target_os = "ios")]
 pub(crate) fn stop() -> Result<(), Error> {
     hop(|standing| {
         let Some(manager) = standing.manager.as_ref() else {
@@ -182,12 +200,23 @@ pub(crate) fn stop() -> Result<(), Error> {
     .and_then(|answer| answer)
 }
 
+/// The Mac stands no service, so the stop answers ready (R76 decision 1).
+#[cfg(target_os = "macos")]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "the Mac stands no service, so the stop answers ready"
+)]
+pub(crate) fn stop() -> Result<(), Error> {
+    Ok(())
+}
+
 /// Take the events the service has reported since the last call.
 pub(crate) fn poll() -> Vec<Event> {
     std::mem::take(&mut *EVENTS.lock())
 }
 
 /// Send one outbox notification to a subscribed central.
+#[cfg(target_os = "ios")]
 pub(crate) fn notify(device: u64, bytes: &[u8]) -> Result<(), Error> {
     let frame = bytes.to_vec();
     hop(move |standing| {
@@ -212,6 +241,12 @@ pub(crate) fn notify(device: u64, bytes: &[u8]) -> Result<(), Error> {
         }
     })
     .and_then(|answer| answer)
+}
+
+/// The Mac never hosts, so its service notifies no central (R76 decision 1).
+#[cfg(target_os = "macos")]
+pub(crate) fn notify(_device: u64, _bytes: &[u8]) -> Result<(), Error> {
+    Err(Error::Unsupported)
 }
 
 /// Close the central's connection, which the platform's peripheral role
@@ -293,6 +328,7 @@ fn begin_advertising(standing: &mut Standing) {
 }
 
 /// Register the service on the platform's queue.
+#[cfg(target_os = "ios")]
 fn add_service(standing: &mut Standing) {
     let Some(manager) = standing.manager.as_ref() else {
         return;
@@ -387,6 +423,7 @@ fn is_characteristic(characteristic: &CBCharacteristic, uuid: &[u8; 16]) -> bool
 }
 
 /// The platform's answer for a radio that is not on.
+#[cfg(target_os = "ios")]
 fn off_error() -> Error {
     Error::Apple {
         domain: "CoreBluetooth".to_owned(),
@@ -396,6 +433,7 @@ fn off_error() -> Error {
 }
 
 /// The platform's answer for a central that is not subscribed.
+#[cfg(target_os = "ios")]
 fn not_connected() -> Error {
     Error::Apple {
         domain: "CoreBluetooth".to_owned(),
@@ -410,6 +448,7 @@ fn describe(error: &NSError) -> String {
 }
 
 /// Run `work` on the manager's queue and take its answer.
+#[cfg(target_os = "ios")]
 fn hop<T: Send + 'static>(
     work: impl FnOnce(&mut Standing) -> T + Send + 'static,
 ) -> Result<T, Error> {

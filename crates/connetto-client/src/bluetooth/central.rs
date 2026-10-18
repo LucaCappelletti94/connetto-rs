@@ -210,13 +210,13 @@ async fn drive(adapter: Adapter, mut commands: mpsc::UnboundedReceiver<Command>,
                 let Some(command) = command else { break };
                 match command {
                     Command::StartScan => {
-                        // iOS scans only connetto's service (R76 decision
-                        // 25), Android and Linux scan wide.
-                        #[cfg(target_os = "ios")]
+                        // The Apple side scans only connetto's service
+                        // (R76 decision 25), Android and Linux scan wide.
+                        #[cfg(any(target_os = "ios", target_os = "macos"))]
                         let filter = ScanFilter {
                             services: vec![Uuid::from_bytes(SERVICE_UUID)],
                         };
-                        #[cfg(not(target_os = "ios"))]
+                        #[cfg(not(any(target_os = "ios", target_os = "macos")))]
                         let filter = ScanFilter::default();
                         if let Err(err) = adapter.start_scan(filter).await {
                             tracing::warn!(%err, "the scan did not start");

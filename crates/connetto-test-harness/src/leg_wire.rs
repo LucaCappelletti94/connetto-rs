@@ -1,7 +1,7 @@
-//! The pure standing of the linux leg proof (R76 slice 9b), beside the
-//! leg's child process in `linux_leg`. The leg's scan, its beacon's prefix
-//! and the phone's network standing the walk reads, and the helpers that
-//! name them.
+//! The pure parts of the two-device peer proof's leg (R76 slices 9b and
+//! 9c), the scan's hosts, the offer, the readings of the system's network
+//! tools and the leg bundle's `Info.plist`, beside the leg's process in
+//! [`leg`](crate::leg).
 
 use std::fmt::Write;
 use std::net::IpAddr;
@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 /// How long the adapter gets to report itself off after a power off.
 pub const ADAPTER_OFF_BOUND: Duration = Duration::from_secs(30);
-
 /// One nearby host the leg's scan stands on, as its standing.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct NearbyHost {
@@ -66,7 +65,7 @@ pub fn in_hotspot_subnet(remote: IpAddr) -> bool {
 /// The remote endpoint of one `ss -tnH state established` line, absent
 /// while the line names no endpoint or no address.
 pub fn ss_remote_address(line: &str) -> Option<IpAddr> {
-    // The endpoint is the line's last field: an address, a port, and
+    // The endpoint is the line's last field, an address and a port, with
     // brackets while the address is IPv6.
     let peer = line.split_whitespace().next_back()?;
     let address = if let Some(close) = peer.find(']')
@@ -92,10 +91,11 @@ pub fn ss_remote_address(line: &str) -> Option<IpAddr> {
 
 /// The host to join, where exactly one host stands in sight and its beacon
 /// carries `prefix`, and none while another host stands or the prefix does
-/// not show.
-pub fn single_nearby(hosts: &[NearbyHost], prefix: &str) -> Option<u64> {
+/// not show. A `None` prefix names an Apple host, whose beacon carries none
+/// (R76 decision 25), so the lone host then stands by its address.
+pub fn single_nearby(hosts: &[NearbyHost], prefix: Option<&str>) -> Option<u64> {
     match hosts {
-        [host] if host.prefix.as_deref() == Some(prefix) => Some(host.host),
+        [host] if host.prefix.as_deref() == prefix => Some(host.host),
         _ => None,
     }
 }
@@ -117,6 +117,52 @@ pub fn bluetooth_state(text: &str) -> BluetoothState {
         "not permitted" => BluetoothState::NotPermitted,
         _ => BluetoothState::Unsupported,
     }
+}
+
+/// The `Info.plist` the leg's bundle carries, its bundle id and executable
+/// and the usage texts the platform's prompts stand on.
+pub fn info_plist() -> &'static str {
+    r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.connetto.proofleg</string>
+	<key>CFBundleExecutable</key>
+	<string>ConnettoProofLeg</string>
+	<key>CFBundleName</key>
+	<string>ConnettoProofLeg</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>The proof leg scans the peer's beacon and runs the identity exchange over Bluetooth.</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>The proof leg links to the peer's hotspot over the local network.</string>
+	<key>NSLocationUsageDescription</key>
+	<string>The proof leg scans and joins the peer's hotspot, which macOS answers only with location access.</string>
+	<key>NSLocationWhenInUseUsageDescription</key>
+	<string>The proof leg scans and joins the peer's hotspot, which macOS answers only with location access.</string>
+</dict>
+</plist>
+"#
+}
+
+/// The gateway a `route -n get default` answer names, absent while the
+/// answer names none, which the mac walk reads while the Mac stands on its
+/// home network and after each join's leave.
+pub fn parse_default_gateway(output: &str) -> Option<IpAddr> {
+    output
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("gateway: "))
+        .and_then(|gateway| gateway.parse().ok())
 }
 
 #[cfg(test)]
@@ -164,7 +210,7 @@ wlp39s0          wifi      disconnected           --
             prefix: Some("a1b2c3d4e5f6a7b8".to_owned()),
             rssi: Some(-40),
         }];
-        assert_eq!(single_nearby(&hosts, "a1b2c3d4e5f6a7b8"), Some(7));
+        assert_eq!(single_nearby(&hosts, Some("a1b2c3d4e5f6a7b8")), Some(7));
     }
 
     #[test]
@@ -174,8 +220,23 @@ wlp39s0          wifi      disconnected           --
             prefix: Some("a1b2c3d4e5f6a7b8".to_owned()),
             rssi: None,
         }];
-        assert_eq!(single_nearby(&hosts, "ffffffffffffffff"), None);
-        assert_eq!(single_nearby(&[], "a1b2c3d4e5f6a7b8"), None);
+        assert_eq!(single_nearby(&hosts, Some("ffffffffffffffff")), None);
+        assert_eq!(single_nearby(&[], Some("a1b2c3d4e5f6a7b8")), None);
+    }
+
+    /// An Apple host's beacon carries no prefix (R76 decision 25), so the
+    /// lone host stands by its address, and a prefix where none was asked
+    /// for is another host.
+    #[test]
+    fn single_host_stands_without_a_prefix_where_none_is_carried() {
+        let host = |prefix: Option<&str>| NearbyHost {
+            host: 7,
+            prefix: prefix.map(str::to_owned),
+            rssi: Some(-64),
+        };
+        assert_eq!(single_nearby(&[host(None)], None), Some(7));
+        assert_eq!(single_nearby(&[host(Some("a1b2c3d4e5f6a7b8"))], None), None);
+        assert_eq!(single_nearby(&[host(None)], Some("a1b2c3d4e5f6a7b8")), None);
     }
 
     #[test]
@@ -192,7 +253,7 @@ wlp39s0          wifi      disconnected           --
                 rssi: None,
             },
         ];
-        assert_eq!(single_nearby(&hosts, "a1b2c3d4e5f6a7b8"), None);
+        assert_eq!(single_nearby(&hosts, Some("a1b2c3d4e5f6a7b8")), None);
     }
 
     #[test]
@@ -261,5 +322,45 @@ wlp39s0          wifi      disconnected           --
         assert!(in_hotspot_subnet(IpAddr::from([10, 42, 0, 2])));
         assert!(!in_hotspot_subnet(IpAddr::from([192, 168, 1, 2])));
         assert!(!in_hotspot_subnet(IpAddr::from([10, 42, 1, 2])));
+    }
+
+    #[test]
+    fn the_default_gateway_reads_a_gateway_line() {
+        let output = "\
+   route to: default
+destination: default
+        mask: default
+        interface: en0
+    gateway: 192.168.1.254
+";
+        assert_eq!(
+            parse_default_gateway(output),
+            Some(IpAddr::from([192, 168, 1, 254]))
+        );
+    }
+
+    #[test]
+    fn the_default_gateway_names_none_without_a_gateway() {
+        assert_eq!(parse_default_gateway(""), None);
+        assert_eq!(parse_default_gateway("   route to: default\n"), None);
+        assert_eq!(parse_default_gateway("    gateway: not-an-address\n"), None);
+    }
+
+    #[test]
+    fn the_leg_bundle_plist_names_every_permission() {
+        let plist = info_plist();
+        for key in [
+            "CFBundleIdentifier",
+            "CFBundleExecutable",
+            "LSUIElement",
+            "NSBluetoothAlwaysUsageDescription",
+            "NSLocalNetworkUsageDescription",
+            "NSLocationUsageDescription",
+            "NSLocationWhenInUseUsageDescription",
+        ] {
+            assert!(plist.contains(&format!("<key>{key}</key>")), "{key}");
+        }
+        assert!(plist.contains("dev.connetto.proofleg"));
+        assert!(plist.contains("ConnettoProofLeg"));
     }
 }

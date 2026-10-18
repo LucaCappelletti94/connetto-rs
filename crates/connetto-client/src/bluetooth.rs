@@ -29,18 +29,28 @@ use crate::hotspot::{
 
 #[cfg(target_os = "android")]
 mod android;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 mod apple;
-#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos"
+))]
 mod central;
 #[cfg(target_os = "linux")]
 mod linux;
 
 #[cfg(target_os = "android")]
 pub(crate) use android::AndroidBluetoothBackend;
-#[cfg(target_os = "ios")]
+#[cfg(any(target_os = "ios", target_os = "macos"))]
 pub(crate) use apple::AppleBluetoothBackend;
-#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos"
+))]
 pub(crate) use central::BtleplugCentral;
 #[cfg(target_os = "linux")]
 pub(crate) use linux::LinuxBluetoothBackend;
@@ -202,7 +212,12 @@ pub struct NearbyHost {
 
 /// An event the host's GATT service reports (R76).
 #[cfg_attr(
-    not(any(target_os = "android", target_os = "ios", target_os = "linux")),
+    not(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )),
     expect(
         dead_code,
         reason = "the platform backends construct these events, a non-Apple build reads them through the tables only"
@@ -235,7 +250,13 @@ pub enum PeripheralEvent {
 
 /// An event the joiner's central reports (R76).
 #[cfg_attr(
-    not(any(test, target_os = "android", target_os = "ios", target_os = "linux")),
+    not(any(
+        test,
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos"
+    )),
     expect(
         dead_code,
         reason = "btleplug's central runs on Android and iOS, so elsewhere only the proofs construct these events"
@@ -318,10 +339,10 @@ pub trait CentralBackend: Send + Sync {
 }
 
 /// The backends on a system with no Bluetooth.
-#[cfg(any(test, not(target_os = "ios")))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
 pub struct UnsupportedBackend;
 
-#[cfg(any(test, not(target_os = "ios")))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
 impl ReadinessBackend for UnsupportedBackend {
     fn state(&self) -> BluetoothState {
         BluetoothState::Unsupported
@@ -340,7 +361,7 @@ impl ReadinessBackend for UnsupportedBackend {
     }
 }
 
-#[cfg(any(test, not(target_os = "ios")))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
 impl PeripheralBackend for UnsupportedBackend {
     fn start(&self, _beacon: [u8; 9]) -> Result<(), BluetoothError> {
         Err(BluetoothError::Unsupported)
@@ -361,7 +382,7 @@ impl PeripheralBackend for UnsupportedBackend {
 
 /// A system's readiness, its peripheral, and its central's starter where it
 /// runs one.
-#[cfg(any(test, not(target_os = "ios")))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
 pub(crate) type Backends = (
     Arc<dyn ReadinessBackend>,
     Arc<dyn PeripheralBackend>,
@@ -369,7 +390,7 @@ pub(crate) type Backends = (
 );
 
 /// The backends on a system with no Bluetooth, which runs no central.
-#[cfg(any(test, not(target_os = "ios")))]
+#[cfg(any(test, not(any(target_os = "ios", target_os = "macos"))))]
 pub(crate) fn unsupported_backends() -> Backends {
     (
         Arc::new(UnsupportedBackend) as Arc<dyn ReadinessBackend>,
@@ -600,7 +621,12 @@ pub(crate) type CentralStarter = Arc<dyn Fn() -> CentralStart + Send + Sync>;
 
 /// btleplug's central as the machine's starter, which the machine runs once
 /// Bluetooth reads Ready and again after a failed start (R76 decision 22).
-#[cfg(any(target_os = "android", target_os = "ios", target_os = "linux"))]
+#[cfg(any(
+    target_os = "android",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "macos"
+))]
 pub(crate) fn btleplug_starter() -> CentralStarter {
     Arc::new(|| -> CentralStart {
         Box::pin(async {

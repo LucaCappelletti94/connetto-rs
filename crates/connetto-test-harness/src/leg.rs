@@ -1,24 +1,31 @@
-//! The linux leg of the two-device peer proof (R76 slice 9b), the native
-//! client the run drives in place of a second phone, so pippo and the phone
-//! make every join both ways.
+//! The leg of the two-device peer proof (R76 slices 9b and 9c), the native
+//! client the run drives in place of a second phone, so the phone and the
+//! leg make every join both ways.
 //!
-//! The leg runs in a child process of the proof binary, because the
-//! client's linux keyring detection reads the process environment, which
-//! the proof sets for the child alone. The child signs in as its own
-//! account through a fake browser that walks the real OIDC chain, keeps its
-//! refresh token and its replica key in sealed files under the evidence
-//! directory, and serves a line-based JSON protocol on its standard
-//! streams. The proof sends one line per command, each carrying an id, and
-//! reads one line per answer, matched by the id, plus a fatal event line
-//! when the client stands down. The `linked` and `nearby` answers read the
-//! client's own standing, so a missed broadcast event leaves nothing
-//! stale, and the pump keeps the one-shot fatal notices. A lag is itself
-//! a fatal line, since a missed fatal notice cannot be read back.
+//! The leg runs in a child process of the proof binary. On linux that is a
+//! direct spawn, since the client's keyring detection reads the process
+//! environment, which the proof sets for the child alone. On macos it is a
+//! signed `ConnettoProofLeg.app` started through `open`, so Launch
+//! Services stands the leg as its own responsible process, its grants
+//! persist across runs, and its secrets sit in the login keychain, which
+//! the bundle reaches without a provisioning profile. The child signs in
+//! as its own account through a fake browser that walks the real OIDC
+//! chain, keeps its refresh token and its replica key in sealed files
+//! under the evidence directory, and serves a line-based JSON protocol on
+//! its standard streams. The proof sends one line per command, each
+//! carrying an id, and reads one line per answer, matched by the id, plus
+//! a fatal event line when the client stands down. The `linked` and
+//! `nearby` answers read the client's own standing, so a missed broadcast
+//! event leaves nothing stale, and the pump keeps the one-shot fatal
+//! notices. A lag is itself a fatal line, since a missed fatal notice
+//! cannot be read back.
 
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::ops::ControlFlow;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -27,21 +34,41 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::{
     AccountChoice, Auth, BeaconState, BluetoothError, BluetoothState, BrowserOpener, ClientEvent,
-    HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinNearbyError, NativeClient,
+    Gate, HotspotError, HotspotOffer, HotspotSecurity, JoinError, JoinNearbyError, NativeClient,
     NativeClientBuilder, NativeTransport, SyncSchema, WifiPayloadError,
 };
 use parking_lot::Mutex as Lock;
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin};
+use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncLock;
 use tokio::sync::broadcast::error::RecvError;
 use tokio::time::{Instant, sleep, timeout};
 use uuid::Uuid;
 
-use crate::linux_proof::{LegOffer, NearbyHost, bluetooth_state, hex_prefix, single_nearby};
+#[cfg(target_os = "macos")]
+use crate::leg_wire::info_plist;
+use crate::leg_wire::{LegOffer, NearbyHost, bluetooth_state, hex_prefix, single_nearby};
 use crate::peer_devices::LINK_END_BOUND;
 use crate::stack::DEMO_DEVICE_ROOT_VAR;
+#[cfg(target_os = "macos")]
+use crate::stack::repo_path;
+
+/// The leg's command stream end the proof writes through, a pipe on linux
+/// and the fifos' write end on macos.
+#[cfg(not(target_os = "macos"))]
+type LegIn = tokio::process::ChildStdin;
+/// The leg's answer stream end the proof reads from, a pipe on linux and
+/// the fifos' read end on macos.
+#[cfg(not(target_os = "macos"))]
+type LegOut = tokio::process::ChildStdout;
+/// The leg's command stream end the proof writes through, the fifos' write
+/// end.
+#[cfg(target_os = "macos")]
+type LegIn = tokio::net::unix::pipe::Sender;
+/// The leg's answer stream end the proof reads from, the fifos' read end.
+#[cfg(target_os = "macos")]
+type LegOut = tokio::net::unix::pipe::Receiver;
 
 /// How long a state query gets on the leg's command stream.
 const QUERY_BOUND: Duration = Duration::from_secs(15);
@@ -49,17 +76,52 @@ const QUERY_BOUND: Duration = Duration::from_secs(15);
 const ACTION_BOUND: Duration = Duration::from_secs(90);
 /// How long the leg gets to sign in, enrol and serve its peer listener.
 const READY_BOUND: Duration = Duration::from_secs(120);
+/// How long the leg's own sign-in and enrolment get, inside [`READY_BOUND`],
+/// so a failed sign-in ends the leg with its reason before the proof gives up.
+const SIGN_IN_BOUND: Duration = Duration::from_secs(90);
 /// How long the leg's scan gets to find the host's beacon.
 const NEARBY_BOUND: Duration = Duration::from_secs(60);
 /// How long the leg gets to close once the proof asks it.
 const CLOSE_BOUND: Duration = Duration::from_secs(30);
 
+/// How long the platform's location prompt gets a grant, which the leg's
+/// first join on macos asks.
+#[cfg(target_os = "macos")]
+const GRANT_BOUND: Duration = Duration::from_secs(300);
+/// How long a join command gets, past the location grant the leg's first
+/// join on macos waits on.
+#[cfg(target_os = "macos")]
+const JOIN_BOUND: Duration = ACTION_BOUND.saturating_add(GRANT_BOUND);
+/// How long a join command gets.
+#[cfg(not(target_os = "macos"))]
+const JOIN_BOUND: Duration = ACTION_BOUND;
+
 /// The data directory the leg keeps its replica in, which the proof names.
+#[cfg(not(target_os = "macos"))]
 const DATA_VAR: &str = "CONNETTO_LINUX_LEG_DATA";
+/// The evidence subdirectory the leg's directories sit in.
+#[cfg(not(target_os = "macos"))]
+const LEG_DIR: &str = "linux-leg";
+/// The keyring service the leg's sealed records name.
+#[cfg(not(target_os = "macos"))]
+const LEG_SERVICE: &str = "connetto-linux-proof";
+/// The data directory the leg keeps its replica in, which the proof names.
+#[cfg(target_os = "macos")]
+const DATA_VAR: &str = "CONNETTO_MAC_LEG_DATA";
+/// The evidence subdirectory the leg's directories and fifos sit in.
+#[cfg(target_os = "macos")]
+const LEG_DIR: &str = "mac-leg";
+/// The keyring service the leg's login keychain items name.
+#[cfg(target_os = "macos")]
+const LEG_SERVICE: &str = "connetto-mac-proof";
+/// The bundle the mac leg stands in, beside the run's evidence.
+#[cfg(target_os = "macos")]
+const LEG_BUNDLE: &str = "ConnettoProofLeg.app";
+/// The executable the bundle carries, a copy of the running proof binary.
+#[cfg(target_os = "macos")]
+const LEG_EXECUTABLE: &str = "ConnettoProofLeg";
 /// The account the leg signs in as, beside the phone's own.
 const LEG_USER: &str = "bob";
-/// The keyring service the leg's sealed records name.
-const LEG_SERVICE: &str = "connetto-linux-proof";
 /// The provider name the demo stack registers.
 const PROVIDER: &str = "dev-idp";
 
@@ -67,7 +129,7 @@ const PROVIDER: &str = "dev-idp";
 /// stream and the waits the walk drives over it.
 pub struct LegClient {
     child: AsyncLock<Child>,
-    stdin: AsyncLock<Option<ChildStdin>>,
+    stdin: AsyncLock<Option<LegIn>>,
     next_id: AtomicU64,
     answers: Arc<Answers>,
     log: Arc<Lock<Vec<String>>>,
@@ -107,15 +169,16 @@ impl Answers {
     }
 }
 
-/// Drive the leg, the child process of the proof binary, which signs in,
-/// enrols and serves the command protocol until the proof asks it to close.
+/// Drive the leg in its own process, the child of the proof binary, the
+/// sign in, the enrolment and the command protocol until the proof asks it
+/// to close.
 ///
 /// # Errors
 ///
 /// When a named environment is missing, the demo schema does not translate,
 /// the sign-in or the enrolment fails, or the command stream breaks.
 pub async fn run_leg() -> Result<()> {
-    // The leg's own steps land in `linux-leg.log` beside the evidence, the
+    // The leg's own steps land in its log file beside the evidence, the
     // radios' and the link's included.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::new(
@@ -157,20 +220,58 @@ pub async fn run_leg() -> Result<()> {
     let connect = NativeClientBuilder::new(ws_url, SyncSchema::new(bundle))
         .signed_in(sign_in)
         .durable(data_dir.as_str())
+        // The leg runs unattended, so its secrets stand ungated on every
+        // platform, as Linux keeps them, and no Touch ID prompt waits.
+        .with_gate(Gate::off())
         .with_deployment_roots([root])
         // With autolink on, the leg's join dials the gateway at the offer's port.
         .with_peer_autolink(true)
         .connect();
-    let client = Box::pin(connect).await.map_err(|err| {
-        let detail = failure.lock().take();
-        match detail {
-            Some(detail) => {
-                anyhow!("the linux leg never signed in: {err:#}, the fake browser: {detail}")
-            }
-            None => anyhow!("the linux leg never signed in: {err:#}"),
-        }
-    })?;
+    // A login whose browser hop failed waits on its loopback callback with
+    // no end, so the sign-in gets a bound that names the hop's failure.
+    let connected = timeout(SIGN_IN_BOUND, Box::pin(connect)).await;
+    let browser = || {
+        failure.lock().take().map_or_else(String::new, |detail| {
+            format!(", the fake browser: {detail}")
+        })
+    };
+    let client = match connected {
+        Ok(Ok(client)) => client,
+        Ok(Err(err)) => bail!("the leg never signed in: {err:#}{}", browser()),
+        Err(_) => bail!(
+            "the leg did not sign in within {SIGN_IN_BOUND:?}{}",
+            browser()
+        ),
+    };
     serve(client).await
+}
+
+/// Run the leg as a process of its own, the sign in, the enrolment and the
+/// command protocol on the process's standard streams.
+///
+/// On macos the main thread stands the platform's main queue draining,
+/// which the Location Services prompt and its reads stand on, and the leg
+/// itself runs on a worker thread's runtime, which ends the process when
+/// it answers.
+///
+/// # Errors
+///
+/// As [`run_leg`].
+pub fn leg_process() -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("starting the leg's runtime")?;
+    #[cfg(target_os = "macos")]
+    {
+        std::thread::spawn(move || match runtime.block_on(run_leg()) {
+            Ok(()) => std::process::exit(0),
+            Err(err) => {
+                eprintln!("the mac leg stood down: {err:#}");
+                std::process::exit(1);
+            }
+        });
+        dispatch2::dispatch_main();
+    }
+    #[cfg(not(target_os = "macos"))]
+    runtime.block_on(run_leg())
 }
 
 /// The command loop, one JSON line per command and one per answer, until
@@ -316,6 +417,14 @@ enum LegCommandError {
     /// The client's nearby join refused.
     #[error(transparent)]
     NearbyJoin(#[from] JoinNearbyError),
+    /// The platform's location access stands denied.
+    #[cfg(target_os = "macos")]
+    #[error("location access stands denied")]
+    LocationDenied,
+    /// The platform's location access never settled to a grant.
+    #[cfg(target_os = "macos")]
+    #[error("location access never stood granted within {0:?}")]
+    LocationUnsettled(Duration),
 }
 
 /// The answers that read the client's standing.
@@ -457,14 +566,24 @@ async fn handle_action(
 ///
 /// # Errors
 ///
-/// When the hotspot's join will not go.
+/// When the hotspot's join will not go, or, on macos, the location grant
+/// the first join asks will not settle.
 async fn join_gateway(
     client: &NativeClient<NativeTransport>,
     offer: &HotspotOffer,
 ) -> Result<serde_json::Value, LegCommandError> {
-    client
-        .join_hotspot(offer)
-        .await
+    let joined = client.join_hotspot(offer).await;
+    #[cfg(target_os = "macos")]
+    let joined = if matches!(&joined, Err(JoinError::MissingPermission(_))) {
+        // macOS refuses a join by name without Location Services access,
+        // so the leg asks for it the way the demo does, waits for the
+        // grant and joins again (R76 slice 9c).
+        request_location_grant().await?;
+        client.join_hotspot(offer).await
+    } else {
+        joined
+    };
+    joined
         .map(|gateway| json!({ "gateway": gateway.to_string() }))
         .map_err(LegCommandError::Join)
 }
@@ -486,6 +605,36 @@ fn pump_received(
         Err(RecvError::Closed) => return ControlFlow::Break(()),
     }
     ControlFlow::Continue(())
+}
+
+/// Ask the platform for its location access and hold until it stands
+/// granted, which the leg's first join on macos needs.
+///
+/// # Errors
+///
+/// When the standing is a denial, or never settles to a grant within
+/// [`GRANT_BOUND`].
+#[cfg(target_os = "macos")]
+async fn request_location_grant() -> Result<(), LegCommandError> {
+    use connetto_peer_apple::hotspot::{LocationAccess, location_access, request_location_access};
+    if location_access() == LocationAccess::Granted {
+        return Ok(());
+    }
+    request_location_access();
+    let deadline = Instant::now() + GRANT_BOUND;
+    loop {
+        match location_access() {
+            LocationAccess::Granted => return Ok(()),
+            LocationAccess::Denied => {
+                return Err(LegCommandError::LocationDenied);
+            }
+            LocationAccess::NotAsked => {}
+        }
+        if Instant::now() >= deadline {
+            return Err(LegCommandError::LocationUnsettled(GRANT_BOUND));
+        }
+        sleep(Duration::from_secs(2)).await;
+    }
 }
 
 /// The one-shot fatal notices the leg reports as its fatal lines, the rest
@@ -630,13 +779,18 @@ fn fake_browser(subject: &str, failure: Arc<Lock<Option<String>>>) -> BrowserOpe
 impl LegClient {
     /// Start the leg under `evidence`, giving it a fresh credential and state
     /// directory with a fresh wrap key, the data directory beside them, and
-    /// the child re-running this binary as its own process.
+    /// the child re-running this binary as its own process, which on linux
+    /// is a direct spawn and on macos a signed bundle through `open`.
+    ///
+    /// `identity` names the signing identity the macos bundle signs with,
+    /// which the linux child ignores.
     ///
     /// # Errors
     ///
-    /// When the directories cannot be made or the child will not start.
-    pub async fn spawn(evidence: &Path) -> Result<Self> {
-        let dir = evidence.join("linux-leg");
+    /// When the directories cannot be made, the bundle cannot be signed or
+    /// the child will not start.
+    pub async fn spawn(evidence: &Path, identity: Option<&str>) -> Result<Self> {
+        let dir = evidence.join(LEG_DIR);
         let credentials = dir.join("credentials");
         let state = dir.join("state");
         let data = dir.join("data");
@@ -652,33 +806,27 @@ impl LegClient {
             .await
             .context("writing the leg's wrap key")?;
         let program = std::env::current_exe().context("finding the proof binary")?;
-        let mut child = tokio::process::Command::new(program)
-            .arg("--linux-leg")
-            .env("CREDENTIALS_DIRECTORY", &credentials)
-            .env("STATE_DIRECTORY", &state)
-            .env(DATA_VAR, &data)
-            // A portal marker in the proof's environment would send the
-            // child's keyring detection to the sandbox instead of the
-            // sealed files.
-            .env_remove("DESKTOP_PORTAL")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("starting the linux leg")?;
-        let stdin = child.stdin.take().context("the leg has no stdin")?;
-        let stdout = child.stdout.take().context("the leg has no stdout")?;
-        let stderr = child.stderr.take().context("the leg has no stderr")?;
+        // The identity stands for the macos bundle's signature, which the
+        // linux child never reads.
+        #[cfg(not(target_os = "macos"))]
+        let _ = identity;
+        #[cfg(not(target_os = "macos"))]
+        let (child, stdin, stdout, stderr) = spawn_linux(&program, &credentials, &state, &data)?;
+        #[cfg(target_os = "macos")]
+        let (child, stdin, stdout) = spawn_macos(&program, evidence, &data, identity).await?;
         let child = AsyncLock::new(child);
         let log = Arc::new(Lock::new(Vec::new()));
-        let log_lines = Arc::clone(&log);
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                eprintln!("[leg] {line}");
-                log_lines.lock().push(line);
-            }
-        });
+        #[cfg(not(target_os = "macos"))]
+        {
+            let log_lines = Arc::clone(&log);
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    eprintln!("[leg] {line}");
+                    log_lines.lock().push(line);
+                }
+            });
+        }
         let answers = Arc::new(Answers::default());
         let read_answers = Arc::clone(&answers);
         tokio::spawn(async move {
@@ -715,7 +863,7 @@ impl LegClient {
         // A fatal line that landed before the wait stood ends it here.
         if let Some(cause) = self.answers.fatal() {
             self.answers.waiters.lock().remove(&id);
-            bail!("the linux leg stood down before {command}: {cause}");
+            bail!("the leg stood down before {command}: {cause}");
         }
         let mut request = body;
         request["id"] = json!(id);
@@ -739,24 +887,24 @@ impl LegClient {
         if let Err(err) = written {
             self.answers.waiters.lock().remove(&id);
             if self.exited().await {
-                bail!("the linux leg exited before it took {command}");
+                bail!("the leg exited before it took {command}");
             }
-            bail!("writing {command} to the linux leg: {err}");
+            bail!("writing {command} to the leg: {err}");
         }
         let answer = match timeout(bound, receiver).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) => match self.answers.fatal() {
                 Some(cause) => {
-                    bail!("the linux leg stood down before it answered {command}: {cause}")
+                    bail!("the leg stood down before it answered {command}: {cause}")
                 }
-                None => bail!("the linux leg closed its stream without answering {command}"),
+                None => bail!("the leg closed its stream without answering {command}"),
             },
             Err(_) => {
                 self.answers.waiters.lock().remove(&id);
                 if self.exited().await {
-                    bail!("the linux leg exited before it answered {command}");
+                    bail!("the leg exited before it answered {command}");
                 }
-                bail!("the linux leg gave no {command} answer within {bound:?}");
+                bail!("the leg gave no {command} answer within {bound:?}");
             }
         };
         if answer.get("ok") != Some(&json!(true)) {
@@ -764,7 +912,7 @@ impl LegClient {
                 .get("error")
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or("an unnamed refusal");
-            bail!("the linux leg refused {command}: {reason}");
+            bail!("the leg refused {command}: {reason}");
         }
         Ok(answer
             .get("result")
@@ -938,7 +1086,7 @@ impl LegClient {
             .request(
                 "join-form",
                 json!({ "ssid": ssid, "passphrase": passphrase, "port": port }),
-                ACTION_BOUND,
+                JOIN_BOUND,
             )
             .await?;
         gateway(&answer)
@@ -951,7 +1099,7 @@ impl LegClient {
     /// As [`LegClient::join_form`].
     pub async fn join_payload(&self, payload: &str) -> Result<IpAddr> {
         let answer = self
-            .request("join-payload", json!({ "payload": payload }), ACTION_BOUND)
+            .request("join-payload", json!({ "payload": payload }), JOIN_BOUND)
             .await?;
         gateway(&answer)
     }
@@ -964,7 +1112,7 @@ impl LegClient {
     /// As [`LegClient::join_form`].
     pub async fn join_nearby(&self, host: &u64) -> Result<(String, IpAddr)> {
         let answer = self
-            .request("join-nearby", json!({ "host": host }), ACTION_BOUND)
+            .request("join-nearby", json!({ "host": host }), JOIN_BOUND)
             .await?;
         let identity = answer
             .get("identity")
@@ -989,10 +1137,10 @@ impl LegClient {
                 (Ok(identity), Ok(serving)) => return Ok((identity, serving)),
                 (Err(err), _) | (_, Err(err)) => {
                     if self.exited().await {
-                        bail!("the linux leg exited before it stood: {err:#}");
+                        bail!("the leg exited before it stood: {err:#}");
                     }
                     if Instant::now() >= deadline {
-                        bail!("the linux leg never stood within {READY_BOUND:?}: {err:#}");
+                        bail!("the leg never stood within {READY_BOUND:?}: {err:#}");
                     }
                 }
             }
@@ -1013,7 +1161,7 @@ impl LegClient {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("the linux leg never named {peer} as linked, it names: {linked:?}");
+                bail!("the leg never named {peer} as linked, it names: {linked:?}");
             }
             sleep(Duration::from_secs(1)).await;
         }
@@ -1033,20 +1181,21 @@ impl LegClient {
                 return Ok(());
             }
             if Instant::now() >= deadline {
-                bail!("the linux leg still names {peer} as linked after the leave and the stop");
+                bail!("the leg still names {peer} as linked after the leave and the stop");
             }
             sleep(Duration::from_secs(2)).await;
         }
     }
 
     /// Hold until the leg's scan stands the host whose beacon carries
-    /// `prefix` and it alone, which the beacon join names to the walk.
+    /// `prefix` and it alone, which the beacon join names to the walk, with
+    /// `None` for an Apple host, whose beacon carries no prefix.
     ///
     /// # Errors
     ///
     /// When the leg never stands a lone host with the prefix within the
     /// bound.
-    pub async fn wait_nearby(&self, prefix: &str) -> Result<u64> {
+    pub async fn wait_nearby(&self, prefix: Option<&str>) -> Result<u64> {
         let deadline = Instant::now() + NEARBY_BOUND;
         loop {
             let hosts = self.nearby().await?;
@@ -1055,7 +1204,7 @@ impl LegClient {
             }
             if Instant::now() >= deadline {
                 bail!(
-                    "the linux leg never stood a lone host with the beacon prefix {prefix}, \
+                    "the leg never stood a lone host with the beacon prefix {prefix:?}, \
                      it stands: {hosts:?}"
                 );
             }
@@ -1076,7 +1225,7 @@ impl LegClient {
                 return Ok(prefix);
             }
             if Instant::now() >= deadline {
-                bail!("the linux leg's beacon never advertised within {NEARBY_BOUND:?}");
+                bail!("the leg's beacon never advertised within {NEARBY_BOUND:?}");
             }
             sleep(Duration::from_secs(2)).await;
         }
@@ -1094,7 +1243,7 @@ impl LegClient {
                 return Ok(port);
             }
             if Instant::now() >= deadline {
-                bail!("the linux leg never served its peer listener within {NEARBY_BOUND:?}");
+                bail!("the leg never served its peer listener within {NEARBY_BOUND:?}");
             }
             sleep(Duration::from_secs(2)).await;
         }
@@ -1117,15 +1266,18 @@ impl LegClient {
             match exit {
                 Ok(Some(status)) if status.success() => return Ok(()),
                 Ok(Some(status)) => {
-                    bail!("the linux leg exited with {status} while the proof asked it to close");
+                    bail!("the leg exited with {status} while the proof asked it to close");
                 }
-                Err(err) => bail!("reading the linux leg's exit: {err}"),
+                Err(err) => bail!("reading the leg's exit: {err}"),
                 Ok(None) => {
                     if Instant::now() >= deadline {
+                        // On macos the child is `open`, so the app ends apart.
+                        #[cfg(target_os = "macos")]
+                        end_leg_app().await;
                         let mut child = self.child.lock().await;
                         let _ = child.kill().await;
                         let _ = child.wait().await;
-                        bail!("the linux leg did not close within {CLOSE_BOUND:?}");
+                        bail!("the leg did not close within {CLOSE_BOUND:?}");
                     }
                     sleep(Duration::from_millis(200)).await;
                 }
@@ -1152,6 +1304,229 @@ fn gateway(answer: &serde_json::Value) -> Result<IpAddr> {
         .ok_or_else(|| anyhow!("the join answer names no gateway"))?;
     text.parse()
         .map_err(|err| anyhow!("the join answer names no gateway address: {err}"))
+}
+
+/// The linux leg's child, a direct spawn carrying the sealed-files keyring
+/// environment the proof sets for it alone.
+///
+/// # Errors
+///
+/// When the child will not start.
+#[cfg(not(target_os = "macos"))]
+fn spawn_linux(
+    program: &Path,
+    credentials: &Path,
+    state: &Path,
+    data: &Path,
+) -> Result<(Child, LegIn, LegOut, tokio::process::ChildStderr)> {
+    let mut child = Command::new(program)
+        .arg("--linux-leg")
+        .env("CREDENTIALS_DIRECTORY", credentials)
+        .env("STATE_DIRECTORY", state)
+        .env(DATA_VAR, data)
+        // A portal marker in the proof's environment would send the
+        // child's keyring detection to the sandbox instead of the
+        // sealed files.
+        .env_remove("DESKTOP_PORTAL")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("starting the linux leg")?;
+    let stdin = child.stdin.take().context("the leg has no stdin")?;
+    let stdout = child.stdout.take().context("the leg has no stdout")?;
+    let stderr = child.stderr.take().context("the leg has no stderr")?;
+    Ok((child, stdin, stdout, stderr))
+}
+
+/// The macos leg's start, the bundle built and signed, the fifos made, and
+/// `open` standing the app with the stack's environment through `--env`,
+/// so the platform's grants follow the bundle and the run's fifos carry
+/// the leg's standard streams.
+///
+/// # Errors
+///
+/// When the bundle cannot be made or signed, a named environment is
+/// missing, `open` will not start, or the app never opens the fifos.
+#[cfg(target_os = "macos")]
+async fn spawn_macos(
+    program: &Path,
+    evidence: &Path,
+    data: &Path,
+    identity: Option<&str>,
+) -> Result<(Child, LegIn, LegOut)> {
+    let identity = identity
+        .map(str::to_owned)
+        .context("the mac leg needs the identity connetto-ios-signing printed")?;
+    crate::ios_signing::unlock().await?;
+    let app = build_bundle(program, &identity).await?;
+    let dir = evidence.join(LEG_DIR);
+    let fifo_in = dir.join("fifo-in");
+    let fifo_out = dir.join("fifo-out");
+    for fifo in [&fifo_in, &fifo_out] {
+        let _ = tokio::fs::remove_file(fifo).await;
+        mkfifo(fifo).await?;
+    }
+    // The ends open before `open` runs, since the system opens the app's
+    // ends inside its own launch, and a fifo open there blocks Launch
+    // Services for the whole session until the other end opens.
+    let (stdin, stdout) = open_fifo_ends(&fifo_in, &fifo_out)?;
+    let var = |key: &str| {
+        std::env::var(key).map_err(|_| anyhow!("{key} is unset, run under connetto-demo-stack"))
+    };
+    let ws = var("CONNETTO_DEMO_WS")?;
+    let auth_origin = var("CONNETTO_DEMO_AUTH_ORIGIN")?;
+    let device_root = var(DEMO_DEVICE_ROOT_VAR)?;
+    let child = Command::new("open")
+        .arg("-W")
+        .arg("-n")
+        .arg("--stdin")
+        .arg(&fifo_in)
+        .arg("--stdout")
+        .arg(&fifo_out)
+        .arg("--stderr")
+        .arg(evidence.join("mac-leg.log"))
+        .arg("--env")
+        .arg(format!("{DATA_VAR}={}", data.display()))
+        .arg("--env")
+        .arg(format!("CONNETTO_DEMO_WS={ws}"))
+        .arg("--env")
+        .arg(format!("CONNETTO_DEMO_AUTH_ORIGIN={auth_origin}"))
+        .arg("--env")
+        .arg(format!("{DEMO_DEVICE_ROOT_VAR}={device_root}"))
+        .arg(&app)
+        .arg("--args")
+        .arg("--mac-leg")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .context("starting open for the mac leg")?;
+    Ok((child, stdin, stdout))
+}
+
+/// The leg's bundle, rebuilt for every run, the running proof binary under
+/// a minimal `ConnettoProofLeg.app`, signed with the identity and verified,
+/// so Launch Services stands the leg as its own responsible process.
+///
+/// # Errors
+///
+/// When the bundle cannot be made, signed or verified.
+#[cfg(target_os = "macos")]
+async fn build_bundle(program: &Path, identity: &str) -> Result<PathBuf> {
+    let app = repo_path(&["target", "proof-leg"])?.join(LEG_BUNDLE);
+    let contents = app.join("Contents");
+    let macos = contents.join("MacOS");
+    tokio::fs::create_dir_all(&macos)
+        .await
+        .with_context(|| format!("creating {}", macos.display()))?;
+    tokio::fs::copy(program, macos.join(LEG_EXECUTABLE))
+        .await
+        .with_context(|| format!("copying the proof binary into {}", app.display()))?;
+    tokio::fs::write(contents.join("Info.plist"), info_plist())
+        .await
+        .with_context(|| "writing the bundle's Info.plist".to_string())?;
+    codesign(&["--force", "--sign", identity], &app).await?;
+    codesign(&["--verify", "--strict"], &app).await?;
+    Ok(app)
+}
+
+/// End the leg's app by its bundle executable, which Launch Services runs
+/// apart from the `open` the proof holds.
+#[cfg(target_os = "macos")]
+async fn end_leg_app() {
+    let Ok(dir) = repo_path(&["target", "proof-leg"]) else {
+        return;
+    };
+    let executable = dir
+        .join(LEG_BUNDLE)
+        .join("Contents")
+        .join("MacOS")
+        .join(LEG_EXECUTABLE);
+    let ended = Command::new("pkill")
+        .arg("-9")
+        .arg("-f")
+        .arg(&executable)
+        .status();
+    if let Err(err) = timeout(CLOSE_BOUND, ended)
+        .await
+        .map_err(|_| "timed out".to_owned())
+        .and_then(|run| run.map_err(|err| err.to_string()))
+    {
+        eprintln!("the leg's app could not be ended: {err}");
+    }
+}
+
+/// One `codesign` call, named with its refusal on failure.
+///
+/// # Errors
+///
+/// When `codesign` refuses.
+#[cfg(target_os = "macos")]
+async fn codesign(args: &[&str], path: &Path) -> Result<()> {
+    let output = Command::new("codesign")
+        .args(args)
+        .arg(path)
+        .output()
+        .await
+        .context("starting codesign")?;
+    if !output.status.success() {
+        bail!(
+            "codesign {} {} failed: {}",
+            args.first().copied().unwrap_or_default(),
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// One `mkfifo`, named with its refusal on failure.
+///
+/// # Errors
+///
+/// When `mkfifo` refuses.
+#[cfg(target_os = "macos")]
+async fn mkfifo(path: &Path) -> Result<()> {
+    let output = Command::new("mkfifo")
+        .arg(path)
+        .output()
+        .await
+        .context("starting mkfifo")?;
+    if !output.status.success() {
+        bail!(
+            "mkfifo {} failed: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// The proof's ends of the two fifos, each opened for reading and writing,
+/// which never blocks, so the system's opens of the app's ends find the
+/// other side already standing. The ends are polled by the runtime, never
+/// read on a blocking thread, since the proof's own write end keeps the
+/// answers' fifo from ever reading its end of file.
+///
+/// # Errors
+///
+/// When a fifo will not open.
+#[cfg(target_os = "macos")]
+fn open_fifo_ends(fifo_in: &Path, fifo_out: &Path) -> Result<(LegIn, LegOut)> {
+    let open = |path: &Path| {
+        std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .with_context(|| format!("opening the fifo {}", path.display()))
+    };
+    let writer = tokio::net::unix::pipe::Sender::from_file(open(fifo_in)?)
+        .context("polling the commands' fifo")?;
+    let reader = tokio::net::unix::pipe::Receiver::from_file(open(fifo_out)?)
+        .context("polling the answers' fifo")?;
+    Ok((writer, reader))
 }
 
 #[cfg(test)]
