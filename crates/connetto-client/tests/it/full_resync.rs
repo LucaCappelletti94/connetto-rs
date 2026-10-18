@@ -9,6 +9,8 @@
 //! session receives (`FullResyncRequired` then a fresh snapshot), so the test
 //! pins the client contract without an oplog or a retention window.
 
+use std::time::Duration;
+
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::Cursor;
 use connetto_core::messages::{
@@ -222,13 +224,14 @@ async fn full_resync_drops_rows_deleted_during_the_outage() {
 /// Send one grouped aggregate frame for `group_key` carrying `result`.
 async fn send_aggregate(
     server: &mut LoopbackTransport,
+    sub_id: &str,
     group_key: &[u8],
     group_values: &str,
     result: &str,
 ) {
     let _ = server
         .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
-            sub_id: AGG_SUB.to_owned(),
+            sub_id: sub_id.to_owned(),
             group_key: Some(group_key.to_vec()),
             group_values_json: Some(group_values.to_owned()),
             result_json: Some(result.to_owned()),
@@ -264,15 +267,15 @@ fn aggregate_resync_server() -> LoopbackTransport {
                 _ => return,
             }
         }
-        send_aggregate(&mut server, b"a", "[\"a\"]", "10").await;
-        send_aggregate(&mut server, b"b", "[\"b\"]", "20").await;
+        send_aggregate(&mut server, AGG_SUB, b"a", "[\"a\"]", "10").await;
+        send_aggregate(&mut server, AGG_SUB, b"b", "[\"b\"]", "20").await;
         let _ = server
             .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
                 sub_id: AGG_SUB.to_owned(),
                 reason: FullResyncReason::AuthorizationChange,
             }))
             .await;
-        send_aggregate(&mut server, b"a", "[\"a\"]", "10").await;
+        send_aggregate(&mut server, AGG_SUB, b"a", "[\"a\"]", "10").await;
         while let Ok(Some(_)) = server.recv().await {}
     });
     client_end
@@ -329,6 +332,133 @@ async fn full_resync_drops_the_aggregate_resting_answer() {
     assert_eq!(
         rows[0],
         b"a".to_vec(),
+        "only the re-bootstrapped group rests"
+    );
+}
+
+/// A fake server that bootstraps a watched grouped aggregate with two groups,
+/// orders a full resync for it, then re-bootstraps a single group, pacing each
+/// step behind an oneshot the test fires so nothing waits on a wall clock.
+fn aggregate_resync_live_server(
+    bootstrap_seen: tokio::sync::oneshot::Receiver<()>,
+    cleared_seen: tokio::sync::oneshot::Receiver<()>,
+) -> LoopbackTransport {
+    let (mut server, client_end) = loopback();
+    tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) = server.recv().await
+        else {
+            return;
+        };
+        let _ = server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "agg-live".to_owned(),
+                session_token: "agg-live".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                resume_token: "agg-live".to_owned(),
+                schema_version: None,
+                initial_credits: 64,
+                last_applied_seq: None,
+            }))
+            .await;
+        // The watch's wire subscription, by the id the client chose.
+        let sub_id = loop {
+            match server.recv().await {
+                Ok(Some(IncomingFrame::Control(ControlMessage::Subscribe(sub)))) => {
+                    break sub.sub_id;
+                }
+                Ok(Some(_)) => {}
+                _ => return,
+            }
+        };
+        send_aggregate(&mut server, &sub_id, b"a", "[\"a\"]", "10").await;
+        send_aggregate(&mut server, &sub_id, b"b", "[\"b\"]", "20").await;
+        // Both groups are up, so the test orders the resync notice.
+        let _ = bootstrap_seen.await;
+        let _ = server
+            .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+                sub_id: sub_id.clone(),
+                reason: FullResyncReason::AuthorizationChange,
+            }))
+            .await;
+        // The test observed the emptied map, so order the re-bootstrap.
+        let _ = cleared_seen.await;
+        send_aggregate(&mut server, &sub_id, b"a", "[\"a\"]", "10").await;
+        while let Ok(Some(_)) = server.recv().await {}
+    });
+    client_end
+}
+
+/// A watched grouped statistic drops its whole map when a `FullResyncRequired`
+/// lands, and the re-bootstrap that follows rebuilds it from the one group the
+/// server still authorizes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_resync_clears_the_watched_aggregate_handle() {
+    // The oneshots pace the scripted server against the assertions instead of a wall clock.
+    let (bootstrap_seen_tx, bootstrap_seen_rx) = tokio::sync::oneshot::channel();
+    let (cleared_seen_tx, cleared_seen_rx) = tokio::sync::oneshot::channel();
+
+    // A running client, so the live pump's resync arm runs on the notice.
+    let (client, pump) = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(aggregate_resync_live_server(
+            bootstrap_seen_rx,
+            cleared_seen_rx,
+        )),
+    )
+    .signed_in(super::support::held("token"))
+    .connect_with_pump()
+    .await
+    .expect("connect with pump");
+    tokio::spawn(pump);
+    let mut events = client.client().events();
+    let mut groups = client
+        .client()
+        .watch_groups::<_, Option<String>, i64>(
+            orders::table
+                .group_by(orders::status)
+                .select((orders::status, diesel::dsl::count_star())),
+        )
+        .await
+        .expect("watch groups");
+
+    // Both bootstrap groups arrive.
+    while groups.map().len() < 2 {
+        tokio::time::timeout(Duration::from_secs(5), groups.changed())
+            .await
+            .expect("the bootstrap timed out")
+            .expect("the pump is driving the connection");
+    }
+    // Both groups are up, so order the resync notice.
+    bootstrap_seen_tx.send(()).expect("order the resync notice");
+
+    // The arm re-reads the emptied table before the notice is forwarded.
+    loop {
+        match events.recv().await {
+            Ok(ClientEvent::FullResync { .. }) => break,
+            Ok(ClientEvent::Closed) => panic!("closed before the resync notice"),
+            Ok(_) => {}
+            Err(err) => panic!("the event stream closed before the resync notice: {err}"),
+        }
+    }
+    assert!(
+        groups.map().is_empty(),
+        "the resync arm cleared the watched handle to mirror the emptied resting table"
+    );
+    // The emptied map is observed, so order the re-bootstrap.
+    cleared_seen_tx.send(()).expect("order the re-bootstrap");
+
+    // The re-bootstrap's single group rebuilds the handle.
+    while groups.map().is_empty() {
+        tokio::time::timeout(Duration::from_secs(5), groups.changed())
+            .await
+            .expect("the re-bootstrap timed out")
+            .expect("the pump is driving the connection");
+    }
+    let mut keys: Vec<Option<String>> = groups.map().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![Some("a".to_owned())],
         "only the re-bootstrapped group rests"
     );
 }
