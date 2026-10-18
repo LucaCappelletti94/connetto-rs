@@ -1,6 +1,8 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek};
 
+use connetto_core::Major;
+
 use crate::ClientError;
 
 use super::super::{
@@ -45,6 +47,7 @@ pub(crate) fn open<R: Read + Seek>(source: R) -> Result<(Incoming, ArchiveReader
         Incoming {
             scope,
             fingerprint: manifest.schema_fingerprint,
+            major: manifest.major,
             account: manifest.account,
             synced_present,
             local_rows,
@@ -308,9 +311,9 @@ pub(super) fn decode_pending(
             .try_into()
             .map_err(|_| malformed())?,
     );
-    // Every entry costs at least its fixed 51 bytes, so a count above what the
+    // Every entry costs at least its fixed 55 bytes, so a count above what the
     // entry can hold is refused before one vector per entry is allocated.
-    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 51).unwrap_or(u64::MAX);
+    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 55).unwrap_or(u64::MAX);
     if count > capacity {
         return Err(malformed());
     }
@@ -332,6 +335,17 @@ pub(super) fn decode_pending(
             .try_into()
             .map_err(|_| malformed())?;
         at = at.checked_add(32).ok_or_else(malformed)?;
+        let major = match u32::from_be_bytes(
+            bytes
+                .get(at..at.checked_add(4).ok_or_else(malformed)?)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?,
+        ) {
+            0 => None,
+            raw => Some(Major::new(raw).ok_or_else(malformed)?),
+        };
+        at = at.checked_add(4).ok_or_else(malformed)?;
         let prov_present = *bytes.get(at).ok_or_else(malformed)?;
         at = at.checked_add(1).ok_or_else(malformed)?;
         let provenance = if prov_present == 1 {
@@ -371,6 +385,7 @@ pub(super) fn decode_pending(
             writer,
             seq,
             hash,
+            major,
             changeset,
             provenance,
         });
@@ -411,6 +426,7 @@ mod tests {
     use super::super::super::ExportScope;
     use super::super::super::{Archive, Incoming};
     use super::decode_pending;
+    use connetto_core::Major;
 
     /// Opens one archive held in a buffer and keeps only what it declares.
     fn read(bytes: &[u8]) -> Result<Incoming, crate::ClientError> {
@@ -422,40 +438,77 @@ mod tests {
         super::super::write::start(Vec::new(), archive)?.finish()
     }
 
-    /// What an export writes, an import reads back unchanged.
+    /// What an export writes, an import reads back unchanged, each queued
+    /// write keeping the major it was captured under or none.
     #[test]
     fn an_archive_round_trips() {
-        let archive = Archive {
-            scope: ExportScope::Unsynced,
-            fingerprint: "abc123".to_owned(),
-            account: Some("\"alice\"".to_owned()),
-            synced_rows: None,
-            local_rows: Some(vec![7u8; 64]),
-            pending: vec![crate::archive::ArchivedEntry {
+        let pending = vec![
+            crate::archive::ArchivedEntry {
                 writer: connetto_core::messages::WriterRef::Number(0),
                 seq: 1,
                 hash: [9u8; 32],
+                major: Major::new(1),
                 changeset: vec![9u8; 16],
                 provenance: None,
-            }],
+            },
+            crate::archive::ArchivedEntry {
+                writer: connetto_core::messages::WriterRef::Number(0),
+                seq: 2,
+                hash: [8u8; 32],
+                major: None,
+                changeset: vec![8u8; 4],
+                provenance: Some(connetto_core::messages::Provenance {
+                    writer: connetto_core::messages::WriterRef::Number(3),
+                    seq: 5,
+                }),
+            },
+        ];
+        let archive = Archive {
+            scope: ExportScope::Unsynced,
+            fingerprint: "abc123".to_owned(),
+            major: Major::new(2),
+            account: Some("\"alice\"".to_owned()),
+            synced_rows: None,
+            local_rows: Some(vec![7u8; 64]),
+            pending: pending.clone(),
             attachments: &[],
         };
         let bytes = write(&archive).expect("write");
         let read_back = read(&bytes).expect("read");
         assert_eq!(read_back.scope, ExportScope::Unsynced);
         assert_eq!(read_back.fingerprint, "abc123");
+        assert_eq!(read_back.major, Major::new(2));
         assert_eq!(read_back.account.as_deref(), Some("\"alice\""));
         assert!(!read_back.synced_present);
         assert_eq!(read_back.local_rows, Some(vec![7u8; 64]));
-        assert_eq!(
-            read_back.pending,
-            vec![crate::archive::ArchivedEntry {
-                writer: connetto_core::messages::WriterRef::Number(0),
-                seq: 1,
-                hash: [9u8; 32],
-                changeset: vec![9u8; 16],
-                provenance: None,
-            }]
+        assert_eq!(read_back.pending, pending);
+    }
+
+    /// A version 4 archive carries no capture major per write, so this build
+    /// refuses it instead of guessing one.
+    #[test]
+    fn a_version_4_archive_is_refused() {
+        let manifest = json!({
+            "format": "connetto-local-data",
+            "version": 4,
+            "scope": "unsynced",
+            "schema_fingerprint": "abc123",
+            "major": 1,
+            "account": null,
+            "compression": "per-entry",
+            "note": "test",
+            "entries": [],
+        });
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        zip.start_file("manifest.json", zip::write::SimpleFileOptions::default())
+            .expect("start manifest");
+        zip.write_all(&serde_json::to_vec(&manifest).expect("encode manifest"))
+            .expect("write manifest");
+        let bytes = zip.finish().expect("finish archive").into_inner();
+        let error = read(&bytes).expect_err("a version 4 archive must be refused");
+        assert!(
+            error.to_string().contains("version 4"),
+            "the refusal names the version: {error}"
         );
     }
 
@@ -463,9 +516,10 @@ mod tests {
     fn compressed_attachments_are_refused_before_their_body_is_read() {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 4,
+            "version": 5,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
+            "major": 1,
             "account": null,
             "compression": "per-entry",
             "note": "test",
@@ -551,9 +605,10 @@ mod tests {
     fn zip_with_entry(entry: &[u8]) -> Vec<u8> {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 4,
+            "version": 5,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
+            "major": 1,
             "account": null,
             "compression": "per-entry",
             "note": "test",
@@ -599,6 +654,7 @@ mod tests {
             &Archive {
                 scope: ExportScope::Unsynced,
                 fingerprint: "abc123".to_owned(),
+                major: Major::new(1),
                 account: None,
                 synced_rows: None,
                 local_rows: None,
@@ -633,9 +689,10 @@ mod tests {
     ) {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 4,
+            "version": 5,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
+            "major": 1,
             "account": null,
             "compression": "per-entry",
             "note": "test",

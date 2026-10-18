@@ -14,6 +14,7 @@ pub(super) struct Manifest {
     pub(super) version: u32,
     pub(super) scope: String,
     pub(super) schema_fingerprint: String,
+    pub(super) major: Option<connetto_core::Major>,
     #[serde(default)]
     pub(super) account: Option<String>,
     pub(super) compression: String,
@@ -83,12 +84,14 @@ mod tests {
     use crate::ClientError;
     use connetto_core::messages::WriterRef;
 
-    /// One entry the framing tests name, with the bytes it carries.
+    /// One entry the framing tests name, with the bytes it carries, captured
+    /// under major 1.
     fn entry(seq: u64, changeset: &[u8]) -> ArchivedEntry {
         ArchivedEntry {
             writer: WriterRef::Number(0),
             seq,
             hash: [0u8; 32],
+            major: connetto_core::Major::new(1),
             changeset: changeset.to_vec(),
             provenance: None,
         }

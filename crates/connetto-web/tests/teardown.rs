@@ -86,6 +86,7 @@ fn work(seqs: &[u64]) -> PendingWork {
             .map(|seq| UnsyncedWrite {
                 writer: WriterRef::Number(1),
                 seq: *seq,
+                major: None,
             })
             .collect(),
         content_files: 0,

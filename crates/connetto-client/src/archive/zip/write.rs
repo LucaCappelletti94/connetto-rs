@@ -109,6 +109,7 @@ fn encode_manifest(archive: &Archive<'_>) -> Result<Vec<u8>, ClientError> {
         version: VERSION,
         scope: archive.scope.as_str().to_owned(),
         schema_fingerprint: archive.fingerprint.clone(),
+        major: archive.major,
         account: archive.account.clone(),
         compression: "per-entry".to_owned(),
         note: NOTE.to_owned(),
@@ -199,13 +200,15 @@ fn write_entry<W: Write>(
 /// Its own framing rather than one entry per write, because a queue of a
 /// hundred writes is a hundred zip entries otherwise, and the order is the
 /// only thing about them that matters. Each entry carries the writer, the
-/// sequence, the chain hash and the optional provenance the write rode with.
+/// sequence, the chain hash, the capture major (0 for none) and the optional
+/// provenance the write rode with.
 pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8> {
     let total: usize = entries
         .iter()
         .map(|entry| {
             8 // seq
                 + 32 // hash
+                + 4 // major
                 + 1 // provenance present
                 + 8 // changeset length
                 + entry.changeset.len()
@@ -224,6 +227,12 @@ pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8>
         write_writer(&mut out, &entry.writer);
         out.extend_from_slice(&entry.seq.to_be_bytes());
         out.extend_from_slice(&entry.hash);
+        out.extend_from_slice(
+            &entry
+                .major
+                .map_or(0, connetto_core::Major::get)
+                .to_be_bytes(),
+        );
         match &entry.provenance {
             Some(prov) => {
                 out.push(1);
@@ -260,6 +269,7 @@ mod tests {
             &Archive {
                 scope: ExportScope::Unsynced,
                 fingerprint: "abc123".to_owned(),
+                major: connetto_core::Major::new(1),
                 account: None,
                 synced_rows: None,
                 local_rows: None,

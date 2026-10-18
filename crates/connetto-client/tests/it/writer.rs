@@ -17,7 +17,6 @@ use connetto_client::{
     ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, ExportScope,
     ImportChoices, MemoryRefreshStore, SyncSchema, UnsyncedWrite,
 };
-use connetto_core::Cursor;
 use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, MutationApplied,
@@ -26,6 +25,7 @@ use connetto_core::messages::{
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Cursor, Major};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use parking_lot::Mutex;
@@ -375,7 +375,8 @@ async fn a_handshake_ack_keeps_the_issued_number_and_rekeys_the_queue() {
         conn.unsynced(),
         vec![UnsyncedWrite {
             writer: WriterRef::Number(0),
-            seq: 1
+            seq: 1,
+            major: Major::new(1),
         }],
         "the offline write waits under the unissued number"
     );
@@ -460,7 +461,8 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
         (1..=3)
             .map(|seq| UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq
+                seq,
+                major: Major::new(1),
             })
             .collect::<Vec<_>>(),
         "nothing at or below the frontier retired locally"
@@ -673,7 +675,8 @@ async fn sequences_survive_an_emptied_queue_and_a_restart() {
         conn.unsynced(),
         vec![UnsyncedWrite {
             writer: WriterRef::Number(1),
-            seq: 3
+            seq: 3,
+            major: Major::new(1),
         }]
     );
 }
@@ -801,11 +804,13 @@ async fn a_writer_unknown_fatal_carries_the_tail_to_the_unissued_number() {
         vec![
             UnsyncedWrite {
                 writer: WriterRef::Number(0),
-                seq: 1
+                seq: 1,
+                major: Major::new(1),
             },
             UnsyncedWrite {
                 writer: WriterRef::Number(0),
-                seq: 2
+                seq: 2,
+                major: Major::new(1),
             },
         ],
         "both writes survive the carry"
@@ -891,7 +896,8 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
         conn.unsynced(),
         vec![UnsyncedWrite {
             writer: WriterRef::Number(1),
-            seq: 1
+            seq: 1,
+            major: Major::new(1),
         }],
         "the corrupt rows skipped, the good one loaded"
     );
@@ -954,11 +960,13 @@ async fn a_failed_append_keeps_the_queue_unchanged_and_retries_the_same_sequence
         vec![
             UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq: 1
+                seq: 1,
+                major: Major::new(1),
             },
             UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq: 2
+                seq: 2,
+                major: Major::new(1),
             },
         ],
         "the retry sits under the standing entry"
@@ -972,11 +980,13 @@ async fn a_failed_append_keeps_the_queue_unchanged_and_retries_the_same_sequence
         vec![
             UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq: 1
+                seq: 1,
+                major: Major::new(1),
             },
             UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq: 2
+                seq: 2,
+                major: Major::new(1),
             },
         ],
         "the restart reloads both entries"
@@ -1071,11 +1081,13 @@ async fn a_failed_carry_retains_the_complete_source_and_the_restart_resends_it()
         vec![
             UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq: 1
+                seq: 1,
+                major: Major::new(1),
             },
             UnsyncedWrite {
                 writer: WriterRef::Number(1),
-                seq: 2
+                seq: 2,
+                major: Major::new(1),
             },
         ],
         "the restart reloads the complete source"
@@ -1130,11 +1142,13 @@ async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
             vec![
                 UnsyncedWrite {
                     writer: WriterRef::Number(0),
-                    seq: 1
+                    seq: 1,
+                    major: Major::new(1),
                 },
                 UnsyncedWrite {
                     writer: WriterRef::Number(0),
-                    seq: 2
+                    seq: 2,
+                    major: Major::new(1),
                 },
             ],
             "both writes survive the carry"
@@ -1204,6 +1218,72 @@ async fn split_open(dir: &tempfile::TempDir) -> ConnettoConnection<Wire> {
         .open_driven()
         .await
         .expect("open with no server")
+}
+
+/// The suite's schema at `major`, one table and no policies.
+fn bundle_at(major: u32) -> SyncSchema {
+    SyncSchema::new(
+        SchemaBundle::new(
+            format!("-- connetto:major {major}"),
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares its major"),
+    )
+}
+
+/// A replica in its own directory, opened offline under `schema`.
+async fn open_with(dir: &tempfile::TempDir, schema: SyncSchema) -> ConnettoConnection<Wire> {
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
+    ClientBuilder::new(schema, super::support::NeverDial::<Wire>::default())
+        .signed_in(credential)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
+        .open_driven()
+        .await
+        .expect("open with no server")
+}
+
+/// R31 on R75: a write an older major captured leaves only through that
+/// major's drain, so the newer major's wire sends nothing queued after it,
+/// whether queued before the connection or while it stands.
+#[tokio::test]
+async fn an_older_majors_entry_holds_the_newer_majors_writes_off_the_wire() {
+    let dir = tempdir().expect("temp dir");
+    {
+        let mut conn = open_with(&dir, bundle_at(1)).await;
+        write(&mut conn, 1);
+        conn.push().await.expect("queue");
+    }
+    let mut conn = open_with(&dir, bundle_at(2)).await;
+    write(&mut conn, 2);
+    conn.push().await.expect("queue");
+
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("attach");
+    write(&mut conn, 3);
+    conn.push().await.expect("queue");
+    drain(&mut conn).await;
+
+    assert!(
+        wire.log.lock().mutations.is_empty(),
+        "nothing passes the older major's entry on the newer major's wire"
+    );
+    assert_eq!(
+        conn.unsynced()
+            .iter()
+            .map(|write| (write.seq, write.major))
+            .collect::<Vec<_>>(),
+        vec![(1, Major::new(1)), (2, Major::new(2)), (3, Major::new(2))],
+        "every write stays queued in one chain, each under its own major"
+    );
 }
 
 #[tokio::test]
@@ -1441,7 +1521,11 @@ fn store_certificate(conn: &mut ConnettoConnection<Wire>, leaf: &[u8], issuer: &
 
 #[cfg(feature = "device-identity")]
 fn unsynced_write(writer: WriterRef, seq: u64) -> UnsyncedWrite {
-    UnsyncedWrite { writer, seq }
+    UnsyncedWrite {
+        writer,
+        seq,
+        major: Major::new(1),
+    }
 }
 
 /// The retired-key window: a revoked device keeps its certificate until the
