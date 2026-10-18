@@ -1731,6 +1731,19 @@ fn is_internal_table(name: &str) -> bool {
     sqlite_own || name.starts_with("_connetto")
 }
 
+/// A capture session over `main` that never records connetto's own tables.
+fn capture_session(db: &mut SqliteConnection) -> Result<Session, ClientError> {
+    let mut session = db
+        .create_session()
+        .map_err(|e| ClientError::Session(e.to_string()))?;
+    // The server holds no `_connetto` table, so one recorded row would sink the whole upload.
+    session.set_table_filter(|table| !table.starts_with("_connetto"));
+    session
+        .attach_all()
+        .map_err(|e| ClientError::Session(e.to_string()))?;
+    Ok(session)
+}
+
 /// The schema an export's empty twins live under while the row patchset is
 /// taken. Its own name because the relay attaches a `blank` of its own to this
 /// same connection, and two attachments cannot share one name.
@@ -2851,12 +2864,7 @@ where
                 CommitDecision::Proceed
             });
         }
-        let mut session = db
-            .create_session()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
-        session
-            .attach_all()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let session = capture_session(&mut db)?;
 
         // Read after every statement this open applies, so the first write
         // re-checks only what the application changed since.
@@ -4207,13 +4215,7 @@ where
             persist_pending(&mut self.db, seq, &changeset)?;
         }
         // Reset capture: a fresh session records only writes after this push.
-        let mut fresh = self
-            .db
-            .create_session()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
-        fresh
-            .attach_all()
-            .map_err(|e| ClientError::Session(e.to_string()))?;
+        let fresh = capture_session(&mut self.db)?;
         self.session = fresh;
         self.pending.insert(seq, changeset.clone());
         // With no server the write stays queued, which is the designed offline
@@ -5341,6 +5343,34 @@ mod tests {
         assert!(
             wait <= RESEND_POLICY.initial_backoff(),
             "the new deferral starts from the first wait"
+        );
+    }
+
+    /// A write to a connetto table never becomes an upload, and an application write beside it still does.
+    #[tokio::test]
+    async fn connetto_tables_are_never_captured() {
+        let config = ClientConfig::new("capture-test");
+        let mut conn =
+            ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
+                .expect("open in-memory replica");
+        conn.db
+            .batch_execute(
+                "CREATE TABLE _connetto_content_outbox (file_id BLOB PRIMARY KEY); \
+                 INSERT INTO _connetto_content_outbox (file_id) VALUES (x'01')",
+            )
+            .expect("bookkeeping write");
+        assert_eq!(
+            conn.push().await.expect("push"),
+            None,
+            "bookkeeping uploads nothing"
+        );
+        conn.db
+            .batch_execute("INSERT INTO t (id) VALUES (1)")
+            .expect("application write");
+        assert_eq!(
+            conn.push().await.expect("push"),
+            Some(0),
+            "the application write uploads"
         );
     }
 
