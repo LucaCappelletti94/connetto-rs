@@ -81,15 +81,16 @@
       <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
       <rect width="4" height="50" rx="1" fill="#EF5350" />
       <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Shared public store</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R11</text>
+      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R11, designed 2026-10-17, sliced into seven pull requests</text>
     </g>
 
     <!-- ===== Backup and restore (R70) ===== -->
     <g transform="translate(35, 726)">
-      <rect width="460" height="50" rx="5" fill="#fff" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="50" rx="1" fill="#EF5350" />
-      <text x="230" y="20" text-anchor="middle" font-size="12" font-weight="600" fill="#333">Deployment backup and restore</text>
-      <text x="230" y="38" text-anchor="middle" font-size="9" fill="#C62828">R70</text>
+      <rect width="460" height="50" rx="5" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="50" rx="1" fill="#4CAF50" />
+      <text x="230" y="18" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Deployment backup and restore</text>
+      <text x="230" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the chunk-store fix and the whole OpenFGA store reconciled at adopted boots</text>
+      <text x="230" y="46" text-anchor="middle" font-size="8.5" fill="#C62828">R70: step 2's frontier leg, which waits on R75</text>
     </g>
 
     <!-- ===== Clock discipline (R72) ===== -->
@@ -275,14 +276,14 @@
 
     <!-- App registry and bot login (R91) -->
     <g transform="translate(550, 1146)">
-      <rect width="300" height="108" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="108" rx="1" fill="#EF5350" />
-      <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#C62828">App registry and bot login</text>
-      <text x="150" y="36" text-anchor="middle" font-size="9" fill="#C62828">R91 (chapters 12 and 11)</text>
-      <text x="150" y="53" text-anchor="middle" font-size="8.5" fill="#555">a developer registers an app: its public key and the tables it wants</text>
-      <text x="150" y="68" text-anchor="middle" font-size="8.5" fill="#555">a user installs it on their own data, three synced tables under RLS</text>
-      <text x="150" y="83" text-anchor="middle" font-size="8.5" fill="#555">one route: a signed assertion buys an ordinary login grant</text>
-      <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#555">the bot is a user of the deployment, no browser and no password</text>
+      <rect width="300" height="108" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="108" rx="1" fill="#4CAF50" />
+      <text x="150" y="20" text-anchor="middle" font-size="12" font-weight="700" fill="#2E7D32">App registry and bot login</text>
+      <text x="150" y="36" text-anchor="middle" font-size="9" fill="#555">R91 (chapters 12 and 11)</text>
+      <text x="150" y="53" text-anchor="middle" font-size="8.5" fill="#4CAF50">built: the bot registry, the installs, the challenge</text>
+      <text x="150" y="68" text-anchor="middle" font-size="8.5" fill="#4CAF50">apps add bots, mint codes, the registry synced to replicas</text>
+      <text x="150" y="83" text-anchor="middle" font-size="8.5" fill="#C62828">R91: the app-token login exchange, the demo apps</text>
+      <text x="150" y="98" text-anchor="middle" font-size="8.5" fill="#C62828">R91: the bot template, examples/bot-template</text>
     </g>
 
     <!-- Arrows and labels between the panels, painted after the column fills so they stay visible -->
@@ -325,7 +326,7 @@
   <!-- ==================== NATIVE CLIENT ZONE ==================== -->
   <g id="native-client-zone">
     <rect x="980" y="20" width="660" height="760" rx="10" fill="#F5F5F5" stroke="#BDBDBD" stroke-width="1.5" />
-    <text x="1310" y="46" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Native client (Dioxus app)</text>
+    <text x="1310" y="46" text-anchor="middle" font-size="15" font-weight="700" fill="#555">Native client (dioxus and Tauri + Leptos demos)</text>
     <text x="1310" y="62" text-anchor="middle" font-size="10" fill="#4CAF50">connetto-client, built and verified, constructed through NativeClientBuilder</text>
 
     <!-- ConnettoConnection -->
@@ -447,15 +448,15 @@
 
     <!-- Device-to-device sync (R74 to R80) -->
     <g transform="translate(1325, 656)">
-      <rect width="300" height="110" rx="6" fill="#FFEBEE" stroke="#EF5350" stroke-width="1.5" />
-      <rect width="4" height="110" rx="1" fill="#EF5350" />
-      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#C62828">Device-to-device sync</text>
-      <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#C62828">R74 to R80 (design concluded as R25, chapter 19)</text>
-      <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#555">two devices exchange signed writes over the LAN with no server</text>
-      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#555">mTLS with device certificates, the server still adjudicates later</text>
-      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#555">a lost device's signed queue is recovered through a courier</text>
-      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#555">one dedup domain, the (device key, sequence) frontier</text>
-      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#555">BLE beacon bootstrap later, on the R88 phone builds</text>
+      <rect width="300" height="110" rx="6" fill="#fff" stroke="#4CAF50" stroke-width="1.5" />
+      <rect width="4" height="110" rx="1" fill="#4CAF50" />
+      <text x="150" y="20" text-anchor="middle" font-size="11" font-weight="700" fill="#2E7D32">Device-to-device sync</text>
+      <text x="150" y="34" text-anchor="middle" font-size="8.5" fill="#4CAF50">R74: chip key, certificates, attestation under PEN 67105</text>
+      <text x="150" y="49" text-anchor="middle" font-size="8.5" fill="#4CAF50">R76 slices 1 to 9c: the link, mDNS, hotspots, beacon</text>
+      <text x="150" y="63" text-anchor="middle" font-size="8.5" fill="#4CAF50">Android, iPhone, Linux host, the iPad and Mac join</text>
+      <text x="150" y="77" text-anchor="middle" font-size="8.5" fill="#C62828">R76: Windows (slice 9d) and the mesh home run (9e)</text>
+      <text x="150" y="91" text-anchor="middle" font-size="8.5" fill="#C62828">R74: proof 5's iPad, Windows and Linux records</text>
+      <text x="150" y="104" text-anchor="middle" font-size="8.5" fill="#C62828">R75 to R80 not started (chapter 19)</text>
     </g>
   </g>
 
@@ -650,5 +651,5 @@
   </g>
 
   <!-- Title -->
-  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-09-23 to the plan's current state.</text>
+  <text x="20" y="1704" font-size="11" fill="#999">connetto-rs architecture diagram: components, library seams, and data flows, colored by build status. Updated 2026-10-18 to the plan's current state.</text>
 </svg>
