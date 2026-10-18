@@ -314,7 +314,8 @@ async fn the_oauth_spine_completes_against_a_real_identity_provider() {
     let verified = authority
         .check_grant(&Grant::new(&access_token))
         .await
-        .expect("the minted session verifies at the handshake");
+        .expect("the minted session verifies at the handshake")
+        .subject;
     let connetto_core::Subject::Identity(session) = verified else {
         panic!("expected identity subject from spine token");
     };

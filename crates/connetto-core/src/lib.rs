@@ -77,9 +77,9 @@ pub use schema::{
 pub use session_id::{SessionId, SessionIdParseError};
 pub use sql::quote_ident;
 pub use traits::{
-    ContentTicketSigner, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority,
-    IncomingFrame, PendingMutation, RefreshFuture, RefreshTokenStore, ReplicaKeyStore, Store,
-    Transport,
+    CheckedGrant, ContentTicketSigner, GrantCheckFuture, GrantRefused, HandleError,
+    HandshakeAuthority, IncomingFrame, PendingMutation, RefreshFuture, RefreshTokenStore,
+    ReplicaKeyStore, Store, Transport,
 };
 #[cfg(feature = "native-transport")]
 pub use transport::{

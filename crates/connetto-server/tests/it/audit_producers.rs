@@ -62,6 +62,7 @@ fn session_of(authority: &TokenAuthority, access_token: &str) -> connetto_core::
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };

@@ -200,6 +200,35 @@ impl<Id, Key> Principal<Id, Key> {
         }
     }
 
+    /// A copy keeping the session, identity, and bot list, with the
+    /// capability set replaced by `capabilities`, deduplicated by rendering in
+    /// first-seen order, since a policy compares the rendering.
+    #[must_use]
+    pub fn with_capabilities(
+        &self,
+        capabilities: impl IntoIterator<Item = CapabilitySubject<Key>>,
+    ) -> Self
+    where
+        Id: Clone,
+        Key: Display,
+    {
+        let mut rendered: Vec<String> = Vec::new();
+        let mut held: Vec<CapabilitySubject<Key>> = Vec::new();
+        for capability in capabilities {
+            let rendering = capability.key().to_string();
+            if !rendered.contains(&rendering) {
+                rendered.push(rendering);
+                held.push(capability);
+            }
+        }
+        Self {
+            session_id: self.session_id,
+            identity: self.identity.clone(),
+            capabilities: held,
+            bot_list: self.bot_list.clone(),
+        }
+    }
+
     /// The durable handle for this run, minted or from the auth store.
     #[must_use]
     pub const fn session_id(&self) -> SessionId {
@@ -463,6 +492,46 @@ mod tests {
         assert_eq!(principal.session_id(), handle(2));
         assert_eq!(principal.identity().unwrap().user_id, "alice");
         assert_eq!(principal.capabilities().len(), 1);
+    }
+
+    /// A replaced capability set keeps the handle, identity, and bot list,
+    /// and drops repeats in first-seen order.
+    #[test]
+    fn with_capabilities_replaces_the_set_and_keeps_the_caller() {
+        use crate::bots::{BotList, Verb};
+
+        let mut principal: Principal = Principal::unidentified(handle(1));
+        principal
+            .accept(Subject::Identity(VerifiedSession {
+                context: AuthContext::new("bot-a"),
+                session_id: handle(2),
+                bot_list: Some(BotList::new([("t".to_owned(), Verb::Read)])),
+            }))
+            .unwrap();
+        principal
+            .accept(Subject::Capability(CapabilitySubject::new("key:old")))
+            .unwrap();
+
+        let replaced = principal.with_capabilities([
+            CapabilitySubject::new("key:one"),
+            CapabilitySubject::new("key:two"),
+            CapabilitySubject::new("key:one"),
+        ]);
+
+        assert_eq!(replaced.session_id(), handle(2));
+        assert_eq!(replaced.identity().unwrap().user_id, "bot-a");
+        assert_eq!(
+            replaced.bot_list().unwrap().entries(),
+            &[("t".to_owned(), Verb::Read)]
+        );
+        assert_eq!(
+            replaced.capabilities(),
+            &[
+                CapabilitySubject::new("key:one"),
+                CapabilitySubject::new("key:two"),
+            ]
+        );
+        assert_eq!(principal.capabilities().len(), 1, "the caller is unchanged");
     }
 
     #[test]

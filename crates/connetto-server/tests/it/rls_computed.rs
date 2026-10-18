@@ -16,7 +16,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use connetto_core::messages::{AggregateUpdate, ControlMessage, SUBSCRIPTION_REFUSED};
+use connetto_core::messages::{
+    AggregateUpdate, ControlMessage, FullResyncReason, SUBSCRIPTION_REFUSED,
+};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
@@ -216,6 +218,35 @@ async fn a_key_only_viewer_gets_its_own_statistic() {
         2,
         "the key holder counts the rows its subject grants, and no others"
     );
+}
+
+/// A held key reaching its expiry replaces the viewer's statistic with the one
+/// the remaining keys answer, behind a notice that drops the old one (R95).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_expired_key_replaces_the_statistic_it_answered() {
+    let fixture = Fixture::acquire().await;
+    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT).await;
+    fixture
+        .exec("INSERT INTO notes VALUES (1, 'key:k1'), (2, 'key:k1'), (3, 'key:k2')")
+        .await;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs();
+    let dying = format!("key:k1@{}", now + 2);
+    let mut holder = connect(&manager);
+    holder
+        .handshake_presenting("holder", &[&dying, "key:k2"], None)
+        .await;
+    holder.subscribe("mine", QUERY).await;
+    assert_eq!(count_of(&next_aggregate(&mut holder, "mine").await), 3);
+
+    let ControlMessage::FullResyncRequired(notice) = holder.next_control().await else {
+        panic!("expected the old statistic to be dropped first");
+    };
+    assert_eq!(notice.sub_id, "mine");
+    assert_eq!(notice.reason, FullResyncReason::AuthorizationChange);
+    assert_eq!(count_of(&next_aggregate(&mut holder, "mine").await), 1);
 }
 
 /// A grouped statistic over an RLS table still answers as its row objects,

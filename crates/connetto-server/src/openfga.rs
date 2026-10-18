@@ -20,7 +20,7 @@
 //! implementations to satisfy a coherence rule rather than a requirement.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -196,6 +196,11 @@ impl SubjectNaming {
     #[must_use]
     pub const fn asks_the_caller(&self) -> bool {
         self.subjects_parameter.is_some() || self.bot_list_parameter.is_some()
+    }
+
+    /// The relations the model gates on the caller's own keys.
+    pub fn gated_relations(&self) -> impl Iterator<Item = &str> + '_ {
+        self.gated_keys.keys().map(String::as_str)
     }
 
     /// Read one fact back as who it concerned.
@@ -405,6 +410,14 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
         T::Future: Send,
         Self: Sized,
     {
+        let key_tables = self
+            .naming
+            .gated_relations()
+            .flat_map(|relation| reach.tables_for_relation(relation))
+            .cloned()
+            .collect::<BTreeSet<String>>()
+            .into_iter()
+            .collect();
         Arc::new(FgaUpkeep {
             shapes: Arc::clone(self.inner.shapes()),
             delegate: self.inner.inner().clone(),
@@ -412,6 +425,7 @@ impl<Id, Key, T> FgaAuth<Id, Key, T> {
             naming: Arc::clone(&self.naming),
             translator,
             pool,
+            key_tables,
         })
     }
 
@@ -1352,6 +1366,10 @@ pub trait StoreUpkeep: Send + Sync {
         &'a self,
         event: &'a subql::PgChangeEvent,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>>;
+
+    /// The tables whose read answer depends on a relation gated on the
+    /// caller's own keys, the set a change of the caller's keys reaches.
+    fn key_tables(&self) -> &[String];
 }
 
 /// The upkeep behind [`FgaAuth`], over the same index it answers from.
@@ -1369,6 +1387,9 @@ struct FgaUpkeep<Id, Key, T> {
     /// How the model spells a person, so a subject can be read back as the
     /// identity a live session carries.
     naming: Arc<SubjectNaming>,
+    /// The tables whose read answer depends on a relation gated on the
+    /// caller's own keys, walked once at startup and read per key change.
+    key_tables: Vec<String>,
 }
 
 impl<Id, Key, T> StoreUpkeep for FgaUpkeep<Id, Key, T>
@@ -1417,6 +1438,10 @@ where
             moves.extend(replayed.moves);
             Ok(moves)
         })
+    }
+
+    fn key_tables(&self) -> &[String] {
+        &self.key_tables
     }
 }
 
@@ -2616,6 +2641,63 @@ mod tests {
         assert!(
             detail.contains("user"),
             "the refusal names the table an operator has to rename: {detail}"
+        );
+    }
+
+    /// **What a change of the caller's keys reaches.** One table here admits
+    /// a relation the caller's own keys complete, and the other reads the
+    /// identity alone, so the upkeep's key tables name the first and no
+    /// other.
+    ///
+    /// The two tables spell different columns, so the two leaf relations
+    /// keep different names, and the set names the gated one alone.
+    #[tokio::test]
+    async fn key_tables_names_the_tables_gated_on_the_callers_keys() {
+        use diesel_async::AsyncPgConnection;
+        use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+        use diesel_async::pooled_connection::bb8::Pool;
+
+        const SCHEMA: &str = "
+            CREATE TABLE papers(id INTEGER PRIMARY KEY, owner TEXT);
+            ALTER TABLE papers ENABLE ROW LEVEL SECURITY;
+            CREATE TABLE journal(id INTEGER PRIMARY KEY, author TEXT);
+            ALTER TABLE journal ENABLE ROW LEVEL SECURITY;
+        ";
+        const POLICIES: &str = "CREATE POLICY papers_p ON papers FOR SELECT USING (\
+            owner = ANY(string_to_array(current_setting('app.subjects', true), ','))); \
+            CREATE POLICY journal_p ON journal FOR SELECT USING (\
+            author = current_setting('app.user_id', true))";
+
+        let translated = Translated::of::<String, connetto_core::bots::TextIds>(
+            SCHEMA,
+            POLICIES,
+            DEFAULT_USER_SETTING,
+        )
+        .expect("both policies are one rls2fga classifies");
+        let naming = translated.naming();
+        let (shapes, translator, reach) = translated.into_parts();
+        let delegate: OpenFgaPolicy<ParserDB, Never, ModelSubject<String, String>, Postgres> =
+            OpenFgaPolicy::new(
+                Arc::clone(&shapes),
+                OpenFgaServiceClient::new(Never),
+                "store",
+            )
+            .expect("the index is usable");
+        let auth: FgaAuth<String, String, Never> = FgaAuth::new(shapes, delegate, naming);
+        let manager = AsyncDieselConnectionManager::<AsyncPgConnection>::new(
+            "postgres://nobody@127.0.0.1:9/none".to_owned(),
+        );
+        let pool = Pool::builder()
+            .max_size(1)
+            .build(manager)
+            .await
+            .expect("the pool builds even though it connects nowhere");
+        let upkeep = auth.upkeep(reach, translator, pool);
+        assert_eq!(
+            upkeep.key_tables(),
+            ["papers".to_owned()],
+            "the papers arm is the one the caller's own keys complete, so a \
+             change of the set reaches papers and no other table"
         );
     }
 

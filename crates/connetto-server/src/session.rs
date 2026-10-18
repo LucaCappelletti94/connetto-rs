@@ -18,7 +18,7 @@
 //! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
 //! write applies to the source Postgres under the caller's RLS context.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -37,7 +37,9 @@ use connetto_core::messages::{
     SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec,
     bot_registration_message,
 };
-use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport};
+use connetto_core::traits::{
+    CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
+};
 
 use crate::device_cert::RevokeError;
 use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, SessionId};
@@ -70,8 +72,8 @@ use crate::fence::{ReadFence, split_snapshot_cursor};
 use crate::guard::RequestGuard;
 use crate::materializer::{
     ComputedCapture, ComputedChange, MatchedPatch, Materializer, MaterializerError, PlannedWrite,
-    ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, SqliteRegistration, TermMove,
-    TermSeed, compress, narrowed_sql, typed_subscriber,
+    ReadConnector, Registration, RuntimeWritableCatalog, SeedPlan, TermMove, TermSeed, compress,
+    narrowed_sql, typed_subscriber,
 };
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, catchup_decision};
@@ -501,6 +503,37 @@ struct RowRegistration {
     /// The membership tables the subscription's terms watch, empty for a
     /// filter naming none (R27).
     member_tables: std::sync::Arc<[MemberTable]>,
+    /// Whether a term of the filter reads the caller's subject set, which the
+    /// registration's seed then holds, so a key change registers it again.
+    reads_subjects: bool,
+}
+
+/// What registering one subscription produced, before it is known to be rows.
+struct Registered {
+    /// The classified registration.
+    registration: Registration,
+    /// The subscription query reverse translated to Postgres.
+    pg_sql: String,
+    /// The membership tables the filter's terms watch (R27).
+    member_tables: std::sync::Arc<[MemberTable]>,
+    /// Whether a term of the filter reads the caller's subject set.
+    reads_subjects: bool,
+}
+
+impl Registered {
+    /// The row registration this is, or the computed capture it is instead.
+    fn into_row(self, consumer_id: u64) -> Result<RowRegistration, ComputedCapture> {
+        match self.registration {
+            Registration::Row(sub_id) => Ok(RowRegistration {
+                consumer_id,
+                sub_id,
+                pg_sql: self.pg_sql,
+                member_tables: self.member_tables,
+                reads_subjects: self.reads_subjects,
+            }),
+            Registration::Computed(capture) => Err(capture),
+        }
+    }
 }
 
 /// Per-session server configuration.
@@ -1073,6 +1106,42 @@ const fn subject_kind<Id, Key>(subject: &Subject<Id, Key>) -> &'static str {
     }
 }
 
+/// What a list of grants resolved to.
+struct ResolvedGrants<Id, Key> {
+    /// The caller the grants name, on the handle they were checked for.
+    principal: Principal<Id, Key>,
+    /// When each resolved key dies, in Unix seconds by its rendering.
+    key_expiry: BTreeMap<String, u64>,
+    /// How many grants were refused.
+    refusals: u32,
+    /// The wait the refused-grant limit imposed, when it was crossed.
+    wait: Option<Duration>,
+}
+
+/// Whether a change of the caller's share keys can change what one row
+/// subscription delivers.
+///
+/// `key_tables` is `None` when no authorization store reports which tables
+/// read the keys, and then every subscription is taken as reached.
+fn key_change_reaches(reg: &RowRegistration, key_tables: Option<&[String]>) -> bool {
+    reg.reads_subjects
+        || key_tables.is_none_or(|tables| {
+            crate::snapshot::table_from_select(&reg.pg_sql)
+                .map_or(true, |table| tables.contains(&table))
+        })
+}
+
+/// Resolve when the earliest held key dies, and never while none is held.
+async fn next_key_expiry(expiry: &BTreeMap<String, u64>) {
+    let Some(&earliest) = expiry.values().min() else {
+        return core::future::pending().await;
+    };
+    let now = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default();
+    tokio::time::sleep(Duration::from_secs(earliest).saturating_sub(now)).await;
+}
+
 /// Map a materializer failure to the reason sent back on the wire.
 fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
     match err {
@@ -1119,6 +1188,19 @@ enum Outbound {
         /// truncate entitles it to delete a whole table regardless of what a
         /// sibling subscription still claims.
         reason: FullResyncReason,
+    },
+    /// Register one computed subscription again under the session's current
+    /// caller and replace its whole answer, because the share keys it answers
+    /// as changed (R95). Its old registration is already gone.
+    Rebootstrap {
+        /// The request that registered it, read again under the new caller.
+        sub: Subscribe,
+    },
+    /// End one row subscription a key change left unservable, in order behind
+    /// the frames already queued for it (R95).
+    Refuse {
+        /// The client-facing label of the subscription.
+        sub_id: String,
     },
 }
 
@@ -1191,6 +1273,8 @@ struct HandshakeOutcome<Id, Key> {
     outbound_tx: mpsc::UnboundedSender<Outbound>,
     /// The receiving half of the outbound channel, drained by the run loop.
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
+    /// When each held share key dies, by its rendering.
+    key_expiry: BTreeMap<String, u64>,
 }
 
 /// One item waiting on the outbound queue.
@@ -1215,6 +1299,16 @@ impl Deliverable {
     /// Whether sending this spends one of the client's delivery credits.
     const fn costs_credit(&self) -> bool {
         matches!(self, Self::Rows(_))
+    }
+
+    /// The subscription this frame belongs to.
+    fn sub_id(&self) -> Option<&str> {
+        match self {
+            Self::Rows(BulkMessage::LivePatch(patch)) => Some(&patch.sub_id),
+            Self::Rows(BulkMessage::SnapshotPatch(patch)) => Some(&patch.sub_id),
+            Self::Rows(BulkMessage::MutationPatch(_)) => None,
+            Self::SnapshotComplete(end) => Some(&end.sub_id),
+        }
     }
 }
 
@@ -1451,9 +1545,9 @@ struct SessionState<Id, Key> {
     paging: VecDeque<PagedRead>,
     /// Snapshots whose fence missed transactions the log may hold, replayed by the run loop before its next frame.
     missed: Vec<MissedReplay>,
-    /// Computed subscriptions by client label: the engine subscription id,
-    /// one id space for every tier.
-    computed_subs: HashMap<String, SubscriptionId>,
+    /// Computed subscriptions by client label, one engine id space for every
+    /// tier.
+    computed_subs: HashMap<String, ComputedSub>,
     outbound: mpsc::UnboundedSender<Outbound>,
     /// The caller, established at handshake and consulted per read and write.
     principal: Arc<Principal<Id, Key>>,
@@ -1475,12 +1569,25 @@ struct SessionState<Id, Key> {
     resume: Resume,
     /// What is left of the connection's wait on reconnect-log reads, which every catchup draws from.
     resume_read_budget: Duration,
+    /// When each held share key dies, in Unix seconds by the key's rendering,
+    /// which the run loop sleeps until (R95).
+    key_expiry: BTreeMap<String, u64>,
     /// Set when a per-connection abuse threshold crossed, so the run loop ends
     /// after the frame that crossed it. A caller with no identity has no name
     /// to ban, so closing the socket is the whole outcome.
     closing: bool,
     /// The enrolment nonce this session was last handed, spent by its next enrolment request.
     enrol_challenge: Option<crate::device_cert::PendingChallenge>,
+}
+
+/// One computed subscription, as a key change has to find it again.
+struct ComputedSub {
+    /// The engine subscription id.
+    id: SubscriptionId,
+    /// The request, so a key change can register the same query again.
+    sub: Subscribe,
+    /// Whether its answer depends on the caller's subject set.
+    rebinds: bool,
 }
 
 /// Fronts a shared [`Materializer`], routes CDC output to sessions, and runs the
@@ -1509,6 +1616,10 @@ pub struct SessionManager<
     /// borrow one through the materializer's mutex.
     catalog: Arc<ParserDB>,
     routes: Mutex<HashMap<u64, Route<Id, Key>>>,
+    /// Held across one event's dispatch and fan-out, and by a session swapping
+    /// its share keys, so no patch filtered under the old keys is queued behind
+    /// the swap's resends (R95).
+    dispatch_gate: Mutex<()>,
     /// Computed-subscription routes keyed by the engine subscription id, one
     /// id space for every tier since the subql bump to `4a500ee`.
     computed_routes: Mutex<HashMap<SubscriptionId, AggRoute>>,
@@ -1650,6 +1761,7 @@ where
         catalog: Arc::new(materializer.catalog().clone()),
         materializer: Arc::new(Mutex::new(materializer)),
         routes: Mutex::new(HashMap::new()),
+        dispatch_gate: Mutex::new(()),
         computed_routes: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashMap::new()),
         snapshot_source,
@@ -2219,6 +2331,7 @@ where
         event: &PgChangeEvent,
         grant_moves: &[GrantMove],
     ) -> Result<(), SessionError> {
+        let _gate = self.dispatch_gate.lock().await;
         // Three classes, three dispositions (R89 decision 1). A timeout is
         // policy and ends its subscription, retrying it replaces nothing. The
         // unknown class gets one retry per subscription and a second failure
@@ -3344,7 +3457,12 @@ where
             user = tracing::field::Empty,
             connection = connection_num,
         );
-        let (principal, refused_grants, grant_wait) = self
+        let ResolvedGrants {
+            principal,
+            key_expiry,
+            refusals: refused_grants,
+            wait: grant_wait,
+        } = self
             .resolve_grants(handle, &handshake)
             .instrument(span.clone())
             .await;
@@ -3461,6 +3579,7 @@ where
             span,
             outbound_tx,
             outbound_rx,
+            key_expiry,
         }))
     }
     /// Refuse a caller that is over a rate limit, reporting whether it was.
@@ -3772,7 +3891,8 @@ where
     }
 
     /// Check every grant on its own and fold what resolved into the caller,
-    /// returning how many were refused and the wait the rate limit imposed.
+    /// returning when each resolved key dies, how many grants were refused, and
+    /// the wait the rate limit imposed.
     ///
     /// A refusal is recorded here and nowhere else. It does not end the
     /// connection and the reply says nothing about it, so this log line is the
@@ -3791,16 +3911,26 @@ where
         &self,
         handle: SessionId,
         handshake: &Handshake,
-    ) -> (Principal<Id, Key>, u32, Option<Duration>) {
-        let mut principal = Principal::unidentified(handle);
-        let mut refusal_wait: Option<Duration> = None;
-        let mut refusals: u32 = 0;
+    ) -> ResolvedGrants<Id, Key> {
+        let mut resolved = ResolvedGrants {
+            principal: Principal::unidentified(handle),
+            key_expiry: BTreeMap::new(),
+            refusals: 0,
+            wait: None,
+        };
         for (position, grant) in handshake.grants.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
             let refused = match self.authority.check_grant(grant).await {
-                Ok(subject) => {
+                Ok(CheckedGrant {
+                    subject,
+                    expires_at,
+                }) => {
                     let kind = subject_kind(&subject);
-                    let ambiguous = principal.accept(subject).is_err();
+                    let key = match &subject {
+                        Subject::Capability(capability) => Some(capability.key().to_string()),
+                        Subject::Identity(_) => None,
+                    };
+                    let ambiguous = resolved.principal.accept(subject).is_err();
                     if ambiguous {
                         tracing::warn!(
                             client_id = %handshake.client_id,
@@ -3809,6 +3939,10 @@ where
                             reason = "ambiguous",
                             "grant refused"
                         );
+                    } else if let (Some(key), Some(expires_at)) = (key, expires_at) {
+                        // A key presented twice dies at the later of its two expiries.
+                        let at = resolved.key_expiry.entry(key).or_insert(expires_at);
+                        *at = (*at).max(expires_at);
                     }
                     ambiguous
                 }
@@ -3826,15 +3960,15 @@ where
             if !refused {
                 continue;
             }
-            refusals = refusals.saturating_add(1);
+            resolved.refusals = resolved.refusals.saturating_add(1);
             // A refused grant never establishes an identity, so the refusal is
             // metered at the tier that has not proved one.
             if let Some(wait) = self.guard.credential_refusal(handle, Tier::Anonymous) {
-                refusal_wait = Some(wait);
+                resolved.wait = Some(wait);
                 break;
             }
         }
-        (principal, refusals, refusal_wait)
+        resolved
     }
 
     /// Serve one connection to completion: the registration gate, the
@@ -3875,6 +4009,7 @@ where
             span: _,
             outbound_tx,
             mut outbound_rx,
+            key_expiry,
         } = outcome;
         let session_id = principal.session_id();
         tracing::info!(?resume, "connection established");
@@ -3901,6 +4036,7 @@ where
             applied_watermark,
             resume,
             resume_read_budget,
+            key_expiry,
             closing: refused == Reaction::Close,
             enrol_challenge: None,
         };
@@ -3953,6 +4089,7 @@ where
                         Err(err) => break Err(err),
                     }
                 }
+                () = next_key_expiry(&state.key_expiry) => self.expire_keys(&mut state).await,
             }
         };
 
@@ -4022,6 +4159,12 @@ where
                 self.resnapshot_row(transport, state, &sub_id, &reason)
                     .await?;
             }
+            Outbound::Rebootstrap { sub } => {
+                self.rebootstrap_computed(transport, state, sub).await?;
+            }
+            Outbound::Refuse { sub_id } => {
+                self.refuse_subscription(transport, state, &sub_id).await?;
+            }
         }
         Ok(true)
     }
@@ -4033,10 +4176,193 @@ where
             self.remove_route(consumer_id).await;
             self.materializer.lock().await.unregister(sub_id);
         }
-        for subscription_id in state.computed_subs.into_values() {
+        for subscription_id in state
+            .computed_subs
+            .into_values()
+            .map(|computed| computed.id)
+        {
             self.remove_computed_route(subscription_id).await;
             self.materializer.lock().await.unregister(subscription_id);
         }
+    }
+
+    /// The tables whose read answer depends on the caller's keys, or `None`
+    /// when no authorization store reports them.
+    fn key_tables(&self) -> Option<&[String]> {
+        self.upkeep
+            .as_deref()
+            .map(crate::openfga::StoreUpkeep::key_tables)
+    }
+
+    /// Drop every held key whose expiry has passed (R95).
+    async fn expire_keys(&self, state: &mut SessionState<Id, Key>) {
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let (expired, live): (BTreeMap<String, u64>, BTreeMap<String, u64>) =
+            core::mem::take(&mut state.key_expiry)
+                .into_iter()
+                .partition(|(_, at)| *at <= now);
+        state.key_expiry = live;
+        if expired.is_empty() {
+            return;
+        }
+        tracing::info!(keys = expired.len(), "held share keys expired");
+        let next = state.principal.with_capabilities(
+            state
+                .principal
+                .capabilities()
+                .iter()
+                .filter(|held| !expired.contains_key(&held.key().to_string()))
+                .cloned(),
+        );
+        let reached = self.reached_by_keys(state);
+        self.swap_keys(state, next, reached).await;
+    }
+
+    /// The labels of the row and the computed subscriptions a change of the
+    /// caller's share keys reaches.
+    fn reached_by_keys(&self, state: &SessionState<Id, Key>) -> (Vec<String>, Vec<String>) {
+        let key_tables = self.key_tables();
+        let rows = state
+            .subs
+            .iter()
+            .filter(|(_, row)| key_change_reaches(&row.reg, key_tables))
+            .map(|(label, _)| label.clone())
+            .collect();
+        let computed = state
+            .computed_subs
+            .iter()
+            .filter(|(_, computed)| computed.rebinds)
+            .map(|(label, _)| label.clone())
+            .collect();
+        (rows, computed)
+    }
+
+    /// Make `next` the session's caller, queueing the resend of every
+    /// subscription in `reached` behind everything already queued (R95).
+    ///
+    /// The dispatch gate is held throughout, so every patch filtered under the
+    /// old keys is queued before the first resend and none after it.
+    async fn swap_keys(
+        &self,
+        state: &mut SessionState<Id, Key>,
+        next: Principal<Id, Key>,
+        (rows, computed): (Vec<String>, Vec<String>),
+    ) {
+        let _gate = self.dispatch_gate.lock().await;
+        state.principal = Arc::new(next);
+        {
+            let mut routes = self.routes.lock().await;
+            for row in state.subs.values() {
+                if let Some(route) = routes.get_mut(&row.reg.consumer_id) {
+                    route.principal = Arc::clone(&state.principal);
+                }
+            }
+        }
+        for label in rows {
+            let instruction = if self.register_again(state, &label).await {
+                Outbound::Resnapshot {
+                    sub_id: label,
+                    reason: FullResyncReason::AuthorizationChange,
+                }
+            } else {
+                Outbound::Refuse { sub_id: label }
+            };
+            let _ = state.outbound.send(instruction);
+        }
+        for label in computed {
+            if let Some(ComputedSub { id, sub, .. }) = state.computed_subs.remove(&label) {
+                self.remove_computed_route(id).await;
+                self.materializer.lock().await.unregister(id);
+                let _ = state.outbound.send(Outbound::Rebootstrap { sub });
+            }
+        }
+    }
+
+    /// Register one row subscription again under the session's current caller
+    /// when its seed holds the subject set, answering whether it can still be
+    /// served.
+    async fn register_again(&self, state: &mut SessionState<Id, Key>, label: &str) -> bool {
+        let Some(row) = state.subs.get(label) else {
+            return false;
+        };
+        if !row.reg.reads_subjects {
+            return true;
+        }
+        let (old_consumer, old_sub) = (row.reg.consumer_id, row.reg.sub_id);
+        let consumer_id = self.next_consumer_id();
+        let registered = self
+            .register_subscription(consumer_id, &row.sub, state)
+            .await;
+        self.remove_route(old_consumer).await;
+        self.materializer.lock().await.unregister(old_sub);
+        match registered.map(|registered| registered.into_row(consumer_id)) {
+            Ok(Ok(mut reg)) => {
+                if let Some(row) = state.subs.get_mut(label) {
+                    // The query is unchanged, so its terms watch the same tables.
+                    reg.member_tables = core::mem::take(&mut row.reg.member_tables);
+                    reg.reads_subjects = true;
+                    row.reg = reg;
+                }
+                true
+            }
+            Ok(Err(capture)) => {
+                self.materializer
+                    .lock()
+                    .await
+                    .unregister(capture.subscription_id);
+                false
+            }
+            Err(err) => {
+                tracing::warn!(sub_id = %label, error = %err, "a subscription could not be registered under the new share keys");
+                false
+            }
+        }
+    }
+
+    /// Register a computed subscription again under the session's current
+    /// caller and replace the answer the client holds (R95).
+    async fn rebootstrap_computed<T: Transport>(
+        &self,
+        transport: &mut T,
+        state: &mut SessionState<Id, Key>,
+        sub: Subscribe,
+    ) -> Result<(), SessionError> {
+        let consumer_id = self.next_consumer_id();
+        let refused = match self.register_subscription(consumer_id, &sub, state).await {
+            Ok(registered) => {
+                let reads_subjects = registered.reads_subjects;
+                match registered.into_row(consumer_id) {
+                    Err(capture) => {
+                        return self
+                            .subscribe_computed(
+                                transport,
+                                sub,
+                                state,
+                                capture,
+                                reads_subjects,
+                                Some(FullResyncReason::AuthorizationChange),
+                            )
+                            .await;
+                    }
+                    Ok(reg) => {
+                        self.materializer.lock().await.unregister(reg.sub_id);
+                        "it registered as rows".to_owned()
+                    }
+                }
+            }
+            Err(err) => err.to_string(),
+        };
+        tracing::warn!(sub_id = %sub.sub_id, error = %refused, "an aggregate could not be registered under the new share keys");
+        transport
+            .send_control(ControlMessage::NonFatalError(NonFatalError {
+                related_to: Some(sub.sub_id),
+                detail: SUBSCRIPTION_REFUSED.to_owned(),
+            }))
+            .await
+            .map_err(transport_err)
     }
 
     /// Answer one content ticket request: check visibility, call the signer,
@@ -4290,6 +4616,25 @@ where
         Ok((Arc::clone(enrolment), user))
     }
 
+    /// The answer to an enrolment nonce request: the nonce or the refusal.
+    fn enrol_challenge(
+        &self,
+        request_id: String,
+        state: &mut SessionState<Id, Key>,
+    ) -> ControlMessage {
+        let answer = self
+            .enrolling(state)
+            .and_then(|(enrolment, _)| enrolment.challenge(&mut state.enrol_challenge));
+        match answer {
+            Ok((nonce, window)) => ControlMessage::EnrolChallenge(EnrolChallenge {
+                request_id,
+                nonce,
+                expires_in_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
+            }),
+            Err(reason) => ControlMessage::EnrolRefused(EnrolRefused { request_id, reason }),
+        }
+    }
+
     async fn handle_control<T: Transport>(
         &self,
         transport: &mut T,
@@ -4303,7 +4648,11 @@ where
                     self.remove_route(consumer_id).await;
                     self.materializer.lock().await.unregister(sub_id);
                 }
-                if let Some(subscription_id) = state.computed_subs.remove(&unsub.sub_id) {
+                if let Some(ComputedSub {
+                    id: subscription_id,
+                    ..
+                }) = state.computed_subs.remove(&unsub.sub_id)
+                {
                     self.remove_computed_route(subscription_id).await;
                     self.materializer.lock().await.unregister(subscription_id);
                 }
@@ -4355,23 +4704,10 @@ where
             ControlMessage::ContentTicketRequest(req) => {
                 self.handle_content_ticket(transport, req, state).await
             }
-            ControlMessage::EnrolChallengeRequest(req) => {
-                let answer = self
-                    .enrolling(state)
-                    .and_then(|(enrolment, _)| enrolment.challenge(&mut state.enrol_challenge));
-                let request_id = req.request_id;
-                let answer = match answer {
-                    Ok((nonce, window)) => ControlMessage::EnrolChallenge(EnrolChallenge {
-                        request_id,
-                        nonce,
-                        expires_in_ms: u64::try_from(window.as_millis()).unwrap_or(u64::MAX),
-                    }),
-                    Err(reason) => {
-                        ControlMessage::EnrolRefused(EnrolRefused { request_id, reason })
-                    }
-                };
-                transport.send_control(answer).await.map_err(transport_err)
-            }
+            ControlMessage::EnrolChallengeRequest(req) => transport
+                .send_control(self.enrol_challenge(req.request_id, state))
+                .await
+                .map_err(transport_err),
             ControlMessage::EnrolRequest(req) => {
                 let request_id = req.request_id.clone();
                 let answer = match self.enrolling(state) {
@@ -4796,7 +5132,7 @@ where
         consumer_id: u64,
         sub: &Subscribe,
         state: &SessionState<Id, Key>,
-    ) -> Result<(SqliteRegistration, std::sync::Arc<[MemberTable]>), SubscribeRefusal> {
+    ) -> Result<Registered, SubscribeRefusal> {
         let mut materializer = self.materializer.lock().await;
         let pg_sql = materializer.translate_subscription_sql(&sub.spec.query)?;
         // The rule's caller-reading term only describes when the caller is stated.
@@ -4820,6 +5156,9 @@ where
             .unwrap_or_default();
         let seed = self.seed_for_terms(&terms, state).await?;
         let member_tables = Self::member_tables_of(&terms);
+        let reads_subjects = terms
+            .iter()
+            .any(|term| caller_of(term) == TermCaller::Subjects);
         // Engine-driven reads run on the dispatch path, so they spend the
         // shared re-execution bound: a slow read delays everyone's stream.
         let viewer = self.viewer_read_setup(state);
@@ -4831,13 +5170,12 @@ where
             self.guard.reexec_budget(),
             viewer,
         )?;
-        Ok((
-            SqliteRegistration {
-                registration,
-                pg_sql,
-            },
+        Ok(Registered {
+            registration,
+            pg_sql,
             member_tables,
-        ))
+            reads_subjects,
+        })
     }
 
     /// The read setup a per-consumer registration would run under: the shared
@@ -4952,11 +5290,8 @@ where
             return Ok(());
         }
         let consumer_id = self.next_consumer_id();
-        let (registration, member_tables) = match self
-            .register_subscription(consumer_id, &sub, state)
-            .await
-        {
-            Ok(pair) => pair,
+        let registered = match self.register_subscription(consumer_id, &sub, state).await {
+            Ok(registered) => registered,
             Err(err) => {
                 tracing::warn!(sub_id = %sub.sub_id, error = %err, "subscription registration refused");
                 // Naming something that does not resolve is one of the four
@@ -4979,27 +5314,17 @@ where
                 return Ok(());
             }
         };
-        let SqliteRegistration {
-            registration,
-            pg_sql,
-        } = registration;
-
-        match registration {
-            Registration::Row(sub_id) => {
-                let reg = RowRegistration {
-                    consumer_id,
-                    sub_id,
-                    pg_sql,
-                    member_tables,
-                };
+        let reads_subjects = registered.reads_subjects;
+        match registered.into_row(consumer_id) {
+            Ok(reg) => {
                 self.serve_term_row(transport, sub, state, tier, reg, reader_permit)
                     .await
             }
-            Registration::Computed(capture) => {
+            Err(capture) => {
                 // Aggregates bootstrap through the re-execution connector on
                 // the owner pool and hold no share permit (R39).
                 drop(reader_permit);
-                self.subscribe_computed(transport, sub, state, capture)
+                self.subscribe_computed(transport, sub, state, capture, reads_subjects, None)
                     .await
             }
         }
@@ -5229,32 +5554,21 @@ where
             .await
             .map_err(transport_err)?;
         let consumer_id = self.next_consumer_id();
-        let registration = match self
+        let registered = match self
             .register_subscription(consumer_id, &hidden, state)
             .await
         {
-            Ok((registration, _)) => registration,
-            // The query is the server's own rendering over its own catalog,
-            // so a refusal here is a server-side defect, never something the
-            // caller sent, and the term is refused with it rather than served
-            // without the rows its local answer needs.
+            Ok(registered) => registered,
+            // The server's own rendering over its own catalog, so a refusal is a server-side defect.
             Err(err) => return Err(SessionError::Snapshot(err.to_string())),
         };
-        let SqliteRegistration {
-            registration,
-            pg_sql,
-        } = registration;
-        let Registration::Row(sub_id) = registration else {
+        let Ok(mut reg) = registered.into_row(consumer_id) else {
             return Err(SessionError::Snapshot(
                 "a membership subscription registered as something other than rows".to_owned(),
             ));
         };
-        let reg = RowRegistration {
-            consumer_id,
-            sub_id,
-            pg_sql,
-            member_tables: std::sync::Arc::from(Vec::new()),
-        };
+        reg.member_tables = std::sync::Arc::from(Vec::new());
+        reg.reads_subjects |= member.subjects;
         self.subscribe_row(transport, hidden, state, reg, tier, Some(permit))
             .await
     }
@@ -5329,6 +5643,12 @@ where
         sub_label: &str,
         reason: &FullResyncReason,
     ) -> Result<(), SessionError> {
+        // The notice goes straight out while row frames wait for credit, so a
+        // queued frame of the old answer would land after the clear.
+        state
+            .pending
+            .retain(|queued| queued.sub_id() != Some(sub_label));
+        state.paging.retain(|read| read.label != sub_label);
         let mut attempt: u32 = 0;
         loop {
             // Read afresh each time: an unsubscribe may have landed between
@@ -6101,12 +6421,17 @@ where
     /// 2). A read tier bootstraps through the engine's own connector under
     /// the shared re-execution bound, because that path holds the
     /// materializer lock.
+    ///
+    /// `resync` goes out once the answer exists and ahead of it, so a client
+    /// replacing an answer drops the old one only for a new one.
     async fn subscribe_computed<T: Transport>(
         &self,
         transport: &mut T,
         sub: Subscribe,
         state: &mut SessionState<Id, Key>,
         capture: ComputedCapture,
+        reads_subjects: bool,
+        resync: Option<FullResyncReason>,
     ) -> Result<(), SessionError> {
         let subscription_id = capture.subscription_id;
         let changes = match self.first_answer(&capture, state).await {
@@ -6126,9 +6451,15 @@ where
             },
         )
         .await;
-        state
-            .computed_subs
-            .insert(sub.sub_id.clone(), subscription_id);
+        if let Some(reason) = resync {
+            transport
+                .send_control(ControlMessage::FullResyncRequired(FullResyncRequired {
+                    sub_id: sub.sub_id.clone(),
+                    reason,
+                }))
+                .await
+                .map_err(transport_err)?;
+        }
         for change in changes {
             transport
                 .send_control(ControlMessage::AggregateUpdate(AggregateUpdate {
@@ -6141,6 +6472,15 @@ where
                 .await
                 .map_err(transport_err)?;
         }
+        let rebinds = capture.per_viewer || reads_subjects;
+        state.computed_subs.insert(
+            sub.sub_id.clone(),
+            ComputedSub {
+                id: subscription_id,
+                sub,
+                rebinds,
+            },
+        );
         Ok(())
     }
 

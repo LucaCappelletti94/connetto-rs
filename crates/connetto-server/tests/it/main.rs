@@ -105,6 +105,8 @@ mod rls_write_question;
 
 mod session_loop;
 
+mod share_keys;
+
 mod restore;
 
 mod slot_watch;

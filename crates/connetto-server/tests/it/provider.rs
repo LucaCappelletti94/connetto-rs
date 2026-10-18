@@ -233,6 +233,7 @@ async fn accessor_refreshes_an_expired_provider_token() {
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };
@@ -271,6 +272,7 @@ async fn accessor_returns_a_still_valid_token_unrefreshed() {
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };

@@ -38,6 +38,10 @@ impl StoreUpkeep for CountingUpkeep {
         self.0.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move { Ok(Vec::new()) })
     }
+
+    fn key_tables(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// Snapshot that serves nothing; the test exercises the live path only.
@@ -169,6 +173,10 @@ impl StoreUpkeep for FailingUpkeep {
     ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
         Box::pin(async move { Err(UpkeepError::Write("the store is unreachable".to_owned())) })
     }
+
+    fn key_tables(&self) -> &[String] {
+        &[]
+    }
 }
 
 /// A store that could not be brought level holds the event as an unavailable answer, so the ingest loop asks again.
@@ -236,6 +244,10 @@ impl StoreUpkeep for UnanswerableUpkeep {
                 "the store refuses the change for good".to_owned(),
             ))
         })
+    }
+
+    fn key_tables(&self) -> &[String] {
+        &[]
     }
 }
 
