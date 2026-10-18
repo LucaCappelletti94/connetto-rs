@@ -42,6 +42,10 @@ native-transport = [
 # dependency, because that line carries the `sqlite` backend the core must not
 # require.
 diesel-pg = ["dep:diesel"]
+# The R31 tier shape reader, on the SQLite backend. Off by default so the
+# core stays dependency-light for the browser build, the way `diesel-pg` is,
+# and on for the build step and the client's post-migration DDL check.
+sqlite-shape = ["diesel/sqlite"]
 # Fakes the client and browser test suites share, chiefly a transport that answers
 # a handshake and nothing else. Test-only: no production build enables it.
 test-support = []

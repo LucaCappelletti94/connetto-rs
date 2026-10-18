@@ -1,0 +1,2 @@
+PRAGMA case_sensitive_like = 1;
+CREATE TABLE notes (id INTEGER PRIMARY KEY NOT NULL, body TEXT) STRICT;

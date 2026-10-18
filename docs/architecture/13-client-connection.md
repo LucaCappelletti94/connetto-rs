@@ -297,6 +297,8 @@ One consequence reaches the application: trusted schema off means a function the
 
 **The major is declared once, in the schema source.** A line `-- connetto:major N` in the Postgres schema source is read by `SchemaBundle::new` into `SchemaBundle::major()`, majors start at 1, and a source without the line fails. The line sits inside the bundle hash. One schema source, read by the application's `build.rs` and the server's boot translation alike, is the deployment's convention, and the handshake is what enforces it at the wire. The client sends its major in the `Handshake` and the server refuses another with `FatalErrorReason::MajorMismatch { server, client }`. The client reads an older own major as `ClientError::UpdateRequired` and a newer one as `ClientError::ServerBehind`. The bundle-hash check stays and catches the same major built from a different schema. Chapter 02 describes the wire side.
 
+**The tier's history is a directory the application commits.** It holds one translated export per major, `<N>.sql`, beside an optional `<N>.boundary.toml` declaring the tables and columns the boundary into major `N` drops or renames. `connetto-schema export-tier` writes the current major's export and never rewrites an older one, and `--check` fails a CI run whose export is missing or stale. The build script passes the directory to `emit` through `TierSource`, and `emit` only reads it, generating each boundary's SQL from the diff of two consecutive exports, SQLite's table rebuild included. A drop the boundary file does not declare, and a new `NOT NULL` column without a default, fail the build.
+
 ---
 
 ## Open Questions
