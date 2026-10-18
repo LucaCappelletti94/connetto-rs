@@ -138,6 +138,8 @@ pub enum NmEvent {
         /// The state's reason.
         reason: u32,
     },
+    /// A device was added or removed, so re-read the Wi-Fi devices.
+    DevicesChanged,
 }
 
 /// Why a `NetworkManager` call failed.
@@ -227,6 +229,7 @@ impl ZbusNm {
                 () = async {
                     tokio::join!(
                         forward_check_permissions(signal_bus.clone(), tx.clone()),
+                        forward_devices(signal_bus.clone(), tx.clone()),
                         forward_wireless(signal_bus, tx.clone()),
                         forward_active_states(states, tx.clone()),
                     );
@@ -278,6 +281,26 @@ async fn forward_check_permissions(
     };
     while let Some(_signal) = stream.next().await {
         if events.send(NmEvent::CheckPermissions).await.is_err() {
+            break;
+        }
+    }
+}
+
+/// Forward the `DeviceAdded` and `DeviceRemoved` signals to the event
+/// channel as one device change.
+async fn forward_devices(bus: zbus::Connection, events: tokio::sync::mpsc::Sender<NmEvent>) {
+    let Ok(proxy) = NmProxy::new(&bus).await else {
+        return;
+    };
+    let (Ok(added), Ok(removed)) = (
+        proxy.receive_device_added().await,
+        proxy.receive_device_removed().await,
+    ) else {
+        return;
+    };
+    let mut changes = futures_util::stream::select(added.map(|_| ()), removed.map(|_| ()));
+    while changes.next().await.is_some() {
+        if events.send(NmEvent::DevicesChanged).await.is_err() {
             break;
         }
     }
@@ -697,6 +720,10 @@ trait Nm {
 
     #[zbus(signal)]
     fn check_permissions(&self) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn device_added(&self, device: OwnedObjectPath) -> zbus::Result<()>;
+    #[zbus(signal)]
+    fn device_removed(&self, device: OwnedObjectPath) -> zbus::Result<()>;
 }
 
 /// The `Properties` interface the signal forwarding subscribes to.
@@ -1673,6 +1700,42 @@ mod tests {
             matches!(err, AddError::Failed(_)),
             "the refusal is the failed reason, {err:?}"
         );
+    }
+
+    /// A device `NetworkManager` adds or removes arrives as the one
+    /// `DevicesChanged` event.
+    #[tokio::test]
+    async fn the_device_signals_arrive_as_a_device_change() {
+        let bus = crate::linux::test_bus::PrivateBus::start();
+        let (server, _calls, _mode, _deactivated) = serve_fake_nm(&bus).await;
+        let io = ZbusNm::new_with_connection(bus.connect().await)
+            .await
+            .expect("the network manager client");
+        let device =
+            zbus::zvariant::OwnedObjectPath::try_from("/org/freedesktop/NetworkManager/Devices/7")
+                .expect("the device path");
+        for member in ["DeviceAdded", "DeviceRemoved"] {
+            let event = event_after(
+                &io,
+                || {
+                    let device = device.clone();
+                    let server = &server;
+                    async move {
+                        emit_signal(
+                            server,
+                            "/org/freedesktop/NetworkManager",
+                            "org.freedesktop.NetworkManager",
+                            member,
+                            &(device,),
+                        )
+                        .await;
+                    }
+                },
+                |event| matches!(event, NmEvent::DevicesChanged),
+            )
+            .await;
+            assert!(matches!(event, NmEvent::DevicesChanged), "{member}");
+        }
     }
 
     /// Each `NetworkManager` signal arrives as its event, over a fake

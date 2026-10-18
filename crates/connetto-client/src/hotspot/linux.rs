@@ -142,6 +142,9 @@ struct Env {
     permissions: HashMap<String, String>,
     /// The Wi-Fi devices, in `NetworkManager`'s order.
     devices: Vec<WifiDevice>,
+    /// Whether a device read has answered, the table standing unread
+    /// until one does.
+    devices_read: bool,
     /// The devices whose `5 GHz` attempt failed, held for the life of the
     /// process.
     five_ghz_failed: BTreeSet<String>,
@@ -264,13 +267,26 @@ impl LinuxHotspotBackend {
                 Item::Command(Command::Host { generation, req }) => {
                     match io.add_and_activate(&req).await {
                         Ok(active) => host_add_answered(io, &standing, generation, active).await,
-                        Err(err) => host_add_refused(io, &standing, &req, generation, err).await,
+                        Err(err) => {
+                            let failed = matches!(err, AddError::Failed(_));
+                            host_add_refused(io, &standing, &req, generation, err).await;
+                            // The device path may be gone, so the table re-reads.
+                            if failed {
+                                read_devices(io, &standing).await;
+                            }
+                        }
                     }
                 }
                 Item::Command(Command::Join { generation, req }) => {
                     match io.add_and_activate(&req).await {
                         Ok(active) => join_add_answered(io, &standing, generation, active).await,
-                        Err(err) => join_add_refused(&standing, generation, err),
+                        Err(err) => {
+                            let failed = matches!(err, AddError::Failed(_));
+                            join_add_refused(&standing, generation, err);
+                            if failed {
+                                read_devices(io, &standing).await;
+                            }
+                        }
                     }
                 }
                 Item::Command(Command::Deactivate(path)) => {
@@ -279,7 +295,11 @@ impl LinuxHotspotBackend {
                     }
                 }
                 Item::Event(event) => handle_event(io, &standing, event).await,
-                Item::Deadline => {}
+                Item::Deadline => {
+                    if !standing.lock().env.devices_read {
+                        read_devices(io, &standing).await;
+                    }
+                }
             }
         }
     }
@@ -357,6 +377,10 @@ fn next_deadline(standing: &Standing) -> Option<Instant> {
     ) {
         let repoll = Instant::now() + TICK;
         due = due.map_or(Some(repoll), |due| Some(due.min(repoll)));
+    }
+    if !s.env.devices_read {
+        let reread = Instant::now() + TICK;
+        due = due.map_or(Some(reread), |due| Some(due.min(reread)));
     }
     due
 }
@@ -639,6 +663,7 @@ async fn handle_event<IO: NmIo>(io: &IO, standing: &Standing, event: NmEvent) {
             state,
             reason,
         } => state_changed(io, standing, &active, state, reason).await,
+        NmEvent::DevicesChanged => read_devices(io, standing).await,
     }
 }
 
@@ -839,8 +864,18 @@ async fn read_env<IO: NmIo>(io: &IO, standing: &Standing) {
     if let Ok(on) = io.wifi_enabled().await {
         standing.lock().env.wifi_enabled = on;
     }
-    if let Ok(devices) = io.wifi_devices().await {
-        standing.lock().env.devices = devices;
+    read_devices(io, standing).await;
+}
+
+/// The device table's re-read, the old table kept on a refusal.
+async fn read_devices<IO: NmIo>(io: &IO, standing: &Standing) {
+    match io.wifi_devices().await {
+        Ok(devices) => {
+            let mut s = standing.lock();
+            s.env.devices = devices;
+            s.env.devices_read = true;
+        }
+        Err(err) => tracing::debug!(%err, "the Wi-Fi devices will not read"),
     }
 }
 
@@ -891,6 +926,10 @@ impl HotspotBackend for LinuxHotspotBackend {
             HostStanding::Five { .. } | HostStanding::Two { .. } | HostStanding::Active { .. }
         ) {
             return Ok(());
+        }
+        // An unread table is no missing Wi-Fi, so the request may retry.
+        if !s.env.devices_read {
+            return Err(HotspotError::Failed);
         }
         let device: WifiDevice = match s.env.devices.iter().find(|device| device.is_access_point())
         {
@@ -1011,6 +1050,9 @@ impl HotspotBackend for LinuxHotspotBackend {
             JoinStanding::Requesting { .. } | JoinStanding::Joined { .. }
         );
         if !replacing {
+            if !s.env.devices_read {
+                return Err(JoinError::Failed);
+            }
             if s.env.devices.is_empty() {
                 return Err(JoinError::Unsupported);
             }
@@ -1178,6 +1220,9 @@ mod tests {
         ipv4: Mutex<HashMap<String, Ipv4Standing>>,
         env_reads: AtomicUsize,
         env_ready: AtomicBool,
+        /// How many device reads refuse before one answers, the test's
+        /// switch.
+        device_refusals: Mutex<usize>,
         events: tokio::sync::Mutex<mpsc::UnboundedReceiver<NmEvent>>,
     }
 
@@ -1201,6 +1246,7 @@ mod tests {
                     ipv4: Mutex::new(HashMap::new()),
                     env_reads: AtomicUsize::new(0),
                     env_ready: AtomicBool::new(false),
+                    device_refusals: Mutex::new(0),
                     events: tokio::sync::Mutex::new(rx),
                 }),
                 tx,
@@ -1232,6 +1278,17 @@ mod tests {
             self.env_reads.fetch_add(1, Ordering::Relaxed);
             let devices = self.devices.lock().clone();
             self.env_ready.store(true, Ordering::Release);
+            let refused = {
+                let mut refusals = self.device_refusals.lock();
+                let left = refusals.checked_sub(1);
+                *refusals = left.unwrap_or(0);
+                left.is_some()
+            };
+            if refused {
+                return std::future::ready(Err(NmIoError::Failed(
+                    "the device table will not read".into(),
+                )));
+            }
             std::future::ready(Ok(devices))
         }
 
@@ -1985,6 +2042,96 @@ mod tests {
             .expect("the event goes in");
         pump_until(|| h.backend.request_host().is_ok()).await;
         pump_until(|| sent(&h).len() == 1).await;
+    }
+
+    /// A device table whose read failed answers the retryable `Failed`,
+    /// and the tick's re-read stands it read.
+    #[tokio::test]
+    async fn an_unread_device_table_answers_failed_until_the_tick_reads_it() {
+        tokio::time::pause();
+        let (fake, events) = FakeNm::new(vec![device(AP_FLAG)], granted_permissions(), true);
+        *fake.device_refusals.lock() = 1;
+        let (backend, receiver) = LinuxHotspotBackend::unstarted();
+        let driver = tokio::spawn(LinuxHotspotBackend::drive(
+            fake.clone(),
+            backend.standing.clone(),
+            receiver,
+        ));
+        let h = Harness {
+            backend,
+            fake,
+            events,
+            driver,
+        };
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(h.backend.request_host(), Err(HotspotError::Failed));
+        assert_eq!(
+            h.backend
+                .request_join(&offer("the-offer", HotspotSecurity::Wpa2)),
+            Err(JoinError::Failed),
+            "an unread table is no missing Wi-Fi"
+        );
+        tokio::time::sleep(TICK + Duration::from_millis(50)).await;
+        pump_until(|| h.backend.request_host().is_ok()).await;
+        pump_until(|| sent(&h).len() == 1).await;
+    }
+
+    /// A device `NetworkManager` adds after the start stands in the table.
+    #[tokio::test]
+    async fn a_device_change_rereads_the_table() {
+        tokio::time::pause();
+        let h = harness(Vec::new(), granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        assert_eq!(h.backend.request_host(), Err(HotspotError::Unsupported));
+        h.fake.devices.lock().push(device(AP_FLAG));
+        h.events
+            .send(NmEvent::DevicesChanged)
+            .expect("the event goes in");
+        pump_until(|| h.backend.request_host().is_ok()).await;
+        pump_until(|| sent(&h).len() == 1).await;
+    }
+
+    /// A device `NetworkManager` removes leaves the table, and a failed
+    /// re-read keeps the table it had.
+    #[tokio::test]
+    async fn a_removed_device_leaves_and_a_failed_reread_keeps_the_table() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        *h.fake.device_refusals.lock() = 1;
+        h.fake.devices.lock().clear();
+        h.events
+            .send(NmEvent::DevicesChanged)
+            .expect("the event goes in");
+        pump_until(|| *h.fake.device_refusals.lock() == 0).await;
+        tokio::task::yield_now().await;
+        assert!(
+            h.backend.standing.lock().env.devices.len() == 1,
+            "a failed re-read keeps the table"
+        );
+        h.events
+            .send(NmEvent::DevicesChanged)
+            .expect("the event goes in");
+        pump_until(|| h.backend.standing.lock().env.devices.is_empty()).await;
+        assert_eq!(h.backend.request_host(), Err(HotspotError::Unsupported));
+    }
+
+    /// An add `NetworkManager` refuses with a failure re-reads the device
+    /// table, since the device path may be gone.
+    #[tokio::test]
+    async fn a_failed_add_rereads_the_device_table() {
+        tokio::time::pause();
+        let h = harness(vec![device(AP_FLAG)], granted_permissions(), true);
+        pump_until(|| h.fake.env_ready()).await;
+        let reads = h.fake.env_reads.load(Ordering::Relaxed);
+        h.fake
+            .adds
+            .lock()
+            .push_back(Err(AddError::Failed("the device is gone".into())));
+        h.fake.devices.lock().clear();
+        assert_eq!(h.backend.request_host(), Ok(()));
+        pump_until(|| h.fake.env_reads.load(Ordering::Relaxed) > reads).await;
+        pump_until(|| h.backend.standing.lock().env.devices.is_empty()).await;
     }
 
     #[tokio::test]

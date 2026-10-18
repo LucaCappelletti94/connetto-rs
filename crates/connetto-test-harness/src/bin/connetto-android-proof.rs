@@ -1420,32 +1420,42 @@ async fn linux_joins_with_summary(
     evidence: &Path,
     proved: &(Duration, Result<(), String>),
 ) -> Result<()> {
-    let reports = linux_peer_proof(phone, evidence).await;
-    let summary = summary(&commit().await, proved, reports.as_deref(), Ok(()));
+    let PeerOutcome { joins, teardown } = match linux_peer_proof(phone, evidence).await {
+        Ok(outcome) => outcome,
+        Err(err) => PeerOutcome {
+            joins: Err(err),
+            teardown: Ok(()),
+        },
+    };
+    let summary = summary(
+        &commit().await,
+        proved,
+        joins.as_deref(),
+        teardown.as_ref().copied(),
+    );
     eprintln!("{summary}");
     tokio::fs::write(evidence.join("summary.txt"), &summary)
         .await
         .context("writing the summary")?;
-    let failed: Vec<&str> = reports?
+    let failed: Vec<&str> = joins?
         .iter()
         .filter(|report| report.outcome.is_err())
         .map(|report| report.name)
         .collect();
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(anyhow!("the {} join failed", failed.join(", ")))
+    if !failed.is_empty() {
+        bail!("the {} join failed", failed.join(", "));
     }
+    teardown.context("bringing the machines back to rest after the joins")
 }
 
 /// The linux-peer proof: the phone's single-phone proof, then pippo in the
-/// second device's place, a native client driven in a child process.
+/// second device's place, a native client driven in a child process. The
+/// outcome holds the walk's reports and the machines' return to rest apart.
 ///
 /// # Errors
 ///
-/// When the leg will not stand, the walk fails its setup, or the machines
-/// cannot come back to rest.
-async fn linux_peer_proof(phone: &Device, evidence: &Path) -> Result<Vec<JoinReport>> {
+/// When the phone cannot be readied before its network leaves.
+async fn linux_peer_proof(phone: &Device, evidence: &Path) -> Result<PeerOutcome> {
     if !demo_has_device_identity() {
         bail!("the linux peer proof needs a demo build with its device identity");
     }
@@ -1480,8 +1490,7 @@ async fn linux_peer_proof(phone: &Device, evidence: &Path) -> Result<Vec<JoinRep
         phone_usual: phone_usual.clone(),
         pippo_usual: pippo_usual.clone(),
     };
-    let reports = linux_section(&steps, evidence).await?;
-    Ok(reports)
+    Ok(linux_section(&steps, evidence).await)
 }
 
 /// The linux section's resource steps, the phone and the leg behind them
@@ -1583,7 +1592,7 @@ impl LinuxSteps for RealSteps<'_> {
 /// The section after the phone's network leaves. Every fallible step
 /// stands in the setup, so the restore and the leg cleanup run before the
 /// result returns, whatever the step meets.
-async fn linux_section<S: LinuxSteps>(steps: &S, evidence: &Path) -> Result<Vec<JoinReport>> {
+async fn linux_section<S: LinuxSteps>(steps: &S, evidence: &Path) -> PeerOutcome {
     let (result, leg): (Result<Vec<JoinReport>>, Option<S::Leg>) =
         match steps.spawn_leg(evidence).await {
             Err(err) => (Err(err), None),
@@ -1611,8 +1620,9 @@ async fn linux_section<S: LinuxSteps>(steps: &S, evidence: &Path) -> Result<Vec<
     };
     let phone_back = steps.restore_network().await;
     let bluetooth = steps.bluetooth_off().await;
-    // The walk's outcome stands whatever the cleanup meets, so a cleanup
-    // that fails is reported beside it and leaves the summary whole.
+    // The walk's outcome stands whatever the cleanup meets, and the first
+    // cleanup failure stands beside it as the teardown's.
+    let mut teardown = Ok(());
     for (what, outcome) in [
         ("powering the linux adapter off", adapter),
         ("closing the linux leg", leg_closed),
@@ -1621,9 +1631,15 @@ async fn linux_section<S: LinuxSteps>(steps: &S, evidence: &Path) -> Result<Vec<
     ] {
         if let Err(err) = outcome {
             eprintln!("the cleanup failed {what}: {err:#}");
+            if teardown.is_ok() {
+                teardown = Err(err.context(what));
+            }
         }
     }
-    result
+    PeerOutcome {
+        joins: result,
+        teardown,
+    }
 }
 
 /// The walk itself: each join in turn, every one recorded, with the
@@ -2303,15 +2319,7 @@ impl Unlock<'_> {
         device.screenshot(evidence, name).await?;
         match self.pin {
             Some(pin) => {
-                // A phone with a fingerprint enrolled opens the prompt on the
-                // sensor, and its PIN pad sits behind the prompt's own button.
-                if let Some((left, top, right, bottom)) =
-                    device.dialog_button_bounds(&PIN_FALLBACK_BUTTONS).await?
-                {
-                    let x = i32::midpoint(left, right).to_string();
-                    let y = i32::midpoint(top, bottom).to_string();
-                    device.adb(&["shell", "input", "tap", &x, &y]).await?;
-                }
+                device.tap_pin_fallback().await?;
                 // The credential pad needs a moment to take focus.
                 sleep(Duration::from_secs(1)).await;
                 device.adb(&["shell", "input", "text", pin]).await?;
@@ -2871,6 +2879,33 @@ impl Device {
 
     /// The bounds of a system dialog's button, or none while the dialog is
     /// not up, matched by the localized texts `labels` name.
+    /// Open the PIN pad a phone with a fingerprint enrolled keeps behind
+    /// the prompt's own button.
+    ///
+    /// # Errors
+    ///
+    /// When the tap fails.
+    async fn tap_pin_fallback(&self) -> Result<()> {
+        // A dump can crash while the prompt animates in, which reads as no
+        // button, so the PIN entry goes on.
+        let fallback = self
+            .dialog_button_bounds(&PIN_FALLBACK_BUTTONS)
+            .await
+            .unwrap_or_else(|err| {
+                eprintln!(
+                    "{} gave no UI dump for the PIN fallback: {err:#}",
+                    self.serial
+                );
+                None
+            });
+        if let Some((left, top, right, bottom)) = fallback {
+            let x = i32::midpoint(left, right).to_string();
+            let y = i32::midpoint(top, bottom).to_string();
+            self.adb(&["shell", "input", "tap", &x, &y]).await?;
+        }
+        Ok(())
+    }
+
     async fn dialog_button_bounds(&self, labels: &[&str]) -> Result<Option<(i32, i32, i32, i32)>> {
         self.adb(&["shell", "uiautomator", "dump", "/sdcard/connetto-ui.xml"])
             .await?;
@@ -3160,6 +3195,47 @@ mod tests {
         std::fs::read_to_string(dir.join("calls")).unwrap_or_default()
     }
 
+    /// A UI dump that fails while the prompt animates in leaves the PIN
+    /// entry to go on, with no tap.
+    #[tokio::test]
+    async fn a_failed_dump_leaves_the_pin_entry_to_go_on() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adb = fake_adb(
+            dir.path(),
+            r#"case "$*" in
+  *"uiautomator dump"*) echo "ERROR: could not get idle state." >&2; exit 1 ;;
+esac
+exit 0"#,
+        );
+        let device = Device::with_adb("emulator-5554".to_owned(), adb, Duration::from_secs(5));
+        device
+            .tap_pin_fallback()
+            .await
+            .expect("a failed dump is no failure");
+        let calls = calls(dir.path());
+        assert!(!calls.contains("input tap"), "{calls}");
+    }
+
+    /// The fallback button a dump shows is tapped at its centre.
+    #[tokio::test]
+    async fn the_pin_fallback_button_is_tapped_at_its_centre() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adb = fake_adb(
+            dir.path(),
+            &format!(
+                r#"case "$*" in
+  *"cat /sdcard/connetto-ui.xml"*) echo '<node index="0" text="{}" clickable="true" bounds="[100,200][300,400]" />' ;;
+esac
+exit 0"#,
+                super::PIN_FALLBACK_BUTTONS[0]
+            ),
+        );
+        let device = Device::with_adb("emulator-5554".to_owned(), adb, Duration::from_secs(5));
+        device.tap_pin_fallback().await.expect("the tap stands");
+        let calls = calls(dir.path());
+        assert!(calls.contains("input tap 200 300"), "{calls}");
+    }
+
     #[tokio::test]
     async fn a_device_that_drops_offline_once_is_reconnected_and_the_command_retried() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3288,6 +3364,8 @@ echo "adb: device offline" >&2; exit 1"#,
         Walk,
         /// The leg's log write.
         Log,
+        /// The phone's return to its network, a cleanup step.
+        Restore,
     }
 
     /// The calls the section made, its setup and its cleanup.
@@ -3381,6 +3459,9 @@ echo "adb: device offline" >&2; exit 1"#,
 
         async fn restore_network(&self) -> anyhow::Result<()> {
             self.flags.lock().restore = true;
+            if self.refusal == FakeRefusal::Restore {
+                anyhow::bail!("the injected restore failure");
+            }
             Ok(())
         }
 
@@ -3402,8 +3483,12 @@ echo "adb: device offline" >&2; exit 1"#,
             (FakeRefusal::Log, true, true, true),
         ] {
             let steps = FakeSteps::new(refusal);
-            let result = super::linux_section(&steps, Path::new("evidence")).await;
-            assert!(result.is_err(), "the {refusal:?} refusal stands");
+            let outcome = super::linux_section(&steps, Path::new("evidence")).await;
+            assert!(outcome.joins.is_err(), "the {refusal:?} refusal stands");
+            assert!(
+                outcome.teardown.is_ok(),
+                "the {refusal:?} refusal's cleanup stood"
+            );
             let flags = steps.flags();
             assert!(
                 flags.restore,
@@ -3430,6 +3515,21 @@ echo "adb: device offline" >&2; exit 1"#,
                 "the {refusal:?} refusal mis-wrote the leg's log"
             );
         }
+    }
+
+    /// A cleanup step that fails stands as the teardown's error beside the
+    /// walk's reports, and the cleanup after it still runs.
+    #[tokio::test]
+    async fn a_cleanup_failure_stands_beside_the_walk() {
+        let steps = FakeSteps::new(FakeRefusal::Restore);
+        let outcome = super::linux_section(&steps, Path::new("evidence")).await;
+        assert!(outcome.joins.is_ok(), "the walk's reports stand");
+        let err = outcome.teardown.expect_err("the restore's failure stands");
+        assert_eq!(err.root_cause().to_string(), "the injected restore failure");
+        assert!(
+            steps.flags().bluetooth_off,
+            "the cleanup after the failure still ran"
+        );
     }
 
     /// The walk's mode needs the dioxus panel, so `--linux-peer` with the

@@ -69,8 +69,42 @@ pub struct LegClient {
     child: AsyncLock<Child>,
     stdin: AsyncLock<Option<ChildStdin>>,
     next_id: AtomicU64,
-    waiters: Arc<Lock<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>>,
+    answers: Arc<Answers>,
     log: Arc<Lock<Vec<String>>>,
+}
+
+/// The leg's answer stream as the proof reads it, each answer handed to
+/// its waiting command, and the first fatal line kept as the cause every
+/// later command fails with.
+#[derive(Default)]
+struct Answers {
+    waiters: Lock<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>,
+    fatal: Lock<Option<String>>,
+}
+
+impl Answers {
+    /// One line of the leg's answer stream.
+    fn route(&self, line: &str) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            eprintln!("[leg] an unparseable line: {line}");
+            return;
+        };
+        if let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) {
+            if let Some(waiter) = self.waiters.lock().remove(&id) {
+                let _ = waiter.send(value);
+            }
+        } else if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
+            eprintln!("[leg] fatal: {error}");
+            self.fatal.lock().get_or_insert_with(|| error.to_owned());
+            // The dropped senders end every pending wait on the cause.
+            self.waiters.lock().clear();
+        }
+    }
+
+    /// The fatal line's cause, once the leg stood down.
+    fn fatal(&self) -> Option<String> {
+        self.fatal.lock().clone()
+    }
 }
 
 /// Drive the leg, the child process of the proof binary, which signs in,
@@ -185,6 +219,8 @@ async fn serve(client: NativeClient<NativeTransport>) -> Result<()> {
                 if write_line(&mut out, &json!({"event": "fatal", "error": error})).await.is_err() {
                     return Err(anyhow!("the proof stopped reading the leg's answers"));
                 }
+                // The client stood down, so the leg does too.
+                break;
             }
         }
     }
@@ -643,30 +679,19 @@ impl LegClient {
                 log_lines.lock().push(line);
             }
         });
-        let waiters: Arc<Lock<HashMap<u64, tokio::sync::oneshot::Sender<serde_json::Value>>>> =
-            Arc::new(Lock::new(HashMap::new()));
-        let read_waiters = Arc::clone(&waiters);
+        let answers = Arc::new(Answers::default());
+        let read_answers = Arc::clone(&answers);
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                    eprintln!("[leg] an unparseable line: {line}");
-                    continue;
-                };
-                if let Some(id) = value.get("id").and_then(serde_json::Value::as_u64) {
-                    if let Some(waiter) = read_waiters.lock().remove(&id) {
-                        let _ = waiter.send(value);
-                    }
-                } else if let Some(error) = value.get("error").and_then(serde_json::Value::as_str) {
-                    eprintln!("[leg] fatal: {error}");
-                }
+                read_answers.route(&line);
             }
         });
         Ok(Self {
             child,
             stdin: AsyncLock::new(Some(stdin)),
             next_id: AtomicU64::new(0),
-            waiters,
+            answers,
             log,
         })
     }
@@ -686,7 +711,12 @@ impl LegClient {
     ) -> Result<serde_json::Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.waiters.lock().insert(id, sender);
+        self.answers.waiters.lock().insert(id, sender);
+        // A fatal line that landed before the wait stood ends it here.
+        if let Some(cause) = self.answers.fatal() {
+            self.answers.waiters.lock().remove(&id);
+            bail!("the linux leg stood down before {command}: {cause}");
+        }
         let mut request = body;
         request["id"] = json!(id);
         request["cmd"] = json!(command);
@@ -707,7 +737,7 @@ impl LegClient {
             }
         };
         if let Err(err) = written {
-            self.waiters.lock().remove(&id);
+            self.answers.waiters.lock().remove(&id);
             if self.exited().await {
                 bail!("the linux leg exited before it took {command}");
             }
@@ -715,9 +745,14 @@ impl LegClient {
         }
         let answer = match timeout(bound, receiver).await {
             Ok(Ok(answer)) => answer,
-            Ok(Err(_)) => bail!("the linux leg closed its stream without answering {command}"),
+            Ok(Err(_)) => match self.answers.fatal() {
+                Some(cause) => {
+                    bail!("the linux leg stood down before it answered {command}: {cause}")
+                }
+                None => bail!("the linux leg closed its stream without answering {command}"),
+            },
             Err(_) => {
-                self.waiters.lock().remove(&id);
+                self.answers.waiters.lock().remove(&id);
                 if self.exited().await {
                     bail!("the linux leg exited before it answered {command}");
                 }
@@ -1121,6 +1156,29 @@ fn gateway(answer: &serde_json::Value) -> Result<IpAddr> {
 
 #[cfg(test)]
 mod tests {
+    /// A fatal line ends every pending wait and stands as the cause, the
+    /// first one kept, while an answer still reaches its command.
+    #[test]
+    fn a_fatal_line_ends_the_waits_and_stands_as_the_cause() {
+        let answers = super::Answers::default();
+        let (answered, mut answer) = tokio::sync::oneshot::channel();
+        answers.waiters.lock().insert(1, answered);
+        answers.route(r#"{"id":1,"ok":true}"#);
+        assert_eq!(
+            answer.try_recv().ok(),
+            Some(serde_json::json!({"id": 1, "ok": true}))
+        );
+        let (pending, mut waiting) = tokio::sync::oneshot::channel();
+        answers.waiters.lock().insert(2, pending);
+        answers.route(r#"{"event":"fatal","error":"the device was revoked"}"#);
+        assert!(matches!(
+            waiting.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        ));
+        answers.route(r#"{"event":"fatal","error":"a later cause"}"#);
+        assert_eq!(answers.fatal().as_deref(), Some("the device was revoked"));
+    }
+
     /// A lagged stream is a fatal line, since a missed one-shot fatal
     /// notice cannot be read back, and a closed one ends the pump.
     #[test]
