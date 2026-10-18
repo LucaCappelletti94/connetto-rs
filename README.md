@@ -19,18 +19,19 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 |---|---|
 | Sync loop | Optimistic writes applied under RLS, CDC through `subql`, live row subscriptions, reconnect with catch-up or resync |
 | Aggregates | `COUNT`, `SUM`, `AVG`, variance and grouped folds per change, `MIN`, `MAX`, joins and rows re-executed per viewer |
-| Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans |
+| Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans, bots registered by one-time code and held to their declared tables |
 | Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
 | Clients | One builder per platform, a native Diesel connection on desktop, Android and iOS, a browser client on a worker over OPFS, Dioxus and Yew hooks |
 | At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier whose references SQLite enforces, retention, several accounts |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
-| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over seven workspaces with proofs on an Android emulator and an iOS simulator |
+| Peers | Device certificates with hardware attestation, and a mutual TLS link between certified devices found over mDNS or a hotspot handed over by Bluetooth beacon or QR code, hosted on Android, iPhone and Linux and joined from those, the iPad and the Mac |
+| Operations | `tracing` logs everywhere, Docker and headless Chrome suites, CI over eight workspaces with proofs on an Android emulator and an iOS simulator, both walking the Tauri demo |
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 99 phases, 81 done and 18 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 99 phases, 82 done and 17 open. The core is built and proven, and the app system's registry and registration are built with it. What remains is the last mile around it, plus the app system's bot template and demo apps, the extension where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
@@ -41,7 +42,6 @@ The plan in `plans/master-implementation-plan.md` tracks 99 phases, 81 done and 
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |
 | Device-to-device sync without a server | R74 to R80 |
 | Share keys on a running client | R95 |
-| The desktop login tab | R97 |
 
 A per-check consistency token, Zanzibar's zookie, is not supported and owned by no phase, since OpenFGA lists it as future work. A withdrawn permission therefore takes effect on the change path within the read cache lifetime, while writes and teardowns are refused at once (chapter 08).
 
