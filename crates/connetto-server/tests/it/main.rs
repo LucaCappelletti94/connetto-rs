@@ -105,6 +105,8 @@ mod rls_write_question;
 
 mod session_loop;
 
+mod share_key_reach;
+mod share_key_terms;
 mod share_keys;
 
 mod restore;
