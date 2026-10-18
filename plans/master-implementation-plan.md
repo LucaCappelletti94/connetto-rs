@@ -220,7 +220,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
-| R95 share keys on a running client | STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Fifteen decisions and six planned pull requests in the section | no |
+| R95 share keys on a running client | STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Fifteen decisions and seven planned pull requests in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R98 one schema contract | **DONE** (2026-10-05, #126) | nothing | no |
@@ -5952,13 +5952,14 @@ A share key usually reaches an application while it runs, when a user opens a sh
 
 ### Steps
 
-Six pull requests, each building and passing CI on its own.
+Seven pull requests, each building and passing CI on its own.
 
 1. The wire. The set message and its answer and the handshake's stated set in `connetto-core`, with chapter 02.
 2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate.
-3. The server. The swap on the session and every route, re-registration, the resends, the stated-set comparison at resume, the metering, the dispatch gate and the expiry timer.
-4. The native client. The add and remove call, persistence beside the refresh token under the gate, the recorded acknowledged set, the re-render and the client expiry timer.
-5. The browser. The worker's call, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
+3. A key leaves an open connection at its expiry. The grant check reports each key's `exp`, the model reports which tables the keys reach, and the session swaps its keys under the dispatch gate, registers again what read them, resends what they reached and drops the frames of the old answer still waiting for credit (decision 8).
+4. The swap on request. `ReplaceShareKeys` with its metering and answer, and the stated-set comparison at resume (decisions 2, 5, 6 and 9).
+5. The native client. The add and remove call, persistence beside the refresh token under the gate, the recorded acknowledged set, the re-render and the client expiry timer.
+6. The browser. The worker's call, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
 6. The documents. Chapters 12 and 13 with the carrying guidance.
 
 ### Proof
