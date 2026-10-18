@@ -2062,10 +2062,11 @@ mod tests {
     fn fake_adb(dir: &Path, body: &str) -> PathBuf {
         use std::io::Write as _;
         let path = dir.join("adb");
-        let script = format!(
-            "#!/bin/sh\nstate={}\necho \"$*\" >>\"$state/calls\"\n{body}\n",
-            dir.display()
-        );
+        // Single-quoted, so a path with spaces or shell characters stays one
+        // word, and each quote inside it closes, escapes and reopens.
+        let state = dir.display().to_string().replace('\'', r"'\''");
+        let script =
+            format!("#!/bin/sh\nstate='{state}'\necho \"$*\" >>\"$state/calls\"\n{body}\n");
         // A child process writes the script, so no descriptor open for
         // writing it lives in this process, where another test's fork could
         // inherit it and make the exec fail with "Text file busy".
