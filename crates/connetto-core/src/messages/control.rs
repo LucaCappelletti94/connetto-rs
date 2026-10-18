@@ -94,6 +94,7 @@ use super::{
     mutation::{MutationApplied, MutationConflict, MutationHeader, MutationReject},
     reconnect::FullResyncRequired,
     registration::{BotRegistered, Challenge, RegisterBot},
+    share_keys::{ReplaceShareKeys, ShareKeysReplaced},
     subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
 };
 
@@ -173,6 +174,11 @@ pub enum ControlMessage {
     RevokeDeviceRequest(RevokeDeviceRequest),
     /// Server confirms the device is revoked.
     DeviceRevokedAck(DeviceRevokedAck),
+
+    /// Client replaces the share keys its session holds (R95).
+    ReplaceShareKeys(ReplaceShareKeys),
+    /// Server confirms the swap, every later frame filtered by the new set.
+    ShareKeysReplaced(ShareKeysReplaced),
 
     /// Client heartbeat probe.
     Ping(Ping),

@@ -19,9 +19,9 @@ use connetto_core::{
         EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
         FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
-        PauseCause, Ping, Pong, RateLimited, RegisterBot, RevocationUpdate, RevokeDeviceRequest,
-        SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
-        SubscriptionSpec, Unsubscribe,
+        PauseCause, Ping, Pong, RateLimited, RegisterBot, ReplaceShareKeys, RevocationUpdate,
+        RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
+        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
     },
     version::PROTOCOL_VERSION,
 };
@@ -95,7 +95,8 @@ fn handshake_and_ack_round_trip() {
         Handshake::new(PROTOCOL_VERSION, "client-a")
             .with_grants([Grant::new("login-token"), Grant::new("share-key")])
             .with_resume_token("prior-run")
-            .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef])),
+            .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef]))
+            .with_cursor_subjects(["key:a", "key:b"]),
     ));
     round_trip_control(&ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
@@ -109,6 +110,22 @@ fn handshake_and_ack_round_trip() {
         schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
         initial_credits: 128,
         last_applied_seq: Some(41),
+    }));
+}
+
+#[test]
+fn share_key_frames_round_trip() {
+    round_trip_control(&ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
+        request_id: "keys-1".into(),
+        keys: vec![Grant::new("share-key-a"), Grant::new("share-key-b")],
+    }));
+    // An empty set removes every key the session holds.
+    round_trip_control(&ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
+        request_id: "keys-2".into(),
+        keys: Vec::new(),
+    }));
+    round_trip_control(&ControlMessage::ShareKeysReplaced(ShareKeysReplaced {
+        request_id: "keys-1".into(),
     }));
 }
 

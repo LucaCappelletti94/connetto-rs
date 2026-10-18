@@ -75,11 +75,12 @@ The header is a MessagePack-encoded enum mirroring the bulk variants with the pa
 
 | Message | Purpose |
 |---|---|
-| `Handshake` | Opens or resumes a session: a client-chosen correlation label (never a trust input), the resume cursor, the server-issued session token when resuming, and zero or more opaque grants. **Decided (R3)** for the grant list shape. |
+| `Handshake` | Opens or resumes a session: a client-chosen correlation label (never a trust input), the resume cursor, the server-issued session token when resuming, and zero or more opaque grants. **Decided (R3)** for the grant list shape. A resume also states, as `cursor_subjects`, the share-key subjects the server last acknowledged, which is the set its cursor was taken under. **Decided (R95, 2026-10-17)**, served from R95's second pull request. The server compares that set with the grants it resolves and resends each resumed subscription the difference reaches instead of catching it up, because a catch-up replays only changes after the cursor and so never shows or hides a row that did not change. The stated set bears no trust, since understating it only costs the client resends and overstating it withholds rows from itself. |
 | `Subscribe` | Registers a new subscription: sub ID + `SubscriptionSpec` |
 | `Unsubscribe` | Cancels a subscription by sub ID |
 | `MutationHeader` | Submits a mutation: control frame carrying the client sequence number, paired one-to-one with the `MutationPatch` bulk frame that follows it |
 | `AckCredits` | Client returns flow-control credits for delivered bulk payloads |
+| `ReplaceShareKeys` | Replaces every share key the session holds with the set it carries, an empty set holding none, correlated by `request_id`. **Decided (R95, 2026-10-17)**, served from R95's second pull request. The identity resolved at the handshake stays, so a grant naming a person is dropped like a grant that fails to check, and a key that fails to check is silent and metered exactly as at the handshake. |
 | `Ping` | Keepalive probe |
 
 ### Server → Client
@@ -87,6 +88,7 @@ The header is a MessagePack-encoded enum mirroring the bulk variants with the pa
 | Message | Purpose |
 |---|---|
 | `HandshakeAck` | Session accepted: a per-connection routing label, the session token to persist, the current cursor, the schema version, the initial credit, and the durable mutation watermark. Carries nothing about a grant that failed to resolve: not-allowed and never-existed are indistinguishable on the wire, and must be. **Decided (R3)** |
+| `ShareKeysReplaced` | Answers `ReplaceShareKeys` with its `request_id` once the session holds the new set and the resend of every subscription the change reaches is queued, so every frame after it is filtered by the new set. Says nothing about which keys resolved. A swap over its limit draws `RateLimited` with the same `request_id` instead. **Decided (R95, 2026-10-17)**, served from R95's second pull request. |
 | `SnapshotBegin` | Control frame: start of initial snapshot for a subscription |
 | `SnapshotPatch` | **Bulk plane.** Snapshot data: `sub_id` + `patchset_zstd` (Zstd-compressed SQLite patchset). One or more frames complete the snapshot. |
 | `SnapshotEnd` | Control frame: snapshot complete, carrying `sub_id` and the cursor at which the snapshot was taken |

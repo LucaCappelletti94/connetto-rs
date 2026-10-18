@@ -16,6 +16,7 @@ pub mod handshake;
 pub mod mutation;
 pub mod reconnect;
 pub mod registration;
+pub mod share_keys;
 pub mod subscription;
 
 pub use aggregate::AggregateUpdate;
@@ -42,6 +43,7 @@ pub use registration::{
     BOT_REGISTRATION_DOMAIN, BotListEntry, BotRegistered, Challenge, RegisterBot,
     bot_registration_message,
 };
+pub use share_keys::{ReplaceShareKeys, ShareKeysReplaced};
 pub use subscription::{
     BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
     SubscriptionSpec, Unsubscribe,
