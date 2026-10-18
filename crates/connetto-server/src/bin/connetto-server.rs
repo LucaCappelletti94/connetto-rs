@@ -113,7 +113,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use connetto_core::device_cert::layout::{ISSUER_CERTIFICATE, ISSUER_KEY};
-use connetto_core::device_cert::{ATTESTATION_OID_IS_STAND_IN, AttestationLevel, DeviceIssuer};
+use connetto_core::device_cert::{AttestationLevel, DeviceIssuer};
 use connetto_core::env::{read_ddl, var_or};
 use connetto_core::messages::SignedList;
 use connetto_server::builder::{
@@ -486,12 +486,6 @@ fn device_certs() -> Result<Option<DeviceCertConfig>> {
             AndroidStatus::File(PathBuf::from(text))
         };
         config = config.with_android_status(source);
-    }
-    if ATTESTATION_OID_IS_STAND_IN {
-        tracing::warn!(
-            "the device certificate's attestation extension still stands under the RFC 5612 \
-             documentation number 32473, pending the assignment of connetto's own number"
-        );
     }
     Ok(Some(config))
 }
