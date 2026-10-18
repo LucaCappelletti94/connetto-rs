@@ -23,6 +23,8 @@ mod outage;
 
 mod parity;
 
+mod read_rule_fold;
+
 mod session_handle;
 
 mod smoke;

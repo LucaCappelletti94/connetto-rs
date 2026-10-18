@@ -25,6 +25,12 @@ use sqlite_diff_rs::Value;
 const PG_DDL: &str =
     "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT, edited_at TEXT);";
 
+/// The row policy beside the catalog, for the materializer's folded read rule.
+const POLICIES: &str = "ALTER TABLE notes ENABLE ROW LEVEL SECURITY; \
+     CREATE POLICY notes_p ON notes \
+     USING (owner = current_setting('app.user_id', true)) \
+     WITH CHECK (owner = current_setting('app.user_id', true));";
+
 diesel::table! {
     /// Test table for subscription and write integration
     notes (id) {
@@ -89,6 +95,7 @@ async fn write_lands_under_rls_and_fans_out_over_cdc() {
     let auth = HarnessAuth::rls(RlsAuth::from_ddl(writer_pool.clone(), PG_DDL).expect("rls auth"));
     let server = spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
+            .with_policies(POLICIES)
             .with_writable(
                 RuntimeWritableCatalog::builder()
                     .versioned("notes", "edited_at")

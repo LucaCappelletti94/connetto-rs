@@ -58,6 +58,7 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
     let server = spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_replication(["orders"])
+            .with_policies(POLICIES)
             .with_session(SessionConfig::new().with_schema_version(Some(derived_version()))),
         snapshot,
         auth,

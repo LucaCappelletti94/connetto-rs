@@ -259,6 +259,7 @@ async fn builder_held_credential_reads_the_callers_own_row() {
     let server = spawn_server(
         ServerConfig::new(PG_DDL, fixture.admin_url())
             .with_replication(["orders"])
+            .with_policies(POLICIES)
             .with_session(
                 SessionConfig::new().with_schema_version(Some(
                     connetto_schema::translate::<String, connetto_core::bots::TextIds>(
