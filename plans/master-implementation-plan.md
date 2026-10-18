@@ -166,7 +166,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | done | ~~R89~~ | A failing re-execution read ends its subscription, not live delivery |
 | done | ~~R90~~ | The browser's refresh token into an `HttpOnly` cookie |
 | any | R91 | Apps, installations and the bot template. Needs nothing since the caller fixes of 2026-09-20 (PRs #41 and #42). The file replica for bots is R93's |
-| any | R92 | Synced tables without local references, with SQLite's own enforcement for the tier. Needs nothing |
+| done | ~~R92~~ | Synced tables without local references, with SQLite's own enforcement for the tier |
 | any | R93 | The file replica for bots. Needs R91's template, R71's headless custody is built |
 | done | ~~R94~~ | One client builder per platform from shared configuration pieces |
 | any | R95 | Share keys added and removed on a running client. Needs nothing since R94 |
@@ -217,7 +217,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R89 a failing re-execution read ends its subscription, not live delivery | **DONE** (2026-09-22, merged `09f6996`) | nothing. Two decisions in the section, the parked retry primitive absorbed | no, though an upstream SQLSTATE exposure would remove the timeout text match |
 | R90 the browser's refresh token in an `HttpOnly` cookie | **DONE** (2026-09-22), minted 2026-09-13 | nothing. One decision in the section and two settled in its review rounds (the cookie's lifetime, credentials for listed origins only), the 2026-08-06 parked BFF entry absorbed | no |
 | R91 apps, installations and the bot template | NOT STARTED, designed and reviewed 2026-09-18, unblocked 2026-10-03 when R96 landed | nothing. Its login route and registry cache go on R96's server builder. The content-ticket caller fix (PR #41) and the grant-move narrowing (PR #42) landed 2026-09-20. The bot file replica is R93's. Every decision is in `plans/apps-and-bots.md` | no |
-| R92 synced tables carry no local references | BUILT 2026-10-16 on `feat/r92-synced-references`, minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
+| R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
 | R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | nothing since R94 (2026-09-30). One decision and one open question in the section | no |
@@ -5793,7 +5793,7 @@ The template's scripted, semantics, property and bench targets pass in CI, the t
 
 ## R92: synced tables carry no local references
 
-**Status.** BUILT 2026-10-16 on `feat/r92-synced-references`, designed 2026-09-22. Minted the same day by R21's decision 8.
+**Status.** DONE 2026-10-18, merged as three stacked pull requests: `e89f61e` (#167), `e8b2694` (#168) and `46d2bef` (#169). Designed 2026-09-22, minted the same day by R21's decision 8.
 
 **Blocked on nothing.** Every lock sits at the git `main` tips with sqlparser at apache `7b5821dd`, where #2575 accepts `WITHOUT ROWID, STRICT`. Reaching it took five upstream fixes, all merged: sqlparser-canonicalize #24 and subql #201 for the `global` field ClickHouse `GLOBAL IN` added (`upstream/sqlparser-canonicalize-global-in.md`, `upstream/subql-global-in.md`), sql-traits #103 and pg2sqlite #122 for the `JOIN USING` alias apache#2492 added, #122 also for the table-options list #2575 introduced (`upstream/sql-traits-join-using-alias.md`, `upstream/pg2sqlite-join-using-alias.md`, `upstream/pg2sqlite-sqlite-table-options.md`), and diesel #5241, which rolls back a SQLite transaction whose `COMMIT` fails. rls2fga `main` needed nothing. Six decisions, listed below, four taken with the maintainer on 2026-09-22 and two on 2026-09-23.
 
@@ -5840,12 +5840,11 @@ Each of these is a test on both backends.
 
 (c) An import whose child table was created first failed with `FOREIGN KEY constraint failed`, and so did one whose self-referencing rows arrive child first. Both are live defects, now `references::an_import_of_a_child_table_created_first_restores` and `references::an_import_of_reverse_ordered_self_references_restores`. A child table that merely sorts first by name imports, since the export writes tables in creation order.
 
-### Slices
+### Slices, all merged 2026-10-18
 
-1. The pin refresh, every workspace lock moved to the `main` tip of each git dependency once subql, pg2sqlite and sql-traits carry their fixes for sqlparser `main`.
-2. The client, steps 1 to 5 with proofs 1 to 7 on both backends (`connetto-client`, the shared proof bodies in `crates/connetto-client/tests/shared/references.rs` and their browser runner in `crates/connetto-web/tests/references.rs`).
-3. The relay hub, decision 6 with proof 8 (`crates/connetto-web/src/relay.rs`).
-4. The chapters and the status views.
+1. The pin refresh, every workspace lock moved to the `main` tip of each git dependency (#167).
+2. The client, steps 1 to 5 with proofs 1 to 7 on both backends, the hub's deferred tier replay with the child-first and orphan halves of proof 8, and chapters 14 and 15 (#168).
+3. The relay hub's effect fan-out, the cascade half of proof 8, and chapter 13 (#169).
 
 ### Done when
 

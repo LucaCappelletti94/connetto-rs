@@ -22,7 +22,7 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 | Identity | OAuth 2.0 and OIDC login, durable sessions, grants, shareable capabilities, audit table, throttling and bans |
 | Authorization | RLS on snapshots and writes, the same policies as an OpenFGA model on the change path |
 | Clients | One builder per platform, a native Diesel connection on desktop, Android and iOS, a browser client on a worker over OPFS, Dioxus and Yew hooks |
-| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier, retention, several accounts |
+| At rest | SQLCipher and `sqlite3mc` with keyring or IndexedDB custody, passkey unlock in the browser and biometric or PIN unlock on Apple, Android and Windows, a device-private tier whose references SQLite enforces, retention, several accounts |
 | Portability | Streamed device archives that restore the tier, unsent writes and unsent content |
 | Files | Chunked, encrypted content with a file server and a client for both platforms, per-identity storage quotas and deployment storage and bandwidth ceilings answered with `Retry-After` |
 | Schema | Postgres DDL translated to the replica at build time by `pg2sqlite`, with write guards |
@@ -30,11 +30,11 @@ On the client, a SQLite replica on native and in the browser is read with Diesel
 
 ## Where it stands
 
-The plan in `plans/master-implementation-plan.md` tracks 99 phases, 80 done and 19 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
+The plan in `plans/master-implementation-plan.md` tracks 99 phases, 81 done and 18 open. The core is built and proven, and what remains is the last mile around it, plus one designed extension: an app system where a developer registers a program by its public key and the tables it wants, a user installs it on their own data, and the program runs as a bot user of the deployment under the user's own sharing rows (chapter 12).
 
 | Remaining | Phases |
 |---|---|
-| One page codec, synced tables without local references | R21, R92 |
+| One page codec | R21 |
 | Schema majors, shared public store, portability download | R31, R11, R61 |
 | Backup and restore, clock discipline | R70, R72 |
 | Demo gaps | R57 |
