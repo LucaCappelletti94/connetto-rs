@@ -210,6 +210,8 @@ A connection is constructed without a transport and given one later. A builder's
 
 **A subscription can be declared with no server.** It is recorded in the replica and sent on the first connection, so `watch` no longer fails while the transport is down. A pump with no socket parks rather than failing, which is what an idle socket does anyway: treating a missing transport as an error ended the pump on its first step and silently stopped device-private queries refreshing for an application that has no server at all.
 
+**A fault that stops the pump is announced.** A disconnect is the reconnect driver's to recover, while a local fault (an apply, session or protocol error) ends the pump with or without a driver. That end queues the last writes, closes the transport, and emits `ClientEvent::Stopped` with the fault's text followed by `ClientEvent::Closed`, so every wait keyed on `Closed`, a content ticket's among them, settles. Every live handle's `changed()`, pending or called later, returns `ClientError::Stopped`, while its last rows stay readable and `with_conn` keeps serving the replica, the offline half `close()` leaves too.
+
 ## Framework adapters: `connetto-dioxus` and `connetto-yew`
 
 **Built.** Two single-file crates wrap `ConnettoClient`'s live-query API as UI framework hooks.

@@ -620,6 +620,7 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::ServerClosed { reason } => {
             Some(format!("server closed the connection: {reason:?}"))
         }
+        ClientEvent::Stopped { detail } => Some(format!("the client stopped: {detail}")),
         ClientEvent::Closed => Some("connection closed".to_owned()),
         ClientEvent::AuthenticationRequired => {
             Some("session expired, sign out and sign in again".to_owned())
@@ -1271,6 +1272,11 @@ fn App() -> Element {
                 }
                 if let Some(label) = status_label(&event) {
                     status.set(label);
+                }
+                // The stop names its cause, and the `Closed` that follows it
+                // would only replace that.
+                if matches!(event, ClientEvent::Stopped { .. }) {
+                    break;
                 }
             }
         })
