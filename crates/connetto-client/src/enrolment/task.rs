@@ -886,7 +886,9 @@ impl<L: Link> Run<L> {
                 self.take_lists(lists).await;
                 // A list naming the new certificate has already revoked or withdrawn it.
                 if self.held.is_some() {
-                    self.announce(standing).await;
+                    self.announce(standing);
+                    #[cfg(feature = "peer")]
+                    self.peer_transition(standing).await;
                 }
                 Ok(())
             }
@@ -946,9 +948,9 @@ impl<L: Link> Run<L> {
         Ok(standing)
     }
 
-    /// Publish the certificate just kept, check its window and start the peer
-    /// link (lifecycle row "Grant received").
-    async fn announce(&mut self, standing: Standing) {
+    /// Publish the certificate just kept and check its window (lifecycle row
+    /// "Grant received").
+    fn announce(&mut self, standing: Standing) {
         self.publish();
         // The server just issued it, so a window that does not hold it now
         // says the local clock is off.
@@ -957,8 +959,6 @@ impl<L: Link> Run<L> {
             Standing::Expired => self.clock_outside(true),
             _ => self.enroller.clock_off.store(false, Ordering::Release),
         }
-        #[cfg(feature = "peer")]
-        self.peer_transition(standing).await;
     }
 
     /// Delete a certificate whose issuer the root revoked, keep the key, and
