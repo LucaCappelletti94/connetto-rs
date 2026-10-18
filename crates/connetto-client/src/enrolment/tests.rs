@@ -3190,3 +3190,183 @@ async fn a_peer_listener_that_will_not_bind_reports_the_failure() {
     end_tx.send(()).expect("the run ends");
     run.await.expect("the run ends");
 }
+
+/// R31 on R75: a write an older major captured under the device's own
+/// writer drains under that device. The drain binds the key by signing the
+/// old major's challenge on its own wire, and only then sends the write.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the scripted old major answers the whole bind and drain in order"
+)]
+async fn an_older_majors_device_write_drains_under_the_bound_device() {
+    use connetto_core::messages::{
+        BindDevice, BulkMessage, Challenge, HandshakeAck, HeldWork, HeldWrite, MutationApplied,
+        WriterAnswer, WriterOutcome, WriterRef, WriterRequest,
+    };
+    use connetto_core::traits::{IncomingFrame, Transport};
+    use connetto_core::{Cursor, LoopbackTransport, Major, SchemaVersion, loopback};
+    use ring::signature::{ECDSA_P256_SHA256_ASN1, UnparsedPublicKey};
+
+    const DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY)";
+    const NONCE: [u8; 32] = [5; 32];
+    let one = Major::new(1).expect("one is a major");
+    let two = Major::new(2).expect("two is a major");
+    let old_version = SchemaVersion::from_hash(b"the major 1 bundle".to_vec());
+    let config = crate::ClientConfig::new("device-drain")
+        .with_schema_major(Some(two))
+        .with_schema_version(Some(SchemaVersion::from_hash(
+            b"the major 2 bundle".to_vec(),
+        )));
+    let mut conn = crate::ConnettoConnection::<LoopbackTransport>::open(
+        &crate::Replica::in_memory(),
+        DDL,
+        &config,
+        None,
+    )
+    .expect("open the major 2 replica");
+
+    // The device holds a certificate in standing and the key behind it.
+    let (key, der) = attesting_key();
+    let point = key.public_point();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    let held = issue_for(
+        &authority,
+        &key,
+        now - HOUR,
+        30 * 24 * HOUR,
+        positive_serial(9),
+    );
+    let key_id = *held.leaf.identity().key().as_bytes();
+    conn.store_device_certificate(&held)
+        .await
+        .expect("store the certificate");
+    conn.writer_keys = Some(Arc::new(RunKeys { der }));
+
+    // One write the major 1 build captured under the device, as a rebuild leaves it.
+    conn.db
+        .batch_execute("INSERT INTO items (id) VALUES (1)")
+        .expect("write locally");
+    let changeset = conn.session.changeset().expect("capture the write");
+    let writer = WriterRef::Device(key_id);
+    let seq = conn
+        .append_entry(&writer, &changeset, None, Some(one))
+        .expect("queue the write under major 1");
+    conn.db
+        .batch_execute(crate::majors::HELD_DDL)
+        .expect("the held batch table");
+    {
+        use diesel::prelude::*;
+        diesel::insert_into(crate::majors::held_batch::table)
+            .values((
+                crate::majors::held_batch::major.eq(1_i64),
+                crate::majors::held_batch::version.eq(old_version.hash()),
+            ))
+            .execute(&mut conn.db)
+            .expect("record the major 1 batch");
+    }
+    conn.load_drain().expect("load the drain");
+
+    let (client_end, mut server) = loopback();
+    let old_major = tokio::spawn(async move {
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(handshake)))) =
+            server.recv().await
+        else {
+            panic!("the drain opens with a handshake");
+        };
+        assert_eq!(
+            (handshake.schema_major, handshake.writer),
+            (Some(one), WriterRequest::Device),
+            "the drain presents major 1 and asks to bind the device"
+        );
+        server
+            .send_control(ControlMessage::Challenge(Challenge { nonce: NONCE }))
+            .await
+            .expect("send the challenge");
+        server
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "old".to_owned(),
+                session_token: "old".to_owned(),
+                resume_token: "old".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(old_version),
+                initial_credits: 64,
+                writer: None,
+            }))
+            .await
+            .expect("send the ack");
+        let Ok(Some(IncomingFrame::Control(ControlMessage::BindDevice(BindDevice {
+            request_id,
+            key_id: bound,
+            signature,
+        })))) = server.recv().await
+        else {
+            panic!("the drain binds before it sends anything");
+        };
+        assert_eq!(bound, key_id, "the bind names the write's key");
+        UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, point)
+            .verify(
+                &connetto_core::messages::writer_bind_message(&NONCE),
+                &signature,
+            )
+            .expect("the bind signs this wire's challenge");
+        server
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id,
+                outcome: WriterOutcome::Bound { frontier: 0 },
+            }))
+            .await
+            .expect("answer the bind");
+        let Ok(Some(IncomingFrame::Control(ControlMessage::MutationHeader(header)))) =
+            server.recv().await
+        else {
+            panic!("the bound drain sends the write");
+        };
+        let Ok(Some(IncomingFrame::Bulk(BulkMessage::MutationPatch(_)))) = server.recv().await
+        else {
+            panic!("the write's patch follows its header");
+        };
+        server
+            .send_control(ControlMessage::MutationApplied(MutationApplied {
+                client_seq: header.client_seq,
+            }))
+            .await
+            .expect("apply the write");
+        while let Ok(Some(_)) = server.recv().await {}
+        header.client_seq
+    });
+
+    let timer = conn.drain_timer().expect("the held batch owes a dial");
+    conn.attach_drain(timer, client_end)
+        .await
+        .expect("attach the drain");
+    let mut events = Vec::new();
+    loop {
+        let event = tokio::time::timeout(Duration::from_secs(5), conn.pump_one())
+            .await
+            .expect("the drain answers within the bound")
+            .expect("a pump step");
+        let drained = matches!(event, ClientEvent::Held(HeldWork::Drained { .. }));
+        events.push(event);
+        if drained {
+            break;
+        }
+    }
+    assert_eq!(
+        old_major.await.expect("the old major ran"),
+        seq,
+        "the write went up under its own sequence"
+    );
+    assert!(
+        events.contains(&ClientEvent::Held(HeldWork::Applied {
+            major: one,
+            write: HeldWrite { writer, seq },
+        })),
+        "the write is reported applied under the device, saw {events:?}"
+    );
+    assert!(
+        conn.unsynced().is_empty(),
+        "nothing of major 1 is left queued"
+    );
+}

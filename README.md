@@ -36,7 +36,7 @@ The plan in `plans/master-implementation-plan.md` tracks 99 phases, 82 done and 
 | Remaining | Phases |
 |---|---|
 | One page codec | R21 |
-| Schema majors, shared public store, portability download | R31, R11, R61 |
+| Shared public store, portability download | R11, R61 |
 | Backup and restore, clock discipline | R70, R72 |
 | Demo gaps | R57 |
 | Apps, installations and the bot template, the file replica for bots | R91, R93 |

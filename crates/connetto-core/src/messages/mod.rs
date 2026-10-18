@@ -36,8 +36,8 @@ pub use error::{
 pub use flow::{AckCredits, Ping, Pong};
 pub use handshake::{Grant, Handshake, HandshakeAck};
 pub use mutation::{
-    ConflictRow, MutationApplied, MutationConflict, MutationHeader, MutationReject,
-    MutationRejectReason,
+    ConflictRow, HeldWork, HeldWrite, MutationApplied, MutationConflict, MutationHeader,
+    MutationReject, MutationRejectReason,
 };
 pub use reconnect::{FullResyncReason, FullResyncRequired};
 pub use registration::{

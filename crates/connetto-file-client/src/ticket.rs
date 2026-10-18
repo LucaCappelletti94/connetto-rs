@@ -53,6 +53,35 @@ where
     }
 }
 
+/// Asks for one ticket on the drain wire and returns the URL granted (R31).
+pub(crate) async fn request_held<T>(
+    client: &ConnettoClient<T>,
+    file_id: FileId,
+    verb: ContentVerb,
+) -> Result<String, ContentError>
+where
+    T: Transport + MaybeSend + 'static,
+    T::Error: Display,
+{
+    let request_id = next_request_id();
+    let mut events = client.events();
+    client
+        .request_held_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+        .await?;
+    loop {
+        match events.recv().await {
+            Ok(event) => match classify(event, &request_id, file_id) {
+                TicketAnswer::Granted(url) => return Ok(url),
+                TicketAnswer::Failed(error) => return Err(error),
+                TicketAnswer::Unrelated(_) => {}
+            },
+            Err(RecvError::Lagged(_)) => return Err(ContentError::TicketLagged),
+            // The drain wire is gone, so no answer to this request is coming.
+            Err(RecvError::Closed) => return Err(ContentError::TicketAbandoned),
+        }
+    }
+}
+
 pub(crate) struct PendingTicket {
     pub(crate) file_id: FileId,
     request_id: String,
@@ -103,6 +132,60 @@ where
     let request_id = next_request_id();
     connection
         .request_content_ticket(request_id.clone(), *file_id.as_bytes(), verb)
+        .await?;
+    *pending = Some(PendingTicket {
+        file_id,
+        request_id,
+    });
+    Ok(())
+}
+
+/// Asks for one ticket on the drain wire, interruptibly (R31).
+pub(crate) async fn request_held_connection_or<T, C>(
+    connection: &mut ConnettoConnection<T>,
+    file_id: FileId,
+    verb: ContentVerb,
+    observed: &mut Vec<ClientEvent>,
+    cancel: C,
+    pending: &mut Option<PendingTicket>,
+) -> Result<Option<String>, ContentError>
+where
+    T: Transport,
+    T::Error: Display,
+    C: core::future::Future<Output = ()>,
+{
+    ensure_pending_held_request(connection, file_id, verb, pending).await?;
+    tokio::pin!(cancel);
+    loop {
+        let event = match connection.pump_one_or(cancel.as_mut()).await {
+            Ok(Some(event)) => event,
+            Ok(None) => return Ok(None),
+            Err(err) => {
+                pending.take();
+                return Err(err.into());
+            }
+        };
+        if let Some(result) = resolve_connection_event(event, file_id, pending, observed) {
+            return result.map(Some);
+        }
+    }
+}
+
+pub(crate) async fn ensure_pending_held_request<T: Transport>(
+    connection: &mut ConnettoConnection<T>,
+    file_id: FileId,
+    verb: ContentVerb,
+    pending: &mut Option<PendingTicket>,
+) -> Result<(), ContentError>
+where
+    T::Error: Display,
+{
+    if pending.is_some() {
+        return Ok(());
+    }
+    let request_id = next_request_id();
+    connection
+        .request_held_ticket(request_id.clone(), *file_id.as_bytes(), verb)
         .await?;
     *pending = Some(PendingTicket {
         file_id,

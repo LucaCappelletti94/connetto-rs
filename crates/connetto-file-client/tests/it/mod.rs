@@ -3,6 +3,8 @@
 
 mod archive;
 mod builder_content;
+mod held;
+mod held_files;
 mod negotiation;
 mod offline_photo;
 mod resolving;

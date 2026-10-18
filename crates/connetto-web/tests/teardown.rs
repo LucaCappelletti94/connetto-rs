@@ -90,6 +90,7 @@ fn work(seqs: &[u64]) -> PendingWork {
             })
             .collect(),
         content_files: 0,
+        held_files: 0,
         retired_files: Vec::new(),
     }
 }

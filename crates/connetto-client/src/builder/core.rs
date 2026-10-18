@@ -42,7 +42,7 @@ use crate::replica::provision_replica_key;
 use crate::share_keys::{
     ErasedShareKeyStore, ShareKeyPersistence, ShareKeySet, ShareKeyStore, share_key_record,
 };
-use crate::{AccessTokenSource, ClientConfig, ClientError, ConnettoConnection};
+use crate::{AccessTokenSource, ClientConfig, ClientError, ConnettoConnection, HeldContent};
 use crate::{GateAskOutcome, GateMechanism};
 
 /// The replica name a build with no identity uses for its client id, and the
@@ -217,6 +217,8 @@ pub(crate) struct Base<T: Transport, C> {
     pub(crate) sleeper: Option<SleeperFn>,
     /// The client id an anonymous build presents, when the app named one.
     pub(crate) client_id: Option<String>,
+    /// The held-content holder a rebuild calls, when one was named (R31).
+    pub(crate) held_content: Option<HeldContent>,
 }
 
 impl<T: Transport, C> Base<T, C> {
@@ -231,6 +233,7 @@ impl<T: Transport, C> Base<T, C> {
             dialer: self.dialer,
             sleeper: self.sleeper,
             client_id: self.client_id,
+            held_content: self.held_content,
         }
     }
 
@@ -246,6 +249,7 @@ impl<T: Transport, C> Base<T, C> {
             dialer,
             sleeper: self.sleeper,
             client_id: self.client_id,
+            held_content: self.held_content,
         }
     }
 }
@@ -302,6 +306,13 @@ macro_rules! base_setters {
             keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
         ) -> Self {
             self.base.share_keys = Some($crate::ShareKeySet::new(keys));
+            self
+        }
+
+        /// The held-content holder a rebuild calls, named here by a browser worker before content attaches (R31).
+        #[must_use]
+        pub fn with_held_content(mut self, held_content: HeldContent) -> Self {
+            self.base.held_content = Some(held_content);
             self
         }
     };
@@ -538,6 +549,7 @@ impl<T: Transport + MaybeSend + 'static> ClientBuilder<T, ()> {
                 dialer: BoxedDialer::injected(dialer),
                 sleeper: None,
                 client_id: None,
+                held_content: None,
             },
         }
     }
@@ -1195,6 +1207,7 @@ where
             self.custody,
         );
         fold_config_aspects(config, self.base.share_keys.clone())
+            .with_optional_held_content(self.base.held_content)
     }
 
     /// Open the replica, then dial once, failing when the dial fails.
@@ -1407,6 +1420,7 @@ where
         sleeper,
         // Taken by the signed-in and durable stages before run_core.
         client_id: _,
+        held_content,
     } = base;
     let config = build_config(
         &schema,
@@ -1416,7 +1430,9 @@ where
         inputs.caller.as_deref(),
         inputs.custody,
     );
-    let config = fold_config_aspects(config, share_keys);
+    // A browser worker names the holder before its hub installs content.
+    let held_content = held_content.or_else(|| content.is_some().then(C::held_content));
+    let config = fold_config_aspects(config, share_keys).with_optional_held_content(held_content);
     let conn = offline_connect_core(
         replica,
         &schema,

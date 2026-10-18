@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::io::Read;
 
 use connetto_client::{ClientEvent, ConnettoConnection, ExportScope, ImportChoices, ImportOutcome};
+use connetto_core::Major;
 use connetto_core::messages::ContentVerb;
 use connetto_core::traits::Transport;
 use connetto_file_core::{
@@ -251,6 +252,7 @@ where
     ) -> Result<(), ContentError> {
         let conn = connection.conn();
         conn.batch_execute(db::CONTENT_DDL)?;
+        conn.batch_execute(db::HELD_CONTENT_DDL)?;
         db::add_outbox_columns(conn)?;
         for (query, column) in &self.heal_queries {
             if !crate::retain::answers_column(conn, query, column) {
@@ -1074,6 +1076,163 @@ where
                 }
             },
         }
+    }
+
+    /// Whether `major` still holds files, the drain's batch-closing gate (R31).
+    ///
+    /// # Errors
+    ///
+    /// A database failure.
+    pub fn held_files_pending<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        major: Major,
+    ) -> Result<bool, ContentError> {
+        Ok(db::held_count(connection.conn(), major)? > 0)
+    }
+
+    /// Begins the drain of the next held file of `major`, interruptibly (R31).
+    pub async fn begin_held_flush_next_or<T, C>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        state: &mut ContentFlushState,
+        major: Major,
+        cancel: C,
+    ) -> (Result<ContentFlushStart<B>, ContentError>, Vec<ClientEvent>)
+    where
+        T: Transport,
+        T::Error: Display,
+        C: core::future::Future<Output = ()>,
+    {
+        let mut observed = Vec::new();
+        let mut cursor = FlushCursor { connection, state };
+        let result = self
+            .begin_held_attempt(&mut cursor, major, &mut observed, cancel)
+            .await;
+        (result, observed)
+    }
+
+    /// Finishes the held bookkeeping for one transferred file (R31).
+    ///
+    /// # Errors
+    ///
+    /// A database failure.
+    pub async fn finish_held_upload<T: Transport>(
+        &self,
+        connection: &mut ConnettoConnection<T>,
+        upload: &ContentUpload<B>,
+        major: Major,
+        result: Result<(), ContentError>,
+    ) -> Result<ContentFlush, ContentError> {
+        Self::finish_held_attempt(connection, major, upload.file_id, result).await
+    }
+
+    async fn begin_held_attempt<T, C>(
+        &self,
+        cursor: &mut FlushCursor<'_, T>,
+        major: Major,
+        observed: &mut Vec<ClientEvent>,
+        cancel: C,
+    ) -> Result<ContentFlushStart<B>, ContentError>
+    where
+        T: Transport,
+        T::Error: Display,
+        C: core::future::Future<Output = ()>,
+    {
+        let Some(file_id) = Self::next_held_file(cursor.connection, cursor.state, major)? else {
+            return Ok(ContentFlushStart::Complete(ContentFlush::Empty));
+        };
+        let Some(manifest) = db::load_held_manifest(cursor.connection.conn(), major, file_id)?
+        else {
+            return Self::finish_held_attempt(
+                cursor.connection,
+                major,
+                file_id,
+                Err(ContentError::NoManifest { file_id }),
+            )
+            .await
+            .map(ContentFlushStart::Complete);
+        };
+        let declared_len = manifest.chunks().iter().map(|chunk| chunk.len).sum();
+        let upload_url = match ticket::request_held_connection_or(
+            cursor.connection,
+            file_id,
+            ContentVerb::Write { declared_len },
+            observed,
+            cancel,
+            &mut cursor.state.pending_ticket,
+        )
+        .await
+        {
+            Ok(Some(url)) => url,
+            Ok(None) => return Ok(ContentFlushStart::Complete(ContentFlush::Interrupted)),
+            Err(error) => {
+                return Self::finish_held_attempt(cursor.connection, major, file_id, Err(error))
+                    .await
+                    .map(ContentFlushStart::Complete);
+            }
+        };
+        Ok(ContentFlushStart::Upload(ContentUpload {
+            file_id,
+            upload_url,
+            manifest,
+            store: self.store.clone(),
+            root_key: self.root_key,
+        }))
+    }
+
+    fn next_held_file<T: Transport>(
+        connection: &mut ConnettoConnection<T>,
+        state: &mut ContentFlushState,
+        major: Major,
+    ) -> Result<Option<FileId>, ContentError> {
+        let waiting = db::held_files(connection.conn(), major)?;
+        if let Some(file_id) = state.pending_ticket.as_ref().map(|ticket| ticket.file_id)
+            && waiting.contains(&file_id)
+        {
+            return Ok(Some(file_id));
+        }
+        state.pending_ticket = None;
+        state.last_attempted = next_after(&waiting, state.last_attempted);
+        Ok(state.last_attempted)
+    }
+
+    async fn finish_held_attempt<T: Transport>(
+        connection: &mut ConnettoConnection<T>,
+        major: Major,
+        file_id: FileId,
+        result: Result<(), ContentError>,
+    ) -> Result<ContentFlush, ContentError> {
+        match result {
+            Ok(()) => {
+                Self::forget_held(connection, major, file_id)?;
+                connection.held_file_settled().await?;
+                Ok(ContentFlush::Progressed)
+            }
+            Err(error) => match error.outcome() {
+                AttemptOutcome::Retry => Ok(ContentFlush::Deferred),
+                AttemptOutcome::Refused | AttemptOutcome::Lost => {
+                    Self::forget_held(connection, major, file_id)?;
+                    connection.held_file_lost(major).await?;
+                    Ok(ContentFlush::Progressed)
+                }
+            },
+        }
+    }
+
+    /// Deletes one held file's rows under suspended capture (R31).
+    fn forget_held<T: Transport>(
+        connection: &mut ConnettoConnection<T>,
+        major: Major,
+        file_id: FileId,
+    ) -> Result<(), ContentError> {
+        connection
+            .transact_with_bookkeeping(
+                |c| db::forget_held_file(c, major, file_id),
+                |_| Ok::<(), diesel::result::Error>(()),
+            )
+            .map(|_| ())
+            .map_err(ContentError::Replica)
     }
 
     /// Exports unsent content and replica data to `sink`.

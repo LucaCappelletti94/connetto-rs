@@ -47,6 +47,7 @@ use tokio::sync::Notify;
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
 /// The major line the test schema source declares.
 const SOURCE: &str = "-- connetto:major 1";
 
@@ -292,6 +293,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     let pending = PendingWork {
         unsynced: stranded,
         content_files: 1,
+        held_files: 0,
         retired_files: Vec::new(),
     };
     assert_eq!(

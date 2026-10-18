@@ -69,6 +69,10 @@ where
 {
     type Handle = ContentHandle<T>;
 
+    fn held_content() -> connetto_client::HeldContent {
+        crate::db::held_content()
+    }
+
     async fn attach(
         self,
         client: ConnettoClient<T>,

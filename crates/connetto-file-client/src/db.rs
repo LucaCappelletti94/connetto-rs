@@ -18,6 +18,8 @@ use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 
 use crate::error::ContentError;
+use connetto_client::ClientError;
+use connetto_core::Major;
 
 diesel::table! {
     /// One row per chunk of one manifest, ordered by `ordinal`.
@@ -74,6 +76,32 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// One row per file a rebuild held for an older major's drain (R31).
+    _connetto_held_content_outbox (major, file_id) {
+        /// The major the file was captured under.
+        major -> BigInt,
+        /// BLAKE3 identity of the held file.
+        file_id -> Binary,
+    }
+}
+
+diesel::table! {
+    /// One row per chunk of a held file's manifest (R31).
+    _connetto_held_content_chunks (major, file_id, ordinal) {
+        /// The major the file was captured under.
+        major -> BigInt,
+        /// BLAKE3 identity of the held file.
+        file_id -> Binary,
+        /// Position of this chunk in the file, from zero.
+        ordinal -> Integer,
+        /// BLAKE3 hash of the chunk's plaintext, its key in the chunk store.
+        hash -> Binary,
+        /// Plaintext byte length of the chunk.
+        len -> BigInt,
+    }
+}
+
 /// The bookkeeping schema, applied on every open so a new replica gains all
 /// tables, the same way `_connetto_meta` arrives.
 pub(crate) const CONTENT_DDL: &str = "\
@@ -86,6 +114,15 @@ pub(crate) const CONTENT_DDL: &str = "\
     (file_id BLOB NOT NULL PRIMARY KEY); \
     CREATE TABLE IF NOT EXISTS _connetto_content_pins \
     (name TEXT NOT NULL PRIMARY KEY, query TEXT NOT NULL, file_id_column TEXT NOT NULL)";
+
+/// The held-content half of the schema (R31), created by a rebuild inside
+/// the rebuild transaction and on every content attach.
+pub(crate) const HELD_CONTENT_DDL: &str = "\
+    CREATE TABLE IF NOT EXISTS _connetto_held_content_outbox \
+    (major INTEGER NOT NULL, file_id BLOB NOT NULL, PRIMARY KEY (major, file_id)); \
+    CREATE TABLE IF NOT EXISTS _connetto_held_content_chunks \
+    (major INTEGER NOT NULL, file_id BLOB NOT NULL, ordinal INTEGER NOT NULL, \
+     hash BLOB NOT NULL, len BIGINT NOT NULL, PRIMARY KEY (major, file_id, ordinal))";
 
 /// Adds the `refused` and `heal` columns to an existing outbox table that predates them.
 ///
@@ -181,6 +218,161 @@ pub(crate) fn load_manifest(
     Ok(Some(Manifest::new(file_id, chunks)))
 }
 
+diesel::table! {
+    /// The replica's own catalogue, as the held-content hooks read it.
+    #[sql_name = "sqlite_schema"]
+    held_catalogue (name) {
+        /// The object kind.
+        #[sql_name = "type"]
+        kind -> Text,
+        /// The object name.
+        name -> Text,
+    }
+}
+
+/// Whether `main` holds a table named `name`.
+fn holds_table(conn: &mut SqliteConnection, name: &str) -> Result<bool, diesel::result::Error> {
+    let count = held_catalogue::table
+        .filter(held_catalogue::kind.eq("table"))
+        .filter(held_catalogue::name.eq(name))
+        .count()
+        .get_result::<i64>(conn)?;
+    Ok(count > 0)
+}
+
+/// Moves an old major's unsent files into the held tables inside the rebuild
+/// transaction (R31), and says whether it held any.
+///
+/// The copy is a cross-table statement the typed DSL cannot express.
+pub(crate) fn hold(conn: &mut SqliteConnection, major: Major) -> Result<bool, ClientError> {
+    conn.batch_execute(HELD_CONTENT_DDL)?;
+    if !holds_table(conn, "_connetto_content_outbox")? {
+        return Ok(false);
+    }
+    let authored = _connetto_content_outbox::table
+        .filter(_connetto_content_outbox::heal.eq(false))
+        .count()
+        .get_result::<i64>(conn)?;
+    if authored == 0 {
+        return Ok(false);
+    }
+    conn.batch_execute(&format!(
+        "INSERT INTO _connetto_held_content_outbox (major, file_id) \
+         SELECT {}, file_id FROM _connetto_content_outbox WHERE heal = 0; \
+         INSERT INTO _connetto_held_content_chunks (major, file_id, ordinal, hash, len) \
+         SELECT {}, file_id, ordinal, hash, len FROM _connetto_content_chunks \
+         WHERE file_id IN (SELECT file_id FROM _connetto_content_outbox WHERE heal = 0)",
+        major.get(),
+        major.get()
+    ))?;
+    Ok(true)
+}
+
+/// How many files are still held for `major` (R31).
+pub(crate) fn held_count(conn: &mut SqliteConnection, major: Major) -> Result<u64, ClientError> {
+    conn.batch_execute(HELD_CONTENT_DDL)?;
+    let stored = i64::from(major.get());
+    let count = _connetto_held_content_outbox::table
+        .filter(_connetto_held_content_outbox::major.eq(stored))
+        .count()
+        .get_result::<i64>(conn)?;
+    Ok(u64::try_from(count).expect("SQLite COUNT is non-negative"))
+}
+
+/// Forgets `major`'s held files and says how many there were (R31).
+pub(crate) fn forget_held(conn: &mut SqliteConnection, major: Major) -> Result<u64, ClientError> {
+    conn.batch_execute(HELD_CONTENT_DDL)?;
+    let stored = i64::from(major.get());
+    let gone = diesel::delete(
+        _connetto_held_content_outbox::table
+            .filter(_connetto_held_content_outbox::major.eq(stored)),
+    )
+    .execute(conn)?;
+    diesel::delete(
+        _connetto_held_content_chunks::table
+            .filter(_connetto_held_content_chunks::major.eq(stored)),
+    )
+    .execute(conn)?;
+    Ok(u64::try_from(gone).expect("SQLite DELETE count is non-negative"))
+}
+
+/// The content layer's held-content hooks, one value for every platform
+/// (R31).
+pub fn held_content() -> connetto_client::HeldContent {
+    connetto_client::HeldContent {
+        hold,
+        count: held_count,
+        forget: forget_held,
+    }
+}
+
+/// The files held for `major`, in stored order (R31).
+pub(crate) fn held_files(
+    conn: &mut SqliteConnection,
+    major: Major,
+) -> Result<Vec<FileId>, ContentError> {
+    let stored = i64::from(major.get());
+    let rows: Vec<Vec<u8>> = _connetto_held_content_outbox::table
+        .filter(_connetto_held_content_outbox::major.eq(stored))
+        .order(_connetto_held_content_outbox::file_id.asc())
+        .select(_connetto_held_content_outbox::file_id)
+        .load(conn)?;
+    rows.into_iter()
+        .map(|id| Ok(FileId::from_bytes(exactly_32(&id)?)))
+        .collect()
+}
+
+/// The held manifest of one file of `major`, from its held chunk rows (R31).
+pub(crate) fn load_held_manifest(
+    conn: &mut SqliteConnection,
+    major: Major,
+    file_id: FileId,
+) -> Result<Option<Manifest>, ContentError> {
+    let stored = i64::from(major.get());
+    let rows: Vec<(Vec<u8>, i64)> = _connetto_held_content_chunks::table
+        .filter(_connetto_held_content_chunks::major.eq(stored))
+        .filter(_connetto_held_content_chunks::file_id.eq(file_id.as_bytes().to_vec()))
+        .order(_connetto_held_content_chunks::ordinal.asc())
+        .select((
+            _connetto_held_content_chunks::hash,
+            _connetto_held_content_chunks::len,
+        ))
+        .load(conn)?;
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut chunks = Vec::with_capacity(rows.len());
+    for (hash, len) in rows {
+        chunks.push(ChunkMeta {
+            hash: ChunkHash::from_bytes(exactly_32(&hash)?),
+            len: u64::try_from(len).map_err(|_| ContentError::Replica(negative_length()))?,
+        });
+    }
+    Ok(Some(Manifest::new(file_id, chunks)))
+}
+
+/// Deletes one held file's rows once it is settled or lost (R31).
+pub(crate) fn forget_held_file(
+    conn: &mut SqliteConnection,
+    major: Major,
+    file_id: FileId,
+) -> Result<(), diesel::result::Error> {
+    let stored = i64::from(major.get());
+    diesel::delete(
+        _connetto_held_content_outbox::table
+            .filter(_connetto_held_content_outbox::major.eq(stored))
+            .filter(_connetto_held_content_outbox::file_id.eq(file_id.as_bytes().to_vec())),
+    )
+    .execute(conn)?;
+    diesel::delete(
+        _connetto_held_content_chunks::table
+            .filter(_connetto_held_content_chunks::major.eq(stored))
+            .filter(_connetto_held_content_chunks::file_id.eq(file_id.as_bytes().to_vec())),
+    )
+    .execute(conn)
+    .map(|_| ())
+}
+
 /// Deletes a manifest's chunk rows.
 pub(crate) fn drop_manifest(
     conn: &mut SqliteConnection,
@@ -212,10 +404,18 @@ pub(crate) fn all_manifests(conn: &mut SqliteConnection) -> Result<Vec<FileId>, 
 pub(crate) fn referenced_hashes(
     conn: &mut SqliteConnection,
 ) -> Result<HashSet<ChunkHash>, ContentError> {
-    let rows: Vec<Vec<u8>> = _connetto_content_chunks::table
+    // Held files' chunks live in the held tables, and their bytes must stay
+    // until the drain settles them, so the sweep keeps those hashes too.
+    let mut rows: Vec<Vec<u8>> = _connetto_content_chunks::table
         .select(_connetto_content_chunks::hash)
         .distinct()
         .load(conn)?;
+    rows.extend(
+        _connetto_held_content_chunks::table
+            .select(_connetto_held_content_chunks::hash)
+            .distinct()
+            .load(conn)?,
+    );
     rows.into_iter()
         .map(|hash| Ok(ChunkHash::from_bytes(exactly_32(&hash)?)))
         .collect()
@@ -443,16 +643,21 @@ pub(crate) fn is_unsent(
         .map(|n| n > 0)
 }
 
-/// Whether any manifest still names this chunk.
+/// Whether any manifest, held or not, still names this chunk.
 pub(crate) fn hash_is_referenced(
     conn: &mut SqliteConnection,
     hash: &ChunkHash,
 ) -> Result<bool, diesel::result::Error> {
-    _connetto_content_chunks::table
-        .filter(_connetto_content_chunks::hash.eq(hash.as_bytes().to_vec()))
+    let bytes = hash.as_bytes().to_vec();
+    let live = _connetto_content_chunks::table
+        .filter(_connetto_content_chunks::hash.eq(bytes.clone()))
         .count()
-        .get_result::<i64>(conn)
-        .map(|n| n > 0)
+        .get_result::<i64>(conn)?;
+    let held = _connetto_held_content_chunks::table
+        .filter(_connetto_held_content_chunks::hash.eq(bytes))
+        .count()
+        .get_result::<i64>(conn)?;
+    Ok(live > 0 || held > 0)
 }
 
 /// Creates or replaces a pin under `name`.
