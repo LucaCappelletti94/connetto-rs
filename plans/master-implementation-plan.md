@@ -220,7 +220,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R92 synced tables carry no local references | NOT STARTED, minted and designed 2026-09-22 by R21's decision 8 | nothing. Four decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
-| R95 share keys on a running client | NOT STARTED, minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Thirteen decisions and five planned pull requests in the section | no |
+| R95 share keys on a running client | STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Fifteen decisions and six planned pull requests in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R98 one schema contract | **DONE** (2026-10-05, #126) | nothing | no |
@@ -5924,7 +5924,7 @@ Both platforms build their clients from one builder each over the shared pieces,
 
 ## R95: share keys added and removed on a running client
 
-**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route decided with the maintainer and the rest from research reported to the maintainer. The working record, with the tree facts, the prior art, the state table of every event against every client situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
+**Status.** STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The wire is #177. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
 
 **Blocked on nothing** since R94 landed on 2026-09-30. Its `Auth` holds the starting set this phase persists.
 
@@ -5947,16 +5947,19 @@ A share key usually reaches an application while it runs, when a user opens a sh
 11. **A change while the client is locked is refused with `ClientError::Locked`**, as the gate refuses every other application call.
 12. **In a relay the worker holds the set.** A tab's add or remove travels to the worker as a relay request whose reply quotes its id, and after the swap the worker states `TabIdentity` to every tab, which the tab's mirror already applies.
 13. **Chapter 12 gains carrying guidance, and delivery stays the application's.** The key goes in the URL fragment, which RFC 3986 keeps out of the request and so out of logs and the Referer header, links open through Universal Links or verified App Links rather than a custom scheme (RFC 8252 section 8.2), and the browser strips the fragment with `history.replaceState` after reading it.
+14. **A swap replaces a per-viewer aggregate behind the resend notice** (decided with the maintainer 2026-10-18). An aggregate over a key-gated table registers per viewer (R85), so a swap registers it again, and a grouped answer's re-bootstrap arrives one group at a time and would leave a group the removed key revealed. So `FullResyncRequired` naming an aggregate tells the client to drop that aggregate's resting answer before the full re-bootstrap follows, as Electric's must-refetch discards a shape. Rejected: the server reading the old registration's groups and removing each one absent from the new answer, an extra read per swap repeating the diff the engine already makes on re-execution.
+15. **A swap holds the dispatch of change events while it replaces the principal.** The swap runs on the session's task and the fan-out on the ingest task, so without a shared gate a patch filtered under the old keys could be queued behind the swap's resends and put back a row they took away. R7 needs none, because its moves are produced on the ingest task itself.
 
 ### Steps
 
-Five pull requests, each building and passing CI on its own.
+Six pull requests, each building and passing CI on its own.
 
 1. The wire. The set message and its answer and the handshake's stated set in `connetto-core`, with chapter 02.
-2. The server. The swap on the session and every route, re-registration, the resends, the stated-set comparison at resume, the metering and the expiry timer.
-3. The native client. The add and remove call, persistence beside the refresh token under the gate, the recorded acknowledged set, the re-render and the client expiry timer.
-4. The browser. The worker's call, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
-5. The documents. Chapters 12 and 13 with the carrying guidance.
+2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate.
+3. The server. The swap on the session and every route, re-registration, the resends, the stated-set comparison at resume, the metering, the dispatch gate and the expiry timer.
+4. The native client. The add and remove call, persistence beside the refresh token under the gate, the recorded acknowledged set, the re-render and the client expiry timer.
+5. The browser. The worker's call, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
+6. The documents. Chapters 12 and 13 with the carrying guidance.
 
 ### Proof
 
