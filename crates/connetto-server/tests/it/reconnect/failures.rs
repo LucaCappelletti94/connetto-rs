@@ -13,6 +13,9 @@ use tokio::task::JoinHandle;
 
 use super::*;
 
+mod paged_replay;
+mod read_failures;
+mod replay_departures;
 mod term_termination;
 mod transport_lifetime;
 mod worker_cancellation;
@@ -177,12 +180,11 @@ async fn parked_client(
 fn hold_page(script: &Mutex<Script>) -> (Arc<Notify>, Arc<Notify>) {
     let arrived = Arc::new(Notify::new());
     let release = Arc::new(Notify::new());
-    let previous = script
-        .lock()
-        .expect("script")
-        .hold
-        .replace((Arc::clone(&arrived), Arc::clone(&release)));
-    assert!(previous.is_none(), "each held page has its own release");
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
     (arrived, release)
 }
 

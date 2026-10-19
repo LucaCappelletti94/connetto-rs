@@ -18,6 +18,9 @@
 //! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
 //! write applies to the source Postgres under the caller's RLS context.
 
+#[cfg(test)]
+mod cursor_lock_tests;
+
 mod input;
 
 use input::HeldInput;

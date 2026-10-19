@@ -782,8 +782,12 @@ struct Script {
     /// Every read asked for since the script was armed.
     reads: Vec<&'static str>,
     armed: bool,
-    /// Holds the next entries read until the test releases it, telling the test it arrived.
-    hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    /// Blocks entries reads in queue order, pruning through the optional position before each hold.
+    holds: std::collections::VecDeque<(
+        Arc<tokio::sync::Notify>,
+        Arc<tokio::sync::Notify>,
+        Option<PgCommitPosition>,
+    )>,
     current_reads: std::collections::HashMap<tokio::task::Id, usize>,
     panic_next_page: bool,
 }
@@ -861,8 +865,14 @@ impl Oplog for ScriptedOplog {
     }
 
     async fn entries_since(&self, after: PgCommitPosition) -> Result<Vec<ChangeRecord>, Refused> {
-        let hold = self.script.lock().expect("script").hold.take();
-        if let Some((arrived, release)) = hold {
+        let hold = self.script.lock().expect("script").holds.pop_front();
+        if let Some((arrived, release, prune)) = hold {
+            if let Some(through) = prune {
+                self.inner
+                    .forget_through(through)
+                    .await
+                    .unwrap_or_else(|never| match never {});
+            }
             arrived.notify_one();
             tokio::time::timeout(Duration::from_secs(15), release.notified())
                 .await
@@ -1202,7 +1212,11 @@ async fn a_change_that_goes_live_during_a_replay_follows_it() {
         Arc::new(tokio::sync::Notify::new()),
         Arc::new(tokio::sync::Notify::new()),
     );
-    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
     subscribe(&mut client).await;
 
     // The route stands and the ceiling is read by the time the replay asks for its entries.
@@ -1280,7 +1294,11 @@ async fn resumes_arriving_during_a_walk_share_the_next_one() {
         Arc::new(tokio::sync::Notify::new()),
     );
     arm(&script, &[], true, None);
-    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
 
     let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[0])).await;
     subscribe(&mut a).await;
@@ -1336,7 +1354,11 @@ async fn a_shared_walk_resyncs_only_the_resume_retention_passed() {
     // The held walk's read is refused once, and the log is pruned through the second change meanwhile.
     let second = events[1].checkpoint().expect("a checkpoint");
     arm(&script, &["entries_since"], true, Some(second));
-    script.lock().expect("script").hold = Some((Arc::clone(&arrived), Arc::clone(&release)));
+    script.lock().expect("script").holds.push_back((
+        Arc::clone(&arrived),
+        Arc::clone(&release),
+        None,
+    ));
 
     let mut a = open_scripted_as(&manager, "client-a", cursor_of(&events[2])).await;
     subscribe(&mut a).await;
