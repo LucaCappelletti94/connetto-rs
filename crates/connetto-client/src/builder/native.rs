@@ -831,11 +831,11 @@ where
                 #[cfg(feature = "peer")]
                 let peer = Peer {
                     node: node.clone(),
-                    discovery: connetto_peer::Discovery::new(
+                    discovery: platform_discovery(connetto_peer::Discovery::new(
                         node,
                         device.peer_autolink,
                         discovery_events,
-                    ),
+                    )),
                     listen: device.peer_listen,
                     events: peer_events_rx,
                     discovery_events: discovery_events_rx,
@@ -1122,6 +1122,19 @@ async fn with_device_tasks(mut pump: CorePump, tasks: impl Future<Output = ()>) 
     tokio::select! {
         () = &mut pump => {}
         () = tasks => pump.await,
+    }
+}
+
+/// Discovery through the system Bonjour service on iOS, which grants an app no raw multicast, and through `mdns-sd` elsewhere (R76).
+#[cfg(feature = "peer")]
+fn platform_discovery(discovery: connetto_peer::Discovery) -> connetto_peer::Discovery {
+    #[cfg(target_os = "ios")]
+    {
+        discovery.with_dns_sd(Arc::new(connetto_peer_apple::discovery::Bonjour))
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        discovery
     }
 }
 

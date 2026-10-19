@@ -1,5 +1,10 @@
 //! The Apple platform's frameworks, each behind its one lock (R76).
 
+#[expect(
+    unsafe_code,
+    reason = "the dns_sd calls, each made on the session's one thread and sound as its SAFETY comment states"
+)]
+pub(super) mod bonjour;
 #[cfg_attr(
     target_os = "macos",
     expect(

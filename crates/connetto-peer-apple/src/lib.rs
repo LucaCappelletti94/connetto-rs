@@ -441,6 +441,12 @@ pub mod hotspot {
     }
 }
 
+/// Peer discovery through the system Bonjour service, which needs no multicast entitlement for the declared service type (R76).
+#[cfg(any(target_os = "ios", target_os = "macos"))]
+pub mod discovery {
+    pub use crate::platform::bonjour::Bonjour;
+}
+
 #[cfg(any(target_os = "ios", target_os = "macos", test))]
 mod route;
 
