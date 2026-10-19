@@ -35,7 +35,7 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             PG_DDL,
@@ -44,9 +44,12 @@ async fn the_handshake_gate_hashes_the_same_bundle_on_both_sides() {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
+        .exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled \
+             TO app_writer",
+        )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let snapshot =

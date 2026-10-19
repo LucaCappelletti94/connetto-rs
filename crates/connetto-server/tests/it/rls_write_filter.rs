@@ -38,7 +38,7 @@ pub(crate) const PG_DDL: &str =
 
 /// Shared setup for both tests. `Fixture` holds the process-wide serialization
 /// lock, so the two do not race each other's `DROP TABLE notes`, and it
-/// provisions `_connetto_mutations` fresh, which the writer role is granted on
+/// provisions the writer tables fresh, which the writer role is granted on
 /// below.
 pub(crate) async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
     fixture
@@ -56,7 +56,7 @@ pub(crate) async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
                OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
             "GRANT USAGE ON SCHEMA public TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer",
         ])
         .await;
     pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await

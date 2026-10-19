@@ -29,7 +29,7 @@ use connetto_test_harness::Fixture;
 use connetto_test_harness::standby::{Pair, Switchboard};
 use connetto_test_harness::{
     ConnettoDefaults, OPLOG_TABLE, PUBLICATION, RosterAuth, SLOT, WITHHELD_ID, exec, pool_for,
-    provision_watermark,
+    provision_writers,
 };
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
@@ -179,11 +179,11 @@ async fn closed(client: &mut LoopbackTransport) -> FatalErrorReason {
     }
 }
 
-/// The orders table, the watermark and the reconnect log, returning the log's handle.
+/// The orders table, the writer tables and the reconnect log, returning the log's handle.
 async fn provision(pool: &Pool<AsyncPgConnection>) -> PgOplog {
     exec(pool, PG_DDL).await;
     exec(pool, "ALTER TABLE orders REPLICA IDENTITY FULL").await;
-    provision_watermark(pool).await;
+    provision_writers(pool).await;
     let oplog = PgOplog::new(pool.clone(), OPLOG_TABLE, OplogConfig::default());
     oplog.ensure_schema().await.expect("provision the oplog");
     oplog
@@ -193,7 +193,7 @@ fn manager_on(pool: &Pool<AsyncPgConnection>, oplog: PgOplog) -> Arc<Manager> {
     manager_writing_to(pool, pool.clone(), oplog)
 }
 
-/// A manager whose watermark reads go through `writes`, so a test can hold that pool.
+/// A manager whose writer reads go through `writes`, so a test can hold that pool.
 fn manager_writing_to(
     pool: &Pool<AsyncPgConnection>,
     writes: Pool<AsyncPgConnection>,

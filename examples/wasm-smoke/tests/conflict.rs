@@ -20,7 +20,7 @@
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     BulkMessage, ConflictRow, ControlMessage, HandshakeAck, MutationConflict, SnapshotBegin,
-    SnapshotEnd, SnapshotPatch, SubscriptionPriority,
+    SnapshotEnd, SnapshotPatch, SubscriptionPriority, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, loopback};
@@ -120,7 +120,10 @@ async fn fake_upstream(mut server: LoopbackTransport, seeded_id: rosetta_uuid::U
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             initial_credits: 64,
-            last_applied_seq: None,
+            writer: Some(WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
         }))
         .await
         .expect("handshake ack");

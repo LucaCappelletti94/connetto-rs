@@ -24,18 +24,19 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
-use connetto_core::auth::{Principal, Subject};
+use connetto_core::auth::{AuthContext, Principal, Subject};
+use connetto_core::chain::{self, GENESIS};
 use connetto_core::device_cert::KeyId;
 use connetto_core::messages::{
     AggregateUpdate, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
-    CONTENT_TICKET_SIGNER_ERROR, Challenge, ContentTicketGrant, ContentTicketRequest, ContentVerb,
-    ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge, EnrolRefusal,
-    EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant,
+    CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
+    ContentVerb, ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge,
+    EnrolRefusal, EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired, Grant,
     Handshake, HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict,
     MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause,
     Pong, RateLimited, RegisterBot, ReplaceShareKeys, RevocationUpdate, RevokeDeviceRequest,
     SUBSCRIPTION_REFUSED, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    Subscribe, SubscriptionSpec, bot_registration_message,
+    Subscribe, SubscriptionSpec, WriterGrant, WriterRequest, bot_registration_message,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -84,9 +85,10 @@ use crate::schema::ConnettoSchema;
 use crate::slot::SlotError;
 use crate::throttle::{ReadLimits, Tier};
 use crate::timeline::{Position, TimelineError, TimelineHistory};
-use crate::write_target::{PgWriteTarget, WriteError, WriteOutcome};
+use crate::write_target::{PgWriteTarget, SettleSpec, WriteError, WriteOutcome};
+use crate::writer_schema::{SettlePath, SettledOutcome, SettledRow, WriterRow};
 use connetto_core::auth::CapabilityKey;
-use connetto_core::auth::{AuthContext, CapabilitySubject};
+use connetto_core::auth::CapabilitySubject;
 
 /// One page of a subscription's initial rows, produced by a [`SnapshotSource`].
 pub struct SnapshotPage {
@@ -973,22 +975,6 @@ fn oplog_err<E: core::fmt::Display>(err: E) -> SessionError {
     SessionError::Oplog(err.to_string())
 }
 
-/// Record that `client_seq` was deferred. The earliest deferred sequence stays
-/// the one every later write waits behind, so the server holds the order
-/// whatever order the client resends in.
-fn record_deferral<Id, Key>(
-    state: &mut SessionState<Id, Key>,
-    client_seq: u64,
-    deferral: Deferral,
-) {
-    if state
-        .deferred
-        .is_none_or(|(earliest, _)| client_seq <= earliest)
-    {
-        state.deferred = Some((client_seq, deferral));
-    }
-}
-
 /// Read the reconnect log through `read`, reading again after a transient failure while the connection's `budget` of waiting lasts.
 ///
 /// Each read runs its own jittered episode of the default policy, 200 ms doubling to 5 s, so clients resuming together after a promotion do not read again in step, and each wait is cut to what is left of the budget and taken from it.
@@ -1343,7 +1329,8 @@ struct HandshakeOutcome<Id, Key> {
     resume: Resume,
     /// What is left of the connection's wait on reconnect-log reads after the handshake's.
     resume_read_budget: Duration,
-    applied_watermark: Option<u64>,
+    /// The writer this connection writes as, resolved at the handshake (R75).
+    writer_row: Option<WriterRow<Id>>,
     /// How many grants were refused, tallied for abuse once the run is
     /// registered so a crossing can close the connection it happened on.
     refused_grants: u32,
@@ -1596,15 +1583,6 @@ struct PagedRead {
 /// few numeric cells), so hitting it means the fold would demote anyway.
 const GROUPED_SEED_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Why a mutation was deferred, which is also how every later sequence behind it is answered.
-#[derive(Debug, Clone, Copy)]
-enum Deferral {
-    /// The caller's reader share or byte window is spent until the instant, answered `RateLimited`.
-    Throttled(Instant),
-    /// The database or the authorization service could not answer, answered `Indeterminate`.
-    Unreachable,
-}
-
 /// Mutable per-session state carried through the run loop.
 /// A snapshot whose first page's fence missed transactions, owed their rows from the log.
 struct MissedReplay {
@@ -1637,18 +1615,19 @@ struct SessionState<Id, Key> {
     principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
-    /// A deferred mutation and what deferred it. Every later sequence on this
-    /// connection is deferred behind it, because the watermark is one number:
-    /// a later write applied first would advance it past the deferred one,
-    /// whose resend the watermark check would then acknowledge unapplied.
-    deferred: Option<(u64, Deferral)>,
-    /// The connetto-minted session id from the verified token. The durable
-    /// watermark keys on it, so a reconnect reusing the same session dedupes.
+    /// The writer this connection writes as (R75). Its `frontier` is the
+    /// per-connection cache of the writer's durable frontier.
+    writer_row: Option<WriterRow<Id>>,
+    /// The connetto-minted session id from the verified token.
     session_id: SessionId,
-    /// Highest `client_seq` durably applied for this client identity, from
-    /// the write target at handshake and advanced per commit. A replayed
-    /// sequence at or below it is re-acknowledged, never re-applied.
-    applied_watermark: Option<u64>,
+    /// The sequence this connection answered `Indeterminate` that stands
+    /// unsettled, so the writes past it are answered the same way rather than
+    /// closed, the client resends them while a new one is in flight.
+    indeterminate: Option<u64>,
+    /// The sequences this connection deferred, each holding the deadline its
+    /// deferral named. A write past the frontier that stands behind one waits
+    /// behind it rather than closing as a gap.
+    deferred: BTreeMap<u64, u64>,
     /// Where the handshake cursor lets every re-declared subscription resume.
     resume: Resume,
     /// What is left of the connection's wait on reconnect-log reads, which every catchup draws from.
@@ -3486,9 +3465,9 @@ where
         nonce
     }
 
-    /// Validate the handshake the gate received, decode the resume cursor,
-    /// read the client's durable mutation watermark, and reply with the ack
-    /// carrying both the server's current cursor and that watermark.
+    /// Validate the handshake the gate received, resolve the writer the
+    /// connection writes as, decode the resume cursor, and reply with the ack
+    /// carrying the server's current cursor and the writer's grant.
     ///
     /// Returns the session identity, or `None` when the manager is shutting
     /// down.
@@ -3591,22 +3570,71 @@ where
         let mut resume_read_budget = self.config.resume_read_budget;
         let current_position =
             read_log::<O, _, _>(&mut resume_read_budget, || self.oplog.current_position()).await?;
-        // The durable mutation watermark: the client retires pending records
-        // at or below it and replays the rest. Its read is the handshake's one
-        // reader-pool checkout, so an unidentified caller takes a share permit
-        // for it (R39) and draws R19's fatal refusal when the share stays full.
-        let applied_watermark = {
-            let Some(_reader_permit) = self
-                .handshake_reader_permit(transport, tier, &principal, refused_grants, &span)
-                .await
-            else {
-                return Ok(None);
-            };
-            self.target
-                .last_applied(session_id)
-                .await
-                .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        let user_id = principal
+            .identity()
+            .map(|identity| identity.user_id.clone());
+        // A number writer issued to a caller with no identity belongs to its run (R75).
+        let bind_session = user_id.is_none().then(|| *session_id.as_uuid());
+        // The writer reads are the handshake's reader-pool checkouts, so an unidentified caller takes a share permit for them (R39).
+        let Some(reader_permit) = self
+            .handshake_reader_permit(transport, tier, &principal, refused_grants, &span)
+            .await
+        else {
+            return Ok(None);
         };
+        let mut writer_row: Option<WriterRow<Id>> = None;
+        let mut writer_grant = None;
+        match handshake.writer {
+            WriterRequest::Issue => {
+                let (writer, frontier) = self
+                    .target
+                    .issue_writer(user_id.clone(), bind_session)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                writer_grant = Some(WriterGrant {
+                    number: u64::try_from(writer).unwrap_or(0),
+                    frontier: u64::try_from(frontier).unwrap_or(0),
+                });
+                writer_row = Some(WriterRow {
+                    writer,
+                    user_id,
+                    device_key: None,
+                    frontier,
+                    head: None,
+                    retired_at: None,
+                });
+            }
+            WriterRequest::Number(number) => {
+                let writer = i64::try_from(number).unwrap_or(i64::MAX);
+                if let Some(row) = self
+                    .target
+                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                {
+                    writer_grant = Some(WriterGrant {
+                        number,
+                        frontier: u64::try_from(row.frontier).unwrap_or(0),
+                    });
+                    writer_row = Some(row);
+                } else {
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(FatalError::new(
+                            FatalErrorReason::WriterUnknown,
+                        )))
+                        .await;
+                    return Ok(None);
+                }
+            }
+            WriterRequest::Device => {}
+        }
+        if let (Some(settled_through), Some(row)) = (handshake.settled_through, &writer_row) {
+            self.target
+                .prune_settled(row.writer, settled_through)
+                .await
+                .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        }
+        drop(reader_permit);
         let resume_token = self
             .authority
             .mint_handle(session_id)
@@ -3650,7 +3678,7 @@ where
                 current_cursor,
                 schema_version: self.config.schema_version.clone(),
                 initial_credits: self.config.initial_credits,
-                last_applied_seq: applied_watermark,
+                writer: writer_grant,
             }))
             .await
         {
@@ -3664,7 +3692,7 @@ where
             principal: Arc::new(principal),
             resume,
             resume_read_budget,
-            applied_watermark,
+            writer_row,
             refused_grants,
             span,
             outbound_tx,
@@ -3675,6 +3703,40 @@ where
                 .map(|subjects| subjects.into_iter().collect()),
         }))
     }
+
+    /// Take the handshake's reader-share permit (R39), refusing the connection with R19's fatal shape while the unreserved share stays full.
+    async fn handshake_reader_permit<T: Transport>(
+        &self,
+        transport: &mut T,
+        tier: Tier,
+        principal: &Principal<Id, Key>,
+        refused_grants: u32,
+        span: &tracing::Span,
+    ) -> Option<ReaderPermit> {
+        match self.guard.reader_permit(tier).await {
+            Ok(permit) => Some(permit),
+            Err(wait) => {
+                let retry_after_ms = retry_ms(wait);
+                span.in_scope(|| {
+                    tracing::warn!(
+                        retry_after_ms,
+                        "connection refused, the unreserved reader share is full"
+                    );
+                });
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::RateLimited { retry_after_ms },
+                    )))
+                    .await;
+                let _ = span.in_scope(|| {
+                    self.guard
+                        .refused_grants(Self::caller(principal), refused_grants)
+                });
+                None
+            }
+        }
+    }
+
     /// Refuse a caller that is over a rate limit, reporting whether it was.
     ///
     /// The credential count short-circuits the connection one, so a caller
@@ -3716,44 +3778,6 @@ where
         true
     }
 
-    /// Take the handshake's reader-share permit (R39), or refuse the caller
-    /// in R19's fatal shape and report [`None`].
-    ///
-    /// The refusals still count on this exit, exactly as on the rate-limit
-    /// one: the tally here and the announcement in `run_session` are two ends
-    /// of one count.
-    async fn handshake_reader_permit<T: Transport>(
-        &self,
-        transport: &mut T,
-        tier: Tier,
-        principal: &Principal<Id, Key>,
-        refused_grants: u32,
-        span: &tracing::Span,
-    ) -> Option<ReaderPermit> {
-        match self.guard.reader_permit(tier).await {
-            Ok(permit) => Some(permit),
-            Err(wait) => {
-                let retry_after_ms = retry_ms(wait);
-                span.in_scope(|| {
-                    tracing::warn!(
-                        retry_after_ms,
-                        "connection refused, the unreserved reader share is full"
-                    );
-                });
-                let _ = transport
-                    .send_control(ControlMessage::FatalError(FatalError::new(
-                        FatalErrorReason::RateLimited { retry_after_ms },
-                    )))
-                    .await;
-                let _ = span.in_scope(|| {
-                    self.guard
-                        .refused_grants(Self::caller(principal), refused_grants)
-                });
-                None
-            }
-        }
-    }
-
     /// Take the mutation's reader-share permit (R39) and then charge its
     /// compressed bytes to the caller's window, in that order so a write the
     /// share defers has spent nothing and is not charged twice on resend. Either
@@ -3781,8 +3805,8 @@ where
                     retry_after_ms = retry_ms(wait),
                     "mutation deferred, the unreserved reader share is full"
                 );
-                self.defer_mutation(transport, client_seq, wait, state)
-                    .await?;
+                self.defer_mutation(transport, client_seq, wait).await?;
+                state.deferred.insert(client_seq, retry_ms(wait));
                 return Ok(None);
             }
         };
@@ -3797,27 +3821,20 @@ where
                     retry_after_ms = retry_ms(wait),
                     "mutation deferred, the caller's byte window is spent"
                 );
-                self.defer_mutation(transport, client_seq, wait, state)
-                    .await?;
+                self.defer_mutation(transport, client_seq, wait).await?;
+                state.deferred.insert(client_seq, retry_ms(wait));
                 Ok(None)
             }
         }
     }
 
-    /// Answer `RateLimited` for `client_seq` and record the deferral so later
-    /// sequences on this connection wait behind it.
+    /// Answer `RateLimited` for `client_seq`, leaving it pending on the client to replay.
     async fn defer_mutation<T: Transport>(
         &self,
         transport: &mut T,
         client_seq: u64,
         wait: Duration,
-        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        record_deferral(
-            state,
-            client_seq,
-            Deferral::Throttled(Instant::now() + wait),
-        );
         transport
             .send_control(ControlMessage::RateLimited(RateLimited {
                 related_to: Some(client_seq.to_string()),
@@ -3827,20 +3844,16 @@ where
             .map_err(transport_err)
     }
 
-    /// Everything that gates a mutation before the watermark. The header and
-    /// patch must agree on the sequence and the patch must fit the byte window
-    /// at all, each refused with a reject the client rolls back, since neither
-    /// can ever be resent as it is. The per-write measurement an operator sizes
-    /// the meter from is logged. A sequence past a deferred one is deferred
-    /// behind it the same way, so writes apply in the order the client
-    /// numbered them, and the deferred sequence itself arriving again is
-    /// settled afresh. `false` means the mutation was answered here.
+    /// The mutation gate before the watermark. The header and patch must agree
+    /// on the sequence, refused with a reject the client rolls back, since the
+    /// pair can never be resent as it is. The per-write measurement an
+    /// operator sizes the meter from is logged. `false` means the mutation was
+    /// answered here.
     async fn admit_mutation<T: Transport>(
         &self,
         transport: &mut T,
         header: &MutationHeader,
         patch: &MutationPatch,
-        state: &mut SessionState<Id, Key>,
     ) -> Result<bool, SessionError> {
         let client_seq = patch.client_seq;
         let patch_len = patch.patchset_zstd.len();
@@ -3850,17 +3863,8 @@ where
             patch_bytes = patch_len,
             "mutation received"
         );
-        let refusal = if header.client_seq == client_seq {
-            self.guard
-                .bytes()
-                .mutation_limit()
-                .filter(|limit| u64::try_from(patch_len).unwrap_or(u64::MAX) > *limit)
-                .map(|limit| {
-                    format!("mutation of {patch_len} bytes exceeds the {limit} byte window")
-                })
-        } else {
-            Some("mutation header and patch client_seq disagree".to_owned())
-        };
+        let refusal = (header.client_seq != client_seq)
+            .then(|| "mutation header and patch client_seq disagree".to_owned());
         if let Some(detail) = refusal {
             self.reject(
                 transport,
@@ -3869,29 +3873,6 @@ where
             )
             .await?;
             return Ok(false);
-        }
-        match state.deferred {
-            Some((deferred_seq, deferral)) if client_seq > deferred_seq => {
-                tracing::debug!(
-                    client_seq,
-                    deferred_seq,
-                    "mutation deferred behind an earlier one"
-                );
-                match deferral {
-                    Deferral::Throttled(until) => {
-                        let wait = until.saturating_duration_since(Instant::now());
-                        self.defer_mutation(transport, client_seq, wait, state)
-                            .await?;
-                    }
-                    Deferral::Unreachable => {
-                        self.reject_indeterminate(transport, client_seq, state)
-                            .await?;
-                    }
-                }
-                return Ok(false);
-            }
-            Some((deferred_seq, _)) if client_seq == deferred_seq => state.deferred = None,
-            _ => {}
         }
         Ok(true)
     }
@@ -4105,7 +4086,7 @@ where
             principal,
             resume,
             resume_read_budget,
-            applied_watermark,
+            writer_row,
             refused_grants,
             span: _,
             outbound_tx,
@@ -4134,9 +4115,10 @@ where
             outbound: outbound_tx,
             principal,
             pending_header: None,
-            deferred: None,
+            writer_row,
             session_id,
-            applied_watermark,
+            indeterminate: None,
+            deferred: BTreeMap::new(),
             resume,
             resume_read_budget,
             cursor_subjects,
@@ -5028,10 +5010,15 @@ where
         WriteVerdict::Allowed
     }
 
-    /// Pair a `MutationPatch` with its header, authorize, conflict-check, and
-    /// apply. A durable apply (and any replay of one) is confirmed with
-    /// [`MutationApplied`], failures reply with their dedicated messages, and
-    /// the data itself flows back as the CDC echo.
+    /// Pair a `MutationPatch` with its header and settle it on the writer's
+    /// applied frontier (R75). A new write at the frontier plus one applies
+    /// and settles its sequence, a redelivery at or below it answers from
+    /// the settled record, and a sequence past the frontier that nothing
+    /// unsettled on this connection explains closes the link.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one branch per frontier state, the redelivery, the gap, and the oversized refusal"
+    )]
     async fn handle_mutation<T: Transport>(
         &self,
         transport: &mut T,
@@ -5044,23 +5031,336 @@ where
                 "mutation patch arrived without a preceding header".into(),
             ));
         };
-        if !self
-            .admit_mutation(transport, &header, &patch, state)
-            .await?
-        {
+        if !self.admit_mutation(transport, &header, &patch).await? {
             return Ok(());
         }
-        // Exactly-once: a sequence at or below the durable watermark was
-        // already applied (this session or an earlier one). Re-acknowledge
-        // so the replaying client retires its pending record.
-        if state
-            .applied_watermark
-            .is_some_and(|watermark| client_seq <= watermark)
-        {
-            return self.ack(transport, client_seq).await;
+        // A write before a device writer binds arrives first, and no sequence
+        // can stand under a writer that does not exist yet.
+        if state.writer_row.is_none() {
+            let _ = transport
+                .send_control(ControlMessage::FatalError(FatalError::new(
+                    FatalErrorReason::ProtocolViolation {
+                        detail: "a write before the device writer bound".into(),
+                    },
+                )))
+                .await;
+            return Err(SessionError::Protocol(
+                "a write before the device writer bound".into(),
+            ));
         }
+        // A brief outage retries through, as a commit does, before the write answers indeterminate.
+        match self.refresh_writer_row_with_retry(state, client_seq).await {
+            Err(WriteError::Transient(_) | WriteError::Frontier) => {
+                state.indeterminate = Some(client_seq);
+                return self.reject_indeterminate(transport, client_seq).await;
+            }
+            Err(err) => return Err(SessionError::WriteTarget(err.detail())),
+            Ok(()) => {}
+        }
+        let Some(writer_row) = &state.writer_row else {
+            return Err(SessionError::Protocol(
+                "the writer row did not stand".into(),
+            ));
+        };
+        let writer = writer_row.writer;
+        let frontier = u64::try_from(writer_row.frontier).unwrap_or(0);
+        let bytes = match crate::materializer::decompress(&patch.patchset_zstd) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return self
+                    .reject(
+                        transport,
+                        client_seq,
+                        MutationRejectReason::Malformed {
+                            detail: err.to_string(),
+                        },
+                    )
+                    .await;
+            }
+        };
+        if client_seq <= frontier {
+            return self
+                .redelivered(transport, writer, client_seq, &bytes, state)
+                .await;
+        }
+        if client_seq > frontier + 1 {
+            // A write past the frontier the writer's own unsettled write explains
+            // answers it, the client sends new writes while a deferred one stands.
+            if state
+                .indeterminate
+                .is_some_and(|unsettled| client_seq > unsettled)
+            {
+                return self.reject_indeterminate(transport, client_seq).await;
+            }
+            // A write past the frontier this connection's own deferred write
+            // explains waits behind it, sharing the deadline the deferral named.
+            let deadline = state
+                .deferred
+                .range(frontier + 1..client_seq)
+                .map(|(_, retry_after_ms)| *retry_after_ms)
+                .min();
+            if let Some(retry_after_ms) = deadline {
+                state.deferred.insert(client_seq, retry_after_ms);
+                return self
+                    .defer_mutation(transport, client_seq, Duration::from_millis(retry_after_ms))
+                    .await;
+            }
+            let _ = transport
+                .send_control(ControlMessage::FatalError(FatalError::new(
+                    FatalErrorReason::SequenceGap {
+                        expected: frontier + 1,
+                        got: client_seq,
+                    },
+                )))
+                .await;
+            // The fatal is the final answer, so the deliberate close ends the
+            // session cleanly rather than as a protocol error.
+            state.closing = true;
+            return Ok(());
+        }
+        // A patch the window could never hold is refused and settles its
+        // sequence, so the write stands refused and the frontier takes it.
+        if let Some(limit) =
+            self.guard.bytes().mutation_limit().filter(|limit| {
+                u64::try_from(patch.patchset_zstd.len()).unwrap_or(u64::MAX) > *limit
+            })
+        {
+            let previous = writer_row.head.as_deref().map_or(GENESIS, |head| {
+                <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
+            });
+            let settle = SettleSpec {
+                writer,
+                seq: client_seq,
+                entry_hash: chain::entry_hash(&previous, client_seq, &bytes),
+                path: SettlePath::Direct,
+            };
+            return self
+                .settle_and_refuse(
+                    transport,
+                    &settle,
+                    MutationRejectReason::Other {
+                        detail: format!(
+                            "mutation of {} bytes exceeds the {limit} byte window",
+                            patch.patchset_zstd.len()
+                        ),
+                    },
+                    state,
+                )
+                .await;
+        }
+        let answered = self
+            .new_write(transport, &patch, client_seq, &bytes, state)
+            .await;
+        // The write already answered, so a failed re-read is logged and the next write reads again.
+        match self.refresh_writer_row(state).await {
+            Err(err @ (WriteError::Transient(_) | WriteError::Frontier)) => {
+                tracing::warn!(
+                    seq = client_seq,
+                    error = %err.detail(),
+                    "the writer row could not be re-read after a write"
+                );
+            }
+            Err(err) => return Err(SessionError::WriteTarget(err.detail())),
+            Ok(()) => {}
+        }
+        answered
+    }
 
-        // Parse and classify against the catalog.
+    /// Re-read the connection's writer row while the database fails transiently and the write retry budget lasts.
+    async fn refresh_writer_row_with_retry(
+        &self,
+        state: &mut SessionState<Id, Key>,
+        seq: u64,
+    ) -> Result<(), WriteError> {
+        let policy =
+            RetryPolicy::new().with_max_total_backoff(Some(self.config.write_retry_budget));
+        let mut episode = policy.start();
+        loop {
+            let outcome = self.refresh_writer_row(state).await;
+            let Err(WriteError::Transient(detail)) = &outcome else {
+                return outcome;
+            };
+            let Some(wait) = episode.next_wait() else {
+                tracing::warn!(seq, error = %detail, "a write could not read its writer row at the database");
+                return outcome;
+            };
+            tracing::warn!(seq, error = %detail, wait_ms = retry_ms(wait), "a write could not read its writer row, reading it again");
+            tokio::time::sleep(wait).await;
+        }
+    }
+
+    /// Re-read the connection's writer row, so the next write takes its sequence and chain hash from where the frontier stands.
+    async fn refresh_writer_row(
+        &self,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), WriteError> {
+        let Some(row) = state.writer_row.clone() else {
+            return Ok(());
+        };
+        let bind_session = row.user_id.is_none().then(|| *state.session_id.as_uuid());
+        let fresh = self
+            .target
+            .writer_by_number(row.writer, row.user_id.as_ref(), bind_session.as_ref())
+            .await?;
+        if let Some(fresh) = fresh {
+            state.writer_row = Some(fresh);
+        }
+        Ok(())
+    }
+
+    /// Answer a redelivery at or below the writer's frontier from the settled
+    /// record: the stored outcome when the entry stands as it was settled,
+    /// a fork when it does not.
+    async fn redelivered<T: Transport>(
+        &self,
+        transport: &mut T,
+        writer: i64,
+        seq: u64,
+        bytes: &[u8],
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        // A pruned record stands settled, so the client retires its copy.
+        let Some(row) = self
+            .target
+            .settled_row(writer, seq)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        else {
+            return self.ack(transport, seq).await;
+        };
+        let previous = if seq == 1 {
+            GENESIS
+        } else {
+            let prior = self
+                .target
+                .settled_row(writer, seq - 1)
+                .await
+                .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+            match prior.and_then(|row| <[u8; 32]>::try_from(row.entry_hash.as_slice()).ok()) {
+                Some(hash) => hash,
+                // A broken chain cannot be trusted to hold this entry.
+                None => {
+                    return Err(SessionError::WriteTarget(
+                        "the writer chain is broken before this entry".to_owned(),
+                    ));
+                }
+            }
+        };
+        let hash = chain::entry_hash(&previous, seq, bytes);
+        let stored = <[u8; 32]>::try_from(row.entry_hash.as_slice()).map_err(|_| {
+            SessionError::WriteTarget("a settled entry hash is not 32 bytes".to_owned())
+        })?;
+        if hash != stored {
+            self.guard.record(
+                AuthEvent::new(
+                    state.session_id,
+                    state
+                        .principal
+                        .identity()
+                        .map(|identity| identity.user_id.clone()),
+                    AuthOp::WriteForked,
+                )
+                .about_write(
+                    writer,
+                    i64::try_from(seq).unwrap_or(i64::MAX),
+                    SettlePath::Direct,
+                    row.path,
+                ),
+            );
+            return self
+                .reject(transport, seq, MutationRejectReason::Forked)
+                .await;
+        }
+        self.answer_settled(transport, seq, &row, state).await
+    }
+
+    /// Send the frame a settled record stored, a conflict reading its row fresh.
+    async fn answer_settled<T: Transport>(
+        &self,
+        transport: &mut T,
+        seq: u64,
+        row: &SettledRow,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let outcome = SettledOutcome::from_json(&row.outcome)
+            .map_err(|err| SessionError::WriteTarget(err.to_string()))?;
+        self.answer_outcome(transport, seq, &outcome, state).await
+    }
+
+    /// Send the frame for a stored outcome, an `Unauthorized` refusal counting
+    /// its abuse signal the way a fresh denial does.
+    async fn answer_outcome<T: Transport>(
+        &self,
+        transport: &mut T,
+        seq: u64,
+        outcome: &SettledOutcome,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        match outcome {
+            SettledOutcome::Applied => self.ack(transport, seq).await,
+            SettledOutcome::Rejected(reason) => {
+                if *reason == MutationRejectReason::Unauthorized {
+                    return self.reject_unauthorized(transport, seq, state).await;
+                }
+                self.reject(transport, seq, reason.clone()).await
+            }
+            SettledOutcome::Conflict {
+                table,
+                version_column,
+                pk_columns,
+                pk_values,
+            } => {
+                let server_row = self
+                    .target
+                    .settled_conflict_row(
+                        &state.principal,
+                        table,
+                        version_column,
+                        pk_columns,
+                        pk_values,
+                    )
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                    .map(|row| ConflictRow {
+                        updated_at: row.version,
+                        row_json: row.row_json,
+                    });
+                transport
+                    .send_control(ControlMessage::MutationConflict(MutationConflict {
+                        client_seq: seq,
+                        table: table.clone(),
+                        server_row,
+                    }))
+                    .await
+                    .map_err(transport_err)
+            }
+        }
+    }
+
+    /// Apply a new write at the frontier, settling its sequence with the apply.
+    async fn new_write<T: Transport>(
+        &self,
+        transport: &mut T,
+        patch: &MutationPatch,
+        seq: u64,
+        bytes: &[u8],
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let writer_row = state
+            .writer_row
+            .as_ref()
+            .expect("a new write stands on the bound writer");
+        let writer = writer_row.writer;
+        let previous = writer_row.head.as_deref().map_or(GENESIS, |head| {
+            <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
+        });
+        let entry_hash = chain::entry_hash(&previous, seq, bytes);
+        let settle = SettleSpec {
+            writer,
+            seq,
+            entry_hash,
+            path: SettlePath::Direct,
+        };
         let plan = match self
             .materializer
             .lock()
@@ -5070,105 +5370,180 @@ where
             Ok(plan) => plan,
             Err(err) => {
                 return self
-                    .reject(transport, client_seq, reject_reason(&err))
+                    .settle_and_refuse(transport, &settle, reject_reason(&err), state)
                     .await;
             }
         };
-
         match self.every_op_authorized(&plan, &state.principal).await {
             WriteVerdict::Allowed => {}
-            // Genuine denial: the caller may not perform this operation.
+            // A genuine denial settles, so a redelivery re-answers it.
             WriteVerdict::Denied => {
-                return self.reject_unauthorized(transport, client_seq, state).await;
-            }
-            // The service could not be reached, so whether the caller may
-            // write is unknown. The client must retry rather than discard.
-            WriteVerdict::Undetermined => {
                 return self
-                    .reject_indeterminate(transport, client_seq, state)
+                    .settle_and_refuse(
+                        transport,
+                        &settle,
+                        MutationRejectReason::Unauthorized,
+                        state,
+                    )
                     .await;
             }
+            // The service could not be reached, so nothing settles and the
+            // client must retry rather than discard.
+            WriteVerdict::Undetermined => {
+                state.indeterminate = Some(seq);
+                return self.reject_indeterminate(transport, seq).await;
+            }
         }
-
-        // Probe conflicts and apply through the write target, which owns the
-        // backend specifics: the Postgres target applies under the user's RLS
-        // context so the database gates the write. The apply is the mutation's
-        // one reader-pool checkout, so a share permit spans it (R39).
+        // The apply is the mutation's one reader-pool checkout, so a share
+        // permit spans it (R39).
         let outcome = {
-            let Some(_reader_permit) = self.mutation_permit(transport, &patch, state).await? else {
+            let Some(_reader_permit) = self.mutation_permit(transport, patch, state).await? else {
                 return Ok(());
             };
-            self.commit_retrying(&plan, &patch.patchset_zstd, state, client_seq)
+            self.commit_with_retry(&state.principal, &plan, &patch.patchset_zstd, &settle)
                 .await
         };
+        self.answer_write(transport, outcome, seq, &settle, state)
+            .await
+    }
+
+    /// Answer the write target's outcome: confirm, conflict, re-answer from
+    /// the record, or refuse with the record settled.
+    async fn answer_write<T: Transport>(
+        &self,
+        transport: &mut T,
+        outcome: Result<WriteOutcome, WriteError>,
+        seq: u64,
+        settle: &SettleSpec,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
         match outcome {
             Ok(WriteOutcome::Applied) => {
-                state.applied_watermark = Some(client_seq);
-                self.ack(transport, client_seq).await
+                state.indeterminate = None;
+                self.ack(transport, seq).await
             }
-            Ok(WriteOutcome::Conflict { table, server_row }) => {
+            Ok(WriteOutcome::Conflict {
+                table, server_row, ..
+            }) => {
+                state.indeterminate = None;
                 transport
                     .send_control(ControlMessage::MutationConflict(MutationConflict {
-                        client_seq,
+                        client_seq: seq,
                         table,
                         server_row,
                     }))
                     .await
-                    .map_err(transport_err)?;
-                Ok(())
+                    .map_err(transport_err)
+            }
+            Ok(WriteOutcome::Settled { row, hash_matches }) => {
+                // A settled sequence resolves the connection's unsettled write.
+                state.indeterminate = None;
+                if hash_matches {
+                    return self.answer_settled(transport, seq, &row, state).await;
+                }
+                // A different entry stands at this sequence, so this one never applies.
+                self.guard.record(
+                    AuthEvent::new(
+                        state.session_id,
+                        state
+                            .principal
+                            .identity()
+                            .map(|identity| identity.user_id.clone()),
+                        AuthOp::WriteForked,
+                    )
+                    .about_write(
+                        settle.writer,
+                        i64::try_from(seq).unwrap_or(i64::MAX),
+                        settle.path,
+                        row.path,
+                    ),
+                );
+                self.reject(transport, seq, MutationRejectReason::Forked)
+                    .await
             }
             Err(WriteError::Unauthorized) => {
-                self.reject_unauthorized(transport, client_seq, state).await
+                self.settle_and_refuse(transport, settle, MutationRejectReason::Unauthorized, state)
+                    .await
             }
             Err(WriteError::Materializer(err)) => {
-                self.reject(transport, client_seq, reject_reason(&err))
+                self.settle_and_refuse(transport, settle, reject_reason(&err), state)
                     .await
             }
             Err(WriteError::Backend(detail)) => {
-                self.reject(
+                self.settle_and_refuse(
                     transport,
-                    client_seq,
+                    settle,
                     MutationRejectReason::Other { detail },
+                    state,
                 )
                 .await
             }
+            Err(WriteError::Frontier) => {
+                // The frontier kept moving under the write, so it cannot settle
+                // until a concurrent copy resolves; the client must retry.
+                state.indeterminate = Some(seq);
+                self.reject_indeterminate(transport, seq).await
+            }
             Err(WriteError::Transient(detail)) => {
-                tracing::warn!(client_seq, error = %detail, "mutation deferred, the database did not answer within the retry budget");
-                self.reject_indeterminate(transport, client_seq, state)
-                    .await
+                tracing::warn!(seq, error = %detail, "a write could not reach the database within the retry budget");
+                state.indeterminate = Some(seq);
+                self.reject_indeterminate(transport, seq).await
             }
         }
     }
 
-    /// Commit one mutation, applying it again while the database fails transiently and the write retry budget lasts.
-    async fn commit_retrying(
+    /// Settle a final refusal under the entry, so a redelivery re-answers it,
+    /// and send the reject the client rolls back on.
+    async fn settle_and_refuse<T: Transport>(
         &self,
+        transport: &mut T,
+        settle: &SettleSpec,
+        reason: MutationRejectReason,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        self.target
+            .settle_refusal(settle, &SettledOutcome::Rejected(reason.clone()))
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        state.indeterminate = None;
+        self.reject(transport, settle.seq, reason).await
+    }
+
+    /// Commit one mutation under `caller`, applying it again while the
+    /// database fails transiently or the frontier re-races it and the write
+    /// retry budget lasts.
+    pub(crate) async fn commit_with_retry(
+        &self,
+        caller: &Principal<Id, Key>,
         plan: &crate::materializer::WritePlan,
         payload_zstd: &[u8],
-        state: &SessionState<Id, Key>,
-        client_seq: u64,
+        settle: &SettleSpec,
     ) -> Result<WriteOutcome, WriteError> {
         let policy =
             RetryPolicy::new().with_max_total_backoff(Some(self.config.write_retry_budget));
         let mut episode = policy.start();
         loop {
-            let outcome = self
-                .target
-                .commit(
-                    &state.principal,
-                    plan,
-                    payload_zstd,
-                    state.session_id,
-                    client_seq,
-                )
-                .await;
-            let Err(WriteError::Transient(detail)) = &outcome else {
-                return outcome;
+            let outcome = self.target.commit(caller, plan, payload_zstd, settle).await;
+            let retryable = match &outcome {
+                Err(WriteError::Transient(detail)) => Some(detail.clone()),
+                Err(WriteError::Frontier) => None,
+                _ => return outcome,
             };
             let Some(wait) = episode.next_wait() else {
                 return outcome;
             };
-            tracing::warn!(client_seq, error = %detail, wait_ms = retry_ms(wait), "a write could not reach the database, applying it again");
+            match retryable {
+                Some(detail) => {
+                    tracing::warn!(seq = settle.seq, error = %detail, wait_ms = retry_ms(wait), "a write could not reach the database, applying it again");
+                }
+                None => {
+                    tracing::warn!(
+                        seq = settle.seq,
+                        wait_ms = retry_ms(wait),
+                        "the frontier moved under a write, racing it again"
+                    );
+                }
+            }
             tokio::time::sleep(wait).await;
         }
     }
@@ -5193,18 +5568,14 @@ where
     }
 
     /// Refuse one write the database or the authorization service could not
-    /// answer, and defer every later sequence on this connection behind it.
-    ///
-    /// The client MUST retry rather than discard its pending record: the
-    /// server could not determine whether the write is permitted or apply it,
-    /// so discarding it would turn a transient outage into permanent loss.
+    /// answer. The client MUST retry rather than discard its pending record:
+    /// the server could not determine whether the write is permitted or apply
+    /// it, so discarding it would turn a transient outage into permanent loss.
     async fn reject_indeterminate<T: Transport>(
         &self,
         transport: &mut T,
         client_seq: u64,
-        state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        record_deferral(state, client_seq, Deferral::Unreachable);
         self.reject(transport, client_seq, MutationRejectReason::Indeterminate)
             .await
     }

@@ -2243,19 +2243,38 @@ async fn read_current_row_pg(
     conflict: &PlannedConflict,
     conn: &mut AsyncPgConnection,
 ) -> Result<Option<ServerRow>, MaterializerError> {
-    let predicate: Vec<String> = conflict
-        .pk_columns
+    read_row_by_pk(
+        conn,
+        &conflict.table,
+        &conflict.version_column,
+        &conflict.pk_columns,
+        &conflict.pk_values,
+    )
+    .await
+}
+
+/// Read the row named by a primary key from Postgres, as a JSON object, the
+/// current version rendered from the row itself. Raw SQL because the table is
+/// the application's own and only known at runtime.
+async fn read_row_by_pk(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    version_column: &str,
+    pk_columns: &[String],
+    pk_values: &[WireValue],
+) -> Result<Option<ServerRow>, MaterializerError> {
+    let predicate: Vec<String> = pk_columns
         .iter()
         .enumerate()
         .map(|(index, col)| format!("{} = ${}", quote_ident(col), index + 1))
         .collect();
     let sql = format!(
         "SELECT row_to_json(t)::text AS row_json FROM {} t WHERE {} LIMIT 1",
-        quote_ident(&conflict.table),
+        quote_ident(table),
         predicate.join(" AND "),
     );
     let mut query = sql_query(sql).into_boxed::<diesel::pg::Pg>();
-    for value in &conflict.pk_values {
+    for value in pk_values {
         query = bind_value_pg(query, value);
     }
     let rows: Vec<RowJson> = diesel_async::RunQueryDsl::load(query, conn).await?;
@@ -2265,13 +2284,50 @@ async fn read_current_row_pg(
     let json: serde_json::Value = serde_json::from_str(&row.row_json)
         .map_err(|err| MaterializerError::Parse(format!("{err}")))?;
     let version = json
-        .get(&conflict.version_column)
+        .get(version_column)
         .map(json_scalar_to_string)
         .unwrap_or_default();
     Ok(Some(ServerRow {
         version,
         row_json: row.row_json,
     }))
+}
+
+/// The stored form of one wire value for a settled conflict outcome.
+pub(crate) fn stored_value(value: &WireValue) -> crate::writer_schema::StoredValue {
+    use crate::writer_schema::StoredValue;
+    match value {
+        Value::Integer(int) => StoredValue::Integer(*int),
+        Value::Real(real) => StoredValue::Real(*real),
+        Value::Text(text) => StoredValue::Text(text.clone()),
+        Value::Blob(blob) => StoredValue::Blob(blob.clone()),
+        Value::Null => StoredValue::Null,
+    }
+}
+
+/// The wire value a stored conflict primary-key value binds as.
+pub(crate) fn wire_value(value: &crate::writer_schema::StoredValue) -> WireValue {
+    use crate::writer_schema::StoredValue;
+    match value {
+        StoredValue::Integer(int) => Value::Integer(*int),
+        StoredValue::Real(real) => Value::Real(*real),
+        StoredValue::Text(text) => Value::Text(text.clone()),
+        StoredValue::Blob(blob) => Value::Blob(blob.clone()),
+        StoredValue::Null => Value::Null,
+    }
+}
+
+/// Read the current row for a re-answered settled conflict, fresh from
+/// Postgres, under the RLS context the caller set on `conn`.
+pub(crate) async fn read_settled_conflict_row(
+    conn: &mut AsyncPgConnection,
+    table: &str,
+    version_column: &str,
+    pk_columns: &[String],
+    pk_values: &[crate::writer_schema::StoredValue],
+) -> Result<Option<ServerRow>, MaterializerError> {
+    let values: Vec<WireValue> = pk_values.iter().map(wire_value).collect();
+    read_row_by_pk(conn, table, version_column, pk_columns, &values).await
 }
 
 /// Bind one wire value with the Postgres SQL type matching its variant.

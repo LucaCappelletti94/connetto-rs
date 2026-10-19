@@ -6,7 +6,7 @@
 //! for it, by hand or through [`connetto_schema!`](crate::connetto_schema), and
 //! names it as the `Audit` member of its
 //! [`ConnettoSchema`](crate::schema::ConnettoSchema). The same arrangement as [`ConnettoStoreSchema`](crate::authn::schema::ConnettoStoreSchema)
-//! and [`ConnettoWatermarkSchema`](crate::watermark_schema::ConnettoWatermarkSchema).
+//! and [`ConnettoWriterSchema`](crate::writer_schema::ConnettoWriterSchema).
 //!
 //! **This table holds state changes, never denials.** A caller probing keys
 //! generates one refusal per attempt, so refusals go to structured logging and
@@ -15,10 +15,11 @@
 //! imposed. The split is normative in `08-authorization.md` and
 //! `denials_never_reach_the_audit_table` pins it.
 //!
-//! Only the insert is laundered as an associated type. The watermark's contract
-//! carries five because it also reads and upserts; an audit row is written once
-//! and never read back by connetto, so one suffices.
+//! Only the insert is laundered as an associated type. The writer's contract
+//! carries many because it reads, settles and prunes; an audit row is written
+//! once and never read back by connetto, so one suffices.
 
+use crate::writer_schema::SettlePath;
 use connetto_core::SessionId;
 use diesel::deserialize::{self, FromSql, FromSqlRow};
 use diesel::expression::AsExpression;
@@ -42,9 +43,6 @@ pub const AUTH_OP_TYPE: &str = "connetto_auth_op";
 pub struct AuthOpSql;
 
 /// What changed about who can reach what.
-///
-/// A closed set, so it is an enum on both sides: a value outside it is
-/// unrepresentable in Rust and rejected by Postgres.
 ///
 /// **A login ending is three values rather than one.** Collapsed, the table
 /// cannot tell an ordinary logout from a stolen credential, which is the most
@@ -72,6 +70,10 @@ pub enum AuthOp {
     /// which is the only thing that produces this. An expiry that merely lapses
     /// leaves its row behind and no record.
     BanLifted,
+    /// A different entry arrived at an already-settled `(writer, sequence)`,
+    /// which stands; the second was refused `Forked`. State, because a fork
+    /// decides which history stands.
+    WriteForked,
 }
 
 impl AuthOp {
@@ -88,6 +90,7 @@ impl AuthOp {
             Self::ModelChange => "model_change",
             Self::Banned => "banned",
             Self::BanLifted => "ban_lifted",
+            Self::WriteForked => "write_forked",
         }
     }
 }
@@ -110,6 +113,7 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"model_change" => Ok(Self::ModelChange),
             b"banned" => Ok(Self::Banned),
             b"ban_lifted" => Ok(Self::BanLifted),
+            b"write_forked" => Ok(Self::WriteForked),
             other => Err(format!(
                 "unrecognised connetto_auth_op label {:?}",
                 String::from_utf8_lossy(other)
@@ -143,6 +147,15 @@ pub struct AuthEvent<Id> {
     /// as they were read and
     /// [`ConnettoAuditSchema::row_key`] maps them to the column.
     pub pk: Option<Vec<Value<Postgres>>>,
+    /// The writer this event names, the server-issued writer row, absent
+    /// except `write_forked`.
+    pub writer: Option<i64>,
+    /// The writer's sequence the event names, absent except `write_forked`.
+    pub seq: Option<i64>,
+    /// The settle path of the standing entry, absent except `write_forked`.
+    pub path: Option<SettlePath>,
+    /// The path the arriving write travelled, absent except `write_forked`.
+    pub other_path: Option<SettlePath>,
 }
 
 impl<Id> AuthEvent<Id> {
@@ -155,6 +168,10 @@ impl<Id> AuthEvent<Id> {
             op,
             table_name: None,
             pk: None,
+            writer: None,
+            seq: None,
+            path: None,
+            other_path: None,
         }
     }
 
@@ -163,6 +180,23 @@ impl<Id> AuthEvent<Id> {
     pub fn about_row(mut self, table_name: impl Into<String>, pk: Vec<Value<Postgres>>) -> Self {
         self.table_name = Some(table_name.into());
         self.pk = Some(pk);
+        self
+    }
+
+    /// Name the writer, its sequence and the two settle paths this event
+    /// concerns, the shape `write_forked` carries.
+    #[must_use]
+    pub fn about_write(
+        mut self,
+        writer: i64,
+        seq: i64,
+        path: SettlePath,
+        other_path: SettlePath,
+    ) -> Self {
+        self.writer = Some(writer);
+        self.seq = Some(seq);
+        self.path = Some(path);
+        self.other_path = Some(other_path);
         self
     }
 }
@@ -298,6 +332,18 @@ macro_rules! connetto_audit_table {
                 table_name -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 /// The row a share key names, absent for everything else.
                 pk -> diesel::sql_types::Nullable<$pk_sql>,
+                /// The writer `write_forked` names, the server-issued writer
+                /// row, absent for everything else.
+                writer -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                /// The writer's sequence `write_forked` names, absent for
+                /// everything else.
+                seq -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+                /// The settle path of the standing entry `write_forked`
+                /// names, absent for everything else.
+                path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
+                /// The path the arriving write travelled, the second of the
+                /// two paths `write_forked` names.
+                other_path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
             }
         }
 
@@ -311,6 +357,10 @@ macro_rules! connetto_audit_table {
             op: $crate::audit::AuthOp,
             table_name: Option<String>,
             pk: Option<$pk>,
+            writer: Option<i64>,
+            seq: Option<i64>,
+            path: Option<$crate::writer_schema::SettlePath>,
+            other_path: Option<$crate::writer_schema::SettlePath>,
         }
 
         /// The default connetto audit schema over the deployment's `Id` type.
@@ -343,6 +393,10 @@ macro_rules! connetto_audit_table {
                     op: event.op,
                     table_name: event.table_name,
                     pk,
+                    writer: event.writer,
+                    seq: event.seq,
+                    path: event.path,
+                    other_path: event.other_path,
                 })
             }
         }

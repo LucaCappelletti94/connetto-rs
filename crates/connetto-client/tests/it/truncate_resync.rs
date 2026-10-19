@@ -123,7 +123,10 @@ fn server_scripted(reason: FullResyncReason, seeds: Rows, replacements: Rows) ->
                 resume_token: "truncate".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await
             .expect("ack");
@@ -324,7 +327,7 @@ async fn an_unacknowledged_local_write_survives_the_clear() {
         .execute(conn.conn())
         .expect("local insert");
     let seq = conn.push().await.expect("push").expect("a queued mutation");
-    assert_eq!(seq, 0, "the first push takes sequence zero");
+    assert_eq!(seq, 1, "the first push takes sequence one");
 
     pump_to_snapshot_end(&mut conn).await;
     pump_to_snapshot_end(&mut conn).await;
@@ -377,7 +380,10 @@ fn membership_server(declared: usize, steps: &'static [Step]) -> LoopbackTranspo
                 resume_token: "membership".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await
             .expect("ack");

@@ -57,7 +57,7 @@
 //!
 //! ```compile_fail
 //! use connetto_server::defaults::{
-//!     ConnettoAudit, ConnettoAuthSchema, ConnettoEnrolments, ConnettoWatermark,
+//!     ConnettoAudit, ConnettoAuthSchema, ConnettoEnrolments, ConnettoWriters,
 //! };
 //!
 //! struct NoBans;
@@ -65,7 +65,7 @@
 //! impl connetto_server::schema::ConnettoSchema for NoBans {
 //!     type Id = String;
 //!     type Auth = ConnettoAuthSchema;
-//!     type Watermark = ConnettoWatermark;
+//!     type Writers = ConnettoWriters;
 //!     type Audit = ConnettoAudit;
 //!     type Enrolments = ConnettoEnrolments;
 //! #   #[cfg(feature = "content")]
@@ -78,7 +78,7 @@
 //! ```
 //! use connetto_server::defaults::{
 //!     ConnettoAudit, ConnettoAuthSchema, ConnettoBans, ConnettoBots, ConnettoEnrolments,
-//!     ConnettoWatermark,
+//!     ConnettoWriters,
 //! };
 //!
 //! struct Complete;
@@ -86,7 +86,7 @@
 //! impl connetto_server::schema::ConnettoSchema for Complete {
 //!     type Id = String;
 //!     type Auth = ConnettoAuthSchema;
-//!     type Watermark = ConnettoWatermark;
+//!     type Writers = ConnettoWriters;
 //!     type Audit = ConnettoAudit;
 //!     type Bans = ConnettoBans;
 //!     type Enrolments = ConnettoEnrolments;
@@ -101,7 +101,7 @@ use crate::authn::ConnettoStoreSchema;
 use crate::ban::ConnettoBanSchema;
 use crate::bots::ConnettoBotSchema;
 use crate::device_cert::ConnettoEnrolmentSchema;
-use crate::watermark_schema::ConnettoWatermarkSchema;
+use crate::writer_schema::ConnettoWriterSchema;
 
 /// Every deployment-owned table set connetto reads through a trait, under one
 /// identity type.
@@ -116,8 +116,8 @@ pub trait ConnettoSchema: Send + Sync + 'static {
         + 'static;
     /// The login sessions and provider tokens.
     type Auth: ConnettoStoreSchema<Id = Self::Id>;
-    /// The exactly-once watermark.
-    type Watermark: ConnettoWatermarkSchema<Id = Self::Id>;
+    /// The writer's applied frontier and its settled entries (R75).
+    type Writers: ConnettoWriterSchema<Id = Self::Id>;
     /// The audit log of access changes.
     type Audit: ConnettoAuditSchema<Id = Self::Id>;
     /// The ban list.
@@ -139,7 +139,7 @@ pub trait ConnettoSchema: Send + Sync + 'static {
 /// device descriptor with each field's SQL type.
 ///
 /// Invoked at module scope with `diesel` and `diesel_async` in scope. The
-/// member structs it emits are `ConnettoAuthSchema`, `ConnettoWatermark`,
+/// member structs it emits are `ConnettoAuthSchema`, `ConnettoWriters`,
 /// `ConnettoAudit`, `ConnettoBans`, `ConnettoEnrolments` and `ConnettoBots`,
 /// and the file member is the file server's `_cfs_` tables. The descriptor is the
 /// application's own type, destructured field by field, so a field list that
@@ -153,7 +153,7 @@ macro_rules! connetto_schema {
         $(, device_descriptor: $($desc:ident)::+ { $($field:ident : $field_sql:ty),* $(,)? })? $(,)?
     ) => {
         $crate::connetto_auth_tables!($id, $id_sql);
-        $crate::connetto_watermark_table!($id);
+        $crate::connetto_writers_table!($id, $id_sql);
         $crate::connetto_audit_table!($id, $id_sql, $pk, $pk_sql);
         $crate::connetto_ban_table!($id, $id_sql);
         $crate::connetto_enrolment_tables!($id, $id_sql; $($($desc)::+ { $($field : $field_sql),* })?);
@@ -166,7 +166,7 @@ macro_rules! connetto_schema {
         impl $crate::schema::ConnettoSchema for $name {
             type Id = $id;
             type Auth = ConnettoAuthSchema;
-            type Watermark = ConnettoWatermark;
+            type Writers = ConnettoWriters;
             type Audit = ConnettoAudit;
             type Bans = ConnettoBans;
             type Enrolments = ConnettoEnrolments;

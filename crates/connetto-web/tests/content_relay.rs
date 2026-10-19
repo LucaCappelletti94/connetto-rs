@@ -14,7 +14,7 @@ use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     BulkMessage, CONTENT_TICKET_REFUSED, ContentTicketGrant, ControlMessage, Handshake,
     HandshakeAck, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
-    NonFatalError,
+    NonFatalError, WriterGrant,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -90,7 +90,10 @@ impl Upstream {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None,
                     initial_credits: 64,
-                    last_applied_seq: None,
+                    writer: Some(WriterGrant {
+                        number: 1,
+                        frontier: 0,
+                    }),
                 },
             )))
             .expect("queue handshake");

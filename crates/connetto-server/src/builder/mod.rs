@@ -44,7 +44,7 @@ use crate::session::{
     StreamCheck, StreamCheckError,
 };
 use crate::throttle::ThrottleConfig;
-use crate::watermark_schema::ConnettoWatermarkSchema;
+use crate::writer_schema::ConnettoWriterSchema;
 use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
@@ -1275,7 +1275,7 @@ async fn require_schema_tables<D: ConnettoSchema>(
 ) -> Result<(), BuildError> {
     let members: [(&[&str], bool); 6] = [
         (<D::Auth as ConnettoStoreSchema>::TABLES, true),
-        (<D::Watermark as ConnettoWatermarkSchema>::TABLES, true),
+        (<D::Writers as ConnettoWriterSchema>::TABLES, true),
         (<D::Bans as ConnettoBanSchema>::TABLES, bans),
         (<D::Audit as ConnettoAuditSchema>::TABLES, audit),
         (<D::Enrolments as ConnettoEnrolmentSchema>::TABLES, devices),

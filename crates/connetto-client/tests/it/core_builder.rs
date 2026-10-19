@@ -93,7 +93,10 @@ fn ack() -> ControlMessage {
         current_cursor: Cursor::new(Vec::new()),
         schema_version: None,
         initial_credits: 64,
-        last_applied_seq: None,
+        writer: Some(connetto_core::messages::WriterGrant {
+            number: 1,
+            frontier: 0,
+        }),
     })
 }
 
@@ -507,7 +510,10 @@ fn closing_server() -> LoopbackTransport {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await
             .expect("ack the handshake");

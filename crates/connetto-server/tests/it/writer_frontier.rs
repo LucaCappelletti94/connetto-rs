@@ -1,0 +1,647 @@
+//! Docker-gated acceptance tests for the per-writer applied frontier (R75).
+//!
+//! Each test drives raw frames through the harness `Client` against the real
+//! Postgres write target and walks one row of the server state table. The
+//! number writer's handshakes refuse what it does not hold and confirm what
+//! it does. `settled_through` prunes the rows at and below the report, and a
+//! pruned record answers applied by sequence alone. The audit names every
+//! fork. A settled entry is never applied twice, and a forged second
+//! changeset at an applied `(writer, sequence)` is refused `Forked`.
+//!
+//! Needs Docker: the fixture starts its own Postgres.
+
+use std::convert::Infallible;
+use std::sync::Arc;
+use std::time::Duration;
+
+use connetto_core::PROTOCOL_VERSION;
+use connetto_core::auth::Principal;
+use connetto_core::chain::{GENESIS, entry_hash};
+use connetto_core::messages::{
+    ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, MutationRejectReason,
+    WriterGrant, WriterRequest,
+};
+use connetto_core::test_support::TestGrantChecker;
+use connetto_core::traits::{IncomingFrame, Transport as _};
+use connetto_server::audit::{AuditHook, AuthEvent, AuthOp};
+use connetto_server::defaults::{_connetto_settled, _connetto_writers};
+use connetto_server::writer_schema::SettlePath;
+use connetto_server::{
+    AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
+    SnapshotSource, ThrottleConfig, loopback, pg_write_target,
+};
+use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
+use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel_async::pooled_connection::AsyncDieselConnectionManager;
+use diesel_async::pooled_connection::bb8::Pool;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
+use parking_lot::Mutex;
+use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+
+/// The notes table these tests sync.
+const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
+
+/// The handshake authority every test manager takes.
+fn test_verifier() -> std::sync::Arc<dyn connetto_core::HandshakeAuthority> {
+    std::sync::Arc::new(TestGrantChecker)
+}
+
+/// No subscriptions are made in these tests, so the snapshot source is never
+/// invoked.
+struct NoSnapshot;
+
+impl SnapshotSource for NoSnapshot {
+    type Error = Infallible;
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn estimate(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _caller: &Principal,
+    ) -> Result<SnapshotEstimate, Self::Error> {
+        Ok(SnapshotEstimate {
+            rows: 0.0,
+            width: 0,
+        })
+    }
+
+    #[expect(
+        clippy::unused_async_trait_impl,
+        reason = "the trait method is async and this body finishes without awaiting"
+    )]
+    async fn snapshot_page(
+        &self,
+        _select_sql: &str,
+        _binds: &[connetto_core::messages::BindValue],
+        _auth: &Principal,
+        _page: &PageSpec,
+    ) -> Result<SnapshotPage, Self::Error> {
+        Ok(SnapshotPage {
+            patchset: Vec::new(),
+            cursor: connetto_core::Cursor::new(Vec::new()),
+            next: None,
+            filled: false,
+            widest_row: 0,
+            rows: 0,
+            bytes: 0,
+        })
+    }
+}
+
+diesel::table! {
+    /// Row from the notes test fixture.
+    notes (id) {
+        /// Note identifier, the primary key.
+        id -> diesel::sql_types::Integer,
+        /// Note text.
+        body -> diesel::sql_types::Text,
+        /// Timestamp of the last edit.
+        edited_at -> diesel::sql_types::Text,
+    }
+}
+
+#[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
+#[diesel(table_name = notes)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct Note {
+    id: i32,
+    body: String,
+    edited_at: String,
+}
+
+fn note(id: i32, body: &str, edited_at: &str) -> Note {
+    Note {
+        id,
+        body: body.to_owned(),
+        edited_at: edited_at.to_owned(),
+    }
+}
+
+/// The `notes` rows, read through the admin pool.
+async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
+    let mut conn = pool.get().await.expect("admin connection");
+    notes::table
+        .order(notes::id)
+        .select(Note::as_select())
+        .load(&mut *conn)
+        .await
+        .expect("read notes")
+}
+
+/// Reset the fixture to a fresh `notes` table seeded with one versioned row
+/// and the writer tables provisioned by the admin.
+async fn seed_notes(fixture: &Fixture) {
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS notes CASCADE",
+            "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_writers",
+            "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
+        ])
+        .await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(notes::table)
+        .values((
+            notes::id.eq(1_i32),
+            notes::body.eq("hello"),
+            notes::edited_at.eq("t0"),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("seed row");
+}
+
+fn writable_catalog() -> RuntimeWritableCatalog {
+    RuntimeWritableCatalog::builder()
+        .versioned("notes", "edited_at")
+        .build()
+}
+
+fn note_table() -> SimpleTable {
+    SimpleTable::new("notes", &["id", "body", "edited_at"], &[0])
+}
+
+/// A changeset that inserts one full row.
+fn insert_changeset(id: i64, body: &str, edited_at: &str) -> Vec<u8> {
+    let insert = Insert::<_, String, Vec<u8>>::from(note_table())
+        .set(0, Value::Integer(id))
+        .expect("set id")
+        .set(1, Value::Text(body.to_owned()))
+        .expect("set body")
+        .set(2, Value::Text(edited_at.to_owned()))
+        .expect("set edited_at");
+    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+        .insert(insert)
+        .build()
+}
+
+/// The writer's frontier and retirement state, read as admin.
+struct WriterFacts {
+    frontier: i64,
+    retired: bool,
+}
+
+async fn writer_facts(pool: &Pool<AsyncPgConnection>, writer: i64) -> WriterFacts {
+    let mut conn = pool.get().await.expect("admin connection");
+    let (frontier, retired) = _connetto_writers::table
+        .filter(_connetto_writers::writer.eq(writer))
+        .select((
+            _connetto_writers::frontier,
+            _connetto_writers::retired_at.is_not_null(),
+        ))
+        .get_result::<(i64, bool)>(&mut *conn)
+        .await
+        .expect("read the writer row");
+    WriterFacts { frontier, retired }
+}
+
+/// One settled entry, read as admin, ordered by sequence.
+struct SettledFacts {
+    seq: i64,
+    entry_hash: Vec<u8>,
+    outcome: String,
+    path: SettlePath,
+}
+
+async fn settled_rows(pool: &Pool<AsyncPgConnection>, writer: i64) -> Vec<SettledFacts> {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_settled::table
+        .filter(_connetto_settled::writer.eq(writer))
+        .select((
+            _connetto_settled::seq,
+            _connetto_settled::entry_hash,
+            _connetto_settled::outcome,
+            _connetto_settled::path,
+        ))
+        .order(_connetto_settled::seq.asc())
+        .load::<(i64, Vec<u8>, String, SettlePath)>(&mut *conn)
+        .await
+        .expect("read the settled rows")
+        .into_iter()
+        .map(|(seq, entry_hash, outcome, path)| SettledFacts {
+            seq,
+            entry_hash,
+            outcome,
+            path,
+        })
+        .collect()
+}
+
+/// Collects the audit events the guard emits, in order.
+#[derive(Default)]
+struct Captured(Arc<Mutex<Vec<AuthEvent<String>>>>);
+
+impl Captured {
+    /// A fresh sink with its audit hook.
+    fn new() -> (Self, AuditHook<String>) {
+        let captured = Self::default();
+        let sink = Arc::clone(&captured.0);
+        let hook = Arc::new(move |event| sink.lock().push(event));
+        (captured, hook)
+    }
+
+    /// The writer-state events, `write_forked`.
+    fn write_events(&self) -> Vec<AuthEvent<String>> {
+        self.0
+            .lock()
+            .iter()
+            .filter(|event| matches!(event.op, AuthOp::WriteForked))
+            .cloned()
+            .collect()
+    }
+}
+
+fn writing_manager(
+    pool: &Pool<AsyncPgConnection>,
+    guard: Arc<RequestGuard<String>>,
+    session: SessionConfig,
+) -> Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>> {
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_write_catalog(writable_catalog())
+            .build()
+            .expect("build materializer"),
+        NoSnapshot,
+        RosterAuth::granting("alice")
+            .and("bob")
+            .withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(pool.clone(), PG_DDL).expect("build write target"),
+    )
+    .with_session(session)
+    .with_guard(guard)
+    .build()
+}
+
+/// A one-connection write pool whose checkout gives up quickly, so a test
+/// holding its connection is an unreachable database.
+async fn single_connection_pool(fixture: &Fixture) -> Pool<AsyncPgConnection> {
+    Pool::builder()
+        .max_size(1)
+        // Opened at build, so the 100 ms checkout bounds only the outage and never the first connect.
+        .min_idle(1)
+        .connection_timeout(Duration::from_millis(100))
+        .build(AsyncDieselConnectionManager::new(fixture.admin_url()))
+        .await
+        .expect("build the write pool")
+}
+
+/// The durable-apply acknowledgement of `client_seq`.
+async fn expect_applied(client: &mut Client, client_seq: u64) {
+    let ControlMessage::MutationApplied(applied) = client.next_control().await else {
+        panic!("expected write {client_seq} to apply");
+    };
+    assert_eq!(applied.client_seq, client_seq);
+}
+
+/// The `Indeterminate` refusal of `client_seq`.
+async fn expect_indeterminate(client: &mut Client, client_seq: u64) {
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected write {client_seq} to be refused");
+    };
+    assert_eq!(
+        (reject.client_seq, reject.reason),
+        (client_seq, MutationRejectReason::Indeterminate)
+    );
+}
+
+/// A refused handshake over the raw transport. The challenge leads, the
+/// fatal follows, and the reason is handed back.
+async fn refused_handshake(
+    manager: &Arc<SessionManager<NoSnapshot, RosterAuth, ConnettoDefaults>>,
+    client_id: &str,
+    grant: &str,
+    writer: WriterRequest,
+) -> FatalError {
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    client
+        .send_control(ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, client_id)
+                .with_grant(Grant::new(grant))
+                .with_writer(writer),
+        ))
+        .await
+        .expect("send handshake");
+    let frame = client.recv().await.expect("recv the challenge");
+    let Some(IncomingFrame::Control(ControlMessage::Challenge(_))) = frame else {
+        panic!("the server leads every connection with a challenge, got {frame:?}");
+    };
+    let frame = client.recv().await.expect("recv the refusal");
+    let Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) = frame else {
+        panic!("the refused handshake must close the connection, got {frame:?}");
+    };
+    client.close().await.expect("close the client");
+    let _ = server.await.expect("join the server task");
+    fatal
+}
+
+/// A number the account does not hold refuses the handshake as unknown and
+/// creates no writer row, never confirming the number exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unknown_number_at_the_handshake_closes_writer_unknown() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    let fatal = refused_handshake(
+        &manager,
+        "probe",
+        "user:alice",
+        WriterRequest::Number(987_654_321),
+    )
+    .await;
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::WriterUnknown),
+        "an unknown number must close as WriterUnknown, got {:?}",
+        fatal.reason
+    );
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    let count: i64 = _connetto_writers::table
+        .count()
+        .get_result(&mut *conn)
+        .await
+        .expect("count the writers");
+    assert_eq!(count, 0, "the refusal must not create a writer");
+}
+
+/// A number of another account refuses the handshake as unknown, the same
+/// way the account's own missing number does, and the owner's record stands
+/// untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_foreign_accounts_number_at_the_handshake_closes_writer_unknown() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    // alice settles one entry under her number.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("foreign-1", "user:alice").await;
+    let alice_number = ack.writer.expect("the handshake issues a number").number;
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // bob names alice's number.
+    let fatal = refused_handshake(
+        &manager,
+        "foreign-2",
+        "user:bob",
+        WriterRequest::Number(alice_number),
+    )
+    .await;
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::WriterUnknown),
+        "another account's number must close as unknown, got {:?}",
+        fatal.reason
+    );
+    let facts = writer_facts(
+        fixture.admin(),
+        i64::try_from(alice_number).expect("number fits"),
+    )
+    .await;
+    assert_eq!(facts.frontier, 1, "the owner's record stands");
+    assert!(!facts.retired, "the foreign handshake retired nothing");
+}
+
+/// The reconnect's `settled_through` prunes the number writer's rows at and
+/// below the report, and a redelivery of a pruned sequence is answered
+/// applied by sequence alone, applying nothing twice.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn settled_through_prunes_the_rows_and_the_pruned_record_answers_by_sequence() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    // alice settles three entries under her number.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("prune-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    expect_applied(&mut client, 2).await;
+    client.upload(3, insert_changeset(4, "four", "t3")).await;
+    expect_applied(&mut client, 3).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // The reconnect reports the frontier, pruning the rows at and below it.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing(
+            "prune-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            Some(3),
+        )
+        .await;
+    assert_eq!(
+        ack.writer,
+        Some(WriterGrant {
+            number,
+            frontier: 3
+        }),
+        "the confirmation carries the pruned frontier"
+    );
+    let writer = i64::try_from(number).expect("number fits");
+    assert!(
+        settled_rows(fixture.admin(), writer).await.is_empty(),
+        "the rows at and below the report are pruned"
+    );
+
+    // A redelivery of a pruned sequence is answered applied by sequence.
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2"),
+            note(4, "four", "t3"),
+        ],
+        "the pruned record applied nothing twice"
+    );
+    assert_eq!(writer_facts(fixture.admin(), writer).await.frontier, 3);
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// An `Indeterminate` answer settles nothing. The retry while the outage
+/// stands is answered the same way, and the recovered database settles the
+/// sequence once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_indeterminate_answer_settles_nothing_and_the_retry_settles_once() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let pool = single_connection_pool(&fixture).await;
+    let manager = writing_manager(
+        &pool,
+        guard,
+        SessionConfig::default().with_write_retry_budget(Duration::ZERO),
+    );
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("indet-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+
+    let outage = pool.get_owned().await.expect("hold the only connection");
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_indeterminate(&mut client, 1).await;
+    let writer = i64::try_from(number).expect("number fits");
+    assert!(
+        settled_rows(fixture.admin(), writer).await.is_empty(),
+        "nothing settles under an Indeterminate"
+    );
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.frontier,
+        0,
+        "the frontier stands where the Indeterminate left it"
+    );
+
+    // The retry while the outage stands is answered the same way.
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_indeterminate(&mut client, 1).await;
+    drop(outage);
+
+    // The recovered database settles the sequence once.
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(rows.len(), 1, "the recovered write settled one row");
+    assert_eq!(rows[0].seq, 1);
+    assert_eq!(rows[0].path, SettlePath::Direct);
+    assert_eq!(rows[0].outcome, "{\"kind\":\"applied\"}");
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the entry applied once"
+    );
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A different changeset at a settled sequence is refused `Forked` and
+/// audited `write_forked`. The standing entry keeps its record, and the
+/// forged one never applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked_and_audited() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+
+    // alice settles one entry under her number.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("fork-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let cs1 = insert_changeset(2, "two", "t1");
+    client.upload(1, cs1.clone()).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // The reconnect forges a different changeset at the settled sequence.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "fork-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            None,
+        )
+        .await;
+    client.upload(1, insert_changeset(5, "forged", "t9")).await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the fork refusal");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert_eq!(reject.reason, MutationRejectReason::Forked);
+
+    // The audit names the writer, the sequence and the two paths.
+    let events = captured.write_events();
+    assert_eq!(events.len(), 1, "the fork audits once");
+    let event = &events[0];
+    assert_eq!(event.op, AuthOp::WriteForked);
+    assert_eq!(event.user_id.as_deref(), Some("alice"));
+    assert_eq!(
+        event.writer,
+        Some(i64::try_from(number).expect("number fits"))
+    );
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(event.path, Some(SettlePath::Direct));
+    assert_eq!(event.other_path, Some(SettlePath::Direct));
+
+    // The standing entry kept its record, and the forged one never applied.
+    let writer = i64::try_from(number).expect("number fits");
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        rows[0].entry_hash,
+        entry_hash(&GENESIS, 1, &cs1).to_vec(),
+        "the record stands the original entry"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the forged changeset never applied"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}

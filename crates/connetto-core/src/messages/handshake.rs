@@ -10,6 +10,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::writer::{WriterGrant, WriterRequest};
 use crate::{cursor::Cursor, schema::SchemaVersion};
 
 /// One grant on a handshake: a connetto-signed token asserting that the bearer
@@ -71,6 +72,14 @@ pub struct Handshake {
     /// Completed subject coverage for `last_cursor`, or `None` while unknown or unfinished.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_subjects: Option<Vec<String>>,
+    /// The writer this connection writes as (R75).
+    #[serde(default)]
+    pub writer: WriterRequest,
+    /// The highest sequence of the requested number writer at or below which
+    /// the client has retired every pending entry, so the server may drop its
+    /// record of those writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled_through: Option<u64>,
 }
 
 impl Handshake {
@@ -83,6 +92,8 @@ impl Handshake {
             resume_token: None,
             last_cursor: None,
             cursor_subjects: None,
+            writer: WriterRequest::Issue,
+            settled_through: None,
         }
     }
 
@@ -125,6 +136,21 @@ impl Handshake {
             .extend(subjects.into_iter().map(Into::into));
         self
     }
+
+    /// Ask to write as `writer`.
+    #[must_use]
+    pub fn with_writer(mut self, writer: WriterRequest) -> Self {
+        self.writer = writer;
+        self
+    }
+
+    /// Report every entry of the requested number writer at or below `seq`
+    /// retired.
+    #[must_use]
+    pub fn with_settled_through(mut self, seq: u64) -> Self {
+        self.settled_through = Some(seq);
+        self
+    }
 }
 
 /// Server acknowledgement of a successful handshake.
@@ -157,12 +183,11 @@ pub struct HandshakeAck {
     pub schema_version: Option<SchemaVersion>,
     /// Initial flow-control credit granted to the server for delivery.
     pub initial_credits: u32,
-    /// The server's durable per-client mutation watermark: the highest
-    /// `client_seq` it has applied for this client identity, `None` when it
-    /// never applied one. The client retires every pending mutation at or
-    /// below it and replays the rest.
+    /// The number writer the handshake confirmed or issued, with its
+    /// frontier. The client retires every pending entry at or below the
+    /// frontier and replays the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_applied_seq: Option<u64>,
+    pub writer: Option<WriterGrant>,
 }
 
 #[cfg(test)]

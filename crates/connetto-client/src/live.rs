@@ -2324,8 +2324,8 @@ where
         })
     }
 
-    /// The sequence numbers of the local writes the server has not confirmed,
-    /// the ones the pump has not queued yet among them.
+    /// The (writer, sequence) pairs of the local writes the server has not
+    /// confirmed, the ones the pump has not queued yet among them.
     ///
     /// The writes committed since the pump's last flush are queued first, so
     /// a guard reading this right after a write sees it. Non-empty means a
@@ -2335,7 +2335,7 @@ where
     ///
     /// [`ClientError::Locked`] while the gate is locked, and the
     /// [`ClientError`] queueing the writes surfaces.
-    pub async fn unsynced(&self) -> Result<Vec<u64>, ClientError> {
+    pub async fn unsynced(&self) -> Result<Vec<crate::UnsyncedWrite>, ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         if self.shared.gate.is_locked() {
             return Err(ClientError::Locked);

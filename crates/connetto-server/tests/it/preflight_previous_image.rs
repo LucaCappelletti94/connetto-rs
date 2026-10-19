@@ -126,7 +126,7 @@ async fn the_database_wide_audit_would_refuse_a_correct_deployment() {
     .expect("the database-wide audit runs");
     let flagged: Vec<String> = flagged.into_iter().map(|row| row.name).collect();
     assert!(
-        flagged.iter().any(|name| name == "_connetto_mutations"),
+        flagged.iter().any(|name| name == "_connetto_writers"),
         "the database-wide reading reports connetto's own bookkeeping, which \
          nothing replicates and which no deployment can usefully change: {flagged:?}"
     );

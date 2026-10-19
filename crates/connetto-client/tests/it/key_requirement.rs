@@ -69,7 +69,7 @@ async fn a_write_to_an_accepted_table_is_captured_by_nothing() {
         .expect("write a keyed row");
     assert_eq!(
         conn.push().await.expect("push"),
-        Some(0),
+        Some(1),
         "the keyed table records and uploads"
     );
 }
@@ -161,7 +161,7 @@ async fn sqlites_own_statistics_table_is_not_the_applications() {
 
     assert_eq!(
         conn.push().await.expect("the statistics table is skipped"),
-        Some(0),
+        Some(1),
         "the write travels"
     );
 }

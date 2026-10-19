@@ -264,16 +264,17 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     file_task.abort();
 }
 
-/// Applies `schema.sql`, `DEPLOYMENT_DDL`, `provision_watermark`, `roles.sql` and
-/// `content.sql`. `provision_watermark` runs before `roles.sql` because `roles.sql`
-/// grants on `_connetto_mutations`, which the watermark step creates.
+/// Applies `schema.sql`, `DEPLOYMENT_DDL`, `provision_writers`, `roles.sql` and
+/// `content.sql`. `provision_writers` runs before `roles.sql` because `roles.sql`
+/// grants on the writer tables, which the writer step creates.
 async fn provision(fixture: &Fixture) {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS photos CASCADE",
             "DROP TABLE IF EXISTS order_lines CASCADE",
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_writers",
         ])
         .await;
     for stmt in split_plain(SCHEMA_SQL) {
@@ -282,7 +283,7 @@ async fn provision(fixture: &Fixture) {
     for stmt in split_plain(connetto_file_server::DEPLOYMENT_DDL) {
         fixture.exec(&stmt).await;
     }
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture.exec(ROLES_SQL).await;
     fixture.exec(CONTENT_SQL).await;
     // `app_writer` is a test-infrastructure writer role; not part of the demo's
@@ -295,7 +296,7 @@ async fn provision(fixture: &Fixture) {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer",
             "GRANT SELECT ON _cfs_manifests TO app_writer",
             "GRANT SELECT ON _cfs_manifest_chunks TO app_writer",
         ])

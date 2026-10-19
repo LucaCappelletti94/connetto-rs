@@ -29,7 +29,7 @@ use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     AckCredits, BulkMessage, ControlMessage, Handshake, HandshakeAck, LivePatch, NonFatalError,
     Ping, SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
-    SubscriptionSpec,
+    SubscriptionSpec, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, PROTOCOL_VERSION, loopback};
@@ -127,7 +127,10 @@ async fn fake_upstream(mut server: LoopbackTransport, trigger: oneshot::Receiver
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             initial_credits: INITIAL_CREDITS,
-            last_applied_seq: None,
+            writer: Some(WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
         }))
         .await
         .expect("handshake ack");

@@ -10,7 +10,7 @@ use connetto_core::auth::Principal;
 use connetto_core::messages::{
     AckCredits, BulkMessage, ContentVerb, ControlMessage, FullResyncReason, Grant, Handshake,
     HandshakeAck, LivePatch, MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe,
-    SubscriptionSpec, Unsubscribe,
+    SubscriptionSpec, Unsubscribe, WriterRequest,
 };
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, MaybeSend, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
@@ -69,7 +69,7 @@ pub use roster::{RosterAuth, WITHHELD_ID};
 pub type RowValue = Value<String, Vec<u8>>;
 
 /// The default deployment schema over `Id = String`, the shape every
-/// harness-backed test uses, matching [`WATERMARK_DDL`].
+/// harness-backed test uses, matching [`WRITERS_DDL`].
 pub use connetto_server::defaults::ConnettoDefaults;
 
 /// The logical replication slot the CDC source follows. Matches the server
@@ -665,21 +665,39 @@ pub async fn drop_slot(pool: &Pool<AsyncPgConnection>) {
     panic!("replication slot {SLOT} could not be dropped");
 }
 
-/// Reference DDL for the exactly-once watermark keyed on the session handle
-/// alone (R2). connetto emits no DDL, so the harness owns this table and keeps
-/// the shape matching the default schema's watermark member.
-pub const WATERMARK_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_mutations \
-    (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)";
+/// Reference DDL for the server's writer tables, the exactly-once frontier
+/// keyed on the writer (R75). connetto emits no DDL, so the harness owns the
+/// shape and keeps it matching the default schema's writers member.
+pub const WRITERS_DDL: &str = "DO $$ BEGIN \
+    CREATE TYPE connetto_settle_path AS ENUM ('direct', 'restore', 'courier'); \
+    EXCEPTION WHEN duplicate_object THEN NULL; END $$; \
+    CREATE TABLE IF NOT EXISTS _connetto_writers \
+    (writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
+     user_id TEXT, \
+     session_id UUID, \
+     device_key BYTEA UNIQUE, \
+     frontier BIGINT NOT NULL DEFAULT 0, \
+     head BYTEA, \
+     retired_at TIMESTAMPTZ); \
+    CREATE TABLE IF NOT EXISTS _connetto_settled \
+    (writer BIGINT NOT NULL, \
+     seq BIGINT NOT NULL, \
+     entry_hash BYTEA NOT NULL, \
+     outcome TEXT NOT NULL, \
+     path connetto_settle_path NOT NULL, \
+     settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+     PRIMARY KEY (writer, seq))";
 
-/// Create the reference watermark table if missing, as admin. A restricted
-/// writer role only needs `SELECT, INSERT, UPDATE` on it, granted separately.
-pub async fn provision_watermark(pool: &Pool<AsyncPgConnection>) {
-    exec(pool, WATERMARK_DDL).await;
+/// Create the reference settle-path enum and writer tables if missing, as
+/// admin. A restricted writer role needs `SELECT, INSERT, UPDATE, DELETE` on
+/// both tables, granted separately.
+pub async fn provision_writers(pool: &Pool<AsyncPgConnection>) {
+    exec(pool, WRITERS_DDL).await;
 }
 
 /// The bot registry tables' DDL over the default schema's `TEXT` ids (R91),
-/// which every server requires, so the fixture creates them with the
-/// watermark and epoch tables.
+/// which every server requires, so the fixture creates them with the writer
+/// and epoch tables.
 pub const BOTS_DDL: &str = connetto_server::defaults::BOTS_DDL;
 
 /// Create the bot registry tables, as admin, readable by every role a test
@@ -871,7 +889,7 @@ struct Authorization {
 }
 
 impl Fixture {
-    /// Start this test's own `Postgres` and create the watermark table.
+    /// Start this test's own `Postgres` and create the writer tables.
     ///
     /// The cluster is a container, or where [`native::POSTGRES_BIN_VAR`] and
     /// [`native::POSTGRES_TEMPLATE_VAR`] are set a copy of the template
@@ -880,7 +898,7 @@ impl Fixture {
     ///
     /// # Panics
     ///
-    /// Panics when the Docker daemon is unreachable, when the container host address or mapped port cannot be resolved, or when watermark provisioning fails, all of which are test setup failures.
+    /// Panics when the Docker daemon is unreachable, when the container host address or mapped port cannot be resolved, or when writer provisioning fails, all of which are test setup failures.
     pub async fn acquire() -> Self {
         let scope = COUNTER_SCOPE.read().await;
         Self::acquire_with(Some(scope), None, false).await
@@ -905,7 +923,7 @@ impl Fixture {
     ///
     /// # Panics
     ///
-    /// Panics when the cluster does not answer or watermark provisioning fails, both setup failures.
+    /// Panics when the cluster does not answer or writer provisioning fails, both setup failures.
     pub async fn on_cluster(admin_url: &str, fga_url: &str) -> Self {
         let scope = COUNTER_SCOPE.read().await;
         let fga = OnceCell::new_with(Some(Authorization {
@@ -1003,8 +1021,8 @@ impl Fixture {
         .await
     }
 
-    /// This fixture once its cluster at `admin_url` answers, with the
-    /// watermark and epoch tables created.
+    /// This fixture once its cluster at `admin_url` answers, with the writer
+    /// and epoch tables created.
     async fn provisioned(
         admin_url: String,
         postgres: Cluster,
@@ -1014,7 +1032,7 @@ impl Fixture {
         exclusive_counter_scope: Option<RwLockWriteGuard<'static, ()>>,
     ) -> Self {
         let admin = pool_when_ready(&admin_url).await;
-        provision_watermark(&admin).await;
+        provision_writers(&admin).await;
         provision_bot_tables(&admin).await;
         exec(&admin, connetto_server::epoch::EPOCH_DDL).await;
         Self {
@@ -1814,9 +1832,9 @@ impl Client {
     }
 
     /// Send a handshake presenting one grant, returning the ack. The checked
-    /// grant, not the client id, decides the durable handle the exactly-once
-    /// watermark keys on, so a reconnect that mints a new `client_id` but
-    /// presents the same grant (a worker restart) keeps its watermark.
+    /// grant, not the client id, decides the account the writer frontier keys
+    /// on, so a reconnect that mints a new `client_id` but presents the same
+    /// grant (a worker restart) writes under the same writer number.
     pub async fn handshake_with(&mut self, client_id: &str, grant: &str) -> HandshakeAck {
         self.handshake_presenting(client_id, &[grant], None).await
     }
@@ -1827,7 +1845,38 @@ impl Client {
     }
 
     /// Send a handshake presenting `grants`, each checked on its own, plus an
-    /// optional resume credential from a previous ack.
+    /// optional resume credential from a previous ack, writing as `writer` and
+    /// reporting `settled_through`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the handshake frame fails on the transport, or when the server's reply is not a `HandshakeAck`.
+    pub async fn handshake_writing(
+        &mut self,
+        client_id: &str,
+        grants: &[&str],
+        resume_token: Option<&str>,
+        writer: WriterRequest,
+        settled_through: Option<u64>,
+    ) -> HandshakeAck {
+        let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
+            .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
+            .with_writer(writer);
+        if let Some(token) = resume_token {
+            handshake = handshake.with_resume_token(token);
+        }
+        if let Some(seq) = settled_through {
+            handshake = handshake.with_settled_through(seq);
+        }
+        self.transport
+            .send_control(ControlMessage::Handshake(handshake))
+            .await
+            .expect("send handshake");
+        self.take_handshake_ack().await
+    }
+
+    /// Send a handshake presenting `grants`, each checked on its own, plus an
+    /// optional resume credential, asking the server to issue a number writer.
     ///
     /// # Panics
     ///
@@ -1838,16 +1887,8 @@ impl Client {
         grants: &[&str],
         resume_token: Option<&str>,
     ) -> HandshakeAck {
-        let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
-            .with_grants(grants.iter().map(|grant| Grant::new(*grant)));
-        if let Some(token) = resume_token {
-            handshake = handshake.with_resume_token(token);
-        }
-        self.transport
-            .send_control(ControlMessage::Handshake(handshake))
+        self.handshake_writing(client_id, grants, resume_token, WriterRequest::Issue, None)
             .await
-            .expect("send handshake");
-        self.take_handshake_ack().await
     }
 
     /// Resume from `cursor` with optional known completed subject coverage.
@@ -1995,15 +2036,20 @@ impl Client {
         self.next_control().await
     }
 
-    /// Read the next frame, asserting it is a control frame.
+    /// Read the next control frame, skipping the background `RevocationUpdate`
+    /// the server sends after a handshake so a reader waiting for another
+    /// control frame returns that frame.
     ///
     /// # Panics
     ///
-    /// Panics when the transport returns a receive error, or when the next frame is not a control frame.
+    /// Panics when the transport returns a receive error, or when the next frame is a bulk frame.
     pub async fn next_control(&mut self) -> ControlMessage {
-        match self.recv().await {
-            Some(IncomingFrame::Control(msg)) => msg,
-            other => panic!("expected control frame, got {other:?}"),
+        loop {
+            match self.recv().await {
+                Some(IncomingFrame::Control(ControlMessage::RevocationUpdate(_))) => {}
+                Some(IncomingFrame::Control(msg)) => return msg,
+                other => panic!("expected control frame, got {other:?}"),
+            }
         }
     }
 
@@ -2502,7 +2548,7 @@ mod running_services_tests {
     use openfga_client::tonic::transport::Channel;
 
     use super::Fixture;
-    use connetto_server::defaults::_connetto_mutations;
+    use connetto_server::defaults::_connetto_writers;
 
     /// A second database in a container's cluster stands in for a cluster
     /// something else started, beside that container's authorization service.
@@ -2524,12 +2570,12 @@ mod running_services_tests {
             .get()
             .await
             .expect("a connection to elsewhere");
-        let pending: i64 = _connetto_mutations::table
+        let writers: i64 = _connetto_writers::table
             .count()
             .get_result(&mut conn)
             .await
-            .expect("the watermark table was provisioned in elsewhere");
-        assert_eq!(pending, 0);
+            .expect("the writer tables were provisioned in elsewhere");
+        assert_eq!(writers, 0);
         assert_eq!(fixture.fga_url().await, fga);
         let (_, store) = fixture.fga_store().await;
         let channel = Channel::from_shared(fga)

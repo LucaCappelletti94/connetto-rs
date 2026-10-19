@@ -1,12 +1,15 @@
 #![doc = include_str!("../README.md")]
 
-pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
+pub use connetto_core::messages::{
+    FullResyncReason, Grant, PauseCause, SyncStatus, WriterGrant, WriterRef, WriterRequest,
+};
 pub use connetto_core::{Custody, NoGate};
 /// The peer link's close reasons, dial errors and chain refusals (R76).
 #[cfg(feature = "peer")]
 pub use connetto_peer::{CloseReason, LinkError, Refusal};
 
 use connetto_core::SUBJECTS_FUNCTION;
+use connetto_core::chain::{GENESIS, entry_hash};
 #[cfg(feature = "peer")]
 use connetto_core::device_cert::DeviceIdentity;
 use connetto_core::messages::{
@@ -41,6 +44,7 @@ use sqlite_diff_rs::{
     DiffOps, DynTable, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK, TableSchema,
     Value,
 };
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(feature = "peer")]
 use std::net::SocketAddr;
@@ -386,6 +390,16 @@ pub enum PeerError {
     Link(#[from] LinkError),
 }
 
+/// One queued write awaiting its final answer, named by the writer and the
+/// sequence it is the writer's.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct UnsyncedWrite {
+    /// The writer the entry is queued under.
+    pub writer: WriterRef,
+    /// The entry's sequence in that writer's queue.
+    pub seq: u64,
+}
+
 /// Why a sign-in switch was refused.
 ///
 /// Nothing has changed when this is returned: the run is still the one it was,
@@ -395,7 +409,7 @@ pub enum SignInRefused {
     /// Writes are still queued after the push, so switching would strand them
     /// under a handle nobody presents again.
     #[error("sign-in blocked: {} write(s) are still queued", .0.len())]
-    Unsent(Vec<u64>),
+    Unsent(Vec<UnsyncedWrite>),
     /// Draining the queue failed, so whether anything is still unsent is
     /// unknown and the switch is refused rather than guessed at.
     #[error("sign-in blocked, the queued writes could not be sent: {0}")]
@@ -1499,21 +1513,12 @@ fn count_ops(changeset: &[u8]) -> u32 {
 /// DDL for the replica-local metadata, written only under capture suspension.
 const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL); \
+    CREATE TABLE IF NOT EXISTS _connetto_writers \
+    (id TEXT NOT NULL PRIMARY KEY, next_seq INTEGER NOT NULL, head BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
-    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL); \
-    CREATE TABLE IF NOT EXISTS _connetto_sequence \
-    (id INTEGER PRIMARY KEY CHECK (id = 1), next INTEGER NOT NULL)";
-
-diesel::table! {
-    /// The next client sequence, durable because the server's watermark outlives the process.
-    #[sql_name = "_connetto_sequence"]
-    next_sequence (id) {
-        /// Always 1.
-        id -> Integer,
-        /// The sequence the next write takes.
-        next -> BigInt,
-    }
-}
+    (writer TEXT NOT NULL, seq INTEGER NOT NULL, changeset BLOB NOT NULL, \
+     entry_hash BLOB NOT NULL, \
+     PRIMARY KEY (writer, seq))";
 
 /// The attach name of the local tier database. An internal constant: authored
 /// SQL never names it, since bare table names resolve across attached
@@ -2268,65 +2273,298 @@ fn seq_storage(seq: u64) -> Result<i64, ClientError> {
     i64::try_from(seq).map_err(|_| ClientError::Session("sequence overflows storage".to_owned()))
 }
 
-/// Record a pushed mutation's changeset durably, so a restart can replay it
-/// until the server acknowledges the durable apply.
+/// A number writer's identity before the server issues a number, so a write
+/// made before the first handshake stays queued under a name the server can
+/// never grant, and no connection ever presents it.
+const UNISSUED_NUMBER: u64 = 0;
+
+/// The writer a write awaiting its number is queued under.
+const fn unissued() -> WriterRef {
+    WriterRef::Number(UNISSUED_NUMBER)
+}
+
+fn hex_digit(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        _ => u8::MAX,
+    }
+}
+
+/// A writer's storage identity, the replica's own spelling of the wire name.
+fn writer_id(writer: &WriterRef) -> String {
+    const HEX: [u8; 16] = *b"0123456789abcdef";
+    match writer {
+        WriterRef::Number(number) => format!("number:{number}"),
+        WriterRef::Device(id) => {
+            let mut out = String::with_capacity(9 + id.len() * 2);
+            out.push_str("device:");
+            for byte in id {
+                out.push(char::from(HEX[(byte >> 4) as usize]));
+                out.push(char::from(HEX[(byte & 0xf) as usize]));
+            }
+            out
+        }
+    }
+}
+
+/// Parse a storage identity the previous run wrote.
+fn writer_from_id(id: &str) -> Option<WriterRef> {
+    let (kind, rest) = id.split_once(':')?;
+    match kind {
+        "number" => Some(WriterRef::Number(rest.parse().ok()?)),
+        "device" if rest.len() == 64 => {
+            let bytes = (0..32)
+                .map(|i| {
+                    let hi = hex_digit(rest.as_bytes()[i * 2]);
+                    let lo = hex_digit(rest.as_bytes()[i * 2 + 1]);
+                    (hi != u8::MAX && lo != u8::MAX).then_some(hi * 16 + lo)
+                })
+                .collect::<Option<Vec<u8>>>()?;
+            Some(WriterRef::Device(bytes.try_into().ok()?))
+        }
+        _ => None,
+    }
+}
+
+/// One queued write of one writer.
+#[derive(Debug, Clone)]
+struct PendingEntry {
+    /// The captured changeset, the bytes the chain hashes and the wire uploads.
+    changeset: Vec<u8>,
+    /// This entry's chain hash, over it and every entry queued before it.
+    hash: [u8; 32],
+}
+
+/// One writer's queue, the client half of the (writer, sequence) identity.
+#[derive(Debug, Clone)]
+struct WriterQueue {
+    /// The sequence a new entry of this writer takes.
+    next_seq: u64,
+    /// The chain head, the last queued entry's hash or the genesis.
+    head: [u8; 32],
+    /// The queued entries, in sequence order.
+    pending: BTreeMap<u64, PendingEntry>,
+}
+
+impl WriterQueue {
+    /// A queue for a writer nothing has written yet.
+    fn fresh() -> Self {
+        Self {
+            next_seq: 1,
+            head: GENESIS,
+            pending: BTreeMap::new(),
+        }
+    }
+}
+
+/// Record a writer's queue state, its next sequence and chain head.
+fn persist_writer_state(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    next_seq: u64,
+    head: &[u8; 32],
+) -> Result<(), ClientError> {
+    diesel::sql_query(
+        "INSERT OR REPLACE INTO _connetto_writers (id, next_seq, head) \
+        VALUES (?, ?, ?)",
+    )
+    .bind::<diesel::sql_types::Text, _>(writer_id(writer))
+    .bind::<diesel::sql_types::BigInt, _>(seq_storage(next_seq)?)
+    .bind::<diesel::sql_types::Binary, _>(head)
+    .execute(db)?;
+    Ok(())
+}
+
+/// Drop a writer's queue state and its records, the writer moving on.
+fn drop_writer_state(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
+    diesel::sql_query("DELETE FROM _connetto_writers WHERE id = ?")
+        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
+        .execute(db)?;
+    delete_writer_pending(db, writer)?;
+    Ok(())
+}
+
+/// The queue state of every writer a previous run left behind.
+fn load_writer_states(
+    db: &mut SqliteConnection,
+) -> Result<BTreeMap<WriterRef, (u64, [u8; 32])>, ClientError> {
+    #[derive(diesel::QueryableByName)]
+    struct WriterRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        id: String,
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        next_seq: i64,
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        head: Vec<u8>,
+    }
+    let rows: Vec<WriterRow> =
+        diesel::sql_query("SELECT id, next_seq, head FROM _connetto_writers").load(db)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some((
+                writer_from_id(&row.id)?,
+                (u64::try_from(row.next_seq).ok()?, row.head.try_into().ok()?),
+            ))
+        })
+        .collect())
+}
+
+/// Record a queued entry durably, with its chain hash, so a restart can
+/// replay it until the server answers the durable apply.
 fn persist_pending(
     db: &mut SqliteConnection,
+    writer: &WriterRef,
     seq: u64,
-    changeset: &[u8],
+    entry: &PendingEntry,
 ) -> Result<(), ClientError> {
-    diesel::sql_query("INSERT OR REPLACE INTO _connetto_pending (seq, changeset) VALUES (?, ?)")
+    diesel::sql_query(
+        "INSERT OR REPLACE INTO _connetto_pending \
+            (writer, seq, changeset, entry_hash) \
+            VALUES (?, ?, ?, ?)",
+    )
+    .bind::<diesel::sql_types::Text, _>(writer_id(writer))
+    .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
+    .bind::<diesel::sql_types::Binary, _>(&entry.changeset)
+    .bind::<diesel::sql_types::Binary, _>(&entry.hash)
+    .execute(db)?;
+    Ok(())
+}
+
+/// Retire one queued entry, acknowledged, rejected, or rolled back.
+fn delete_pending(
+    db: &mut SqliteConnection,
+    writer: &WriterRef,
+    seq: u64,
+) -> Result<(), ClientError> {
+    diesel::sql_query("DELETE FROM _connetto_pending WHERE writer = ? AND seq = ?")
+        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
         .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
-        .bind::<diesel::sql_types::Binary, _>(changeset)
         .execute(db)?;
     Ok(())
 }
 
-/// Retire a pending mutation record: acknowledged, rejected, or rolled back.
-fn delete_pending(db: &mut SqliteConnection, seq: u64) -> Result<(), ClientError> {
-    diesel::sql_query("DELETE FROM _connetto_pending WHERE seq = ?")
-        .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
+/// Retire every queued entry of one writer, it moving to a fresh writer.
+fn delete_writer_pending(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
+    diesel::sql_query("DELETE FROM _connetto_pending WHERE writer = ?")
+        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
         .execute(db)?;
     Ok(())
 }
 
-/// The next sequence a previous run recorded, 0 when none did.
-fn load_next_seq(db: &mut SqliteConnection) -> Result<u64, ClientError> {
-    let stored: Option<i64> = next_sequence::table
-        .select(next_sequence::next)
-        .first(db)
-        .optional()?;
-    Ok(stored
-        .and_then(|next| u64::try_from(next).ok())
-        .unwrap_or(0))
-}
-
-/// Record `next` as the sequence the next write takes, under suspended capture.
-fn record_next_seq(db: &mut SqliteConnection, next: u64) -> Result<(), ClientError> {
-    let next = seq_storage(next)?;
-    diesel::insert_into(next_sequence::table)
-        .values((next_sequence::id.eq(1), next_sequence::next.eq(next)))
-        .on_conflict(next_sequence::id)
-        .do_update()
-        .set(next_sequence::next.eq(next))
+/// Re-key a writer's pending rows and queue state onto another writer, the
+/// unissued number taking its issued one.
+fn rekey_writer(
+    db: &mut SqliteConnection,
+    from: &WriterRef,
+    to: &WriterRef,
+) -> Result<(), ClientError> {
+    let from_id = writer_id(from);
+    let to_id = writer_id(to);
+    diesel::sql_query("UPDATE _connetto_pending SET writer = ? WHERE writer = ?")
+        .bind::<diesel::sql_types::Text, _>(&to_id)
+        .bind::<diesel::sql_types::Text, _>(&from_id)
+        .execute(db)?;
+    diesel::sql_query("UPDATE _connetto_writers SET id = ? WHERE id = ?")
+        .bind::<diesel::sql_types::Text, _>(&to_id)
+        .bind::<diesel::sql_types::Text, _>(&from_id)
         .execute(db)?;
     Ok(())
 }
-/// The pending mutations persisted by a previous run against this replica.
-fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, ClientError> {
+
+/// A queued entry as the bookkeeping stores it: sequence, changeset and
+/// chain hash.
+struct LoadedEntry {
+    seq: u64,
+    changeset: Vec<u8>,
+    hash: [u8; 32],
+}
+
+/// Every queued entry a previous run left, per writer in writer then
+/// sequence order.
+fn load_pending(
+    db: &mut SqliteConnection,
+) -> Result<BTreeMap<WriterRef, Vec<LoadedEntry>>, ClientError> {
     #[derive(diesel::QueryableByName)]
     struct PendingRow {
+        #[diesel(sql_type = diesel::sql_types::Text)]
+        writer: String,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         seq: i64,
         #[diesel(sql_type = diesel::sql_types::Binary)]
         changeset: Vec<u8>,
+        #[diesel(sql_type = diesel::sql_types::Binary)]
+        entry_hash: Vec<u8>,
     }
-    let rows: Vec<PendingRow> =
-        diesel::sql_query("SELECT seq, changeset FROM _connetto_pending ORDER BY seq").load(db)?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| u64::try_from(row.seq).ok().map(|seq| (seq, row.changeset)))
-        .collect())
+    let rows: Vec<PendingRow> = diesel::sql_query(
+        "SELECT writer, seq, changeset, entry_hash \
+            FROM _connetto_pending ORDER BY writer, seq",
+    )
+    .load(db)?;
+    let mut queues = BTreeMap::new();
+    for row in rows {
+        let Some(writer) = writer_from_id(&row.writer) else {
+            continue;
+        };
+        let Ok(seq) = u64::try_from(row.seq) else {
+            continue;
+        };
+        let Ok(hash) = row.entry_hash.try_into() else {
+            continue;
+        };
+        queues
+            .entry(writer)
+            .or_insert_with(Vec::new)
+            .push(LoadedEntry {
+                seq,
+                changeset: row.changeset,
+                hash,
+            });
+    }
+    Ok(queues)
+}
+
+/// Every writer queue a previous run left: the persisted queue state merged
+/// with the persisted entries, the entry hashes winning the head when both
+/// agree to disagree.
+fn load_writer_queues(
+    db: &mut SqliteConnection,
+) -> Result<BTreeMap<WriterRef, WriterQueue>, ClientError> {
+    let states = load_writer_states(db)?;
+    let pending = load_pending(db)?;
+    let mut queues = BTreeMap::new();
+    for (writer, (next_seq, head)) in states {
+        queues.insert(
+            writer,
+            WriterQueue {
+                next_seq,
+                head,
+                pending: BTreeMap::new(),
+            },
+        );
+    }
+    for (writer, entries) in pending {
+        let queue = queues.entry(writer).or_insert_with(WriterQueue::fresh);
+        let mut last_hash: Option<[u8; 32]> = None;
+        for entry in entries {
+            last_hash = Some(entry.hash);
+            queue.pending.insert(
+                entry.seq,
+                PendingEntry {
+                    changeset: entry.changeset,
+                    hash: entry.hash,
+                },
+            );
+        }
+        if let Some(last) = last_hash {
+            queue.head = last;
+            if let Some(max_seq) = queue.pending.keys().next_back() {
+                queue.next_seq = queue.next_seq.max(max_seq + 1);
+            }
+        }
+    }
+    Ok(queues)
 }
 
 /// What a completed handshake told the client.
@@ -2334,31 +2572,42 @@ struct HandshakeOk {
     connection_id: String,
     session_handle: String,
     resume_token: String,
-    watermark: Option<u64>,
+    writer: Option<WriterGrant>,
     schema_version: Option<SchemaVersion>,
     challenge: Option<[u8; 32]>,
 }
 
-/// Run the opening handshake over `transport`: send the hello (carrying the
-/// grants, the resume cursor and, on a resume, the credential proving the
-/// previous run's handle) and read the ack.
-///
-/// `now` is the epoch second the replica's clock reports, used to drop a share
-/// key whose expiry has already passed.
-///
-/// Shared by the first connect and every resume.
+/// The handshake exchange's inputs, the transport alone apart.
+struct HandshakeInput<'a> {
+    config: &'a ClientConfig,
+    token_source: Option<&'a AccessTokenSource>,
+    resume: Option<&'a Cursor>,
+    resume_token: Option<&'a str>,
+    writer: WriterRequest,
+    settled_through: Option<u64>,
+    /// The replica's clock, used to drop a share key whose expiry passed.
+    now: i64,
+}
+
+/// Run the opening handshake and read the ack, shared by the first connect
+/// and every resume.
 async fn exchange_handshake<T>(
     transport: &mut T,
-    config: &ClientConfig,
-    token_source: Option<&AccessTokenSource>,
-    resume: Option<&Cursor>,
-    resume_token: Option<&str>,
-    now: i64,
+    input: HandshakeInput<'_>,
 ) -> Result<HandshakeOk, ClientError>
 where
     T: Transport,
     T::Error: core::fmt::Display,
 {
+    let HandshakeInput {
+        config,
+        token_source,
+        resume,
+        resume_token,
+        writer,
+        settled_through,
+        now,
+    } = input;
     let mut grants = Vec::with_capacity(
         1 + config
             .subjects
@@ -2381,8 +2630,12 @@ where
             .filter(|grant| !grant_expiry::has_expired(grant, now))
             .cloned(),
     );
-    let mut handshake =
-        Handshake::new(PROTOCOL_VERSION, config.client_id.clone()).with_grants(grants);
+    let mut handshake = Handshake::new(PROTOCOL_VERSION, config.client_id.clone())
+        .with_grants(grants)
+        .with_writer(writer);
+    if let Some(seq) = settled_through {
+        handshake = handshake.with_settled_through(seq);
+    }
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
     }
@@ -2434,7 +2687,7 @@ where
                 connection_id: ack.connection_id,
                 session_handle: ack.session_token,
                 resume_token: ack.resume_token,
-                watermark: ack.last_applied_seq,
+                writer: ack.writer,
                 schema_version: ack.schema_version,
                 challenge,
             })
@@ -2527,7 +2780,10 @@ struct Wire<T> {
 #[derive(Clone, Copy)]
 enum AttachReplay {
     Idle,
-    Pending { watermark: Option<u64> },
+    /// The bound writer's queue is resent, the frontier raised first.
+    Pending {
+        frontier: Option<u64>,
+    },
 }
 
 /// The label prefix the server gives a hidden membership subscription (R27).
@@ -2575,7 +2831,11 @@ pub struct ConnettoConnection<T: Transport> {
     session: Session,
     db: SqliteConnection,
     last_cursor: Option<Cursor>,
-    next_seq: u64,
+    /// The queues of the writers this replica has queued writes under.
+    writers: BTreeMap<WriterRef, WriterQueue>,
+    /// The writer this connection writes as, absent until its number
+    /// writer is issued or confirmed.
+    bound_writer: Option<WriterRef>,
     /// Set by the commit hook whenever a write commits, so the driver knows
     /// to look for a captured mutation to flush. Server patch applies trip it
     /// too, harmlessly: an empty capture session never uploads.
@@ -2604,10 +2864,6 @@ pub struct ConnettoConnection<T: Transport> {
     /// Transaction bookkeeping for the diesel `Connection` impl. The manager
     /// issues `BEGIN`/`COMMIT` through this connection, which delegate to `db`.
     transaction_state: AnsiTransactionManager,
-    /// Changesets of pushed mutations awaiting resolution, keyed by `client_seq`,
-    /// so a server rejection can be inverted and rolled back locally. Nothing
-    /// is ever evicted from it, and a record leaves only when the server settles it.
-    pending: BTreeMap<u64, Vec<u8>>,
     /// Where sending the writes the server deferred again stands.
     resend: Resend,
     /// How many resends were ever armed, so a pump tells a fresh timer from the one it sleeps on.
@@ -2649,6 +2905,30 @@ pub struct ConnettoConnection<T: Transport> {
     /// Where pushed revocation lists go, the enrolment task's inbox.
     #[cfg(feature = "device-identity")]
     list_sink: Option<tokio::sync::mpsc::UnboundedSender<Vec<connetto_core::messages::SignedList>>>,
+}
+
+/// The schema and metadata tables an open installs, in dependency order.
+fn install_replica_schema(
+    db: &mut SqliteConnection,
+    sqlite_ddl: Option<&str>,
+    config: &ClientConfig,
+) -> Result<(), ClientError> {
+    if let Some(ddl) = sqlite_ddl {
+        db.batch_execute(&synced_schema::without_references(ddl)?)?;
+    }
+    // The views are what the map has to agree with.
+    check_policy_tables(db, &config.policy_tables)?;
+    // A rowid-only table records nothing, so a write to one uploads nothing and reports success (R62).
+    check_recorded_tables(db, "main", &config.unrecorded_tables)?;
+    db.batch_execute(META_DDL)?;
+    db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
+    // After the subscription tables, since it references `_connetto_query`.
+    db.batch_execute(aggregates::AGGREGATE_DDL)?;
+    #[cfg(feature = "device-identity")]
+    db.batch_execute(enrolment::CERTIFICATE_DDL)?;
+    // A watch the previous run died still holding counts down from now.
+    subscriptions::anchor_launch(db)?;
+    Ok(())
 }
 
 impl<T> ConnettoConnection<T>
@@ -2784,33 +3064,13 @@ where
         register_write_exemption(&mut db, &write_exempt)?;
         // A person carries the wildcard, and a bot login reads its list here (R99).
         register_bot_list(&mut db, connetto_core::BOT_LIST_WILDCARD.to_owned())?;
-        if let Some(ddl) = sqlite_ddl {
-            db.batch_execute(&synced_schema::without_references(ddl)?)?;
-        }
-        // After the schema exists, whether this open created it or a previous
-        // run did: the views are what the map has to agree with.
-        check_policy_tables(&mut db, &config.policy_tables)?;
-        // Beside it, and for the same reason: SQLite records nothing for a
-        // table whose only key is the implicit rowid, so a write to one
-        // uploads nothing and reports success (R62).
-        check_recorded_tables(&mut db, "main", &config.unrecorded_tables)?;
-        db.batch_execute(META_DDL)?;
-        db.batch_execute(subscriptions::SUBSCRIPTION_DDL)?;
-        // After the subscription tables, since it references `_connetto_query`.
-        db.batch_execute(aggregates::AGGREGATE_DDL)?;
-        #[cfg(feature = "device-identity")]
-        db.batch_execute(enrolment::CERTIFICATE_DDL)?;
-        // Once per open, before anything can re-claim: a watch the previous run
-        // died still holding gets its countdown from now, so the UI has this
-        // run to re-claim it and an abandoned one retires. Ahead of the capture
-        // session, which does not exist yet, so nothing has to be suspended.
-        subscriptions::anchor_launch(&mut db)?;
+        install_replica_schema(&mut db, sqlite_ddl, config)?;
         // An explicit resume cursor wins. Otherwise the replica remembers
         // its own resume point, so reopening a persisted replica (a file, an
-        // OPFS import) continues where the previous run stopped. Pending
-        // mutations persisted by a previous run come along for replay.
+        // OPFS import) continues where the previous run stopped. The writer
+        // queues a previous run left, entries and all, come along for replay.
         let resume = resume.or_else(|| load_cursor(&mut db));
-        let pending = load_pending(&mut db)?;
+        let writers = load_writer_queues(&mut db)?;
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let applied_rows: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -2834,10 +3094,7 @@ where
         // Read after every statement this open applies, so the first write
         // re-checks only what the application changed since.
         let main_schema = schema_cookie(&mut db, "main")?;
-        let next_seq = pending
-            .last_key_value()
-            .map_or(0, |(seq, _)| seq + 1)
-            .max(load_next_seq(&mut db)?);
+
         let mut conn = Self {
             wire: None,
             run: None,
@@ -2846,7 +3103,8 @@ where
             session,
             db,
             last_cursor: resume,
-            next_seq,
+            writers,
+            bound_writer: None,
             dirty,
             write_exempt,
             changed,
@@ -2855,7 +3113,6 @@ where
             apply_staging,
             residual_warned: false,
             transaction_state: AnsiTransactionManager::default(),
-            pending,
             resend: Resend::Idle,
             resends_armed: 0,
             config: config.clone(),
@@ -2943,20 +3200,22 @@ where
     }
 
     /// Give this connection a transport: greet the server with the highest
-    /// applied cursor and keep every piece of local state (replica, capture
-    /// session, pending mutations, sequence counter).
+    /// applied cursor and the writer this run writes as, and keep every piece
+    /// of local state (replica, capture session, the writer queues, the
+    /// sequence counters).
     ///
     /// One method for both arrivals, because they are one operation. A
     /// connection opened offline reaching a server for the first time and a
     /// live connection replacing a dropped transport differ only in whether a
     /// resume credential exists to present, and the server settles the rest.
     ///
-    /// The ack's durable watermark retires every pending mutation the server
-    /// already applied and the rest are replayed, so the upload path stays
-    /// exactly-once across the gap, however long it was. The dirty flag is
-    /// forced so writes captured but never pushed re-flush. A re-declared
-    /// subscription replays what the server retained past the cursor, or
-    /// full-resyncs.
+    /// The ack's frontier retires nothing locally: the bound writer's whole
+    /// queue is resent in order, and the server re-answers the entries at or
+    /// below its frontier from its settled record, so a refusal the client
+    /// never saw still rolls back, and the upload path stays exactly-once
+    /// across the gap, however long it was. The dirty flag is forced so
+    /// writes captured but never pushed re-flush. A re-declared subscription
+    /// replays what the server retained past the cursor, or full-resyncs.
     ///
     /// # Errors
     ///
@@ -2965,16 +3224,25 @@ where
     /// transport, and one that had nothing stays usable for local reads.
     pub async fn attach(&mut self, mut transport: T) -> Result<(), ClientError> {
         let now = clock::now_secs(&mut self.db)?;
+        let (writer, settled_through) = self.writer_handshake();
         let ack = exchange_handshake(
             &mut transport,
-            &self.config,
-            self.token_source.as_ref(),
-            self.last_cursor.as_ref(),
-            self.run.as_ref().map(|run| run.resume_token.as_str()),
-            now,
+            HandshakeInput {
+                config: &self.config,
+                token_source: self.token_source.as_ref(),
+                resume: self.last_cursor.as_ref(),
+                resume_token: self.run.as_ref().map(|run| run.resume_token.as_str()),
+                writer,
+                settled_through,
+                now,
+            },
         )
         .await?;
-        let watermark = ack.watermark;
+        let bound = self.apply_writer_grant(writer, ack.writer)?;
+        let frontier = match bound {
+            Some(WriterRef::Number(_)) => ack.writer.map(|grant| grant.frontier),
+            _ => None,
+        };
         self.run = Some(Run {
             session_handle: ack.session_handle,
             resume_token: ack.resume_token,
@@ -2986,7 +3254,8 @@ where
             challenge: ack.challenge,
         });
         self.history_cleared = false;
-        self.attach_replay = AttachReplay::Pending { watermark };
+        self.bound_writer = bound;
+        self.attach_replay = AttachReplay::Pending { frontier };
         self.notices
             .push_back(ClientEvent::SyncStatus(SyncStatus::Connected));
         // Relaxed: same-task flag, no ordering dependency.
@@ -3003,65 +3272,231 @@ where
     ///
     /// [`ClientError`] when pending mutation or subscription replay fails.
     pub async fn resume_attach(&mut self) -> Result<(), ClientError> {
-        let AttachReplay::Pending { watermark } = self.attach_replay else {
+        let AttachReplay::Pending { frontier } = self.attach_replay else {
             return Ok(());
         };
-        self.reconcile_pending(watermark).await?;
+        self.reconcile_pending(frontier).await?;
         self.replay_subscriptions().await?;
         self.attach_replay = AttachReplay::Idle;
         Ok(())
     }
 
-    /// Bring the pending mutations in line with the server's durable
-    /// watermark after a handshake: retire everything at or below it (those
-    /// applied, so the optimistic local rows are correct) and report each as
-    /// [`ClientEvent::MutationApplied`], since its own acknowledgement was
-    /// lost with the old socket, then replay the rest in order, and keep the
-    /// sequence counter above every number the server has seen. The server's
-    /// watermark makes a duplicated replay idempotent.
-    async fn reconcile_pending(&mut self, watermark: Option<u64>) -> Result<(), ClientError> {
-        if let Some(watermark) = watermark {
-            let retired: Vec<u64> = self
-                .pending
-                .range(..=watermark)
-                .map(|(seq, _)| *seq)
-                .collect();
-            if !retired.is_empty() {
-                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                for seq in retired {
-                    self.pending.remove(&seq);
-                    delete_pending(&mut self.db, seq)?;
-                    self.notices
-                        .push_back(ClientEvent::MutationApplied { client_seq: seq });
-                }
+    /// Raise the bound writer's next sequence to the frontier the handshake
+    /// reported and replay the queue in order, nothing at or below the
+    /// frontier retired locally, the server re-answering it from its record.
+    async fn reconcile_pending(&mut self, frontier: Option<u64>) -> Result<(), ClientError> {
+        if let (Some(writer), Some(frontier)) = (self.bound_writer, frontier)
+            && let Some(queue) = self.writers.get_mut(&writer)
+        {
+            let raised = frontier.saturating_add(1).max(queue.next_seq);
+            if raised != queue.next_seq {
+                queue.next_seq = raised;
+                persist_writer_state(&mut self.db, &writer, queue.next_seq, &queue.head)?;
             }
-            self.next_seq = self.next_seq.max(watermark.saturating_add(1));
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            record_next_seq(&mut self.db, self.next_seq)?;
+
         }
         self.replay_pending().await
     }
 
-    /// Replays every unacknowledged mutation on the current transport.
+    /// Replays the bound writer's unacknowledged entries on the current
+    /// transport, each carrying its writer and its sequence.
     ///
-    /// Calling this while offline leaves the durable queue untouched.
+    /// Calling this while offline leaves the durable queues untouched.
     ///
     /// # Errors
     ///
-    /// [`ClientError`] when encoding or sending a queued mutation fails.
+    /// [`ClientError`] when encoding or sending a queued entry fails.
     pub async fn replay_pending(&mut self) -> Result<(), ClientError> {
         if !self.is_connected() {
             return Ok(());
         }
-        let replays: Vec<(u64, Vec<u8>)> = self
+        let Some((writer, queue)) = self
+            .bound_writer
+            .and_then(|writer| self.writers.get(&writer).map(|queue| (writer, queue)))
+        else {
+            return Ok(());
+        };
+        let replays: Vec<(u64, Vec<u8>)> = queue
             .pending
             .iter()
-            .map(|(seq, changeset)| (*seq, changeset.clone()))
+            .map(|(seq, entry)| (*seq, entry.changeset.clone()))
             .collect();
         for (seq, changeset) in replays {
-            self.send_mutation(seq, &changeset).await?;
+            self.send_mutation(writer, seq, &changeset).await?;
         }
         Ok(())
+    }
+
+    /// The writer to present at the next handshake, with how much of it the
+    /// server has already settled.
+    fn writer_handshake(&mut self) -> (WriterRequest, Option<u64>) {
+        match self.number_identity() {
+            Some(number) => {
+                let writer = WriterRef::Number(number);
+                (
+                    WriterRequest::Number(number),
+                    Some(self.settled_through(&writer)),
+                )
+            }
+            None => (WriterRequest::Issue, None),
+        }
+    }
+
+    /// The number writer this replica holds, if any, the unissued one
+    /// held back, it waits for the server to issue its number.
+    fn number_identity(&self) -> Option<u64> {
+        self.writers.keys().find_map(|writer| match writer {
+            WriterRef::Number(number) if *number != UNISSUED_NUMBER => Some(*number),
+            _ => None,
+        })
+    }
+
+    /// How much of one writer the server has settled, the retired prefix of
+    /// its queue, contiguous from sequence one, or the whole queue when it
+    /// holds nothing.
+    fn settled_through(&self, writer: &WriterRef) -> u64 {
+        match self.writers.get(writer) {
+            Some(queue) => queue
+                .pending
+                .keys()
+                .next()
+                .copied()
+                .map_or(queue.next_seq.saturating_sub(1), |seq| {
+                    seq.saturating_sub(1)
+                }),
+            None => 0,
+        }
+    }
+
+    /// Fold the ack's grant into the writer state, moving the unissued
+    /// queue to the issued number, and return the writer the connection now
+    /// writes as.
+    fn apply_writer_grant(
+        &mut self,
+        request: WriterRequest,
+        granted: Option<WriterGrant>,
+    ) -> Result<Option<WriterRef>, ClientError> {
+        match request {
+            WriterRequest::Issue => {
+                let grant = granted.ok_or_else(|| {
+                    ClientError::Protocol("the server issued no writer to an issue".to_owned())
+                })?;
+                if grant.number == UNISSUED_NUMBER {
+                    return Err(ClientError::Protocol(
+                        "the server issued the unissued number".to_owned(),
+                    ));
+                }
+                if grant.frontier != 0 {
+                    return Err(ClientError::Protocol(
+                        "a fresh number arrived with a frontier".to_owned(),
+                    ));
+                }
+                let number = WriterRef::Number(grant.number);
+                {
+                    let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                    if let Some(queue) = self.writers.remove(&unissued()) {
+                        rekey_writer(&mut self.db, &unissued(), &number)?;
+                        persist_writer_state(&mut self.db, &number, queue.next_seq, &queue.head)?;
+                        self.writers.insert(number, queue);
+                    } else {
+                        self.writers.insert(number, WriterQueue::fresh());
+                        persist_writer_state(&mut self.db, &number, 1, &GENESIS)?;
+                    }
+                }
+                Ok(Some(number))
+            }
+            WriterRequest::Number(number) => {
+                let grant = granted.ok_or_else(|| {
+                    ClientError::Protocol("the server answered a number without a grant".to_owned())
+                })?;
+                if grant.number != number {
+                    return Err(ClientError::Protocol(
+                        "the server confirmed another number than the handshake named".to_owned(),
+                    ));
+                }
+                let writer = WriterRef::Number(number);
+                if let Entry::Vacant(entry) = self.writers.entry(writer) {
+                    entry.insert(WriterQueue::fresh());
+                    {
+                        let _suspended =
+                            SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                        persist_writer_state(&mut self.db, &writer, 1, &GENESIS)?;
+                    }
+                }
+                Ok(Some(writer))
+            }
+            WriterRequest::Device => {
+                if granted.is_some() {
+                    return Err(ClientError::Protocol(
+                        "the server answered a device handshake with a grant".to_owned(),
+                    ));
+                }
+                Ok(None)
+            }
+        }
+    }
+
+    /// Carry a dead writer's tail to `target` and drop the dead writer, each
+    /// entry re-hashed into the target queue's chain.
+    fn carry_writer(&mut self, dead: WriterRef, target: &WriterRef) -> Result<(), ClientError> {
+        let Some(queue) = self.writers.get(&dead).cloned() else {
+            return Ok(());
+        };
+        let entries: Vec<(u64, Vec<u8>)> = queue
+            .pending
+            .into_iter()
+            .map(|(seq, entry)| (seq, entry.changeset))
+            .collect();
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            drop_writer_state(&mut self.db, &dead)?;
+        }
+        self.writers.remove(&dead);
+        for (_seq, changeset) in entries {
+            self.append_entry(target, &changeset)?;
+        }
+        Ok(())
+    }
+
+    /// The writer a tail travels to when its writer dies, the number
+    /// otherwise the unissued one until the server issues it, never the dead
+    /// writer itself.
+    fn tail_target(&mut self, dead: &WriterRef) -> WriterRef {
+        match self.number_identity() {
+            Some(number) if WriterRef::Number(number) != *dead => WriterRef::Number(number),
+            _ => unissued(),
+        }
+    }
+
+    /// Carry a dead writer's tail to the live writer, tolerating the database
+    /// the same way the fatal that drove the carry does.
+    fn carry_to_live(&mut self, dead: WriterRef) {
+        let target = self.tail_target(&dead);
+        if let Err(err) = self.carry_writer(dead, &target) {
+            tracing::warn!(error = %err, "the tail could not be re-queued");
+        }
+    }
+
+    /// Append a changeset to one writer's queue, taking the next sequence,
+    /// hashing it into the writer's chain, and persisting it.
+    fn append_entry(&mut self, writer: &WriterRef, changeset: &[u8]) -> Result<u64, ClientError> {
+        let queue = self
+            .writers
+            .entry(*writer)
+            .or_insert_with(WriterQueue::fresh);
+        let seq = queue.next_seq;
+        let hash = entry_hash(&queue.head, seq, changeset);
+        queue.next_seq += 1;
+        queue.head = hash;
+        let entry = PendingEntry {
+            changeset: changeset.to_vec(),
+            hash,
+        };
+        queue.pending.insert(seq, entry.clone());
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        persist_writer_state(&mut self.db, writer, queue.next_seq, &queue.head)?;
+        persist_pending(&mut self.db, writer, seq, &entry)?;
+        Ok(seq)
     }
 
     /// The armed resend of writes the server deferred, when there is one.
@@ -3148,6 +3583,9 @@ where
         self.attach_replay = AttachReplay::Idle;
         // A fresh transport replays every pending write, so no resend stays owed.
         self.resend = Resend::Idle;
+        // The writer identity a connection bound to is per-connection; a fresh
+        // handshake rebinds it.
+        self.bound_writer = None;
         #[cfg(feature = "device-identity")]
         self.enrol_waiters.clear();
         if self.wire.take().is_some() {
@@ -3293,12 +3731,20 @@ where
         self.last_cursor.is_some()
     }
 
-    /// The sequence numbers of mutations captured locally but not yet
+    /// The (writer, sequence) pairs of entries captured locally but not yet
     /// confirmed durable by the server. Non-empty means a teardown would lose
     /// data, so logout and expiry surface these before purging the replica.
     #[must_use]
-    pub fn unsynced(&self) -> Vec<u64> {
-        self.pending.keys().copied().collect()
+    pub fn unsynced(&self) -> Vec<UnsyncedWrite> {
+        self.writers
+            .iter()
+            .flat_map(|(writer, queue)| {
+                queue.pending.keys().map(move |seq| UnsyncedWrite {
+                    writer: *writer,
+                    seq: *seq,
+                })
+            })
+            .collect()
     }
 
     /// The lowercased names of the tables in the attached local tier, empty
@@ -3393,7 +3839,12 @@ where
                 account: self.account(),
                 synced_rows,
                 local_rows,
-                pending: self.pending.values().cloned().collect(),
+                pending: self
+                    .writers
+                    .values()
+                    .flat_map(|queue| queue.pending.values())
+                    .map(|entry| entry.changeset.clone())
+                    .collect(),
                 attachments,
             },
         )
@@ -3464,8 +3915,8 @@ where
         )?;
         let (local_columns, main_columns) =
             resolve_import_columns(&mut self.db, &self.local_tables, &self.hidden_tables)?;
-        for changeset in &archive.pending {
-            pending_tables(changeset, &main_columns)?;
+        for entry in &archive.pending {
+            pending_tables(entry, &main_columns)?;
         }
         let (incoming, held) = build_import_index(
             &mut self.db,
@@ -3533,8 +3984,6 @@ where
         F: FnOnce(&mut SqliteConnection) -> Result<(), ClientError>,
     {
         let mut outcome = ImportOutcome::default();
-        let mut restored: Vec<(u64, Vec<u8>)> = Vec::new();
-        let mut next_seq = self.next_seq;
         {
             // Suspended for the whole apply, so restoring a write does not
             // capture a second write of the same rows.
@@ -3570,9 +4019,6 @@ where
                         .map_err(|err| {
                             ClientError::Import(format!("applying a restored write: {err}"))
                         })?;
-                    persist_pending(db, next_seq, changeset)?;
-                    restored.push((next_seq, changeset.clone()));
-                    next_seq += 1;
                     outcome.writes_restored += 1;
                 }
                 record_next_seq(db, next_seq)?;
@@ -3580,9 +4026,28 @@ where
                 Ok(())
             })?;
         }
-        self.next_seq = next_seq;
-        self.pending.extend(restored);
+        let restored = self.restore_archived_writes(&plan.archive.pending)?;
+        debug_assert_eq!(outcome.writes_restored, restored);
         Ok(outcome)
+    }
+
+    /// Re-queue the archive's writes as fresh entries under this replica's
+    /// writer, each taking a fresh sequence and chain hash.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a local database failure while persisting the queue.
+    fn restore_archived_writes(&mut self, entries: &[Vec<u8>]) -> Result<usize, ClientError> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let target = self.choose_writer();
+        let mut restored = 0;
+        for changeset in entries {
+            self.append_entry(&target, changeset)?;
+            restored += 1;
+        }
+        Ok(restored)
     }
 
     /// How the key protecting this replica is held.
@@ -4149,7 +4614,8 @@ where
         Ok(())
     }
 
-    /// Upload local writes captured since the last push as one mutation.
+    /// Upload local writes captured since the last push as one mutation
+    /// under the writer this run writes as.
     ///
     /// Returns the assigned `client_seq`, or `None` when there was nothing to
     /// send. The pending record is persisted and the capture session reset
@@ -4172,13 +4638,8 @@ where
         if changeset.is_empty() {
             return Ok(None);
         }
-        let seq = self.next_seq;
-        self.next_seq += 1;
-        {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            record_next_seq(&mut self.db, self.next_seq)?;
-            persist_pending(&mut self.db, seq, &changeset)?;
-        }
+        let writer = self.choose_writer();
+        let seq = self.append_entry(&writer, &changeset)?;
         // Reset capture: a fresh session records only writes after this push.
         let mut fresh = self
             .db
@@ -4188,37 +4649,56 @@ where
             .attach_all()
             .map_err(|e| ClientError::Session(e.to_string()))?;
         self.session = fresh;
-        self.pending.insert(seq, changeset.clone());
         // With no server the write stays queued, which is the designed offline
         // state rather than a failure: it is already durable in
         // `_connetto_pending` above, and `attach` replays it. Returning an
         // error here would make every caller treat working offline as a fault.
         // A caller that needs to know asks `unsynced`, or reads the
-        // connection-state event.
-        if self.is_connected() {
-            self.send_mutation(seq, &changeset).await?;
+        // connection-state event. A write under a writer the connection is
+        // not bound to waits for the connection to bind it, the replay sends
+        // it then.
+        if self.is_connected() && self.bound_writer == Some(writer) {
+            self.send_mutation(writer, seq, &changeset).await?;
         }
         Ok(Some(seq))
     }
 
-    /// Send one mutation as its header and patchset frame pair. Shared by
-    /// [`push`](Self::push) and the replay in
-    /// [`reconcile_pending`](Self::reconcile_pending).
+    /// The writer a new local write queues under: the number, the unissued
+    /// one until the server issues it.
+    fn choose_writer(&mut self) -> WriterRef {
+        match self.number_identity() {
+            Some(number) => WriterRef::Number(number),
+            None => unissued(),
+        }
+    }
+
+    /// Send one mutation as its header and patchset frame pair, as `writer`'s
+    /// sequence `seq`. Shared by [`push`](Self::push) and the replay in
+    /// [`replay_pending`](Self::replay_pending).
     ///
     /// This is the one place a captured changeset leaves for the server, so it
     /// is where a split table's backing name goes back to the logical Postgres
     /// name the wire speaks. The durable pending record keeps the physical
     /// names it was captured under, because that is what a rollback has to
     /// apply locally, and a replay renames again on its way out.
-    async fn send_mutation(&mut self, seq: u64, changeset: &[u8]) -> Result<(), ClientError> {
+    async fn send_mutation(
+        &mut self,
+        writer: WriterRef,
+        seq: u64,
+        changeset: &[u8],
+    ) -> Result<(), ClientError> {
+        if self.bound_writer != Some(writer) {
+            return Err(ClientError::Protocol(
+                "a mutation left for a writer the connection is not bound to".to_owned(),
+            ));
+        }
         let logical = self.to_logical(changeset.to_vec())?;
         let op_count = count_ops(&logical);
         let payload = zstd::encode_all(logical.as_slice(), ZSTD_LEVEL)?;
+        let header = MutationHeader::new(seq, op_count);
         self.wire()?
             .transport
-            .send_control(ControlMessage::MutationHeader(MutationHeader::new(
-                seq, op_count,
-            )))
+            .send_control(ControlMessage::MutationHeader(header))
             .await
             .map_err(|e| ClientError::Transport(e.to_string()))?;
         self.wire()?
@@ -4229,21 +4709,29 @@ where
         Ok(())
     }
 
-    /// Roll back the optimistic local write for `client_seq` after the server
-    /// rejected or conflicted it: decode the touched rows for the event, invert
-    /// the captured changeset, and apply the inverse with capture suspended,
-    /// so the rollback is never re-uploaded. A row a concurrent server patch
-    /// already changed is left alone. Returns the touched rows, empty when
-    /// the changeset is gone.
-    fn rollback(&mut self, client_seq: u64) -> Result<Vec<AffectedRow>, ClientError> {
-        let Some(changeset) = self.pending.remove(&client_seq) else {
+    /// Roll back the optimistic local write for `writer`'s `client_seq` after
+    /// the server rejected or conflicted it: decode the touched rows for the
+    /// event, invert the captured changeset, and apply the inverse with
+    /// capture suspended, so the rollback is never re-uploaded. A row a
+    /// concurrent server patch already changed is left alone. Returns the
+    /// touched rows, empty when the changeset is gone.
+    fn rollback(
+        &mut self,
+        writer: WriterRef,
+        client_seq: u64,
+    ) -> Result<Vec<AffectedRow>, ClientError> {
+        let Some(queue) = self.writers.get_mut(&writer) else {
             return Ok(Vec::new());
         };
+        let Some(entry) = queue.pending.remove(&client_seq) else {
+            return Ok(Vec::new());
+        };
+        let changeset = entry.changeset;
         let rows = affected_rows(&changeset, &self.config.policy_tables)?;
         let inverse = invert_changeset(&changeset)
             .map_err(|err| ClientError::Apply(format!("inverting rejected changeset: {err}")))?;
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        delete_pending(&mut self.db, client_seq)?;
+        delete_pending(&mut self.db, &writer, client_seq)?;
         self.db
             .apply_changeset(&inverse, rollback_omit)
             .map_err(|err| ClientError::Apply(err.to_string()))?;
@@ -4375,7 +4863,11 @@ where
             .related_to
             .as_deref()
             .and_then(|related| related.parse::<u64>().ok())
-            .is_some_and(|seq| self.pending.contains_key(&seq));
+            .is_some_and(|seq| {
+                self.writers
+                    .values()
+                    .any(|queue| queue.pending.contains_key(&seq))
+            });
         if throttled_write {
             self.defer_pending(Some(Duration::from_millis(limited.retry_after_ms)));
         }
@@ -4443,11 +4935,14 @@ where
                     reason: resync.reason,
                 })
             }
-            ControlMessage::MutationApplied(ack) => self.mutation_applied(ack.client_seq),
-            ControlMessage::MutationReject(reject) => self.mutation_rejected(&reject),
+            ControlMessage::MutationApplied(ack) => Ok(self.mutation_applied(ack.client_seq)?),
+            ControlMessage::MutationReject(reject) => Ok(self.mutation_rejected(&reject)?),
             ControlMessage::MutationConflict(conflict) => {
                 self.settle_resend();
-                let rows = self.rollback(conflict.client_seq)?;
+                let writer = self
+                    .bound_writer
+                    .expect("a conflict arrives for the bound writer");
+                let rows = self.rollback(writer, conflict.client_seq)?;
                 Ok(ClientEvent::MutationConflict {
                     client_seq: conflict.client_seq,
                     rows,
@@ -4485,9 +4980,7 @@ where
             }
             // The server says why it is closing. Surfaced rather than treated
             // as a violation: the server behaved exactly as the protocol says.
-            ControlMessage::FatalError(fatal) => Ok(ClientEvent::ServerClosed {
-                reason: fatal.reason,
-            }),
+            ControlMessage::FatalError(fatal) => Ok(self.server_closed(fatal.reason)),
             ControlMessage::DeliveryPaused { cause } => Ok(ClientEvent::DeliveryPaused { cause }),
             ControlMessage::DeliveryResumed => Ok(ClientEvent::DeliveryResumed),
             ControlMessage::MembershipOpened(opened) => {
@@ -4510,28 +5003,59 @@ where
         }
     }
 
-    /// Retire a mutation the server applied durably.
+    /// Apply the writer-state change a writer fatal carries, then surface the
+    /// close, the pump redialing under the fresh writer.
+    fn server_closed(&mut self, reason: FatalErrorReason) -> ClientEvent {
+        if reason == FatalErrorReason::WriterUnknown
+            && let Some(writer) = self.bound_writer
+        {
+            self.carry_to_live(writer);
+        }
+        ClientEvent::ServerClosed { reason }
+    }
+
+    /// Retire an entry the server applied durably, under the bound writer.
     fn mutation_applied(&mut self, client_seq: u64) -> Result<ClientEvent, ClientError> {
-        if self.pending.remove(&client_seq).is_some() {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            delete_pending(&mut self.db, client_seq)?;
+        let writer = self.bound_writer;
+        if let Some(writer) = writer {
+            let removed = self
+                .writers
+                .get_mut(&writer)
+                .and_then(|queue| queue.pending.remove(&client_seq))
+                .is_some();
+            if removed {
+                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                delete_pending(&mut self.db, &writer, client_seq)?;
+            }
         }
         self.settle_resend();
         Ok(ClientEvent::MutationApplied { client_seq })
     }
 
-    /// Roll back a mutation the server refused, or keep it for a resend when the server could not settle it.
+    /// Roll back an entry the server refused, or keep it for a resend when the
+    /// server could not settle it, under the bound writer.
     fn mutation_rejected(&mut self, reject: &MutationReject) -> Result<ClientEvent, ClientError> {
         let client_seq = reject.client_seq;
+        let writer = self.bound_writer;
         // Rolling back a write the server could not settle would lose it for good.
         if reject.reason == MutationRejectReason::Indeterminate {
-            if self.pending.contains_key(&client_seq) {
+            let held = writer
+                .and_then(|writer| {
+                    self.writers
+                        .get(&writer)
+                        .map(|queue| queue.pending.contains_key(&client_seq))
+                })
+                .unwrap_or(false);
+            if held {
                 self.defer_pending(None);
             }
             return Ok(ClientEvent::MutationDeferred { client_seq });
         }
         self.settle_resend();
-        let rows = self.rollback(client_seq)?;
+        let rows = match writer {
+            Some(writer) => self.rollback(writer, client_seq)?,
+            None => Vec::new(),
+        };
         Ok(ClientEvent::MutationRejected { client_seq, rows })
     }
 
@@ -4719,7 +5243,12 @@ where
     /// columns and ordinals come straight from it.
     fn pending_spare(&mut self) -> Result<HashMap<String, Vec<String>>, ClientError> {
         let mut spare: HashMap<String, Vec<String>> = HashMap::new();
-        let changesets: Vec<Vec<u8>> = self.pending.values().cloned().collect();
+        let changesets: Vec<Vec<u8>> = self
+            .writers
+            .values()
+            .flat_map(|queue| queue.pending.values())
+            .map(|entry| entry.changeset.clone())
+            .collect();
         for changeset in &changesets {
             let ParsedDiffSet::Changeset(diff) =
                 ParsedDiffSet::parse(changeset).map_err(|err| {
@@ -4920,10 +5449,15 @@ where
     /// and the server refuses the upload for the same reason. Capture stays
     /// suspended so re-applying does not queue the writes a second time.
     fn reapply_pending(&mut self) -> Result<(), ClientError> {
-        if self.pending.is_empty() {
+        let queued: Vec<Vec<u8>> = self
+            .writers
+            .values()
+            .flat_map(|queue| queue.pending.values())
+            .map(|entry| entry.changeset.clone())
+            .collect();
+        if queued.is_empty() {
             return Ok(());
         }
-        let queued: Vec<Vec<u8>> = self.pending.values().cloned().collect();
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<_, ClientError, _>(|conn| {
             for changeset in &queued {
@@ -5281,18 +5815,32 @@ mod tests {
     }
 
     /// A resent write the server refuses settles the deferral, so the next outage starts its resend from the first wait.
-    #[test]
-    fn a_settled_resend_restarts_the_next_deferral_from_the_first_wait() {
+    #[tokio::test]
+    async fn a_settled_resend_restarts_the_next_deferral_from_the_first_wait() {
         let config = ClientConfig::new("resend-test");
         let mut conn =
             ConnettoConnection::<FakeTransport>::open(&Replica::in_memory(), DDL, &config, None)
                 .expect("open in-memory replica");
+        conn.attach(FakeTransport::accepting())
+            .await
+            .expect("attach");
+        let writer = conn
+            .bound_writer
+            .expect("the handshake bound the issued number");
         conn.db
             .batch_execute("INSERT INTO t (id) VALUES (1)")
             .expect("local write");
         let changeset = conn.session.changeset().expect("capture the write");
-        conn.pending.insert(0, changeset.clone());
-        conn.pending.insert(1, changeset);
+        let first = conn
+            .append_entry(&writer, &changeset)
+            .expect("queue the write");
+        conn.db
+            .batch_execute("INSERT INTO t (id) VALUES (2)")
+            .expect("second local write");
+        let changeset = conn.session.changeset().expect("capture the second write");
+        let second = conn
+            .append_entry(&writer, &changeset)
+            .expect("queue the second write");
         // A deferral whose writes went out again after its schedule had grown.
         let mut episode = RESEND_POLICY.start();
         for _ in 0..6 {
@@ -5301,12 +5849,12 @@ mod tests {
         conn.resend = Resend::Resent { episode };
 
         conn.handle_control(ControlMessage::MutationReject(MutationReject {
-            client_seq: 0,
+            client_seq: first,
             reason: MutationRejectReason::Unauthorized,
         }))
         .expect("the refusal settles");
         conn.handle_control(ControlMessage::MutationReject(MutationReject {
-            client_seq: 1,
+            client_seq: second,
             reason: MutationRejectReason::Indeterminate,
         }))
         .expect("the next outage defers");

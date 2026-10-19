@@ -68,7 +68,7 @@ The auth layer did not take the session concept over. The session layer never ha
 
 **A handle covers one unbroken run of one caller, and any change of caller mints a new one.** **Decided (R2).** Signing in ends the unidentified run and starts an identified one, and signing out ends that one, so nothing is ever inherited. Four things key on the handle (the write watermark, the subscription set, each subscription's cursor, and the buffer the server accumulates while the client is away), and a handle that outlived a change of caller would hand all four to the next person to use the device. The apparent cost, discarding subscriptions and cursors at sign-in, is zero: the local copy is changing from in-memory to identity-named at that same moment, so a fresh snapshot happens regardless. The sign-in seam already receives both the outgoing handle and the incoming identity, so it already bridges the discontinuity.
 
-The write watermark needs no protection beyond this, and the mechanism is already built: `HandshakeAck.last_applied_seq` exists, and `ConnettoConnection::reconcile_pending` in `crates/connetto-client/src/lib.rs` raises the client's counter to the server's watermark plus one, so a client whose in-memory copy lost its counter repairs it from the server on reconnect. **Built.**
+The write frontier needs no protection beyond this, and the mechanism is already built: `HandshakeAck.writer` carries the writer number and its stored frontier (R75), and the client reconciles its own sequence against the answered frontier on reconnect, so a connection whose in-memory copy lost its counter repairs it from the server before it writes. **Built.**
 
 ### Identity
 
@@ -215,7 +215,7 @@ At sign-in the server re-keys that row from the session to the user. **connetto 
 
 ## What each thing keys
 
-**Decided (R2).** The exactly-once mutation watermark keys on the session and not on the identity. `_connetto_mutations` is `PRIMARY KEY (user_id, session_id)` today (`11-authentication.md:114-122`) and becomes keyed on the session handle alone. The watermark needs a stable per-client handle, which is what a session is. It does not need to know who the client is.
+**Decided (R2), amended R75.** The exactly-once identity keys on a server-issued writer number and not on the session or the identity. `_connetto_writers` is `PRIMARY KEY (writer)` (`11-authentication.md`), and its `user_id` column is nullable, so an anonymous caller writes under a number with no account at all and a numbered writer can outlive the session that first asked for it. The number needs a stable per-writer identity, which the server mints at handshake and the client presents on reconnect. It does not need to know the session, and it does not have to know who the client is.
 
 Routing, flow-control credits, and subscription bookkeeping key on `connection_num` and need neither an identity nor a session. They are per-connection by nature and stay that way.
 

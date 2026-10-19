@@ -1,9 +1,9 @@
 //! Needs Docker: the fixture starts its own Postgres.
 //!
-//! A deployment that names its own watermark table and types its user id as a
+//! A deployment that names its own writer tables and types its user id as a
 //! `uuid::Uuid` serves through the builder (R98 proof 3). The default
-//! `_connetto_mutations` table is absent, so a write that lands proves the
-//! server reads and writes through the deployment's member.
+//! `_connetto_writers` and `_connetto_settled` tables are absent, so a write
+//! that lands proves the server reads and writes through the deployment's member.
 
 use std::sync::Arc;
 
@@ -21,12 +21,13 @@ use super::e2e::{PG_SERIAL, exec, mint_tokens, reset_fixture};
 use super::lifecycle::{admin_pool, builder_over, live_session, next_control, wait_ready};
 
 /// The deployment's schema, every default member over a `Uuid` id but the
-/// watermark, which lives in a table of its own.
+/// writers, which live in tables of its own.
 mod app {
-    use connetto_server::SessionId;
     use connetto_server::schema::ConnettoSchema;
-    use connetto_server::watermark_schema::{ConnettoWatermarkSchema, greatest};
-    use diesel::ExpressionMethods as _;
+    use connetto_server::writer_schema::{
+        ConnettoWriterSchema, SettlePath, SettledRow, Statement, WriterRow,
+    };
+    use diesel_async::AsyncPgConnection;
 
     connetto_server::connetto_schema! {
         pub struct UuidDefaults;
@@ -35,59 +36,219 @@ mod app {
     }
 
     diesel::table! {
-        app_write_marks (session_id) {
-            session_id -> Uuid,
-            last_seq -> BigInt,
+        app_writers (writer) {
+            writer -> BigInt,
+            user_id -> Nullable<Uuid>,
+            session_id -> Nullable<Uuid>,
+            device_key -> Nullable<Bytea>,
+            frontier -> BigInt,
+            head -> Nullable<Bytea>,
+            retired_at -> Nullable<Timestamptz>,
         }
     }
 
-    #[derive(diesel::Insertable)]
-    #[diesel(table_name = app_write_marks)]
-    pub struct NewWriteMark {
-        session_id: SessionId,
-        last_seq: i64,
+    diesel::table! {
+        app_settled (writer, seq) {
+            writer -> BigInt,
+            seq -> BigInt,
+            entry_hash -> Bytea,
+            outcome -> Text,
+            path -> connetto_server::writer_schema::SettlePathSql,
+            settled_at -> Timestamptz,
+        }
     }
 
-    pub struct AppWatermark;
+    /// The `app_writers` row as the columns the queries select.
+    type WriterRowTuple = (
+        i64,
+        Option<uuid::Uuid>,
+        Option<Vec<u8>>,
+        i64,
+        Option<Vec<u8>>,
+        Option<connetto_server::authn::schema::Instant>,
+    );
 
-    impl ConnettoWatermarkSchema for AppWatermark {
+    pub struct AppWriters;
+
+    impl ConnettoWriterSchema for AppWriters {
         type Id = uuid::Uuid;
-        const TABLES: &'static [&'static str] = &["app_write_marks"];
-        type WatermarkQuery = app_write_marks::table;
-        type LastSeq = app_write_marks::last_seq;
-        type WmPk = diesel::dsl::Eq<app_write_marks::session_id, SessionId>;
-        type Upsert = diesel::helper_types::Set<
-            diesel::helper_types::DoUpdate<
-                diesel::helper_types::OnConflict<
-                    diesel::query_builder::InsertStatement<
-                        app_write_marks::table,
-                        <NewWriteMark as diesel::Insertable<app_write_marks::table>>::Values,
-                    >,
-                    app_write_marks::session_id,
-                >,
-            >,
-            diesel::dsl::Eq<
-                app_write_marks::last_seq,
-                greatest<
-                    app_write_marks::last_seq,
-                    <i64 as diesel::expression::AsExpression<diesel::sql_types::BigInt>>::Expression,
-                >,
-            >,
-        >;
+        const TABLES: &'static [&'static str] = &["app_writers", "app_settled"];
 
-        fn watermark_upsert(session_id: SessionId, last_seq: i64) -> Self::Upsert {
-            diesel::insert_into(app_write_marks::table)
-                .values(NewWriteMark {
-                    session_id,
-                    last_seq,
-                })
-                .on_conflict(app_write_marks::session_id)
-                .do_update()
-                .set(app_write_marks::last_seq.eq(greatest(app_write_marks::last_seq, last_seq)))
+        fn issue(
+            conn: &mut AsyncPgConnection,
+            user_id: Option<Self::Id>,
+            session_id: Option<uuid::Uuid>,
+        ) -> Statement<'_, (i64, i64)> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                diesel::insert_into(app_writers::table)
+                    .values((
+                        app_writers::user_id.eq(user_id),
+                        app_writers::session_id.eq(session_id),
+                        app_writers::frontier.eq(0),
+                    ))
+                    .returning((app_writers::writer, app_writers::frontier))
+                    .get_result(&mut *conn)
+                    .await
+            })
         }
 
-        fn wm_pk(session_id: SessionId) -> Self::WmPk {
-            app_write_marks::session_id.eq(session_id)
+        fn by_number<'c>(
+            conn: &'c mut AsyncPgConnection,
+            writer: i64,
+            user_id: Option<&'c Self::Id>,
+            session_id: Option<&'c uuid::Uuid>,
+        ) -> Statement<'c, Option<WriterRow<Self::Id>>> {
+            Box::pin(async move {
+                use diesel::{
+                    ExpressionMethods, NullableExpressionMethods, OptionalExtension,
+                    PgExpressionMethods, QueryDsl,
+                };
+                use diesel_async::RunQueryDsl;
+                let query = app_writers::table
+                    .filter(app_writers::writer.eq(writer))
+                    .filter(
+                        app_writers::user_id
+                            .nullable()
+                            .is_not_distinct_from(user_id.copied()),
+                    )
+                    .filter(
+                        app_writers::session_id
+                            .nullable()
+                            .is_not_distinct_from(session_id.copied()),
+                    )
+                    .select((
+                        app_writers::writer,
+                        app_writers::user_id,
+                        app_writers::device_key,
+                        app_writers::frontier,
+                        app_writers::head,
+                        app_writers::retired_at,
+                    ));
+                let row: Option<WriterRowTuple> =
+                    RunQueryDsl::first(query, &mut *conn).await.optional()?;
+                Ok(row.map(
+                    |(writer, user_id, device_key, frontier, head, retired_at)| WriterRow {
+                        writer,
+                        user_id,
+                        device_key,
+                        frontier,
+                        head,
+                        retired_at: retired_at.map(From::from),
+                    },
+                ))
+            })
+        }
+
+        fn settled(
+            conn: &mut AsyncPgConnection,
+            writer: i64,
+            seq: i64,
+        ) -> Statement<'_, Option<SettledRow>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, OptionalExtension, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = app_settled::table
+                    .filter(app_settled::writer.eq(writer))
+                    .filter(app_settled::seq.eq(seq))
+                    .select((
+                        app_settled::entry_hash,
+                        app_settled::outcome,
+                        app_settled::path,
+                    ));
+                let row: Option<(Vec<u8>, String, SettlePath)> =
+                    RunQueryDsl::first(query, &mut *conn).await.optional()?;
+                Ok(row.map(|(entry_hash, outcome, path)| SettledRow {
+                    entry_hash,
+                    outcome: outcome.into_bytes(),
+                    path,
+                }))
+            })
+        }
+
+        fn settle<'c>(
+            conn: &'c mut AsyncPgConnection,
+            writer: i64,
+            seq: i64,
+            entry_hash: &'c [u8],
+            outcome: &'c str,
+            path: SettlePath,
+        ) -> Statement<'c, bool> {
+            Box::pin(async move {
+                use diesel::ExpressionMethods as _;
+                use diesel_async::RunQueryDsl as _;
+                let affected = diesel::insert_into(app_settled::table)
+                    .values((
+                        app_settled::writer.eq(writer),
+                        app_settled::seq.eq(seq),
+                        app_settled::entry_hash.eq(entry_hash.to_vec()),
+                        app_settled::outcome.eq(outcome.to_owned()),
+                        app_settled::path.eq(path),
+                    ))
+                    .on_conflict((app_settled::writer, app_settled::seq))
+                    .do_nothing()
+                    .execute(&mut *conn)
+                    .await?;
+                Ok(affected == 1)
+            })
+        }
+
+        fn advance<'c>(
+            conn: &'c mut AsyncPgConnection,
+            writer: i64,
+            seq: i64,
+            head: &'c [u8],
+        ) -> Statement<'c, bool> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = diesel::update(
+                    app_writers::table
+                        .filter(app_writers::writer.eq(writer))
+                        .filter(app_writers::frontier.eq(seq - 1)),
+                )
+                .set((
+                    app_writers::frontier.eq(seq),
+                    app_writers::head.eq(head.to_vec()),
+                ));
+                let affected = RunQueryDsl::execute(query, &mut *conn).await?;
+                Ok(affected == 1)
+            })
+        }
+
+        fn settle_outcome<'c>(
+            conn: &'c mut AsyncPgConnection,
+            writer: i64,
+            seq: i64,
+            outcome: &'c str,
+        ) -> Statement<'c, bool> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = diesel::update(
+                    app_settled::table
+                        .filter(app_settled::writer.eq(writer))
+                        .filter(app_settled::seq.eq(seq)),
+                )
+                .set(app_settled::outcome.eq(outcome.to_owned()));
+                let affected = RunQueryDsl::execute(query, &mut *conn).await?;
+                Ok(affected == 1)
+            })
+        }
+
+        fn prune(conn: &mut AsyncPgConnection, writer: i64, seq: i64) -> Statement<'_, i64> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = diesel::delete(
+                    app_settled::table
+                        .filter(app_settled::writer.eq(writer))
+                        .filter(app_settled::seq.le(seq)),
+                );
+                let removed = RunQueryDsl::execute(query, &mut *conn).await?;
+                Ok(i64::try_from(removed).unwrap_or(i64::MAX))
+            })
         }
     }
 
@@ -96,7 +257,7 @@ mod app {
     impl ConnettoSchema for AppSchema {
         type Id = uuid::Uuid;
         type Auth = ConnettoAuthSchema;
-        type Watermark = AppWatermark;
+        type Writers = AppWriters;
         type Audit = ConnettoAudit;
         type Bans = ConnettoBans;
         type Enrolments = ConnettoEnrolments;
@@ -158,9 +319,18 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
     let pool = admin_pool(&fixture).await;
     reset_fixture(&pool, &fixture).await;
     for stmt in [
-        "DROP TABLE _connetto_mutations",
-        "CREATE TABLE app_write_marks (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
-        "GRANT SELECT, INSERT, UPDATE ON app_write_marks TO app_reader",
+        "DROP TABLE _connetto_settled",
+        "DROP TABLE _connetto_writers",
+        "CREATE TABLE app_writers (\
+         writer BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY, \
+         user_id UUID, session_id UUID, device_key BYTEA UNIQUE, \
+         frontier BIGINT NOT NULL DEFAULT 0, head BYTEA, retired_at TIMESTAMPTZ)",
+        "CREATE TABLE app_settled (\
+         writer BIGINT NOT NULL, seq BIGINT NOT NULL, entry_hash BYTEA NOT NULL, \
+         outcome TEXT NOT NULL, path connetto_settle_path NOT NULL, \
+         settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+         PRIMARY KEY (writer, seq))",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON app_writers, app_settled TO app_reader",
         "CREATE TABLE connetto_sessions (\
          session_id UUID PRIMARY KEY, user_id UUID NOT NULL, \
          current_refresh_hash BYTEA NOT NULL, idle_deadline TIMESTAMPTZ NOT NULL, \
@@ -232,12 +402,12 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
         ControlMessage::MutationApplied(_) => {}
         other => panic!("the write answered {other:?}"),
     }
-    let marked: i64 = app::app_write_marks::table
-        .select(app::app_write_marks::last_seq)
+    let frontier: i64 = app::app_writers::table
+        .select(app::app_writers::frontier)
         .first(&mut pool.get().await.expect("a connection"))
         .await
-        .expect("the write advanced the deployment's own watermark");
-    assert_eq!(marked, 1);
+        .expect("the write advanced the deployment's own writer frontier");
+    assert_eq!(frontier, 1);
 
     stream.abort();
     http.abort();

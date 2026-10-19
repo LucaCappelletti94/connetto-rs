@@ -70,8 +70,8 @@ pub mod slot;
 pub mod snapshot;
 pub mod throttle;
 pub mod timeline;
-pub mod watermark_schema;
 pub mod write_target;
+pub mod writer_schema;
 
 pub use abuse::{
     AbuseConfig, AbuseConfigError, AbuseLimits, ConnectionLimits, Crossing, Enforcement,
@@ -145,5 +145,5 @@ pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
 pub use throttle::{Limit, ReadLimits, ThrottleConfig, Tier, TierLimits};
 pub use timeline::{Position, TimelineError, TimelineHistory};
-pub use watermark_schema::ConnettoWatermarkSchema;
 pub use write_target::{PgWriteTarget, pg_write_target};
+pub use writer_schema::{ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow};

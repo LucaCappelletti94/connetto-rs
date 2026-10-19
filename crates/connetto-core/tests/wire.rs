@@ -21,7 +21,8 @@ use connetto_core::{
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
         PauseCause, Ping, Pong, RateLimited, RegisterBot, ReplaceShareKeys, RevocationUpdate,
         RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
-        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe,
+        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe, WriterGrant,
+        WriterRequest,
     },
     version::PROTOCOL_VERSION,
 };
@@ -102,15 +103,34 @@ fn handshake_and_ack_round_trip() {
         PROTOCOL_VERSION,
         "client-a",
     )));
-    round_trip_control(&ControlMessage::HandshakeAck(HandshakeAck {
-        connection_id: "connection-1".into(),
-        session_token: "opaque-handle".into(),
-        resume_token: "opaque-credential".into(),
-        current_cursor: Cursor::new(vec![1, 2, 3, 4]),
-        schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
-        initial_credits: 128,
-        last_applied_seq: Some(41),
-    }));
+    for writer in [
+        WriterRequest::Issue,
+        WriterRequest::Number(12),
+        WriterRequest::Device,
+    ] {
+        round_trip_control(&ControlMessage::Handshake(
+            Handshake::new(PROTOCOL_VERSION, "client-a")
+                .with_writer(writer)
+                .with_settled_through(9),
+        ));
+    }
+    for writer in [
+        Some(WriterGrant {
+            number: 12,
+            frontier: 41,
+        }),
+        None,
+    ] {
+        round_trip_control(&ControlMessage::HandshakeAck(HandshakeAck {
+            connection_id: "connection-1".into(),
+            session_token: "opaque-handle".into(),
+            resume_token: "opaque-credential".into(),
+            current_cursor: Cursor::new(vec![1, 2, 3, 4]),
+            schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
+            initial_credits: 128,
+            writer,
+        }));
+    }
 }
 
 #[test]
@@ -213,6 +233,10 @@ fn mutation_control_frames_round_trip() {
     round_trip_control(&ControlMessage::MutationReject(MutationReject {
         client_seq: 18,
         reason: MutationRejectReason::Indeterminate,
+    }));
+    round_trip_control(&ControlMessage::MutationReject(MutationReject {
+        client_seq: 19,
+        reason: MutationRejectReason::Forked,
     }));
 }
 
@@ -336,6 +360,15 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
         // SessionManager::reconcile_history, when the database's timeline
         // changed under a running server (R73).
         FatalErrorReason::DatabaseTimelineChanged,
+        // SessionManager::handle_mutation, on a write past its writer's
+        // frontier plus one (R75).
+        FatalErrorReason::SequenceGap {
+            expected: 4,
+            got: 6,
+        },
+        // SessionManager::run_handshake, on a number no writer of the
+        // account carries (R75).
+        FatalErrorReason::WriterUnknown,
     ];
     for reason in &reasons {
         match reason {
@@ -347,7 +380,9 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::ServerShuttingDown
             | FatalErrorReason::RateLimited { .. }
             | FatalErrorReason::ChangeStreamGap
-            | FatalErrorReason::DatabaseTimelineChanged => {}
+            | FatalErrorReason::DatabaseTimelineChanged
+            | FatalErrorReason::SequenceGap { .. }
+            | FatalErrorReason::WriterUnknown => {}
         }
     }
     reasons

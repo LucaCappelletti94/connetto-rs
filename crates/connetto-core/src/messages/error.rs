@@ -117,6 +117,17 @@ pub enum FatalErrorReason {
     ChangeStreamGap,
     /// The database moved to another timeline, so this connection may hold changes it lost (R73).
     DatabaseTimelineChanged,
+    /// A write arrived past the one after its writer's frontier, so a write
+    /// between them is missing (R75). The pending queue evicts nothing, so a
+    /// gap is a defect and never a state to continue from.
+    SequenceGap {
+        /// The sequence the server takes next.
+        expected: u64,
+        /// The sequence that arrived.
+        got: u64,
+    },
+    /// The number writer the handshake named is no writer of this account (R75).
+    WriterUnknown,
 }
 
 /// Session-terminating error frame.

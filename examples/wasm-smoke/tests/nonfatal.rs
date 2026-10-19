@@ -20,6 +20,7 @@ use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection};
 use connetto_core::messages::{
     ControlMessage, HandshakeAck, NonFatalError, SUBSCRIPTION_REFUSED, SubscriptionSpec,
+    WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackError, LoopbackTransport, loopback};
@@ -53,7 +54,10 @@ async fn ack_handshake(server: &mut LoopbackTransport, session: &str) -> bool {
             current_cursor: Cursor::new(Vec::new()),
             schema_version: None,
             initial_credits: 64,
-            last_applied_seq: None,
+            writer: Some(WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
         }))
         .await
         .expect("handshake ack");
