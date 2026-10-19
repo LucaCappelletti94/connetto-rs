@@ -6,13 +6,8 @@
 //! first test still detects drift: it fails at the WebSocket handshake the
 //! instant the client's version stops matching the server's.
 //!
-//! ISOLATION: each test uses a distinct `db_worker_boot_*` function whose OPFS
-//! filenames are unique, so Chrome's delayed `FileSystemSyncAccessHandle`
-//! release after `Worker.terminate()` never blocks the next worker's file open.
-//! `DB_ALIVE_LOCK` is shared across all connetto workers on the same origin;
-//! each test holds its own `SUITE_LOCK_*` that serialises that test's lifecycle
-//! and a 200 ms sleep before releasing the lock gives Chrome time to finish the
-//! OPFS cleanup before the next worker starts.
+//! Each DB worker instantiates the test's compiled Wasm module with its own boot identity.
+//! Distinct database names separate records within the origin-wide `sahpool`.
 
 #![cfg(target_arch = "wasm32")]
 
@@ -43,8 +38,6 @@ wasm_bindgen_test_configure!(run_in_dedicated_worker);
 const AUTH_PROVIDER: &str = "dev-idp";
 const AUTH_USERNAME: &str = "startup";
 
-// Separate lock names: each test holds its own lock for its full lifecycle so
-// DB_ALIVE_LOCK is never contended between a not-yet-GC'd worker and the next.
 const SUITE_LOCK_ALIGN: &str = "connetto-yew-photo-suite-align";
 const SUITE_LOCK_PHOTO: &str = "connetto-yew-photo-suite-photo";
 
@@ -88,23 +81,6 @@ struct Photo {
 
 fn stage(msg: &str) {
     web_sys::console::log_1(&msg.into());
-}
-
-fn relay_worker_breadcrumbs() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static INSTALLED: AtomicBool = AtomicBool::new(false);
-    if INSTALLED.swap(true, Ordering::Relaxed) {
-        return;
-    }
-    if let Ok(ch) = BroadcastChannel::new("connetto-debug") {
-        let cb =
-            wasm_bindgen::closure::Closure::<dyn FnMut(MessageEvent)>::new(|e: MessageEvent| {
-                web_sys::console::log_1(&e.data());
-            });
-        ch.set_onmessage(Some(cb.as_ref().unchecked_ref()));
-        cb.forget();
-        std::mem::forget(ch);
-    }
 }
 
 fn play_the_tab() {
@@ -218,16 +194,32 @@ fn glue_url() -> String {
     format!("{base}.js")
 }
 
-fn spawn_worker(glue_url: &str, boot_fn: &str) -> Worker {
-    let wasm_url = glue_url
-        .strip_suffix(".js")
-        .map_or_else(|| format!("{glue_url}_bg.wasm"), |b| format!("{b}_bg.wasm"));
+fn spawn_worker(glue_url: &str, boot_fn: &str) -> (Worker, workers::BootIdentity) {
+    let identity = workers::BootIdentity::mint();
+    let id = identity.to_string();
     let src = format!(
-        "const ch=new BroadcastChannel('connetto-debug');\n\
-         try{{\n  const mod=await import({g:?});\n  await mod.default({{module_or_path:{w:?}}});\n  await mod.{f}();\n}}catch(e){{\n  ch.postMessage('yew worker FAILED: '+e);\n  throw e;\n}}",
-        g = glue_url,
-        w = wasm_url,
-        f = boot_fn,
+        r#"self.connettoBoot = {id:?};
+try {{
+    const module = await new Promise((resolve, reject) => {{
+        const timer = setTimeout(() => reject(new Error('compiled module handoff timed out')), 15000);
+        function receive(event) {{
+            const [boot, module] = event.data;
+            if (boot !== self.connettoBoot) return;
+            clearTimeout(timer);
+            removeEventListener('message', receive);
+            resolve(module);
+        }}
+        addEventListener('message', receive);
+    }});
+    const mod = await import({glue_url:?});
+    await mod.default({{module_or_path: module}});
+    await mod.{boot_fn}();
+}} catch (error) {{
+    new BroadcastChannel({hello:?}).postMessage('failed:' + self.connettoBoot + ':' + error);
+    throw error;
+}}
+"#,
+        hello = workers::HELLO_CHANNEL,
     );
     let parts = Array::of1(&JsValue::from_str(&src));
     let opts = web_sys::BlobPropertyBag::new();
@@ -238,7 +230,12 @@ fn spawn_worker(glue_url: &str, boot_fn: &str) -> Worker {
     worker_opts.set_type(web_sys::WorkerType::Module);
     let w = Worker::new_with_options(&url, &worker_opts).expect("spawn worker");
     web_sys::Url::revoke_object_url(&url).ok();
-    w
+    w.post_message(&Array::of2(
+        &JsValue::from_str(&id),
+        &wasm_bindgen::module(),
+    ))
+    .expect("compiled worker module");
+    (w, identity)
 }
 
 fn photo_bytes() -> Vec<u8> {
@@ -307,13 +304,13 @@ async fn connect_tab(
 
 #[wasm_bindgen_test]
 async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
-    relay_worker_breadcrumbs();
     play_the_tab();
     let _serial = locks::hold_lock(SUITE_LOCK_ALIGN).await;
-    let worker = spawn_worker(&glue_url(), "db_worker_boot_align");
-    workers::await_db_worker_ready(&[])
-        .await
-        .expect("db worker ready");
+    let (worker, boot) = spawn_worker(&glue_url(), "db_worker_boot_align");
+    if let Err(error) = workers::await_db_worker_ready(&[boot]).await {
+        worker.terminate();
+        panic!("align readiness rejected {error:?}");
+    }
     stage("yew align worker booted");
 
     let (_, identity) = mint_session().await;
@@ -375,8 +372,7 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
     drop(client);
     done_rx.await.expect("pump exited");
     worker.terminate();
-    // Chrome headless does not release the OPFS access handle synchronously on
-    // terminate; per-test file names are the isolation guarantee, this is margin.
+    // Chrome releases terminated workers' OPFS handles asynchronously.
     workers::sleep(core::time::Duration::from_millis(200)).await;
 }
 
@@ -384,13 +380,13 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
 
 #[wasm_bindgen_test]
 async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
-    relay_worker_breadcrumbs();
     play_the_tab();
     let _serial = locks::hold_lock(SUITE_LOCK_PHOTO).await;
-    let worker = spawn_worker(&glue_url(), "db_worker_photo_boot");
-    workers::await_db_worker_ready(&[])
-        .await
-        .expect("db worker ready");
+    let (worker, boot) = spawn_worker(&glue_url(), "db_worker_photo_boot");
+    if let Err(error) = workers::await_db_worker_ready(&[boot]).await {
+        worker.terminate();
+        panic!("photo readiness rejected {error:?}");
+    }
     stage("yew photo worker booted");
 
     let (_, identity) = mint_session().await;
@@ -502,7 +498,6 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
     drop(client);
     done_rx.await.expect("pump exited");
     worker.terminate();
-    // Chrome headless does not release the OPFS access handle synchronously on
-    // terminate; per-test file names are the isolation guarantee, this is margin.
+    // Chrome releases terminated workers' OPFS handles asynchronously.
     workers::sleep(core::time::Duration::from_millis(200)).await;
 }
