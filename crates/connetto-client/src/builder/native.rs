@@ -926,22 +926,32 @@ where
                         Arc::new(move || port_node.local_addr().map(|addr| addr.port())),
                         bind,
                         Arc::new(
-                            move |addr: SocketAddr, answer: tokio::sync::oneshot::Sender<bool>| {
+                            move |addr: SocketAddr,
+                                  answer: tokio::sync::oneshot::Sender<
+                                crate::hotspot::DialAnswer,
+                            >| {
                                 let handle = dial_handle.clone();
                                 tokio::spawn(async move {
-                                    match handle.link_peer(addr).await {
-                                        Ok(_) => {
-                                            let _ = answer.send(true);
+                                    let outcome = match handle.link_peer(addr).await {
+                                        Ok(_) => crate::hotspot::DialAnswer::Linked,
+                                        Err(PeerError::Link(
+                                            connetto_peer::LinkError::Unreachable(err),
+                                        )) if err.get_ref().is_some_and(|inner| {
+                                            inner.is::<crate::hotspot::VpnBlocksJoin>()
+                                        }) =>
+                                        {
+                                            crate::hotspot::DialAnswer::BlockedByVpn
                                         }
                                         Err(err) => {
                                             tracing::debug!(
-                                                                                                %addr,
+                                                %addr,
                                                 ?err,
                                                 "the dial to the joined hotspot's gateway failed"
                                             );
-                                            let _ = answer.send(false);
+                                            crate::hotspot::DialAnswer::Failed
                                         }
-                                    }
+                                    };
+                                    let _ = answer.send(outcome);
                                 });
                             },
                         ),

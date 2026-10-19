@@ -818,6 +818,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     // Whether this device stands joined to a host's hotspot, which hides the
     // joins and the hosting until it leaves.
     let joined: Signal<bool> = use_signal(|| false);
+    // Whether a VPN refused the joined hotspot's dial, shown on its own line
+    // so a join's outcome landing later never hides it.
+    let vpn_blocked: Signal<bool> = use_signal(|| false);
     // A permission a host or join named as missing, which the panel asks for
     // on the UI thread, where the platform's prompt wants to be asked from.
     let missing: Signal<Option<String>> = use_signal(|| None);
@@ -844,6 +847,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
         let mut outcome = outcome;
         let mut nearby = nearby;
         let mut joined = joined;
+        let mut vpn_blocked = vpn_blocked;
         use_hook(move || {
             spawn(async move {
                 let mut rx = event_rx;
@@ -855,6 +859,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
                         }
                         ClientEvent::HotspotLeft => {
                             joined.set(false);
+                            vpn_blocked.set(false);
                             outcome.set("the joined network was lost".to_owned());
                         }
                         ClientEvent::HostNearby { host, prefix, rssi } => {
@@ -870,6 +875,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
                         }
                         ClientEvent::HotspotUnreached => {
                             outcome.set("unreached".to_owned());
+                        }
+                        ClientEvent::JoinedNetworkBlockedByVpn => {
+                            vpn_blocked.set(true);
                         }
                         _ => {}
                     }
@@ -919,6 +927,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let payload_joined = joined;
     let nearby_joined = joined;
     let leave_joined = joined;
+    let leave_vpn_blocked = vpn_blocked;
 
     let me = parts
         .0
@@ -935,6 +944,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let outcome = outcome();
     let hosting = offer.is_some();
     let joined_now = joined();
+    let vpn_line = (joined() && vpn_blocked()).then_some(
+        "link: a VPN on this device blocks its own connections over the joined hotspot, only peers that connect to it can link",
+    );
     #[cfg(target_os = "ios")]
     let personal_note: Option<&str> = Some("connetto cannot see whether Personal Hotspot is on");
     #[cfg(not(target_os = "ios"))]
@@ -994,6 +1006,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
                 p {
                     "hotspot: "
                     {outcome}
+                }
+                if let Some(line) = vpn_line {
+                    p { {line} }
                 }
                 div { class: "row",
                     button {
@@ -1285,9 +1300,11 @@ fn PeerPanel(parts: SessionParts) -> Element {
                                     let parts = leave_parts.clone();
                                     let mut outcome = leave_outcome;
                                     let mut joined = leave_joined;
+                                    let mut vpn_blocked = leave_vpn_blocked;
                                     spawn(async move {
                                         parts.0.native.leave_hotspot().await;
                                         joined.set(false);
+                                        vpn_blocked.set(false);
                                         outcome.set("left".to_owned());
                                     });
                                 },

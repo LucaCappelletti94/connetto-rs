@@ -345,8 +345,24 @@ struct InFlight {
     /// The issue's instant, the redial's origin.
     issued: tokio::time::Instant,
     /// The dial's answer.
-    answer: oneshot::Receiver<bool>,
+    answer: oneshot::Receiver<DialAnswer>,
 }
+
+/// How one dial to the joined hotspot's gateway ended (R76).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialAnswer {
+    /// The link stands.
+    Linked,
+    /// The dial failed and a redial may land.
+    Failed,
+    /// A VPN the app cannot bypass refused the joined network, which no redial changes.
+    BlockedByVpn,
+}
+
+/// The refusal a socket bind meets under a VPN the app cannot bypass (R76).
+#[derive(Debug, thiserror::Error)]
+#[error("a VPN on this device blocks its own connections over the joined hotspot")]
+pub(crate) struct VpnBlocksJoin;
 
 /// The hotspot machine's commands, from the client's API (R76).
 pub(crate) enum Command {
@@ -390,7 +406,7 @@ pub(crate) struct Machine {
     /// Bind the dials' sockets to `subnet`, or stop binding with `None`.
     pub(crate) bind: SubnetBind,
     /// Dial one gateway address, answering `answer` whether it linked.
-    dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<bool>) + Send + Sync>,
+    dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<DialAnswer>) + Send + Sync>,
     /// Emit an event to the application.
     emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
     host: HostState,
@@ -406,7 +422,7 @@ impl Machine {
         autolink: bool,
         peer_port: Arc<dyn Fn() -> Option<u16> + Send + Sync>,
         bind: SubnetBind,
-        dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<bool>) + Send + Sync>,
+        dial: Arc<dyn Fn(SocketAddr, oneshot::Sender<DialAnswer>) + Send + Sync>,
         emit: Arc<dyn Fn(ClientEvent) + Send + Sync>,
     ) -> Self {
         Self {
@@ -709,13 +725,15 @@ impl Machine {
         // The gateway's dial standing, after the rows that end the join.
         let mut ended = false;
         let mut unreached = false;
+        let mut blocked = false;
         if let JoinState::Joined { dial: Some(plan) } = &mut self.join {
             let now = tokio::time::Instant::now();
             let mut linked = false;
             if let Some(mut in_flight) = plan.in_flight.take() {
                 match in_flight.answer.try_recv() {
-                    Ok(true) => linked = true,
-                    Ok(false) | Err(oneshot::error::TryRecvError::Closed) => {
+                    Ok(DialAnswer::Linked) => linked = true,
+                    Ok(DialAnswer::BlockedByVpn) => blocked = true,
+                    Ok(DialAnswer::Failed) | Err(oneshot::error::TryRecvError::Closed) => {
                         plan.next = Some(in_flight.issued + REDIAL);
                     }
                     Err(oneshot::error::TryRecvError::Empty) => {
@@ -723,7 +741,7 @@ impl Machine {
                     }
                 }
             }
-            if linked {
+            if linked || blocked {
                 ended = true;
             } else if now >= plan.bound {
                 ended = true;
@@ -742,6 +760,12 @@ impl Machine {
             self.join = JoinState::Joined { dial: None };
             if unreached {
                 (self.emit)(ClientEvent::JoinedHostUnreached);
+            }
+            if blocked {
+                tracing::warn!(
+                    "a VPN on this device blocks its own connections over the joined hotspot, so its dial stops and only peers that connect to it can link"
+                );
+                (self.emit)(ClientEvent::JoinedNetworkBlockedByVpn);
             }
         }
     }
@@ -910,9 +934,9 @@ mod tests {
     /// The dial seam's answer script, one held dial standing.
     struct FakeDial {
         /// The answer the next dial gets, at its call.
-        answer: Mutex<Option<bool>>,
+        answer: Mutex<Option<DialAnswer>>,
         /// The dial held back, its answer unsent.
-        held: Mutex<Option<oneshot::Sender<bool>>>,
+        held: Mutex<Option<oneshot::Sender<DialAnswer>>>,
     }
 
     impl FakeDial {
@@ -924,15 +948,28 @@ mod tests {
             }
         }
 
-        /// The answer the next dial gets, at its call.
+        /// The answer the next dial gets, linked or failed, at its call.
         fn script(&self, linked: bool) {
-            *self.answer.lock() = Some(linked);
+            self.script_answer(if linked {
+                DialAnswer::Linked
+            } else {
+                DialAnswer::Failed
+            });
+        }
+
+        /// The answer the next dial gets, at its call.
+        fn script_answer(&self, answer: DialAnswer) {
+            *self.answer.lock() = Some(answer);
         }
 
         /// The held dial's answer, for the dial standing unanswered.
         fn finish(&self, linked: bool) {
             if let Some(answer) = self.held.lock().take() {
-                let _ = answer.send(linked);
+                let _ = answer.send(if linked {
+                    DialAnswer::Linked
+                } else {
+                    DialAnswer::Failed
+                });
             }
         }
     }
@@ -1653,6 +1690,29 @@ mod tests {
         assert_eq!(
             h.events.lock().as_slice(),
             &[ClientEvent::JoinedHostUnreached]
+        );
+    }
+
+    /// The join row `The dial answers BlockedByVpn | dial in flight | end the
+    /// standing, emit JoinedNetworkBlockedByVpn once`, with no redial.
+    #[tokio::test]
+    async fn a_vpn_refusal_ends_the_dial_with_its_own_event() {
+        tokio::time::pause();
+        let mut h = Harness::new(true);
+        h.dial.script_answer(DialAnswer::BlockedByVpn);
+        h.joined();
+        h.machine.tick();
+        assert_eq!(
+            h.events.lock().as_slice(),
+            &[ClientEvent::JoinedNetworkBlockedByVpn]
+        );
+        tokio::time::advance(DIAL_BOUND + REDIAL).await;
+        h.machine.tick();
+        assert_eq!(h.dials.lock().len(), 1, "a VPN refusal is never redialled");
+        assert_eq!(
+            h.events.lock().as_slice(),
+            &[ClientEvent::JoinedNetworkBlockedByVpn],
+            "the bound adds no JoinedHostUnreached"
         );
     }
 

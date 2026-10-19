@@ -1303,6 +1303,11 @@ pub enum ClientEvent {
     /// link standing, so it stopped (R76).
     #[cfg(feature = "peer")]
     JoinedHostUnreached,
+    /// A VPN on this device that apps cannot bypass refused the joined
+    /// hotspot's dial, so the redial stopped and only peers that connect to
+    /// this device over the hotspot can link with it (R76).
+    #[cfg(feature = "peer")]
+    JoinedNetworkBlockedByVpn,
     /// The platform's Bluetooth standing changed (R76 decision 21).
     #[cfg(feature = "peer")]
     BluetoothChanged {
