@@ -449,7 +449,7 @@ fn handle_query(
         Some("beacon") => Ok(beacon_json(&client.beacon_state())),
         Some("bluetooth") => Ok(json!({ "state": client.bluetooth_state().to_string() })),
         Some("linked") => Ok(json!({
-            "linked": client.linked_peers().iter().map(short_identity).collect::<Vec<_>>(),
+            "linked": client.linked_peers().iter().map(|link| short_identity(&link.peer)).collect::<Vec<_>>(),
         })),
         Some("nearby") => Ok(json!({ "nearby": nearby_entries(&client.nearby_hosts()) })),
         Some("state") => {
@@ -465,7 +465,7 @@ fn handle_query(
                 "linked": client
                     .linked_peers()
                     .iter()
-                    .map(short_identity)
+                    .map(|link| short_identity(&link.peer))
                     .collect::<Vec<_>>(),
                 "nearby": nearby_entries(&client.nearby_hosts()),
             }))

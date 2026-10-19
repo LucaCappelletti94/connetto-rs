@@ -46,7 +46,7 @@ pub use error::{CloseReason, LinkError, Refusal, TrustError};
 pub use event::PeerEvent;
 pub use frame::PeerFrame;
 pub use identity::{Clock, Identity, SystemClock, Trust};
-pub use node::{Liveness, Node, SocketPrep};
+pub use node::{Liveness, Node, PeerLink, SocketPrep};
 
 #[cfg(feature = "discovery")]
 pub use discovery::{

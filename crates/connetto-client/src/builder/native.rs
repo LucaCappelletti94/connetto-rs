@@ -1277,11 +1277,11 @@ where
         self.device.as_ref().and_then(EnrolHandle::peer_address)
     }
 
-    /// The peers this device's node reports linked, an empty list without a
-    /// device or for a build without the `peer` feature (R76).
+    /// The peers this device's node reports linked, each with its kept link's
+    /// remote address, an empty list without a device (R76).
     #[cfg(feature = "peer")]
     #[must_use]
-    pub fn linked_peers(&self) -> Vec<connetto_core::device_cert::DeviceIdentity> {
+    pub fn linked_peers(&self) -> Vec<connetto_peer::PeerLink> {
         self.device
             .as_ref()
             .map_or_else(Vec::new, EnrolHandle::linked_peers)

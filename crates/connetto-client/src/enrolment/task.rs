@@ -432,9 +432,9 @@ impl EnrolHandle {
         self.peer.local_addr()
     }
 
-    /// The peers the device's node reports linked (R76).
+    /// The peers the device's node reports linked, with their links' remote addresses (R76).
     #[cfg(feature = "peer")]
-    pub(crate) fn linked_peers(&self) -> Vec<DeviceIdentity> {
+    pub(crate) fn linked_peers(&self) -> Vec<connetto_peer::PeerLink> {
         self.peer.linked()
     }
 

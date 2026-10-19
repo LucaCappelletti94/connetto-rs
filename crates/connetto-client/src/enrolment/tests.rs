@@ -1910,10 +1910,17 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
             _ => None,
         })
         .expect("the link reports its peer");
+    let links = handle.linked_peers();
     assert_eq!(
-        handle.linked_peers(),
-        vec![linked_peer],
+        links.iter().map(|link| &link.peer).collect::<Vec<_>>(),
+        [&linked_peer],
         "the device's node reports its live peer"
+    );
+    assert!(
+        links[0]
+            .remote
+            .is_some_and(|remote| remote.ip().is_loopback()),
+        "the live link names its remote address"
     );
 
     // The look wakes at the expiry plus the tolerance and closes the link.

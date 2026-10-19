@@ -671,11 +671,17 @@ enum WipeState {
     Error(String),
 }
 
-/// The line a linked peer takes in the panel, its account and the head of
-/// its key.
+/// The line a linked peer takes in the panel, its account, the head of its
+/// key and, while the link is live, the address it runs to.
 #[cfg(feature = "peer")]
-fn linked_line(peer: &connetto_core::device_cert::DeviceIdentity) -> String {
-    format!("linked: {}", short_identity(peer))
+fn linked_line(
+    peer: &connetto_core::device_cert::DeviceIdentity,
+    remote: Option<std::net::SocketAddr>,
+) -> String {
+    match remote {
+        Some(remote) => format!("linked: {} via {remote}", short_identity(peer)),
+        None => format!("linked: {}", short_identity(peer)),
+    }
 }
 
 /// A device identity as `account/key prefix`, what the panel names devices
@@ -763,6 +769,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     // The listener's port, read again every second, since the listener opens
     // beside the pump the way enrolment does.
     let mut peer_port: Signal<Option<u16>> = use_signal(|| None);
+    // One line per linked peer, read off the node on the same pace, so a
+    // replaced link never leaves its old address on the page.
+    let mut peers: Signal<Vec<String>> = use_signal(Vec::new);
     // The Bluetooth standing and the host's beacon, read on the same pace.
     let mut bluetooth_line: Signal<String> = use_signal(|| "bluetooth: unsupported".to_owned());
     let mut beacon_line: Signal<String> =
@@ -785,13 +794,22 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     if *beacon_line.peek() != line {
                         beacon_line.set(line);
                     }
+                    let mut lines: Vec<String> = parts
+                        .0
+                        .native
+                        .linked_peers()
+                        .iter()
+                        .map(|link| linked_line(&link.peer, link.remote))
+                        .collect();
+                    lines.sort();
+                    if *peers.peek() != lines {
+                        peers.set(lines);
+                    }
                 }
             })
         });
     }
 
-    // One line per linked peer, what the link's events name the peer as.
-    let peers: Signal<Vec<String>> = use_signal(Vec::new);
     // The offer this device hosts, as its plain lines, until the hotspot
     // stops.
     let offer: Signal<Option<OfferLines>> = use_signal(|| None);
@@ -822,7 +840,6 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let client = parts.0.client.clone();
     let event_rx = client.events();
     {
-        let mut peers = peers;
         let mut offer = offer;
         let mut outcome = outcome;
         let mut nearby = nearby;
@@ -832,23 +849,6 @@ fn PeerPanel(parts: SessionParts) -> Element {
                 let mut rx = event_rx;
                 while let Ok(event) = rx.recv().await {
                     match event {
-                        ClientEvent::PeerLinked { peer } => {
-                            let line = linked_line(&peer);
-                            let mut held = peers.peek().clone();
-                            if !held
-                                .iter()
-                                .any(|held_line| held_line.as_str() == line.as_str())
-                            {
-                                held.push(line);
-                                peers.set(held);
-                            }
-                        }
-                        ClientEvent::PeerUnlinked { peer, .. } => {
-                            let line = linked_line(&peer);
-                            let mut held = peers.peek().clone();
-                            held.retain(|held_line| held_line.as_str() != line.as_str());
-                            peers.set(held);
-                        }
                         ClientEvent::HotspotStopped => {
                             offer.set(None);
                             outcome.set("stopped by the system or the user".to_owned());
