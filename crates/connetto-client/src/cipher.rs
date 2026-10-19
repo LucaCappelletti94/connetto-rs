@@ -116,7 +116,7 @@ const BUSY_POLL: core::time::Duration = core::time::Duration::from_millis(10);
 /// [`UnlockError::CodecMissing`] when no page codec is linked,
 /// [`UnlockError::Pragma`] when a pragma is rejected,
 /// [`UnlockError::Busy`] when another connection holds the file locked for
-/// longer than [`BUSY_WAIT`], and [`UnlockError::WrongKey`] when the file does
+/// longer than five seconds, and [`UnlockError::WrongKey`] when the file does
 /// not decrypt.
 pub fn unlock(conn: &mut SqliteConnection, key: &ReplicaKey) -> Result<(), UnlockError> {
     unlock_within(conn, key, BUSY_WAIT)
