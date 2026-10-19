@@ -60,6 +60,14 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    /// The client's private retirement-owed table, seeded by an assertion.
+    _connetto_retire (writer) {
+        /// The writer to retire, the replica's spelling of the wire name.
+        writer -> Text,
+    }
+}
+
 /// One row of the durable pending queue, the bookkeeping columns the
 /// assertions read.
 #[derive(diesel::Queryable, Debug, PartialEq, Eq)]
@@ -110,6 +118,7 @@ struct Wire {
     lie: Option<Lie>,
     closing: Option<FatalErrorReason>,
     refuse: Option<FatalErrorReason>,
+    retire_answer: Option<String>,
 }
 
 impl Default for Wire {
@@ -122,6 +131,7 @@ impl Default for Wire {
             lie: None,
             closing: None,
             refuse: None,
+            retire_answer: None,
         }
     }
 }
@@ -164,6 +174,12 @@ impl Wire {
     /// Refuse the handshake itself with `reason`, before any ack.
     fn refusing_with(mut self, reason: FatalErrorReason) -> Self {
         self.refuse = Some(reason);
+        self
+    }
+
+    /// Answer a retirement under a request id the connection did not send.
+    fn retire_answer_with(mut self, request_id: impl Into<String>) -> Self {
+        self.retire_answer = Some(request_id.into());
         self
     }
 }
@@ -242,10 +258,11 @@ impl Transport for Wire {
             ControlMessage::RetireWriter(retire) => {
                 let mut log = self.log.lock();
                 log.retires.push(retire.clone());
+                let request_id = self.retire_answer.clone().unwrap_or(retire.request_id);
                 log.outbox
                     .push_back(IncomingFrame::Control(ControlMessage::WriterAnswer(
                         WriterAnswer {
-                            request_id: retire.request_id,
+                            request_id,
                             outcome: WriterOutcome::Retired,
                         },
                     )));
@@ -317,6 +334,17 @@ async fn drain(conn: &mut ConnettoConnection<Wire>) -> Vec<ClientEvent> {
         }
     }
     seen
+}
+
+/// Pump until the connection fails, past any notices the attach pushed first.
+async fn pump_to_error(conn: &mut ConnettoConnection<Wire>) -> ClientError {
+    for _ in 0..16 {
+        match conn.pump_one().await {
+            Ok(_) => {}
+            Err(err) => return err,
+        }
+    }
+    panic!("no protocol failure surfaced");
 }
 
 fn write(conn: &mut ConnettoConnection<Wire>, id: i32) {
@@ -574,20 +602,6 @@ async fn sequences_survive_an_emptied_queue_and_a_restart() {
             seq: 3
         }]
     );
-}
-
-diesel::table! {
-    /// The client's private pending table, seeded by the boot-skip test.
-    _connetto_pending (writer, seq) {
-        /// The writer the entry stands under.
-        writer -> Text,
-        /// The entry's sequence.
-        seq -> BigInt,
-        /// The captured changeset.
-        changeset -> Binary,
-        /// The entry's chain hash.
-        entry_hash -> Binary,
-    }
 }
 
 /// A handshake acknowledged with no writer at all refuses the issue: the
@@ -1203,4 +1217,64 @@ async fn a_failed_number_grant_preserves_the_unissued_queue_for_retry() {
     drain(&mut conn).await;
     assert_eq!(wire.log.lock().mutations, [1]);
     assert_eq!(conn.unsynced(), Vec::<UnsyncedWrite>::new());
+}
+
+/// A `WriterAnswer` with no bind or retirement in flight is a protocol
+/// failure, the connection never settling a task it never sent.
+#[tokio::test]
+async fn a_writer_answer_with_nothing_in_flight_is_a_protocol_failure() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("attach");
+
+    // The handshake settled and nothing is owed, so the connection holds no
+    // writer task. The server must not answer one.
+    wire.log
+        .lock()
+        .outbox
+        .push_back(IncomingFrame::Control(ControlMessage::WriterAnswer(
+            WriterAnswer {
+                request_id: "spurious".to_owned(),
+                outcome: WriterOutcome::Retired,
+            },
+        )));
+    let err = pump_to_error(&mut conn).await;
+    let ClientError::Protocol(detail) = err else {
+        panic!("the spurious answer must fail the protocol, got {err:?}");
+    };
+    assert_eq!(
+        detail, "a writer answer arrived with nothing in flight",
+        "the connection names the violation it refused"
+    );
+}
+
+/// A `WriterAnswer` naming a request the connection never sent is a protocol
+/// failure, and the retirement it owes stays owed for the next answer.
+#[tokio::test]
+async fn a_writer_answer_naming_a_foreign_request_is_a_protocol_failure() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    // A retirement owed before the connection stands goes up at the attach.
+    diesel::insert_into(_connetto_retire::table)
+        .values(_connetto_retire::writer.eq("number:1"))
+        .on_conflict_do_nothing()
+        .execute(conn.conn())
+        .expect("remember the retirement");
+    let wire = Wire::default().retire_answer_with("foreign");
+    conn.attach(wire.clone()).await.expect("attach");
+
+    let err = pump_to_error(&mut conn).await;
+    let ClientError::Protocol(detail) = err else {
+        panic!("the foreign answer must fail the protocol, got {err:?}");
+    };
+    assert_eq!(
+        detail, "the writer answer names a foreign request",
+        "the connection names the violation it refused"
+    );
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.retires.len(), 1, "the retirement went up once");
+    }
 }

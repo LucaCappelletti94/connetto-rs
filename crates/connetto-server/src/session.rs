@@ -1230,7 +1230,6 @@ pub(crate) fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
 fn same_account<Id: core::fmt::Display>(row_user: Option<&Id>, caller_user: Option<&Id>) -> bool {
     match (row_user, caller_user) {
         (Some(owner), Some(caller)) => owner.to_string() == caller.to_string(),
-        (None, None) => true,
         _ => false,
     }
 }

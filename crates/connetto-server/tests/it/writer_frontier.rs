@@ -48,7 +48,7 @@ use connetto_server::{
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
@@ -328,6 +328,36 @@ impl Enrolments {
         (Signer(key), key_id)
     }
 
+    /// Enrol `user` under the fixed key `key_id`, with the public key as
+    /// stored, for the cases where the stored public key is not the key that
+    /// signs.
+    async fn enrol_with(
+        &self,
+        user: &str,
+        key_id: [u8; 32],
+        public_key: Vec<u8>,
+        expires_at: SystemTime,
+    ) -> KeyId {
+        let key = KeyId::from_bytes(key_id);
+        let record = Enrolment {
+            user: user.to_owned(),
+            key,
+            serial: [7; 16],
+            issuer: KeyId::from_bytes([9; 32]),
+            issued_at: SystemTime::now(),
+            expires_at,
+            session: SessionId::from_uuid(uuid::Uuid::new_v4()),
+            public_key,
+            descriptor: vec![0x91, 0x01],
+            attestation: AttestationLevel::Unproven,
+        };
+        self.store
+            .record(record)
+            .await
+            .expect("record the certificate");
+        key
+    }
+
     /// Revoke `key_id` whoever enrolled it, as an operator would.
     fn revoke(&self, key_id: [u8; 32]) {
         self.store.revoke_key(KeyId::from_bytes(key_id));
@@ -373,6 +403,7 @@ fn writing_manager(
         NoSnapshot,
         RosterAuth::granting("alice")
             .and("bob")
+            .and_the_unnamed_caller()
             .withholding(WITHHELD_ID),
         test_verifier(),
         NoConnector,
@@ -430,15 +461,18 @@ async fn refused_handshake(
     client_id: &str,
     grant: &str,
     writer: WriterRequest,
+    settled_through: Option<u64>,
 ) -> FatalError {
     let (server_transport, mut client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
+        .with_grant(Grant::new(grant))
+        .with_writer(writer);
+    if let Some(seq) = settled_through {
+        handshake = handshake.with_settled_through(seq);
+    }
     client
-        .send_control(ControlMessage::Handshake(
-            Handshake::new(PROTOCOL_VERSION, client_id)
-                .with_grant(Grant::new(grant))
-                .with_writer(writer),
-        ))
+        .send_control(ControlMessage::Handshake(handshake))
         .await
         .expect("send handshake");
     let frame = client.recv().await.expect("recv the challenge");
@@ -474,6 +508,7 @@ async fn an_unknown_number_at_the_handshake_closes_writer_unknown() {
         "probe",
         "user:alice",
         WriterRequest::Number(987_654_321),
+        None,
     )
     .await;
     assert!(
@@ -542,6 +577,7 @@ async fn a_retired_number_at_the_handshake_closes_writer_retired() {
         "retired-3",
         "user:alice",
         WriterRequest::Number(number),
+        None,
     )
     .await;
     assert!(
@@ -584,6 +620,7 @@ async fn a_foreign_accounts_number_at_the_handshake_closes_writer_unknown() {
         "foreign-2",
         "user:bob",
         WriterRequest::Number(alice_number),
+        None,
     )
     .await;
     assert!(
@@ -2983,4 +3020,628 @@ async fn a_settled_row_reads_its_settle_path_back() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].path, SettlePath::Restore);
     assert_eq!(rows[1].path, SettlePath::Courier);
+}
+
+/// Whether no writer row stands for the device key, read as admin.
+async fn device_row_absent(pool: &Pool<AsyncPgConnection>, key_id: [u8; 32]) -> bool {
+    let mut conn = pool.get().await.expect("admin connection");
+    let found: Option<i64> = _connetto_writers::table
+        .filter(_connetto_writers::device_key.eq(key_id.to_vec()))
+        .select(_connetto_writers::writer)
+        .first(&mut *conn)
+        .await
+        .optional()
+        .expect("read the device writer");
+    found.is_none()
+}
+
+/// An entry settled through a restore stands redelivered when its own
+/// writer re-uploads it at its own sequence: the same bytes, answered from
+/// the record, and the cross-path delivery audited on both paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_path_entry_reuploaded_at_its_sequence_audits_redelivered() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
+
+    // A stands fresh.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("rp-1", "user:alice").await;
+    let a = ack.writer.expect("the handshake issues a number").number;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+    let writer_a = i64::try_from(a).expect("number fits");
+
+    // B's import settles A's entry through the restore path.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("rp-2", "user:alice").await;
+    let cs1 = insert_changeset(2, "two", "t1");
+    client
+        .upload_with_provenance(
+            1,
+            cs1.clone(),
+            Some(Provenance {
+                writer: WriterRef::Number(a),
+                seq: 1,
+            }),
+        )
+        .await;
+    expect_applied(&mut client, 1).await;
+    assert_eq!(
+        settled_rows(fixture.admin(), writer_a).await[0].path,
+        SettlePath::Restore,
+        "the original stands restore"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+
+    // A's own writer re-uploads the entry at its own sequence.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing(
+            "rp-3",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(a),
+            None,
+        )
+        .await;
+    assert_eq!(
+        ack.writer.expect("the number confirms").frontier,
+        1,
+        "the restore advanced the number's frontier"
+    );
+    client.upload(1, cs1).await;
+    expect_applied(&mut client, 1).await;
+
+    // Answered from the record, audited on both paths, applied once.
+    let events = captured.write_events();
+    assert_eq!(events.len(), 1, "the cross-path redelivery audits once");
+    let event = &events[0];
+    assert_eq!(event.op, AuthOp::WriteRedelivered);
+    assert_eq!(event.user_id.as_deref(), Some("alice"));
+    assert_eq!(event.writer, Some(writer_a));
+    assert_eq!(event.seq, Some(1));
+    assert_eq!(event.path, Some(SettlePath::Direct));
+    assert_eq!(event.other_path, Some(SettlePath::Restore));
+    let rows_a = settled_rows(fixture.admin(), writer_a).await;
+    assert_eq!(rows_a.len(), 1, "the redelivery settles no second row");
+    assert_eq!(
+        rows_a[0].path,
+        SettlePath::Restore,
+        "the restore path stands"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the entry applied once"
+    );
+    client.close().await;
+    server.await.expect("join 3").expect("session ok");
+}
+
+/// A retired number's settled row prunes at the handshake that reports how
+/// far the client settled it, and a provenance write of a pruned original
+/// settles its copy applied, the entry standing applied once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retired_number_with_settled_through_prunes_and_a_provenance_of_it_applies() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
+
+    // A settles one entry.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("pt-1", "user:alice").await;
+    let a = ack.writer.expect("the handshake issues a number").number;
+    let cs1 = insert_changeset(2, "two", "t1");
+    client.upload(1, cs1.clone()).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+    let writer_a = i64::try_from(a).expect("number fits");
+
+    // The retirement, then the settle report that prunes the row.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("pt-2", "user:alice").await;
+    let answer = client.retire_writer("r1", WriterRef::Number(a)).await;
+    assert_eq!(answer.outcome, WriterOutcome::Retired);
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+
+    let fatal = refused_handshake(
+        &manager,
+        "pt-3",
+        "user:alice",
+        WriterRequest::Number(a),
+        Some(1),
+    )
+    .await;
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::WriterRetired),
+        "the retired number must close as WriterRetired, got {:?}",
+        fatal.reason
+    );
+    assert!(
+        settled_rows(fixture.admin(), writer_a).await.is_empty(),
+        "the settle report pruned the settled row"
+    );
+
+    // A fresh number's copy of the pruned entry settles applied.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("pt-4", "user:alice").await;
+    client
+        .upload_with_provenance(
+            1,
+            cs1,
+            Some(Provenance {
+                writer: WriterRef::Number(a),
+                seq: 1,
+            }),
+        )
+        .await;
+    expect_applied(&mut client, 1).await;
+    assert!(
+        settled_rows(fixture.admin(), writer_a).await.is_empty(),
+        "the pruned record settles nothing of the original"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the entry applied once"
+    );
+    client.close().await;
+    server.await.expect("join 4").expect("session ok");
+}
+
+/// An anonymous caller enrols no device key, so its bind answers not
+/// enrolled, standing no writer row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_bind_is_not_enrolled() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let (_, key_id) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let (_, _) = client
+        .handshake_challenge_writing("anon-bind", &[], None, WriterRequest::Issue, None)
+        .await;
+    let answer = client.bind_device("b1", key_id, Vec::new()).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::NotEnrolled,
+        "an anonymous caller enrols no device key"
+    );
+    assert!(device_row_absent(fixture.admin(), key_id).await);
+    client.close().await;
+    server.await.expect("join the bind").expect("session ok");
+}
+
+/// A bind whose key's stored public key is not an EC P-256 point answers
+/// not enrolled, the signature never reaching verification, and no writer
+/// row standing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_bind_of_a_key_with_an_unreadable_public_key_is_not_enrolled() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let key_id = enrolments
+        .enrol_with(
+            "alice",
+            [41; 32],
+            Vec::new(),
+            SystemTime::now() + Duration::from_hours(24),
+        )
+        .await
+        .as_bytes()
+        .to_owned();
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let (challenge, _) = client
+        .handshake_challenge_writing("unr-1", &["user:alice"], None, WriterRequest::Issue, None)
+        .await;
+    let key = device_key();
+    let signature = key
+        .sign(&writer_bind_message(&challenge.nonce))
+        .expect("sign")
+        .clone();
+    let answer = client.bind_device("b1", key_id, signature).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::NotEnrolled,
+        "an unreadable public key answers not enrolled"
+    );
+    assert!(device_row_absent(fixture.admin(), key_id).await);
+    client.close().await;
+    server.await.expect("join the bind").expect("session ok");
+}
+
+/// A device key bound by one account retires nothing when another account
+/// names it, never confirming the key exists.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_a_device_key_another_account_holds_is_unknown() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let (signer, key_id) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    // alice binds the key.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let (challenge, _) = client
+        .handshake_challenge_writing("fk-1", &["user:alice"], None, WriterRequest::Issue, None)
+        .await;
+    let answer = client
+        .bind_device("b1", key_id, signer.signature(&challenge.nonce))
+        .await;
+    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // bob names the key.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("fk-2", "user:bob").await;
+    let answer = client.retire_writer("r1", WriterRef::Device(key_id)).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::Unknown,
+        "another account's key retires nothing"
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert!(
+        !writer_facts(fixture.admin(), writer).await.retired,
+        "the owner's writer stands"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// An anonymous caller retires no device key, the row standing untouched.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_retire_of_a_device_key_is_unknown() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let (signer, key_id) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    // alice binds the key.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let (challenge, _) = client
+        .handshake_challenge_writing("anr-1", &["user:alice"], None, WriterRequest::Issue, None)
+        .await;
+    let answer = client
+        .bind_device("b1", key_id, signer.signature(&challenge.nonce))
+        .await;
+    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // An anonymous caller names the key.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_unidentified("anr-2").await;
+    let answer = client.retire_writer("r1", WriterRef::Device(key_id)).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::Unknown,
+        "an anonymous caller retires no device key"
+    );
+    let writer = writer_for_key(fixture.admin(), key_id).await;
+    assert!(
+        !writer_facts(fixture.admin(), writer).await.retired,
+        "the writer stands"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// A server that installs no device enrolment retires no device key and
+/// applies a provenance copy of one plainly, standing no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_server_without_enrolment_refuses_device_retire_and_applies_provenance_plain() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
+
+    // The retirement refuses as unknown.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("ne-1", "user:alice").await;
+    let answer = client.retire_writer("r1", WriterRef::Device([7; 32])).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::Unknown,
+        "no enrolment stands, so no key retires"
+    );
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // A provenance copy of the key applies as a plain write.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("ne-2", "user:alice").await;
+    client
+        .upload_with_provenance(
+            1,
+            insert_changeset(2, "two", "t1"),
+            Some(Provenance {
+                writer: WriterRef::Device([7; 32]),
+                seq: 1,
+            }),
+        )
+        .await;
+    expect_applied(&mut client, 1).await;
+    assert!(device_row_absent(fixture.admin(), [7; 32]).await);
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// A revoked key that never bound retires as unknown, standing no row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn retiring_a_revoked_enrolled_key_that_never_bound_is_unknown() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let (_, key_id) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    enrolments.revoke(key_id);
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("rv-1", "user:alice").await;
+    let answer = client.retire_writer("r1", WriterRef::Device(key_id)).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::Unknown,
+        "a revoked key that never bound retires as unknown"
+    );
+    assert!(device_row_absent(fixture.admin(), key_id).await);
+    client.close().await;
+    server
+        .await
+        .expect("join the retirement")
+        .expect("session ok");
+}
+
+/// A provenance write of a device key that cannot stand as its original
+/// applies plainly and stands no row: the revoked key, the other account's
+/// key, and a key no account enrolled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_provenance_write_of_a_device_key_that_cannot_stand_applies_plain() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let (_, revoked) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    enrolments.revoke(revoked);
+    let (_, foreign) = enrolments
+        .enrol("bob", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let unknown = [77; 32];
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    // Each copy applies as a plain write.
+    for (id, key_id, body) in [
+        (2, revoked, "two"),
+        (3, foreign, "three"),
+        (4, unknown, "four"),
+    ] {
+        let (server_transport, client) = loopback();
+        let server = tokio::spawn(manager.clone().serve(server_transport));
+        let mut client = Client::new(client);
+        client
+            .handshake_with(&format!("pp-{id}"), "user:alice")
+            .await;
+        client
+            .upload_with_provenance(
+                1,
+                insert_changeset(id, body, "t1"),
+                Some(Provenance {
+                    writer: WriterRef::Device(key_id),
+                    seq: 1,
+                }),
+            )
+            .await;
+        expect_applied(&mut client, 1).await;
+        assert!(
+            device_row_absent(fixture.admin(), key_id).await,
+            "the copy that cannot stand settles no row"
+        );
+        client.close().await;
+        server.await.expect("join the copy").expect("session ok");
+    }
+
+    let seeded = notes(fixture.admin()).await;
+    for id in [1, 2, 3, 4] {
+        assert!(
+            seeded.iter().any(|row| row.id == id),
+            "the copy applied as a plain write"
+        );
+    }
+}
+
+/// An anonymous caller's provenance copy of a device key that another
+/// account holds, or that the account holds unbound, settles nothing of the
+/// key's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let enrolments = Enrolments::new();
+    let (signer, held) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let (_, unbound) = enrolments
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(enrolments.installable()),
+        SessionConfig::default(),
+    );
+
+    // alice binds the key so it stands a device row with no entries.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let (challenge, _) = client
+        .handshake_challenge_writing("ap-1", &["user:alice"], None, WriterRequest::Device, None)
+        .await;
+    let answer = client
+        .bind_device("b1", held, signer.signature(&challenge.nonce))
+        .await;
+    assert_eq!(answer.outcome, WriterOutcome::Bound { frontier: 0 });
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+    let writer = writer_for_key(fixture.admin(), held).await;
+
+    // An anonymous copy of the bound key settles nothing of it, and a copy
+    // of the account's unbound key stands no row.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let _ = client
+        .handshake_writing("ap-2", &[], None, WriterRequest::Issue, None)
+        .await;
+    client
+        .upload_with_provenance(
+            1,
+            insert_changeset(5, "five", "t1"),
+            Some(Provenance {
+                writer: WriterRef::Device(held),
+                seq: 1,
+            }),
+        )
+        .await;
+    let _ = client.next_control().await;
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.frontier,
+        0,
+        "the copy settles nothing of the other account's key"
+    );
+    client
+        .upload_with_provenance(
+            2,
+            insert_changeset(6, "six", "t2"),
+            Some(Provenance {
+                writer: WriterRef::Device(unbound),
+                seq: 1,
+            }),
+        )
+        .await;
+    let _ = client.next_control().await;
+    assert!(device_row_absent(fixture.admin(), unbound).await);
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
 }

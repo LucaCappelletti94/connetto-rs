@@ -3771,9 +3771,12 @@ where
     ///
     /// [`ClientError::Transport`] when the send fails.
     async fn flush_writer_tasks(&mut self) -> Result<(), ClientError> {
-        if self.writer_in_flight.is_some() || self.wire.is_none() {
+        if self.writer_in_flight.is_some() {
             return Ok(());
         }
+        let Some(wire) = self.wire.as_mut() else {
+            return Ok(());
+        };
         let Some(task) = self.writer_tasks.pop_front() else {
             return Ok(());
         };
@@ -3789,15 +3792,10 @@ where
                 writer: *writer,
             }),
         };
-        if let Some(wire) = self.wire.as_mut() {
-            wire.transport
-                .send_control(message)
-                .await
-                .map_err(|err| ClientError::Transport(err.to_string()))?;
-        } else {
-            self.writer_tasks.push_front(task);
-            return Ok(());
-        }
+        wire.transport
+            .send_control(message)
+            .await
+            .map_err(|err| ClientError::Transport(err.to_string()))?;
         self.writer_in_flight = Some(task);
         Ok(())
     }
@@ -3922,12 +3920,12 @@ where
     /// retiring the number behind the bind, so the device becomes the writer.
     #[cfg(feature = "device-identity")]
     async fn finish_number_tail(&mut self) -> Result<(), ClientError> {
-        let Some(WriterRef::Number(_)) = self.bound_writer else {
-            return Ok(());
-        };
         let Some(writer) = self.bound_writer else {
             return Ok(());
         };
+        if !matches!(writer, WriterRef::Number(_)) {
+            return Ok(());
+        }
         let Some(queue) = self.writers.get(&writer) else {
             return Ok(());
         };
