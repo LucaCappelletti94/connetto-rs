@@ -80,7 +80,8 @@ const GENERIC_NAMES: [&str; 3] = ["iPhone", "iPad", "iPod"];
 )]
 pub(crate) const HOTSPOT_JOIN_DOMAIN: &str = "NEHotspotConfigurationErrorDomain";
 
-/// The code that domain answers for a network the device already stands on.
+/// The code `NEHotspotConfigurationErrorAlreadyAssociated` the domain
+/// answers for a network the device already stands on.
 #[cfg_attr(
     not(any(target_os = "ios", test)),
     expect(
@@ -88,7 +89,7 @@ pub(crate) const HOTSPOT_JOIN_DOMAIN: &str = "NEHotspotConfigurationErrorDomain"
         reason = "the iOS platform and the tests read this, a host build without tests uses neither"
     )
 )]
-pub(crate) const HOTSPOT_ALREADY_ASSOCIATED: isize = 7;
+pub(crate) const HOTSPOT_ALREADY_ASSOCIATED: isize = 13;
 
 /// Whether the platform's name answer stands generic, so [`device_name`]
 /// reads `None` (R76 decision 17).
@@ -196,9 +197,11 @@ mod tests {
 
     #[test]
     fn the_join_domain_stands_already_associated_only_there() {
-        assert!(join_already_associated(HOTSPOT_JOIN_DOMAIN, 7));
+        assert!(join_already_associated(HOTSPOT_JOIN_DOMAIN, 13));
+        // Code 7 is the user's denial of the join dialog, a refusal.
+        assert!(!join_already_associated(HOTSPOT_JOIN_DOMAIN, 7));
         assert!(!join_already_associated(HOTSPOT_JOIN_DOMAIN, 6));
-        assert!(!join_already_associated("OtherDomain", 7));
+        assert!(!join_already_associated("OtherDomain", 13));
     }
 }
 
