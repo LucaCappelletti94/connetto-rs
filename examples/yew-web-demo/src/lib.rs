@@ -10,8 +10,7 @@ pub use connetto_demo_deployment::{AUTH_BASE, DEMO_WS_URL, auth_landing};
 pub const DEMO_QUERY: &str = "SELECT * FROM orders WHERE quantity > 0";
 pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
 
-// Each test gets unique OPFS filenames so Chrome's delayed handle release after
-// Worker.terminate() never blocks the next worker's file open.
+// Distinct names separate test records within the shared pool.
 const ALIGN_DB_PREFIX: &str = "connetto-yew-align";
 const ALIGN_HUB_META: &str = "connetto-yew-align-hub-meta.sqlite";
 const ALIGN_AUTH_DB: &str = "connetto-yew-align-auth.sqlite";
