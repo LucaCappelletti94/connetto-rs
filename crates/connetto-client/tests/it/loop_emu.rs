@@ -27,7 +27,7 @@ use connetto_client::{
     AffectedRow, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant,
     KeyValue, LiveQuery, Watchable,
 };
-use connetto_core::messages::SUBSCRIPTION_REFUSED;
+use connetto_core::messages::{MutationRejectReason, SUBSCRIPTION_REFUSED};
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     ConnettoReadSetup, InMemoryOplog, ManagerBuilder, Materializer, NoConnector, Oplog,
@@ -1112,12 +1112,13 @@ async fn rejected_write_rolls_back_locally() {
         event,
         ClientEvent::MutationRejected {
             client_seq: 1,
+            reason: MutationRejectReason::SchemaMismatch,
             rows: vec![AffectedRow {
                 table: "orders".to_owned(),
                 key: vec![KeyValue::Int(99)],
             }],
         },
-        "the reject event names the rolled-back row by table and primary key",
+        "the reject event names the reason and the rolled-back row by table and primary key",
     );
 
     // The server-rejected write was undone on the client.
@@ -1152,9 +1153,89 @@ async fn rejected_write_rolls_back_locally() {
     })
     .await;
     assert!(
-        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
-            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
-        "the withheld row mutation was refused",
+        matches!(&refused, ClientEvent::MutationRejected { reason, rows, .. }
+            if *reason == MutationRejectReason::SchemaMismatch
+                && rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused for the same catalog reason"
+    );
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// A write the authorization policy withholds is refused as `Unauthorized`,
+/// and the event carries that reason, so the application can act on a denial
+/// rather than guess one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_write_is_refused_as_unauthorized() {
+    let fixture = Fixture::acquire().await;
+    // The table is writable, so the refusal the withheld row draws is the
+    // authorization one rather than the catalog's.
+    let writable = RuntimeWritableCatalog::builder().writable("orders").build();
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
+    let target = server_write_target(&fixture);
+    let manager = ManagerBuilder::new(
+        materializer,
+        SeedSnapshot,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        target,
+    )
+    .build();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::tempdir().expect("temp dir");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
+    .await
+    .expect("client connect");
+
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(&mut client)
+        .expect("optimistic withheld insert");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { reason, rows, .. }
+            if *reason == MutationRejectReason::Unauthorized
+                && rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused as unauthorized"
     );
 
     client.close().await.expect("close");

@@ -1099,10 +1099,12 @@ pub enum ClientEvent {
         /// The applied mutation's sequence number.
         client_seq: u64,
     },
-    /// The server rejected a prior mutation.
+    /// The server refused a mutation and the client rolled it back locally.
     MutationRejected {
         /// The rejected mutation's sequence number.
         client_seq: u64,
+        /// The server's reason for refusing the write.
+        reason: MutationRejectReason,
         /// Rows the rejected write touched, rolled back locally.
         rows: Vec<AffectedRow>,
     },
@@ -6000,7 +6002,11 @@ where
         };
         #[cfg(feature = "device-identity")]
         self.finish_number_tail().await?;
-        Ok(ClientEvent::MutationRejected { client_seq, rows })
+        Ok(ClientEvent::MutationRejected {
+            client_seq,
+            reason: reject.reason.clone(),
+            rows,
+        })
     }
 
     /// The server gave a resent write a final answer, so whatever deferred it has passed and the next deferral starts its schedule afresh.

@@ -109,6 +109,21 @@ pub enum MutationRejectReason {
     Forked,
 }
 
+/// Formats the refusal and any driver detail for display.
+impl core::fmt::Display for MutationRejectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unauthorized => f.write_str("unauthorized"),
+            Self::SchemaMismatch => f.write_str("schema mismatch"),
+            Self::Constraint { detail } => write!(f, "constraint violation: {detail}"),
+            Self::Malformed { detail } => write!(f, "malformed patchset: {detail}"),
+            Self::Other { detail } => f.write_str(detail),
+            Self::Indeterminate => f.write_str("cannot tell yet, retrying"),
+            Self::Forked => f.write_str("another write already settled at this sequence"),
+        }
+    }
+}
+
 /// Server rejects a mutation without applying it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationReject {

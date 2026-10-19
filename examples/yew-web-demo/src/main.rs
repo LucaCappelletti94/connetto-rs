@@ -454,9 +454,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::MutationApplied { client_seq } => {
             Some(format!("mutation {client_seq} applied"))
         }
-        ClientEvent::MutationRejected { client_seq, .. } => {
-            Some(format!("mutation {client_seq} rejected"))
-        }
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => Some(format!("mutation {client_seq} rejected: {reason}")),
         ClientEvent::MutationConflict {
             client_seq,
             server_row,
