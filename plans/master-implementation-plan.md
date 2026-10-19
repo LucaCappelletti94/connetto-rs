@@ -5942,7 +5942,7 @@ A share key usually reaches an application while it runs, when a user opens a sh
 6. **Each swap counts against the subscription-creation signal** once for every subscription it reaches, so toggling a valid key cannot force unbounded resends.
 7. **Removal hides rows locally at once and removes them through the server.** The re-rendered subjects function hides them from every view, and the resend deletes them from the backing tables within one sync cycle, the bound PowerSync, Electric and Couchbase Lite state. Writes queued under a removed key keep today's contract, `Unauthorized` and a local rollback.
 8. **A key expires on both sides as a removal.** The client re-renders at the earliest `exp` it holds and deletes the key, and the server drops the subject at its `exp` and resends what it reached. Chapter 12 states a key lives until its expiry.
-9. **A change made while the server could not see it is carried by a stated set.** The client records beside its cursor the subject set the server last acknowledged, the set of the last answered set message or the last handshake, and states it at the handshake as subject names. The server compares it with the resolved principal and snapshots each re-declared subscription the difference reaches instead of catching it up, with the same reach computation as decision 2. No security property rests on the stated set, since understating it costs the client resends and overstating it withholds rows from itself. Rejected: resuming without a cursor, which re-snapshots everything and carries no resync notice, so stale rows survive. Rejected: the server keeping each handle's last set beside the write watermark, or a signed set inside every cursor, durable state and cryptography defending nothing the stated set leaves open.
+9. **A resume cursor carries completed durable authorization coverage.** `cursor_subjects: None` means unknown or unfinished coverage, while `Some([])` means a known empty set. The client persists unknown coverage before authorization replacement can change its backing rows and retains it while any key request, reached delivery or subscription replay remains unfinished. It commits a known subject set and its covered cursor together after those operations settle. Unknown coverage or a known set differing from the resolved principal requires `AuthorizationChange` snapshots for reached subscriptions, including a resolved empty set. A known equal set permits ordinary catch-up, and the cursor remains available for unreached subscriptions. A committed key change also invalidates the connection's remaining known resume coverage, including when repeated changes restore the handshake's subject set. `ShareKeysReplaced` and `HandshakeAck` alone do not establish coverage. No trust rests on the supplied metadata, and neither server-owned key state nor a consistency token is introduced.
 10. **The browser persists a signed-in durable client's set in `IdbKeyStore`**, one wrapped record per identity under the replica key's non-extractable key-encryption key and passkey gate. That is decision 1 under R90, which left `IdbKeyStore` as the browser's only gated store for secrets, and its limits are the replica key's (chapter 14, RFC 10017 sections 8.5 and 8.6). `wipe_replica` removes it. Anonymous clients and in-memory bots store nothing (R94 decision 20). Rejected: a set kept server-side for the browser session, which re-delivers application credentials across chapter 12's delivery boundary and dies with the session while the key and the replica outlive it. Rejected: no browser persistence, which fails this phase's restart proof.
 11. **A change while the client is locked is refused with `ClientError::Locked`**, as the gate refuses every other application call.
 12. **In a relay the worker holds the set.** A tab's add or remove travels to the worker as a relay request whose reply quotes its id, and after the swap the worker states `TabIdentity` to every tab, which the tab's mirror already applies.
@@ -5954,12 +5954,12 @@ A share key usually reaches an application while it runs, when a user opens a sh
 
 Seven pull requests, each building and passing CI on its own.
 
-1. The wire. The set message and its answer and the handshake's stated set in `connetto-core`, with chapter 02.
+1. The wire. The set message and its answer and the handshake's optional cursor-subject checkpoint in `connetto-core`, with chapter 02.
 2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate.
 3. A key leaves an open connection at its expiry. The grant check reports each key's `exp`, the model reports which tables the keys reach, and the session swaps its keys under the dispatch gate, registers again what read them, resends what they reached and drops the frames of the old answer still waiting for credit (decision 8).
-4. The swap on request. `ReplaceShareKeys` with its metering and answer, and the stated-set comparison at resume (decisions 2, 5, 6 and 9).
-5. The native client. The add and remove call, persistence beside the refresh token under the gate, the recorded acknowledged set, the re-render and the client expiry timer.
-6. The browser. The worker's call, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
+4. The swap on request. `ReplaceShareKeys` with its metering and queued-only answer, and authorization snapshots for unknown or differing cursor coverage at resume (decisions 2, 5, 6 and 9).
+5. The native client. The add and remove call, persistence beside the refresh token under the gate, durable checkpoint invalidation and publication, the re-render and the client expiry timer.
+6. The browser. The worker's call and durable checkpoint ownership, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
 7. The documents. Chapters 12 and 13 with the carrying guidance.
 
 ### Proof
@@ -5969,10 +5969,11 @@ Seven pull requests, each building and passing CI on its own.
 3. A key reaching its `exp` on an open connection removes its rows on both sides without a reconnect.
 4. A key that fails to check draws the same silence and the same metering mid-session as at the handshake, and repeated swaps are limited.
 5. A change while locked is refused, and a tab's change reaches every tab of the relay.
+6. Interrupted replacements and repeated key changes, including a return to the starting set, preserve unchanged rows across reconnects and late subscription replay. Unknown coverage requires authorization snapshots even when no key resolves, while a matching known empty checkpoint permits catch-up.
 
 ### Done when
 
-Both platforms add and remove share keys on a running client, persist them where the client is durable, and chapters 02, 12 and 13 describe the message, the stated set and the carrying guidance.
+Both platforms add and remove share keys on a running client, persist them where the client is durable, and chapters 02, 12 and 13 describe the messages, durable authorization checkpoints and carrying guidance.
 
 ---
 
