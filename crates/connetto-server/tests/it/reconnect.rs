@@ -48,6 +48,7 @@ use subql::{
     SourceItem,
 };
 
+mod failures;
 const PG_DDL: &str =
     "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT);";
 const SQLITE_DDL: &str =
@@ -783,6 +784,8 @@ struct Script {
     armed: bool,
     /// Holds the next entries read until the test releases it, telling the test it arrived.
     hold: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+    current_reads: std::collections::HashMap<tokio::task::Id, usize>,
+    panic_next_page: bool,
 }
 
 /// An in-memory reconnect log that refuses scripted reads, as a database does while it is cut off.
@@ -816,6 +819,11 @@ impl ScriptedOplog {
                 return Ok(());
             }
             script.reads.push(read);
+            if read == "current_position"
+                && let Some(task) = tokio::task::try_id()
+            {
+                *script.current_reads.entry(task).or_default() += 1;
+            }
             if script.refuse.front() == Some(&read) {
                 script.refuse.pop_front();
                 (
@@ -856,8 +864,15 @@ impl Oplog for ScriptedOplog {
         let hold = self.script.lock().expect("script").hold.take();
         if let Some((arrived, release)) = hold {
             arrived.notify_one();
-            release.notified().await;
+            tokio::time::timeout(Duration::from_secs(15), release.notified())
+                .await
+                .expect("held page released before deadline");
         }
+        let panic = {
+            let mut script = self.script.lock().expect("script");
+            std::mem::take(&mut script.panic_next_page)
+        };
+        assert!(!panic, "scripted catch-up walker panic");
         self.gate("entries_since").await?;
         self.inner
             .entries_since(after)
@@ -911,8 +926,8 @@ impl Oplog for ScriptedOplog {
     }
 }
 
-type ScriptedManager =
-    SessionManager<SeedSnapshot, RosterAuth, ConnettoDefaults, NoConnector, ScriptedOplog>;
+type ScriptedManager<A = RosterAuth> =
+    SessionManager<SeedSnapshot, A, ConnettoDefaults, NoConnector, ScriptedOplog>;
 
 /// Open a session on the scripted manager, printing the error it ends with, and read the ack.
 async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> LoopbackTransport {
@@ -974,21 +989,42 @@ async fn scripted_for(
     Vec<PgChangeEvent>,
     PgSqliteEmuSource,
 ) {
-    let script = Arc::new(std::sync::Mutex::new(Script::default()));
     let roster = names[1..]
         .iter()
         .fold(RosterAuth::granting(names[0]), |roster, name| {
             roster.and(*name)
         });
+    scripted_with_auth(fixture, config, roster, PG_DDL).await
+}
+
+async fn scripted_with_auth<A>(
+    fixture: &Fixture,
+    config: SessionConfig,
+    auth: A,
+    ddl: &str,
+) -> (
+    Arc<ScriptedManager<A>>,
+    Arc<std::sync::Mutex<Script>>,
+    Vec<PgChangeEvent>,
+    PgSqliteEmuSource,
+)
+where
+    A: VisibilityPolicy<Watcher = Arc<connetto_core::Principal>, Backend = Postgres>
+        + Send
+        + Sync
+        + 'static,
+    A::Error: core::fmt::Display + connetto_server::FailedAuthorization,
+{
+    let script = Arc::new(std::sync::Mutex::new(Script::default()));
     let manager = ManagerBuilder::new(
-        Materializer::builder(PG_DDL)
+        Materializer::builder(ddl)
             .build()
             .expect("build materializer"),
         SeedSnapshot,
-        roster,
+        auth,
         test_verifier(),
         NoConnector,
-        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), ddl)
             .expect("build write target"),
     )
     .with_oplog(ScriptedOplog {
@@ -997,7 +1033,7 @@ async fn scripted_for(
     })
     .with_session(config)
     .build();
-    let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
+    let mut source = PgSqliteEmuSource::open_in_memory(ddl).expect("open emu source");
     let mut events = Vec::new();
     for id in 1..=3 {
         let sql = format!(
