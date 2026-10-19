@@ -22,15 +22,20 @@
 //! own responsibility, so the maintainer allows them once, on the first
 //! run, and the run itself takes no further taps.
 //!
-//! It runs on a Mac as the command of `connetto-demo-stack`, which provides the
-//! stack and the environment naming it.
+//! `--star` drives an iPhone, an iPad and an Android phone through Android-hosted and iPhone-hosted rounds. Each round requires all six directed peer observations after a 60s freshness interval and preserves its matrix, pages and cleanup result.
+//!
+//! It runs on a Mac through a private driver script passed to `connetto-demo-stack`, which supplies the stack environment without logging the script's password arguments.
 //!
 //! ```text
 //! cargo build -p connetto-test-harness --bin connetto-ios-proof
-//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- \
-//!   target/debug/connetto-ios-proof [--simulator UDID | --device UDID --identity SHA1] \
+//! cargo run -p connetto-test-harness --bin connetto-demo-stack -- sh private-proof.sh
+//!
+//! # Proof command usage
+//! target/debug/connetto-ios-proof [--simulator UDID | --device UDID --identity SHA1] \
 //!     [--demo dioxus|tauri] [--app PATH] \
-//!     [--peer-device UDID | --mac-peer] [--every-join --hotspot-passphrase PASS]
+//!     [--peer-device UDID --every-join | --mac-peer --every-join | \
+//!      --star --peer-device UDID --android-peer SERIAL --android-apk APK] \
+//!     [--hotspot-passphrase PASS]
 //! ```
 //!
 //! A simulator build carries the keychain entitlements under the team ID
@@ -54,12 +59,14 @@
 //! Android's killed-process step has no counterpart here, since the session
 //! that catches the redirect dies with the process that opened it.
 
+use std::fmt::Write as _;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow, bail};
 use connetto_client::BluetoothState;
+use connetto_test_harness::android_phone;
 use connetto_test_harness::demo::{order_count, wait_for_count};
 use connetto_test_harness::inspector::{PageSession, list_pages};
 use connetto_test_harness::ios_signing;
@@ -74,6 +81,8 @@ use connetto_test_harness::stack::{
     TLS_CERT_VAR, TLS_KEY_VAR, demo_has_device_identity, demo_mobile_features, now_millis,
     repo_path,
 };
+use connetto_test_harness::star;
+use connetto_test_harness::step;
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt as _;
 use tokio::process::{Child, Command};
@@ -141,7 +150,15 @@ const DEMO_LOG_SOURCES: [&str; 2] = [
 ];
 /// The system's alert button labels in the runner's locales, which the
 /// tapper taps in place of the user (R76).
-const ALERT_LABELS: [&str; 6] = ["Join", "Accedi", "Connetti", "Allow", "Consenti", "OK"];
+const ALERT_LABELS: [&str; 7] = [
+    "Join",
+    "Accedi",
+    "Connetti",
+    "Allow",
+    "Consenti",
+    "OK",
+    "Continua a provare con la rete Wi-Fi",
+];
 /// The iOS development profile the tapper's runner signs with, as
 /// `connetto-ios-signing` names it.
 const TAPPER_PROFILE: &str = "connetto tapper development";
@@ -187,8 +204,12 @@ async fn driver() -> Result<()> {
         },
         _ => unreachable!("parse_arguments checked the simulator and device"),
     };
-    let evidence =
-        repo_path(&["target", "ios-proof"])?.join(format!("{}-{}", target.udid(), now_millis()));
+    let evidence = repo_path(&["target", "ios-proof"])?.join(format!(
+        "{}{}-{}",
+        if parsed.star { "star-" } else { "" },
+        target.udid(),
+        now_millis()
+    ));
     tokio::fs::create_dir_all(&evidence)
         .await
         .with_context(|| format!("creating {}", evidence.display()))?;
@@ -200,7 +221,24 @@ async fn driver() -> Result<()> {
     };
     let (mut relay, sync_url) = relay_for(&target, &stack).await?;
     let started = std::time::SystemTime::now();
-    let outcome = if parsed.every_join {
+    let outcome = if parsed.star {
+        star_walk(
+            &target,
+            &app,
+            &stack,
+            &evidence,
+            &mut relay,
+            &sync_url,
+            identity.as_deref(),
+            parsed.peer.as_deref(),
+            parsed.android_peer.as_deref(),
+            parsed.android_apk.as_deref(),
+            parsed.android_unlock_pin.as_deref(),
+            parsed.passphrase.as_deref(),
+            parsed.join.unwrap_or_default(),
+        )
+        .await
+    } else if parsed.every_join {
         every_join_walk(
             &target,
             &app,
@@ -414,6 +452,12 @@ async fn prove(
     step("install");
     target.install(app).await?;
     let mut inspector = Inspector::start(target, evidence).await?;
+    // Discovery's first browse asks for the local network after every
+    // install, and the alert keeps the app inactive, so no login page opens.
+    let tapper = match target {
+        Target::Device { udid, identity } => Some(Tapper::build(udid, identity, evidence).await?),
+        Target::Simulator { .. } => None,
+    };
 
     step("sign in");
     target
@@ -423,8 +467,14 @@ async fn prove(
             ("CONNETTO_DEMO_PG", &stack.pg_url),
         ])
         .await?;
+    // A credential an aborted run left signed in starts discovery at launch.
+    if let Some(tapper) = &tapper {
+        tapper
+            .run("tap-alert", 40, evidence, "local-network-at-launch")
+            .await?;
+    }
     let login_prefix = format!("{}/authorize?", stack.issuer);
-    let mut app = sign_in(target, &mut inspector, &login_prefix, evidence).await?;
+    let mut app = sign_in(target, &mut inspector, &login_prefix, evidence, USER).await?;
     target.record(&mut app, evidence, "signed-in").await?;
 
     if demo_has_device_identity() {
@@ -434,6 +484,11 @@ async fn prove(
         target
             .record(&mut app, evidence, "device-certified")
             .await?;
+        if let Some(tapper) = &tapper {
+            tapper
+                .run("tap-alert", 40, evidence, "local-network")
+                .await?;
+        }
     }
 
     step("sync a backend write");
@@ -493,56 +548,59 @@ async fn sign_in(
     inspector: &mut Inspector,
     login_prefix: &str,
     evidence: &Path,
+    user: &str,
 ) -> Result<PageSession> {
     let deadline = Instant::now() + Duration::from_secs(90);
     let mut demo = String::from("no demo page");
-    loop {
-        if let Some(mut login) = inspector
-            .try_page(|url| url.starts_with(login_prefix))
-            .await?
-        {
-            target.screenshot(evidence, "login-page").await?;
-            submit_login(&mut login).await?;
-            let mut app = inspector.page(is_demo_page).await?;
-            app.wait_for_text("status: connected", Duration::from_secs(90))
-                .await?;
-            // The simulator creates gated keychain items without enforcing
-            // them, so the custody reads verified there too. The sheet itself
-            // is proven on a device with a person.
-            app.wait_for_text(
-                "custody: released only after user verification",
-                Duration::from_secs(10),
-            )
-            .await?;
-            return Ok(app);
-        }
-        if let Some(mut app) = inspector.try_page(is_demo_page).await? {
-            // A page that does not answer is looked for again through a fresh
-            // proxy, since a relaunched app's inspector can stall once.
-            match app.page_text().await {
-                Ok(text) => {
-                    if text.contains("status: connected") {
-                        eprintln!("an earlier credential signed the demo in, signing out first");
-                        sign_out(&mut app).await?;
+    let observe = async {
+        let mut submitted = false;
+        loop {
+            if !submitted
+                && let Some(mut login) = inspector
+                    .try_page(|url| url.starts_with(login_prefix))
+                    .await?
+            {
+                target.screenshot(evidence, "login-page").await?;
+                submit_login(&mut login, user).await?;
+                submitted = true;
+                continue;
+            }
+            if let Some(mut app) = inspector.try_page(is_demo_page).await? {
+                match app.page_text().await {
+                    Ok(text) => {
+                        if text.contains("status: connected") {
+                            if !submitted {
+                                eprintln!(
+                                    "an earlier credential signed the demo in, signing out first"
+                                );
+                                sign_out(&mut app).await?;
+                            } else if text
+                                .contains("custody: released only after user verification")
+                            {
+                                return Ok::<_, anyhow::Error>(app);
+                            }
+                        }
+                        demo = text.split_whitespace().collect::<Vec<_>>().join(" ");
                     }
-                    demo = text.split_whitespace().collect::<Vec<_>>().join(" ");
-                }
-                Err(err) => {
-                    demo = format!("a page that did not answer ({err:#})");
-                    inspector.restart_at = Instant::now();
+                    Err(err) => {
+                        demo = format!("a page that did not answer ({err:#})");
+                        eprintln!("{demo}, reattaching the inspector");
+                        inspector.restart_at = Instant::now();
+                    }
                 }
             }
+            inspector.keep_alive().await?;
+            sleep(Duration::from_secs(1)).await;
         }
-        if Instant::now() >= deadline {
-            let shown: String = demo.chars().take(400).collect();
-            bail!(
-                "neither the login page nor a signed-in demo appeared within 90s, the demo \
-                 showed {shown:?}, {}",
-                inspector.state()
-            );
-        }
-        inspector.keep_alive().await?;
-        sleep(Duration::from_secs(1)).await;
+    };
+    if let Ok(outcome) = tokio::time::timeout_at(deadline, observe).await {
+        outcome
+    } else {
+        let shown: String = demo.chars().take(400).collect();
+        bail!(
+            "sign-in did not finish within 90s, the demo showed {shown:?}, {}",
+            inspector.state()
+        );
     }
 }
 
@@ -571,10 +629,10 @@ async fn leave_signed_out(phone: &Target, evidence: &Path) -> Result<()> {
 /// Fill the dev user into the identity provider's form and submit it. The
 /// authentication session catches the final redirect itself, so no trusted
 /// input is needed.
-async fn submit_login(login: &mut PageSession) -> Result<()> {
+async fn submit_login(login: &mut PageSession, user: &str) -> Result<()> {
     let script = format!(
         "(() => {{ const u = document.querySelector('input[name=username]'); if (!u) return false; u.value = {}; u.form.submit(); return true; }})()",
-        serde_json::Value::String(USER.to_owned())
+        serde_json::Value::String(user.to_owned())
     );
     if login.evaluate(&script).await? == true {
         Ok(())
@@ -622,10 +680,6 @@ async fn recheck_after_time_away(
     Ok(app)
 }
 
-fn step(name: &str) {
-    eprintln!("== {name}");
-}
-
 /// What the command line names, before anything runs.
 #[derive(Default)]
 struct ParsedArguments {
@@ -637,11 +691,21 @@ struct ParsedArguments {
     mac_peer: bool,
     every_join: bool,
     passphrase: Option<String>,
+    star: bool,
+    android_peer: Option<String>,
+    android_apk: Option<PathBuf>,
+    android_unlock_pin: Option<String>,
+    join: Option<star::Join>,
 }
 
 /// `--simulator`, or `--device` with `--identity`, `--app`, and, for the
 /// two-phone run, `--peer-device`, `--every-join` and
-/// `--hotspot-passphrase`, and, for the mac run, `--mac-peer` beside them.
+/// `--hotspot-passphrase`, and, for the mac run, `--mac-peer` beside them,
+/// and, for the star, the Android phone's arguments (R76 slice 9f).
+#[expect(
+    clippy::too_many_lines,
+    reason = "mode validation stays beside argument parsing"
+)]
 fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
     let mut arguments = ParsedArguments::default();
     let mut args = args.iter();
@@ -674,8 +738,48 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
                 arguments.passphrase = Some(argument_value(&mut args, arg)?.to_owned());
             }
             "--every-join" => arguments.every_join = true,
+            "--star" => arguments.star = true,
+            "--android-peer" => {
+                arguments.android_peer = Some(argument_value(&mut args, arg)?.to_owned());
+            }
+            "--android-apk" => {
+                arguments.android_apk =
+                    Some(PathBuf::from(argument_value(&mut args, arg)?.to_owned()));
+            }
+            "--android-unlock-pin" => {
+                arguments.android_unlock_pin = Some(argument_value(&mut args, arg)?.to_owned());
+            }
+            "--join" => {
+                arguments.join = Some(
+                    star::Join::parse(argument_value(&mut args, arg)?)
+                        .map_err(|err| anyhow!("{err}"))?,
+                );
+            }
             other => bail!("unknown argument {other:?}"),
         }
+    }
+    if arguments.star && arguments.simulator.is_some() {
+        bail!(
+            "--star drives the iPhone, the iPad and the Android phone, so it needs --device, not --simulator"
+        );
+    }
+    if arguments.star && arguments.every_join {
+        bail!("give either --star or --every-join, not both");
+    }
+    if arguments.star && arguments.mac_peer {
+        bail!("give either --star or --mac-peer, not both");
+    }
+    if arguments.star
+        && (arguments.device.is_none()
+            || arguments.identity.is_none()
+            || arguments.peer.is_none()
+            || arguments.android_peer.is_none()
+            || arguments.android_apk.is_none()
+            || arguments.passphrase.is_none())
+    {
+        bail!(
+            "--star needs --device, --identity, --peer-device, --android-peer, --android-apk and --hotspot-passphrase"
+        );
     }
     if arguments.simulator.is_some() && arguments.device.is_some() {
         bail!("give either --simulator or --device, not both");
@@ -689,8 +793,8 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
     if arguments.mac_peer && arguments.simulator.is_some() {
         bail!("--mac-peer runs a paired phone and this Mac, so it needs --device, not --simulator");
     }
-    if arguments.peer.is_some() && !arguments.every_join {
-        bail!("--peer-device needs --every-join");
+    if arguments.peer.is_some() && !arguments.every_join && !arguments.star {
+        bail!("--peer-device needs --every-join or --star");
     }
     if arguments.mac_peer && !arguments.every_join {
         bail!("--mac-peer needs --every-join");
@@ -713,8 +817,8 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
     {
         bail!("--peer-device names the same device as --device");
     }
-    if arguments.every_join && matches!(demo(), Demo::Tauri) {
-        bail!("--every-join needs the dioxus demo, whose panel holds the peer controls");
+    if (arguments.every_join || arguments.star) && matches!(demo(), Demo::Tauri) {
+        bail!("--every-join and --star need the dioxus demo, whose panel holds the peer controls");
     }
     Ok(arguments)
 }
@@ -1319,7 +1423,7 @@ async fn host_signed_back_in(
     .await?;
     let mut host_inspector = Inspector::start(host, evidence).await?;
     let login_prefix = format!("{}/authorize?", stack.issuer);
-    let mut host_app = sign_in(host, &mut host_inspector, &login_prefix, evidence).await?;
+    let mut host_app = sign_in(host, &mut host_inspector, &login_prefix, evidence, USER).await?;
     host_app
         .wait_for_text("device: certified until", Duration::from_secs(60))
         .await?;
@@ -1645,7 +1749,8 @@ async fn peer_proof(
         .await?;
     let login_prefix = format!("{}/authorize?", stack.issuer);
     step("sign in the second phone");
-    let mut peer_app = sign_in(joiner, &mut joiner_inspector, &login_prefix, evidence).await?;
+    let mut peer_app =
+        sign_in(joiner, &mut joiner_inspector, &login_prefix, evidence, USER).await?;
     // A local-network prompt can show while the page first browses.
     joiner_tapper
         .run("tap-alert", 40, evidence, "peer-local-network")
@@ -1784,7 +1889,16 @@ async fn one_join(
         let offer = read_hotspot_offer(host_app).await?;
         host.record(host_app, evidence, &shot("host-offer")).await?;
 
-        join_on_second_phone(join, &offer, joiner, peer_app, joiner_tapper, evidence).await?;
+        join_on_second_phone(
+            join,
+            join.name(),
+            &offer,
+            joiner,
+            peer_app,
+            joiner_tapper,
+            evidence,
+        )
+        .await?;
         // The joiner moved onto the hotspot, which can reset the links both
         // pages' sessions ride on.
         *peer_app = joiner_inspector.reattach().await?;
@@ -1828,9 +1942,11 @@ async fn one_join(
 }
 
 /// The second phone's side of one join, up to the system's join prompt
-/// tapped.
+/// tapped. The evidence takes the names the caller gives in `shot`, which
+/// the star uses to tell its two joiners apart.
 async fn join_on_second_phone(
     join: JoinBy,
+    shot: &str,
     offer: &HotspotOfferLines,
     joiner: &Target,
     peer_app: &mut PageSession,
@@ -1842,21 +1958,13 @@ async fn join_on_second_phone(
             step("find the beacon on the second phone");
             wait_for_single_nearby(peer_app).await?;
             joiner
-                .record(peer_app, evidence, &format!("{}-peer-nearby", join.name()))
+                .record(peer_app, evidence, &format!("{shot}-peer-nearby"))
                 .await?;
             peer_app.click("Join the nearby host").await?;
             // The line shows while the exchange and then the join run,
             // behind which the system's prompts stand.
             peer_app
                 .wait_for_text("joining the nearby host", Duration::from_secs(10))
-                .await?;
-            joiner_tapper
-                .run(
-                    "tap-alert",
-                    40,
-                    evidence,
-                    &format!("{}-joiner-alert", join.name()),
-                )
                 .await?;
         }
         JoinBy::Payload => {
@@ -1871,14 +1979,6 @@ async fn join_on_second_phone(
                 .wait_for_text("joining the hotspot", Duration::from_secs(10))
                 .await
                 .context("the second phone did not take the payload")?;
-            joiner_tapper
-                .run(
-                    "tap-alert",
-                    40,
-                    evidence,
-                    &format!("{}-joiner-alert", join.name()),
-                )
-                .await?;
         }
         JoinBy::Form => {
             step("fill the join form on the second phone");
@@ -1889,16 +1989,17 @@ async fn join_on_second_phone(
             peer_app
                 .wait_for_text("joining the hotspot", Duration::from_secs(10))
                 .await?;
-            joiner_tapper
-                .run(
-                    "tap-alert",
-                    40,
-                    evidence,
-                    &format!("{}-joiner-alert", join.name()),
-                )
-                .await?;
         }
     }
+    let bound = if join == JoinBy::Beacon { 90 } else { 60 };
+    joiner_tapper
+        .run(
+            "tap-join-alert",
+            bound,
+            evidence,
+            &format!("{shot}-joiner-alert"),
+        )
+        .await?;
     Ok(())
 }
 
@@ -1942,6 +2043,30 @@ async fn switch_and_reattach(
     let switched = tapper.switch_hotspot(on, evidence, name).await;
     *app = inspector.reattach().await?;
     switched
+}
+
+/// Run `action` on the page, once more on a fresh session when the inspector
+/// session dropped, since a Personal Hotspot switch resets the USB link some
+/// seconds after the runner reattached.
+async fn on_page<T>(
+    inspector: &mut Inspector,
+    app: &mut PageSession,
+    mut action: impl AsyncFnMut(&mut PageSession) -> Result<T>,
+) -> Result<T> {
+    match action(app).await {
+        Err(err) if session_dropped(&err) => {
+            eprintln!("the page session dropped ({err:#}), on a fresh session");
+            *app = inspector.reattach().await?;
+            action(app).await
+        }
+        outcome => outcome,
+    }
+}
+
+/// Whether the error is the inspector session's own, not the page's answer.
+fn session_dropped(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}");
+    text.contains("inspector session") || text.contains("inspector request")
 }
 
 /// Wait until the joiner lists exactly one nearby host, whose beacon the join
@@ -2042,7 +2167,12 @@ impl Tapper {
         let mut found = Vec::new();
         while let Some(entry) = read.next_entry().await? {
             let path = entry.path();
-            if path.extension().is_some_and(|ext| ext == "xctestrun") {
+            // `run` writes its `tapper-<name>.xctestrun` files beside the build's own.
+            let own_run = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("tapper-"));
+            if path.extension().is_some_and(|ext| ext == "xctestrun") && !own_run {
                 found.push(path);
             }
         }
@@ -2584,6 +2714,1583 @@ fn free_port() -> Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+// The handheld star (R76 slice 9f): the two rounds where the iPhone, the
+// iPad and the Android phone share one hotspot at a time.
+
+/// The star's Android phone: its `adb`, and the setting and the network the
+/// run restores it to.
+struct StarAndroid {
+    /// The phone at its `adb`.
+    device: android_phone::Device,
+    /// The screen-on setting the run restores.
+    stay_on: Option<String>,
+    /// The error dialogs' setting the run restores.
+    error_dialogs: Option<String>,
+    /// The browser role holder the run restores.
+    browser_holder: Option<String>,
+    /// The network the phone stands on before the run.
+    usual_ssid: Option<String>,
+}
+
+/// One of the star's three pages, read through a session that a broken read
+/// replaces from its own inspector or `adb` within the bound.
+enum StarPage<'a> {
+    /// An iOS handheld's page on its inspector.
+    Ios {
+        app: &'a mut PageSession,
+        inspector: &'a mut Inspector,
+    },
+    /// The Android phone's page on its `adb` link.
+    Android {
+        device: &'a android_phone::Device,
+        app: &'a mut PageSession,
+    },
+}
+
+impl StarPage<'_> {
+    /// The page's text, on a fresh session when the page did not answer. The
+    /// match binds the fields' references through one more level, so each
+    /// arm reborrows them at their own depth.
+    async fn text(&mut self) -> Result<String> {
+        match self {
+            Self::Ios { app, inspector } => {
+                let app = &mut **app;
+                let inspector = &mut **inspector;
+                match app.page_text().await {
+                    Ok(text) => Ok(text),
+                    Err(err) => {
+                        eprintln!("the page did not answer ({err:#}), on a fresh session");
+                        *app = inspector.reattach().await?;
+                        app.page_text().await
+                    }
+                }
+            }
+            Self::Android { device, app } => {
+                let app = &mut **app;
+                let device = &**device;
+                match app.page_text().await {
+                    Ok(text) => Ok(text),
+                    Err(err) => {
+                        eprintln!("the Android page did not answer ({err:#}), on a fresh session");
+                        *app = device.app().await?;
+                        app.page_text().await
+                    }
+                }
+            }
+        }
+    }
+
+    async fn leave_hotspot(&mut self) -> Result<()> {
+        if !self.text().await?.contains("Leave the hotspot") {
+            return Ok(());
+        }
+        match self {
+            Self::Ios { app, .. } | Self::Android { app, .. } => {
+                app.click("Leave the hotspot").await
+            }
+        }
+    }
+}
+
+/// The `JoinBy` a star's join uses on the iOS joiner.
+fn join_by(join: star::Join) -> JoinBy {
+    match join {
+        star::Join::Beacon => JoinBy::Beacon,
+        star::Join::Payload => JoinBy::Payload,
+        star::Join::Form => JoinBy::Form,
+    }
+}
+
+/// The name a step's report reads, the way the summary prints it.
+fn step_name(round: star::Round, joiner: star::Device, join: star::Join) -> String {
+    format!(
+        "{} round, the {} joins by the {}",
+        round.name(),
+        joiner.name(),
+        join.name()
+    )
+}
+
+/// The round whose early steps failed, every step carrying the same error.
+fn failed_round(plan: star::RoundPlan, err: &anyhow::Error) -> star::RoundReport {
+    let round = plan.round;
+    let failed = |name: String| star::StepReport {
+        name,
+        took: Duration::from_secs(0),
+        outcome: Err(format!("{err:#}")),
+    };
+    star::RoundReport {
+        round,
+        joins: [
+            failed(step_name(round, plan.joiners[0], plan.join)),
+            failed(step_name(round, plan.joiners[1], plan.join)),
+        ],
+        link: failed(format!("{} round, the three-way link", round.name())),
+        restore: failed(format!("{} round, the restore", round.name())),
+    }
+}
+
+async fn read_star_pages(pages: [&mut StarPage<'_>; 3], deadline: Instant) -> [Result<String>; 3] {
+    let [first, second, third] = pages;
+    let (first, second, third) = tokio::join!(
+        tokio::time::timeout_at(deadline, first.text()),
+        tokio::time::timeout_at(deadline, second.text()),
+        tokio::time::timeout_at(deadline, third.text()),
+    );
+    [first, second, third]
+        .map(|result| result.context("reading a star page exceeded its deadline")?)
+}
+
+async fn wait_star_link(
+    pages: [&mut StarPage<'_>; 3],
+    names: [&str; 3],
+    identities: [&str; 3],
+    evidence: &Path,
+    round: star::Round,
+    gateway: &mut Option<std::net::Ipv4Addr>,
+) -> Result<()> {
+    let [first, second, third] = pages;
+    observe_star_link(
+        async |deadline| read_star_pages([&mut *first, &mut *second, &mut *third], deadline).await,
+        names,
+        identities,
+        evidence,
+        round,
+        gateway,
+    )
+    .await
+}
+
+/// Hold until every star page names the other two as linked through the
+/// round's hotspot, learning its gateway off a joiner's page, and write the
+/// matrix and the three pages to the evidence.
+async fn observe_star_link(
+    mut read: impl AsyncFnMut(Instant) -> [Result<String>; 3],
+    names: [&str; 3],
+    identities: [&str; 3],
+    evidence: &Path,
+    round: star::Round,
+    gateway: &mut Option<std::net::Ipv4Addr>,
+) -> Result<()> {
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(120);
+    // Expired home-network links must age past the peer's 45s silence bound.
+    let fresh_after = started + Duration::from_secs(60);
+    let mut texts: [Option<String>; 3] = [None, None, None];
+    let mut failures: [Option<String>; 3] = [None, None, None];
+    let mut matrix = star::LinkMatrix::from_pages(identities, ["", "", ""], *gateway);
+    let mut passed = false;
+    while Instant::now() < deadline {
+        let read_started = Instant::now();
+        let read_deadline = deadline.min(read_started + Duration::from_secs(15));
+        let answers = match tokio::time::timeout_at(deadline, read(read_deadline)).await {
+            Ok(answers) => answers,
+            Err(_) => std::array::from_fn(|_| Err(anyhow!("the observation deadline expired"))),
+        };
+        let mut complete = true;
+        let mut answered = false;
+        for (index, answer) in answers.into_iter().enumerate() {
+            match answer {
+                Ok(text) => {
+                    texts[index] = Some(text);
+                    failures[index] = None;
+                    answered = true;
+                }
+                Err(error) => {
+                    failures[index] = Some(format!("{error:#}"));
+                    complete = false;
+                }
+            }
+        }
+        if answered {
+            if gateway.is_none() {
+                *gateway = texts
+                    .iter()
+                    .flatten()
+                    .find_map(|text| star::hotspot_gateway(text));
+            }
+            matrix = star::LinkMatrix::from_pages(
+                identities,
+                texts.each_ref().map(|text| text.as_deref().unwrap_or("")),
+                *gateway,
+            );
+        }
+        if complete && read_started >= fresh_after && matrix.holds() {
+            passed = true;
+            break;
+        }
+        tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_secs(2))).await;
+    }
+    write_star_matrix(&texts, &failures, matrix, names, evidence, round, passed).await?;
+    if passed {
+        return Ok(());
+    }
+    let mut missing = matrix.missing(names);
+    missing.extend(failures.iter().enumerate().filter_map(|(index, failure)| {
+        failure
+            .as_ref()
+            .map(|failure| format!("{} could not be read ({failure})", names[index]))
+    }));
+    if missing.is_empty() {
+        missing.push("no complete current observation after the freshness boundary".to_owned());
+    }
+    bail!("the three-way link did not hold, {}", missing.join(", "));
+}
+
+async fn write_star_matrix(
+    texts: &[Option<String>; 3],
+    failures: &[Option<String>; 3],
+    matrix: star::LinkMatrix,
+    names: [&str; 3],
+    evidence: &Path,
+    round: star::Round,
+    passed: bool,
+) -> Result<()> {
+    let name = round.name();
+    let mut shown = if passed {
+        String::new()
+    } else {
+        "last observed links\n".to_owned()
+    };
+    shown.push_str(&matrix.text(names));
+    shown.push('\n');
+    for (index, failure) in failures.iter().enumerate() {
+        if let Some(failure) = failure {
+            shown.push_str(names[index]);
+            shown.push_str(" could not be read (");
+            shown.push_str(failure);
+            shown.push_str(")\n");
+        }
+    }
+    tokio::fs::write(evidence.join(format!("link-matrix-{name}.txt")), shown)
+        .await
+        .context("writing the link matrix")?;
+    for (index, text) in texts.iter().enumerate() {
+        if let Some(text) = text {
+            tokio::fs::write(
+                evidence.join(format!("link-matrix-{name}-{}.txt", names[index])),
+                text,
+            )
+            .await
+            .context("writing a link-matrix page")?;
+        }
+    }
+    Ok(())
+}
+
+/// Hold until no star page names a peer through the round's hotspot, which
+/// the leaves and the stop end. Links over any other network stay.
+async fn wait_star_links_end(
+    pages: [&mut StarPage<'_>; 3],
+    gateway: Option<std::net::Ipv4Addr>,
+) -> Result<()> {
+    if gateway.is_none() {
+        return Ok(());
+    }
+    let deadline = Instant::now() + LINK_END_BOUND;
+    let [first, second, third] = pages;
+    while Instant::now() < deadline {
+        let read_deadline = deadline.min(Instant::now() + Duration::from_secs(15));
+        let answers =
+            read_star_pages([&mut *first, &mut *second, &mut *third], read_deadline).await;
+        if answers.iter().all(|answer| {
+            answer
+                .as_ref()
+                .is_ok_and(|text| !star::names_hotspot_link(text, gateway))
+        }) {
+            return Ok(());
+        }
+        tokio::time::sleep_until(deadline.min(Instant::now() + Duration::from_secs(2))).await;
+    }
+    bail!("link termination could not be observed within {LINK_END_BOUND:?}");
+}
+
+async fn restore_android_network(android: &StarAndroid) -> Result<()> {
+    android
+        .device
+        .adb(&["shell", "svc", "wifi", "enable"])
+        .await?;
+    if let Some(ssid) = &android.usual_ssid {
+        android.device.restore_network(ssid).await?;
+    }
+    Ok(())
+}
+
+/// The star's one-time Android setup: the phone awake and unlocked, the demo
+/// installed clear of its earlier run, the links the demo dials reversed, the
+/// Bluetooth permissions granted and its own account signed in.
+async fn star_android_setup(
+    device: android_phone::Device,
+    apk: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    unlock_pin: Option<&str>,
+) -> Result<(StarAndroid, Result<(), String>)> {
+    // The run's own values of the phone's settings, read before it moves
+    // any of them, so a failed setup still brings them back.
+    let (device, usual_ssid, stay_on, error_dialogs, browser_holder) = async {
+        let usual_ssid = device.current_ssid().await?;
+        let stay_on = device.global_setting(android_phone::STAY_ON).await?;
+        let error_dialogs = device
+            .global_setting(android_phone::HIDE_ERROR_DIALOGS)
+            .await?;
+        // The login tab is read through Chrome's DevTools socket, so Chrome
+        // holds the browser role for the run and the device's own choice
+        // returns after.
+        let browser_holder = device.browser_role_holder().await?;
+        Ok::<
+            (
+                android_phone::Device,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            ),
+            anyhow::Error,
+        >((device, usual_ssid, stay_on, error_dialogs, browser_holder))
+    }
+    .await?;
+    let star = StarAndroid {
+        device,
+        stay_on,
+        error_dialogs,
+        browser_holder,
+        usual_ssid,
+    };
+    let outcome = async {
+        star.device.hide_error_dialogs().await?;
+        star.device
+            .adb(&["shell", "svc", "power", "stayon", "true"])
+            .await?;
+        star.device
+            .adb(&["shell", "input", "keyevent", "KEYCODE_WAKEUP"])
+            .await?;
+        let unlock = android_phone::Unlock { pin: unlock_pin };
+        unlock.dismiss_keyguard(&star.device).await?;
+        step("install the demo on the Android phone");
+        let package = android_phone::Demo::Dioxus.package();
+        star.device
+            .adb(&["install", "-r", "-t", &apk.display().to_string()])
+            .await?;
+        star.device.adb(&["shell", "pm", "clear", package]).await?;
+        star.device.adb(&["logcat", "-c"]).await?;
+        star.device.adb(&["reverse", "--remove-all"]).await?;
+        let reverse = android_phone::parse_reverse(
+            &std::env::var("CONNETTO_DEMO_ADB_REVERSE").with_context(
+                || "CONNETTO_DEMO_ADB_REVERSE is unset, run under connetto-demo-stack",
+            )?,
+        )?;
+        for (device_port, host_port) in &reverse {
+            star.device.reverse(*device_port, *host_port).await?;
+        }
+        for permission in android_phone::BT_PERMISSIONS {
+            star.device
+                .adb(&["shell", "pm", "grant", package, permission])
+                .await?;
+        }
+        star.device
+            .adb(&[
+                "shell",
+                "pm",
+                "grant",
+                package,
+                "android.permission.NEARBY_WIFI_DEVICES",
+            ])
+            .await?;
+        step("sign in the Android phone");
+        android_phone::sign_in_phone(
+            &star.device,
+            star::Device::Android.account(),
+            &stack.issuer,
+            evidence,
+            unlock,
+            "android",
+        )
+        .await?;
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+    Ok((star, outcome.map_err(|err| format!("{err:#}"))))
+}
+
+/// The iPad standing signed in as its own account: its earlier page
+/// reattached when it is still up, a fresh install and sign-in otherwise.
+async fn ipad_signed_in(
+    ipad: &Target,
+    fresh: bool,
+    app: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    sync_url: &str,
+) -> Result<(Inspector, PageSession)> {
+    if !fresh {
+        let mut inspector = Inspector::start(ipad, evidence).await?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < deadline {
+            if let Some(mut page) = inspector.try_page(is_demo_page).await?
+                && page.page_text().await?.contains("status: connected")
+            {
+                return Ok((inspector, page));
+            }
+            sleep(Duration::from_secs(1)).await;
+        }
+    }
+    step("install the demo on the iPad");
+    ipad.install(app).await?;
+    let mut inspector = Inspector::start(ipad, evidence).await?;
+    ipad.launch(&[
+        ("CONNETTO_DEMO_WS", sync_url),
+        ("CONNETTO_DEMO_AUTH_ORIGIN", &stack.auth_origin),
+        ("CONNETTO_DEMO_PG", &stack.pg_url),
+    ])
+    .await?;
+    step("sign in the iPad");
+    let login_prefix = format!("{}/authorize?", stack.issuer);
+    let page = sign_in(
+        ipad,
+        &mut inspector,
+        &login_prefix,
+        evidence,
+        star::Device::IPad.account(),
+    )
+    .await?;
+    Ok((inspector, page))
+}
+
+/// The star's round restore, which the round runs whatever its steps did:
+/// the joiners leave, the host stops its hotspot, the links end and the
+/// network the round moved comes back, the first failure kept.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the two iOS handhelds' pages and inspectors, the Android phone, the round, the host's kind, the tapper and the evidence are each the restore's own"
+)]
+async fn star_round_restore(
+    iphone_app: &mut PageSession,
+    iphone_inspector: &mut Inspector,
+    ipad_app: &mut PageSession,
+    ipad_inspector: &mut Inspector,
+    android: &StarAndroid,
+    round: star::Round,
+    personal_hotspot: bool,
+    gateway: Option<std::net::Ipv4Addr>,
+    iphone_tapper: &Tapper,
+    evidence: &Path,
+) -> (Duration, Result<(), String>) {
+    let started = Instant::now();
+    let outcome = async {
+        step("leave the hotspots");
+        let mut fail = Ok::<(), anyhow::Error>(());
+        if let Err(err) = (StarPage::Ios {
+            app: ipad_app,
+            inspector: ipad_inspector,
+        })
+        .leave_hotspot()
+        .await
+        {
+            eprintln!("the iPad's leave: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        if personal_hotspot {
+            let android_leave = async {
+                let mut android_app = android.device.app().await?;
+                StarPage::Android {
+                    device: &android.device,
+                    app: &mut android_app,
+                }
+                .leave_hotspot()
+                .await?;
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(err) = android_leave {
+                eprintln!("the Android phone's leave: {err:#}");
+                fail = fail.and(Err(err));
+            }
+            if let Err(err) = android
+                .device
+                .adb(&["shell", "am", "force-stop", "com.android.settings"])
+                .await
+            {
+                eprintln!("closing the Android network approval: {err:#}");
+                fail = fail.and(Err(err));
+            }
+            let stop = stop_hosting(iphone_inspector, iphone_app).await;
+            if let Err(err) = stop {
+                eprintln!("the iPhone's stop: {err:#}");
+                fail = fail.and(Err(err));
+            }
+            let off = switch_and_reattach(
+                false,
+                iphone_tapper,
+                iphone_inspector,
+                iphone_app,
+                evidence,
+                "iphone-hosts-hotspot-off",
+            )
+            .await;
+            if let Err(err) = off {
+                eprintln!("the iPhone's Personal Hotspot off: {err:#}");
+                fail = fail.and(Err(err));
+            }
+        } else {
+            if let Err(err) = (StarPage::Ios {
+                app: iphone_app,
+                inspector: iphone_inspector,
+            })
+            .leave_hotspot()
+            .await
+            {
+                eprintln!("the iPhone's leave: {err:#}");
+                fail = fail.and(Err(err));
+            }
+            let stop = async {
+                let attempt = async |app: &mut PageSession| {
+                    if app.page_text().await?.contains("hotspot: hosting") {
+                        app.click("Stop the hotspot").await?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                };
+                let mut android_app = android.device.app().await?;
+                if let Err(err) = attempt(&mut android_app).await {
+                    eprintln!(
+                        "the Android page did not take the stop ({err:#}), on a fresh session"
+                    );
+                    android_app = android.device.app().await?;
+                    attempt(&mut android_app).await?;
+                }
+                Ok::<(), anyhow::Error>(())
+            }
+            .await;
+            if let Err(err) = stop {
+                eprintln!("the Android phone's stop: {err:#}");
+                fail = fail.and(Err(err));
+            }
+        }
+        let links_end = async {
+            let mut android_app = android.device.app().await?;
+            wait_star_links_end(
+                [
+                    &mut StarPage::Ios {
+                        app: iphone_app,
+                        inspector: iphone_inspector,
+                    },
+                    &mut StarPage::Ios {
+                        app: ipad_app,
+                        inspector: ipad_inspector,
+                    },
+                    &mut StarPage::Android {
+                        device: &android.device,
+                        app: &mut android_app,
+                    },
+                ],
+                gateway,
+            )
+            .await
+        }
+        .await;
+        if let Err(err) = links_end {
+            eprintln!("the links' end: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        if let Err(err) = restore_android_network(android).await {
+            eprintln!("the Android phone's usual network: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        let bluetooth = android_phone::bluetooth_off(&android.device).await;
+        if let Err(err) = bluetooth {
+            eprintln!("the Android Bluetooth off: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        if let Err(err) = &fail {
+            eprintln!("the {} round's restore: {err:#}", round.name());
+        }
+        fail
+    }
+    .await;
+    (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+}
+
+/// The round's report whose steps all failed with one error, the restore
+/// carrying its own outcome.
+fn round_report_failed(
+    plan: star::RoundPlan,
+    err: &str,
+    restore: (Duration, Result<(), String>),
+) -> star::RoundReport {
+    let round = plan.round;
+    let failed = |name: String| star::StepReport {
+        name,
+        took: Duration::from_secs(0),
+        outcome: Err(err.to_owned()),
+    };
+    star::RoundReport {
+        round,
+        joins: [
+            failed(step_name(round, plan.joiners[0], plan.join)),
+            failed(step_name(round, plan.joiners[1], plan.join)),
+        ],
+        link: failed(format!("{} round, the three-way link", round.name())),
+        restore: star::StepReport {
+            name: format!("{} round, the restore", round.name()),
+            took: restore.0,
+            outcome: restore.1,
+        },
+    }
+}
+
+/// The star's first round: the Android phone hosts its local-only hotspot,
+/// and the iPhone and the iPad join it and stay joined until every device
+/// links to every other. It ends with the hotspot down, every link ended and
+/// the Android phone back on its usual network, off Bluetooth.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the plan, the two iOS handhelds, the Android phone, both tappers, the build, the stack, the evidence and the sync url are each the round's own"
+)]
+async fn android_hosts_round(
+    plan: &star::RoundPlan,
+    target: &Target,
+    ipad: &Target,
+    android: &StarAndroid,
+    iphone_tapper: &Tapper,
+    ipad_tapper: &Tapper,
+    app: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    sync_url: &str,
+) -> star::RoundReport {
+    let round = plan.round;
+    let names: [&str; 3] = [
+        star::Device::IPhone.name(),
+        star::Device::IPad.name(),
+        star::Device::Android.name(),
+    ];
+    // The iPhone signed out at the end of its proof, so it signs back in.
+    let (mut iphone_inspector, mut iphone_app) =
+        match host_signed_back_in(target, stack, sync_url, evidence).await {
+            Ok(pages) => pages,
+            Err(err) => return failed_round(*plan, &err),
+        };
+    // The iPad is the run's fresh third device.
+    let (mut ipad_inspector, mut ipad_app) =
+        match ipad_signed_in(ipad, true, app, stack, evidence, sync_url).await {
+            Ok(pages) => pages,
+            Err(err) => return failed_round(*plan, &err),
+        };
+    let join = join_by(plan.join);
+    let setup = async {
+        ipad_tapper
+            .run(
+                "tap-alert",
+                40,
+                evidence,
+                "android-hosts-ipad-local-network",
+            )
+            .await?;
+        ipad_app
+            .wait_for_text("device: certified until", Duration::from_secs(60))
+            .await?;
+        ipad.record(&mut ipad_app, evidence, "android-hosts-ipad-signed-in")
+            .await?;
+        if join == JoinBy::Beacon {
+            turn_on_bluetooth(&mut ipad_app, ipad_tapper, evidence).await?;
+        }
+        step("take the Android phone off its network");
+        android
+            .device
+            .adb(&["shell", "svc", "wifi", "disable"])
+            .await?;
+        sleep(Duration::from_secs(5)).await;
+        if join == JoinBy::Beacon {
+            android_phone::bluetooth_on(&android.device).await?;
+        }
+        step("host a hotspot on the Android phone");
+        let mut android_app = android.device.app().await?;
+        android_app.click("Host a hotspot").await?;
+        if join == JoinBy::Beacon {
+            let beacon = android_phone::read_beacon(&mut android_app).await?;
+            eprintln!("{beacon}");
+        } else {
+            step("decline Bluetooth on the Android phone");
+            android
+                .device
+                .tap_dialog_button(
+                    &android_phone::DENY_BUTTONS,
+                    "the Bluetooth enable dialog's refusal",
+                )
+                .await?;
+            android_app
+                .wait_for_text("hosting, the beacon is off", Duration::from_secs(30))
+                .await?;
+        }
+        let offer = read_hotspot_offer(&mut android_app).await?;
+        let iphone_identity = own_identity(&mut iphone_app).await?;
+        let ipad_identity = own_identity(&mut ipad_app).await?;
+        let android_identity = own_identity(&mut android_app).await?;
+        android
+            .device
+            .screenshot(evidence, "android-hosts-android-offer")
+            .await?;
+        Ok::<_, anyhow::Error>((
+            android_app,
+            offer,
+            iphone_identity,
+            ipad_identity,
+            android_identity,
+        ))
+    }
+    .await;
+    let (mut android_app, offer, iphone_identity, ipad_identity, android_identity) = match setup {
+        Ok(values) => values,
+        Err(err) => {
+            // The network may have already moved, so the restore still runs.
+            eprintln!("the {} round's setup: {err:#}", round.name());
+            let restore = star_round_restore(
+                &mut iphone_app,
+                &mut iphone_inspector,
+                &mut ipad_app,
+                &mut ipad_inspector,
+                android,
+                round,
+                false,
+                None,
+                iphone_tapper,
+                evidence,
+            )
+            .await;
+            return round_report_failed(*plan, &format!("{err:#}"), restore);
+        }
+    };
+    // The hotspot's gateway, once a joiner's page names it.
+    let mut gateway = None;
+    let join1 = {
+        let started = Instant::now();
+        let outcome = async {
+            if join == JoinBy::Beacon {
+                turn_on_bluetooth(&mut iphone_app, iphone_tapper, evidence).await?;
+            }
+            step("join the hotspot on the iPhone");
+            join_on_second_phone(
+                join,
+                "android-hosts-iphone",
+                &offer,
+                target,
+                &mut iphone_app,
+                iphone_tapper,
+                evidence,
+            )
+            .await?;
+            // The joiner moved onto the hotspot, which resets the link its
+            // session rides on.
+            iphone_app = iphone_inspector.reattach().await?;
+            step("link through the hotspot");
+            wait_linked(
+                &mut android_app,
+                &mut iphone_app,
+                &android_identity,
+                &iphone_identity,
+            )
+            .await?;
+            target
+                .record(&mut iphone_app, evidence, "android-hosts-iphone-linked")
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+    };
+    let join2 = {
+        let started = Instant::now();
+        let outcome = async {
+            step("join the hotspot on the iPad");
+            join_on_second_phone(
+                join,
+                "android-hosts-ipad",
+                &offer,
+                ipad,
+                &mut ipad_app,
+                ipad_tapper,
+                evidence,
+            )
+            .await?;
+            ipad_app = ipad_inspector.reattach().await?;
+            step("link through the hotspot");
+            wait_linked(
+                &mut android_app,
+                &mut ipad_app,
+                &android_identity,
+                &ipad_identity,
+            )
+            .await?;
+            ipad.record(&mut ipad_app, evidence, "android-hosts-ipad-linked")
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+    };
+    let link = {
+        let started = Instant::now();
+        let outcome = async {
+            step("wait for the three-way link");
+            wait_star_link(
+                [
+                    &mut StarPage::Ios {
+                        app: &mut iphone_app,
+                        inspector: &mut iphone_inspector,
+                    },
+                    &mut StarPage::Ios {
+                        app: &mut ipad_app,
+                        inspector: &mut ipad_inspector,
+                    },
+                    &mut StarPage::Android {
+                        device: &android.device,
+                        app: &mut android_app,
+                    },
+                ],
+                names,
+                [&iphone_identity, &ipad_identity, &android_identity],
+                evidence,
+                round,
+                &mut gateway,
+            )
+            .await
+        }
+        .await;
+        (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+    };
+    let restore = star_round_restore(
+        &mut iphone_app,
+        &mut iphone_inspector,
+        &mut ipad_app,
+        &mut ipad_inspector,
+        android,
+        round,
+        false,
+        gateway,
+        iphone_tapper,
+        evidence,
+    )
+    .await;
+    star::RoundReport {
+        round,
+        joins: [
+            star::StepReport {
+                name: step_name(round, star::Device::IPhone, plan.join),
+                took: join1.0,
+                outcome: join1.1,
+            },
+            star::StepReport {
+                name: step_name(round, star::Device::IPad, plan.join),
+                took: join2.0,
+                outcome: join2.1,
+            },
+        ],
+        link: star::StepReport {
+            name: format!("{} round, the three-way link", round.name()),
+            took: link.0,
+            outcome: link.1,
+        },
+        restore: star::StepReport {
+            name: format!("{} round, the restore", round.name()),
+            took: restore.0,
+            outcome: restore.1,
+        },
+    }
+}
+
+/// The star's second round: the iPhone hosts its Personal Hotspot, and the
+/// Android phone and the iPad join it and stay joined until every device
+/// links to every other. It ends with the hotspot down, every link ended and
+/// the iPhone's Personal Hotspot off.
+#[expect(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the plan, the two iOS handhelds, the Android phone, both tappers, the build, the stack, the evidence, the sync url and the passphrase are each the round's own"
+)]
+async fn iphone_hosts_round(
+    plan: &star::RoundPlan,
+    target: &Target,
+    ipad: &Target,
+    android: &StarAndroid,
+    iphone_tapper: &Tapper,
+    ipad_tapper: &Tapper,
+    app: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    sync_url: &str,
+    passphrase: &str,
+) -> star::RoundReport {
+    let round = plan.round;
+    let names: [&str; 3] = [
+        star::Device::IPhone.name(),
+        star::Device::IPad.name(),
+        star::Device::Android.name(),
+    ];
+    // The iPhone hosts, so it signs back in fresh, its page standing ready.
+    let (mut iphone_inspector, mut iphone_app) =
+        match host_signed_back_in(target, stack, sync_url, evidence).await {
+            Ok(pages) => pages,
+            Err(err) => return failed_round(*plan, &err),
+        };
+    // The iPad stood signed in through the first round, or it signs in now.
+    let (mut ipad_inspector, mut ipad_app) =
+        match ipad_signed_in(ipad, false, app, stack, evidence, sync_url).await {
+            Ok(pages) => pages,
+            Err(err) => return failed_round(*plan, &err),
+        };
+    let join = join_by(plan.join);
+    let setup = async {
+        step("host my Personal Hotspot on the iPhone");
+        switch_and_reattach(
+            true,
+            iphone_tapper,
+            &mut iphone_inspector,
+            &mut iphone_app,
+            evidence,
+            "iphone-hosts-hotspot-on",
+        )
+        .await?;
+        let name = device_name(target.udid()).await?;
+        on_page(&mut iphone_inspector, &mut iphone_app, async |app| {
+            app.set_input("personal-ssid", &name).await?;
+            app.set_input("personal-passphrase", passphrase).await?;
+            app.click("Host my Personal Hotspot").await
+        })
+        .await?;
+        // The host's beacon is always on, and the Bluetooth prompt can block
+        // the hosting.
+        let _ = iphone_tapper
+            .run("tap-alert", 40, evidence, "iphone-hosts-host-alert")
+            .await;
+        let offer = on_page(&mut iphone_inspector, &mut iphone_app, async |app| {
+            read_hotspot_offer(app).await
+        })
+        .await?;
+        let iphone_identity = on_page(&mut iphone_inspector, &mut iphone_app, async |app| {
+            own_identity(app).await
+        })
+        .await?;
+        let ipad_identity = on_page(&mut ipad_inspector, &mut ipad_app, async |app| {
+            own_identity(app).await
+        })
+        .await?;
+        let android_identity = {
+            let mut android_app = android.device.app().await?;
+            own_identity(&mut android_app).await?
+        };
+        on_page(&mut iphone_inspector, &mut iphone_app, async |app| {
+            target.record(app, evidence, "iphone-hosts-offer").await
+        })
+        .await?;
+        Ok::<_, anyhow::Error>((offer, iphone_identity, ipad_identity, android_identity))
+    }
+    .await;
+    let (offer, iphone_identity, ipad_identity, android_identity) = match setup {
+        Ok(values) => values,
+        Err(err) => {
+            // The Personal Hotspot may already be on, so the restore still
+            // runs.
+            eprintln!("the {} round's setup: {err:#}", round.name());
+            let restore = star_round_restore(
+                &mut iphone_app,
+                &mut iphone_inspector,
+                &mut ipad_app,
+                &mut ipad_inspector,
+                android,
+                round,
+                true,
+                None,
+                iphone_tapper,
+                evidence,
+            )
+            .await;
+            return round_report_failed(*plan, &format!("{err:#}"), restore);
+        }
+    };
+    // A VPN the demo cannot bypass refuses its join's network binding, so
+    // the M52's Tailscale stays off until the round's restore.
+    let tailscale_off = set_tailscale(android, false).await;
+    // The hotspot's gateway, once a joiner's page names it.
+    let mut gateway = None;
+    let join1 = {
+        let started = Instant::now();
+        let outcome = async {
+            if join == JoinBy::Beacon {
+                android_phone::bluetooth_on(&android.device).await?;
+            }
+            step("join the hotspot on the Android phone");
+            let mut android_app = android.device.app().await?;
+            match join {
+                JoinBy::Beacon => {
+                    wait_for_single_nearby(&mut android_app).await?;
+                    android
+                        .device
+                        .screenshot(evidence, "iphone-hosts-android-nearby")
+                        .await?;
+                    android_app.click("Join the nearby host").await?;
+                    android_app
+                        .wait_for_text("joining the nearby host", Duration::from_secs(10))
+                        .await?;
+                }
+                JoinBy::Payload => {
+                    let payload = offer
+                        .payload
+                        .as_deref()
+                        .ok_or_else(|| anyhow!("the offer shows no payload"))?;
+                    android_app.set_input("payload", payload).await?;
+                    android_app.click("Join from the payload").await?;
+                    android_app
+                        .wait_for_text("joining the hotspot", Duration::from_secs(10))
+                        .await?;
+                }
+                JoinBy::Form => {
+                    android_app.set_input("ssid", &offer.ssid).await?;
+                    android_app
+                        .set_input("passphrase", &offer.passphrase)
+                        .await?;
+                    android_app
+                        .set_input("port", &offer.port.to_string())
+                        .await?;
+                    android_app.click("Join the hotspot").await?;
+                    android_app
+                        .wait_for_text("joining the hotspot", Duration::from_secs(10))
+                        .await?;
+                }
+            }
+            // The host allows the client, and the Android's approval dialog
+            // follows.
+            iphone_tapper
+                .run(
+                    "tap-alert",
+                    40,
+                    evidence,
+                    "iphone-hosts-android-joiner-alert",
+                )
+                .await?;
+            // Android skips its dialog for a network it approved before, so
+            // the join landing stands in for the tap.
+            let joined = async {
+                let mut app = android.device.app().await?;
+                app.wait_for_text("hotspot: joined", Duration::from_secs(60))
+                    .await
+            };
+            tokio::select! {
+                approved = android.device.tap_connect_button() => approved?,
+                joined = joined => joined?,
+            }
+            // The Android joined onto the hotspot, which resets the links
+            // both pages' sessions ride on.
+            iphone_app = iphone_inspector.reattach().await?;
+            let mut android_app = android.device.app().await?;
+            step("link through the hotspot");
+            wait_linked(
+                &mut iphone_app,
+                &mut android_app,
+                &iphone_identity,
+                &android_identity,
+            )
+            .await?;
+            android
+                .device
+                .screenshot(evidence, "iphone-hosts-android-linked")
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+    };
+    let join2 = {
+        let started = Instant::now();
+        let outcome = async {
+            step("join the hotspot on the iPad");
+            if join == JoinBy::Beacon {
+                // The button is hidden when Bluetooth is already on, so the
+                // guard reads the page.
+                if !ipad_app.page_text().await?.contains("bluetooth: ready") {
+                    turn_on_bluetooth(&mut ipad_app, ipad_tapper, evidence).await?;
+                }
+            }
+            join_on_second_phone(
+                join,
+                "iphone-hosts-ipad",
+                &offer,
+                ipad,
+                &mut ipad_app,
+                ipad_tapper,
+                evidence,
+            )
+            .await?;
+            // A client joining the Personal Hotspot resets the host's USB
+            // link, and the joiner's page moves onto the hotspot.
+            iphone_app = iphone_inspector.reattach().await?;
+            ipad_app = ipad_inspector.reattach().await?;
+            step("link through the hotspot");
+            wait_linked(
+                &mut iphone_app,
+                &mut ipad_app,
+                &iphone_identity,
+                &ipad_identity,
+            )
+            .await?;
+            ipad.record(&mut ipad_app, evidence, "iphone-hosts-ipad-linked")
+                .await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+    };
+    let link = {
+        let started = Instant::now();
+        let outcome = async {
+            step("wait for the three-way link");
+            let mut android_app = android.device.app().await?;
+            wait_star_link(
+                [
+                    &mut StarPage::Ios {
+                        app: &mut iphone_app,
+                        inspector: &mut iphone_inspector,
+                    },
+                    &mut StarPage::Ios {
+                        app: &mut ipad_app,
+                        inspector: &mut ipad_inspector,
+                    },
+                    &mut StarPage::Android {
+                        device: &android.device,
+                        app: &mut android_app,
+                    },
+                ],
+                names,
+                [&iphone_identity, &ipad_identity, &android_identity],
+                evidence,
+                round,
+                &mut gateway,
+            )
+            .await
+        }
+        .await;
+        (started.elapsed(), outcome.map_err(|err| format!("{err:#}")))
+    };
+    let restore = star_round_restore(
+        &mut iphone_app,
+        &mut iphone_inspector,
+        &mut ipad_app,
+        &mut ipad_inspector,
+        android,
+        round,
+        true,
+        gateway,
+        iphone_tapper,
+        evidence,
+    )
+    .await;
+    let restore = {
+        let back_on = set_tailscale(android, true).await;
+        let failed = tailscale_off
+            .and(back_on)
+            .map_err(|err| format!("the M52's Tailscale: {err:#}"));
+        (restore.0, restore.1.and(failed))
+    };
+    star::RoundReport {
+        round,
+        joins: [
+            star::StepReport {
+                name: step_name(round, star::Device::Android, plan.join),
+                took: join1.0,
+                outcome: join1.1,
+            },
+            star::StepReport {
+                name: step_name(round, star::Device::IPad, plan.join),
+                took: join2.0,
+                outcome: join2.1,
+            },
+        ],
+        link: star::StepReport {
+            name: format!("{} round, the three-way link", round.name()),
+            took: link.0,
+            outcome: link.1,
+        },
+        restore: star::StepReport {
+            name: format!("{} round, the restore", round.name()),
+            took: restore.0,
+            outcome: restore.1,
+        },
+    }
+}
+
+/// Connect or disconnect the Android phone's Tailscale through its own
+/// receiver, holding until the platform reports the VPN in the asked state.
+async fn set_tailscale(android: &StarAndroid, on: bool) -> Result<()> {
+    let action = if on { "CONNECT_VPN" } else { "DISCONNECT_VPN" };
+    step(&format!("the M52's Tailscale {action}"));
+    android
+        .device
+        .adb(&[
+            "shell",
+            "am",
+            "broadcast",
+            "-n",
+            "com.tailscale.ipn/.IPNReceiver",
+            "-a",
+            &format!("com.tailscale.ipn.{action}"),
+        ])
+        .await?;
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let state = android
+            .device
+            .adb(&["shell", "dumpsys", "connectivity"])
+            .await?;
+        if state.contains("ni{VPN CONNECTED") == on {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "the VPN stayed {} after 20s",
+                if on { "down" } else { "up" }
+            );
+        }
+        sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// The star's end of day: both iOS handhelds signed out, and the Android
+/// phone back at rest, every cleanup attempted and the first failure kept.
+async fn star_finish(
+    target: &Target,
+    ipad: &Target,
+    android: &StarAndroid,
+    evidence: &Path,
+) -> Result<()> {
+    let mut fail = Ok::<(), anyhow::Error>(());
+    step("sign the iPhone back out");
+    if let Err(err) = leave_signed_out(target, evidence).await {
+        eprintln!("the iPhone's sign out: {err:#}");
+        fail = fail.and(Err(err));
+    }
+    step("sign the iPad back out");
+    if let Err(err) = leave_signed_out(ipad, evidence).await {
+        eprintln!("the iPad's sign out: {err:#}");
+        fail = fail.and(Err(err));
+    }
+    if let Err(err) = ipad.copy_demo_log(evidence).await {
+        eprintln!("the iPad log could not be collected ({err:#})");
+        fail = fail.and(Err(err));
+    }
+    if let Err(err) = android_finish(android, evidence).await {
+        eprintln!("the Android phone's rest: {err:#}");
+        fail = fail.and(Err(err));
+    }
+    fail
+}
+
+/// The Android phone's way back to rest: its sign-out, its logcat, its
+/// settings and its browser role back, its Bluetooth off and its links
+/// removed, every cleanup attempted and the first failure kept.
+async fn android_finish(android: &StarAndroid, evidence: &Path) -> Result<()> {
+    async {
+        let mut fail = Ok::<(), anyhow::Error>(());
+        if let Err(err) = restore_android_network(android).await {
+            eprintln!("the Android phone's network before sign-out: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        step("sign the Android phone back out");
+        let signout = async {
+            let mut android_app = android.device.app().await?;
+            sign_out(&mut android_app).await?;
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        if let Err(err) = signout {
+            eprintln!("the Android phone's sign out: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        if let Err(err) = android
+            .device
+            .adb(&[
+                "shell",
+                "am",
+                "force-stop",
+                android_phone::Demo::Dioxus.package(),
+            ])
+            .await
+        {
+            eprintln!("stopping the Android demo: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        let logcat = android
+            .device
+            .adb(&["logcat", "-d"])
+            .await
+            .unwrap_or_default();
+        if let Err(err) = tokio::fs::write(evidence.join("android-logcat.txt"), logcat).await {
+            eprintln!("the Android logcat: {err:#}");
+            fail = fail.and(Err(
+                anyhow::Error::new(err).context("writing the Android logcat")
+            ));
+        }
+        let role = match android.browser_holder.as_deref() {
+            Some(holder) => android.device.set_browser_role_holder(holder).await,
+            None => android
+                .device
+                .adb(&[
+                    "shell",
+                    "cmd",
+                    "role",
+                    "remove-role-holder",
+                    android_phone::BROWSER_ROLE,
+                    android_phone::BROWSER,
+                ])
+                .await
+                .map(drop),
+        };
+        if let Err(err) = role {
+            eprintln!("the Android browser's role: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        let screen = android
+            .device
+            .restore_global_setting(android_phone::STAY_ON, android.stay_on.as_deref())
+            .await;
+        if let Err(err) = screen {
+            eprintln!("the Android screen's setting: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        let dialogs = android
+            .device
+            .restore_global_setting(
+                android_phone::HIDE_ERROR_DIALOGS,
+                android.error_dialogs.as_deref(),
+            )
+            .await;
+        if let Err(err) = dialogs {
+            eprintln!("the Android error dialogs' setting: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        if let Err(err) = android_phone::bluetooth_off(&android.device).await {
+            eprintln!("the Android Bluetooth: {err:#}");
+            fail = fail.and(Err(err));
+        }
+        // The links drop best effort, since the run is over either way.
+        let _ = android.device.adb(&["forward", "--remove-all"]).await;
+        let _ = android.device.adb(&["reverse", "--remove-all"]).await;
+        fail
+    }
+    .await
+}
+
+/// The star's rounds and their end of day: the Android phone's setup and both
+/// tappers first, and a failure there brings the phone's own state back and
+/// fails the rounds' setup, then the two rounds and the devices' way back to
+/// rest, which the run's failure keeps while the summary records the rounds.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the two iOS handhelds, the build, the stack, the evidence, the sync url, the identity, the Android phone and its arguments, the passphrase and the join are each the run's own"
+)]
+async fn run_star_rounds(
+    target: &Target,
+    ipad: &Target,
+    app: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    sync_url: &str,
+    identity: &str,
+    android_serial: &str,
+    android_apk: &Path,
+    android_unlock_pin: Option<&str>,
+    passphrase: &str,
+    join: star::Join,
+) -> (Vec<star::RoundReport>, Result<(), String>) {
+    let prep = async {
+        let android = match star_android_setup(
+            android_phone::Device::new(android_serial.to_owned(), android_phone::Demo::Dioxus),
+            android_apk,
+            stack,
+            evidence,
+            android_unlock_pin,
+        )
+        .await
+        {
+            Ok((android, Ok(()))) => android,
+            Ok((android, Err(err))) => {
+                eprintln!("the Android phone's setup: {err}");
+                let rest = android_finish(&android, evidence).await;
+                let note = match rest {
+                    Ok(()) => String::new(),
+                    Err(rest) => format!(", its rest: {rest:#}"),
+                };
+                return Err(anyhow::anyhow!("the Android phone's setup: {err}{note}"));
+            }
+            Err(err) => return Err(anyhow::anyhow!("{err}")),
+        };
+        let iphone_tapper = match Tapper::build(target.udid(), identity, evidence).await {
+            Ok(tapper) => tapper,
+            Err(err) => {
+                let rest = android_finish(&android, evidence).await;
+                let note = match rest {
+                    Ok(()) => String::new(),
+                    Err(rest) => format!(", its rest: {rest:#}"),
+                };
+                eprintln!("the iPhone's tapper: {err:#}{note}");
+                return Err(anyhow::anyhow!("the iPhone's tapper: {err}{note}"));
+            }
+        };
+        let ipad_tapper = match Tapper::build(ipad.udid(), identity, evidence).await {
+            Ok(tapper) => tapper,
+            Err(err) => {
+                let rest = android_finish(&android, evidence).await;
+                let note = match rest {
+                    Ok(()) => String::new(),
+                    Err(rest) => format!(", its rest: {rest:#}"),
+                };
+                eprintln!("the iPad's tapper: {err:#}{note}");
+                return Err(anyhow::anyhow!("the iPad's tapper: {err}{note}"));
+            }
+        };
+        Ok::<(StarAndroid, Tapper, Tapper), anyhow::Error>((android, iphone_tapper, ipad_tapper))
+    }
+    .await;
+    let (android, iphone_tapper, ipad_tapper) = match prep {
+        Err(err) => return (Vec::new(), Err(format!("{err:#}"))),
+        Ok(values) => values,
+    };
+    let plans = star::plan(join);
+    let mut rounds = vec![
+        android_hosts_round(
+            &plans[0],
+            target,
+            ipad,
+            &android,
+            &iphone_tapper,
+            &ipad_tapper,
+            app,
+            stack,
+            evidence,
+            sync_url,
+        )
+        .await,
+    ];
+    rounds.push(
+        iphone_hosts_round(
+            &plans[1],
+            target,
+            ipad,
+            &android,
+            &iphone_tapper,
+            &ipad_tapper,
+            app,
+            stack,
+            evidence,
+            sync_url,
+            passphrase,
+        )
+        .await,
+    );
+    // Both rounds stood or not. The devices' rest runs either way, and a
+    // failure there keeps the run's failure while the summary records the
+    // rounds.
+    let finish = star_finish(target, ipad, &android, evidence).await;
+    let finish = finish.map_err(|err| format!("{err:#}"));
+    (rounds, finish)
+}
+
+/// The handheld star (R76 slice 9f): the iPhone proves, then the two rounds
+/// run, the Android phone hosting while the iPhone and the iPad join it, and
+/// the iPhone hosting its Personal Hotspot while the Android phone and the
+/// iPad join it, and in each round every device links to every other over the
+/// one hotspot. It ends with every device back at rest and the summary
+/// written.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the phone, its build, the stack, the evidence, the relay, the sync url, the identity, the peer, the Android phone and its arguments, the passphrase and the join are each the run's own"
+)]
+async fn star_walk(
+    target: &Target,
+    app: &Path,
+    stack: &Stack,
+    evidence: &Path,
+    relay: &mut Relay,
+    sync_url: &str,
+    identity: Option<&str>,
+    peer: Option<&str>,
+    android_serial: Option<&str>,
+    android_apk: Option<&Path>,
+    android_unlock_pin: Option<&str>,
+    passphrase: Option<&str>,
+    join: star::Join,
+) -> Result<()> {
+    let identity = identity.context("--star needs the --identity connetto-ios-signing printed")?;
+    let peer = peer.context("--star needs --peer-device")?;
+    let android_serial = android_serial.context("--star needs --android-peer")?;
+    let android_apk = android_apk.context("--star needs --android-apk")?;
+    let passphrase = passphrase.context("--star needs --hotspot-passphrase")?;
+    if !demo_has_device_identity() {
+        bail!("the star needs a demo build with its device identity");
+    }
+    let started = Instant::now();
+    let outcome = prove(target, app, stack, evidence, relay, sync_url).await;
+    let proved = (
+        started.elapsed(),
+        outcome.as_ref().map_err(|err| format!("{err:#}")).map(drop),
+    );
+    let (rounds, rest) = if outcome.is_ok() {
+        let ipad = Target::Device {
+            udid: peer.to_owned(),
+            identity: identity.to_owned(),
+        };
+        run_star_rounds(
+            target,
+            &ipad,
+            app,
+            stack,
+            evidence,
+            sync_url,
+            identity,
+            android_serial,
+            android_apk,
+            android_unlock_pin,
+            passphrase,
+            join,
+        )
+        .await
+    } else {
+        (Vec::new(), Ok(()))
+    };
+    // The summary records the run either way, and the devices' rest's
+    // failure records itself beside the rounds.
+    let mut summary = star::summary(&commit().await, &proved, &rounds);
+    if let Err(err) = &rest {
+        writeln!(&mut summary, "the devices' rest: failed: {err}")?;
+    }
+    eprintln!("{summary}");
+    tokio::fs::write(evidence.join("summary.txt"), &summary)
+        .await
+        .context("writing the summary")?;
+    let mut failed: Vec<String> = rounds
+        .iter()
+        .flat_map(|report| {
+            [
+                &report.joins[0],
+                &report.joins[1],
+                &report.link,
+                &report.restore,
+            ]
+            .into_iter()
+            .filter(|step| step.outcome.is_err())
+            .map(|step| step.name.clone())
+        })
+        .collect();
+    if let Err(err) = &rest {
+        failed.push(format!("the devices' rest: {err}"));
+    }
+    if failed.is_empty() {
+        outcome.map(drop)
+    } else {
+        bail!("the star's steps failed: {}", failed.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -2765,6 +4472,81 @@ mod tests {
         }
     }
 
+    /// The star's arguments name the iPhone, the iPad and the Android phone
+    /// beside the join, and clash with the other walks.
+    #[test]
+    fn the_star_arguments_are_checked() {
+        let args = |parts: &[&str]| parts.iter().copied().map(String::from).collect::<Vec<_>>();
+        let star = [
+            "--star",
+            "--device",
+            "u1",
+            "--identity",
+            "sha1",
+            "--peer-device",
+            "u2",
+            "--android-peer",
+            "192.168.1.10:5555",
+            "--android-apk",
+            "app.apk",
+            "--hotspot-passphrase",
+            "pass",
+        ];
+        assert!(
+            super::parse_arguments(&star.iter().copied().map(String::from).collect::<Vec<_>>())
+                .is_ok(),
+            "a complete star run"
+        );
+        for join in ["beacon", "payload", "form"] {
+            let with_join = [&star[..], &["--join", join]].concat();
+            assert!(
+                super::parse_arguments(
+                    &with_join
+                        .iter()
+                        .copied()
+                        .map(String::from)
+                        .collect::<Vec<_>>()
+                )
+                .is_ok(),
+                "the join {join}"
+            );
+        }
+        let with_pin = [&star[..], &["--android-unlock-pin", "1234"]].concat();
+        assert!(
+            super::parse_arguments(
+                &with_pin
+                    .iter()
+                    .copied()
+                    .map(String::from)
+                    .collect::<Vec<_>>()
+            )
+            .is_ok(),
+            "the unlock pin"
+        );
+        for broken in [
+            args(&["--star"]),
+            args(&["--star", "--simulator", "SIM-1"]),
+            args(&["--star", "--every-join"]),
+            args(&["--star", "--mac-peer"]),
+            args(&[
+                "--star",
+                "--device",
+                "u1",
+                "--identity",
+                "sha1",
+                "--peer-device",
+                "u2",
+                "--android-peer",
+                "192.168.1.10:5555",
+                "--hotspot-passphrase",
+                "pass",
+            ]),
+            args(&["--star", "--join", "wifi"]),
+        ] {
+            assert!(super::parse_arguments(&broken).is_err(), "{broken:?}");
+        }
+    }
+
     /// The mac peer's arguments stand beside the two-phone run's, and
     /// clash with its `--peer-device`.
     #[test]
@@ -2869,5 +4651,55 @@ mod tests {
         );
         assert!(edited.get("TestConfigurations").is_none());
         assert_eq!(edited["Actionable"]["ActionableBundlePath"], "x");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_star_matrix_needs_current_answers_after_the_freshness_boundary() {
+        let evidence = tempfile::tempdir().expect("the evidence directory");
+        let started = tokio::time::Instant::now();
+        let outcome = super::observe_star_link(
+            async |_| {
+                [
+                    Ok("linked: b via 10.42.0.7:1\nlinked: c via 10.42.0.1:1".to_owned()),
+                    Ok("hotspot: joined through the gateway 10.42.0.1\nlinked: a via 10.42.0.9:1\nlinked: c via 10.42.0.1:1".to_owned()),
+                    Ok("linked: a via 10.42.0.9:1\nlinked: b via 10.42.0.7:1".to_owned()),
+                ]
+            },
+            ["iphone", "ipad", "android"],
+            ["a", "b", "c"],
+            evidence.path(),
+            connetto_test_harness::star::Round::AndroidHosts,
+            &mut None,
+        )
+        .await;
+        assert!(outcome.is_ok());
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(60));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_star_matrix_cannot_pass_from_cached_pages_when_a_device_stops_answering() {
+        let evidence = tempfile::tempdir().expect("the evidence directory");
+        let started = tokio::time::Instant::now();
+        let outcome = super::observe_star_link(
+            async |_| {
+                [
+                    if started.elapsed() < std::time::Duration::from_secs(30) {
+                        Ok("linked: b via 10.42.0.7:1\nlinked: c via 10.42.0.1:1".to_owned())
+                    } else {
+                        Err(anyhow::anyhow!("the iphone inspector is unavailable"))
+                    },
+                    Ok("hotspot: joined through the gateway 10.42.0.1\nlinked: a via 10.42.0.9:1\nlinked: c via 10.42.0.1:1".to_owned()),
+                    Ok("linked: a via 10.42.0.9:1\nlinked: b via 10.42.0.7:1".to_owned()),
+                ]
+            },
+            ["iphone", "ipad", "android"],
+            ["a", "b", "c"],
+            evidence.path(),
+            connetto_test_harness::star::Round::AndroidHosts,
+            &mut None,
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(started.elapsed(), std::time::Duration::from_secs(120));
     }
 }

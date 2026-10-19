@@ -62,6 +62,7 @@ use testcontainers::{ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{OnceCell, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use tokio::task::JoinHandle;
 
+pub mod android_phone;
 pub mod demo;
 pub mod fanout;
 pub mod inspector;
@@ -74,12 +75,18 @@ pub mod relay;
 pub mod roster;
 pub mod stack;
 pub mod standby;
+pub mod star;
 
 mod native;
 use native::NativeCluster;
 pub use native::{POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
 
 pub use roster::{RosterAuth, WITHHELD_ID};
+
+/// One proof step's line, which the proofs' summaries read off the log.
+pub fn step(name: &str) {
+    eprintln!("== {name}");
+}
 
 /// The value type carried in an uploaded changeset: SQLite text keys and blob
 /// bodies, matching `Insert::<_, String, Vec<u8>>`.
