@@ -170,3 +170,70 @@ async fn builder_content_stages_a_file_durable() {
         "the staged bytes resolve from the content directory"
     );
 }
+
+/// A replica-key store shared across builds, so one process can reopen the same replica.
+struct SharedKeys(std::sync::Arc<MemoryKeyStore>);
+
+impl connetto_core::traits::ReplicaKeyStore for SharedKeys {
+    type Error = connetto_client::ClientError;
+
+    async fn load(&self, name: &str) -> Result<Option<connetto_client::ReplicaKey>, Self::Error> {
+        self.0.load(name).await
+    }
+
+    async fn store(
+        &self,
+        name: &str,
+        key: &connetto_client::ReplicaKey,
+    ) -> Result<(), Self::Error> {
+        self.0.store(name, key).await
+    }
+
+    async fn clear(&self, name: &str) -> Result<(), Self::Error> {
+        self.0.clear(name).await
+    }
+
+    fn protection(&self) -> connetto_client::Custody {
+        self.0.protection()
+    }
+}
+
+/// A closed and dropped client releases its replica at once, so the same process reopens it even with a file still unsent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_closed_client_with_unsent_content_reopens_at_once() {
+    let dir = tempdir().expect("a temp dir");
+    let keys = std::sync::Arc::new(MemoryKeyStore::default());
+    for round in 0..20 {
+        let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema())
+            .with_dialer(OneShot { transport: None })
+            .with_content(Content::default())
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), SharedKeys(std::sync::Arc::clone(&keys)))
+            .connect()
+            .await
+            .unwrap_or_else(|err| panic!("round {round} reopens the replica: {err}"));
+        if round == 0 {
+            let ContentHandle::Durable(content) =
+                client.content().expect("the build attached content")
+            else {
+                panic!("a durable build places its content at the content directory");
+            };
+            content
+                .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
+                    diesel::insert_into(photos::table)
+                        .values((
+                            photos::id.eq(1),
+                            photos::content_id.eq(file_id.as_bytes().to_vec()),
+                        ))
+                        .execute(conn)
+                        .map(|_| ())
+                })
+                .await
+                .expect("stage the file");
+        }
+        client.client().close().await;
+        drop(client);
+    }
+}

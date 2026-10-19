@@ -76,6 +76,9 @@ pub enum UnlockError {
     /// first read of the schema failed. A wrong key and a corrupt file are
     /// indistinguishable to the codec, by design.
     WrongKey(diesel::result::Error),
+    /// Another connection held the file locked for longer than the open waits,
+    /// so nothing is known about the key and the open may simply be retried.
+    Busy(diesel::result::Error),
 }
 
 impl std::fmt::Display for UnlockError {
@@ -86,11 +89,19 @@ impl std::fmt::Display for UnlockError {
             ),
             Self::Pragma(err) => write!(f, "applying the replica key failed: {err}"),
             Self::WrongKey(err) => write!(f, "the replica key does not decrypt this file: {err}"),
+            Self::Busy(err) => write!(f, "another connection holds the replica locked: {err}"),
         }
     }
 }
 
 impl std::error::Error for UnlockError {}
+
+/// How long opening a replica waits for another connection's lock.
+pub(crate) const BUSY_WAIT: core::time::Duration = core::time::Duration::from_secs(5);
+
+/// The pause between two attempts while the file is locked.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+const BUSY_POLL: core::time::Duration = core::time::Duration::from_millis(10);
 
 /// Apply `key` to a freshly established connection and prove it decrypts.
 ///
@@ -103,9 +114,20 @@ impl std::error::Error for UnlockError {}
 /// # Errors
 ///
 /// [`UnlockError::CodecMissing`] when no page codec is linked,
-/// [`UnlockError::Pragma`] when a pragma is rejected, and
-/// [`UnlockError::WrongKey`] when the file does not decrypt.
+/// [`UnlockError::Pragma`] when a pragma is rejected,
+/// [`UnlockError::Busy`] when another connection holds the file locked for
+/// longer than [`BUSY_WAIT`], and [`UnlockError::WrongKey`] when the file does
+/// not decrypt.
 pub fn unlock(conn: &mut SqliteConnection, key: &ReplicaKey) -> Result<(), UnlockError> {
+    unlock_within(conn, key, BUSY_WAIT)
+}
+
+/// [`unlock`], waiting at most `wait` for another connection's lock.
+fn unlock_within(
+    conn: &mut SqliteConnection,
+    key: &ReplicaKey,
+    wait: core::time::Duration,
+) -> Result<(), UnlockError> {
     codec_present(conn)?;
 
     #[cfg(all(target_family = "wasm", target_os = "unknown"))]
@@ -115,11 +137,63 @@ pub fn unlock(conn: &mut SqliteConnection, key: &ReplicaKey) -> Result<(), Unloc
     conn.batch_execute(unlock_statement(key).as_str())
         .map_err(UnlockError::Pragma)?;
 
+    // SQLite runs the handler only on `SQLITE_BUSY`, the one way to tell a lock from a wrong key here.
+    let busy = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
+    conn.on_busy(busy_handler(std::sync::Arc::clone(&busy), wait));
     // The codec only reports a bad key on the first read of a real page. An
     // empty new database passes trivially, which is correct: there is nothing
     // yet to decrypt.
-    conn.batch_execute("SELECT count(*) FROM sqlite_schema;")
-        .map_err(UnlockError::WrongKey)
+    let probed = conn.batch_execute("SELECT count(*) FROM sqlite_schema;");
+    keep_waiting(conn, wait);
+    probed.map_err(|err| {
+        if busy.load(core::sync::atomic::Ordering::Relaxed) {
+            UnlockError::Busy(err)
+        } else {
+            UnlockError::WrongKey(err)
+        }
+    })
+}
+
+/// A busy handler that records it ran and retries until `wait` has passed.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn busy_handler(
+    busy: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    wait: core::time::Duration,
+) -> impl FnMut(i32) -> diesel::sqlite::BusyDecision + Send + 'static {
+    let attempts = wait.as_millis() / BUSY_POLL.as_millis();
+    move |retries| {
+        busy.store(true, core::sync::atomic::Ordering::Relaxed);
+        if u128::try_from(retries).unwrap_or(u128::MAX) < attempts {
+            std::thread::sleep(BUSY_POLL);
+            diesel::sqlite::BusyDecision::Retry
+        } else {
+            diesel::sqlite::BusyDecision::GiveUp
+        }
+    }
+}
+
+/// A busy handler that records it ran and gives up at once, since a browser worker cannot block.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn busy_handler(
+    busy: std::sync::Arc<core::sync::atomic::AtomicBool>,
+    _wait: core::time::Duration,
+) -> impl FnMut(i32) -> diesel::sqlite::BusyDecision + Send + 'static {
+    move |_| {
+        busy.store(true, core::sync::atomic::Ordering::Relaxed);
+        diesel::sqlite::BusyDecision::GiveUp
+    }
+}
+
+/// Replace the probe's handler with a plain timeout, so the open's later statements wait the same way.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+fn keep_waiting(conn: &mut SqliteConnection, wait: core::time::Duration) {
+    conn.set_busy_timeout(i32::try_from(wait.as_millis()).unwrap_or(i32::MAX));
+}
+
+/// Drop the probe's handler, since a browser worker cannot block on a lock.
+#[cfg(all(target_family = "wasm", target_os = "unknown"))]
+fn keep_waiting(conn: &mut SqliteConnection, _wait: core::time::Duration) {
+    conn.remove_busy_handler();
 }
 
 /// The `PRAGMA key` statement that unlocks a connection with `key`.
@@ -239,5 +313,34 @@ mod tests {
             cipher_url("replica.sqlite", "memvfs"),
             "file:replica.sqlite?vfs=multipleciphers-memvfs"
         );
+    }
+
+    /// A file another connection holds locked past the wait is reported busy, never as a key that does not decrypt.
+    #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+    #[test]
+    fn a_locked_replica_is_busy_and_opens_once_released() {
+        use diesel::Connection as _;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("replica.db");
+        let url = path.to_str().expect("utf-8 path");
+        let key = ReplicaKey::from_bytes([0x5a; ReplicaKey::LEN]);
+        let mut holder = SqliteConnection::establish(url).expect("open the holder");
+        unlock(&mut holder, &key).expect("unlock the holder");
+        holder
+            .batch_execute("CREATE TABLE t (id INTEGER PRIMARY KEY); BEGIN EXCLUSIVE;")
+            .expect("hold the file locked");
+
+        let mut opener = SqliteConnection::establish(url).expect("open the second connection");
+        let refused = unlock_within(&mut opener, &key, core::time::Duration::from_millis(50));
+        assert!(
+            matches!(refused, Err(UnlockError::Busy(_))),
+            "a locked file is busy, got {refused:?}"
+        );
+
+        holder.batch_execute("COMMIT;").expect("release the lock");
+        let mut opener = SqliteConnection::establish(url).expect("open again");
+        unlock_within(&mut opener, &key, core::time::Duration::from_millis(50))
+            .expect("the released file opens under its key");
     }
 }
