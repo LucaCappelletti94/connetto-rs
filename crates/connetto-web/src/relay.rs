@@ -2723,7 +2723,10 @@ where
                     current_cursor: relay_cursor(worker),
                     schema_version: worker.schema_version().cloned(),
                     initial_credits: INITIAL_CREDITS,
-                    writer: Some(WriterGrant { number, frontier }),
+                    writer: Some(WriterGrant {
+                        number,
+                        frontier,
+                    }),
                 },
             )));
             // Right after its own ack, so a tab knows from its first moment
@@ -2787,6 +2790,11 @@ where
             tab.credits = tab.credits.saturating_add(ack.credits);
             flush_tab_bulk(tab);
             Ok(())
+        }
+        ControlMessage::BindDevice(_) | ControlMessage::RetireWriter(_) => {
+            Err(TabFault::Close(
+                "a tab never binds or retires a writer, the worker's connection is the profile's one writer".to_owned(),
+            ))
         }
         other => Err(TabFault::Close(format!(
             "unsupported tab frame in this increment: {other:?}"

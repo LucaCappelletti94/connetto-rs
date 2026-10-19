@@ -116,18 +116,20 @@ async fn builder_content_stages_a_file_in_memory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builder_content_stages_a_file_durable() {
     let dir = tempdir().expect("a temp dir");
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema())
-        .with_dialer(OneShot {
-            transport: Some(FakeTransport::accepting_but_silent()),
-        })
-        .with_content(Content::default())
-        .signed_in(
-            HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-        )
-        .durable(dir.path(), MemoryKeyStore::default())
-        .connect()
-        .await
-        .expect("the durable build connects");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1", schema())
+            .with_dialer(OneShot {
+                transport: Some(FakeTransport::accepting_but_silent()),
+            })
+            .with_content(Content::default())
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), MemoryKeyStore::default())
+            .connect(),
+    )
+    .await
+    .expect("the durable build connects");
     let ContentHandle::Durable(content) = client.content().expect("the build attached content")
     else {
         panic!("a durable build places its content at the content directory");

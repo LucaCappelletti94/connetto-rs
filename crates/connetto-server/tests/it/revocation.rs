@@ -14,7 +14,7 @@ use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_server::LoopbackTransport;
 use connetto_server::device_cert::{
     Device, DeviceCertConfig, DeviceEnrolment, Enrolment, EnrolmentError, EnrolmentFuture,
-    EnrolmentStore, MemoryEnrolments, Recorded, Revocation,
+    EnrolmentStore, KeyRecord, MemoryEnrolments, Recorded, Revocation,
 };
 use connetto_test_harness::Fixture;
 use parking_lot::Mutex;
@@ -163,6 +163,14 @@ impl EnrolmentStore<String> for FailingListStore {
         key: KeyId,
     ) -> EnrolmentFuture<'a, Option<AttestationLevel>> {
         self.inner.stored_attestation(user, key)
+    }
+
+    fn key_record<'a>(
+        &'a self,
+        user: Option<&'a String>,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<KeyRecord<String>>> {
+        self.inner.key_record(user, key)
     }
 }
 

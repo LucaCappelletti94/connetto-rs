@@ -15,6 +15,7 @@
 //!     enrolled_at TIMESTAMPTZ NOT NULL,
 //!     last_seen TIMESTAMPTZ NOT NULL,
 //!     revoked_at TIMESTAMPTZ,
+//!     public_key BYTEA NOT NULL,
 //!     attestation TEXT NOT NULL
 //!     -- then one column per descriptor field
 //! );
@@ -43,7 +44,8 @@ use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection};
 
 use super::enrolment::{
-    Device, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore, Recorded, Revocation,
+    Device, Enrolment, EnrolmentError, EnrolmentFuture, EnrolmentStore, KeyRecord, Recorded,
+    Revocation,
 };
 
 /// One statement of a [`ConnettoEnrolmentSchema`], run on a borrowed
@@ -78,6 +80,8 @@ pub struct NewEnrolment<'a, Id, D> {
     pub descriptor: D,
     /// The attestation level the enrolment proved, which a renewal keeps.
     pub attestation: AttestationLevel,
+    /// The device key's `SubjectPublicKeyInfo`, whose hash is the key id.
+    pub public_key: Vec<u8>,
 }
 
 /// A renewal of a key already enrolled under the same account.
@@ -194,6 +198,16 @@ pub trait ConnettoEnrolmentSchema: Send + Sync + 'static {
         key: KeyId,
         user: &'c Self::Id,
     ) -> Statement<'c, Option<String>>;
+
+    /// The enrolment of `key`, with its account, whether it is revoked,
+    /// whether a certificate of it is still live, and its public key, when
+    /// `user` names no account or names the account the key is enrolled
+    /// under, `None` otherwise.
+    fn key_record<'c>(
+        conn: &'c mut AsyncPgConnection,
+        key: KeyId,
+        user: Option<&'c Self::Id>,
+    ) -> Statement<'c, Option<super::enrolment::KeyRecord<Self::Id>>>;
 }
 
 /// An [`EnrolmentStore`] over the deployment's enrolment tables, `D`'s
@@ -234,6 +248,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                     issued_at,
                     expires_at,
                     session,
+                    public_key,
                     descriptor: _,
                     attestation,
                 } = enrolment;
@@ -246,6 +261,7 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
                         at: issued_at,
                         descriptor: descriptor.clone(),
                         attestation,
+                        public_key,
                     };
                     // A concurrent first enrolment of the same key inserted
                     // its row between the read and the insert.
@@ -369,6 +385,19 @@ impl<S: ConnettoEnrolmentSchema> EnrolmentStore<S::Id> for PgEnrolments<S> {
             }
         })
     }
+
+    fn key_record<'a>(
+        &'a self,
+        user: Option<&'a S::Id>,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<KeyRecord<S::Id>>> {
+        Box::pin(async move {
+            let mut conn = self.pool.get().await.map_err(EnrolmentError::Pool)?;
+            S::key_record(&mut conn, key, user)
+                .await
+                .map_err(EnrolmentError::Query)
+        })
+    }
 }
 
 /// A key id read back from its `BYTEA` column.
@@ -428,6 +457,8 @@ macro_rules! connetto_enrolment_tables {
                 last_seen -> diesel::sql_types::Timestamptz,
                 /// When it was revoked.
                 revoked_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                /// The device key's `SubjectPublicKeyInfo`.
+                public_key -> diesel::sql_types::Bytea,
                 /// The attestation level the first enrolment recorded.
                 attestation -> diesel::sql_types::Text,
                 $( $field -> $field_sql, )*
@@ -540,6 +571,7 @@ macro_rules! connetto_enrolment_tables {
                         at,
                         descriptor,
                         attestation,
+                        public_key,
                     } = enrolment;
                     let $($shape)* = descriptor;
                     let at = $crate::ban::Instant::from(at);
@@ -550,6 +582,7 @@ macro_rules! connetto_enrolment_tables {
                             connetto_device_enrolments::session_id.eq(session),
                             connetto_device_enrolments::enrolled_at.eq(at),
                             connetto_device_enrolments::last_seen.eq(at),
+                            connetto_device_enrolments::public_key.eq(public_key),
                             connetto_device_enrolments::attestation.eq(attestation.as_str()),
                             $( connetto_device_enrolments::$field.eq($field), )*
                         ))
@@ -763,6 +796,75 @@ macro_rules! connetto_enrolment_tables {
                     .await
                     .optional()?;
                     Ok(stored.map(|(spelled,)| spelled))
+                })
+            }
+
+            fn key_record<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                key: $crate::device_cert::KeyId,
+                user: Option<&'c Self::Id>,
+            ) -> $crate::device_cert::Statement<'c, Option<$crate::device_cert::KeyRecord<Self::Id>>> {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    // The enrolment and its certificate live in different tables, so liveness
+                    // is its own EXISTS rather than a projection the diesel DSL cannot name.
+                    let live: bool = diesel::select(diesel::dsl::exists(QueryDsl::filter(
+                        QueryDsl::filter(
+                            connetto_device_certificates::table,
+                            connetto_device_certificates::key_id.eq(key.as_bytes().to_vec()),
+                        ),
+                        connetto_device_certificates::expires_at.gt($crate::ban::Instant::from(
+                            std::time::SystemTime::now(),
+                        )),
+                    )))
+                    .get_result(conn)
+                    .await?;
+                    let found: Option<($id, bool, Vec<u8>)> = match user {
+                        Some(user) => RunQueryDsl::first(
+                            QueryDsl::filter(
+                                QueryDsl::filter(
+                                    QueryDsl::select(
+                                        connetto_device_enrolments::table,
+                                        (
+                                            connetto_device_enrolments::user_id,
+                                            connetto_device_enrolments::revoked_at.is_not_null(),
+                                            connetto_device_enrolments::public_key,
+                                        ),
+                                    ),
+                                    connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
+                                ),
+                                connetto_device_enrolments::user_id.eq(user.clone()),
+                            ),
+                            conn,
+                        )
+                        .await
+                        .optional()?,
+                        None => RunQueryDsl::first(
+                            QueryDsl::filter(
+                                QueryDsl::select(
+                                    connetto_device_enrolments::table,
+                                    (
+                                        connetto_device_enrolments::user_id,
+                                        connetto_device_enrolments::revoked_at.is_not_null(),
+                                        connetto_device_enrolments::public_key,
+                                    ),
+                                ),
+                                connetto_device_enrolments::key_id.eq(key.as_bytes().to_vec()),
+                            ),
+                            conn,
+                        )
+                        .await
+                        .optional()?,
+                    };
+                    Ok(found.map(
+                        |(user, revoked, public_key)| $crate::device_cert::KeyRecord {
+                            user,
+                            revoked,
+                            certificate_live: live,
+                            public_key,
+                        },
+                    ))
                 })
             }
         }

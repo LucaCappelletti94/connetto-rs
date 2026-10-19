@@ -38,6 +38,7 @@ diesel::table! {
         enrolled_at -> Timestamptz,
         last_seen -> Timestamptz,
         revoked_at -> Nullable<Timestamptz>,
+        public_key -> Binary,
         attestation -> Text,
     }
 }
@@ -247,6 +248,7 @@ async fn a_chip_proven_enrolment_records_its_level_and_a_renewal_keeps_it() {
             connetto_device_enrolments::session_id.eq(uuid::Uuid::nil()),
             connetto_device_enrolments::enrolled_at.eq(Utc::now()),
             connetto_device_enrolments::last_seen.eq(Utc::now()),
+            connetto_device_enrolments::public_key.eq(seeded.subject_public_key_info()),
             connetto_device_enrolments::attestation.eq(AttestationLevel::Unproven.as_str()),
         ))
         .execute(&mut conn)

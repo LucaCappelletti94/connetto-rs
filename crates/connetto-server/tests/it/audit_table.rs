@@ -34,7 +34,7 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
                 'logged_out', 'session_revoked', 'token_replayed', \
                 'capability_minted', 'permission_change', 'model_change', \
-                'banned', 'ban_lifted', 'write_forked')"
+                'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
         ),
         format!(
             "CREATE TABLE auth_events (\

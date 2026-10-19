@@ -96,6 +96,7 @@ use super::{
     registration::{BotRegistered, Challenge, RegisterBot},
     share_keys::{ReplaceShareKeys, ShareKeysReplaced},
     subscription::{MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, Unsubscribe},
+    writer::{BindDevice, RetireWriter, WriterAnswer},
 };
 
 /// Every control-plane frame flowing between client and server.
@@ -179,6 +180,13 @@ pub enum ControlMessage {
     ReplaceShareKeys(ReplaceShareKeys),
     /// Server confirms the swap, every later frame filtered by the new set.
     ShareKeysReplaced(ShareKeysReplaced),
+
+    /// Client proves its device key to write as it (R75).
+    BindDevice(BindDevice),
+    /// Client retires the writer an archive it imported was made under (R75).
+    RetireWriter(RetireWriter),
+    /// Server answers a bind or a retirement.
+    WriterAnswer(WriterAnswer),
 
     /// Client heartbeat probe.
     Ping(Ping),

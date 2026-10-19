@@ -126,7 +126,12 @@ pub enum FatalErrorReason {
         /// The sequence that arrived.
         got: u64,
     },
-    /// The number writer the handshake named is no writer of this account (R75).
+    /// The writer this connection writes as was retired, by an import of an
+    /// archive made under it (R75). The client takes a fresh writer and
+    /// carries its unsent entries forward under it.
+    WriterRetired,
+    /// The number writer the handshake named is no writer of this account
+    /// (R75). The client takes a fresh writer as it would for a retired one.
     WriterUnknown,
 }
 

@@ -77,7 +77,8 @@ pub struct Handshake {
     pub writer: WriterRequest,
     /// The highest sequence of the requested number writer at or below which
     /// the client has retired every pending entry, so the server may drop its
-    /// record of those writes.
+    /// record of those writes. Absent for a device writer, whose records live
+    /// as long as its enrolment can still vouch for them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_through: Option<u64>,
 }
@@ -184,8 +185,9 @@ pub struct HandshakeAck {
     /// Initial flow-control credit granted to the server for delivery.
     pub initial_credits: u32,
     /// The number writer the handshake confirmed or issued, with its
-    /// frontier. The client retires every pending entry at or below the
-    /// frontier and replays the rest.
+    /// frontier, `None` when it asked to write as a device key, whose
+    /// frontier the bind answers. The client retires every pending entry at
+    /// or below the frontier and replays the rest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub writer: Option<WriterGrant>,
 }

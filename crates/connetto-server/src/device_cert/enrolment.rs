@@ -35,10 +35,27 @@ pub struct Enrolment<Id> {
     pub expires_at: SystemTime,
     /// The session that asked for it.
     pub session: SessionId,
+    /// The device key's `SubjectPublicKeyInfo`, whose hash is the key id.
+    pub public_key: Vec<u8>,
     /// The application's device descriptor, as sent.
     pub descriptor: Vec<u8>,
     /// The attestation level the first enrolment recorded, which renewals keep.
     pub attestation: AttestationLevel,
+}
+
+/// One key's enrolment record, what a writer decision needs (R75): the account
+/// that holds it, whether the enrolment stands, and whether the key's
+/// certificate can still prove a write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRecord<Id> {
+    /// The account the key is enrolled under.
+    pub user: Id,
+    /// Whether the enrolment is revoked.
+    pub revoked: bool,
+    /// Whether the key holds a certificate not expired at the read.
+    pub certificate_live: bool,
+    /// The device key's `SubjectPublicKeyInfo`.
+    pub public_key: Vec<u8>,
 }
 
 /// What recording an enrolment found.
@@ -149,6 +166,15 @@ pub trait EnrolmentStore<Id>: Send + Sync + 'static {
         user: &'a Id,
         key: KeyId,
     ) -> EnrolmentFuture<'a, Option<AttestationLevel>>;
+
+    /// The enrolment of `key`, with the account that holds it and whether its
+    /// certificate is still live, when `user` names no account or names the
+    /// account the key is enrolled under, `None` otherwise (R75).
+    fn key_record<'a>(
+        &'a self,
+        user: Option<&'a Id>,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<KeyRecord<Id>>>;
 }
 
 #[derive(Debug)]
@@ -325,6 +351,38 @@ impl<Id: Clone + PartialEq + Send + Sync + 'static> EnrolmentStore<Id> for Memor
             .map(|row| row.attestation);
         Box::pin(core::future::ready(Ok(stored)))
     }
+
+    fn key_record<'a>(
+        &'a self,
+        user: Option<&'a Id>,
+        key: KeyId,
+    ) -> EnrolmentFuture<'a, Option<KeyRecord<Id>>> {
+        let record = {
+            let state = self.state.lock();
+            state
+                .rows
+                .get(&key)
+                .filter(|row| user.is_none_or(|user| row.user == *user))
+                .map(|row| {
+                    let public_key = state
+                        .grants
+                        .iter()
+                        .find(|grant| grant.key == key)
+                        .map(|grant| grant.public_key.clone())
+                        .unwrap_or_default();
+                    KeyRecord {
+                        user: row.user.clone(),
+                        revoked: row.revoked_at.is_some(),
+                        certificate_live: state
+                            .grants
+                            .iter()
+                            .any(|grant| grant.key == key && grant.expires_at > SystemTime::now()),
+                        public_key,
+                    }
+                })
+        };
+        Box::pin(core::future::ready(Ok(record)))
+    }
 }
 
 /// A nonce handed to a session, spent by the next enrolment request whatever its outcome.
@@ -438,6 +496,18 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
         self
     }
 
+    /// The enrolled key's record, for a bind signature check, delegating to the store.
+    pub(crate) async fn key_record(
+        &self,
+        user: Option<&Id>,
+        key: KeyId,
+    ) -> Result<Option<KeyRecord<Id>>, EnrolRefusal> {
+        self.store
+            .key_record(user, key)
+            .await
+            .map_err(|_| EnrolRefusal::IssuerUnavailable)
+    }
+
     /// A fresh nonce, replacing any the session held, and how long it stays valid.
     pub(crate) fn challenge(
         &self,
@@ -527,6 +597,7 @@ impl<Id: Clone + core::fmt::Display + 'static> DeviceEnrolment<Id> {
             issued_at: not_before,
             expires_at: not_before + lifetime,
             session,
+            public_key: csr.public_key().to_vec(),
             descriptor: request.descriptor,
             attestation: level,
         };

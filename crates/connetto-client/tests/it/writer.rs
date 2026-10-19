@@ -4,8 +4,9 @@
 //! hold: a handshake acknowledged with no writer yet keeps the issued number
 //! and re-keys the queue; a handshake with a number writer reconciles the
 //! queue against the reported frontier without retiring anything locally; a
-//! write whose answer was lost is rolled back when its resend is refused; the
-//! number's sequence and chain head outlive an emptied queue and a restart.
+//! `WriterRetired` fatal re-queues the tail with provenance under a fresh
+//! number. The device-writer rows need an enrolled key, which the native
+//! suites steer through the enrolment task.
 
 use std::collections::VecDeque;
 use std::future::{Future, ready};
@@ -18,7 +19,8 @@ use connetto_core::Cursor;
 use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, MutationApplied,
-    MutationReject, MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
+    MutationReject, MutationRejectReason, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
+    WriterRequest,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -37,7 +39,6 @@ diesel::table! {
         id -> Integer,
     }
 }
-
 diesel::table! {
     /// The client's private writer-state table, read by the assertions.
     _connetto_writers (id) {
@@ -45,6 +46,28 @@ diesel::table! {
         next_seq -> BigInt,
         head -> Binary,
     }
+}
+
+diesel::table! {
+    /// The client's private pending-queue table, read by the assertions.
+    _connetto_pending (writer, seq) {
+        writer -> Text,
+        seq -> BigInt,
+        changeset -> Binary,
+        entry_hash -> Binary,
+        prov_writer -> Nullable<Text>,
+        prov_seq -> Nullable<BigInt>,
+    }
+}
+
+/// One row of the durable pending queue, the bookkeeping columns the
+/// assertions read.
+#[derive(diesel::Queryable, Debug, PartialEq, Eq)]
+struct PendingRow {
+    writer: String,
+    seq: i64,
+    prov_writer: Option<String>,
+    prov_seq: Option<i64>,
 }
 
 /// How the fake answers the mutation headers it is handed.
@@ -71,12 +94,13 @@ struct Log {
     handshakes: Vec<WriterRequest>,
     mutations: Vec<u64>,
     bulks: Vec<Vec<u8>>,
+    retires: Vec<connetto_core::messages::RetireWriter>,
     outbox: VecDeque<IncomingFrame>,
 }
 
 /// A transport that plays a fresh server: it grants a writer number at the
-/// handshake, records what it is sent, and answers mutations from its own
-/// record.
+/// handshake, records what it is sent, and answers mutations, binds and
+/// retirements from its own record.
 #[derive(Clone)]
 struct Wire {
     log: Arc<Mutex<Log>>,
@@ -131,8 +155,8 @@ impl Wire {
         self
     }
 
-    /// Close the session deliberately with `reason` right after the handshake.
-    fn closing_with(mut self, reason: FatalErrorReason) -> Self {
+    /// Close the connection right after the handshake with `reason`.
+    fn closing(mut self, reason: FatalErrorReason) -> Self {
         self.closing = Some(reason);
         self
     }
@@ -215,6 +239,17 @@ impl Transport for Wire {
                 };
                 self.log.lock().outbox.push_back(frame);
             }
+            ControlMessage::RetireWriter(retire) => {
+                let mut log = self.log.lock();
+                log.retires.push(retire.clone());
+                log.outbox
+                    .push_back(IncomingFrame::Control(ControlMessage::WriterAnswer(
+                        WriterAnswer {
+                            request_id: retire.request_id,
+                            outcome: WriterOutcome::Retired,
+                        },
+                    )));
+            }
             _ => {}
         }
         ready(Ok(()))
@@ -257,6 +292,19 @@ fn writers(conn: &mut ConnettoConnection<Wire>) -> Vec<String> {
         .order(_connetto_writers::id)
         .load::<String>(conn.conn())
         .expect("read the writer states")
+}
+
+fn pending(conn: &mut ConnettoConnection<Wire>) -> Vec<PendingRow> {
+    _connetto_pending::table
+        .select((
+            _connetto_pending::writer,
+            _connetto_pending::seq,
+            _connetto_pending::prov_writer,
+            _connetto_pending::prov_seq,
+        ))
+        .order(_connetto_pending::seq)
+        .load(conn.conn())
+        .expect("read the queue")
 }
 
 /// Pump until the wire is gone, keeping the events the run announced.
@@ -351,8 +399,8 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
     conn.attach(Wire::default().silent()).await.expect("attach");
     drain(&mut conn).await;
 
-    // A second connection that reports a frontier ahead of the queue, the
-    // way a run presenting the number with its settled sequences would.
+    // A second connection that reports a frontier ahead of the queue, as a
+    // courier settling this number's writes would.
     let wire = Wire::default().silent().grant(1, 5);
     conn.attach(wire.clone()).await.expect("attach");
     {
@@ -388,6 +436,66 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
         conn.push().await.expect("queue"),
         Some(6),
         "the next sequence starts past the frontier"
+    );
+}
+
+/// The table's `WriterRetired` row for a number writer: the tail re-queues
+/// with provenance under a fresh number, and the key is left alone.
+#[tokio::test]
+async fn a_writer_retired_fatal_requeues_the_tail_with_provenance() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    drain(&mut conn).await;
+
+    // The server retires the writer and closes the connection over it.
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::WriterRetired),
+    )
+    .await
+    .expect("attach");
+    let seen = drain(&mut conn).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::ServerClosed {
+                reason: FatalErrorReason::WriterRetired
+            }
+        )),
+        "the fatal surfaced as a server close"
+    );
+
+    // A fresh connection asks a fresh number, and the tail goes up again under
+    // it, provenance intact.
+    let wire = Wire::default().silent().grant(2, 0);
+    conn.attach(wire.clone()).await.expect("attach");
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.handshakes,
+            vec![WriterRequest::Issue],
+            "the retired number is no longer presented"
+        );
+    }
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.mutations, vec![1], "the tail went up again");
+    }
+    assert_eq!(
+        pending(&mut conn),
+        vec![PendingRow {
+            writer: "number:2".to_owned(),
+            seq: 1,
+            prov_writer: Some("number:1".to_owned()),
+            prov_seq: Some(1),
+        }],
+        "the entry carries the writer and sequence it was first written under"
     );
 }
 
@@ -579,7 +687,7 @@ async fn a_writer_unknown_fatal_carries_the_tail_to_the_unissued_number() {
 
     let wire = Wire::default()
         .silent()
-        .closing_with(FatalErrorReason::WriterUnknown);
+        .closing(FatalErrorReason::WriterUnknown);
     conn.attach(wire.clone()).await.expect("attach");
     write(&mut conn, 1);
     assert_eq!(conn.push().await.expect("queue"), Some(1));

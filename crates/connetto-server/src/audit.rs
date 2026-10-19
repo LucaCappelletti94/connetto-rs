@@ -74,6 +74,10 @@ pub enum AuthOp {
     /// which stands; the second was refused `Forked`. State, because a fork
     /// decides which history stands.
     WriteForked,
+    /// An already-settled entry arrived again through another path and was
+    /// answered from the settled record. State, because the cross-path
+    /// delivery is the trace the courier needs.
+    WriteRedelivered,
 }
 
 impl AuthOp {
@@ -91,6 +95,7 @@ impl AuthOp {
             Self::Banned => "banned",
             Self::BanLifted => "ban_lifted",
             Self::WriteForked => "write_forked",
+            Self::WriteRedelivered => "write_redelivered",
         }
     }
 }
@@ -114,6 +119,7 @@ impl FromSql<AuthOpSql, Pg> for AuthOp {
             b"banned" => Ok(Self::Banned),
             b"ban_lifted" => Ok(Self::BanLifted),
             b"write_forked" => Ok(Self::WriteForked),
+            b"write_redelivered" => Ok(Self::WriteRedelivered),
             other => Err(format!(
                 "unrecognised connetto_auth_op label {:?}",
                 String::from_utf8_lossy(other)
@@ -183,7 +189,7 @@ impl<Id> AuthEvent<Id> {
     }
 
     /// Name the writer, its sequence and the two settle paths this event
-    /// concerns, the shape `write_forked` carries.
+    /// concerns, the shape the two write-state changes carry.
     #[must_use]
     pub fn about_write(
         mut self,

@@ -427,14 +427,16 @@ async fn a_durable_client_forgets_its_device_only_past_the_unsynced_guard() {
     keys.store(&record, &connetto_core::test_support::replica_key())
         .await
         .expect("seed the key");
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
-        .with_dialer(super::support::NeverDial::<FakeTransport>::default())
-        .signed_in(credential)
-        .durable(dir.path(), keys.clone())
-        .with_gate(Gate::off())
-        .connect()
-        .await
-        .expect("the durable client opens offline");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+            .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+            .signed_in(credential)
+            .durable(dir.path(), keys.clone())
+            .with_gate(Gate::off())
+            .connect(),
+    )
+    .await
+    .expect("the durable client opens offline");
     client
         .client()
         .with_conn(|conn| {
@@ -514,14 +516,16 @@ CREATE VIEW orders AS SELECT id, owner_id FROM orders_rls WHERE owner_id = curre
     keys.store(&record, &connetto_core::test_support::replica_key())
         .await
         .expect("seed the key");
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1/", schema)
-        .with_dialer(super::support::NeverDial::<FakeTransport>::default())
-        .signed_in(credential)
-        .durable(dir.path(), keys.clone())
-        .with_gate(Gate::off())
-        .connect()
-        .await
-        .expect("the durable client opens offline");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", schema)
+            .with_dialer(super::support::NeverDial::<FakeTransport>::default())
+            .signed_in(credential)
+            .durable(dir.path(), keys.clone())
+            .with_gate(Gate::off())
+            .connect(),
+    )
+    .await
+    .expect("the durable client opens offline");
 
     client
         .forget_device(true)

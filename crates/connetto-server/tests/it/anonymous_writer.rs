@@ -3,29 +3,36 @@
 //! A caller with no identity has no account to check a number against, and
 //! numbers are sequential, so a number writer issued to such a caller belongs
 //! to the run that holds the resume credential naming its durable handle. A
-//! second run that guesses the first run's number is told it is unknown and
-//! prunes nothing of it. The owning run, resuming on its own token, still
-//! confirms the number at the standing frontier.
+//! second run that guesses the first run's number is told it is unknown,
+//! prunes nothing of it, retires nothing of it, and settles a copy that names
+//! it as a plain write. The owning run, resuming on its own token, still
+//! confirms the number and retires it itself.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
+
+#![expect(
+    clippy::too_many_lines,
+    reason = "each test walks the run's writer against the state table in order and a split would hide the sequence"
+)]
 
 use std::convert::Infallible;
 use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
-    ControlMessage, FatalError, FatalErrorReason, Handshake, WriterRequest,
+    ControlMessage, FatalError, FatalErrorReason, Handshake, Provenance, WriterRef, WriterRequest,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
 use connetto_server::defaults::{_connetto_settled, _connetto_writers};
+use connetto_server::writer_schema::SettlePath;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, NoConnector, PageSpec, RequestGuard,
     RuntimeWritableCatalog, SessionConfig, SessionManager, SnapshotEstimate, SnapshotPage,
     SnapshotSource, ThrottleConfig, loopback, pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth};
-use diesel::{ExpressionMethods, QueryDsl};
+use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
@@ -94,6 +101,26 @@ diesel::table! {
         /// Timestamp of the last edit.
         edited_at -> diesel::sql_types::Text,
     }
+}
+
+#[derive(diesel::Queryable, diesel::Selectable, Debug, PartialEq)]
+#[diesel(table_name = notes)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+struct Note {
+    id: i32,
+    body: String,
+    edited_at: String,
+}
+
+/// The `notes` rows, read through the admin pool.
+async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
+    let mut conn = pool.get().await.expect("admin connection");
+    notes::table
+        .order(notes::id)
+        .select(Note::as_select())
+        .load(&mut *conn)
+        .await
+        .expect("read notes")
 }
 
 /// Reset the fixture to a fresh `notes` table seeded with one row and the
@@ -175,6 +202,18 @@ async fn settled_count(pool: &Pool<AsyncPgConnection>, writer: i64) -> i64 {
         .expect("count the settled rows")
 }
 
+/// One settled entry's path, read as admin, for the row at `seq`.
+async fn settled_path(pool: &Pool<AsyncPgConnection>, writer: i64, seq: i64) -> Option<SettlePath> {
+    let mut conn = pool.get().await.expect("admin connection");
+    _connetto_settled::table
+        .filter(_connetto_settled::writer.eq(writer))
+        .filter(_connetto_settled::seq.eq(seq))
+        .select(_connetto_settled::path)
+        .first(&mut *conn)
+        .await
+        .ok()
+}
+
 /// A manager whose write policy admits the unnamed caller, so an anonymous
 /// run reaches the database and the writer binding is what decides.
 fn writing_manager(
@@ -235,8 +274,9 @@ async fn refused_anonymous_handshake(
 }
 
 /// A second anonymous run that names the first run's number is told it is
-/// unknown and prunes nothing of it. The owning run, resuming on its own
-/// token, still confirms the number at the standing frontier.
+/// unknown, prunes nothing of it and retires nothing of it, and a copy that
+/// names the number applies as a plain write. The owning run, resuming on its
+/// own token, still confirms the number and retires it itself.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_anonymous_run_cannot_reach_another_run_number() {
     let fixture = Fixture::acquire().await;
@@ -294,8 +334,66 @@ async fn an_anonymous_run_cannot_reach_another_run_number() {
         "a settle report from a foreign run prunes nothing"
     );
 
-    // Run A, resuming on its own token, still confirms the number at the
-    // standing frontier.
+    // Run B cannot retire the owner's writer.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_unidentified("anon-b-retire").await;
+    let answer = client.retire_writer("r1", WriterRef::Number(number)).await;
+    assert_eq!(
+        answer.outcome,
+        connetto_core::messages::WriterOutcome::Unknown,
+        "a foreign run retires nothing"
+    );
+    client.close().await;
+    server
+        .await
+        .expect("join the retire run")
+        .expect("session ok");
+    assert!(
+        !writer_facts(fixture.admin(), db_number).await.retired,
+        "the writer still stands after a foreign retirement"
+    );
+
+    // Run B's copy that names the owner's writer settles nothing of it and
+    // applies as a plain write.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_unidentified("anon-b-copy").await;
+    client
+        .upload_with_provenance(
+            1,
+            insert_changeset(3, "three", "t2"),
+            Some(Provenance {
+                writer: WriterRef::Number(number),
+                seq: 1,
+            }),
+        )
+        .await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server
+        .await
+        .expect("join the copy run")
+        .expect("session ok");
+    assert_eq!(
+        settled_count(fixture.admin(), db_number).await,
+        1,
+        "the copy settles nothing of the owner's writer"
+    );
+    assert_eq!(
+        settled_path(fixture.admin(), db_number, 1).await,
+        Some(SettlePath::Direct),
+        "the owner's entry still stands direct"
+    );
+    assert!(
+        notes(fixture.admin()).await.iter().any(|row| row.id == 3),
+        "the copy that names a foreign writer applies as a plain write"
+    );
+
+    // Run A, resuming on its own token, still confirms the number and retires
+    // it itself.
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
@@ -316,9 +414,19 @@ async fn an_anonymous_run_cannot_reach_another_run_number() {
         grant.frontier, 1,
         "the resumed run answers the standing frontier"
     );
+    let answer = client.retire_writer("r2", WriterRef::Number(number)).await;
+    assert_eq!(
+        answer.outcome,
+        connetto_core::messages::WriterOutcome::Retired,
+        "the owning run retires its own writer"
+    );
     client.close().await;
     server
         .await
         .expect("join the resumed run")
         .expect("session ok");
+    assert!(
+        writer_facts(fixture.admin(), db_number).await.retired,
+        "the owner's retirement stands"
+    );
 }

@@ -229,6 +229,33 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
         user_id: Option<&'c Self::Id>,
         session_id: Option<&'c uuid::Uuid>,
     ) -> Statement<'c, Option<WriterRow<Self::Id>>>;
+    /// `SELECT` the device writer `device_key`, `None` when none exists.
+    fn by_key<'c>(
+        conn: &'c mut AsyncPgConnection,
+        device_key: &'c [u8],
+    ) -> Statement<'c, Option<WriterRow<Self::Id>>>;
+    /// `INSERT ... (user_id, device_key) ON CONFLICT (device_key) DO NOTHING
+    /// RETURNING writer, frontier`, the first bind or first provenance of a
+    /// device writer, `None` when the row stood already.
+    fn insert_key<'c>(
+        conn: &'c mut AsyncPgConnection,
+        user_id: Option<Self::Id>,
+        device_key: &'c [u8],
+    ) -> Statement<'c, Option<(i64, i64)>>;
+    /// The same insert opening the row retired, the retirement of a device
+    /// key that never bound, `None` when the row stood already.
+    fn insert_retired_key<'c>(
+        conn: &'c mut AsyncPgConnection,
+        user_id: Option<Self::Id>,
+        device_key: &'c [u8],
+    ) -> Statement<'c, Option<i64>>;
+    /// `UPDATE ... SET retired_at = now() WHERE writer AND device_key match
+    /// and the row is not retired`, reporting whether it retired.
+    fn mark_retired<'c>(
+        conn: &'c mut AsyncPgConnection,
+        writer: i64,
+        device_key: Option<&'c [u8]>,
+    ) -> Statement<'c, bool>;
     /// `SELECT` the settled row `(writer, seq)`, `None` when pruned or never
     /// settled.
     fn settled(
@@ -431,6 +458,134 @@ macro_rules! connetto_writers_table {
                             }
                         },
                     ))
+                })
+            }
+
+            fn by_key<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                device_key: &'c [u8],
+            ) -> $crate::writer_schema::Statement<
+                'c,
+                Option<$crate::writer_schema::WriterRow<Self::Id>>,
+            > {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let query = QueryDsl::select(
+                        QueryDsl::filter(
+                            _connetto_writers::table,
+                            _connetto_writers::device_key.eq(device_key.to_vec()),
+                        ),
+                        (
+                            _connetto_writers::writer,
+                            _connetto_writers::user_id,
+                            _connetto_writers::device_key,
+                            _connetto_writers::frontier,
+                            _connetto_writers::head,
+                            _connetto_writers::retired_at,
+                        ),
+                    );
+                    let row: Option<(
+                        i64,
+                        Option<$id>,
+                        Option<Vec<u8>>,
+                        i64,
+                        Option<Vec<u8>>,
+                        Option<$crate::authn::schema::Instant>,
+                    )> = RunQueryDsl::first(query, &mut *conn).await.optional()?;
+                    Ok(row.map(
+                        |(writer, user_id, device_key, frontier, head, retired_at)| {
+                            $crate::writer_schema::WriterRow {
+                                writer,
+                                user_id,
+                                device_key,
+                                frontier,
+                                head,
+                                retired_at: retired_at.map(From::from),
+                            }
+                        },
+                    ))
+                })
+            }
+
+            fn insert_key<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                user_id: Option<Self::Id>,
+                device_key: &'c [u8],
+            ) -> $crate::writer_schema::Statement<'c, Option<(i64, i64)>> {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, OptionalExtension as _};
+                    use diesel_async::RunQueryDsl as _;
+                    let row: Option<(i64, i64)> = diesel::insert_into(_connetto_writers::table)
+                        .values((
+                            _connetto_writers::user_id.eq(user_id),
+                            _connetto_writers::device_key.eq(device_key.to_vec()),
+                            _connetto_writers::frontier.eq(0),
+                        ))
+                        .on_conflict(_connetto_writers::device_key)
+                        .do_nothing()
+                        .returning((_connetto_writers::writer, _connetto_writers::frontier))
+                        .get_result(&mut *conn)
+                        .await
+                        .optional()?;
+                    Ok(row)
+                })
+            }
+
+            fn insert_retired_key<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                user_id: Option<Self::Id>,
+                device_key: &'c [u8],
+            ) -> $crate::writer_schema::Statement<'c, Option<i64>> {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, OptionalExtension as _};
+                    use diesel_async::RunQueryDsl as _;
+                    let at = $crate::authn::schema::Instant::from(std::time::SystemTime::now());
+                    let row: Option<i64> = diesel::insert_into(_connetto_writers::table)
+                        .values((
+                            _connetto_writers::user_id.eq(user_id),
+                            _connetto_writers::device_key.eq(device_key.to_vec()),
+                            _connetto_writers::frontier.eq(0),
+                            _connetto_writers::retired_at.eq(at),
+                        ))
+                        .on_conflict(_connetto_writers::device_key)
+                        .do_nothing()
+                        .returning(_connetto_writers::writer)
+                        .get_result(&mut *conn)
+                        .await
+                        .optional()?;
+                    Ok(row)
+                })
+            }
+
+            fn mark_retired<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                writer: i64,
+                device_key: Option<&'c [u8]>,
+            ) -> $crate::writer_schema::Statement<'c, bool> {
+                Box::pin(async move {
+                    use diesel::{
+                        ExpressionMethods as _, NullableExpressionMethods as _,
+                        PgExpressionMethods as _, QueryDsl,
+                    };
+                    use diesel_async::RunQueryDsl;
+                    let at = $crate::authn::schema::Instant::from(std::time::SystemTime::now());
+                    let key: Option<Vec<u8>> = device_key.map(|key| key.to_vec());
+                    let query = diesel::update(QueryDsl::filter(
+                        QueryDsl::filter(
+                            QueryDsl::filter(
+                                _connetto_writers::table,
+                                _connetto_writers::writer.eq(writer),
+                            ),
+                            _connetto_writers::retired_at.is_null(),
+                        ),
+                        _connetto_writers::device_key
+                            .nullable()
+                            .is_not_distinct_from(key),
+                    ))
+                    .set(_connetto_writers::retired_at.eq(at));
+                    let affected = RunQueryDsl::execute(query, &mut *conn).await?;
+                    Ok(affected == 1)
                 })
             }
 

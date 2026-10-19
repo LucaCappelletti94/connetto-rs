@@ -142,6 +142,114 @@ mod app {
             })
         }
 
+        fn by_key<'c>(
+            conn: &'c mut AsyncPgConnection,
+            device_key: &'c [u8],
+        ) -> Statement<'c, Option<WriterRow<Self::Id>>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, OptionalExtension, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = app_writers::table
+                    .filter(app_writers::device_key.eq(device_key.to_vec()))
+                    .select((
+                        app_writers::writer,
+                        app_writers::user_id,
+                        app_writers::device_key,
+                        app_writers::frontier,
+                        app_writers::head,
+                        app_writers::retired_at,
+                    ));
+                let row: Option<WriterRowTuple> =
+                    RunQueryDsl::first(query, &mut *conn).await.optional()?;
+                Ok(row.map(
+                    |(writer, user_id, device_key, frontier, head, retired_at)| WriterRow {
+                        writer,
+                        user_id,
+                        device_key,
+                        frontier,
+                        head,
+                        retired_at: retired_at.map(From::from),
+                    },
+                ))
+            })
+        }
+
+        fn insert_key<'c>(
+            conn: &'c mut AsyncPgConnection,
+            user_id: Option<Self::Id>,
+            device_key: &'c [u8],
+        ) -> Statement<'c, Option<(i64, i64)>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, OptionalExtension};
+                use diesel_async::RunQueryDsl as _;
+                let row: Option<(i64, i64)> = diesel::insert_into(app_writers::table)
+                    .values((
+                        app_writers::user_id.eq(user_id),
+                        app_writers::device_key.eq(device_key.to_vec()),
+                        app_writers::frontier.eq(0),
+                    ))
+                    .on_conflict(app_writers::device_key)
+                    .do_nothing()
+                    .returning((app_writers::writer, app_writers::frontier))
+                    .get_result(&mut *conn)
+                    .await
+                    .optional()?;
+                Ok(row)
+            })
+        }
+
+        fn insert_retired_key<'c>(
+            conn: &'c mut AsyncPgConnection,
+            user_id: Option<Self::Id>,
+            device_key: &'c [u8],
+        ) -> Statement<'c, Option<i64>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, OptionalExtension};
+                use diesel_async::RunQueryDsl as _;
+                let at =
+                    connetto_server::authn::schema::Instant::from(std::time::SystemTime::now());
+                let row: Option<i64> = diesel::insert_into(app_writers::table)
+                    .values((
+                        app_writers::user_id.eq(user_id),
+                        app_writers::device_key.eq(device_key.to_vec()),
+                        app_writers::frontier.eq(0),
+                        app_writers::retired_at.eq(at),
+                    ))
+                    .on_conflict(app_writers::device_key)
+                    .do_nothing()
+                    .returning(app_writers::writer)
+                    .get_result(&mut *conn)
+                    .await
+                    .optional()?;
+                Ok(row)
+            })
+        }
+
+        fn mark_retired<'c>(
+            conn: &'c mut AsyncPgConnection,
+            writer: i64,
+            device_key: Option<&'c [u8]>,
+        ) -> Statement<'c, bool> {
+            Box::pin(async move {
+                use diesel::{
+                    ExpressionMethods, NullableExpressionMethods, PgExpressionMethods, QueryDsl,
+                };
+                use diesel_async::RunQueryDsl;
+                let at =
+                    connetto_server::authn::schema::Instant::from(std::time::SystemTime::now());
+                let key: Option<Vec<u8>> = device_key.map(<[u8]>::to_vec);
+                let query = diesel::update(
+                    app_writers::table
+                        .filter(app_writers::writer.eq(writer))
+                        .filter(app_writers::retired_at.is_null())
+                        .filter(app_writers::device_key.nullable().is_not_distinct_from(key)),
+                )
+                .set(app_writers::retired_at.eq(at));
+                let affected = RunQueryDsl::execute(query, &mut *conn).await?;
+                Ok(affected == 1)
+            })
+        }
+
         fn settled(
             conn: &mut AsyncPgConnection,
             writer: i64,

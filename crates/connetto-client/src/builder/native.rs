@@ -843,7 +843,7 @@ where
                     java: device.java.clone(),
                 };
                 let (enroller, handle) = Enroller::new(
-                    keys,
+                    Arc::clone(&keys),
                     device.lifetime,
                     device.descriptor,
                     device.roots,
@@ -857,6 +857,9 @@ where
                     #[cfg(feature = "peer")]
                     bluetooth_tx,
                 );
+                core.client()
+                    .with_device_writer(keys, handle.writer_retirement())
+                    .await?;
                 let enrolment = core.client().enrolment(enroller);
                 #[cfg(feature = "peer")]
                 let (runner, beacon_rx, nearby_rx, bt_backend) = Box::pin(async {

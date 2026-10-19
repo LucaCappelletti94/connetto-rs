@@ -138,6 +138,9 @@ pub(crate) struct SettleSpec {
     pub previous_hash: [u8; 32],
     /// The path that settles the entry.
     pub path: SettlePath,
+    /// The original `(writer, seq, hash)` to settle alongside as `Restore`,
+    /// present only when the apply re-applies a provenance original.
+    pub original: Option<(i64, u64, [u8; 32])>,
 }
 
 /// A Postgres write target that applies under the caller's RLS context.
@@ -248,6 +251,55 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)
     }
 
+    /// The device writer `device_key`, absent when none exists.
+    pub(crate) async fn writer_by_key(
+        &self,
+        device_key: &[u8],
+    ) -> Result<Option<WriterRow<D::Id>>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::by_key(&mut conn, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The first bind or first provenance of a device writer, absent when the
+    /// row stood already.
+    pub(crate) async fn insert_device_writer(
+        &self,
+        user_id: Option<D::Id>,
+        device_key: &[u8],
+    ) -> Result<Option<(i64, i64)>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::insert_key(&mut conn, user_id, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The same insert opening the row retired, the retirement of a device key
+    /// that never bound, absent when the row stood already.
+    pub(crate) async fn insert_retired_device_writer(
+        &self,
+        user_id: Option<D::Id>,
+        device_key: &[u8],
+    ) -> Result<Option<i64>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::insert_retired_key(&mut conn, user_id, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// Retire the writer `writer`, reporting whether this call retired it.
+    pub(crate) async fn mark_writer_retired(
+        &self,
+        writer: i64,
+        device_key: Option<&[u8]>,
+    ) -> Result<bool, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::mark_retired(&mut conn, writer, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
     /// The settled row of `(writer, seq)`, absent when pruned or never settled.
     pub(crate) async fn settled_row(
         &self,
@@ -319,6 +371,10 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         settle: &SettleSpec,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(settle.seq)?;
+        let original = settle
+            .original
+            .map(|(writer, oseq, hash)| seq_storage(oseq).map(|os| (writer, os, hash)))
+            .transpose()?;
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
@@ -380,6 +436,20 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     apply_diffset_bytes_async_with_catalog(catalog, &bytes, c, &adapter).await?;
                 if affected < expected {
                     return Err(CommitError::Denied);
+                }
+                if let Some((writer, oseq, hash)) = original {
+                    // The provenance original stands applied too; settle it here
+                    // or the device would lose it on its next prune.
+                    D::Writers::settle(
+                        c,
+                        writer,
+                        oseq,
+                        &hash,
+                        &SettledOutcome::Applied.json(),
+                        SettlePath::Restore,
+                    )
+                    .await?;
+                    D::Writers::advance(c, writer, oseq, &hash).await?;
                 }
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                     return Err(CommitError::Frontier);

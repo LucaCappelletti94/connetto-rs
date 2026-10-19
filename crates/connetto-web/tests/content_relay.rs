@@ -334,6 +334,7 @@ async fn send_mutation(tab: &mut MessageTransport<MessagePort>, seq: u64, change
     tab.send_control(ControlMessage::MutationHeader(MutationHeader {
         client_seq: seq,
         op_count: 1,
+        provenance: None,
     }))
     .await
     .expect("post header");

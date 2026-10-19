@@ -18,7 +18,7 @@
 //! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
 //! write applies to the source Postgres under the caller's RLS context.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -26,17 +26,18 @@ use std::time::{Duration, Instant, SystemTime};
 
 use connetto_core::auth::{AuthContext, Principal, Subject};
 use connetto_core::chain::{self, GENESIS};
-use connetto_core::device_cert::KeyId;
+use connetto_core::device_cert::{KeyId, spki_point};
 use connetto_core::messages::{
-    AggregateUpdate, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
+    AggregateUpdate, BindDevice, BindValue, BotRegistered, BulkMessage, CONTENT_TICKET_REFUSED,
     CONTENT_TICKET_SIGNER_ERROR, Challenge, ConflictRow, ContentTicketGrant, ContentTicketRequest,
     ContentVerb, ControlMessage, DeviceRevokedAck, DevicesList, DevicesRequest, EnrolChallenge,
     EnrolRefusal, EnrolRefused, FatalError, FatalErrorReason, FullResyncReason, FullResyncRequired,
     Grant, Handshake, HandshakeAck, LivePatch, MembershipOpened, MutationApplied, MutationConflict,
     MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError, PauseCause,
-    Pong, RateLimited, RegisterBot, ReplaceShareKeys, RevocationUpdate, RevokeDeviceRequest,
-    SUBSCRIPTION_REFUSED, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd, SnapshotPatch,
-    Subscribe, SubscriptionSpec, WriterGrant, WriterRequest, bot_registration_message,
+    Pong, Provenance, RateLimited, RegisterBot, ReplaceShareKeys, RetireWriter, RevocationUpdate,
+    RevokeDeviceRequest, SUBSCRIPTION_REFUSED, ShareKeysReplaced, SignedList, SnapshotBegin,
+    SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionSpec, WriterAnswer, WriterGrant,
+    WriterOutcome, WriterRef, WriterRequest, bot_registration_message, writer_bind_message,
 };
 use connetto_core::traits::{
     CheckedGrant, ContentTicketSigner, HandshakeAuthority, IncomingFrame, Transport,
@@ -47,7 +48,7 @@ use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersio
 use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
 use ring::rand::{SecureRandom, SystemRandom};
-use ring::signature::{ED25519, UnparsedPublicKey};
+use ring::signature::{ECDSA_P256_SHA256_ASN1, ED25519, UnparsedPublicKey};
 use sha2::{Digest, Sha256};
 use sqlite_diff_rs::{
     DiffOps, Indirect, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, TableSchema,
@@ -1206,7 +1207,7 @@ async fn next_key_expiry(expiry: &BTreeMap<String, u64>, config: &SessionConfig)
 }
 
 /// Map a materializer failure to the reason sent back on the wire.
-fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
+pub(crate) fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
     match err {
         MaterializerError::Parse(detail) => MutationRejectReason::Malformed {
             detail: detail.clone(),
@@ -1220,6 +1221,17 @@ fn reject_reason(err: &MaterializerError) -> MutationRejectReason {
         other => MutationRejectReason::Other {
             detail: other.to_string(),
         },
+    }
+}
+
+/// Whether a writer row's account is the caller's, the Display rendering
+/// standing in for the id's equality at this edge, the same spelling every
+/// Postgres binding and registry key uses.
+fn same_account<Id: core::fmt::Display>(row_user: Option<&Id>, caller_user: Option<&Id>) -> bool {
+    match (row_user, caller_user) {
+        (Some(owner), Some(caller)) => owner.to_string() == caller.to_string(),
+        (None, None) => true,
+        _ => false,
     }
 }
 
@@ -1329,8 +1341,13 @@ struct HandshakeOutcome<Id, Key> {
     resume: Resume,
     /// What is left of the connection's wait on reconnect-log reads after the handshake's.
     resume_read_budget: Duration,
-    /// The writer this connection writes as, resolved at the handshake (R75).
+    /// The writer this connection writes as, resolved at the handshake for a
+    /// number request and set by the `BindDevice` for a device one, absent
+    /// before that bind.
     writer_row: Option<WriterRow<Id>>,
+    /// The challenge nonce of the round the handshake settled, the message a
+    /// device key signs to bind its writer (R75).
+    bind_nonce: [u8; 32],
     /// How many grants were refused, tallied for abuse once the run is
     /// registered so a crossing can close the connection it happened on.
     refused_grants: u32,
@@ -1615,11 +1632,16 @@ struct SessionState<Id, Key> {
     principal: Arc<Principal<Id, Key>>,
     /// The `MutationHeader` awaiting its paired `MutationPatch`.
     pending_header: Option<MutationHeader>,
-    /// The writer this connection writes as (R75). Its `frontier` is the
-    /// per-connection cache of the writer's durable frontier.
+    /// The writer this connection writes as (R75), resolved at the handshake
+    /// for a number request and set by the `BindDevice` for a device one,
+    /// absent before that bind. Its `frontier` is the per-connection cache of
+    /// the writer's durable frontier.
     writer_row: Option<WriterRow<Id>>,
     /// The connetto-minted session id from the verified token.
     session_id: SessionId,
+    /// The challenge nonce of the round the handshake settled, the message a
+    /// device key signs to bind its writer (R75).
+    bind_nonce: [u8; 32],
     /// The sequence this connection answered `Indeterminate` that stands
     /// unsettled, so the writes past it are answered the same way rather than
     /// closed, the client resends them while a new one is in flight.
@@ -1762,6 +1784,9 @@ pub struct SessionManager<
     /// or `None` when the deployment wired no registry, in which case every
     /// registration fails closed and is refused without saying why.
     bot_registry: Option<PgBotRegistry<D::Bots>>,
+    /// The sessions bound to each device writer (R75), so a retirement can
+    /// close every connection that writes as the retired writer.
+    writer_sessions: Mutex<HashMap<i64, HashSet<SessionId>>>,
 }
 
 /// Keeps the open-run-loop count right while one `serve` is in flight.
@@ -1851,7 +1876,17 @@ where
         open_sessions: Arc::new(AtomicUsize::new(0)),
         shutting_down: AtomicBool::new(false),
         bot_registry,
+        writer_sessions: Mutex::new(HashMap::new()),
     })
+}
+
+/// The verdict a device bind settles. `Writer` answers the connection,
+/// `Revoked` closes it with `DeviceRevoked`, the way a connected device
+/// learns of its revocation.
+#[derive(Debug)]
+enum BindVerdict {
+    Writer(WriterOutcome),
+    Revoked,
 }
 
 impl<Snap, Auth, C, O, Id, Key, D, S> SessionManager<Snap, Auth, D, C, O, Id, Key, S>
@@ -2009,7 +2044,7 @@ where
 
     /// Who a signal is attributed to: the handle for the rate limit, the person
     /// for the abuse tally.
-    fn caller(principal: &Principal<Id, Key>) -> Caller<'_, Id> {
+    pub(crate) fn caller(principal: &Principal<Id, Key>) -> Caller<'_, Id> {
         Caller {
             session: principal.session_id(),
             user: principal.identity().map(|identity| &identity.user_id),
@@ -3283,12 +3318,12 @@ where
     async fn registration_gate<T: Transport>(
         &self,
         transport: &mut T,
-    ) -> Result<Option<Handshake>, SessionError> {
+    ) -> Result<Option<(Handshake, [u8; 32])>, SessionError> {
         // The tally of a connection that never proves an identity keys on the
         // connection alone, so the gate mints the id the tally names.
         let session = SessionId::from_uuid(Uuid::new_v4());
         let mut nonce = Self::mint_nonce();
-        let result: Result<Option<Handshake>, SessionError> =
+        let result: Result<Option<(Handshake, [u8; 32])>, SessionError> =
             loop {
                 if self.shutting_down.load(Ordering::Acquire) {
                     let _ = transport
@@ -3318,7 +3353,7 @@ where
                     Err(err) => break Err(err),
                     Ok(None) => break Ok(None),
                     Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(handshake)))) => {
-                        break Ok(Some(handshake));
+                        break Ok(Some((handshake, nonce)));
                     }
                     Ok(Some(IncomingFrame::Control(ControlMessage::RegisterBot(registration)))) => {
                         match self.settle_registration(&registration, &nonce).await {
@@ -3479,6 +3514,7 @@ where
         &self,
         transport: &mut T,
         handshake: Handshake,
+        nonce: [u8; 32],
     ) -> Result<Option<HandshakeOutcome<Id, Key>>, SessionError> {
         if handshake.protocol_version != PROTOCOL_VERSION {
             // Outside any connection context on purpose: no session exists yet,
@@ -3606,24 +3642,42 @@ where
             }
             WriterRequest::Number(number) => {
                 let writer = i64::try_from(number).unwrap_or(i64::MAX);
-                if let Some(row) = self
+                match self
                     .target
                     .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
                     .await
                     .map_err(|err| SessionError::WriteTarget(err.detail()))?
                 {
-                    writer_grant = Some(WriterGrant {
-                        number,
-                        frontier: u64::try_from(row.frontier).unwrap_or(0),
-                    });
-                    writer_row = Some(row);
-                } else {
-                    let _ = transport
-                        .send_control(ControlMessage::FatalError(FatalError::new(
-                            FatalErrorReason::WriterUnknown,
-                        )))
-                        .await;
-                    return Ok(None);
+                    Some(row) if row.retired_at.is_some() => {
+                        // A retired writer still retires its settled records at the handshake.
+                        if let Some(settled_through) = handshake.settled_through {
+                            self.target
+                                .prune_settled(row.writer, settled_through)
+                                .await
+                                .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                        }
+                        let _ = transport
+                            .send_control(ControlMessage::FatalError(FatalError::new(
+                                FatalErrorReason::WriterRetired,
+                            )))
+                            .await;
+                        return Ok(None);
+                    }
+                    Some(row) => {
+                        writer_grant = Some(WriterGrant {
+                            number,
+                            frontier: u64::try_from(row.frontier).unwrap_or(0),
+                        });
+                        writer_row = Some(row);
+                    }
+                    None => {
+                        let _ = transport
+                            .send_control(ControlMessage::FatalError(FatalError::new(
+                                FatalErrorReason::WriterUnknown,
+                            )))
+                            .await;
+                        return Ok(None);
+                    }
                 }
             }
             WriterRequest::Device => {}
@@ -3693,6 +3747,7 @@ where
             resume,
             resume_read_budget,
             writer_row,
+            bind_nonce: nonce,
             refused_grants,
             span,
             outbound_tx,
@@ -4065,10 +4120,10 @@ where
         mut transport: T,
     ) -> Result<(), SessionError> {
         let _tally = OpenSessionTally::start(self.open_sessions.clone());
-        let Some(handshake) = self.registration_gate(&mut transport).await? else {
+        let Some((handshake, nonce)) = self.registration_gate(&mut transport).await? else {
             return Ok(());
         };
-        let Some(outcome) = self.run_handshake(&mut transport, handshake).await? else {
+        let Some(outcome) = self.run_handshake(&mut transport, handshake, nonce).await? else {
             return Ok(());
         };
         let span = outcome.span.clone();
@@ -4087,6 +4142,7 @@ where
             resume,
             resume_read_budget,
             writer_row,
+            bind_nonce,
             refused_grants,
             span: _,
             outbound_tx,
@@ -4117,6 +4173,7 @@ where
             pending_header: None,
             writer_row,
             session_id,
+            bind_nonce,
             indeterminate: None,
             deferred: BTreeMap::new(),
             resume,
@@ -4181,6 +4238,18 @@ where
 
         // Runs on every exit, an error included, so no ended session stays registered.
         self.unregister_connection(session_id, connection_num).await;
+        // A session that was bound to a device writer leaves the writer's live
+        // set, so a later retirement does not try to close it again (R75).
+        if let Some(row) = state
+            .writer_row
+            .as_ref()
+            .filter(|row| row.device_key.is_some())
+        {
+            let mut live = self.writer_sessions.lock().await;
+            if let Some(set) = live.get_mut(&row.writer) {
+                set.remove(&session_id);
+            }
+        }
         // The connection is the window for a caller with no identity, so its
         // tallies die here and nothing else expires them.
         self.guard.forget_connection(session_id);
@@ -4853,6 +4922,10 @@ where
         }
     }
 
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one dispatch arm per control message, each delegating to its own handler"
+    )]
     async fn handle_control<T: Transport>(
         &self,
         transport: &mut T,
@@ -4955,9 +5028,271 @@ where
                 self.replace_share_keys(req, state).await;
                 Ok(())
             }
+            ControlMessage::BindDevice(bind) => {
+                tracing::debug!(request_id = %bind.request_id, "device bind requested");
+                self.handle_bind_device(transport, bind, state).await
+            }
+            ControlMessage::RetireWriter(retire) => {
+                self.handle_retire_writer(transport, retire, state).await
+            }
             // Server-origin frames received from a client are ignored.
             _ => Ok(()),
         }
+    }
+
+    /// Verify a device key's signature over this connection's bind nonce and
+    /// switch the connection to write as its writer, answering the outcome,
+    /// or close the connection with `DeviceRevoked` when the key's enrolment
+    /// is revoked.
+    async fn handle_bind_device<T: Transport>(
+        &self,
+        transport: &mut T,
+        bind: BindDevice,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let outcome = match state.principal.identity() {
+            Some(identity) => match self
+                .bind_device(identity.user_id.clone(), &bind, state)
+                .await?
+            {
+                BindVerdict::Writer(outcome) => outcome,
+                // The device must learn of its revocation.
+                BindVerdict::Revoked => {
+                    tracing::debug!(request_id = %bind.request_id, "device bind refused as revoked, closing the connection");
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(FatalError::new(
+                            FatalErrorReason::DeviceRevoked,
+                        )))
+                        .await;
+                    return Err(SessionError::Protocol("a bind of a revoked key".into()));
+                }
+            },
+            // An anonymous session enrols no device key.
+            None => WriterOutcome::NotEnrolled,
+        };
+        tracing::debug!(request_id = %bind.request_id, ?outcome, "device bind answered");
+        transport
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: bind.request_id,
+                outcome,
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
+    /// The bind's verification and its verdict. `BindVerdict::Revoked`
+    /// stands when the key is the caller's own revoked enrolment.
+    async fn bind_device(
+        &self,
+        user_id: Id,
+        bind: &BindDevice,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<BindVerdict, SessionError> {
+        let enrolment = self
+            .device_enrolment
+            .get()
+            .ok_or_else(|| SessionError::Protocol("no device enrolment installed".into()))?;
+        let Some(record) = enrolment
+            .key_record(Some(&user_id), KeyId::from_bytes(bind.key_id))
+            .await
+            .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?
+        else {
+            return Ok(BindVerdict::Writer(WriterOutcome::NotEnrolled));
+        };
+        if record.revoked {
+            return Ok(BindVerdict::Revoked);
+        }
+        // The nonce is the connection's, so a signature from another
+        // connection's bind cannot stand here.
+        let message = writer_bind_message(&state.bind_nonce);
+        let Some(point) = spki_point(&record.public_key) else {
+            return Ok(BindVerdict::Writer(WriterOutcome::NotEnrolled));
+        };
+        if UnparsedPublicKey::new(&ECDSA_P256_SHA256_ASN1, &point)
+            .verify(&message, &bind.signature)
+            .is_err()
+        {
+            return Ok(BindVerdict::Writer(WriterOutcome::NotEnrolled));
+        }
+        let key: Vec<u8> = bind.key_id.to_vec();
+        let row = match self
+            .target
+            .writer_by_key(&key)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+        {
+            Some(row) if row.retired_at.is_some() => {
+                return Ok(BindVerdict::Writer(WriterOutcome::Retired));
+            }
+            Some(row) => row,
+            None => {
+                self.target
+                    .insert_device_writer(Some(user_id), &key)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                self.target
+                    .writer_by_key(&key)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                    .ok_or_else(|| {
+                        SessionError::Protocol("the device writer row did not stand".into())
+                    })?
+            }
+        };
+        if row.retired_at.is_some() {
+            return Ok(BindVerdict::Writer(WriterOutcome::Retired));
+        }
+        // A bind after a number switches the connection to the device writer.
+        state.writer_row = Some(row.clone());
+        state.indeterminate = None;
+        self.writer_sessions
+            .lock()
+            .await
+            .entry(row.writer)
+            .or_default()
+            .insert(state.session_id);
+        Ok(BindVerdict::Writer(WriterOutcome::Bound {
+            frontier: u64::try_from(row.frontier).unwrap_or(0),
+        }))
+    }
+
+    /// Retire the writer the request names, closing the sessions that write
+    /// as it, and answer the outcome.
+    async fn handle_retire_writer<T: Transport>(
+        &self,
+        transport: &mut T,
+        retire: RetireWriter,
+        state: &mut SessionState<Id, Key>,
+    ) -> Result<(), SessionError> {
+        let outcome = match state.principal.identity() {
+            Some(identity) => {
+                self.retire_writer(
+                    Some(identity.user_id.clone()),
+                    state.session_id,
+                    &retire.writer,
+                )
+                .await?
+            }
+            // An anonymous run retires only the number writer its own handle
+            // holds, looked up by that handle.
+            None => {
+                self.retire_writer(None, state.session_id, &retire.writer)
+                    .await?
+            }
+        };
+        transport
+            .send_control(ControlMessage::WriterAnswer(WriterAnswer {
+                request_id: retire.request_id,
+                outcome,
+            }))
+            .await
+            .map_err(transport_err)
+    }
+
+    /// Mark the named writer retired and close the sessions bound to it.
+    async fn retire_writer(
+        &self,
+        user_id: Option<Id>,
+        session: SessionId,
+        writer: &WriterRef,
+    ) -> Result<WriterOutcome, SessionError> {
+        let bind_session = user_id.is_none().then(|| *session.as_uuid());
+        let row = match writer {
+            WriterRef::Number(number) => {
+                let writer = i64::try_from(*number).unwrap_or(i64::MAX);
+                match self
+                    .target
+                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                {
+                    Some(row) => row,
+                    None => return Ok(WriterOutcome::Unknown),
+                }
+            }
+            WriterRef::Device(key_id) => {
+                let Some(user_id) = user_id else {
+                    // An anonymous caller holds no device writer to retire.
+                    return Ok(WriterOutcome::Unknown);
+                };
+                let key: Vec<u8> = key_id.to_vec();
+                match self
+                    .target
+                    .writer_by_key(&key)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                {
+                    // Only this account's writer retires, never confirming
+                    // another account's key exists.
+                    Some(row) if same_account(row.user_id.as_ref(), Some(&user_id)) => row,
+                    Some(_) => return Ok(WriterOutcome::Unknown),
+                    // A device key enrolled to this account that never bound
+                    // retires with its row created (R75).
+                    None => match self.retire_unbound_device_key(user_id, key_id).await? {
+                        Some(row) => row,
+                        None => return Ok(WriterOutcome::Unknown),
+                    },
+                }
+            }
+        };
+        let retired = self
+            .target
+            .mark_writer_retired(row.writer, row.device_key.as_deref())
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        if !retired {
+            return Ok(WriterOutcome::Retired);
+        }
+        // The writer's live sessions learn of the retirement as a fatal.
+        let sessions = self
+            .writer_sessions
+            .lock()
+            .await
+            .remove(&row.writer)
+            .unwrap_or_default();
+        for session in sessions {
+            let _ = self
+                .close_session(session, FatalErrorReason::WriterRetired)
+                .await;
+        }
+        Ok(WriterOutcome::Retired)
+    }
+
+    /// A device key enrolled to this account that never bound, retired with
+    /// its row created. `None` when the key is no live enrolment of the
+    /// account, so the retirement is refused as unknown.
+    ///
+    /// # Errors
+    ///
+    /// [`SessionError::WriteTarget`] when the writer tables fail,
+    /// [`SessionError::Protocol`] when the enrolment store does not answer.
+    async fn retire_unbound_device_key(
+        &self,
+        user_id: Id,
+        key: &[u8; 32],
+    ) -> Result<Option<WriterRow<Id>>, SessionError> {
+        let Some(enrolment) = self.device_enrolment.get() else {
+            return Ok(None);
+        };
+        let Some(record) = enrolment
+            .key_record(Some(&user_id), KeyId::from_bytes(*key))
+            .await
+            .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?
+        else {
+            return Ok(None);
+        };
+        if record.revoked {
+            return Ok(None);
+        }
+        let bytes: Vec<u8> = key.to_vec();
+        self.target
+            .insert_retired_device_writer(Some(user_id), &bytes)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        self.target
+            .writer_by_key(&bytes)
+            .await
+            .map_err(|err| SessionError::WriteTarget(err.detail()))
     }
 
     /// Ask the write question about every op in `plan`, stopping at the first
@@ -5138,6 +5473,7 @@ where
                 entry_hash: chain::entry_hash(&previous, client_seq, &bytes),
                 previous_hash: previous,
                 path: SettlePath::Direct,
+                original: None,
             };
             return self
                 .settle_and_refuse(
@@ -5154,7 +5490,7 @@ where
                 .await;
         }
         let answered = self
-            .new_write(transport, &patch, client_seq, &bytes, state)
+            .new_write(transport, &header, &patch, client_seq, &bytes, state)
             .await;
         // The write already answered, so a failed re-read is logged and the next write reads again.
         match self.refresh_writer_row(state).await {
@@ -5203,10 +5539,14 @@ where
             return Ok(());
         };
         let bind_session = row.user_id.is_none().then(|| *state.session_id.as_uuid());
-        let fresh = self
-            .target
-            .writer_by_number(row.writer, row.user_id.as_ref(), bind_session.as_ref())
-            .await?;
+        let fresh = match row.device_key.as_deref() {
+            Some(key) => self.target.writer_by_key(key).await,
+            None => {
+                self.target
+                    .writer_by_number(row.writer, row.user_id.as_ref(), bind_session.as_ref())
+                    .await
+            }
+        }?;
         if let Some(fresh) = fresh {
             state.writer_row = Some(fresh);
         }
@@ -5260,6 +5600,25 @@ where
             return self
                 .reject(transport, seq, MutationRejectReason::Forked)
                 .await;
+        }
+        if row.path != SettlePath::Direct {
+            // A cross-path delivery stands on both paths' audit.
+            self.guard.record(
+                AuthEvent::new(
+                    state.session_id,
+                    state
+                        .principal
+                        .identity()
+                        .map(|identity| identity.user_id.clone()),
+                    AuthOp::WriteRedelivered,
+                )
+                .about_write(
+                    writer,
+                    i64::try_from(seq).unwrap_or(i64::MAX),
+                    SettlePath::Direct,
+                    row.path,
+                ),
+            );
         }
         self.answer_settled(transport, seq, &row, state).await
     }
@@ -5327,10 +5686,16 @@ where
         }
     }
 
-    /// Apply a new write at the frontier, settling its sequence with the apply.
+    /// Apply a new write at the frontier, settling its sequence with the apply
+    /// and, when the provenance original stands unsettled, settling it alongside.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "one arm per state of the writer frontier and the provenance original"
+    )]
     async fn new_write<T: Transport>(
         &self,
         transport: &mut T,
+        header: &MutationHeader,
         patch: &MutationPatch,
         seq: u64,
         bytes: &[u8],
@@ -5345,13 +5710,81 @@ where
             <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
         });
         let entry_hash = chain::entry_hash(&previous, seq, bytes);
-        let settle = SettleSpec {
+        let mut settle = SettleSpec {
             writer,
             seq,
             entry_hash,
             previous_hash: previous,
             path: SettlePath::Direct,
+            original: None,
         };
+        // A provenance entry the original already settled settles this copy
+        // with the stored outcome, so the logical write applies once.
+        if let Some(provenance) = header.provenance {
+            match self.provenance_original(&provenance, bytes, state).await? {
+                Some((orig_writer, orig_frontier, _orig_hash))
+                    if provenance.seq <= orig_frontier =>
+                {
+                    let stored = self
+                        .target
+                        .settled_row(orig_writer, provenance.seq)
+                        .await
+                        .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                    let outcome = match stored {
+                        // A pruned record stands applied.
+                        None => SettledOutcome::Applied,
+                        Some(row) => {
+                            if row.path != SettlePath::Direct {
+                                self.guard.record(
+                                    AuthEvent::new(
+                                        state.session_id,
+                                        state
+                                            .principal
+                                            .identity()
+                                            .map(|identity| identity.user_id.clone()),
+                                        AuthOp::WriteRedelivered,
+                                    )
+                                    .about_write(
+                                        writer,
+                                        i64::try_from(seq).unwrap_or(i64::MAX),
+                                        SettlePath::Direct,
+                                        row.path,
+                                    ),
+                                );
+                            }
+                            SettledOutcome::from_json(&row.outcome)
+                                .map_err(|err| SessionError::WriteTarget(err.to_string()))?
+                        }
+                    };
+                    self.target
+                        .settle_refusal(&settle, &outcome)
+                        .await
+                        .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                    return self.answer_outcome(transport, seq, &outcome, state).await;
+                }
+                Some((orig_writer, orig_frontier, orig_hash))
+                    if provenance.seq == orig_frontier + 1 =>
+                {
+                    settle.original = Some((orig_writer, provenance.seq, orig_hash));
+                }
+                Some((_, orig_frontier, _)) => {
+                    let _ = transport
+                        .send_control(ControlMessage::FatalError(FatalError::new(
+                            FatalErrorReason::SequenceGap {
+                                expected: orig_frontier + 1,
+                                got: provenance.seq,
+                            },
+                        )))
+                        .await;
+                    return Err(SessionError::Protocol(format!(
+                        "a provenance sequence {} past the original frontier {orig_frontier}",
+                        provenance.seq
+                    )));
+                }
+                // The original is not a writer of this account, so the entry applies plainly.
+                None => {}
+            }
+        }
         let plan = match self
             .materializer
             .lock()
@@ -5398,6 +5831,91 @@ where
             .await
     }
 
+    /// The provenance original's writer, its frontier and this entry's hash
+    /// under it, absent when the original is not a writer of this account.
+    async fn provenance_original(
+        &self,
+        provenance: &Provenance,
+        bytes: &[u8],
+        state: &SessionState<Id, Key>,
+    ) -> Result<Option<(i64, u64, [u8; 32])>, SessionError> {
+        let user_id = state
+            .principal
+            .identity()
+            .map(|identity| identity.user_id.clone());
+        let bind_session = user_id.is_none().then(|| *state.session_id.as_uuid());
+        let row = match provenance.writer {
+            WriterRef::Number(number) => {
+                let writer = i64::try_from(number).unwrap_or(i64::MAX);
+                match self
+                    .target
+                    .writer_by_number(writer, user_id.as_ref(), bind_session.as_ref())
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                {
+                    Some(row) => row,
+                    None => return Ok(None),
+                }
+            }
+            WriterRef::Device(key_id) => {
+                let key: Vec<u8> = key_id.to_vec();
+                match self
+                    .target
+                    .writer_by_key(&key)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                {
+                    // Only this account's writers settle through their
+                    // provenance; a key held elsewhere applies plain and is
+                    // never confirmed.
+                    Some(row) if same_account(row.user_id.as_ref(), user_id.as_ref()) => row,
+                    Some(_) => return Ok(None),
+                    // A device key enrolled to this account that never bound
+                    // takes its row at frontier 0 (R75).
+                    None => {
+                        let Some(user_id) = user_id else {
+                            return Ok(None);
+                        };
+                        let Some(enrolment) = self.device_enrolment.get() else {
+                            return Ok(None);
+                        };
+                        let Some(record) = enrolment
+                            .key_record(Some(&user_id), KeyId::from_bytes(key_id))
+                            .await
+                            .map_err(|_| {
+                                SessionError::Protocol("the enrolment store did not answer".into())
+                            })?
+                        else {
+                            return Ok(None);
+                        };
+                        if record.revoked {
+                            return Ok(None);
+                        }
+                        self.target
+                            .insert_device_writer(Some(user_id), &key)
+                            .await
+                            .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                        match self
+                            .target
+                            .writer_by_key(&key)
+                            .await
+                            .map_err(|err| SessionError::WriteTarget(err.detail()))?
+                        {
+                            Some(row) => row,
+                            None => return Ok(None),
+                        }
+                    }
+                }
+            }
+        };
+        let frontier = u64::try_from(row.frontier).unwrap_or(0);
+        let previous = row.head.as_deref().map_or(GENESIS, |head| {
+            <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
+        });
+        let entry_hash = chain::entry_hash(&previous, provenance.seq, bytes);
+        Ok(Some((row.writer, frontier, entry_hash)))
+    }
+
     /// Answer the write target's outcome: confirm, conflict, re-answer from
     /// the record, or refuse with the record settled.
     async fn answer_write<T: Transport>(
@@ -5430,6 +5948,25 @@ where
                 // A settled sequence resolves the connection's unsettled write.
                 state.indeterminate = None;
                 if hash_matches {
+                    if row.path != settle.path {
+                        // A cross-path delivery stands on both paths' audit.
+                        self.guard.record(
+                            AuthEvent::new(
+                                state.session_id,
+                                state
+                                    .principal
+                                    .identity()
+                                    .map(|identity| identity.user_id.clone()),
+                                AuthOp::WriteRedelivered,
+                            )
+                            .about_write(
+                                settle.writer,
+                                i64::try_from(seq).unwrap_or(i64::MAX),
+                                settle.path,
+                                row.path,
+                            ),
+                        );
+                    }
                     return self.answer_settled(transport, seq, &row, state).await;
                 }
                 // A different entry stands at this sequence, so this one never applies.

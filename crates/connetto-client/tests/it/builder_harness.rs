@@ -342,17 +342,19 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
             .expect("translate the sources"),
     );
 
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
-        .with_dialer(OneShot {
-            transport: Some(quiet_transport()),
-        })
-        .signed_in(
-            HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-        )
-        .durable(dir.path(), store.clone())
-        .connect()
-        .await
-        .expect("a durable build connects");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
+            .with_dialer(OneShot {
+                transport: Some(quiet_transport()),
+            })
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), store.clone())
+            .connect(),
+    )
+    .await
+    .expect("a durable build connects");
     client
         .client()
         .with_conn(|conn| {
@@ -373,17 +375,19 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
     // The second build dials a quiet socket and reopens the encrypted
     // replica from the same directory and the same key store. The row it
     // reads back is the one the first build wrote.
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema)
-        .with_dialer(OneShot {
-            transport: Some(quiet_transport()),
-        })
-        .signed_in(
-            HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-        )
-        .durable(dir.path(), store)
-        .connect()
-        .await
-        .expect("the second build reopens the same replica");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1", schema)
+            .with_dialer(OneShot {
+                transport: Some(quiet_transport()),
+            })
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), store)
+            .connect(),
+    )
+    .await
+    .expect("the second build reopens the same replica");
     let rows: Vec<Note> = client
         .client()
         .with_conn(|conn| {

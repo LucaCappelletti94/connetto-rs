@@ -8,9 +8,10 @@ use std::time::Duration;
 
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
-    AckCredits, BulkMessage, ContentVerb, ControlMessage, FullResyncReason, Grant, Handshake,
-    HandshakeAck, LivePatch, MutationHeader, MutationPatch, Ping, SnapshotPatch, Subscribe,
-    SubscriptionSpec, Unsubscribe, WriterRequest,
+    AckCredits, BindDevice, BulkMessage, Challenge, ContentVerb, ControlMessage, FullResyncReason,
+    Grant, Handshake, HandshakeAck, LivePatch, MutationHeader, MutationPatch, Ping, Provenance,
+    RetireWriter, SnapshotPatch, Subscribe, SubscriptionSpec, Unsubscribe, WriterAnswer, WriterRef,
+    WriterRequest,
 };
 use connetto_core::traits::{ContentTicketSigner, IncomingFrame, MaybeSend, Transport};
 use connetto_core::{Cursor, PROTOCOL_VERSION};
@@ -1917,6 +1918,40 @@ impl Client {
         self.take_handshake_ack().await
     }
 
+    /// Like [`Self::handshake_writing`], and also returns the `Challenge` that
+    /// leads the connection. The challenge's nonce is what a device writer
+    /// signs to prove its key, under [`writer_bind_message`](connetto_core::messages::writer::writer_bind_message).
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the handshake frame fails on the transport, when the leading frame is not a `Challenge`, or when the server's reply is not a `HandshakeAck`.
+    pub async fn handshake_challenge_writing(
+        &mut self,
+        client_id: &str,
+        grants: &[&str],
+        resume_token: Option<&str>,
+        writer: WriterRequest,
+        settled_through: Option<u64>,
+    ) -> (Challenge, HandshakeAck) {
+        let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
+            .with_grants(grants.iter().map(|grant| Grant::new(*grant)))
+            .with_writer(writer);
+        if let Some(token) = resume_token {
+            handshake = handshake.with_resume_token(token);
+        }
+        if let Some(seq) = settled_through {
+            handshake = handshake.with_settled_through(seq);
+        }
+        self.transport
+            .send_control(ControlMessage::Handshake(handshake))
+            .await
+            .expect("send handshake");
+        let ControlMessage::Challenge(challenge) = self.next_control().await else {
+            panic!("the server leads every connection with a challenge");
+        };
+        (challenge, self.take_handshake_ack().await)
+    }
+
     /// The handshake ack of the frame the caller just sent (R91). The server
     /// leads every connection with a `Challenge` the person ignores, and the
     /// ack follows it. A peer that leads with nothing answers with the bare
@@ -1989,18 +2024,36 @@ impl Client {
             .expect("send replace share keys");
     }
 
-    /// Upload one mutation: a header naming the op count, then the compressed
-    /// changeset patch.
+    /// Upload one mutation that names no origin for the entry.
     ///
     /// # Panics
     ///
     /// Panics when zstd compression of `changeset` fails, or when sending the mutation header or patch frame fails on the transport.
     pub async fn upload(&mut self, client_seq: u64, changeset: Vec<u8>) {
+        self.upload_with_provenance(client_seq, changeset, None)
+            .await;
+    }
+
+    /// Upload one mutation carrying `provenance`, naming the writer and
+    /// sequence the entry was first written under. A header naming the op
+    /// count leads, then the compressed changeset patch.
+    ///
+    /// # Panics
+    ///
+    /// Panics when zstd compression of `changeset` fails, or when sending the mutation header or patch frame fails on the transport.
+    pub async fn upload_with_provenance(
+        &mut self,
+        client_seq: u64,
+        changeset: Vec<u8>,
+        provenance: Option<Provenance>,
+    ) {
         let payload = zstd::encode_all(changeset.as_slice(), 3).expect("compress");
+        let mut header = MutationHeader::new(client_seq, 1);
+        if let Some(provenance) = provenance {
+            header = header.with_provenance(provenance);
+        }
         self.transport
-            .send_control(ControlMessage::MutationHeader(MutationHeader::new(
-                client_seq, 1,
-            )))
+            .send_control(ControlMessage::MutationHeader(header))
             .await
             .expect("send mutation header");
         self.transport
@@ -2031,6 +2084,82 @@ impl Client {
             )))
             .await
             .expect("send mutation patch");
+    }
+
+    /// Prove the connection's device key with a signature over the
+    /// connection's challenge nonce, and wait for the `WriterAnswer` that
+    /// settles the bind.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `BindDevice` frame fails, when the answer is not a `WriterAnswer` naming `request_id`, or when the connection closes before answering.
+    pub async fn bind_device(
+        &mut self,
+        request_id: &str,
+        key_id: [u8; 32],
+        signature: Vec<u8>,
+    ) -> WriterAnswer {
+        self.transport
+            .send_control(ControlMessage::BindDevice(BindDevice {
+                request_id: request_id.to_owned(),
+                key_id,
+                signature,
+            }))
+            .await
+            .expect("send bind device");
+        self.await_writer_answer(request_id).await
+    }
+
+    /// Retire an archived writer of the caller's account and wait for the
+    /// `WriterAnswer` that settles the retirement.
+    ///
+    /// # Panics
+    ///
+    /// Panics when sending the `RetireWriter` frame fails, when the answer is not a `WriterAnswer` naming `request_id`, or when the connection closes before answering.
+    pub async fn retire_writer(&mut self, request_id: &str, writer: WriterRef) -> WriterAnswer {
+        self.transport
+            .send_control(ControlMessage::RetireWriter(RetireWriter {
+                request_id: request_id.to_owned(),
+                writer,
+            }))
+            .await
+            .expect("send retire writer");
+        self.await_writer_answer(request_id).await
+    }
+
+    /// Wait for the `WriterAnswer` to `request_id`, on a bounded deadline,
+    /// skipping the frames that interleave with it. A live patch met in
+    /// flight is kept for the next live read rather than dropped, and a
+    /// connection that closes without answering panics, since a closed
+    /// connection is itself the outcome a writer test asserts against.
+    async fn await_writer_answer(&mut self, request_id: &str) -> WriterAnswer {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let frame = tokio::time::timeout(remaining, self.transport.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("timed out waiting for the writer answer to {request_id}")
+                })
+                .expect("recv frame");
+            match frame {
+                Some(IncomingFrame::Control(ControlMessage::WriterAnswer(answer))) => {
+                    assert_eq!(
+                        answer.request_id, request_id,
+                        "the writer answer names a different request"
+                    );
+                    return answer;
+                }
+                Some(IncomingFrame::Bulk(BulkMessage::LivePatch(patch))) => {
+                    self.live_backlog.push_back(patch);
+                }
+                Some(IncomingFrame::Control(ControlMessage::RevocationUpdate(_))) => {}
+                Some(IncomingFrame::Control(other)) => {
+                    panic!("expected the writer answer to {request_id}, got {other:?}");
+                }
+                _ => panic!("the connection closed before answering {request_id}"),
+            }
+        }
     }
 
     /// Replenish the server's delivery credits.
