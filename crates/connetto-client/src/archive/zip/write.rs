@@ -194,23 +194,60 @@ fn write_entry<W: Write>(
         .map_err(zip_error)
 }
 
-/// The queue as one entry: a count, then each changeset behind its length.
+/// The queue as one entry: a count, then each entry behind its fields.
 ///
 /// Its own framing rather than one entry per write, because a queue of a
 /// hundred writes is a hundred zip entries otherwise, and the order is the
-/// only thing about them that matters.
-pub(super) fn encode_pending(records: &[Vec<u8>]) -> Vec<u8> {
-    let total: usize = records.iter().map(|record| record.len() + 8).sum();
+/// only thing about them that matters. Each entry carries the writer, the
+/// sequence, the chain hash and the optional provenance the write rode with.
+pub(super) fn encode_pending(entries: &[super::super::ArchivedEntry]) -> Vec<u8> {
+    let total: usize = entries
+        .iter()
+        .map(|entry| {
+            8 // seq
+                + 32 // hash
+                + 1 // provenance present
+                + 8 // changeset length
+                + entry.changeset.len()
+                + writer_field_len(&entry.writer)
+                + entry
+                    .provenance
+                    .as_ref()
+                    .map_or(0, |prov| writer_field_len(&prov.writer) + 8)
+        })
+        .sum();
     let mut out = Vec::with_capacity(total + 8);
     // usize fits u64 on every supported Rust target
-    let count = u64::try_from(records.len()).expect("slice length exceeds u64");
+    let count = u64::try_from(entries.len()).expect("slice length exceeds u64");
     out.extend_from_slice(&count.to_be_bytes());
-    for record in records {
-        let len = u64::try_from(record.len()).expect("slice length exceeds u64");
+    for entry in entries {
+        write_writer(&mut out, &entry.writer);
+        out.extend_from_slice(&entry.seq.to_be_bytes());
+        out.extend_from_slice(&entry.hash);
+        match &entry.provenance {
+            Some(prov) => {
+                out.push(1);
+                write_writer(&mut out, &prov.writer);
+                out.extend_from_slice(&prov.seq.to_be_bytes());
+            }
+            None => out.push(0),
+        }
+        let len = u64::try_from(entry.changeset.len()).expect("slice length exceeds u64");
         out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(record);
+        out.extend_from_slice(&entry.changeset);
     }
     out
+}
+
+fn writer_field_len(writer: &connetto_core::messages::WriterRef) -> usize {
+    8 + crate::writer_id(writer).len()
+}
+
+fn write_writer(out: &mut Vec<u8>, writer: &connetto_core::messages::WriterRef) {
+    let id = crate::writer_id(writer);
+    let len = u64::try_from(id.len()).expect("writer id exceeds u64");
+    out.extend_from_slice(&len.to_be_bytes());
+    out.extend_from_slice(id.as_bytes());
 }
 
 #[cfg(test)]
