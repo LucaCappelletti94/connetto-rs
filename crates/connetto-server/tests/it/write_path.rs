@@ -789,7 +789,7 @@ async fn a_write_the_settled_record_covers_is_acknowledged_unapplied() {
             ),
             &format!(
                 "INSERT INTO _connetto_settled (writer, seq, entry_hash, outcome, path) \
-                 VALUES ({}, 2, '\\x{}', '{{\"kind\":\"applied\"}}', 'direct')",
+                 VALUES ({}, 2, '\\x{}', '\"applied\"', 'direct')",
                 writer.number,
                 hex(&h2)
             ),

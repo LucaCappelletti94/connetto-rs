@@ -18,8 +18,8 @@ use connetto_core::PROTOCOL_VERSION;
 use connetto_core::auth::Principal;
 use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
-    ControlMessage, FatalError, FatalErrorReason, Grant, Handshake, MutationRejectReason,
-    WriterGrant, WriterRequest,
+    ConflictRow, ControlMessage, FatalError, FatalErrorReason, Grant, Handshake,
+    MutationRejectReason, WriterGrant, WriterRequest,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport as _};
@@ -37,7 +37,7 @@ use diesel_async::pooled_connection::AsyncDieselConnectionManager;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use parking_lot::Mutex;
-use sqlite_diff_rs::{ChangeSet, DiffOps, Insert, SimpleTable, Value};
+use sqlite_diff_rs::{ChangeSet, ChangesetFormat, DiffOps, Insert, SimpleTable, Update, Value};
 
 /// The notes table these tests sync.
 const PG_DDL: &str = "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT);";
@@ -557,7 +557,7 @@ async fn an_indeterminate_answer_settles_nothing_and_the_retry_settles_once() {
     assert_eq!(rows.len(), 1, "the recovered write settled one row");
     assert_eq!(rows[0].seq, 1);
     assert_eq!(rows[0].path, SettlePath::Direct);
-    assert_eq!(rows[0].outcome, "{\"kind\":\"applied\"}");
+    assert_eq!(rows[0].outcome, "\"applied\"");
     assert_eq!(
         notes(fixture.admin()).await,
         vec![note(1, "hello", "t0"), note(2, "two", "t1")],
@@ -644,4 +644,605 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked_and_audited(
     );
     client.close().await;
     server.await.expect("join 2").expect("session ok");
+}
+
+/// A table versioned on a primary key of text, real and bytea columns, so a
+/// conflict re-read proves it binds every stored value kind.
+const MULTI_DDL: &str = "CREATE TABLE multi \
+    (key TEXT, weight REAL, tag BYTEA, body TEXT, edited_at TEXT, \
+     PRIMARY KEY (key, weight, tag));";
+
+diesel::table! {
+    /// Row from the multi test fixture.
+    multi (key, weight, tag) {
+        /// Text key.
+        key -> Text,
+        /// Real key.
+        weight -> Double,
+        /// Bytea key.
+        tag -> Bytea,
+        /// Row body.
+        body -> Text,
+        /// Version column.
+        edited_at -> Text,
+    }
+}
+
+/// Seed `multi` with its one versioned row.
+async fn seed_multi(fixture: &Fixture) {
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(multi::table)
+        .values((
+            multi::key.eq("a"),
+            multi::weight.eq(1.5_f64),
+            multi::tag.eq(vec![0_u8, 1]),
+            multi::body.eq("one"),
+            multi::edited_at.eq("t0"),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("seed row");
+}
+
+fn multi_table() -> SimpleTable {
+    SimpleTable::new(
+        "multi",
+        &["key", "weight", "tag", "body", "edited_at"],
+        &[0, 1, 2],
+    )
+}
+
+/// An update of the seeded `multi` row whose old version value is stale, so it
+/// conflicts against whatever stands.
+fn multi_update_changeset(body: &str, edited_at: &str) -> Vec<u8> {
+    let update = Update::<_, ChangesetFormat, String, Vec<u8>>::from(multi_table())
+        .set(0, Value::Text("a".to_owned()), Value::Text("a".to_owned()))
+        .expect("set key")
+        .set(1, Value::Real(1.5), Value::Real(1.5))
+        .expect("set weight")
+        .set(2, Value::Blob(vec![0_u8, 1]), Value::Blob(vec![0_u8, 1]))
+        .expect("set tag")
+        .set(
+            3,
+            Value::Text("one".to_owned()),
+            Value::Text(body.to_owned()),
+        )
+        .expect("set body")
+        .set(
+            4,
+            Value::Text("t9".to_owned()),
+            Value::Text(edited_at.to_owned()),
+        )
+        .expect("set edited_at");
+    ChangeSet::<SimpleTable, String, Vec<u8>>::new()
+        .update(update)
+        .build()
+}
+
+/// The conflict reply's `server_row` for `client_seq`, the table named.
+async fn expect_conflict(client: &mut Client, client_seq: u64) -> ConflictRow {
+    let ControlMessage::MutationConflict(conflict) = client.next_control().await else {
+        panic!("expected write {client_seq} to conflict");
+    };
+    assert_eq!(conflict.client_seq, client_seq);
+    assert_eq!(conflict.table, "multi");
+    conflict.server_row.expect("the row stands")
+}
+
+/// Two connections that each hold the writer's frontier settle one sequence.
+/// The second is answered from the first's record, the fork is audited, and
+/// the byte-identical redelivery re-answers the standing entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_connections_racing_one_sequence_are_answered_from_the_record() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+
+    // Both connections bind the frontier before either writes. B is the same
+    // account on its own run, since one handle holds one live connection.
+    let (server_transport, client_a) = loopback();
+    let server_a = tokio::spawn(manager.clone().serve(server_transport));
+    let mut a = Client::new(client_a);
+    let ack = a.handshake_with("race-a", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let (server_transport, client_b) = loopback();
+    let server_b = tokio::spawn(manager.clone().serve(server_transport));
+    let mut b = Client::new(client_b);
+    b.handshake_writing(
+        "race-b",
+        &["user:alice#race-b"],
+        None,
+        WriterRequest::Number(number),
+        None,
+    )
+    .await;
+
+    // A settles the sequence. B still holds the frontier it bound.
+    let cs1 = insert_changeset(2, "two", "t1");
+    a.upload(1, cs1.clone()).await;
+    expect_applied(&mut a, 1).await;
+
+    // B's copy of the sequence carries a different changeset, so it never
+    // applies and the fork is named.
+    b.upload(1, insert_changeset(5, "forked", "t9")).await;
+    let ControlMessage::MutationReject(reject) = b.next_control().await else {
+        panic!("expected the fork refusal");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert_eq!(reject.reason, MutationRejectReason::Forked);
+
+    // The byte-identical redelivery re-answers the standing entry.
+    b.upload(1, cs1.clone()).await;
+    expect_applied(&mut b, 1).await;
+
+    // The audit names the fork once, and the standing entry keeps its record.
+    let events = captured.write_events();
+    assert_eq!(events.len(), 1, "the fork audits once");
+    assert_eq!(events[0].seq, Some(1));
+    let writer = i64::try_from(number).expect("number fits");
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(rows.len(), 1, "the race settled one row");
+    assert_eq!(
+        rows[0].entry_hash,
+        entry_hash(&GENESIS, 1, &cs1).to_vec(),
+        "the record stands the first entry"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the racing changeset never applied"
+    );
+    a.close().await;
+    b.close().await;
+    server_a.await.expect("join a").expect("session a ok");
+    server_b.await.expect("join b").expect("session b ok");
+}
+
+/// A conflict settles its sequence with the row's primary key, and the
+/// redelivery re-reads the current row fresh instead of re-sending the copy
+/// it settled. A primary key of text, real and blob columns survives the
+/// stored round trip the re-read binds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_conflict_re_answer_reads_the_current_row_fresh() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS multi CASCADE",
+            MULTI_DDL,
+            "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_writers",
+        ])
+        .await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
+    seed_multi(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let _ = captured;
+    let manager = ManagerBuilder::new(
+        Materializer::builder(MULTI_DDL)
+            .with_write_catalog(
+                RuntimeWritableCatalog::builder()
+                    .versioned("multi", "edited_at")
+                    .build(),
+            )
+            .build()
+            .expect("build materializer"),
+        NoSnapshot,
+        RosterAuth::granting("alice")
+            .and("bob")
+            .withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), MULTI_DDL)
+            .expect("build write target"),
+    )
+    .build();
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake_with("conf-1", "user:alice").await;
+
+    // The stale write conflicts, the reply carrying the row as it stands.
+    let cs = multi_update_changeset("two", "t1");
+    client.upload(1, cs.clone()).await;
+    let first = expect_conflict(&mut client, 1).await;
+    assert_eq!(first.updated_at, "t0", "the reply is the row as it stands");
+
+    // The row moves while the refusal stands.
+    {
+        let mut conn = fixture.admin().get().await.expect("admin connection");
+        diesel::update(multi::table)
+            .set((multi::body.eq("three"), multi::edited_at.eq("t5")))
+            .execute(&mut *conn)
+            .await
+            .expect("move the row");
+    }
+
+    // The redelivery re-answers from the record and reads the row fresh.
+    client.upload(1, cs).await;
+    let second = expect_conflict(&mut client, 1).await;
+    assert_eq!(
+        second.updated_at, "t5",
+        "the re-read is the row as it stands now"
+    );
+    assert!(
+        second.row_json.contains("three"),
+        "the re-read carries the new body, got {}",
+        second.row_json
+    );
+
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A write past the frontier that this connection's own unsettled write
+/// explains is not closed as a sequence gap. It is deferred the same way the
+/// unsettled write was, and the sequences it stands under settle nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_past_a_deferred_gap_is_answered_indeterminate() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let pool = single_connection_pool(&fixture).await;
+    let manager = writing_manager(
+        &pool,
+        guard,
+        SessionConfig::default().with_write_retry_budget(Duration::ZERO),
+    );
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("gap-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+
+    let outage = pool.get_owned().await.expect("hold the only connection");
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_indeterminate(&mut client, 1).await;
+    drop(outage);
+
+    // The gap the unsettled write stands in is not closed. The write past it
+    // is deferred the same way, and nothing settles.
+    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    expect_indeterminate(&mut client, 2).await;
+    let writer = i64::try_from(number).expect("number fits");
+    assert!(
+        settled_rows(fixture.admin(), writer).await.is_empty(),
+        "the deferred writes settle nothing"
+    );
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A patch that does not decompress is refused `Malformed` without settling
+/// its sequence, so the same sequence stands open for a readable patch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_patch_that_does_not_decompress_is_refused_malformed() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("mal-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+
+    client.upload_raw(1, b"not a zstd frame".to_vec()).await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the malformed refusal");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert!(matches!(
+        reject.reason,
+        MutationRejectReason::Malformed { .. }
+    ));
+
+    // The sequence settled nothing, so a readable patch still applies it.
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    let writer = i64::try_from(number).expect("number fits");
+    assert_eq!(
+        settled_rows(fixture.admin(), writer).await.len(),
+        1,
+        "the readable patch settled the sequence once"
+    );
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A patch the window could never hold is refused and its sequence settled,
+/// so the redelivery re-answers the stored refusal rather than re-measuring.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_patch_over_the_byte_window_is_refused_and_settled() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::new().with_mutation_bytes_per_identity(1, Duration::from_secs(60)),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("win-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let writer = i64::try_from(number).expect("number fits");
+
+    let cs = insert_changeset(2, "two", "t1");
+    client.upload(1, cs.clone()).await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the oversize refusal");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert!(matches!(reject.reason, MutationRejectReason::Other { .. }));
+
+    // The refusal settled the sequence, so it stands refused and the frontier
+    // takes it.
+    let rows = settled_rows(fixture.admin(), writer).await;
+    assert_eq!(rows.len(), 1, "the refusal settled the sequence");
+    assert!(
+        rows[0].outcome.contains("exceeds"),
+        "the stored refusal names the window, got {}",
+        rows[0].outcome
+    );
+    assert_eq!(
+        writer_facts(fixture.admin(), writer).await.frontier,
+        1,
+        "the frontier took the refusal"
+    );
+
+    // The redelivery re-answers the stored refusal.
+    client.upload(1, cs).await;
+    let ControlMessage::MutationReject(second) = client.next_control().await else {
+        panic!("expected the re-answered refusal");
+    };
+    assert_eq!(second.client_seq, 1);
+    assert!(matches!(second.reason, MutationRejectReason::Other { .. }));
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0")],
+        "the oversize patch never applied"
+    );
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A write that arrives before a device writer binds cannot stand under a
+/// writer that does not exist yet, so the fatal names the violation and the
+/// session ends as a protocol error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_before_a_device_writer_binds_closes_the_session() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_writing("dev-1", &["user:alice"], None, WriterRequest::Device, None)
+        .await;
+    assert_eq!(ack.writer, None, "a device request carries no number grant");
+
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    let ControlMessage::FatalError(fatal) = client.next_control().await else {
+        panic!("expected the protocol fatal");
+    };
+    assert!(
+        matches!(
+            fatal.reason,
+            FatalErrorReason::ProtocolViolation { ref detail }
+                if detail == "a write before the device writer bound"
+        ),
+        "the fatal names the violation, got {fatal:?}"
+    );
+    assert!(client.recv().await.is_none(), "the session ends");
+    client.close().await;
+    let outcome = server.await.expect("join server");
+    assert!(outcome.is_err(), "the session fails closed");
+}
+
+/// A redelivery whose chain was pruned under it cannot be trusted, so the
+/// session closes with the write target error rather than re-answering over a
+/// broken chain.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redelivery_behind_a_pruned_chain_closes_the_session() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    // alice settles two entries, the second answer standing unacked.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("chain-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let cs2 = insert_changeset(3, "three", "t2");
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.upload(2, cs2.clone()).await;
+    expect_applied(&mut client, 2).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // The reconnect reports the first entry settled, pruning its record.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "chain-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            Some(1),
+        )
+        .await;
+
+    // The redelivery of the second entry finds its chain pruned.
+    client.upload(2, cs2).await;
+    assert!(
+        client.recv().await.is_none(),
+        "the session closes rather than trust the broken chain"
+    );
+    client.close().await;
+    let outcome = server.await.expect("join 2");
+    assert!(outcome.is_err(), "the session fails closed");
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2")
+        ],
+        "nothing applied twice over the broken chain"
+    );
+}
+
+/// A settled record whose entry hash is not a chain hash is not trusted, so
+/// the redelivery closes the session with the write target error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_entry_hash_of_the_wrong_length_closes_the_session() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("hash-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let cs1 = insert_changeset(2, "two", "t1");
+    client.upload(1, cs1.clone()).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // Corrupt the record the way a torn write would leave it, a hash the
+    // chain never produced.
+    let writer = i64::try_from(number).expect("number fits");
+    {
+        let mut conn = fixture.admin().get().await.expect("admin connection");
+        diesel::update(_connetto_settled::table)
+            .filter(_connetto_settled::writer.eq(writer))
+            .set(_connetto_settled::entry_hash.eq(b"broken"))
+            .execute(&mut *conn)
+            .await
+            .expect("corrupt the record");
+    }
+
+    // The redelivery cannot verify the chain.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "hash-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            None,
+        )
+        .await;
+    client.upload(1, cs1).await;
+    assert!(
+        client.recv().await.is_none(),
+        "the session closes rather than re-answer over a bad hash"
+    );
+    client.close().await;
+    let outcome = server.await.expect("join 2");
+    assert!(outcome.is_err(), "the session fails closed");
+}
+
+/// A settled row the deployment wrote over the restore or courier path reads
+/// its path back as the variant it stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_settled_row_reads_its_settle_path_back() {
+    let fixture = Fixture::acquire().await;
+    fixture
+        .setup(&[
+            "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_writers",
+        ])
+        .await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
+
+    let mut conn = fixture.admin().get().await.expect("admin connection");
+    diesel::insert_into(_connetto_settled::table)
+        .values((
+            _connetto_settled::writer.eq(1_i64),
+            _connetto_settled::seq.eq(1_i64),
+            _connetto_settled::entry_hash.eq([0u8; 32]),
+            _connetto_settled::outcome.eq(r#""applied""#),
+            _connetto_settled::path.eq(SettlePath::Restore),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("restore row");
+    diesel::insert_into(_connetto_settled::table)
+        .values((
+            _connetto_settled::writer.eq(1_i64),
+            _connetto_settled::seq.eq(2_i64),
+            _connetto_settled::entry_hash.eq([0u8; 32]),
+            _connetto_settled::outcome.eq(r#""applied""#),
+            _connetto_settled::path.eq(SettlePath::Courier),
+        ))
+        .execute(&mut *conn)
+        .await
+        .expect("courier row");
+
+    let rows = settled_rows(fixture.admin(), 1).await;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].path, SettlePath::Restore);
+    assert_eq!(rows[1].path, SettlePath::Courier);
 }

@@ -300,21 +300,6 @@ impl FakeTransport {
         }
     }
 
-    /// Issue and confirm the writer number `number`, so a handshake naming it
-    /// is confirmed and a fresh one is granted it.
-    #[must_use]
-    pub fn with_writer_number(mut self, number: u64) -> Self {
-        self.issued = number;
-        self
-    }
-
-    /// Carry `frontier` in the grant, everything at or below it settled.
-    #[must_use]
-    pub fn with_writer_frontier(mut self, frontier: u64) -> Self {
-        self.issued_frontier = frontier;
-        self
-    }
-
     fn answer(&self, writer: Option<WriterGrant>) -> IncomingFrame {
         match &self.reply {
             HandshakeReply::Accept => {

@@ -11,11 +11,13 @@ use std::collections::VecDeque;
 use std::future::{Future, ready};
 use std::sync::Arc;
 
-use connetto_client::{ClientBuilder, ClientEvent, ConnettoConnection, DataDir, UnsyncedWrite};
+use connetto_client::{
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, UnsyncedWrite,
+};
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, HandshakeAck, MutationApplied, MutationReject,
-    MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, MutationApplied,
+    MutationReject, MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
@@ -50,6 +52,15 @@ enum Answer {
     Silent,
 }
 
+/// The grant shape a lying handshake answers with.
+#[derive(Clone, Copy)]
+enum Lie {
+    /// No writer at all.
+    Ungranted,
+    /// A named grant, whatever it says.
+    Grant(WriterGrant),
+}
+
 /// What the connection has been sent, plus the frames it is due to hand back.
 #[derive(Default)]
 struct Log {
@@ -67,6 +78,8 @@ struct Wire {
     writer_number: u64,
     writer_frontier: u64,
     answer: Answer,
+    lie: Option<Lie>,
+    closing: Option<FatalErrorReason>,
 }
 
 impl Default for Wire {
@@ -76,6 +89,8 @@ impl Default for Wire {
             writer_number: 1,
             writer_frontier: 0,
             answer: Answer::default(),
+            lie: None,
+            closing: None,
         }
     }
 }
@@ -99,6 +114,21 @@ impl Wire {
         self.answer = Answer::Silent;
         self
     }
+
+    /// Answer every handshake with `lie` instead of the honest one.
+    fn lie(mut self, lie: Option<WriterGrant>) -> Self {
+        self.lie = Some(match lie {
+            Some(grant) => Lie::Grant(grant),
+            None => Lie::Ungranted,
+        });
+        self
+    }
+
+    /// Close the session deliberately with `reason` right after the handshake.
+    fn closing_with(mut self, reason: FatalErrorReason) -> Self {
+        self.closing = Some(reason);
+        self
+    }
 }
 
 impl Transport for Wire {
@@ -110,12 +140,16 @@ impl Transport for Wire {
     ) -> impl Future<Output = Result<(), Self::Error>> {
         match message {
             ControlMessage::Handshake(handshake) => {
-                let writer = match handshake.writer {
-                    WriterRequest::Device => None,
-                    WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
-                        number: self.writer_number,
-                        frontier: self.writer_frontier,
-                    }),
+                let writer = match self.lie {
+                    Some(Lie::Ungranted) => None,
+                    Some(Lie::Grant(grant)) => Some(grant),
+                    None => match handshake.writer {
+                        WriterRequest::Device => None,
+                        WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
+                            number: self.writer_number,
+                            frontier: self.writer_frontier,
+                        }),
+                    },
                 };
                 let mut log = self.log.lock();
                 log.handshakes.push(handshake.writer);
@@ -131,6 +165,12 @@ impl Transport for Wire {
                             writer,
                         },
                     )));
+                if let Some(reason) = self.closing.take() {
+                    log.outbox
+                        .push_back(IncomingFrame::Control(ControlMessage::FatalError(
+                            FatalError::new(reason),
+                        )));
+                }
             }
             ControlMessage::MutationHeader(header) => {
                 // The silent arm still records what went up, so a test can
@@ -405,5 +445,235 @@ async fn sequences_survive_an_emptied_queue_and_a_restart() {
             writer: WriterRef::Number(1),
             seq: 3
         }]
+    );
+}
+
+diesel::table! {
+    /// The client's private pending table, seeded by the boot-skip test.
+    _connetto_pending (writer, seq) {
+        /// The writer the entry stands under.
+        writer -> Text,
+        /// The entry's sequence.
+        seq -> BigInt,
+        /// The captured changeset.
+        changeset -> Binary,
+        /// The entry's chain hash.
+        entry_hash -> Binary,
+    }
+}
+
+/// A handshake acknowledged with no writer at all refuses the issue: the
+/// client asked the server to issue its number and the server declined.
+#[tokio::test]
+async fn a_handshake_ack_with_no_grant_refuses_the_issue() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    let err = conn
+        .attach(Wire::default().lie(None))
+        .await
+        .expect_err("the lying ack refuses");
+    let ClientError::Protocol(detail) = err else {
+        panic!("the lying ack refuses with a protocol error, got {err:?}");
+    };
+    assert_eq!(detail, "the server issued no writer to an issue");
+}
+
+/// A fresh issue answering with the unissued number is refused: number zero
+/// belongs to the queue's waiting room, not to a grant.
+#[tokio::test]
+async fn a_handshake_ack_issuing_the_unissued_number_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    let err = conn
+        .attach(Wire::default().lie(Some(WriterGrant {
+            number: 0,
+            frontier: 0,
+        })))
+        .await
+        .expect_err("the lying ack refuses");
+    let ClientError::Protocol(detail) = err else {
+        panic!("the lying ack refuses with a protocol error, got {err:?}");
+    };
+    assert_eq!(detail, "the server issued the unissued number");
+}
+
+/// A fresh number that arrives with a frontier is refused: nothing settled
+/// under a number the client never presented.
+#[tokio::test]
+async fn a_fresh_number_arriving_with_a_frontier_is_refused() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    let err = conn
+        .attach(Wire::default().lie(Some(WriterGrant {
+            number: 1,
+            frontier: 5,
+        })))
+        .await
+        .expect_err("the lying ack refuses");
+    let ClientError::Protocol(detail) = err else {
+        panic!("the lying ack refuses with a protocol error, got {err:?}");
+    };
+    assert_eq!(detail, "a fresh number arrived with a frontier");
+}
+
+/// A number confirmation the server did not grant is refused, as is one that
+/// names a different number than the handshake presented.
+#[tokio::test]
+async fn number_confirmations_the_server_never_granted_are_refused() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default()).await.expect("attach");
+    let err = conn
+        .attach(Wire::default().lie(None))
+        .await
+        .expect_err("the lying ack refuses");
+    let ClientError::Protocol(detail) = err else {
+        panic!("the lying ack refuses with a protocol error, got {err:?}");
+    };
+    assert_eq!(detail, "the server answered a number without a grant");
+
+    conn.attach(Wire::default()).await.expect("attach");
+    let err = conn
+        .attach(Wire::default().lie(Some(WriterGrant {
+            number: 2,
+            frontier: 0,
+        })))
+        .await
+        .expect_err("the lying ack refuses");
+    let ClientError::Protocol(detail) = err else {
+        panic!("the lying ack refuses with a protocol error, got {err:?}");
+    };
+    assert_eq!(
+        detail,
+        "the server confirmed another number than the handshake named"
+    );
+}
+
+/// A writer the server declares unknown carries its unacked tail to the
+/// unissued number, so the next run re-issues and resends rather than losing
+/// the writes.
+#[tokio::test]
+async fn a_writer_unknown_fatal_carries_the_tail_to_the_unissued_number() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    let wire = Wire::default()
+        .silent()
+        .closing_with(FatalErrorReason::WriterUnknown);
+    conn.attach(wire.clone()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    write(&mut conn, 2);
+    assert_eq!(conn.push().await.expect("queue"), Some(2));
+    let seen = drain(&mut conn).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::ServerClosed {
+                reason: FatalErrorReason::WriterUnknown
+            }
+        )),
+        "the fatal surfaced, saw {seen:?}"
+    );
+    assert_eq!(
+        writers(&mut conn),
+        vec!["number:0".to_owned()],
+        "the tail re-keyed under the unissued number"
+    );
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Number(0),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(0),
+                seq: 2
+            },
+        ],
+        "both writes survive the carry"
+    );
+
+    // The fresh run asks for a new number and resends the carried tail.
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("re-attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.handshakes,
+            vec![WriterRequest::Issue],
+            "the carried tail presents no number, so a fresh one is asked"
+        );
+        assert_eq!(
+            log.mutations,
+            vec![1, 2],
+            "the carried tail resends in order"
+        );
+    }
+    assert!(
+        conn.unsynced().is_empty(),
+        "the applied answers retired the carried entries"
+    );
+    assert_eq!(
+        writers(&mut conn),
+        vec!["number:1".to_owned()],
+        "the tail stands under the issued number"
+    );
+}
+
+/// Pending records a torn write or corruption left undecodable are skipped at
+/// boot rather than poisoning the queue, and the decodable record loads.
+#[tokio::test]
+async fn corrupt_pending_rows_are_skipped_at_boot() {
+    let dir = tempdir().expect("temp dir");
+    {
+        let mut conn = open(&dir).await;
+        conn.attach(Wire::default().silent()).await.expect("attach");
+        write(&mut conn, 1);
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        drain(&mut conn).await;
+
+        // Seed the pending table the way a torn write would leave it: the
+        // good record beside three the boot cannot decode.
+        diesel::insert_into(_connetto_pending::table)
+            .values((
+                _connetto_pending::writer.eq("junk"),
+                _connetto_pending::seq.eq(1_i64),
+                _connetto_pending::changeset.eq(b"one"),
+                _connetto_pending::entry_hash.eq([0u8; 32]),
+            ))
+            .execute(conn.conn())
+            .expect("undecodable writer row");
+        diesel::insert_into(_connetto_pending::table)
+            .values((
+                _connetto_pending::writer.eq("number:5"),
+                _connetto_pending::seq.eq(-3_i64),
+                _connetto_pending::changeset.eq(b"two"),
+                _connetto_pending::entry_hash.eq([0u8; 32]),
+            ))
+            .execute(conn.conn())
+            .expect("negative sequence row");
+        diesel::insert_into(_connetto_pending::table)
+            .values((
+                _connetto_pending::writer.eq("number:9"),
+                _connetto_pending::seq.eq(7_i64),
+                _connetto_pending::changeset.eq(b"three"),
+                _connetto_pending::entry_hash.eq([0u8; 31]),
+            ))
+            .execute(conn.conn())
+            .expect("short hash row");
+    }
+
+    // The boot loads the good entry and skips the corrupt rows.
+    let conn = open(&dir).await;
+    assert_eq!(
+        conn.unsynced(),
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(1),
+            seq: 1
+        }],
+        "the corrupt rows skipped, the good one loaded"
     );
 }

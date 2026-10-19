@@ -75,6 +75,7 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::ModelChange,
         AuthOp::Banned,
         AuthOp::BanLifted,
+        AuthOp::WriteForked,
     ];
     for op in all {
         let session = SessionId::from_uuid(uuid::Uuid::new_v4());

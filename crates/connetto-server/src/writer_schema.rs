@@ -23,7 +23,6 @@
 //! RETURNING` and `UPDATE` statement types generically. The default impl
 //! builds them concretely, the same way the audit and enrolment members do.
 
-use core::fmt;
 use std::pin::Pin;
 use std::time::SystemTime;
 
@@ -96,8 +95,10 @@ impl FromSql<SettlePathSql, Pg> for SettlePath {
 /// The outcome a settled entry answers with, the one column that re-answers
 /// an applied, a rejected (with its full reason) or a conflicted (with its
 /// table) write.
+///
+/// Externally tagged, since the arbitrary-precision `serde_json` this crate
+/// builds with cannot re-read a number an internally tagged enum buffers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "kind")]
 pub enum SettledOutcome {
     /// The entry applied, or a byte-identical re-delivery of one answered the
     /// same way.
@@ -156,22 +157,6 @@ impl SettledOutcome {
     /// When the text is not valid JSON of a stored outcome.
     pub fn from_json(bytes: &[u8]) -> Result<Self, serde_json::Error> {
         serde_json::from_slice(bytes)
-    }
-}
-
-impl fmt::Display for SettledOutcome {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Applied => f.write_str("applied"),
-            Self::Rejected(reason) => {
-                f.write_str("rejected ")?;
-                fmt::Debug::fmt(reason, f)
-            }
-            Self::Conflict { table, .. } => {
-                f.write_str("conflict on ")?;
-                f.write_str(table)
-            }
-        }
     }
 }
 
@@ -582,9 +567,17 @@ mod tests {
         for outcome in [
             SettledOutcome::Applied,
             SettledOutcome::Rejected(MutationRejectReason::Unauthorized),
+            SettledOutcome::Rejected(MutationRejectReason::SchemaMismatch),
+            SettledOutcome::Rejected(MutationRejectReason::Indeterminate),
             SettledOutcome::Rejected(MutationRejectReason::Forked),
             SettledOutcome::Rejected(MutationRejectReason::Malformed {
                 detail: "bad patchset".into(),
+            }),
+            SettledOutcome::Rejected(MutationRejectReason::Constraint {
+                detail: "unique violation".into(),
+            }),
+            SettledOutcome::Rejected(MutationRejectReason::Other {
+                detail: "something else".into(),
             }),
             SettledOutcome::Conflict {
                 table: "notes".into(),
@@ -592,9 +585,22 @@ mod tests {
                 pk_columns: vec!["id".into()],
                 pk_values: vec![StoredValue::Text("1".into())],
             },
+            SettledOutcome::Conflict {
+                table: "multi".into(),
+                version_column: "edited_at".into(),
+                pk_columns: vec!["key".into(), "weight".into(), "tag".into()],
+                pk_values: vec![
+                    StoredValue::Text("a".into()),
+                    StoredValue::Real(1.5),
+                    StoredValue::Blob(vec![0, 1]),
+                    StoredValue::Integer(7),
+                    StoredValue::Null,
+                ],
+            },
         ] {
-            let parsed = SettledOutcome::from_json(outcome.json().as_bytes())
-                .expect("the stored text reads back");
+            let text = outcome.json();
+            let parsed = SettledOutcome::from_json(text.as_bytes())
+                .unwrap_or_else(|err| panic!("the stored text reads back: {err}, json: {text}"));
             assert_eq!(outcome, parsed);
         }
     }

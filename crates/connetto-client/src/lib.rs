@@ -5788,6 +5788,29 @@ mod tests {
     const DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY)";
 
     #[test]
+    fn writer_id_round_trips_through_writer_from_id() {
+        let device = [0xab; 32];
+        let spelled = writer_id(&WriterRef::Device(device));
+        assert_eq!(spelled, format!("device:{}", "ab".repeat(32)));
+        assert_eq!(writer_from_id(&spelled), Some(WriterRef::Device(device)));
+        assert_eq!(
+            writer_from_id(&writer_id(&WriterRef::Number(7))),
+            Some(WriterRef::Number(7))
+        );
+    }
+
+    #[test]
+    fn writer_from_id_refuses_ids_it_cannot_parse() {
+        assert_eq!(writer_from_id("garbage"), None);
+        assert_eq!(writer_from_id("number:x"), None);
+        assert_eq!(writer_from_id("device:ab"), None);
+        let bad = format!("device:{}", "a".repeat(63));
+        assert_eq!(writer_from_id(&bad), None);
+        let bad = format!("device:g{}", "a".repeat(63));
+        assert_eq!(writer_from_id(&bad), None);
+    }
+
+    #[test]
     fn in_memory_replica_is_always_ephemeral() {
         // Even when the config explicitly asks for Verified, an in-memory
         // replica reports Ephemeral: nothing durable is ever written.
