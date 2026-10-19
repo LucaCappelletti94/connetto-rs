@@ -430,7 +430,8 @@ async fn a_resuming_refusal_is_as_bare_as_a_fresh_one() {
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "resume-probe")
                 .with_grant(connetto_core::messages::Grant::new("user:resume-probe"))
-                .with_cursor(resume),
+                .with_cursor(resume)
+                .with_cursor_subjects(core::iter::empty::<&str>()),
         ))
         .await
         .expect("send handshake");

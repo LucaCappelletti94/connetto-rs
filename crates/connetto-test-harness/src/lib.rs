@@ -1867,9 +1867,7 @@ impl Client {
         self.take_handshake_ack().await
     }
 
-    /// Send a handshake presenting `grant` and the cursor a client persisted, so
-    /// the server catches the subscription up from that point instead of
-    /// snapshotting it afresh.
+    /// Resume from `cursor` with optional known completed subject coverage.
     ///
     /// # Panics
     ///
@@ -1879,10 +1877,14 @@ impl Client {
         client_id: &str,
         grant: &str,
         cursor: Cursor,
+        cursor_subjects: Option<&[&str]>,
     ) -> HandshakeAck {
-        let handshake = Handshake::new(PROTOCOL_VERSION, client_id)
+        let mut handshake = Handshake::new(PROTOCOL_VERSION, client_id)
             .with_grant(Grant::new(grant))
             .with_cursor(cursor);
+        if let Some(subjects) = cursor_subjects {
+            handshake = handshake.with_cursor_subjects(subjects.iter().copied());
+        }
         self.transport
             .send_control(ControlMessage::Handshake(handshake))
             .await

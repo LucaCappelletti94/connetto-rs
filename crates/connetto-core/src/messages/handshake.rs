@@ -68,12 +68,9 @@ pub struct Handshake {
     /// echoed back verbatim.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_cursor: Option<Cursor>,
-    /// The share-key subjects the server last acknowledged, as their
-    /// rendering, which is the set `last_cursor` was taken under (R95). The
-    /// server resends each resumed subscription a difference from the
-    /// resolved grants reaches rather than catching it up.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cursor_subjects: Vec<String>,
+    /// Completed subject coverage for `last_cursor`, or `None` while unknown or unfinished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor_subjects: Option<Vec<String>>,
 }
 
 impl Handshake {
@@ -85,7 +82,7 @@ impl Handshake {
             grants: Vec::new(),
             resume_token: None,
             last_cursor: None,
-            cursor_subjects: Vec::new(),
+            cursor_subjects: None,
         }
     }
 
@@ -117,13 +114,14 @@ impl Handshake {
         self
     }
 
-    /// State the share-key subjects the resume cursor was taken under.
+    /// Add subjects whose delivery durably covers the resume cursor, including a known empty set.
     #[must_use]
     pub fn with_cursor_subjects(
         mut self,
         subjects: impl IntoIterator<Item = impl Into<String>>,
     ) -> Self {
         self.cursor_subjects
+            .get_or_insert_with(Vec::new)
             .extend(subjects.into_iter().map(Into::into));
         self
     }

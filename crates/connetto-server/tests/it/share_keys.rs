@@ -6,7 +6,7 @@
 //! target the handshake reads its watermark from.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
@@ -26,6 +26,8 @@ use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth, WITHHELD_ID};
 use subql::backend::CdcEvent;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
+
+use super::share_key_clock::ExpiryClock;
 
 const PG_DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, label TEXT);";
 
@@ -115,6 +117,7 @@ struct Settings {
     throttle: Option<ThrottleConfig>,
     initial_credits: Option<u32>,
     oplog: Option<InMemoryOplog>,
+    session: Option<SessionConfig>,
 }
 
 fn manager(fixture: &Fixture, snapshot: &KeyedSnapshot, settings: Settings) -> Manager {
@@ -135,9 +138,11 @@ fn manager(fixture: &Fixture, snapshot: &KeyedSnapshot, settings: Settings) -> M
             AbuseConfig::default(),
         )));
     }
+    let mut session = settings.session.unwrap_or_default();
     if let Some(credits) = settings.initial_credits {
-        builder = builder.with_session(SessionConfig::new().with_initial_credits(credits));
+        session = session.with_initial_credits(credits);
     }
+    builder = builder.with_session(session);
     match settings.oplog {
         Some(oplog) => builder.with_oplog(oplog).build(),
         None => builder.build(),
@@ -363,23 +368,23 @@ async fn a_swap_over_the_subscription_limit_keeps_the_old_keys() {
     );
 }
 
-/// A grant naming `key` that dies two seconds from now.
-fn dying_in_two_seconds(key: &str) -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    format!("{key}@{}", now + 2)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_key_leaves_the_session_at_its_expiry() {
     let fixture = Fixture::acquire().await;
     let snapshot = KeyedSnapshot::default();
-    let manager = manager(&fixture, &snapshot, Settings::default());
-    let mut client = connect(&manager, &[&dying_in_two_seconds("key:a"), "key:b"], None).await;
+    let clock = ExpiryClock::new();
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            session: Some(clock.session_config()),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(&manager, &[&clock.grant("key:a"), "key:b"], None).await;
     subscribe(&mut client, "items").await;
     controls_until(&mut client, is_end).await;
+    clock.advance(Duration::from_secs(1));
 
     let frames = controls_until(&mut client, is_end).await;
 
@@ -392,20 +397,23 @@ async fn a_held_key_leaves_the_session_at_its_expiry() {
 async fn queued_frames_of_an_expired_key_never_follow_the_resend() {
     let fixture = Fixture::acquire().await;
     let snapshot = KeyedSnapshot::default();
+    let clock = ExpiryClock::new();
     let manager = manager(
         &fixture,
         &snapshot,
         Settings {
             initial_credits: Some(0),
+            session: Some(clock.session_config()),
             ..Settings::default()
         },
     );
-    let mut client = connect(&manager, &[&dying_in_two_seconds("key:a"), "key:b"], None).await;
+    let mut client = connect(&manager, &[&clock.grant("key:a"), "key:b"], None).await;
     subscribe(&mut client, "items").await;
     // With no credit the page and its end wait in the queue behind the begin.
     let ControlMessage::SnapshotBegin(_) = next_control(&mut client).await else {
         panic!("expected the snapshot to begin");
     };
+    clock.advance(Duration::from_secs(1));
 
     let frames = controls_until(&mut client, |msg| {
         matches!(msg, ControlMessage::SnapshotBegin(_))
@@ -499,3 +507,161 @@ async fn a_resume_under_other_keys_resends_instead_of_catching_up() {
     );
     assert_eq!(snapshot.reads(), reads);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbounded_grant_keeps_a_key_held_by_an_earlier_finite_grant() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let clock = super::share_key_clock::ExpiryClock::new();
+    let finite = clock.grant("key:a");
+    let other = clock.grant("key:c");
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            session: Some(clock.session_config()),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(&manager, &[finite.as_str(), "key:a", other.as_str()], None).await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    clock.advance(Duration::from_secs(1));
+    let frames = controls_until(&mut client, is_end).await;
+    assert_eq!(kinds(&frames), ["resync", "begin", "end"]);
+    assert_eq!(frames[0], resync_of("items"));
+    assert_eq!(
+        keys_of(&snapshot.last()),
+        ["key:a"],
+        "the unbounded grant outranks the finite one and the other key died"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unbounded_grant_keeps_a_key_held_by_a_later_finite_grant() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let clock = super::share_key_clock::ExpiryClock::new();
+    let finite = clock.grant("key:a");
+    let other = clock.grant("key:c");
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            session: Some(clock.session_config()),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(&manager, &["key:a", finite.as_str(), other.as_str()], None).await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    clock.advance(Duration::from_secs(1));
+    let frames = controls_until(&mut client, is_end).await;
+    assert_eq!(kinds(&frames), ["resync", "begin", "end"]);
+    assert_eq!(frames[0], resync_of("items"));
+    assert_eq!(
+        keys_of(&snapshot.last()),
+        ["key:a"],
+        "the unbounded grant outranks the later finite one and the other key died"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duplicate_finite_grants_die_at_the_latest_expiry() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let clock = super::share_key_clock::ExpiryClock::new();
+    // The clock starts at unix second 1000, so the hardcoded expiries spell that fixed start.
+    let first = clock.grant("key:a");
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            session: Some(clock.session_config()),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(
+        &manager,
+        &[first.as_str(), "key:c@1003", "key:u", "key:a@1005"],
+        None,
+    )
+    .await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    clock.advance(Duration::from_secs(4));
+    let frames = controls_until(&mut client, is_end).await;
+    assert_eq!(kinds(&frames), ["resync", "begin", "end"]);
+    assert_eq!(frames[0], resync_of("items"));
+    assert_eq!(
+        keys_of(&snapshot.last()),
+        ["key:a", "key:u"],
+        "the earlier expiry of the duplicated key lost to the later one"
+    );
+
+    clock.advance(Duration::from_secs(2));
+    let frames = controls_until(&mut client, is_end).await;
+    assert_eq!(kinds(&frames), ["resync", "begin", "end"]);
+    assert_eq!(frames[0], resync_of("items"));
+    assert_eq!(
+        keys_of(&snapshot.last()),
+        ["key:u"],
+        "the later expiry still dies the duplicated key"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn identity_and_refused_grants_never_touch_the_key_lifetimes() {
+    let fixture = Fixture::acquire().await;
+    let snapshot = KeyedSnapshot::default();
+    let clock = super::share_key_clock::ExpiryClock::new();
+    let finite = clock.grant("key:a");
+    let other = clock.grant("key:c");
+    let manager = manager(
+        &fixture,
+        &snapshot,
+        Settings {
+            session: Some(clock.session_config()),
+            ..Settings::default()
+        },
+    );
+    let mut client = connect(
+        &manager,
+        &[
+            "junk",
+            "user:alice",
+            finite.as_str(),
+            "key:a",
+            other.as_str(),
+        ],
+        None,
+    )
+    .await;
+    subscribe(&mut client, "items").await;
+    controls_until(&mut client, is_end).await;
+
+    clock.advance(Duration::from_secs(1));
+    let frames = controls_until(&mut client, is_end).await;
+    assert_eq!(kinds(&frames), ["resync", "begin", "end"]);
+    assert_eq!(frames[0], resync_of("items"));
+    let caller = snapshot.last();
+    assert_eq!(
+        caller.identity().map(|context| context.user_id.as_str()),
+        Some("alice"),
+        "the identity grant resolved into the caller"
+    );
+    assert_eq!(
+        keys_of(&caller),
+        ["key:a"],
+        "neither the refused grant nor the identity touched the key's lifetime"
+    );
+}
+
+#[path = "share_key_admission.rs"]
+mod admission;
+
+#[path = "share_key_checkpoint.rs"]
+mod checkpoint;

@@ -148,7 +148,7 @@ async fn a_client_offline_across_the_truncate_is_replaced_on_reconnect() {
     fixture.exec("TRUNCATE notes").await;
 
     let mut back = server.connect();
-    back.handshake_resuming("r48-away", "user:alice#away", resume_from)
+    back.handshake_resuming("r48-away", "user:alice#away", resume_from, Some(&[]))
         .await;
     back.subscribe("notes", "SELECT * FROM notes WHERE owner = 'alice'")
         .await;

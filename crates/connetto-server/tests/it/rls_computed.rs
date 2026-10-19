@@ -22,10 +22,13 @@ use connetto_core::messages::{
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     AbuseConfig, ManagerBuilder, Materializer, PgReadConnector, PgSnapshotSource, RequestGuard,
-    RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits, loopback, pg_write_target,
+    RuntimeWritableCatalog, SessionConfig, SessionManager, ThrottleConfig, TierLimits, loopback,
+    pg_write_target,
 };
 use connetto_test_harness::{Client, ConnettoDefaults, Fixture, RosterAuth, pool_for, with_user};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
+
+use super::share_key_clock::ExpiryClock;
 
 /// The catalog DDL carries the RLS marker: subql classifies the table from
 /// the parsed DDL, and without it the aggregate registers as a shared fold
@@ -49,11 +52,11 @@ const OWNER_IS_CALLER_OR_SUBJECT: &str = "owner = current_setting('app.user_id',
 /// Provision the RLS table and the reader role, then build the manager whose
 /// connector reads as that role.
 async fn manager(fixture: &Fixture) -> Arc<Manager> {
-    manager_under(fixture, OWNER_IS_CALLER).await
+    manager_under(fixture, OWNER_IS_CALLER, SessionConfig::new()).await
 }
 
 /// [`manager`] whose `notes` policy is `policy`.
-async fn manager_under(fixture: &Fixture, policy: &str) -> Arc<Manager> {
+async fn manager_under(fixture: &Fixture, policy: &str, session: SessionConfig) -> Arc<Manager> {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
@@ -86,6 +89,7 @@ async fn manager_under(fixture: &Fixture, policy: &str) -> Arc<Manager> {
         pg_write_target::<ConnettoDefaults>(admin, PG_DDL).expect("build write target"),
     )
     .with_guard(guard)
+    .with_session(session)
     .build()
 }
 
@@ -203,7 +207,7 @@ async fn an_unidentified_caller_keeps_the_rls_aggregate_refusal() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_only_viewer_gets_its_own_statistic() {
     let fixture = Fixture::acquire().await;
-    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT).await;
+    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT, SessionConfig::new()).await;
     fixture
         .exec("INSERT INTO notes VALUES (1, 'key:k1'), (2, 'key:k1'), (10, 'alice')")
         .await;
@@ -225,21 +229,18 @@ async fn a_key_only_viewer_gets_its_own_statistic() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_key_replaces_the_statistic_it_answered() {
     let fixture = Fixture::acquire().await;
-    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT).await;
+    let clock = ExpiryClock::new();
+    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT, clock.session_config()).await;
     fixture
         .exec("INSERT INTO notes VALUES (1, 'key:k1'), (2, 'key:k1'), (3, 'key:k2')")
         .await;
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::SystemTime::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    let dying = format!("key:k1@{}", now + 2);
     let mut holder = connect(&manager);
     holder
-        .handshake_presenting("holder", &[&dying, "key:k2"], None)
+        .handshake_presenting("holder", &[&clock.grant("key:k1"), "key:k2"], None)
         .await;
     holder.subscribe("mine", QUERY).await;
     assert_eq!(count_of(&next_aggregate(&mut holder, "mine").await), 3);
+    clock.advance(Duration::from_secs(1));
 
     let ControlMessage::FullResyncRequired(notice) = holder.next_control().await else {
         panic!("expected the old statistic to be dropped first");
@@ -254,7 +255,7 @@ async fn an_expired_key_replaces_the_statistic_it_answered() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_key_swap_replaces_the_statistic_the_old_keys_answered() {
     let fixture = Fixture::acquire().await;
-    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT).await;
+    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT, SessionConfig::new()).await;
     fixture
         .exec("INSERT INTO notes VALUES (1, 'key:k1'), (2, 'key:k1'), (3, 'key:k2')")
         .await;

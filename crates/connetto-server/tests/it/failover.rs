@@ -97,7 +97,9 @@ async fn connect(manager: &Arc<Manager>, cursor: Option<Cursor>) -> LoopbackTran
     let mut handshake =
         Handshake::new(PROTOCOL_VERSION, CALLER).with_grant(Grant::new(format!("user:{CALLER}")));
     if let Some(cursor) = cursor {
-        handshake = handshake.with_cursor(cursor);
+        handshake = handshake
+            .with_cursor(cursor)
+            .with_cursor_subjects(core::iter::empty::<&str>());
     }
     client
         .send_control(ControlMessage::Handshake(handshake))

@@ -78,7 +78,7 @@ use crate::materializer::{
 use crate::openfga::{GrantHolder, GrantMove};
 use crate::oplog::{CatchupDecision, ChangeRecord, InMemoryOplog, Oplog, catchup_decision};
 use crate::reexec::{FailedRead, NoConnector, ReadBudget, ReadFailure};
-use crate::reserve::ReaderPermit;
+use crate::reserve::{ReaderPermit, ReaderReservation};
 use crate::row_view::ValuesRow;
 use crate::schema::ConnettoSchema;
 use crate::slot::SlotError;
@@ -554,6 +554,8 @@ pub struct SessionConfig {
     write_retry_budget: Duration,
     /// The time one connection may stay open at its first frame before the registration gate closes it (R91).
     first_frame_budget: Duration,
+    #[cfg(feature = "test-seams")]
+    key_expiry_clock: Option<tokio::sync::watch::Receiver<SystemTime>>,
 }
 
 impl Default for SessionConfig {
@@ -564,6 +566,8 @@ impl Default for SessionConfig {
             resume_read_budget: Duration::from_secs(30),
             write_retry_budget: Duration::from_secs(5),
             first_frame_budget: Duration::from_secs(30),
+            #[cfg(feature = "test-seams")]
+            key_expiry_clock: None,
         }
     }
 }
@@ -608,6 +612,25 @@ impl SessionConfig {
     pub const fn with_first_frame_budget(mut self, budget: Duration) -> Self {
         self.first_frame_budget = budget;
         self
+    }
+
+    /// Uses the supplied time for share-key expiry scheduling and comparison.
+    #[cfg(feature = "test-seams")]
+    #[must_use]
+    pub fn with_key_expiry_clock(
+        mut self,
+        clock: tokio::sync::watch::Receiver<SystemTime>,
+    ) -> Self {
+        self.key_expiry_clock = Some(clock);
+        self
+    }
+
+    fn key_expiry_now(&self) -> SystemTime {
+        #[cfg(feature = "test-seams")]
+        if let Some(clock) = &self.key_expiry_clock {
+            return *clock.borrow();
+        }
+        SystemTime::now()
     }
 
     /// Delivery credits granted at handshake.
@@ -1168,11 +1191,30 @@ fn key_change_reaches(reg: &RowRegistration, key_tables: Option<&[String]>) -> b
 }
 
 /// Resolve when the earliest held key dies, and never while none is held.
-async fn next_key_expiry(expiry: &BTreeMap<String, u64>) {
+async fn next_key_expiry(expiry: &BTreeMap<String, u64>, config: &SessionConfig) {
     let Some(&earliest) = expiry.values().min() else {
         return core::future::pending().await;
     };
-    let now = SystemTime::now()
+    #[cfg(feature = "test-seams")]
+    if let Some(clock) = &config.key_expiry_clock {
+        let mut clock = clock.clone();
+        loop {
+            if clock
+                .borrow_and_update()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                >= earliest
+            {
+                return;
+            }
+            if clock.changed().await.is_err() {
+                return core::future::pending().await;
+            }
+        }
+    }
+    let now = config
+        .key_expiry_now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     tokio::time::sleep(Duration::from_secs(earliest).saturating_sub(now)).await;
@@ -1225,12 +1267,16 @@ enum Outbound {
         /// sibling subscription still claims.
         reason: FullResyncReason,
     },
-    /// Register one computed subscription again under the session's current
-    /// caller and replace its whole answer, because the share keys it answers
-    /// as changed (R95). Its old registration is already gone.
+    /// Replace the row registration that still owns a requested reader reservation.
+    ReservedResnapshot {
+        sub_id: String,
+        owner: (u64, SubscriptionId),
+        permit: ReaderPermit,
+    },
+    /// Rebuild the computed registration that still owns this label.
     Rebootstrap {
-        /// The request that registered it, read again under the new caller.
-        sub: Subscribe,
+        sub_id: String,
+        retired_id: SubscriptionId,
     },
     /// End one row subscription a key change left unservable, in order behind
     /// the frames already queued for it (R95).
@@ -1311,8 +1357,8 @@ struct HandshakeOutcome<Id, Key> {
     outbound_rx: mpsc::UnboundedReceiver<Outbound>,
     /// When each held share key dies, by its rendering.
     key_expiry: BTreeMap<String, u64>,
-    /// The share-key subjects the client's resume cursor was taken under.
-    cursor_subjects: BTreeSet<String>,
+    /// Known completed subject coverage for the resume cursor.
+    cursor_subjects: Option<BTreeSet<String>>,
 }
 
 /// One item waiting on the outbound queue.
@@ -1581,6 +1627,7 @@ struct SessionState<Id, Key> {
     /// subscriptions take turns rather than one finishing before the next
     /// starts.
     paging: VecDeque<PagedRead>,
+    reader_reservation: ReaderReservation,
     /// Snapshots whose fence missed transactions the log may hold, replayed by the run loop before its next frame.
     missed: Vec<MissedReplay>,
     /// Computed subscriptions by client label, one engine id space for every
@@ -1607,10 +1654,8 @@ struct SessionState<Id, Key> {
     resume: Resume,
     /// What is left of the connection's wait on reconnect-log reads, which every catchup draws from.
     resume_read_budget: Duration,
-    /// The share-key subjects the handshake said its cursor was taken under, so
-    /// a resumed subscription a difference reaches is replaced rather than
-    /// caught up (R95).
-    cursor_subjects: BTreeSet<String>,
+    /// Known completed subject coverage, absent while unknown or unfinished.
+    cursor_subjects: Option<BTreeSet<String>>,
     /// When each held share key dies, in Unix seconds by the key's rendering,
     /// which the run loop sleeps until (R95).
     key_expiry: BTreeMap<String, u64>,
@@ -3626,7 +3671,9 @@ where
             outbound_tx,
             outbound_rx,
             key_expiry,
-            cursor_subjects: handshake.cursor_subjects.into_iter().collect(),
+            cursor_subjects: handshake
+                .cursor_subjects
+                .map(|subjects| subjects.into_iter().collect()),
         }))
     }
     /// Refuse a caller that is over a rate limit, reporting whether it was.
@@ -3969,6 +4016,7 @@ where
             refusals: 0,
             wait: None,
         };
+        let mut unbounded = BTreeSet::new();
         for (position, grant) in grants.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
             let refused = match self.authority.check_grant(grant).await {
@@ -3991,10 +4039,18 @@ where
                     let ambiguous = resolved.principal.accept(subject).is_err();
                     if ambiguous {
                         source.log_refusal(position, "ambiguous", kind);
-                    } else if let (Some(key), Some(expires_at)) = (key, expires_at) {
-                        // A key presented twice dies at the later of its two expiries.
-                        let at = resolved.key_expiry.entry(key).or_insert(expires_at);
-                        *at = (*at).max(expires_at);
+                    } else if let Some(key) = key {
+                        match expires_at {
+                            Some(expires_at) if !unbounded.contains(&key) => {
+                                let at = resolved.key_expiry.entry(key).or_insert(expires_at);
+                                *at = (*at).max(expires_at);
+                            }
+                            None => {
+                                resolved.key_expiry.remove(&key);
+                                unbounded.insert(key);
+                            }
+                            Some(_) => {}
+                        }
                     }
                     ambiguous
                 }
@@ -4073,6 +4129,7 @@ where
             pending: VecDeque::new(),
             subs: HashMap::new(),
             paging: VecDeque::new(),
+            reader_reservation: ReaderReservation::default(),
             missed: Vec::new(),
             computed_subs: HashMap::new(),
             outbound: outbound_tx,
@@ -4137,7 +4194,7 @@ where
                         Err(err) => break Err(err),
                     }
                 }
-                () = next_key_expiry(&state.key_expiry) => self.expire_keys(&mut state).await,
+                () = next_key_expiry(&state.key_expiry, &self.config) => self.expire_keys(&mut state).await,
             }
         };
 
@@ -4204,11 +4261,32 @@ where
                 let _ = transport.send_control(msg).await;
             }
             Outbound::Resnapshot { sub_id, reason } => {
-                self.resnapshot_row(transport, state, &sub_id, &reason)
+                self.resnapshot_row(transport, state, &sub_id, &reason, None)
                     .await?;
             }
-            Outbound::Rebootstrap { sub } => {
-                self.rebootstrap_computed(transport, state, sub).await?;
+            Outbound::ReservedResnapshot {
+                sub_id,
+                owner,
+                permit,
+            } => {
+                if state
+                    .subs
+                    .get(&sub_id)
+                    .is_some_and(|row| (row.reg.consumer_id, row.reg.sub_id) == owner)
+                {
+                    self.resnapshot_row(
+                        transport,
+                        state,
+                        &sub_id,
+                        &FullResyncReason::AuthorizationChange,
+                        Some(permit),
+                    )
+                    .await?;
+                }
+            }
+            Outbound::Rebootstrap { sub_id, retired_id } => {
+                self.rebootstrap_computed(transport, state, sub_id, retired_id)
+                    .await?;
             }
             Outbound::Refuse { sub_id } => {
                 self.refuse_subscription(transport, state, &sub_id).await?;
@@ -4273,6 +4351,32 @@ where
         if rendered_keys(next.capabilities()) != rendered_keys(state.principal.capabilities()) {
             let reached = self.reached_by_keys(state);
             let tier = Tier::of(&state.principal);
+            let permit = if reached.0.is_empty() {
+                None
+            } else {
+                let held = state
+                    .reader_reservation
+                    .upgrade()
+                    .or_else(|| state.paging.iter().find_map(|read| read.permit.clone()));
+                let permit = if let Some(held) = held {
+                    held
+                } else {
+                    match self.guard.reader_permit(tier).await {
+                        Ok(permit) => permit,
+                        Err(wait) => {
+                            let _ = state.outbound.send(Outbound::Control(
+                                ControlMessage::RateLimited(RateLimited {
+                                    related_to: Some(request_id),
+                                    retry_after_ms: retry_ms(wait),
+                                }),
+                            ));
+                            return;
+                        }
+                    }
+                };
+                state.reader_reservation = permit.remember();
+                Some(permit)
+            };
             let refused = reached
                 .0
                 .iter()
@@ -4291,7 +4395,7 @@ where
                     )));
                 return;
             }
-            self.swap_keys(state, next, reached).await;
+            self.swap_keys(state, next, reached, permit).await;
         }
         state.key_expiry = resolved.key_expiry;
         let _ = state
@@ -4303,7 +4407,9 @@ where
 
     /// Drop every held key whose expiry has passed (R95).
     async fn expire_keys(&self, state: &mut SessionState<Id, Key>) {
-        let now = SystemTime::now()
+        let now = self
+            .config
+            .key_expiry_now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -4325,7 +4431,7 @@ where
                 .cloned(),
         );
         let reached = self.reached_by_keys(state);
-        self.swap_keys(state, next, reached).await;
+        self.swap_keys(state, next, reached, None).await;
     }
 
     /// The labels of the row and the computed subscriptions a change of the
@@ -4357,9 +4463,11 @@ where
         state: &mut SessionState<Id, Key>,
         next: Principal<Id, Key>,
         (rows, computed): (Vec<String>, Vec<String>),
+        reader_permit: Option<ReaderPermit>,
     ) {
         let _gate = self.dispatch_gate.lock().await;
         state.principal = Arc::new(next);
+        state.cursor_subjects = None;
         {
             let mut routes = self.routes.lock().await;
             for row in state.subs.values() {
@@ -4370,9 +4478,20 @@ where
         }
         for label in rows {
             let instruction = if self.register_again(state, &label).await {
-                Outbound::Resnapshot {
-                    sub_id: label,
-                    reason: FullResyncReason::AuthorizationChange,
+                if let Some(permit) = &reader_permit {
+                    let Some(row) = state.subs.get(&label) else {
+                        continue;
+                    };
+                    Outbound::ReservedResnapshot {
+                        owner: (row.reg.consumer_id, row.reg.sub_id),
+                        sub_id: label,
+                        permit: permit.clone(),
+                    }
+                } else {
+                    Outbound::Resnapshot {
+                        sub_id: label,
+                        reason: FullResyncReason::AuthorizationChange,
+                    }
                 }
             } else {
                 Outbound::Refuse { sub_id: label }
@@ -4380,10 +4499,13 @@ where
             let _ = state.outbound.send(instruction);
         }
         for label in computed {
-            if let Some(ComputedSub { id, sub, .. }) = state.computed_subs.remove(&label) {
+            if let Some(id) = state.computed_subs.get(&label).map(|sub| sub.id) {
                 self.remove_computed_route(id).await;
                 self.materializer.lock().await.unregister(id);
-                let _ = state.outbound.send(Outbound::Rebootstrap { sub });
+                let _ = state.outbound.send(Outbound::Rebootstrap {
+                    sub_id: label,
+                    retired_id: id,
+                });
             }
         }
     }
@@ -4435,8 +4557,17 @@ where
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
-        sub: Subscribe,
+        sub_id: String,
+        retired_id: SubscriptionId,
     ) -> Result<(), SessionError> {
+        let std::collections::hash_map::Entry::Occupied(owner) = state.computed_subs.entry(sub_id)
+        else {
+            return Ok(());
+        };
+        if owner.get().id != retired_id {
+            return Ok(());
+        }
+        let sub = owner.remove().sub;
         let consumer_id = self.next_consumer_id();
         let refused = match self.register_subscription(consumer_id, &sub, state).await {
             Ok(registered) => {
@@ -5557,8 +5688,10 @@ where
             // A catch-up never shows or hides a row that did not change, so keys
             // that changed since the cursor need the whole set again (R95).
             Resume::At(..)
-                if state.cursor_subjects != rendered_keys(state.principal.capabilities())
-                    && key_change_reaches(&reg, self.key_tables()) =>
+                if key_change_reaches(&reg, self.key_tables())
+                    && state.cursor_subjects.as_ref().is_none_or(|subjects| {
+                        *subjects != rendered_keys(state.principal.capabilities())
+                    }) =>
             {
                 Some(FullResyncReason::AuthorizationChange)
             }
@@ -5761,6 +5894,7 @@ where
         state: &mut SessionState<Id, Key>,
         sub_label: &str,
         reason: &FullResyncReason,
+        permit: Option<ReaderPermit>,
     ) -> Result<(), SessionError> {
         // The notice goes straight out while row frames wait for credit, so a
         // queued frame of the old answer would land after the clear.
@@ -5784,7 +5918,7 @@ where
                         sub,
                         reg,
                         tier: Tier::of(&state.principal),
-                        permit: None,
+                        permit: permit.clone(),
                         restarted: false,
                     },
                     Some(reason.clone()),
@@ -6326,6 +6460,7 @@ where
                     state,
                     &sub.sub_id,
                     &FullResyncReason::CursorOutsideRetention,
+                    None,
                 )
                 .await;
         }
@@ -6357,7 +6492,7 @@ where
                     table: self.event_table(record.event()),
                 };
                 return self
-                    .resnapshot_row(transport, state, &sub.sub_id, &reason)
+                    .resnapshot_row(transport, state, &sub.sub_id, &reason, None)
                     .await;
             }
             let Some(payload) = self
@@ -6773,6 +6908,9 @@ async fn flush<T: Transport>(
         }
     }
 }
+
+#[cfg(test)]
+mod rebootstrap_tests;
 
 #[cfg(test)]
 mod tests {

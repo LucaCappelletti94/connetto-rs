@@ -280,6 +280,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
+    .with_upkeep(Arc::new(super::support::KeyIndependentUpkeep))
     .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let slot: ServeSlot = Arc::new(Mutex::new(None));
@@ -621,6 +622,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
+    .with_upkeep(Arc::new(super::support::KeyIndependentUpkeep))
     .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let slot: ServeSlot = Arc::new(Mutex::new(None));

@@ -18,7 +18,7 @@
 //! since a second gate built from the same [`ReaderReserve`] would grant its
 //! own unreserved share.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -140,12 +140,12 @@ impl ReaderGate {
     /// releases it.
     pub(crate) async fn acquire(&self, tier: Tier) -> Result<ReaderPermit, Duration> {
         match tier {
-            Tier::Identified => Ok(ReaderPermit { _permit: None }),
+            Tier::Identified => Ok(ReaderPermit { permit: None }),
             Tier::Anonymous => {
                 let acquire = Arc::clone(&self.anonymous).acquire_owned();
                 match tokio::time::timeout(ANONYMOUS_WAIT, acquire).await {
                     Ok(permit) => Ok(ReaderPermit {
-                        _permit: Some(Arc::new(
+                        permit: Some(Arc::new(
                             permit.expect("the reader gate semaphore is never closed"),
                         )),
                     }),
@@ -163,13 +163,34 @@ impl ReaderGate {
 /// it, and the share returns when the last clone drops.
 #[derive(Debug, Clone)]
 pub(crate) struct ReaderPermit {
-    _permit: Option<Arc<OwnedSemaphorePermit>>,
+    permit: Option<Arc<OwnedSemaphorePermit>>,
 }
 
 impl ReaderPermit {
     /// The no-op permit, for hosts with no gate configured.
     pub(crate) const fn none() -> Self {
-        Self { _permit: None }
+        Self { permit: None }
+    }
+
+    /// Remember the slot without retaining its capacity.
+    pub(crate) fn remember(&self) -> ReaderReservation {
+        self.permit
+            .as_ref()
+            .map_or_else(ReaderReservation::default, |permit| {
+                ReaderReservation(Arc::downgrade(permit))
+            })
+    }
+}
+
+/// A session's non-owning reference to a live reader slot.
+#[derive(Default)]
+pub(crate) struct ReaderReservation(Weak<OwnedSemaphorePermit>);
+
+impl ReaderReservation {
+    pub(crate) fn upgrade(&self) -> Option<ReaderPermit> {
+        self.0.upgrade().map(|permit| ReaderPermit {
+            permit: Some(permit),
+        })
     }
 }
 
