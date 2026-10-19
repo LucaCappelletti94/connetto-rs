@@ -72,6 +72,20 @@ pub fn public_key_info(key: &dyn DeviceKey) -> Vec<u8> {
     spki
 }
 
+/// The 65-byte uncompressed point a P-256 `SubjectPublicKeyInfo` wraps, or
+/// `None` when the bytes are not such an SPKI. The point is the input the
+/// ECDSA verifier takes, so a signer whose record holds the SPKI verifies
+/// only after this split.
+#[must_use]
+pub fn spki_point(spki: &[u8]) -> Option<[u8; 65]> {
+    if spki.len() != P256_SPKI_PREFIX.len() + 65 || !spki.starts_with(P256_SPKI_PREFIX.as_slice()) {
+        return None;
+    }
+    let mut point = [0_u8; 65];
+    point.copy_from_slice(&spki[P256_SPKI_PREFIX.len()..]);
+    Some(point)
+}
+
 /// The id certificates name `key` by.
 #[must_use]
 pub fn key_id(key: &dyn DeviceKey) -> KeyId {
@@ -110,5 +124,60 @@ impl SigningKey for CertificateSigner<'_> {
         self.key
             .sign(message)
             .map_err(|_| rcgen::Error::RemoteKeyError)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rcgen::KeyPair;
+
+    /// A P-256 key that signs with `rcgen`, wrapped over the trait.
+    struct RcgenKey(KeyPair);
+
+    impl DeviceKey for RcgenKey {
+        fn public_point(&self) -> [u8; 65] {
+            self.0
+                .public_key_raw()
+                .try_into()
+                .expect("a P-256 key's raw public key is its 65-byte point")
+        }
+
+        fn sign(&self, message: &[u8]) -> Result<Vec<u8>, DeviceKeyError> {
+            Ok(SigningKey::sign(&self.0, message).expect("rcgen signs a P-256 message"))
+        }
+
+        fn home(&self) -> KeyHome {
+            KeyHome::Software
+        }
+    }
+
+    #[test]
+    fn a_signature_by_a_device_key_verifies_through_the_spki_point() {
+        let key = RcgenKey(KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key"));
+        let spki = public_key_info(&key);
+        let message = b"the message the device signs";
+        let signature = key.sign(message).expect("the device key signs");
+        let point = spki_point(&spki).expect("the SPKI holds the point");
+        assert_eq!(point, key.public_point());
+        ring::signature::UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &point)
+            .verify(message, &signature)
+            .expect("a signature by the key verifies against its point");
+    }
+
+    #[test]
+    fn an_spki_of_another_shape_yields_no_point() {
+        let key = RcgenKey(KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("key"));
+        let spki = public_key_info(&key);
+        // A trailing byte past the point, and a byte short of the prefix, both
+        // fail the shape check.
+        let longer = {
+            let mut bytes = spki.clone();
+            bytes.push(0);
+            bytes
+        };
+        let truncated = &spki[..spki.len() - 1];
+        assert_eq!(spki_point(&longer), None);
+        assert_eq!(spki_point(truncated), None);
     }
 }
