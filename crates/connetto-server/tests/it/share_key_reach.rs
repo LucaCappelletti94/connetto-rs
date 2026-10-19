@@ -2,7 +2,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use connetto_core::auth::Principal;
 use connetto_core::messages::{
@@ -20,6 +20,8 @@ use connetto_server::{
 use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth};
 use subql::{CdcSource, PgChangeEvent, PgSqliteEmuSource, SourceItem};
 use tracing::Instrument;
+
+use super::share_key_clock::ExpiryClock;
 
 const DDL: &str = "CREATE TABLE gated (id INT PRIMARY KEY, label TEXT); \
     CREATE TABLE plain (id INT PRIMARY KEY, label TEXT);";
@@ -100,7 +102,7 @@ impl SnapshotSource for KeysSnapshot {
 
 type Manager = Arc<SessionManager<KeysSnapshot, RosterAuth, ConnettoDefaults>>;
 
-fn manager(fixture: &Fixture) -> Manager {
+fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
     ManagerBuilder::new(
         Materializer::builder(DDL)
             .build()
@@ -115,6 +117,7 @@ fn manager(fixture: &Fixture) -> Manager {
     .with_upkeep(Arc::new(ModelUpkeep {
         key_tables: vec![GATED.to_owned()],
     }))
+    .with_session(clock.session_config())
     .build()
 }
 
@@ -185,23 +188,17 @@ fn is_end(msg: &ControlMessage) -> bool {
     matches!(msg, ControlMessage::SnapshotEnd(_))
 }
 
-fn expiring_key(key: &str) -> String {
-    let now = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs();
-    format!("{key}@{}", now + 5)
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_key_reaches_only_the_tables_the_model_gates() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture);
-    let mut client = connect(&manager, &[&expiring_key("key:a"), "key:b"]).await;
+    let clock = ExpiryClock::new();
+    let manager = manager(&fixture, &clock);
+    let mut client = connect(&manager, &[&clock.grant("key:a"), "key:b"]).await;
     subscribe(&mut client, GATED, "SELECT * FROM gated").await;
     controls_until(&mut client, is_end).await;
     subscribe(&mut client, PLAIN, "SELECT * FROM plain").await;
     controls_until(&mut client, is_end).await;
+    clock.advance(Duration::from_secs(1));
 
     let mut frames = Vec::new();
     loop {

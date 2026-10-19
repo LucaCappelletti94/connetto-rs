@@ -18,7 +18,7 @@
 //! on a durable apply, `MutationReject` or `MutationConflict` otherwise. The
 //! write applies to the source Postgres under the caller's RLS context.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -554,6 +554,8 @@ pub struct SessionConfig {
     write_retry_budget: Duration,
     /// The time one connection may stay open at its first frame before the registration gate closes it (R91).
     first_frame_budget: Duration,
+    #[cfg(feature = "test-seams")]
+    key_expiry_clock: Option<tokio::sync::watch::Receiver<SystemTime>>,
 }
 
 impl Default for SessionConfig {
@@ -564,6 +566,8 @@ impl Default for SessionConfig {
             resume_read_budget: Duration::from_secs(30),
             write_retry_budget: Duration::from_secs(5),
             first_frame_budget: Duration::from_secs(30),
+            #[cfg(feature = "test-seams")]
+            key_expiry_clock: None,
         }
     }
 }
@@ -608,6 +612,25 @@ impl SessionConfig {
     pub const fn with_first_frame_budget(mut self, budget: Duration) -> Self {
         self.first_frame_budget = budget;
         self
+    }
+
+    /// Uses the supplied time for share-key expiry scheduling and comparison.
+    #[cfg(feature = "test-seams")]
+    #[must_use]
+    pub fn with_key_expiry_clock(
+        mut self,
+        clock: tokio::sync::watch::Receiver<SystemTime>,
+    ) -> Self {
+        self.key_expiry_clock = Some(clock);
+        self
+    }
+
+    fn key_expiry_now(&self) -> SystemTime {
+        #[cfg(feature = "test-seams")]
+        if let Some(clock) = &self.key_expiry_clock {
+            return *clock.borrow();
+        }
+        SystemTime::now()
     }
 
     /// Delivery credits granted at handshake.
@@ -1132,11 +1155,30 @@ fn key_change_reaches(reg: &RowRegistration, key_tables: Option<&[String]>) -> b
 }
 
 /// Resolve when the earliest held key dies, and never while none is held.
-async fn next_key_expiry(expiry: &BTreeMap<String, u64>) {
+async fn next_key_expiry(expiry: &BTreeMap<String, u64>, config: &SessionConfig) {
     let Some(&earliest) = expiry.values().min() else {
         return core::future::pending().await;
     };
-    let now = SystemTime::now()
+    #[cfg(feature = "test-seams")]
+    if let Some(clock) = &config.key_expiry_clock {
+        let mut clock = clock.clone();
+        loop {
+            if clock
+                .borrow_and_update()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs()
+                >= earliest
+            {
+                return;
+            }
+            if clock.changed().await.is_err() {
+                return core::future::pending().await;
+            }
+        }
+    }
+    let now = config
+        .key_expiry_now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     tokio::time::sleep(Duration::from_secs(earliest).saturating_sub(now)).await;
@@ -1189,12 +1231,10 @@ enum Outbound {
         /// sibling subscription still claims.
         reason: FullResyncReason,
     },
-    /// Register one computed subscription again under the session's current
-    /// caller and replace its whole answer, because the share keys it answers
-    /// as changed (R95). Its old registration is already gone.
+    /// Rebuild the computed registration that still owns this label.
     Rebootstrap {
-        /// The request that registered it, read again under the new caller.
-        sub: Subscribe,
+        sub_id: String,
+        retired_id: SubscriptionId,
     },
     /// End one row subscription a key change left unservable, in order behind
     /// the frames already queued for it (R95).
@@ -3918,6 +3958,7 @@ where
             refusals: 0,
             wait: None,
         };
+        let mut unbounded = BTreeSet::new();
         for (position, grant) in handshake.grants.iter().enumerate() {
             let position = u64::try_from(position).unwrap_or(u64::MAX);
             let refused = match self.authority.check_grant(grant).await {
@@ -3939,10 +3980,18 @@ where
                             reason = "ambiguous",
                             "grant refused"
                         );
-                    } else if let (Some(key), Some(expires_at)) = (key, expires_at) {
-                        // A key presented twice dies at the later of its two expiries.
-                        let at = resolved.key_expiry.entry(key).or_insert(expires_at);
-                        *at = (*at).max(expires_at);
+                    } else if let Some(key) = key {
+                        match expires_at {
+                            Some(expires_at) if !unbounded.contains(&key) => {
+                                let at = resolved.key_expiry.entry(key).or_insert(expires_at);
+                                *at = (*at).max(expires_at);
+                            }
+                            None => {
+                                resolved.key_expiry.remove(&key);
+                                unbounded.insert(key);
+                            }
+                            Some(_) => {}
+                        }
                     }
                     ambiguous
                 }
@@ -4089,7 +4138,7 @@ where
                         Err(err) => break Err(err),
                     }
                 }
-                () = next_key_expiry(&state.key_expiry) => self.expire_keys(&mut state).await,
+                () = next_key_expiry(&state.key_expiry, &self.config) => self.expire_keys(&mut state).await,
             }
         };
 
@@ -4159,8 +4208,9 @@ where
                 self.resnapshot_row(transport, state, &sub_id, &reason)
                     .await?;
             }
-            Outbound::Rebootstrap { sub } => {
-                self.rebootstrap_computed(transport, state, sub).await?;
+            Outbound::Rebootstrap { sub_id, retired_id } => {
+                self.rebootstrap_computed(transport, state, sub_id, retired_id)
+                    .await?;
             }
             Outbound::Refuse { sub_id } => {
                 self.refuse_subscription(transport, state, &sub_id).await?;
@@ -4196,7 +4246,9 @@ where
 
     /// Drop every held key whose expiry has passed (R95).
     async fn expire_keys(&self, state: &mut SessionState<Id, Key>) {
-        let now = SystemTime::now()
+        let now = self
+            .config
+            .key_expiry_now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
@@ -4273,10 +4325,13 @@ where
             let _ = state.outbound.send(instruction);
         }
         for label in computed {
-            if let Some(ComputedSub { id, sub, .. }) = state.computed_subs.remove(&label) {
+            if let Some(id) = state.computed_subs.get(&label).map(|sub| sub.id) {
                 self.remove_computed_route(id).await;
                 self.materializer.lock().await.unregister(id);
-                let _ = state.outbound.send(Outbound::Rebootstrap { sub });
+                let _ = state.outbound.send(Outbound::Rebootstrap {
+                    sub_id: label,
+                    retired_id: id,
+                });
             }
         }
     }
@@ -4328,8 +4383,17 @@ where
         &self,
         transport: &mut T,
         state: &mut SessionState<Id, Key>,
-        sub: Subscribe,
+        sub_id: String,
+        retired_id: SubscriptionId,
     ) -> Result<(), SessionError> {
+        let std::collections::hash_map::Entry::Occupied(owner) = state.computed_subs.entry(sub_id)
+        else {
+            return Ok(());
+        };
+        if owner.get().id != retired_id {
+            return Ok(());
+        }
+        let sub = owner.remove().sub;
         let consumer_id = self.next_consumer_id();
         let refused = match self.register_subscription(consumer_id, &sub, state).await {
             Ok(registered) => {
@@ -6654,6 +6718,9 @@ async fn flush<T: Transport>(
         }
     }
 }
+
+#[cfg(test)]
+mod rebootstrap_tests;
 
 #[cfg(test)]
 mod tests {

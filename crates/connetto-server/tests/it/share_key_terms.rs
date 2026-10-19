@@ -1,7 +1,7 @@
 //! Subject-dependent membership survives key expiry without retaining expired reach.
 
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::Duration;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::auth::DEFAULT_USER_SETTING;
@@ -21,6 +21,8 @@ use connetto_test_harness::{ConnettoDefaults, Fixture, RosterAuth};
 use sqlite_diff_rs::{ParsedDiffSet, PatchsetOp, Value};
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 
+use super::share_key_clock::ExpiryClock;
+
 const DDL: &str = "CREATE TABLE items (id INT PRIMARY KEY, team_id INT NOT NULL, label TEXT); \
     CREATE TABLE team_members (team_id INT NOT NULL, member TEXT NOT NULL, \
     PRIMARY KEY (team_id, member));";
@@ -32,7 +34,7 @@ const PUBLICATION: &str = "share_key_terms_pub";
 const LABEL: &str = "member-items";
 type Manager = Arc<SessionManager<PgSnapshotSource, RosterAuth, ConnettoDefaults>>;
 
-async fn manager(fixture: &Fixture) -> Manager {
+async fn manager(fixture: &Fixture, clock: &ExpiryClock) -> Manager {
     fixture
         .setup(&[
             DDL,
@@ -60,6 +62,7 @@ async fn manager(fixture: &Fixture) -> Manager {
         NoConnector,
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), DDL).expect("write target"),
     )
+    .with_session(clock.session_config())
     .build()
 }
 
@@ -71,19 +74,15 @@ async fn next_frame(client: &mut LoopbackTransport) -> IncomingFrame {
         .expect("the session remains open")
 }
 
-async fn connect(manager: &Manager) -> LoopbackTransport {
+async fn connect(manager: &Manager, clock: &ExpiryClock) -> LoopbackTransport {
     let (server, mut client) = loopback();
     let manager = Arc::clone(manager);
     tokio::spawn(async move { manager.serve(server).await });
-    let expires = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .expect("after epoch")
-        .as_secs()
-        + 5;
+    let dying = clock.grant("key:a");
     client
         .send_control(ControlMessage::Handshake(
             Handshake::new(PROTOCOL_VERSION, "key-terms")
-                .with_grants([Grant::new(format!("key:a@{expires}")), Grant::new("key:b")]),
+                .with_grants([Grant::new(dying), Grant::new("key:b")]),
         ))
         .await
         .expect("send handshake");
@@ -183,8 +182,9 @@ async fn dispatch(manager: &Manager, statements: &[&str]) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_expired_subject_loses_its_membership_snapshot_and_live_rows() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture).await;
-    let mut client = connect(&manager).await;
+    let clock = ExpiryClock::new();
+    let manager = manager(&fixture, &clock).await;
+    let mut client = connect(&manager, &clock).await;
     subscribe(&mut client, LABEL, &membership_query()).await;
     assert_eq!(snapshot_ids(&mut client, LABEL).await, [11, 22]);
     let initial = through_pong(&mut client, 101).await;
@@ -197,6 +197,7 @@ async fn an_expired_subject_loses_its_membership_snapshot_and_live_rows() {
             _ => None,
         })
         .expect("the membership mirror opens");
+    clock.advance(Duration::from_secs(1));
 
     let mut notices = Vec::new();
     let mut ended = Vec::new();
@@ -247,12 +248,14 @@ async fn an_expired_subject_loses_its_membership_snapshot_and_live_rows() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_membership_reseed_refuses_the_subscription_and_removes_its_routes() {
     let fixture = Fixture::acquire().await;
-    let manager = manager(&fixture).await;
-    let mut client = connect(&manager).await;
+    let clock = ExpiryClock::new();
+    let manager = manager(&fixture, &clock).await;
+    let mut client = connect(&manager, &clock).await;
     subscribe(&mut client, LABEL, &membership_query()).await;
     assert_eq!(snapshot_ids(&mut client, LABEL).await, [11, 22]);
     through_pong(&mut client, 201).await;
     fixture.exec("DROP PUBLICATION share_key_terms_pub").await;
+    clock.advance(Duration::from_secs(1));
 
     let refusal = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
