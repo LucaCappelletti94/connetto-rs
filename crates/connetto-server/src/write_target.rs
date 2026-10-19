@@ -49,12 +49,19 @@ pub(crate) enum WriteOutcome {
     /// The whole changeset applied.
     Applied,
     /// A version-bearing op found a stale or missing row. Carries the current
-    /// server row for the conflict reply, absent when the row is gone.
+    /// server row for the conflict reply, absent when the row is gone, and
+    /// the row locator the settle record re-answers a conflict from.
     Conflict {
         /// Table carrying the conflicting row.
         table: String,
         /// The server's copy of the row.
         server_row: Option<ConflictRow>,
+        /// The version column the conflict checked.
+        version_column: String,
+        /// The primary key columns naming the row.
+        pk_columns: Vec<String>,
+        /// The primary key values naming the row, one per column.
+        pk_values: Vec<crate::writer_schema::StoredValue>,
     },
     /// The write resolves to a first-seen settlement without another apply.
     Settled(Settlement),
@@ -125,6 +132,13 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
             updated_at: row.version,
             row_json: row.row_json,
         }),
+        version_column: conflict.version_column.clone(),
+        pk_columns: conflict.pk_columns.clone(),
+        pk_values: conflict
+            .pk_values
+            .iter()
+            .map(crate::materializer::stored_value)
+            .collect(),
     }
 }
 
@@ -348,6 +362,23 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .await
             .map_err(WriteError::from)?;
         Ok(())
+    }
+
+    /// Drop every settled row of `writer`.
+    pub(crate) async fn prune_writer(&self, writer: i64) -> Result<(), WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::prune_all(&mut conn, writer)
+            .await
+            .map_err(WriteError::from)?;
+        Ok(())
+    }
+
+    /// Every device writer, the sweep's input.
+    pub(crate) async fn device_writers(&self) -> Result<Vec<(i64, Option<Vec<u8>>)>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::device_writers(&mut conn)
+            .await
+            .map_err(WriteError::from)
     }
 
     /// Probe conflicts, apply one upload, and settle its sequence in the same

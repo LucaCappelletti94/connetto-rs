@@ -131,4 +131,6 @@ mod write_path;
 
 mod writer_frontier;
 
+mod courier_frontier;
+
 mod upkeep_consulted;
