@@ -804,6 +804,73 @@ async fn a_joiner_that_breaks_the_frame_protocol_where_its_lists_come() {
     host_node.stop(CloseReason::Closed);
 }
 
+/// A joiner that sends its offer where its lists come gets the break named
+/// without the offer's payload, so the name carries no passphrase (R76
+/// slice 9f).
+#[tokio::test]
+async fn a_joiner_offer_where_its_lists_come_keeps_its_payload_out_of_its_name() {
+    let now = whole_second();
+    let deployment = Deployment::new(43, now);
+    let issuer = deployment.add_issuer(now, [1; 16]);
+    let host = deployment.device(
+        &issuer,
+        "host",
+        now,
+        DAY,
+        [1; 16],
+        AttestationLevel::Unproven,
+    );
+    let joiner = deployment.device(
+        &issuer,
+        "joiner",
+        now,
+        DAY,
+        [2; 16],
+        AttestationLevel::Unproven,
+    );
+
+    let (h_tx, _h_rx) = events();
+    let host_node = node(deployment.root_der(), h_tx);
+    serve(&host_node, &host);
+    let (host_io, joiner_io) = chunk_pair(514);
+    let offer = OfferFrame::new("camp", "opensesame", 1, Some(5678));
+    let (host_res, ()) = tokio::join!(host_node.offer_over(host_io, offer), async {
+        let mut raw = raw_client(deployment.root_der(), &joiner, joiner_io).await;
+        let hello = PeerFrame::Hello {
+            version: 1,
+            dial: 1,
+            numbers: Vec::new(),
+        };
+        write_frame(&mut raw, &hello)
+            .await
+            .expect("the hello writes");
+        let _ = read_frame(&mut raw).await;
+        write_frame(
+            &mut raw,
+            &PeerFrame::Offer {
+                ssid: "camp".to_owned(),
+                passphrase: "opensesame".to_owned(),
+                security: 1,
+                port: Some(5678),
+            },
+        )
+        .await
+        .expect("the offer writes");
+    });
+    let Err(ExchangeError::Protocol(message)) = host_res else {
+        panic!("unexpected exchange result {host_res:?}");
+    };
+    assert!(
+        !message.contains("opensesame"),
+        "the offer's payload stays out of its name"
+    );
+    assert!(
+        !message.contains("camp"),
+        "the offer's SSID stays out of the error"
+    );
+    host_node.stop(CloseReason::Closed);
+}
+
 /// A host that breaks the frame protocol where the offer comes gets a named
 /// refusal from the joiner (R76 slice 5a).
 #[tokio::test]
@@ -1007,4 +1074,21 @@ fn an_offer_frame_redacts_its_passphrase_in_its_debug_form() {
     );
     assert!(debug.contains("camp"), "the network name stays");
     assert!(debug.contains("5678"), "the port stays");
+}
+
+/// A peer frame's debug form redacts the offer's passphrase, so a log that
+/// names a frame never carries the network key (R76 slice 9f).
+#[test]
+fn a_peer_frame_offer_redacts_its_passphrase_in_its_debug_form() {
+    let frame = PeerFrame::Offer {
+        ssid: "camp".to_owned(),
+        passphrase: "opensesame".to_owned(),
+        security: 1,
+        port: Some(5678),
+    };
+    let debug = format!("{frame:?}");
+    assert!(
+        !debug.contains("opensesame"),
+        "the passphrase stays out of the log"
+    );
 }

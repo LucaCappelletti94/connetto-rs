@@ -601,12 +601,12 @@ fn stop_state(state: &NodeState, reason: CloseReason) {
     if let Some(slot) = state.listener.write().take() {
         let _ = slot.stop.send(true);
     }
-    let drained: Vec<SlotState> = {
+    let drained = {
         let mut links = state.links.lock();
         state.serving.store(false, Ordering::Release);
-        links.drain().map(|(_, slot_state)| slot_state).collect()
+        std::mem::take(&mut *links)
     };
-    for slot_state in drained {
+    for (_, slot_state) in drained {
         match slot_state {
             SlotState::Live(slot) => {
                 let _ = slot.command.send(LinkCommand::Close(reason));
