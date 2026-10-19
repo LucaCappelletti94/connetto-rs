@@ -463,6 +463,8 @@ async fn setup(
     #[cfg(target_os = "windows")] owner: Arc<dyn connetto_client::HelloOwner>,
 ) -> anyhow::Result<Parts> {
     use anyhow::Context as _;
+    #[cfg(target_os = "android")]
+    connetto_auth_session::initialize_tls()?;
 
     let server = endpoint(
         std::env::var("CONNETTO_DEMO_WS").ok(),

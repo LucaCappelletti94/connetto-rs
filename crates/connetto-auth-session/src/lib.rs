@@ -20,6 +20,9 @@
 //! follows from process start, so a screen Android rebuilds inside the running
 //! process is followed too. An app whose build does not merge the module's
 //! manifest declares that provider itself.
+//!
+//! Android applications call `initialize_tls` before constructing a native client, including when credentials are cached.
+//! The bundled `android/verifier.gradle` selects the Kotlin verifier version from `Cargo.lock` and composes its revocation policy with an application's `network_security_config.xml`.
 
 use std::time::Duration;
 
@@ -90,6 +93,16 @@ pub fn delivered() -> Result<Option<String>, AuthSessionError> {
     return android::delivered();
     #[cfg(not(target_os = "android"))]
     Ok(None)
+}
+
+/// Initializes Android's native certificate verifier for secure connections.
+///
+/// # Errors
+///
+/// Returns [`AuthSessionError::Bridge`] if the Android context is unavailable.
+#[cfg(target_os = "android")]
+pub fn initialize_tls() -> Result<(), AuthSessionError> {
+    android::initialize_tls()
 }
 
 /// The JNI access an Android build's device key needs, reaching the Java VM

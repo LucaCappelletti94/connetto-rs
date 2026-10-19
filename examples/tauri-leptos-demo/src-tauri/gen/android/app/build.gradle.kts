@@ -43,6 +43,7 @@ android {
                enable = true
             }
             proguardFiles(
+                file("../../../../../../crates/connetto-auth-session/android/consumer-rules.pro"),
                 *fileTree(".") {
                   include("**/*.pro")
                   exclude("build/**")
@@ -75,6 +76,8 @@ kotlin {
 rust {
     rootDirRel = "../../../"
 }
+
+apply(from = file("../../../../../../crates/connetto-auth-session/android/verifier.gradle"))
 
 dependencies {
     implementation("androidx.webkit:webkit:1.14.0")

@@ -119,6 +119,7 @@ tokio = { version = "1", features = [
   "io-util",
 ] }
 thiserror = "2"
+rustls-platform-verifier = "0.7.1"
 # Routed to the merged diesel group-clause export by the [patch] blocks below.
 diesel = { version = "2", features = ["sqlite"] }
 
