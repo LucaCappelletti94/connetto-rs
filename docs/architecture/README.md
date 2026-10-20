@@ -29,6 +29,7 @@ The numbering records the order chapters were written, not a reading order and n
 | `18-file-handling.md` | File handling: identity, chunking, the encrypted stores, tickets, the availability convention, and the abuse surface. **Built through R68** (the core, the file server, the connetto seam, the native client and the browser client), with R69 the demos, R87 the quotas and R70's boot reconcile and healing built |
 | `19-device-to-device.md` | Offline collaboration between devices: certificates, the per-device frontier, the LAN link, the exchange, the provisional tier, and courier recovery. **Built (R74)** for device identity, enrolment, revocation, issuer rotation, the client's half of the clock rule and the lost-key path, **Built (R76)** for the link, discovery, the Android hosting and joining, the beacon and the exchange, the text and QR fallback, the iPhone host and iPad join, the Linux hosting and joining and the Mac join, **Decided, not built** for Windows and R75 to R80 |
 | `20-deployment.md` | What a deployment holds and what each backup method carries, what a restore to an earlier point does to connected clients (R70), and the failover recipe (R73). **Built** for the inventory, the chunk store, rows, logins and the authorization store, every adopted boot reconciling the whole OpenFGA store against Postgres |
+| `21-clocks.md` | Which clock every timer and deadline reads, what each does across a suspend, and the skew two machines' wall clocks may have. **Built (R72)** |
 
 ## Not chapters
 
