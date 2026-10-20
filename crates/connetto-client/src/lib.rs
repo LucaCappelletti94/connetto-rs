@@ -309,6 +309,10 @@ pub enum ClientError {
     /// for provision-once custody.
     #[error("the local database does not decrypt under the key supplied: {0}")]
     ReplicaUndecryptable(String),
+    /// Another connection held the local database locked for longer than the
+    /// open waits, so the file and the key are untouched and a later open succeeds.
+    #[error("another connection holds the local database locked: {0}")]
+    ReplicaBusy(String),
     /// Applying the replica cipher failed before any page was read: this build
     /// links a SQLite with no page codec, or a cipher pragma was rejected.
     #[error("replica cipher: {0}")]
@@ -429,12 +433,13 @@ pub enum SignInRefused {
 }
 
 /// Split a cipher failure by what the caller can do about it: a key that does
-/// not decrypt is recoverable by discarding the replica, everything else is a
-/// build or configuration fault.
+/// not decrypt is recoverable by discarding the replica, a busy file by opening
+/// again, and everything else is a build or configuration fault.
 impl From<UnlockError> for ClientError {
     fn from(error: UnlockError) -> Self {
         match error {
             UnlockError::WrongKey(_) => Self::ReplicaUndecryptable(error.to_string()),
+            UnlockError::Busy(_) => Self::ReplicaBusy(error.to_string()),
             UnlockError::CodecMissing | UnlockError::Pragma(_) => Self::Cipher(error.to_string()),
         }
     }
