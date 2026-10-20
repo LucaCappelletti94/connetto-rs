@@ -1094,5 +1094,5 @@ async fn a_failed_number_grant_preserves_the_unissued_queue_for_retry() {
     conn.attach(wire.clone()).await.expect("retry grant");
     drain(&mut conn).await;
     assert_eq!(wire.log.lock().mutations, [1]);
-    assert!(conn.unsynced().is_empty());
+    assert_eq!(conn.unsynced(), Vec::<UnsyncedWrite>::new());
 }
