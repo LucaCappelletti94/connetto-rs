@@ -295,6 +295,11 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
     /// `DELETE` the settled rows of `writer` at or below `seq`, the
     /// `settled_through` prune of a number writer.
     fn prune(conn: &mut AsyncPgConnection, writer: i64, seq: i64) -> Statement<'_, i64>;
+    /// `DELETE` every settled row of `writer`, the sweep of a device writer
+    /// whose enrolment can no longer deliver.
+    fn prune_all(conn: &mut AsyncPgConnection, writer: i64) -> Statement<'_, i64>;
+    /// `SELECT writer, device_key` of every device writer, the sweep's input.
+    fn device_writers(conn: &mut AsyncPgConnection) -> Statement<'_, Vec<(i64, Option<Vec<u8>>)>>;
 }
 
 /// Generate the default connetto writer tables and their
@@ -719,6 +724,39 @@ macro_rules! connetto_writers_table {
                     ));
                     let removed = RunQueryDsl::execute(query, &mut *conn).await?;
                     Ok(i64::try_from(removed).unwrap_or(i64::MAX))
+                })
+            }
+
+            fn prune_all(
+                conn: &mut diesel_async::AsyncPgConnection,
+                writer: i64,
+            ) -> $crate::writer_schema::Statement<'_, i64> {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let query = diesel::delete(QueryDsl::filter(
+                        _connetto_settled::table,
+                        _connetto_settled::writer.eq(writer),
+                    ));
+                    let removed = RunQueryDsl::execute(query, &mut *conn).await?;
+                    Ok(i64::try_from(removed).unwrap_or(i64::MAX))
+                })
+            }
+
+            fn device_writers(
+                conn: &mut diesel_async::AsyncPgConnection,
+            ) -> $crate::writer_schema::Statement<'_, Vec<(i64, Option<Vec<u8>>)>> {
+                Box::pin(async move {
+                    use diesel::{ExpressionMethods as _, QueryDsl};
+                    use diesel_async::RunQueryDsl;
+                    let query = QueryDsl::select(
+                        QueryDsl::filter(
+                            _connetto_writers::table,
+                            _connetto_writers::device_key.is_not_null(),
+                        ),
+                        (_connetto_writers::writer, _connetto_writers::device_key),
+                    );
+                    RunQueryDsl::load(query, &mut *conn).await
                 })
             }
         }

@@ -365,6 +365,30 @@ mod app {
                 Ok(i64::try_from(removed).unwrap_or(i64::MAX))
             })
         }
+
+        fn prune_all(conn: &mut AsyncPgConnection, writer: i64) -> Statement<'_, i64> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query =
+                    diesel::delete(app_settled::table.filter(app_settled::writer.eq(writer)));
+                let removed = RunQueryDsl::execute(query, &mut *conn).await?;
+                Ok(i64::try_from(removed).unwrap_or(i64::MAX))
+            })
+        }
+
+        fn device_writers(
+            conn: &mut AsyncPgConnection,
+        ) -> Statement<'_, Vec<(i64, Option<Vec<u8>>)>> {
+            Box::pin(async move {
+                use diesel::{ExpressionMethods, QueryDsl};
+                use diesel_async::RunQueryDsl;
+                let query = app_writers::table
+                    .filter(app_writers::device_key.is_not_null())
+                    .select((app_writers::writer, app_writers::device_key));
+                RunQueryDsl::load(query, &mut *conn).await
+            })
+        }
     }
 
     pub struct AppSchema;
