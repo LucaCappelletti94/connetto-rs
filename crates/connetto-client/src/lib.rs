@@ -3414,15 +3414,22 @@ where
                 let number = WriterRef::Number(grant.number);
                 {
                     let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-                    if let Some(queue) = self.writers.remove(&unissued()) {
-                        rekey_writer(&mut self.db, &unissued(), &number)?;
-                        persist_writer_state(&mut self.db, &number, queue.next_seq, &queue.head)?;
-                        self.writers.insert(number, queue);
-                    } else {
-                        self.writers.insert(number, WriterQueue::fresh());
-                        persist_writer_state(&mut self.db, &number, 1, &GENESIS)?;
-                    }
+                    let queue = self.writers.get(&unissued());
+                    self.db.transaction::<(), ClientError, _>(|db| {
+                        let (next_seq, head) = if let Some(queue) = queue {
+                            rekey_writer(db, &unissued(), &number)?;
+                            (queue.next_seq, &queue.head)
+                        } else {
+                            (1, &GENESIS)
+                        };
+                        persist_writer_state(db, &number, next_seq, head)
+                    })?;
                 }
+                let queue = self
+                    .writers
+                    .remove(&unissued())
+                    .unwrap_or_else(WriterQueue::fresh);
+                self.writers.insert(number, queue);
                 Ok(Some(number))
             }
             WriterRequest::Number(number) => {
@@ -3436,12 +3443,12 @@ where
                 }
                 let writer = WriterRef::Number(number);
                 if let Entry::Vacant(entry) = self.writers.entry(writer) {
-                    entry.insert(WriterQueue::fresh());
                     {
                         let _suspended =
                             SuspendedCapture::new(&mut self.session, &self.write_exempt);
                         persist_writer_state(&mut self.db, &writer, 1, &GENESIS)?;
                     }
+                    entry.insert(WriterQueue::fresh());
                 }
                 Ok(Some(writer))
             }

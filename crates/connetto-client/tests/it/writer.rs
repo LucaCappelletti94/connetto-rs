@@ -1053,3 +1053,46 @@ async fn a_split_table_entry_hashes_the_logical_bytes() {
         "the upload speaks the logical name"
     );
 }
+
+#[tokio::test]
+async fn a_failed_number_grant_preserves_the_unissued_queue_for_retry() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("offline write"), Some(1));
+    let before = conn.unsynced();
+    conn.conn()
+        .batch_execute(
+            "CREATE TRIGGER fail_grant BEFORE UPDATE ON _connetto_writers \
+         WHEN NEW.id = 'number:1' \
+         BEGIN SELECT RAISE(FAIL, 'grant failure'); END;",
+        )
+        .expect("arm grant failure");
+    assert!(conn.attach(Wire::default()).await.is_err());
+    assert_eq!(
+        conn.unsynced(),
+        before,
+        "a failed grant preserves the in-memory queue"
+    );
+    assert_eq!(writers(&mut conn), ["number:0"]);
+    let durable: Vec<String> = _connetto_pending::table
+        .select(_connetto_pending::writer)
+        .load(conn.conn())
+        .expect("durable writer");
+    assert_eq!(durable, ["number:0"]);
+    conn.conn()
+        .batch_execute("DROP TRIGGER fail_grant")
+        .expect("disarm failure");
+    drop(conn);
+    let mut conn = open(&dir).await;
+    assert_eq!(
+        conn.unsynced(),
+        before,
+        "the unissued tail survives restart"
+    );
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("retry grant");
+    drain(&mut conn).await;
+    assert_eq!(wire.log.lock().mutations, [1]);
+    assert!(conn.unsynced().is_empty());
+}
