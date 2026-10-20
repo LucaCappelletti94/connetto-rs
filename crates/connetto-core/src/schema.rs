@@ -100,6 +100,7 @@ pub struct SchemaBundle {
     policy_tables: Vec<(String, String)>,
     policy_views: Vec<String>,
     local_tier_ddl: Option<String>,
+    shared_tables: Vec<String>,
 }
 
 impl SchemaBundle {
@@ -140,6 +141,7 @@ impl SchemaBundle {
                 .collect(),
             policy_views: policy_views.into_iter().map(Into::into).collect(),
             local_tier_ddl: local_tier_ddl.map(Into::into),
+            shared_tables: Vec::new(),
         }
     }
 
@@ -150,6 +152,18 @@ impl SchemaBundle {
     #[must_use]
     pub fn with_local_tier(mut self, local_tier_ddl: impl Into<String>) -> Self {
         self.local_tier_ddl = Some(local_tier_ddl.into());
+        self
+    }
+
+    /// Return a copy of this bundle naming the tables a device stores once for
+    /// every account. The version is unaffected, since where a device stores a
+    /// table changes nothing on the wire.
+    #[must_use]
+    pub fn with_shared_tables<T: Into<String>>(
+        mut self,
+        tables: impl IntoIterator<Item = T>,
+    ) -> Self {
+        self.shared_tables = tables.into_iter().map(Into::into).collect();
         self
     }
 
@@ -191,6 +205,13 @@ impl SchemaBundle {
     #[must_use]
     pub fn local_tier_ddl(&self) -> Option<&str> {
         self.local_tier_ddl.as_deref()
+    }
+
+    /// The tables a device stores once for every account, as the build
+    /// validated them.
+    #[must_use]
+    pub fn shared_tables(&self) -> &[String] {
+        &self.shared_tables
     }
 
     /// The schema version this bundle presents at handshake.
@@ -421,6 +442,17 @@ mod tests {
             without.version(),
             with.version(),
             "the local tier is a separate database and is not part of the synced shape"
+        );
+    }
+
+    #[test]
+    fn the_shared_tables_do_not_change_the_version() {
+        let without = reference();
+        let with = without.clone().with_shared_tables(["orders"]);
+        assert_eq!(
+            without.version(),
+            with.version(),
+            "a server that names no shared table must accept the client that does"
         );
     }
 

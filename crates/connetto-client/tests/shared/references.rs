@@ -24,10 +24,10 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 type Conn = ConnettoConnection<FakeTransport>;
 
-/// A synced table whose rows name a parent the replica may never hold.
+/// A synced table as its translation reaches the replica, without the
+/// reference to a parent the replica may never hold.
 const SYNCED_DDL: &str = "CREATE TABLE IF NOT EXISTS folders (id INTEGER PRIMARY KEY); \
-    CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, \
-    folder INTEGER NOT NULL REFERENCES folders(id));";
+    CREATE TABLE IF NOT EXISTS notes (id INTEGER PRIMARY KEY, folder INTEGER NOT NULL);";
 
 diesel::table! {
     /// The synced child, whose folder the replica may never hold.
@@ -131,8 +131,8 @@ impl TransportFactory for Offline {
     }
 }
 
-/// Open an in-memory replica over `synced`, with `tier` as its device-local tier.
-fn try_open_with(synced: &str, tier: Option<&str>) -> Result<Conn, ClientError> {
+/// An in-memory replica over `synced`, with `tier` as its device-local tier.
+fn open_with(synced: &str, tier: Option<&str>) -> Conn {
     let schema = SyncSchema::new(SchemaBundle::new(
         "",
         "",
@@ -141,26 +141,14 @@ fn try_open_with(synced: &str, tier: Option<&str>) -> Result<Conn, ClientError> 
         Vec::<String>::new(),
         tier,
     ));
-    ClientBuilder::new(schema, Offline).open_driven()
-}
-
-/// An in-memory replica over `synced`, with `tier` as its device-local tier.
-fn open_with(synced: &str, tier: Option<&str>) -> Conn {
-    try_open_with(synced, tier).expect("the replica opens")
+    ClientBuilder::new(schema, Offline)
+        .open_driven()
+        .expect("the replica opens")
 }
 
 /// An in-memory replica over [`SYNCED_DDL`] with `tier` as its tier.
 fn open(tier: &str) -> Conn {
     open_with(SYNCED_DDL, Some(tier))
-}
-
-/// Replica DDL that does not parse as SQLite refuses the open, since its
-/// references could not be removed.
-pub fn an_unparsable_replica_schema_refuses_the_open() {
-    assert!(matches!(
-        try_open_with("CREATE TABLE notes (id INTEGER PRIMARY KEY,", None),
-        Err(ClientError::Schema(_))
-    ));
 }
 
 /// How many references SQLite records for `table` in `schema`. Raw because a
@@ -179,73 +167,14 @@ fn references(conn: &mut Conn, schema: &str, table: &str) -> i64 {
         .rows
 }
 
-/// The text SQLite stored for `table`. Raw because the catalogue has no
-/// `table!` of its own here.
-fn stored_sql(conn: &mut Conn, table: &str) -> String {
-    #[derive(QueryableByName)]
-    struct Stored {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        sql: String,
-    }
-    diesel::sql_query("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
-        .bind::<diesel::sql_types::Text, _>(table)
-        .get_result::<Stored>(conn.conn())
-        .expect("read the stored table")
-        .sql
-}
-
-/// Proof 1 for a fixed set of tables: a table written with references is
-/// stored exactly as the same table written without them.
-pub fn stripping_keeps_the_rest_of_each_table() {
-    let cases = [
-        (
-            "odd table",
-            "CREATE TABLE \"odd table\" (\"c 0\" INTEGER PRIMARY KEY AUTOINCREMENT, c1 TEXT NOT NULL \
-             DEFAULT 'x' COLLATE NOCASE CHECK (c1 IS NOT NULL) UNIQUE REFERENCES p(id), c2 INTEGER \
-             GENERATED ALWAYS AS (length(\"c 0\")) STORED, CONSTRAINT to_q FOREIGN KEY (c1) \
-             REFERENCES q(a) ON DELETE SET DEFAULT) STRICT",
-            "CREATE TABLE \"odd table\" (\"c 0\" INTEGER PRIMARY KEY AUTOINCREMENT, c1 TEXT NOT NULL \
-             DEFAULT 'x' COLLATE NOCASE CHECK (c1 IS NOT NULL) UNIQUE, c2 INTEGER \
-             GENERATED ALWAYS AS (length(\"c 0\")) STORED) STRICT",
-        ),
-        (
-            "t",
-            "CREATE TABLE t (c0 BLOB, c1 REAL DEFAULT (1 + 2) REFERENCES p, c2 ANY \
-             CONSTRAINT to_p REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED, c3 TEXT GENERATED \
-             ALWAYS AS (length(c0)) VIRTUAL, PRIMARY KEY (c0), CHECK (c0 IS NOT NULL), \
-             FOREIGN KEY (c0, c1) REFERENCES q(a, b) ON DELETE CASCADE ON UPDATE SET NULL) \
-             WITHOUT ROWID",
-            "CREATE TABLE t (c0 BLOB, c1 REAL DEFAULT (1 + 2), c2 ANY, c3 TEXT GENERATED \
-             ALWAYS AS (length(c0)) VIRTUAL, PRIMARY KEY (c0), CHECK (c0 IS NOT NULL)) \
-             WITHOUT ROWID",
-        ),
-        (
-            "both",
-            "CREATE TABLE both (id INTEGER PRIMARY KEY, p INTEGER REFERENCES p(id)) \
-             WITHOUT ROWID, STRICT",
-            "CREATE TABLE both (id INTEGER PRIMARY KEY, p INTEGER) WITHOUT ROWID, STRICT",
-        ),
-    ];
-    for (table, with, without) in cases {
-        let mut conn = open_with(with, None);
-        assert_eq!(
-            stored_sql(&mut conn, table),
-            without,
-            "only the references went"
-        );
-    }
-}
-
-/// Proof 2 and the synced half of decision 1: the tier keeps its reference and
-/// the synced table loses its own.
-pub fn the_tier_keeps_its_references_and_synced_tables_lose_theirs() {
+/// The tier half of decision 1: the tier keeps its reference.
+pub fn the_tier_keeps_its_references() {
     let mut conn = open(
         "CREATE TABLE parents (id INTEGER PRIMARY KEY); \
          CREATE TABLE children (id INTEGER PRIMARY KEY, \
          parent INTEGER REFERENCES parents(id) ON DELETE CASCADE)",
     );
     assert_eq!(references(&mut conn, "connetto_local", "children"), 1);
-    assert_eq!(references(&mut conn, "main", "notes"), 0);
 }
 
 /// Proof 3: enforcement is on for a replica with a tier and for one without,

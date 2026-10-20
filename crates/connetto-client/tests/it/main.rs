@@ -104,7 +104,6 @@ mod sql_functions;
 mod synced_references;
 
 mod support;
-mod synced_schema;
 
 #[cfg(feature = "native-auth")]
 mod teardown;

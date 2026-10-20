@@ -1284,7 +1284,6 @@ dependencies = [
  "openidconnect",
  "parking_lot",
  "pg2sqlite",
- "proptest",
  "rcgen",
  "reqwest 0.12.28",
  "ring",
