@@ -1,9 +1,23 @@
 # connetto-core
 
-Shared wire protocol, framing, and I/O trait signatures for the connetto-rs sync stack. Every other crate in the workspace, server and client alike, depends on this one and only this one for its shared vocabulary.
+[![Coverage](https://codecov.io/gh/LucaCappelletti94/connetto-rs/graph/badge.svg)](https://codecov.io/gh/LucaCappelletti94/connetto-rs)
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](https://github.com/LucaCappelletti94/connetto-rs/blob/main/LICENSE)
+[![docs.rs](https://docs.rs/connetto-core/badge.svg)](https://docs.rs/connetto-core)
+[![crates.io](https://img.shields.io/crates/v/connetto-core.svg)](https://crates.io/crates/connetto-core)
 
-The crate defines two top-level enums, `ControlMessage` and `BulkMessage`, that together cover every frame exchanged between a connetto server and its clients. Control frames carry structured metadata (handshake, subscribe, mutation header, error, keepalive) as uncompressed MessagePack. Bulk frames carry SQLite patchsets and schema blobs whose payload bytes are already Zstd-compressed by the sender. The `codec` module serialises those types with `rmp-serde` and, when the transport lacks its own message boundary, wraps each payload in a `u32` big-endian length header.
+Shared wire types, framing and I/O traits for the server, native client and browser client. `ControlMessage` carries uncompressed `MessagePack` metadata, while `BulkMessage` carries patchsets and schema payloads whose content is already compressed. The `codec` module adds a `u32` length prefix for byte-stream transports.
 
-The `traits` module defines the seams `connetto-server`, `connetto-client`, and `connetto-client-wasm` each fill: `Transport` for the wire and `Store` for local persistence. Authorization is not among them: that question goes through `subql`'s own visibility trait, so the executor answering it is not a structural commitment of this crate. Nothing here reaches for a runtime, a socket, or a database. All that lives in the consumer crates.
+```rust
+use connetto_core::codec::{decode_control_framed, encode_control_framed};
+use connetto_core::messages::{ControlMessage, Ping};
 
-See `docs/architecture/` at the workspace root for the full protocol design, and `open-questions.md` for the decision index that names each field and message.
+let message = ControlMessage::Ping(Ping { nonce: 42 });
+let frame = encode_control_framed(&message).expect("encode control frame");
+let (decoded, consumed) = decode_control_framed(&frame).expect("decode control frame");
+assert_eq!(decoded, message);
+assert_eq!(consumed, frame.len());
+```
+
+The `traits` module defines transport, persistence and credential-storage boundaries. Optional features provide native `WebSocket` and loopback transports, device certificates and program logging.
+
+The hosted API documentation and package badges resolve after the first release.
