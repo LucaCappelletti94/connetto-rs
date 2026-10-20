@@ -134,6 +134,8 @@ pub(crate) struct SettleSpec {
     pub seq: u64,
     /// The entry's chain hash.
     pub entry_hash: [u8; 32],
+    /// The chain head the entry hashed under.
+    pub previous_hash: [u8; 32],
     /// The path that settles the entry.
     pub path: SettlePath,
 }
@@ -332,6 +334,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     settle.writer,
                     seq,
                     &settle.entry_hash,
+                    &settle.previous_hash,
                     &SettledOutcome::Applied.json(),
                     settle.path,
                 )
@@ -403,6 +406,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 settle.writer,
                 seq,
                 &settle.entry_hash,
+                &settle.previous_hash,
                 &text,
                 settle.path,
             )

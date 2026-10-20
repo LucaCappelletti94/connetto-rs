@@ -186,6 +186,10 @@ pub struct WriterRow<Id> {
 pub struct SettledRow {
     /// The entry's chain hash.
     pub entry_hash: Vec<u8>,
+    /// The chain head the entry hashed under, its predecessor's evidence,
+    /// retained with the row so a redelivery verifies against it rather
+    /// than a preceding row the prune may have removed.
+    pub previous_hash: Vec<u8>,
     /// The stored outcome, its JSON text.
     pub outcome: Vec<u8>,
     /// The path that settled it.
@@ -233,13 +237,14 @@ pub trait ConnettoWriterSchema: Send + Sync + 'static {
         seq: i64,
     ) -> Statement<'_, Option<SettledRow>>;
     /// `INSERT ... ON CONFLICT (writer, seq) DO NOTHING`, settling one entry
-    /// with `entry_hash`, `outcome` and `path`, reporting whether this
-    /// statement won the sequence.
+    /// with `entry_hash`, `previous_hash`, `outcome` and `path`, reporting
+    /// whether this statement won the sequence.
     fn settle<'c>(
         conn: &'c mut AsyncPgConnection,
         writer: i64,
         seq: i64,
         entry_hash: &'c [u8],
+        previous_hash: &'c [u8],
         outcome: &'c str,
         path: SettlePath,
     ) -> Statement<'c, bool>;
@@ -324,6 +329,9 @@ macro_rules! connetto_writers_table {
                 /// The entry's chain hash, computed from the chain and the
                 /// changeset bytes.
                 entry_hash -> diesel::sql_types::Bytea,
+                /// The chain head the entry hashed under, its predecessor's
+                /// evidence.
+                previous_hash -> diesel::sql_types::Bytea,
                 /// The stored outcome, [`$crate::writer_schema::SettledOutcome`]
                 /// as JSON text.
                 outcome -> diesel::sql_types::Text,
@@ -445,19 +453,21 @@ macro_rules! connetto_writers_table {
                         ),
                         (
                             _connetto_settled::entry_hash,
+                            _connetto_settled::previous_hash,
                             _connetto_settled::outcome,
                             _connetto_settled::path,
                         ),
                     );
-                    let row: Option<(Vec<u8>, String, $crate::writer_schema::SettlePath)> =
+                    let row: Option<(Vec<u8>, Vec<u8>, String, $crate::writer_schema::SettlePath)> =
                         RunQueryDsl::first(query, &mut *conn).await.optional()?;
-                    Ok(row.map(
-                        |(entry_hash, outcome, path)| $crate::writer_schema::SettledRow {
+                    Ok(row.map(|(entry_hash, previous_hash, outcome, path)| {
+                        $crate::writer_schema::SettledRow {
                             entry_hash,
+                            previous_hash,
                             outcome: outcome.into_bytes(),
                             path,
-                        },
-                    ))
+                        }
+                    }))
                 })
             }
 
@@ -466,6 +476,7 @@ macro_rules! connetto_writers_table {
                 writer: i64,
                 seq: i64,
                 entry_hash: &'c [u8],
+                previous_hash: &'c [u8],
                 outcome: &'c str,
                 path: $crate::writer_schema::SettlePath,
             ) -> $crate::writer_schema::Statement<'c, bool> {
@@ -477,6 +488,7 @@ macro_rules! connetto_writers_table {
                             _connetto_settled::writer.eq(writer),
                             _connetto_settled::seq.eq(seq),
                             _connetto_settled::entry_hash.eq(entry_hash.to_vec()),
+                            _connetto_settled::previous_hash.eq(previous_hash.to_vec()),
                             _connetto_settled::outcome.eq(outcome.to_owned()),
                             _connetto_settled::path.eq(path),
                         ))

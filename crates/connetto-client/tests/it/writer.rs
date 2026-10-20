@@ -12,16 +12,20 @@ use std::future::{Future, ready};
 use std::sync::Arc;
 
 use connetto_client::{
-    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, UnsyncedWrite,
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, SyncSchema, UnsyncedWrite,
 };
 use connetto_core::Cursor;
+use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, MutationApplied,
     MutationReject, MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
 };
+use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
+use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use parking_lot::Mutex;
+use sqlite_diff_rs::ParsedDiffSet;
 use tempfile::tempdir;
 
 const DDL: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY)";
@@ -66,6 +70,7 @@ enum Lie {
 struct Log {
     handshakes: Vec<WriterRequest>,
     mutations: Vec<u64>,
+    bulks: Vec<Vec<u8>>,
     outbox: VecDeque<IncomingFrame>,
 }
 
@@ -80,6 +85,7 @@ struct Wire {
     answer: Answer,
     lie: Option<Lie>,
     closing: Option<FatalErrorReason>,
+    refuse: Option<FatalErrorReason>,
 }
 
 impl Default for Wire {
@@ -91,6 +97,7 @@ impl Default for Wire {
             answer: Answer::default(),
             lie: None,
             closing: None,
+            refuse: None,
         }
     }
 }
@@ -129,6 +136,12 @@ impl Wire {
         self.closing = Some(reason);
         self
     }
+
+    /// Refuse the handshake itself with `reason`, before any ack.
+    fn refusing_with(mut self, reason: FatalErrorReason) -> Self {
+        self.refuse = Some(reason);
+        self
+    }
 }
 
 impl Transport for Wire {
@@ -153,23 +166,30 @@ impl Transport for Wire {
                 };
                 let mut log = self.log.lock();
                 log.handshakes.push(handshake.writer);
-                log.outbox
-                    .push_back(IncomingFrame::Control(ControlMessage::HandshakeAck(
-                        HandshakeAck {
-                            connection_id: "wire".to_owned(),
-                            session_token: "wire".to_owned(),
-                            resume_token: "run:wire".to_owned(),
-                            current_cursor: Cursor::new(Vec::new()),
-                            schema_version: None,
-                            initial_credits: 64,
-                            writer,
-                        },
-                    )));
-                if let Some(reason) = self.closing.take() {
+                if let Some(reason) = self.refuse.take() {
                     log.outbox
                         .push_back(IncomingFrame::Control(ControlMessage::FatalError(
                             FatalError::new(reason),
                         )));
+                } else {
+                    log.outbox
+                        .push_back(IncomingFrame::Control(ControlMessage::HandshakeAck(
+                            HandshakeAck {
+                                connection_id: "wire".to_owned(),
+                                session_token: "wire".to_owned(),
+                                resume_token: "run:wire".to_owned(),
+                                current_cursor: Cursor::new(Vec::new()),
+                                schema_version: None,
+                                initial_credits: 64,
+                                writer,
+                            },
+                        )));
+                    if let Some(reason) = self.closing.take() {
+                        log.outbox
+                            .push_back(IncomingFrame::Control(ControlMessage::FatalError(
+                                FatalError::new(reason),
+                            )));
+                    }
                 }
             }
             ControlMessage::MutationHeader(header) => {
@@ -200,10 +220,10 @@ impl Transport for Wire {
         ready(Ok(()))
     }
 
-    fn send_bulk(
-        &mut self,
-        _message: BulkMessage,
-    ) -> impl Future<Output = Result<(), Self::Error>> {
+    fn send_bulk(&mut self, message: BulkMessage) -> impl Future<Output = Result<(), Self::Error>> {
+        if let BulkMessage::MutationPatch(patch) = message {
+            self.log.lock().bulks.push(patch.patchset_zstd);
+        }
         ready(Ok(()))
     }
 
@@ -675,5 +695,361 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
             seq: 1
         }],
         "the corrupt rows skipped, the good one loaded"
+    );
+}
+
+/// A failure inside the append's pending-row write leaves the durable queue
+/// exactly where it stood, so the retry takes the same sequence and a
+/// restart reloads the unbroken queue.
+#[tokio::test]
+async fn a_failed_append_keeps_the_queue_unchanged_and_retries_the_same_sequence() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    drain(&mut conn).await;
+
+    // A failure injected into the pending-row write.
+    conn.conn()
+        .batch_execute(
+            "CREATE TRIGGER fail_pending BEFORE INSERT ON _connetto_pending \
+             BEGIN SELECT RAISE(FAIL, 'review injected write failure'); END;",
+        )
+        .expect("arm the trigger");
+    write(&mut conn, 2);
+    assert!(
+        conn.push().await.is_err(),
+        "the append fails on the injected write failure"
+    );
+    conn.conn()
+        .batch_execute("DROP TRIGGER fail_pending")
+        .expect("disarm the trigger");
+
+    // Nothing durable moved: the next sequence still stands and no entry was left behind.
+    let next_seq: i64 = _connetto_writers::table
+        .select(_connetto_writers::next_seq)
+        .first(conn.conn())
+        .expect("read the queue state");
+    assert_eq!(
+        next_seq, 2,
+        "the failed append left the next sequence where it stood"
+    );
+    assert_eq!(
+        _connetto_pending::table
+            .count()
+            .get_result::<i64>(conn.conn())
+            .expect("count the queue"),
+        1,
+        "the failed append left the standing entry and nothing else"
+    );
+
+    // The retry takes the same sequence the failed append did.
+    assert_eq!(
+        conn.push().await.expect("the retry queues"),
+        Some(2),
+        "the retry re-takes the failed sequence"
+    );
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 2
+            },
+        ],
+        "the retry sits under the standing entry"
+    );
+    drop(conn);
+
+    // A restart reloads the unbroken queue and resends it in order.
+    let mut conn = open(&dir).await;
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 2
+            },
+        ],
+        "the restart reloads both entries"
+    );
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.mutations,
+            vec![1, 2],
+            "the restart resends the entries in order"
+        );
+    }
+    assert!(
+        conn.unsynced().is_empty(),
+        "the applied answers retired both entries"
+    );
+}
+
+/// A failure midway through a multi-entry carry keeps the complete source and
+/// leaves no partial target behind, so a restart resends the whole tail.
+#[tokio::test]
+async fn a_failed_carry_retains_the_complete_source_and_the_restart_resends_it() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    write(&mut conn, 2);
+    assert_eq!(conn.push().await.expect("queue"), Some(2));
+    drain(&mut conn).await;
+
+    // The reconnect's fatal carries the tail to the unissued number, and the
+    // carry's second insert fails.
+    conn.conn()
+        .batch_execute(
+            "CREATE TRIGGER fail_carry BEFORE INSERT ON _connetto_pending \
+             WHEN NEW.writer = 'number:0' AND NEW.seq = 2 \
+             BEGIN SELECT RAISE(FAIL, 'review carry failure'); END;",
+        )
+        .expect("arm the trigger");
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing_with(FatalErrorReason::WriterUnknown),
+    )
+    .await
+    .expect("attach");
+    let seen = drain(&mut conn).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::ServerClosed {
+                reason: FatalErrorReason::WriterUnknown
+            }
+        )),
+        "the fatal surfaced, saw {seen:?}"
+    );
+    conn.conn()
+        .batch_execute("DROP TRIGGER fail_carry")
+        .expect("disarm the trigger");
+
+    // The failed carry left the complete source standing.
+    let pending: Vec<(String, i64)> = _connetto_pending::table
+        .select((_connetto_pending::writer, _connetto_pending::seq))
+        .order(_connetto_pending::seq)
+        .load(conn.conn())
+        .expect("read the queue");
+    assert_eq!(
+        pending,
+        vec![("number:1".to_owned(), 1), ("number:1".to_owned(), 2)],
+        "the failed carry retained both entries under the dead number"
+    );
+    let ids: Vec<String> = _connetto_writers::table
+        .select(_connetto_writers::id)
+        .order(_connetto_writers::id)
+        .load(conn.conn())
+        .expect("read the queue states");
+    assert_eq!(
+        ids,
+        vec!["number:1".to_owned()],
+        "the failed carry left no partial target behind"
+    );
+    drop(conn);
+
+    // The restart loads the source and resends the whole tail.
+    let mut conn = open(&dir).await;
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 2
+            },
+        ],
+        "the restart reloads the complete source"
+    );
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.mutations,
+            vec![1, 2],
+            "the restart resends the whole tail"
+        );
+    }
+    assert!(conn.unsynced().is_empty(), "the answers retired the tail");
+}
+
+/// A handshake the server refuses as `WriterUnknown` before the ack carries
+/// the presented number's tail to the unissued number, so the next run
+/// re-issues instead of re-presenting a number the server does not hold.
+#[tokio::test]
+async fn a_handshake_refusal_carries_the_unknown_numbers_tail() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    write(&mut conn, 2);
+    assert_eq!(conn.push().await.expect("queue"), Some(2));
+    drain(&mut conn).await;
+
+    // The reconnect presents the number and the server refuses the handshake
+    // itself, before any ack.
+    let error = conn
+        .attach(Wire::default().refusing_with(FatalErrorReason::WriterUnknown))
+        .await
+        .expect_err("the refused handshake fails the attach");
+    assert!(
+        matches!(
+            error,
+            ClientError::Refused {
+                reason: FatalErrorReason::WriterUnknown
+            }
+        ),
+        "the refusal surfaces, saw {error:?}"
+    );
+    assert_eq!(
+        writers(&mut conn),
+        vec!["number:0".to_owned()],
+        "the unknown number's tail re-keyed under the unissued number"
+    );
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Number(0),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(0),
+                seq: 2
+            },
+        ],
+        "both writes survive the carry"
+    );
+
+    // The next run asks for a fresh number and resends the carried tail.
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("re-attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.handshakes,
+            vec![WriterRequest::Issue],
+            "the carried tail presents no number, so a fresh one is asked"
+        );
+        assert_eq!(
+            log.mutations,
+            vec![1, 2],
+            "the carried tail resends in order"
+        );
+    }
+    assert!(
+        conn.unsynced().is_empty(),
+        "the applied answers retired the carried entries"
+    );
+}
+
+/// The split table's local replica writes the physical table under the view,
+/// so the queue entry hashes the logical bytes the wire uploads and keeps the
+/// physical bytes for the rollback.
+const SPLIT_DDL: &str = "CREATE TABLE physical_t (id INTEGER PRIMARY KEY); \
+    CREATE VIEW t AS SELECT * FROM physical_t; \
+    CREATE TRIGGER t_insert INSTEAD OF INSERT ON t \
+    BEGIN INSERT INTO physical_t (id) VALUES (NEW.id); END;";
+
+/// The split schema's bundle: the view `t` over its physical table.
+fn split_bundle() -> SyncSchema {
+    SyncSchema::new(SchemaBundle::new(
+        "",
+        "",
+        SPLIT_DDL,
+        vec![("t".to_owned(), "physical_t".to_owned())],
+        vec!["t".to_owned()],
+        None::<&str>,
+    ))
+}
+
+/// A replica in its own directory, opened offline under the split schema.
+async fn split_open(dir: &tempfile::TempDir) -> ConnettoConnection<Wire> {
+    let credential = super::support::held("tester");
+    let store = super::support::key_store(&credential).await;
+    ClientBuilder::new(split_bundle(), super::support::NeverDial::<Wire>::default())
+        .signed_in(credential)
+        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .open_driven()
+        .await
+        .expect("open with no server")
+}
+
+#[tokio::test]
+async fn a_split_table_entry_hashes_the_logical_bytes() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = split_open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    drain(&mut conn).await;
+
+    // The durable record keeps the physical bytes it was captured under...
+    let (changeset, stored): (Vec<u8>, Vec<u8>) = _connetto_pending::table
+        .select((_connetto_pending::changeset, _connetto_pending::entry_hash))
+        .first(conn.conn())
+        .expect("read the record");
+    let mut parsed = ParsedDiffSet::parse(&changeset).expect("parse the changeset");
+    assert_eq!(
+        parsed.rename_tables(|name| (name == "physical_t").then(|| "t".to_owned())),
+        1,
+        "the record was captured under the physical name"
+    );
+    let logical: Vec<u8> = parsed.into();
+
+    // ...and the hash and the queue head stand the logical upload bytes.
+    assert_eq!(
+        stored,
+        entry_hash(&GENESIS, 1, &logical).to_vec(),
+        "the stored hash stands the logical upload bytes"
+    );
+    let head: Vec<u8> = _connetto_writers::table
+        .select(_connetto_writers::head)
+        .first(conn.conn())
+        .expect("read the queue head");
+    assert_eq!(head, stored, "the queue head stands the logical hash");
+
+    // The replay uploads the logical bytes.
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("re-attach");
+    drain(&mut conn).await;
+    let payload = zstd::decode_all(
+        wire.log
+            .lock()
+            .bulks
+            .first()
+            .expect("the replay uploaded a bulk frame")
+            .as_slice(),
+    )
+    .expect("decompress the upload");
+    let mut uploaded = ParsedDiffSet::parse(&payload).expect("parse the upload");
+    assert_eq!(
+        uploaded.rename_tables(|name| (name == "physical_t").then(|| "t".to_owned())),
+        0,
+        "the upload speaks the logical name"
     );
 }

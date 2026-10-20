@@ -44,6 +44,7 @@ use sqlite_diff_rs::{
     DiffOps, DynTable, ParsedDiffSet, PatchDelete, PatchSet, PatchsetOp, SchemaWithPK, TableSchema,
     Value,
 };
+use std::borrow::Cow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(feature = "peer")]
@@ -2330,9 +2331,10 @@ fn writer_from_id(id: &str) -> Option<WriterRef> {
 /// One queued write of one writer.
 #[derive(Debug, Clone)]
 struct PendingEntry {
-    /// The captured changeset, the bytes the chain hashes and the wire uploads.
+    /// The captured changeset, the physical table names a rollback applies.
     changeset: Vec<u8>,
-    /// This entry's chain hash, over it and every entry queued before it.
+    /// This entry's chain hash, over the logical upload bytes and every
+    /// entry queued before it.
     hash: [u8; 32],
 }
 
@@ -2417,7 +2419,8 @@ fn persist_pending(
     db: &mut SqliteConnection,
     writer: &WriterRef,
     seq: u64,
-    entry: &PendingEntry,
+    changeset: &[u8],
+    hash: [u8; 32],
 ) -> Result<(), ClientError> {
     diesel::sql_query(
         "INSERT OR REPLACE INTO _connetto_pending \
@@ -2426,8 +2429,8 @@ fn persist_pending(
     )
     .bind::<diesel::sql_types::Text, _>(writer_id(writer))
     .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
-    .bind::<diesel::sql_types::Binary, _>(&entry.changeset)
-    .bind::<diesel::sql_types::Binary, _>(&entry.hash)
+    .bind::<diesel::sql_types::Binary, _>(changeset)
+    .bind::<diesel::sql_types::Binary, _>(&hash)
     .execute(db)?;
     Ok(())
 }
@@ -3225,7 +3228,7 @@ where
     pub async fn attach(&mut self, mut transport: T) -> Result<(), ClientError> {
         let now = clock::now_secs(&mut self.db)?;
         let (writer, settled_through) = self.writer_handshake();
-        let ack = exchange_handshake(
+        let ack = match exchange_handshake(
             &mut transport,
             HandshakeInput {
                 config: &self.config,
@@ -3237,7 +3240,24 @@ where
                 now,
             },
         )
-        .await?;
+        .await
+        {
+            // The server does not hold the number the handshake presented, so
+            // its tail travels to the live writer before the refusal surfaces
+            // and the next run asks for a fresh number.
+            Err(ClientError::Refused {
+                reason: FatalErrorReason::WriterUnknown,
+            }) => {
+                if let WriterRequest::Number(number) = writer {
+                    self.carry_to_live(WriterRef::Number(number));
+                }
+                return Err(ClientError::Refused {
+                    reason: FatalErrorReason::WriterUnknown,
+                });
+            }
+            Ok(ack) => ack,
+            Err(err) => return Err(err),
+        };
         let bound = self.apply_writer_grant(writer, ack.writer)?;
         let frontier = match bound {
             Some(WriterRef::Number(_)) => ack.writer.map(|grant| grant.frontier),
@@ -3437,23 +3457,53 @@ where
     }
 
     /// Carry a dead writer's tail to `target` and drop the dead writer, each
-    /// entry re-hashed into the target queue's chain.
+    /// entry re-hashed into the target queue's chain, in one durable write so
+    /// a failure midway leaves the source queue complete and the target
+    /// untouched.
     fn carry_writer(&mut self, dead: WriterRef, target: &WriterRef) -> Result<(), ClientError> {
-        let Some(queue) = self.writers.get(&dead).cloned() else {
-            return Ok(());
+        let (mut next_seq, mut head) = match self.writers.get(target) {
+            Some(queue) => (queue.next_seq, queue.head),
+            None => (1, GENESIS),
         };
-        let entries: Vec<(u64, Vec<u8>)> = queue
-            .pending
-            .into_iter()
-            .map(|(seq, entry)| (seq, entry.changeset))
-            .collect();
-        {
-            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-            drop_writer_state(&mut self.db, &dead)?;
+        let dead_queue = self.writers.get(&dead);
+        let mut plan: Vec<(u64, [u8; 32])> = Vec::new();
+        if let Some(queue) = dead_queue {
+            for entry in queue.pending.values() {
+                let hash = entry_hash(&head, next_seq, &self.logical_for(&entry.changeset)?);
+                plan.push((next_seq, hash));
+                next_seq += 1;
+                head = hash;
+            }
         }
-        self.writers.remove(&dead);
-        for (_seq, changeset) in entries {
-            self.append_entry(target, &changeset)?;
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        self.db.transaction::<(), ClientError, _>(|db| {
+            for ((seq, hash), entry) in plan.iter().zip(
+                dead_queue
+                    .into_iter()
+                    .flat_map(|queue| queue.pending.values()),
+            ) {
+                persist_pending(db, target, *seq, &entry.changeset, *hash)?;
+            }
+            if !plan.is_empty() {
+                persist_writer_state(db, target, next_seq, &head)?;
+            }
+            drop_writer_state(db, &dead)
+        })?;
+        if let Some(dead_queue) = self.writers.remove(&dead)
+            && !plan.is_empty()
+        {
+            let queue = self
+                .writers
+                .entry(*target)
+                .or_insert_with(WriterQueue::fresh);
+            queue.next_seq = next_seq;
+            queue.head = head;
+            for ((dst_seq, hash), (_src_seq, mut entry)) in
+                plan.into_iter().zip(dead_queue.pending.into_iter())
+            {
+                entry.hash = hash;
+                queue.pending.insert(dst_seq, entry);
+            }
         }
         Ok(())
     }
@@ -3478,24 +3528,32 @@ where
     }
 
     /// Append a changeset to one writer's queue, taking the next sequence,
-    /// hashing it into the writer's chain, and persisting it.
+    /// hashing it into the writer's chain, and persisting the queue state and
+    /// the entry together, so a failure between the two leaves nothing half
+    /// written and the retry takes the same sequence.
     fn append_entry(&mut self, writer: &WriterRef, changeset: &[u8]) -> Result<u64, ClientError> {
-        let queue = self
-            .writers
-            .entry(*writer)
-            .or_insert_with(WriterQueue::fresh);
-        let seq = queue.next_seq;
-        let hash = entry_hash(&queue.head, seq, changeset);
-        queue.next_seq += 1;
-        queue.head = hash;
+        let (seq, head) = match self.writers.get(writer) {
+            Some(queue) => (queue.next_seq, queue.head),
+            None => (1, GENESIS),
+        };
+        let hash = entry_hash(&head, seq, &self.logical_for(changeset)?);
         let entry = PendingEntry {
             changeset: changeset.to_vec(),
             hash,
         };
-        queue.pending.insert(seq, entry.clone());
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        persist_writer_state(&mut self.db, writer, queue.next_seq, &queue.head)?;
-        persist_pending(&mut self.db, writer, seq, &entry)?;
+        self.db.transaction::<(), ClientError, _>(|db| {
+            persist_writer_state(db, writer, seq + 1, &hash)?;
+            persist_pending(db, writer, seq, &entry.changeset, entry.hash)?;
+            Ok(())
+        })?;
+        let queue = self
+            .writers
+            .entry(*writer)
+            .or_insert_with(WriterQueue::fresh);
+        queue.next_seq = seq + 1;
+        queue.head = hash;
+        queue.pending.insert(seq, entry);
         Ok(seq)
     }
 
@@ -5581,6 +5639,23 @@ where
             return Ok(bytes);
         }
         rename_diffset(bytes, |name| tables.logical(name).map(str::to_owned))
+    }
+
+    /// The canonical bytes the queue chain hashes a payload under, the
+    /// logical table names the wire uploads. A payload no split table
+    /// touches borrows its captured bytes, only the split path re-encodes.
+    fn logical_for<'a>(&'a self, changeset: &'a [u8]) -> Result<Cow<'a, [u8]>, ClientError> {
+        let tables = &self.config.policy_tables;
+        if tables.is_empty() {
+            return Ok(Cow::Borrowed(changeset));
+        }
+        let mut parsed = ParsedDiffSet::parse(changeset)
+            .map_err(|err| ClientError::Apply(format!("parsing a diffset to hash it: {err:?}")))?;
+        let rename = |name: &str| tables.logical(name).map(str::to_owned);
+        if parsed.rename_tables(rename) == 0 {
+            return Ok(Cow::Borrowed(changeset));
+        }
+        Ok(Cow::Owned(parsed.into()))
     }
 
     /// What of `bytes` should actually be applied, once departure notices are

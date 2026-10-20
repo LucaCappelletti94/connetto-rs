@@ -52,6 +52,7 @@ mod app {
             writer -> BigInt,
             seq -> BigInt,
             entry_hash -> Bytea,
+            previous_hash -> Bytea,
             outcome -> Text,
             path -> connetto_server::writer_schema::SettlePathSql,
             settled_at -> Timestamptz,
@@ -154,16 +155,20 @@ mod app {
                     .filter(app_settled::seq.eq(seq))
                     .select((
                         app_settled::entry_hash,
+                        app_settled::previous_hash,
                         app_settled::outcome,
                         app_settled::path,
                     ));
-                let row: Option<(Vec<u8>, String, SettlePath)> =
+                let row: Option<(Vec<u8>, Vec<u8>, String, SettlePath)> =
                     RunQueryDsl::first(query, &mut *conn).await.optional()?;
-                Ok(row.map(|(entry_hash, outcome, path)| SettledRow {
-                    entry_hash,
-                    outcome: outcome.into_bytes(),
-                    path,
-                }))
+                Ok(
+                    row.map(|(entry_hash, previous_hash, outcome, path)| SettledRow {
+                        entry_hash,
+                        previous_hash,
+                        outcome: outcome.into_bytes(),
+                        path,
+                    }),
+                )
             })
         }
 
@@ -172,6 +177,7 @@ mod app {
             writer: i64,
             seq: i64,
             entry_hash: &'c [u8],
+            previous_hash: &'c [u8],
             outcome: &'c str,
             path: SettlePath,
         ) -> Statement<'c, bool> {
@@ -183,6 +189,7 @@ mod app {
                         app_settled::writer.eq(writer),
                         app_settled::seq.eq(seq),
                         app_settled::entry_hash.eq(entry_hash.to_vec()),
+                        app_settled::previous_hash.eq(previous_hash.to_vec()),
                         app_settled::outcome.eq(outcome.to_owned()),
                         app_settled::path.eq(path),
                     ))
@@ -327,6 +334,7 @@ async fn a_deployment_schema_of_its_own_serves_through_the_builder() {
          frontier BIGINT NOT NULL DEFAULT 0, head BYTEA, retired_at TIMESTAMPTZ)",
         "CREATE TABLE app_settled (\
          writer BIGINT NOT NULL, seq BIGINT NOT NULL, entry_hash BYTEA NOT NULL, \
+         previous_hash BYTEA NOT NULL, \
          outcome TEXT NOT NULL, path connetto_settle_path NOT NULL, \
          settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
          PRIMARY KEY (writer, seq))",

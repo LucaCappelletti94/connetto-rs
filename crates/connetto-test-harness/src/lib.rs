@@ -683,6 +683,7 @@ pub const WRITERS_DDL: &str = "DO $$ BEGIN \
     (writer BIGINT NOT NULL, \
      seq BIGINT NOT NULL, \
      entry_hash BYTEA NOT NULL, \
+     previous_hash BYTEA NOT NULL, \
      outcome TEXT NOT NULL, \
      path connetto_settle_path NOT NULL, \
      settled_at TIMESTAMPTZ NOT NULL DEFAULT now(), \

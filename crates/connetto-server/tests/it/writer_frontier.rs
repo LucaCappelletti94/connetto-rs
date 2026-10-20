@@ -931,10 +931,11 @@ async fn a_write_past_a_deferred_gap_is_answered_indeterminate() {
     server.await.expect("join server").expect("session ok");
 }
 
-/// A patch that does not decompress is refused `Malformed` without settling
-/// its sequence, so the same sequence stands open for a readable patch.
+/// A patch the server cannot read cannot be hashed, so nothing settles under
+/// its sequence. The session ends with the protocol fatal, and the resent
+/// entry settles the sequence it left open.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_patch_that_does_not_decompress_is_refused_malformed() {
+async fn a_patch_that_does_not_decompress_closes_the_session_and_resends_applied() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
     let (captured, hook) = Captured::new();
@@ -953,16 +954,32 @@ async fn a_patch_that_does_not_decompress_is_refused_malformed() {
     let number = ack.writer.expect("the handshake issues a number").number;
 
     client.upload_raw(1, b"not a zstd frame".to_vec()).await;
-    let ControlMessage::MutationReject(reject) = client.next_control().await else {
-        panic!("expected the malformed refusal");
+    let ControlMessage::FatalError(fatal) = client.next_control().await else {
+        panic!("expected the protocol fatal");
     };
-    assert_eq!(reject.client_seq, 1);
-    assert!(matches!(
-        reject.reason,
-        MutationRejectReason::Malformed { .. }
-    ));
+    assert!(
+        matches!(fatal.reason, FatalErrorReason::ProtocolViolation { .. }),
+        "the fatal names the undecodable envelope, got {fatal:?}"
+    );
+    assert!(client.recv().await.is_none(), "the session ends");
+    client.close().await;
+    let outcome = server.await.expect("join 1");
+    assert!(outcome.is_err(), "the session fails closed");
 
-    // The sequence settled nothing, so a readable patch still applies it.
+    // Nothing settled under the unreadable sequence, so the resent entry
+    // settles it on the next connection.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "mal-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            None,
+        )
+        .await;
     client.upload(1, insert_changeset(2, "two", "t1")).await;
     expect_applied(&mut client, 1).await;
     let writer = i64::try_from(number).expect("number fits");
@@ -971,8 +988,13 @@ async fn a_patch_that_does_not_decompress_is_refused_malformed() {
         1,
         "the readable patch settled the sequence once"
     );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0"), note(2, "two", "t1")],
+        "the resent entry applied"
+    );
     client.close().await;
-    server.await.expect("join server").expect("session ok");
+    server.await.expect("join 2").expect("session ok");
 }
 
 /// A patch the window could never hold is refused and its sequence settled,
@@ -1078,11 +1100,10 @@ async fn a_write_before_a_device_writer_binds_closes_the_session() {
     assert!(outcome.is_err(), "the session fails closed");
 }
 
-/// A redelivery whose chain was pruned under it cannot be trusted, so the
-/// session closes with the write target error rather than re-answering over a
-/// broken chain.
+/// A redelivery whose preceding record a prune removed verifies against the
+/// retained record's own predecessor hash and re-answers it, applied.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_redelivery_behind_a_pruned_chain_closes_the_session() {
+async fn a_redelivery_behind_a_pruned_chain_reanswers_the_retained_record() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
     let (captured, hook) = Captured::new();
@@ -1094,12 +1115,13 @@ async fn a_redelivery_behind_a_pruned_chain_closes_the_session() {
     let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
     let _ = captured;
 
-    // alice settles two entries, the second answer standing unacked.
+    // alice settles two entries.
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let ack = client.handshake_with("chain-1", "user:alice").await;
     let number = ack.writer.expect("the handshake issues a number").number;
+    let writer = i64::try_from(number).expect("number fits");
     let cs2 = insert_changeset(3, "three", "t2");
     client.upload(1, insert_changeset(2, "two", "t1")).await;
     expect_applied(&mut client, 1).await;
@@ -1122,15 +1144,12 @@ async fn a_redelivery_behind_a_pruned_chain_closes_the_session() {
         )
         .await;
 
-    // The redelivery of the second entry finds its chain pruned.
+    // The redelivery of the second entry re-answers its retained record,
+    // which stands its own predecessor evidence.
     client.upload(2, cs2).await;
-    assert!(
-        client.recv().await.is_none(),
-        "the session closes rather than trust the broken chain"
-    );
+    expect_applied(&mut client, 2).await;
     client.close().await;
-    let outcome = server.await.expect("join 2");
-    assert!(outcome.is_err(), "the session fails closed");
+    server.await.expect("join 2").expect("session ok");
     assert_eq!(
         notes(fixture.admin()).await,
         vec![
@@ -1138,7 +1157,148 @@ async fn a_redelivery_behind_a_pruned_chain_closes_the_session() {
             note(2, "two", "t1"),
             note(3, "three", "t2")
         ],
-        "nothing applied twice over the broken chain"
+        "nothing applied twice over the pruned chain"
+    );
+    assert_eq!(
+        settled_rows(fixture.admin(), writer).await.len(),
+        1,
+        "the pruned record is gone and the retained one stands"
+    );
+}
+
+/// A redelivery whose retained record stores a refusal re-answers that
+/// refusal, a pruned predecessor standing no way in the record's own
+/// predecessor evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redelivery_behind_a_pruned_chain_reanswers_the_stored_refusal() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::new().with_mutation_bytes_per_identity(1, Duration::from_secs(60)),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    // Every patch exceeds the one-byte window, so both settle refused.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("win-2", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let cs2 = insert_changeset(3, "three", "t2");
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    let ControlMessage::MutationReject(first) = client.next_control().await else {
+        panic!("expected the first stored refusal");
+    };
+    assert!(matches!(first.reason, MutationRejectReason::Other { .. }));
+    client.upload(2, cs2.clone()).await;
+    let ControlMessage::MutationReject(second) = client.next_control().await else {
+        panic!("expected the second stored refusal");
+    };
+    assert!(matches!(second.reason, MutationRejectReason::Other { .. }));
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // The reconnect reports the first entry settled, pruning its record.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "win-3",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            Some(1),
+        )
+        .await;
+
+    // The redelivery of the second entry re-answers the stored refusal.
+    client.upload(2, cs2).await;
+    let ControlMessage::MutationReject(replayed) = client.next_control().await else {
+        panic!("expected the re-answered refusal");
+    };
+    assert_eq!(replayed.client_seq, 2);
+    assert!(matches!(
+        replayed.reason,
+        MutationRejectReason::Other { .. }
+    ));
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![note(1, "hello", "t0")],
+        "the window-refused patches never applied"
+    );
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+}
+
+/// A redelivery with different bytes at a pruned predecessor's successor is
+/// refused forked and audited, the retained record's own predecessor hash
+/// still deciding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_redelivery_with_forged_bytes_behind_a_pruned_chain_is_refused_forked() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+
+    // alice settles two entries.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("fork-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    expect_applied(&mut client, 1).await;
+    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    expect_applied(&mut client, 2).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // The reconnect reports the first entry settled, pruning its record.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "fork-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            Some(1),
+        )
+        .await;
+
+    // The second sequence re-arrives with bytes the chain never hashed.
+    client.upload(2, insert_changeset(9, "nine", "t9")).await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("expected the forked refusal");
+    };
+    assert_eq!(reject.client_seq, 2);
+    assert!(matches!(reject.reason, MutationRejectReason::Forked));
+    client.close().await;
+    server.await.expect("join 2").expect("session ok");
+    assert_eq!(
+        captured.write_events().len(),
+        1,
+        "the fork over the pruned chain audited once"
+    );
+    assert_eq!(
+        notes(fixture.admin()).await,
+        vec![
+            note(1, "hello", "t0"),
+            note(2, "two", "t1"),
+            note(3, "three", "t2")
+        ],
+        "the forged bytes never applied"
     );
 }
 
@@ -1204,6 +1364,67 @@ async fn a_settled_entry_hash_of_the_wrong_length_closes_the_session() {
     assert!(outcome.is_err(), "the session fails closed");
 }
 
+/// A retained record whose predecessor hash a torn write corrupted cannot be
+/// trusted, so the redelivery closes the session with the write target error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_retained_predecessor_hash_of_the_wrong_length_closes_the_session() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let (captured, hook) = Captured::new();
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    guard.set_audit_hook(hook);
+    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let _ = captured;
+
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    let ack = client.handshake_with("prev-1", "user:alice").await;
+    let number = ack.writer.expect("the handshake issues a number").number;
+    let cs1 = insert_changeset(2, "two", "t1");
+    client.upload(1, cs1.clone()).await;
+    expect_applied(&mut client, 1).await;
+    client.close().await;
+    server.await.expect("join 1").expect("session ok");
+
+    // Corrupt the predecessor evidence the way a torn write would leave it.
+    let writer = i64::try_from(number).expect("number fits");
+    {
+        let mut conn = fixture.admin().get().await.expect("admin connection");
+        diesel::update(_connetto_settled::table)
+            .filter(_connetto_settled::writer.eq(writer))
+            .set(_connetto_settled::previous_hash.eq(b"broken"))
+            .execute(&mut *conn)
+            .await
+            .expect("corrupt the record");
+    }
+
+    // The redelivery cannot verify the entry against its own evidence.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client
+        .handshake_writing(
+            "prev-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(number),
+            None,
+        )
+        .await;
+    client.upload(1, cs1).await;
+    assert!(
+        client.recv().await.is_none(),
+        "the session closes rather than re-answer over a bad predecessor hash"
+    );
+    client.close().await;
+    let outcome = server.await.expect("join 2");
+    assert!(outcome.is_err(), "the session fails closed");
+}
+
 /// A settled row the deployment wrote over the restore or courier path reads
 /// its path back as the variant it stored.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1223,6 +1444,7 @@ async fn a_settled_row_reads_its_settle_path_back() {
             _connetto_settled::writer.eq(1_i64),
             _connetto_settled::seq.eq(1_i64),
             _connetto_settled::entry_hash.eq([0u8; 32]),
+            _connetto_settled::previous_hash.eq([0u8; 32]),
             _connetto_settled::outcome.eq(r#""applied""#),
             _connetto_settled::path.eq(SettlePath::Restore),
         ))
@@ -1234,6 +1456,7 @@ async fn a_settled_row_reads_its_settle_path_back() {
             _connetto_settled::writer.eq(1_i64),
             _connetto_settled::seq.eq(2_i64),
             _connetto_settled::entry_hash.eq([0u8; 32]),
+            _connetto_settled::previous_hash.eq([0u8; 32]),
             _connetto_settled::outcome.eq(r#""applied""#),
             _connetto_settled::path.eq(SettlePath::Courier),
         ))

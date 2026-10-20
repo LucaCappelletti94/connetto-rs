@@ -5067,15 +5067,19 @@ where
         let bytes = match crate::materializer::decompress(&patch.patchset_zstd) {
             Ok(bytes) => bytes,
             Err(err) => {
-                return self
-                    .reject(
-                        transport,
-                        client_seq,
-                        MutationRejectReason::Malformed {
-                            detail: err.to_string(),
+                // The envelope cannot be read, so the entry cannot be hashed
+                // and nothing may settle under its sequence. The link ends
+                // and the client resends the entry it still holds.
+                let _ = transport
+                    .send_control(ControlMessage::FatalError(FatalError::new(
+                        FatalErrorReason::ProtocolViolation {
+                            detail: format!("mutation envelope: {err}"),
                         },
-                    )
+                    )))
                     .await;
+                return Err(SessionError::Protocol(
+                    "a mutation envelope does not decompress".into(),
+                ));
             }
         };
         if client_seq <= frontier {
@@ -5132,6 +5136,7 @@ where
                 writer,
                 seq: client_seq,
                 entry_hash: chain::entry_hash(&previous, client_seq, &bytes),
+                previous_hash: previous,
                 path: SettlePath::Direct,
             };
             return self
@@ -5228,24 +5233,9 @@ where
         else {
             return self.ack(transport, seq).await;
         };
-        let previous = if seq == 1 {
-            GENESIS
-        } else {
-            let prior = self
-                .target
-                .settled_row(writer, seq - 1)
-                .await
-                .map_err(|err| SessionError::WriteTarget(err.detail()))?;
-            match prior.and_then(|row| <[u8; 32]>::try_from(row.entry_hash.as_slice()).ok()) {
-                Some(hash) => hash,
-                // A broken chain cannot be trusted to hold this entry.
-                None => {
-                    return Err(SessionError::WriteTarget(
-                        "the writer chain is broken before this entry".to_owned(),
-                    ));
-                }
-            }
-        };
+        let previous = <[u8; 32]>::try_from(row.previous_hash.as_slice()).map_err(|_| {
+            SessionError::WriteTarget("a retained entry's predecessor hash is malformed".to_owned())
+        })?;
         let hash = chain::entry_hash(&previous, seq, bytes);
         let stored = <[u8; 32]>::try_from(row.entry_hash.as_slice()).map_err(|_| {
             SessionError::WriteTarget("a settled entry hash is not 32 bytes".to_owned())
@@ -5359,6 +5349,7 @@ where
             writer,
             seq,
             entry_hash,
+            previous_hash: previous,
             path: SettlePath::Direct,
         };
         let plan = match self
