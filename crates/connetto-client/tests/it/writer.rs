@@ -5,15 +5,17 @@
 //! and re-keys the queue; a handshake with a number writer reconciles the
 //! queue against the reported frontier without retiring anything locally; a
 //! `WriterRetired` fatal re-queues the tail with provenance under a fresh
-//! number. The device-writer rows need an enrolled key, which the native
-//! suites steer through the enrolment task.
+//! number; an archive import re-queues the archived writes with provenance
+//! and retires the archived writer once. The device-writer rows need an
+//! enrolled key, which the native suites steer through the enrolment task.
 
 use std::collections::VecDeque;
 use std::future::{Future, ready};
 use std::sync::Arc;
 
 use connetto_client::{
-    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, SyncSchema, UnsyncedWrite,
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, ExportScope,
+    ImportChoices, SyncSchema, UnsyncedWrite,
 };
 use connetto_core::Cursor;
 use connetto_core::chain::{GENESIS, entry_hash};
@@ -525,6 +527,73 @@ async fn a_writer_retired_fatal_requeues_the_tail_with_provenance() {
             prov_seq: Some(1),
         }],
         "the entry carries the writer and sequence it was first written under"
+    );
+}
+
+/// The table's archive row: the archived writer's writes re-queue with
+/// provenance under the importer's fresh writer, and the archived writer is
+/// retired once, the answered retirement not re-sent.
+#[tokio::test]
+async fn an_archive_import_requeues_with_provenance_and_retires_the_archived_writer() {
+    let source_dir = tempdir().expect("temp dir");
+    let mut source = open(&source_dir).await;
+    conn_attach_silent(&mut source).await;
+    write(&mut source, 1);
+    assert_eq!(source.push().await.expect("queue"), Some(1));
+    let archive = source
+        .export_local_data(ExportScope::Everything, Vec::new())
+        .expect("export");
+
+    let fresh_dir = tempdir().expect("temp dir");
+    let mut fresh = open(&fresh_dir).await;
+    let plan = fresh
+        .import_local_data(std::io::Cursor::new(archive))
+        .expect("plan");
+    assert_eq!(plan.queued_writes(), 1, "the unsynced write travelled");
+    let outcome = fresh
+        .apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("apply");
+    assert_eq!(outcome.writes_restored, 1);
+    assert_eq!(
+        pending(&mut fresh),
+        vec![PendingRow {
+            writer: "number:0".to_owned(),
+            seq: 1,
+            prov_writer: Some("number:1".to_owned()),
+            prov_seq: Some(1),
+        }],
+        "the restored write sits under the importer's fresh writer, provenance intact"
+    );
+
+    let wire = Wire::default().grant(2, 0);
+    fresh.attach(wire.clone()).await.expect("attach");
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.handshakes, vec![WriterRequest::Issue]);
+    }
+    drain(&mut fresh).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.retires.len(),
+            1,
+            "one retirement owed per distinct archived writer"
+        );
+        assert_eq!(log.retires[0].writer, WriterRef::Number(1));
+        assert_eq!(log.mutations, vec![1], "the restored write went up");
+    }
+    assert!(
+        fresh.unsynced().is_empty(),
+        "the applied answer retired the entry"
+    );
+
+    // The answer cleared the obligation, so a second connection owes nothing.
+    let second = Wire::default().grant(2, 0);
+    fresh.attach(second.clone()).await.expect("attach");
+    drain(&mut fresh).await;
+    assert!(
+        second.log.lock().retires.is_empty(),
+        "the answered retirement is not re-sent"
     );
 }
 
@@ -1648,4 +1717,9 @@ async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete
     drain(&mut restored).await;
     assert_eq!(wire.log.lock().mutations, [1, 2]);
     assert_eq!(restored.unsynced(), Vec::<UnsyncedWrite>::new());
+}
+
+async fn conn_attach_silent(conn: &mut ConnettoConnection<Wire>) {
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    drain(conn).await;
 }

@@ -2,8 +2,9 @@
 //!
 //! A browser profile's writer is a number the server issues and the worker's
 //! durable replica keeps. A signed-in profile reboots under the number it was
-//! issued, and a different changeset at a settled (writer, sequence) is
-//! refused Forked.
+//! issued, a restore of an already-settled write is answered from the
+//! server's settled record, and a different changeset at a settled
+//! (writer, sequence) is refused Forked.
 //!
 //! The browser-stack runner supplies Postgres, the identity provider and the
 //! sync server.
@@ -18,7 +19,8 @@ use std::time::Duration;
 
 use common::mint_session;
 use connetto_client::{
-    ClientBuilder, ClientEvent, ConnettoConnection, Gate, HeldCredential, ReplicaKey, WriterRef,
+    ClientBuilder, ClientEvent, ConnettoConnection, ExportScope, Gate, HeldCredential, ReplicaKey,
+    WriterRef,
 };
 use connetto_core::messages::{
     BulkMessage, Challenge, ControlMessage, Grant, Handshake, MutationApplied, MutationHeader,
@@ -28,8 +30,11 @@ use connetto_core::{IncomingFrame, PROTOCOL_VERSION, Transport};
 use connetto_wasm_smoke::BrowserSocket;
 use connetto_wasm_smoke::build;
 use connetto_wasm_smoke::workers::{DEMO_WS_URL, demo_schema, sleep};
+use connetto_web::auth::request_unsynced;
+use connetto_web::workers::request_import;
 use diesel::prelude::*;
 use harness::{ParityFixture, load_orders, pump_until, unique_base};
+use js_sys::{Array, Uint8Array};
 use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -187,6 +192,114 @@ async fn the_number_writer_survives_a_reload() {
     })
     .await;
     assert!(worker.unsynced().is_empty());
+}
+
+/// A restore of a write the server already settled is answered from the
+/// settled record. The direct client settles a row, exports its unsynced
+/// entry, and the worker imports it: the worker's entry carries the original
+/// (writer, sequence) as provenance, the server settles the new sequence from
+/// the stored outcome, and neither mirror ends up with a second copy.
+#[wasm_bindgen_test]
+async fn a_restore_of_a_settled_write_is_answered_from_the_settled_record() {
+    let base = unique_base();
+    let (token, user_id) = mint_session().await;
+    let mut fixture = ParityFixture::setup(base, "writer-restore", token, &user_id).await;
+
+    // The direct client writes one row and uploads it, exporting its unsynced
+    // tail before the ack retires it, the archive of a profile that wrote and
+    // then caught up.
+    let before: HashSet<rosetta_uuid::Uuid> = load_orders(&mut fixture.direct)
+        .iter()
+        .map(|row| row.id)
+        .collect();
+    diesel::insert_into(orders::table)
+        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(5_i64)))
+        .execute(fixture.direct.conn())
+        .expect("insert the row");
+    let id = load_orders(&mut fixture.direct)
+        .iter()
+        .map(|row| row.id)
+        .find(|id| !before.contains(id))
+        .expect("the newly minted id");
+    fixture
+        .direct
+        .push()
+        .await
+        .expect("push")
+        .expect("mutation sent");
+    let unsynced = fixture.direct.unsynced();
+    let [entry] = unsynced.as_slice() else {
+        panic!("the written row must sit unsynced until the ack");
+    };
+    assert_eq!(entry.seq, 1, "a fresh writer starts its sequences at one");
+    assert!(
+        matches!(entry.writer, WriterRef::Number(_)),
+        "a keyless browser writes under a server-issued number"
+    );
+
+    // The export scopes only the unsynced tail, then the server settles the
+    // write on the direct path.
+    let archive = fixture
+        .direct
+        .export_local_data(ExportScope::Unsynced, Vec::new())
+        .expect("export the unsynced tail");
+    pump_until(&mut fixture.direct, |event| {
+        matches!(event, ClientEvent::MutationApplied { .. })
+    })
+    .await;
+    assert!(
+        fixture.direct.unsynced().is_empty(),
+        "the write settled on the direct path"
+    );
+
+    // Both mirrors already hold the row, so the import's local apply omits it
+    // and only its unsynced entry is restored.
+    fixture.converge_row(id).await;
+
+    let blob = {
+        let array = Uint8Array::from(archive.as_slice());
+        web_sys::Blob::new_with_u8_array_sequence(&Array::of1(&array)).expect("blob from bytes")
+    };
+    let (outcome, _) = request_import(blob)
+        .await
+        .expect("the worker imports the archive");
+    assert_eq!(
+        outcome.writes_restored, 1,
+        "the archive's one unsynced entry is restored"
+    );
+
+    // The worker replays the restored entry with its provenance, the server
+    // settles the new sequence from the stored outcome, and the queue drains.
+    for _ in 0..200 {
+        let pending = request_unsynced().await.expect("the worker answers");
+        if pending.unsynced.is_empty() {
+            break;
+        }
+        sleep(Duration::from_millis(100)).await;
+    }
+    let pending = request_unsynced().await.expect("the worker answers");
+    assert!(
+        pending.unsynced.is_empty(),
+        "the restored entry settled from the stored outcome, not a re-apply"
+    );
+
+    // Neither mirror gained a second copy of the row.
+    assert_eq!(
+        load_orders(&mut fixture.direct)
+            .iter()
+            .filter(|row| row.id == id)
+            .count(),
+        1,
+        "the direct mirror holds the row once"
+    );
+    assert_eq!(
+        load_orders(&mut fixture.relay)
+            .iter()
+            .filter(|row| row.id == id)
+            .count(),
+        1,
+        "the worker's mirror holds the row once"
+    );
 }
 
 /// A different changeset at a settled (writer, sequence) is refused Forked.

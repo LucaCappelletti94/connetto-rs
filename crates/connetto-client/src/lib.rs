@@ -4665,17 +4665,26 @@ where
                 synced_rows,
                 local_rows,
                 pending: {
-                    // The list order is the append-position order, the one a
-                    // restoring replica re-queues in, so it sorts before the
-                    // changesets leave the queues.
-                    let mut queued: Vec<(u64, Vec<u8>)> = self
+                    let mut queued: Vec<_> = self
                         .writers
-                        .values()
-                        .flat_map(|queue| queue.pending.values())
-                        .map(|entry| (entry.position, entry.changeset.clone()))
+                        .iter()
+                        .flat_map(|(writer, queue)| {
+                            queue.pending.iter().map(move |(seq, entry)| {
+                                (
+                                    entry.position,
+                                    archive::ArchivedEntry {
+                                        writer: *writer,
+                                        seq: *seq,
+                                        hash: entry.hash,
+                                        changeset: entry.changeset.clone(),
+                                        provenance: entry.provenance,
+                                    },
+                                )
+                            })
+                        })
                         .collect();
                     queued.sort_unstable_by_key(|(position, _)| *position);
-                    queued.into_iter().map(|(_, changeset)| changeset).collect()
+                    queued.into_iter().map(|(_, entry)| entry).collect()
                 },
                 attachments,
             },
@@ -4748,7 +4757,7 @@ where
         let (local_columns, main_columns) =
             resolve_import_columns(&mut self.db, &self.local_tables, &self.hidden_tables)?;
         for entry in &archive.pending {
-            pending_tables(entry, &main_columns)?;
+            pending_tables(&entry.changeset, &main_columns)?;
         }
         let (incoming, held) = build_import_index(
             &mut self.db,
@@ -4842,12 +4851,12 @@ where
                     )?;
                     outcome.rows_restored += 1;
                 }
-                for changeset in &plan.archive.pending {
+                for entry in &plan.archive.pending {
                     // A row this changeset updates or deletes that the replica
                     // never held is omitted rather than failing: the cache is
                     // not imported, so it may not be here, and the server
                     // settles the write when it goes up.
-                    db.apply_changeset(changeset, |_| ConflictAction::Omit)
+                    db.apply_changeset(&entry.changeset, |_| ConflictAction::Omit)
                         .map_err(|err| {
                             ClientError::Import(format!("applying a restored write: {err}"))
                         })?;
@@ -4862,21 +4871,54 @@ where
         Ok(outcome)
     }
 
-    /// Re-queue the archive's writes as fresh entries under this replica's
-    /// writer, in the archive's list order, each taking a fresh sequence,
-    /// chain hash and position.
+    /// Re-queue archived writes in causal order while retaining their original identities.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a local database failure while persisting the queue.
-    fn restore_archived_writes(&mut self, entries: &[Vec<u8>]) -> Result<usize, ClientError> {
+    fn restore_archived_writes(
+        &mut self,
+        entries: &[archive::ArchivedEntry],
+    ) -> Result<usize, ClientError> {
         if entries.is_empty() {
             return Ok(0);
         }
-        let target = self.choose_writer();
+        let current = self.choose_writer();
+        let archived: std::collections::BTreeSet<WriterRef> = entries
+            .iter()
+            .map(|entry| entry.writer)
+            .filter(is_real_writer)
+            .collect();
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            for writer in &archived {
+                persist_retire(&mut self.db, writer)?;
+            }
+        }
+        let target = if archived.contains(&current) {
+            // The archived writer is this replica's own, so it is retired and
+            // its tail, restored entries included, travels to the live writer.
+            let live = self.tail_target(&current);
+            self.carry_writers(&[current], &live)?;
+            #[cfg(feature = "device-identity")]
+            if matches!(current, WriterRef::Device(_))
+                && let Some(sender) = &self.writer_retired
+            {
+                let _ = sender.send(crate::enrolment::Command::WriterRetired);
+            }
+            live
+        } else {
+            current
+        };
         let mut restored = 0;
-        for changeset in entries {
-            self.append_entry(&target, changeset, None)?;
+        for entry in entries {
+            let provenance = entry.provenance.or_else(|| {
+                is_real_writer(&entry.writer).then_some(Provenance {
+                    writer: entry.writer,
+                    seq: entry.seq,
+                })
+            });
+            self.append_entry(&target, &entry.changeset, provenance)?;
             restored += 1;
         }
         Ok(restored)

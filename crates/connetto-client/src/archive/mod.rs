@@ -34,8 +34,8 @@ impl ExportScope {
 
 /// The archive format name.
 const FORMAT: &str = "connetto-local-data";
-/// Version 3 requires attachment-aware readers.
-const VERSION: u32 = 3;
+/// Version 4 carries each queued write's writer, sequence and chain hash.
+const VERSION: u32 = 4;
 const MANIFEST: &str = "manifest.json";
 const SYNCED_ROWS: &str = "synced.patchset";
 const LOCAL_ROWS: &str = "device-private.patchset";
@@ -109,16 +109,28 @@ pub(crate) struct Archive<'a> {
     pub(crate) synced_rows: Option<Vec<u8>>,
     /// The device-private tier's rows, absent when no tier is attached.
     pub(crate) local_rows: Option<Vec<u8>>,
-    /// The writes that never reached the server, in their append-position
-    /// order across every writer, the order an import re-queues them in.
-    ///
-    /// Their sequence numbers are deliberately not carried: a number means
-    /// something only inside one durable session handle, and an archive is
-    /// restored under a different one, so an import stacks them above the
-    /// receiving replica's own (R56 decision 12).
-    pub(crate) pending: Vec<Vec<u8>>,
+    /// Unconfirmed writes in causal append order.
+    pub(crate) pending: Vec<ArchivedEntry>,
     /// Opaque files supplied by an optional client layer.
     pub(crate) attachments: &'a [ArchiveAttachment],
+}
+
+/// One queued write an archive carries, named by the writer and the sequence
+/// it was the writer's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ArchivedEntry {
+    /// The writer the write was queued under.
+    pub(crate) writer: connetto_core::messages::WriterRef,
+    /// The write's sequence in that writer's queue.
+    pub(crate) seq: u64,
+    /// The write's chain hash.
+    pub(crate) hash: [u8; 32],
+    /// The captured changeset.
+    pub(crate) changeset: Vec<u8>,
+    /// The writer and sequence the write was first made under, present when
+    /// the write was carried to a fresh writer or restored by an earlier
+    /// import.
+    pub(crate) provenance: Option<connetto_core::messages::Provenance>,
 }
 
 /// What an import reads out of an archive.
@@ -139,8 +151,8 @@ pub(crate) struct Incoming {
     pub(crate) synced_present: bool,
     /// The device-private tier's rows.
     pub(crate) local_rows: Option<Vec<u8>>,
-    /// The writes that never reached the server, in order.
-    pub(crate) pending: Vec<Vec<u8>>,
+    /// Unconfirmed writes in causal append order.
+    pub(crate) pending: Vec<ArchivedEntry>,
     /// Opaque files supplied by optional client layers.
     pub(crate) attachments: Vec<ArchiveAttachment>,
 }
