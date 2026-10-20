@@ -1,0 +1,115 @@
+import java.util.zip.ZipFile
+import javax.xml.XMLConstants
+import javax.xml.parsers.DocumentBuilderFactory
+import javax.xml.transform.TransformerFactory
+import javax.xml.transform.dom.DOMSource
+import javax.xml.transform.stream.StreamResult
+import org.w3c.dom.Node
+
+abstract class RustlsVersion implements ValueSource<String, RustlsVersion.Params> {
+    interface Params extends ValueSourceParameters {
+        RegularFileProperty getLockFile()
+    }
+
+    @Override
+    String obtain() {
+        def lines = parameters.lockFile.get().asFile.readLines()
+        def index = lines.findIndexOf { it.trim() == 'name = "rustls-platform-verifier-android"' }
+        if (index < 0) throw new GradleException('rustls-platform-verifier-android is absent from Cargo.lock')
+        return lines.drop(index + 1)
+            .find { it.stripLeading().startsWith('version = ') }
+            .find(/"([^"]*)"/) { match, version -> version }
+    }
+}
+
+abstract class MergeVerifierNetworkSecurity extends DefaultTask {
+    @InputFile
+    abstract RegularFileProperty getApplicationPolicy()
+
+    @InputFile
+    abstract RegularFileProperty getVerifierAar()
+
+    @OutputDirectory
+    abstract DirectoryProperty getOutputDirectory()
+
+    @TaskAction
+    void merge() {
+        def factory = DocumentBuilderFactory.newInstance()
+        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING, true)
+        def parser = factory.newDocumentBuilder()
+        def application = parser.parse(applicationPolicy.get().asFile)
+        def policy = new ZipFile(verifierAar.get().asFile).withCloseable { archive ->
+            def entry = archive.getEntry('res/xml/network_security_config.xml')
+            if (entry == null) throw new GradleException('the verifier AAR has no network security policy')
+            archive.getInputStream(entry).withCloseable { parser.parse(it) }
+        }
+        def children = application.documentElement.childNodes
+        for (int index = 0; index < children.length; index++) {
+            def child = children.item(index)
+            if (child.nodeType != Node.ELEMENT_NODE) continue
+            def imported = policy.importNode(child, true)
+            if (child.nodeName == 'base-config') {
+                def previous = policy.documentElement.getElementsByTagName('base-config')
+                if (previous.length > 0) policy.documentElement.removeChild(previous.item(0))
+                policy.documentElement.insertBefore(imported, policy.documentElement.firstChild)
+            } else {
+                policy.documentElement.appendChild(imported)
+            }
+        }
+        def output = outputDirectory.file('xml/network_security_config.xml').get().asFile
+        output.parentFile.mkdirs()
+        TransformerFactory.newInstance().newTransformer()
+            .transform(new DOMSource(policy), new StreamResult(output))
+    }
+}
+
+def cargoDirectory = rootProject.projectDir
+while (cargoDirectory != null && !new File(cargoDirectory, 'Cargo.lock').isFile()) {
+    cargoDirectory = cargoDirectory.parentFile
+}
+if (cargoDirectory == null) throw new GradleException('Cargo.lock is absent from the project ancestors')
+def cargoLock = new File(cargoDirectory, 'Cargo.lock')
+def verifierVersion = providers.of(RustlsVersion) { spec ->
+    spec.parameters.lockFile.set(cargoLock)
+}
+
+rootProject.allprojects { candidate ->
+    candidate.repositories.maven {
+        url = uri('https://github.com/rustls/rustls-platform-verifier/raw/maven-archive/android-release-support/maven/')
+        content { includeGroup('org.rustls') }
+    }
+    candidate.configurations.configureEach { configuration ->
+        configuration.resolutionStrategy.eachDependency { details ->
+            if (details.requested.group == 'org.rustls' && details.requested.name == 'rustls-platform-verifier') {
+                details.useVersion(verifierVersion.get())
+            }
+        }
+    }
+    candidate.plugins.withId('com.android.application') {
+        def applicationPolicy = candidate.layout.projectDirectory.file('src/main/res/xml/network_security_config.xml')
+        if (applicationPolicy.asFile.isFile()) {
+            def policyArtifacts = candidate.configurations.create('connettoVerifierPolicy') {
+                canBeResolved = true
+                canBeConsumed = false
+                transitive = false
+            }
+            candidate.dependencies.add(policyArtifacts.name, 'org.rustls:rustls-platform-verifier')
+            candidate.extensions.getByName('android').applicationVariants.all { variant ->
+                def mergePolicy = candidate.tasks.register(
+                    "merge${variant.name.capitalize()}VerifierNetworkSecurity", MergeVerifierNetworkSecurity
+                ) { task ->
+                    task.applicationPolicy.set(applicationPolicy)
+                    task.verifierAar.set(candidate.layout.file(candidate.providers.provider { policyArtifacts.singleFile }))
+                    task.outputDirectory.set(candidate.layout.buildDirectory.dir("generated/res/verifier/${variant.name}"))
+                }
+                variant.registerGeneratedResFolders(
+                    candidate.files(mergePolicy.flatMap { it.outputDirectory }).builtBy(mergePolicy)
+                )
+            }
+        }
+    }
+}
+
+dependencies {
+    add('implementation', 'org.rustls:rustls-platform-verifier')
+}

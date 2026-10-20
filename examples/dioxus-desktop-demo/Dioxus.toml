@@ -12,13 +12,15 @@ biometrics = { description = "Unlock your synced data" }
 bluetooth = { description = "Find and link to nearby devices" }
 local_network = { description = "Find and link to nearby devices" }
 
-# The mDNS service the peer discovery advertises and browses (R76).
+# The mDNS service the peer discovery advertises and browses, and the local
+# network usage description, which the unified `local_network` permission
+# leaves out of the iOS bundle (R76).
 [ios.plist]
 NSBonjourServices = ["_connetto-peer._tcp"]
+NSLocalNetworkUsageDescription = "Find and link to nearby devices"
 
-# The macOS local network usage description, which the unified
-# `local_network` permission never writes, since its platform key stands
-# iOS only (R76).
+# The macOS local network and location usage descriptions, which the unified
+# permissions leave out of the macOS bundle (R76).
 [macos.plist]
 NSLocalNetworkUsageDescription = "Find and link to nearby devices"
 NSLocationUsageDescription = "Join a nearby device's hotspot"

@@ -10,6 +10,8 @@ Every public call hops onto the queue that owns its work, waited on at most [`HO
 
 On iOS and iPadOS the platform answers the device's name only under the `com.apple.developer.device-information.user-assigned-device-name` entitlement, and its generic model name without it, which `device_name` reads as `None`. A WPA3 join asks the platform for its `setWPA3PersonalPassphrase:` selector, and answers `Missing` where the platform does not.
 
+`discovery::Bonjour` advertises and browses `_connetto-peer._tcp` through the system's `dns_sd` service for `connetto-peer`'s discovery, since iOS lets an app send and receive raw multicast only under Apple's managed multicast entitlement. An app using it lists the service type in `NSBonjourServices` and sets `NSLocalNetworkUsageDescription`, without which iOS refuses every operation.
+
 On every target but Apple the functions answer `Unsupported` or empty, and the device's idiom is `Other`.
 
 ```rust

@@ -49,6 +49,10 @@ class HotspotPlugin {
         private const val SECURITY_WPA2 = 0
         private const val SECURITY_WPA3 = 1
 
+        private const val BIND_OK = 0
+        private const val BIND_REFUSED = 1
+        private const val BIND_REFUSED_UNDER_VPN = 2
+
         private const val PERMISSION_REQUEST = 1001
 
         private val lock = Any()
@@ -128,7 +132,9 @@ class HotspotPlugin {
                             hostPassphrase = config.passphrase
                             hostSecurity =
                                 if (config.securityType ==
-                                    SoftApConfiguration.SECURITY_TYPE_WPA2_PSK
+                                    SoftApConfiguration.SECURITY_TYPE_WPA2_PSK ||
+                                    config.securityType ==
+                                    SoftApConfiguration.SECURITY_TYPE_WPA3_SAE_TRANSITION
                                 ) {
                                     SECURITY_WPA2
                                 } else {
@@ -341,22 +347,30 @@ class HotspotPlugin {
         }
 
         @JvmStatic
-        fun bindSocket(fd: Int): Boolean {
-            val network = synchronized(lock) { joinNetwork } ?: return false
+        fun bindSocket(fd: Int): Int {
+            val network = synchronized(lock) { joinNetwork } ?: return BIND_REFUSED
             val pfd = runCatching { ParcelFileDescriptor.adoptFd(fd) }.getOrNull()
-                ?: return false
+                ?: return BIND_REFUSED
             return try {
                 // The network binds through the file descriptor, and the fd
                 // is the socket's, not the descriptor's, so Java must never
                 // close it out from under the dial.
                 network.bindSocket(pfd.fileDescriptor)
-                true
+                BIND_OK
             } catch (e: Exception) {
-                false
+                if (underVpn()) BIND_REFUSED_UNDER_VPN else BIND_REFUSED
             } finally {
                 runCatching { pfd.detachFd() }
             }
         }
+
+        /** Whether a VPN is the app's active network, the one a refused bind falls under. */
+        private fun underVpn(): Boolean = runCatching {
+            val cm = context()?.getSystemService(Context.CONNECTIVITY_SERVICE)
+                as? ConnectivityManager ?: return@runCatching false
+            cm.getNetworkCapabilities(cm.activeNetwork)
+                ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        }.getOrDefault(false)
 
         /** The application context, cached once the framework hands it out. */
         private fun context(): Context? {

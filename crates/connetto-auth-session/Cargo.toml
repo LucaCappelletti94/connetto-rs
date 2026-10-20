@@ -10,8 +10,27 @@ repository.workspace = true
 homepage.workspace = true
 publish = false
 
-[lints]
-workspace = true
+[lints.rust]
+missing_docs = "forbid"
+unused_macro_rules = "forbid"
+unconditional_recursion = "forbid"
+unreachable_patterns = "forbid"
+unused_import_braces = "forbid"
+unused_must_use = "forbid"
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "forbid"
+deprecated = "deny"
+unknown_lints = "allow"
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+module_name_repetitions = "allow"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
 
 [features]
 # `java_access`, the JNI access an Android build's device key needs (R74).
@@ -22,11 +41,11 @@ thiserror.workspace = true
 
 [target.'cfg(target_os = "android")'.dependencies]
 connetto-client = { path = "../connetto-client", features = ["device-identity"], optional = true }
+rustls-platform-verifier.workspace = true
+jni = "0.22"
 
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-# `ffi` bundles the Kotlin module or the Swift package into the app and calls
-# it, and `android::with_activity` reaches the Activity, without code of our
-# own touching raw JNI or Objective-C pointers.
+# `ffi` bundles the native module, and `with_activity` reaches its Android context.
 manganis = "0.7.10"
 # Polling for the redirect within the caller's bound.
 tokio = { workspace = true, features = ["time"] }

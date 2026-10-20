@@ -441,9 +441,9 @@ impl EnrolHandle {
         self.peer.local_addr()
     }
 
-    /// The peers the device's node reports linked (R76).
+    /// The peers the device's node reports linked, with their links' remote addresses (R76).
     #[cfg(feature = "peer")]
-    pub(crate) fn linked_peers(&self) -> Vec<DeviceIdentity> {
+    pub(crate) fn linked_peers(&self) -> Vec<connetto_peer::PeerLink> {
         self.peer.linked()
     }
 
@@ -717,7 +717,7 @@ fn unexpected() -> Failed {
 }
 
 /// The task's state across its loop.
-struct Run<L> {
+struct Run<L: Link> {
     link: L,
     enroller: Enroller,
     held: Option<Held>,
@@ -1270,6 +1270,13 @@ impl<L: Link> Run<L> {
     }
 }
 
+#[cfg(feature = "peer")]
+impl<L: Link> Drop for Run<L> {
+    fn drop(&mut self) {
+        self.peer_stop(CloseReason::Closed);
+    }
+}
+
 /// Run the enrolment task until the client ends.
 #[expect(
     clippy::too_many_lines,
@@ -1431,7 +1438,4 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             }
         }
     }
-    // The task is done, so the peer link ends with it (R76).
-    #[cfg(feature = "peer")]
-    run.peer_stop(CloseReason::Closed);
 }

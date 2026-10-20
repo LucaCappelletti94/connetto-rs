@@ -1,4 +1,4 @@
-//! The App Attest exchange through DeviceCheck on iOS and iPadOS.
+//! The App Attest exchange through `DeviceCheck` on iOS and iPadOS.
 
 use std::sync::mpsc::{RecvTimeoutError, SyncSender, sync_channel};
 

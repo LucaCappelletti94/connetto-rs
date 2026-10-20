@@ -403,19 +403,27 @@ impl connetto_peer::SocketPrep for JoinedBind {
             return Ok(());
         }
         let fd = sock.as_fd().as_raw_fd();
-        let bound = call(&*self.java, |env| {
+        let answer = call(&*self.java, |env| {
             let class = plugin(env, PLUGIN_CLASS)?;
-            let bound = env
-                .call_static_method(class, "bindSocket", "(I)Z", &[JValue::from(fd)])?
-                .z()?;
-            Ok(bound)
+            let answer = env
+                .call_static_method(class, "bindSocket", "(I)I", &[JValue::from(fd)])?
+                .i()?;
+            Ok(answer)
         })
         .map_err(|failure| std::io::Error::other(failure.to_string()))?;
-        if !bound {
-            return Err(std::io::Error::other(
+        match answer {
+            BIND_OK => Ok(()),
+            BIND_REFUSED_UNDER_VPN => Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                super::VpnBlocksJoin,
+            )),
+            _ => Err(std::io::Error::other(
                 "the joined network will not take the dial's socket",
-            ));
+            )),
         }
-        Ok(())
     }
 }
+
+/// The bind answers of the plugin's `bindSocket`.
+const BIND_OK: i32 = 0;
+const BIND_REFUSED_UNDER_VPN: i32 = 2;

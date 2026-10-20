@@ -1470,49 +1470,58 @@ async fn far_closes_drains_for_the_whole_bound() {
 #[cfg(feature = "peer")]
 #[tokio::test]
 async fn a_fresh_device_serves_its_peer_listener_at_open() {
-    let (key, der) = attesting_key();
-    let now = whole_second();
-    let authority = authority(now).await;
-    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
-    let state = Arc::new(Mutex::new(FakeState::default()));
-    let (events, _events) = broadcast::channel(64);
-    let (end_tx, end_rx) = watch::channel(());
-    #[cfg(feature = "peer")]
-    let peer = peer(&authority);
-    let link = FakeLink {
-        state: Arc::clone(&state),
-        events,
-        end: end_rx,
-        issuer: Arc::new(authority.issuer),
-        certificate: authority.certificate,
-        ask: Ask::Lost,
-        gate: None,
-        grant_from: None,
-    };
-    #[cfg(feature = "peer")]
-    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
-    #[cfg(feature = "peer")]
-    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
-    let (enroller, handle) = Enroller::new(
-        Arc::new(RunKeys { der }),
-        Some(HOUR),
-        Vec::new(),
-        vec![authority.root.clone()],
-        Some(held),
-        Vec::new(),
-        inbox(),
-        peer,
-        #[cfg(feature = "peer")]
-        hotspot_tx,
-        #[cfg(feature = "peer")]
-        bluetooth_tx,
-    );
-    let run = tokio::spawn(run(link, enroller));
+    for cancel in [false, true] {
+        let (key, der) = attesting_key();
+        let now = whole_second();
+        let authority = authority(now).await;
+        let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let (events, _events) = broadcast::channel(64);
+        let (end_tx, end_rx) = watch::channel(());
+        let peer = peer(&authority);
+        let link = FakeLink {
+            state: Arc::clone(&state),
+            events,
+            end: end_rx,
+            issuer: Arc::new(authority.issuer),
+            certificate: authority.certificate,
+            ask: Ask::Lost,
+            gate: None,
+            grant_from: None,
+        };
+        let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+        let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+        let (enroller, handle) = Enroller::new(
+            Arc::new(RunKeys { der }),
+            Some(HOUR),
+            Vec::new(),
+            vec![authority.root.clone()],
+            Some(held),
+            Vec::new(),
+            inbox(),
+            peer,
+            hotspot_tx,
+            bluetooth_tx,
+        );
+        let run = tokio::spawn(run(link, enroller));
+        poll_until(|| handle.peer_address().is_some()).await;
 
-    poll_until(|| handle.peer_address().is_some()).await;
-
-    end_tx.send(()).expect("the run ends");
-    run.await.expect("the run ends");
+        if cancel {
+            run.abort();
+            assert!(
+                run.await
+                    .expect_err("the task was cancelled")
+                    .is_cancelled()
+            );
+        } else {
+            end_tx.send(()).expect("the run ends");
+            run.await.expect("the run ends");
+        }
+        assert!(
+            handle.peer_address().is_none(),
+            "an ended task retains no listener"
+        );
+    }
 }
 
 /// The refusal of a device past its expiry, which also raises the event
@@ -1897,10 +1906,17 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
             _ => None,
         })
         .expect("the link reports its peer");
+    let links = handle.linked_peers();
     assert_eq!(
-        handle.linked_peers(),
-        vec![linked_peer],
+        links.iter().map(|link| &link.peer).collect::<Vec<_>>(),
+        [&linked_peer],
         "the device's node reports its live peer"
+    );
+    assert!(
+        links[0]
+            .remote
+            .is_some_and(|remote| remote.ip().is_loopback()),
+        "the live link names its remote address"
     );
 
     // The look wakes at the expiry plus the tolerance and closes the link. A late

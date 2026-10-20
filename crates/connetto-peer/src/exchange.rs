@@ -287,7 +287,8 @@ async fn host_exchange<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Some(frame) => {
                 return Err(ExchangeError::Protocol(format!(
-                    "the joiner sent a {frame:?} frame where its lists end"
+                    "the joiner sent {} frame where its lists end",
+                    frame.named()
                 )));
             }
         }
@@ -376,7 +377,8 @@ async fn joiner_exchange<S: AsyncRead + AsyncWrite + Unpin>(
             }
             Some(frame) => {
                 return Err(ExchangeError::Protocol(format!(
-                    "the host sent a {frame:?} frame where the offer comes"
+                    "the host sent {} frame where the offer comes",
+                    frame.named()
                 )));
             }
             None => {

@@ -2900,8 +2900,29 @@ async fn linked_stands_its_live_peers_and_a_close_drops_one() {
             peer: alpha.identity.clone()
         }]
     );
-    assert_eq!(a.linked(), vec![beta.identity.clone()]);
-    assert_eq!(b.linked(), vec![alpha.identity.clone()]);
+    let (a_links, b_links) = (a.linked(), b.linked());
+    assert_eq!(
+        a_links.iter().map(|link| &link.peer).collect::<Vec<_>>(),
+        [&beta.identity]
+    );
+    assert_eq!(
+        b_links.iter().map(|link| &link.peer).collect::<Vec<_>>(),
+        [&alpha.identity]
+    );
+    // Both sides keep the same connection, so one side names the other's
+    // listener and the other names the dialer's source address.
+    assert!(
+        (a_links[0].remote == Some(b_addr)) != (b_links[0].remote == Some(a_addr)),
+        "the kept link's remotes {:?} and {:?} name one connection",
+        a_links[0].remote,
+        b_links[0].remote
+    );
+    assert!(
+        [a_links[0].remote, b_links[0].remote]
+            .iter()
+            .all(|remote| remote.is_some_and(|remote| remote.ip().is_loopback())),
+        "both remotes stand on the loopback"
+    );
 
     // B stops, the link closes, and A's read drops B with the close.
     b.stop(CloseReason::Closed);
@@ -2952,7 +2973,7 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
             peer: gone.identity.clone()
         }]
     );
-    assert_eq!(host_node.linked(), vec![gone.identity.clone()]);
+    assert_eq!(peers(host_node.linked()), vec![gone.identity.clone()]);
 
     // The duplicate close holds the peer in the read while its kept link
     // registers, which raises no second event for the same peer.
@@ -2968,13 +2989,16 @@ async fn a_duplicate_close_holds_the_peer_in_the_link_read() {
     no_events(&mut h_rx, Duration::from_millis(500)).await;
     assert_eq!(
         host_node.linked(),
-        vec![gone.identity.clone()],
-        "the held peer stays in the read"
+        vec![crate::PeerLink {
+            peer: gone.identity.clone(),
+            remote: None,
+        }],
+        "the held peer stays in the read without an address"
     );
     let mut raw = raw_linked(deployment.root_der(), &gone, host_addr).await;
     no_events(&mut h_rx, Duration::from_millis(500)).await;
     assert_eq!(
-        host_node.linked(),
+        peers(host_node.linked()),
         vec![gone.identity.clone()],
         "the keeper's link stands the peer live again"
     );
@@ -3038,7 +3062,7 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
             peer: gone.identity.clone()
         }]
     );
-    assert_eq!(host_node.linked(), vec![gone.identity.clone()]);
+    assert_eq!(peers(host_node.linked()), vec![gone.identity.clone()]);
     time::pause();
     let started = time::Instant::now();
     write_frame(
@@ -3053,8 +3077,11 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
     no_events(&mut h_rx, Duration::from_millis(500)).await;
     assert_eq!(
         host_node.linked(),
-        vec![gone.identity.clone()],
-        "the held peer stays in the read"
+        vec![crate::PeerLink {
+            peer: gone.identity.clone(),
+            remote: None,
+        }],
+        "the held peer stays in the read without an address"
     );
     await_event(&mut h_rx, Duration::from_secs(60), |event| {
         matches!(event, PeerEvent::Unlinked { .. })
@@ -3070,4 +3097,9 @@ async fn the_hello_bound_drops_a_held_peer_in_the_link_read() {
         "the bound drops the peer the keeper never kept"
     );
     host_node.stop(CloseReason::Closed);
+}
+
+/// The peers a link read names, without their addresses.
+fn peers(links: Vec<crate::PeerLink>) -> Vec<DeviceIdentity> {
+    links.into_iter().map(|link| link.peer).collect()
 }

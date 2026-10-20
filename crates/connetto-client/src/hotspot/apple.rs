@@ -141,7 +141,10 @@ impl HotspotBackend for AppleHotspotBackend {
                 *self.was_available.write() = false;
                 Ok(())
             }
-            Err(error) => Err(join_refusal(&error)),
+            Err(error) => {
+                tracing::debug!(?error, "the join was refused at once");
+                Err(join_refusal(&error))
+            }
         }
     }
 

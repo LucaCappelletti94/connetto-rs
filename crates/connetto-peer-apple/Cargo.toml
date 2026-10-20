@@ -1,6 +1,6 @@
 [package]
 name = "connetto-peer-apple"
-description = "The Apple platform bridge for the connetto peer link, the Bluetooth peripheral the host serves its exchange over and the join a joiner's device asks the system for, the Network Extension's on iOS and CoreWLAN's on macOS, in the workspace's second unsafe crate."
+description = "The Apple platform bridge for the connetto peer link, the Bluetooth peripheral the host serves its exchange over, the join a joiner's device asks the system for, the Network Extension's on iOS and CoreWLAN's on macOS, and the Bonjour discovery iOS needs, in the workspace's second unsafe crate."
 readme = "README.md"
 version.workspace = true
 edition.workspace = true
