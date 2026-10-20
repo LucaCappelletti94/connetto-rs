@@ -2731,7 +2731,7 @@ async fn a_redelivery_behind_a_pruned_chain_reanswers_the_stored_refusal() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
     let _ = captured;
 
     // Every patch exceeds the one-byte window, so both settle refused.
@@ -2800,7 +2800,7 @@ async fn a_redelivery_with_forged_bytes_behind_a_pruned_chain_is_refused_forked(
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
 
     // alice settles two entries.
     let (server_transport, client) = loopback();
@@ -2928,7 +2928,7 @@ async fn a_retained_predecessor_hash_of_the_wrong_length_closes_the_session() {
         AbuseConfig::default(),
     ));
     guard.set_audit_hook(hook);
-    let manager = writing_manager(fixture.admin(), guard, SessionConfig::default());
+    let manager = writing_manager(fixture.admin(), guard, None, SessionConfig::default());
     let _ = captured;
 
     let (server_transport, client) = loopback();
@@ -3644,4 +3644,60 @@ async fn an_anonymous_provenance_copy_of_a_device_key_settles_nothing() {
     assert!(device_row_absent(fixture.admin(), unbound).await);
     client.close().await;
     server.await.expect("join 2").expect("session ok");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_refused_provenance_write_settles_its_unbound_original() {
+    let fixture = Fixture::acquire().await;
+    seed_notes(&fixture).await;
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default(),
+        AbuseConfig::default(),
+    ));
+    let store = Enrolments::new();
+    let (_, key) = store
+        .enrol("alice", SystemTime::now() + Duration::from_hours(24))
+        .await;
+    let manager = writing_manager(
+        fixture.admin(),
+        guard,
+        Some(store.installable()),
+        SessionConfig::default(),
+    );
+    let (transport, client) = loopback();
+    let server = tokio::spawn(manager.serve(transport));
+    let mut client = Client::new(client);
+    let ack = client
+        .handshake_with("refused-original", "user:alice")
+        .await;
+    let copy = i64::try_from(ack.writer.expect("number writer").number).expect("stored number");
+    client
+        .upload_with_provenance(
+            1,
+            vec![0],
+            Some(Provenance {
+                writer: WriterRef::Device(key),
+                seq: 1,
+            }),
+        )
+        .await;
+    let ControlMessage::MutationReject(reject) = client.next_control().await else {
+        panic!("the malformed logical write must be refused");
+    };
+    assert_eq!(reject.client_seq, 1);
+    assert!(matches!(
+        reject.reason,
+        MutationRejectReason::Malformed { .. }
+    ));
+    client.close().await;
+    server.await.expect("server task").expect("session");
+    let original = writer_for_key(fixture.admin(), key).await;
+    let original_rows = settled_rows(fixture.admin(), original).await;
+    let copy_rows = settled_rows(fixture.admin(), copy).await;
+    assert_eq!(original_rows.len(), 1);
+    assert_eq!(copy_rows.len(), 1);
+    assert_eq!(original_rows[0].outcome, copy_rows[0].outcome);
+    assert_eq!(writer_facts(fixture.admin(), original).await.frontier, 1);
+    assert_eq!(writer_facts(fixture.admin(), copy).await.frontier, 1);
+    assert_eq!(notes(fixture.admin()).await, [note(1, "hello", "t0")]);
 }

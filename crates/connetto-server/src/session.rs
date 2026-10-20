@@ -86,7 +86,7 @@ use crate::schema::ConnettoSchema;
 use crate::slot::SlotError;
 use crate::throttle::{ReadLimits, Tier};
 use crate::timeline::{Position, TimelineError, TimelineHistory};
-use crate::write_target::{PgWriteTarget, SettleSpec, WriteError, WriteOutcome};
+use crate::write_target::{PgWriteTarget, SettleSpec, Settlement, WriteError, WriteOutcome};
 use crate::writer_schema::{SettlePath, SettledOutcome, SettledRow, WriterRow};
 use connetto_core::auth::CapabilityKey;
 use connetto_core::auth::CapabilitySubject;
@@ -5721,7 +5721,7 @@ where
         // with the stored outcome, so the logical write applies once.
         if let Some(provenance) = header.provenance {
             match self.provenance_original(&provenance, bytes, state).await? {
-                Some((orig_writer, orig_frontier, _orig_hash))
+                Some((orig_writer, orig_frontier, _orig_hash, _orig_previous))
                     if provenance.seq <= orig_frontier =>
                 {
                     let stored = self
@@ -5755,18 +5755,20 @@ where
                                 .map_err(|err| SessionError::WriteTarget(err.to_string()))?
                         }
                     };
-                    self.target
+                    let settlement = self
+                        .target
                         .settle_refusal(&settle, &outcome)
                         .await
                         .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                    let outcome = self.recorded_outcome(&state.principal, &settle, &settlement)?;
                     return self.answer_outcome(transport, seq, &outcome, state).await;
                 }
-                Some((orig_writer, orig_frontier, orig_hash))
+                Some((orig_writer, orig_frontier, orig_hash, orig_previous))
                     if provenance.seq == orig_frontier + 1 =>
                 {
-                    settle.original = Some((orig_writer, provenance.seq, orig_hash));
+                    settle.original = Some((orig_writer, provenance.seq, orig_hash, orig_previous));
                 }
-                Some((_, orig_frontier, _)) => {
+                Some((_, orig_frontier, _, _)) => {
                     let _ = transport
                         .send_control(ControlMessage::FatalError(FatalError::new(
                             FatalErrorReason::SequenceGap {
@@ -5830,14 +5832,13 @@ where
             .await
     }
 
-    /// The provenance original's writer, its frontier and this entry's hash
-    /// under it, absent when the original is not a writer of this account.
+    /// The owned original's writer, frontier, entry hash and predecessor.
     async fn provenance_original(
         &self,
         provenance: &Provenance,
         bytes: &[u8],
         state: &SessionState<Id, Key>,
-    ) -> Result<Option<(i64, u64, [u8; 32])>, SessionError> {
+    ) -> Result<Option<(i64, u64, [u8; 32], [u8; 32])>, SessionError> {
         let user_id = state
             .principal
             .identity()
@@ -5912,7 +5913,41 @@ where
             <[u8; 32]>::try_from(head).unwrap_or(GENESIS)
         });
         let entry_hash = chain::entry_hash(&previous, provenance.seq, bytes);
-        Ok(Some((row.writer, frontier, entry_hash)))
+        Ok(Some((row.writer, frontier, entry_hash, previous)))
+    }
+
+    fn recorded_outcome(
+        &self,
+        caller: &Principal<Id, Key>,
+        settle: &SettleSpec,
+        settlement: &Settlement,
+    ) -> Result<SettledOutcome, SessionError> {
+        let row = &settlement.row;
+        let operation = if settlement.forked {
+            Some(AuthOp::WriteForked)
+        } else {
+            (row.path != settle.path).then_some(AuthOp::WriteRedelivered)
+        };
+        if let Some(operation) = operation {
+            self.guard.record(
+                AuthEvent::new(
+                    caller.session_id(),
+                    caller.identity().map(|identity| identity.user_id.clone()),
+                    operation,
+                )
+                .about_write(
+                    settle.writer,
+                    i64::try_from(settle.seq).unwrap_or(i64::MAX),
+                    settle.path,
+                    row.path,
+                ),
+            );
+        }
+        if settlement.forked {
+            return Ok(SettledOutcome::Rejected(MutationRejectReason::Forked));
+        }
+        SettledOutcome::from_json(&row.outcome)
+            .map_err(|err| SessionError::WriteTarget(err.to_string()))
     }
 
     /// Answer the write target's outcome: confirm, conflict, re-answer from
@@ -5943,50 +5978,10 @@ where
                     .await
                     .map_err(transport_err)
             }
-            Ok(WriteOutcome::Settled { row, hash_matches }) => {
-                // A settled sequence resolves the connection's unsettled write.
+            Ok(WriteOutcome::Settled(settlement)) => {
                 state.indeterminate = None;
-                if hash_matches {
-                    if row.path != settle.path {
-                        // A cross-path delivery stands on both paths' audit.
-                        self.guard.record(
-                            AuthEvent::new(
-                                state.session_id,
-                                state
-                                    .principal
-                                    .identity()
-                                    .map(|identity| identity.user_id.clone()),
-                                AuthOp::WriteRedelivered,
-                            )
-                            .about_write(
-                                settle.writer,
-                                i64::try_from(seq).unwrap_or(i64::MAX),
-                                settle.path,
-                                row.path,
-                            ),
-                        );
-                    }
-                    return self.answer_settled(transport, seq, &row, state).await;
-                }
-                // A different entry stands at this sequence, so this one never applies.
-                self.guard.record(
-                    AuthEvent::new(
-                        state.session_id,
-                        state
-                            .principal
-                            .identity()
-                            .map(|identity| identity.user_id.clone()),
-                        AuthOp::WriteForked,
-                    )
-                    .about_write(
-                        settle.writer,
-                        i64::try_from(seq).unwrap_or(i64::MAX),
-                        row.path,
-                        settle.path,
-                    ),
-                );
-                self.reject(transport, seq, MutationRejectReason::Forked)
-                    .await
+                let outcome = self.recorded_outcome(&state.principal, settle, &settlement)?;
+                self.answer_outcome(transport, seq, &outcome, state).await
             }
             Err(WriteError::Unauthorized) => {
                 self.settle_and_refuse(transport, settle, MutationRejectReason::Unauthorized, state)
@@ -6028,12 +6023,20 @@ where
         reason: MutationRejectReason,
         state: &mut SessionState<Id, Key>,
     ) -> Result<(), SessionError> {
-        self.target
-            .settle_refusal(settle, &SettledOutcome::Rejected(reason.clone()))
+        let settlement = self
+            .target
+            .settle_refusal(settle, &SettledOutcome::Rejected(reason))
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+        let outcome = self.recorded_outcome(&state.principal, settle, &settlement)?;
         state.indeterminate = None;
-        self.reject(transport, settle.seq, reason).await
+        match outcome {
+            SettledOutcome::Rejected(reason) => self.reject(transport, settle.seq, reason).await,
+            outcome => {
+                self.answer_outcome(transport, settle.seq, &outcome, state)
+                    .await
+            }
+        }
     }
 
     /// Commit one mutation under `caller`, applying it again while the

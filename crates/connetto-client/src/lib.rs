@@ -1520,10 +1520,13 @@ const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     (id TEXT NOT NULL PRIMARY KEY, next_seq INTEGER NOT NULL, head BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
     (writer TEXT NOT NULL, seq INTEGER NOT NULL, changeset BLOB NOT NULL, \
-     entry_hash BLOB NOT NULL, prov_writer TEXT, prov_seq INTEGER, \
+     entry_hash BLOB NOT NULL, position INTEGER NOT NULL, \
+     prov_writer TEXT, prov_seq INTEGER, \
      PRIMARY KEY (writer, seq)); \
     CREATE TABLE IF NOT EXISTS _connetto_retire \
-    (writer TEXT NOT NULL PRIMARY KEY)";
+    (writer TEXT NOT NULL PRIMARY KEY); \
+    CREATE TABLE IF NOT EXISTS _connetto_retired_keys \
+    (key_id BLOB NOT NULL PRIMARY KEY)";
 
 /// The attach name of the local tier database. An internal constant: authored
 /// SQL never names it, since bare table names resolve across attached
@@ -1570,6 +1573,54 @@ diesel::table! {
         kind -> diesel::sql_types::Text,
         /// The object name.
         name -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    /// Durable writer frontiers.
+    _connetto_writers (id) {
+        /// The writer identity.
+        id -> diesel::sql_types::Text,
+        /// The next sequence to append.
+        next_seq -> diesel::sql_types::BigInt,
+        /// The last appended entry hash.
+        head -> diesel::sql_types::Binary,
+    }
+}
+
+diesel::table! {
+    /// Outstanding entries ordered across writers by append position.
+    _connetto_pending (writer, seq) {
+        /// The current writer identity.
+        writer -> diesel::sql_types::Text,
+        /// The sequence under the current writer.
+        seq -> diesel::sql_types::BigInt,
+        /// The captured physical changeset.
+        changeset -> diesel::sql_types::Binary,
+        /// The logical changeset's chain hash.
+        entry_hash -> diesel::sql_types::Binary,
+        /// The replica-wide append position.
+        position -> diesel::sql_types::BigInt,
+        /// The original writer identity.
+        prov_writer -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
+        /// The original writer's sequence.
+        prov_seq -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
+    }
+}
+
+diesel::table! {
+    /// The writers owed a retirement on the next connection.
+    _connetto_retire (writer) {
+        /// The writer awaiting retirement.
+        writer -> diesel::sql_types::Text,
+    }
+}
+
+diesel::table! {
+    /// Keys durably excluded from writer selection.
+    _connetto_retired_keys (key_id) {
+        /// The retired device key.
+        key_id -> diesel::sql_types::Binary,
     }
 }
 
@@ -2346,9 +2397,20 @@ struct PendingEntry {
     /// This entry's chain hash, over the logical upload bytes and every
     /// entry queued before it.
     hash: [u8; 32],
+    /// The replica-wide order the entry was queued in, ahead of every writer
+    /// sequence, so a restart and a reapply replay it where it was made.
+    position: u64,
     /// The writer and sequence this entry was first written under, set when
     /// the entry was imported or carried to a fresh writer.
     provenance: Option<Provenance>,
+}
+
+struct CarriedEntry {
+    source: WriterRef,
+    original_seq: u64,
+    position: u64,
+    seq: u64,
+    hash: [u8; 32],
 }
 
 /// One writer's queue, the client half of the (writer, sequence) identity.
@@ -2380,22 +2442,21 @@ fn persist_writer_state(
     next_seq: u64,
     head: &[u8; 32],
 ) -> Result<(), ClientError> {
-    diesel::sql_query(
-        "INSERT OR REPLACE INTO _connetto_writers (id, next_seq, head) \
-        VALUES (?, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>(writer_id(writer))
-    .bind::<diesel::sql_types::BigInt, _>(seq_storage(next_seq)?)
-    .bind::<diesel::sql_types::Binary, _>(head)
-    .execute(db)?;
+    let id = writer_id(writer);
+    diesel::replace_into(_connetto_writers::table)
+        .values((
+            _connetto_writers::id.eq(&id),
+            _connetto_writers::next_seq.eq(seq_storage(next_seq)?),
+            _connetto_writers::head.eq(*head),
+        ))
+        .execute(db)?;
     Ok(())
 }
 
 /// Drop a writer's queue state and its records, the writer moving on.
 fn drop_writer_state(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
-    diesel::sql_query("DELETE FROM _connetto_writers WHERE id = ?")
-        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
-        .execute(db)?;
+    let id = writer_id(writer);
+    diesel::delete(_connetto_writers::table.filter(_connetto_writers::id.eq(&id))).execute(db)?;
     delete_writer_pending(db, writer)?;
     Ok(())
 }
@@ -2404,30 +2465,26 @@ fn drop_writer_state(db: &mut SqliteConnection, writer: &WriterRef) -> Result<()
 fn load_writer_states(
     db: &mut SqliteConnection,
 ) -> Result<BTreeMap<WriterRef, (u64, [u8; 32])>, ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct WriterRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        id: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
-        next_seq: i64,
-        #[diesel(sql_type = diesel::sql_types::Binary)]
-        head: Vec<u8>,
-    }
-    let rows: Vec<WriterRow> =
-        diesel::sql_query("SELECT id, next_seq, head FROM _connetto_writers").load(db)?;
+    let rows: Vec<(String, i64, Vec<u8>)> = _connetto_writers::table
+        .select((
+            _connetto_writers::id,
+            _connetto_writers::next_seq,
+            _connetto_writers::head,
+        ))
+        .load(db)?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| {
+        .filter_map(|(id, next_seq, head)| {
             Some((
-                writer_from_id(&row.id)?,
-                (u64::try_from(row.next_seq).ok()?, row.head.try_into().ok()?),
+                writer_from_id(&id)?,
+                (u64::try_from(next_seq).ok()?, head.try_into().ok()?),
             ))
         })
         .collect())
 }
 
-/// Record a queued entry durably, with its chain hash and provenance, so a
-/// restart can replay it until the server answers the durable apply.
+/// Record a queued entry durably, with its chain hash, append position and
+/// provenance, so a restart can replay it where it was made.
 fn persist_pending(
     db: &mut SqliteConnection,
     writer: &WriterRef,
@@ -2435,23 +2492,24 @@ fn persist_pending(
     changeset: &[u8],
     hash: [u8; 32],
     provenance: Option<Provenance>,
+    position: u64,
 ) -> Result<(), ClientError> {
     let (prov_writer, prov_seq) = match &provenance {
         Some(prov) => (Some(writer_id(&prov.writer)), Some(seq_storage(prov.seq)?)),
         None => (None, None),
     };
-    diesel::sql_query(
-        "INSERT OR REPLACE INTO _connetto_pending \
-            (writer, seq, changeset, entry_hash, prov_writer, prov_seq) \
-            VALUES (?, ?, ?, ?, ?, ?)",
-    )
-    .bind::<diesel::sql_types::Text, _>(writer_id(writer))
-    .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
-    .bind::<diesel::sql_types::Binary, _>(changeset)
-    .bind::<diesel::sql_types::Binary, _>(&hash)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(&prov_writer)
-    .bind::<diesel::sql_types::Nullable<diesel::sql_types::BigInt>, _>(&prov_seq)
-    .execute(db)?;
+    let id = writer_id(writer);
+    diesel::replace_into(_connetto_pending::table)
+        .values((
+            _connetto_pending::writer.eq(&id),
+            _connetto_pending::seq.eq(seq_storage(seq)?),
+            _connetto_pending::changeset.eq(changeset),
+            _connetto_pending::entry_hash.eq(hash),
+            _connetto_pending::position.eq(seq_storage(position)?),
+            _connetto_pending::prov_writer.eq(&prov_writer),
+            _connetto_pending::prov_seq.eq(&prov_seq),
+        ))
+        .execute(db)?;
     Ok(())
 }
 
@@ -2461,17 +2519,20 @@ fn delete_pending(
     writer: &WriterRef,
     seq: u64,
 ) -> Result<(), ClientError> {
-    diesel::sql_query("DELETE FROM _connetto_pending WHERE writer = ? AND seq = ?")
-        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
-        .bind::<diesel::sql_types::BigInt, _>(seq_storage(seq)?)
-        .execute(db)?;
+    let id = writer_id(writer);
+    diesel::delete(
+        _connetto_pending::table
+            .filter(_connetto_pending::writer.eq(&id))
+            .filter(_connetto_pending::seq.eq(seq_storage(seq)?)),
+    )
+    .execute(db)?;
     Ok(())
 }
 
 /// Retire every queued entry of one writer, it moving to a fresh writer.
 fn delete_writer_pending(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
-    diesel::sql_query("DELETE FROM _connetto_pending WHERE writer = ?")
-        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
+    let id = writer_id(writer);
+    diesel::delete(_connetto_pending::table.filter(_connetto_pending::writer.eq(&id)))
         .execute(db)?;
     Ok(())
 }
@@ -2485,23 +2546,22 @@ fn rekey_writer(
 ) -> Result<(), ClientError> {
     let from_id = writer_id(from);
     let to_id = writer_id(to);
-    diesel::sql_query("UPDATE _connetto_pending SET writer = ? WHERE writer = ?")
-        .bind::<diesel::sql_types::Text, _>(&to_id)
-        .bind::<diesel::sql_types::Text, _>(&from_id)
+    diesel::update(_connetto_pending::table.filter(_connetto_pending::writer.eq(&from_id)))
+        .set(_connetto_pending::writer.eq(&to_id))
         .execute(db)?;
-    diesel::sql_query("UPDATE _connetto_writers SET id = ? WHERE id = ?")
-        .bind::<diesel::sql_types::Text, _>(&to_id)
-        .bind::<diesel::sql_types::Text, _>(&from_id)
+    diesel::update(_connetto_writers::table.filter(_connetto_writers::id.eq(&from_id)))
+        .set(_connetto_writers::id.eq(&to_id))
         .execute(db)?;
     Ok(())
 }
 
 /// A queued entry as the bookkeeping stores it, sequence, changeset, chain
-/// hash and provenance.
+/// hash, append position and provenance.
 struct LoadedEntry {
     seq: u64,
     changeset: Vec<u8>,
     hash: [u8; 32],
+    position: u64,
     provenance: Option<Provenance>,
 }
 
@@ -2510,26 +2570,31 @@ struct LoadedEntry {
 fn load_pending(
     db: &mut SqliteConnection,
 ) -> Result<BTreeMap<WriterRef, Vec<LoadedEntry>>, ClientError> {
-    #[derive(diesel::QueryableByName)]
+    #[derive(diesel::Queryable)]
     struct PendingRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
         writer: String,
-        #[diesel(sql_type = diesel::sql_types::BigInt)]
         seq: i64,
-        #[diesel(sql_type = diesel::sql_types::Binary)]
         changeset: Vec<u8>,
-        #[diesel(sql_type = diesel::sql_types::Binary)]
         entry_hash: Vec<u8>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+        position: i64,
         prov_writer: Option<String>,
-        #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::BigInt>)]
         prov_seq: Option<i64>,
     }
-    let rows: Vec<PendingRow> = diesel::sql_query(
-        "SELECT writer, seq, changeset, entry_hash, prov_writer, prov_seq \
-            FROM _connetto_pending ORDER BY writer, seq",
-    )
-    .load(db)?;
+    let rows: Vec<PendingRow> = _connetto_pending::table
+        .select((
+            _connetto_pending::writer,
+            _connetto_pending::seq,
+            _connetto_pending::changeset,
+            _connetto_pending::entry_hash,
+            _connetto_pending::position,
+            _connetto_pending::prov_writer,
+            _connetto_pending::prov_seq,
+        ))
+        .order((
+            _connetto_pending::writer.asc(),
+            _connetto_pending::seq.asc(),
+        ))
+        .load(db)?;
     let mut queues = BTreeMap::new();
     for row in rows {
         let Some(writer) = writer_from_id(&row.writer) else {
@@ -2539,6 +2604,9 @@ fn load_pending(
             continue;
         };
         let Ok(hash) = row.entry_hash.try_into() else {
+            continue;
+        };
+        let Ok(position) = u64::try_from(row.position) else {
             continue;
         };
         let provenance = row
@@ -2554,6 +2622,7 @@ fn load_pending(
                 seq,
                 changeset: row.changeset,
                 hash,
+                position,
                 provenance,
             });
     }
@@ -2562,41 +2631,63 @@ fn load_pending(
 
 /// Remember a writer to retire on the next connection.
 fn persist_retire(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
-    diesel::sql_query("INSERT OR IGNORE INTO _connetto_retire (writer) VALUES (?)")
-        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
+    let id = writer_id(writer);
+    diesel::insert_into(_connetto_retire::table)
+        .values(_connetto_retire::writer.eq(&id))
+        .on_conflict_do_nothing()
         .execute(db)?;
     Ok(())
 }
 
 /// The writers owed a retirement, in writer order.
 fn load_retires(db: &mut SqliteConnection) -> Result<Vec<WriterRef>, ClientError> {
-    #[derive(diesel::QueryableByName)]
-    struct RetireRow {
-        #[diesel(sql_type = diesel::sql_types::Text)]
-        writer: String,
-    }
-    let rows: Vec<RetireRow> =
-        diesel::sql_query("SELECT writer FROM _connetto_retire ORDER BY writer").load(db)?;
+    let rows: Vec<String> = _connetto_retire::table
+        .select(_connetto_retire::writer)
+        .order(_connetto_retire::writer.asc())
+        .load(db)?;
     Ok(rows
         .into_iter()
-        .filter_map(|row| writer_from_id(&row.writer))
+        .filter_map(|writer| writer_from_id(&writer))
         .collect())
 }
 
 /// Drop a writer's retirement obligation, its answer arrived.
 fn clear_retire(db: &mut SqliteConnection, writer: &WriterRef) -> Result<(), ClientError> {
-    diesel::sql_query("DELETE FROM _connetto_retire WHERE writer = ?")
-        .bind::<diesel::sql_types::Text, _>(writer_id(writer))
+    let id = writer_id(writer);
+    diesel::delete(_connetto_retire::table.filter(_connetto_retire::writer.eq(&id))).execute(db)?;
+    Ok(())
+}
+
+/// Durably exclude a retired device key from writer selection, so a
+/// certificate the enrolment task has not yet cleared cannot take new writes
+/// and a fresh one cannot reactivate the retired writer.
+#[cfg(feature = "device-identity")]
+fn persist_retired_key(db: &mut SqliteConnection, key_id: [u8; 32]) -> Result<(), ClientError> {
+    diesel::insert_into(_connetto_retired_keys::table)
+        .values(_connetto_retired_keys::key_id.eq(key_id))
+        .on_conflict_do_nothing()
         .execute(db)?;
     Ok(())
 }
 
-/// Every writer queue a previous run left: the persisted queue state merged
-/// with the persisted entries, the entry hashes winning the head when both
-/// agree to disagree.
+/// The device keys a completed retirement excluded, in key order.
+#[cfg(feature = "device-identity")]
+fn load_retired_keys(db: &mut SqliteConnection) -> Result<HashSet<[u8; 32]>, ClientError> {
+    let rows: Vec<Vec<u8>> = _connetto_retired_keys::table
+        .select(_connetto_retired_keys::key_id)
+        .load(db)?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|key| key.try_into().ok())
+        .collect())
+}
+
+/// Every writer queue a previous run left, beside the position the next
+/// queued entry takes: the highest durable position plus one, restarting at
+/// one when no entry stands, settled history not ordered by the counter.
 fn load_writer_queues(
     db: &mut SqliteConnection,
-) -> Result<BTreeMap<WriterRef, WriterQueue>, ClientError> {
+) -> Result<(BTreeMap<WriterRef, WriterQueue>, u64), ClientError> {
     let states = load_writer_states(db)?;
     let pending = load_pending(db)?;
     let mut queues = BTreeMap::new();
@@ -2620,6 +2711,7 @@ fn load_writer_queues(
                 PendingEntry {
                     changeset: entry.changeset,
                     hash: entry.hash,
+                    position: entry.position,
                     provenance: entry.provenance,
                 },
             );
@@ -2631,7 +2723,13 @@ fn load_writer_queues(
             }
         }
     }
-    Ok(queues)
+    let next_position = queues
+        .values()
+        .flat_map(|queue| queue.pending.values())
+        .map(|entry| entry.position)
+        .max()
+        .map_or(1, |position| position + 1);
+    Ok((queues, next_position))
 }
 
 /// What a completed handshake told the client.
@@ -2945,6 +3043,10 @@ pub struct ConnettoConnection<T: Transport> {
     last_cursor: Option<Cursor>,
     /// The queues of the writers this replica has queued writes under.
     writers: BTreeMap<WriterRef, WriterQueue>,
+    /// The position the next queued entry takes, rebuilt at open from the
+    /// durable entries and advanced only after one commits, so the order of
+    /// outstanding entries outlives every writer sequence.
+    next_position: u64,
     /// The writer this connection writes as, absent on a device connection
     /// until its bind is answered.
     bound_writer: Option<WriterRef>,
@@ -2964,6 +3066,11 @@ pub struct ConnettoConnection<T: Transport> {
     /// The device's keys, opened at a bind to sign it, device identity only.
     #[cfg(feature = "device-identity")]
     writer_keys: Option<Arc<dyn crate::enrolment::DeviceKeys>>,
+    /// The device keys a completed retirement excluded from writer
+    /// selection, held so a not-yet-cleared certificate cannot take new
+    /// writes and a fresh one cannot reactivate the retired writer.
+    #[cfg(feature = "device-identity")]
+    retired_keys: HashSet<[u8; 32]>,
     /// Set by the commit hook whenever a write commits, so the driver knows
     /// to look for a captured mutation to flush. Server patch applies trip it
     /// too, harmlessly: an empty capture session never uploads.
@@ -3198,7 +3305,9 @@ where
         // OPFS import) continues where the previous run stopped. The writer
         // queues a previous run left, entries and all, come along for replay.
         let resume = resume.or_else(|| load_cursor(&mut db));
-        let writers = load_writer_queues(&mut db)?;
+        let (writers, next_position) = load_writer_queues(&mut db)?;
+        #[cfg(feature = "device-identity")]
+        let retired_keys = load_retired_keys(&mut db)?;
         let changed: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
         let applied_rows: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
         let apply_staging: Arc<Mutex<HashMap<String, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -3232,6 +3341,7 @@ where
             db,
             last_cursor: resume,
             writers,
+            next_position,
             bound_writer: None,
             writer_tasks: VecDeque::new(),
             writer_in_flight: None,
@@ -3243,6 +3353,8 @@ where
             writer_retired: None,
             #[cfg(feature = "device-identity")]
             writer_keys: None,
+            #[cfg(feature = "device-identity")]
+            retired_keys,
             dirty,
             write_exempt,
             changed,
@@ -3520,7 +3632,8 @@ where
 
     /// The writer to present at the next handshake, with how much of it the
     /// server has already settled. A number's unsent tail outlives a device's
-    /// bind, and a fresh number is asked only when no writer's tail waits.
+    /// bind, and an unissued tail takes its fresh number first, so a fresh
+    /// number is asked whenever any writer's tail waits.
     fn writer_handshake(&mut self) -> Result<(WriterRequest, Option<u64>), ClientError> {
         let number = self.number_identity();
         let number_tail = number.is_some_and(|number| {
@@ -3535,6 +3648,15 @@ where
                 WriterRequest::Number(number),
                 Some(self.settled_through(&writer)),
             ));
+        }
+        // An unissued tail settles under its own fresh number first, or a
+        // device handshake would queue it behind the device's later entries.
+        let unissued_tail = self
+            .writers
+            .get(&unissued())
+            .is_some_and(|queue| !queue.pending.is_empty());
+        if unissued_tail {
+            return Ok((WriterRequest::Issue, None));
         }
         if self.device_bindable()? {
             return Ok((WriterRequest::Device, None));
@@ -3603,6 +3725,13 @@ where
             let Some(held) = self.device_certificate()? else {
                 return Ok(false);
             };
+            // A completed retirement excludes the key before the enrolment
+            // task's cleanup runs, so a not-yet-cleared certificate does not
+            // make it bindable.
+            let key_id = *held.leaf.identity().key().as_bytes();
+            if self.retired_keys.contains(&key_id) {
+                return Ok(false);
+            }
             Ok(matches!(
                 crate::enrolment::Standing::of(Some(&held), std::time::SystemTime::now()),
                 crate::enrolment::Standing::Fresh | crate::enrolment::Standing::Aging
@@ -3686,7 +3815,7 @@ where
                 #[cfg(feature = "device-identity")]
                 if let Ok(Some(held)) = self.device_certificate() {
                     let key_id = *held.leaf.identity().key().as_bytes();
-                    self.carry_writer(unissued(), &WriterRef::Device(key_id))?;
+                    self.carry_writers(&[unissued()], &WriterRef::Device(key_id))?;
                 }
                 Ok(None)
             }
@@ -3716,6 +3845,17 @@ where
             return Ok(());
         }
         let task = self.bind_task().await?;
+        // A bind owed for this key supersedes any queued bind for another,
+        // the selected writer having moved, so the stale one drops rather
+        // than sending for a writer the replica no longer writes as.
+        if let WriterTaskKind::Bind { key_id, .. } = &task.kind {
+            self.writer_tasks.retain(|queued| {
+                !matches!(
+                    &queued.kind,
+                    WriterTaskKind::Bind { key_id: other, .. } if other != key_id
+                )
+            });
+        }
         if self.bound_writer.is_none() {
             self.writer_tasks.push_back(task);
         } else {
@@ -3860,6 +4000,16 @@ where
         let writer = WriterRef::Device(key_id);
         match outcome {
             WriterOutcome::Bound { frontier } => {
+                // A completed retirement excludes the key before its answer
+                // can arrive, so a late `Bound` cannot reactivate it.
+                if self.retired_keys.contains(&key_id) {
+                    tracing::warn!("a bind answer named a retired device key, dropping it");
+                    self.flush_writer_tasks().await?;
+                    return Ok(ClientEvent::NonFatal {
+                        related_to: Some(request_id),
+                        detail: "a stale bind answer for a retired key dropped".to_owned(),
+                    });
+                }
                 let queue = self
                     .writers
                     .entry(writer)
@@ -3882,9 +4032,7 @@ where
                     .filter(|w| !matches!(w, WriterRef::Device(_)))
                     .copied()
                     .collect();
-                for dead in stale {
-                    self.carry_writer(dead, &writer)?;
-                }
+                self.carry_writers(&stale, &writer)?;
                 self.flush_writer_tasks().await?;
                 self.replay_pending().await?;
                 Ok(ClientEvent::NonFatal {
@@ -3895,7 +4043,7 @@ where
             WriterOutcome::Retired | WriterOutcome::NotEnrolled | WriterOutcome::Unknown => {
                 // The key is retired or not a live enrolment, so the tail
                 // travels under a fresh number and the device enrols fresh.
-                Ok(self.retire_device())
+                self.retire_device()
             }
         }
     }
@@ -3940,82 +4088,113 @@ where
         Ok(())
     }
 
-    /// Atomically carries a writer's pending entries with their original provenance.
-    fn carry_writer(&mut self, dead: WriterRef, target: &WriterRef) -> Result<(), ClientError> {
-        let (mut next_seq, mut head) = match self.writers.get(target) {
-            Some(queue) => (queue.next_seq, queue.head),
-            None => (1, GENESIS),
-        };
-        let dead_queue = self.writers.get(&dead);
-        let mut plan: Vec<(u64, [u8; 32])> = Vec::new();
-        if let Some(queue) = dead_queue {
-            for entry in queue.pending.values() {
-                let hash = entry_hash(&head, next_seq, &self.logical_for(&entry.changeset)?);
-                plan.push((next_seq, hash));
-                next_seq += 1;
-                head = hash;
+    /// Atomically carries tails in append order and excludes retired device keys.
+    fn carry_writers(&mut self, dead: &[WriterRef], target: &WriterRef) -> Result<(), ClientError> {
+        debug_assert!(!dead.contains(target));
+        let capacity = dead
+            .iter()
+            .filter_map(|writer| self.writers.get(writer))
+            .map(|queue| queue.pending.len())
+            .sum();
+        let mut plan = Vec::with_capacity(capacity);
+        for source in dead {
+            if let Some(queue) = self.writers.get(source) {
+                for (original_seq, entry) in &queue.pending {
+                    plan.push(CarriedEntry {
+                        source: *source,
+                        original_seq: *original_seq,
+                        position: entry.position,
+                        seq: 0,
+                        hash: GENESIS,
+                    });
+                }
             }
+        }
+        plan.sort_unstable_by_key(|entry| entry.position);
+        let (mut next_seq, mut head) = self
+            .writers
+            .get(target)
+            .map_or((1, GENESIS), |queue| (queue.next_seq, queue.head));
+        for placement in &mut plan {
+            let entry = &self.writers[&placement.source].pending[&placement.original_seq];
+            placement.seq = next_seq;
+            placement.hash = entry_hash(&head, next_seq, &self.logical_for(&entry.changeset)?);
+            next_seq += 1;
+            head = placement.hash;
         }
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<(), ClientError, _>(|db| {
-            for ((seq, hash), (original_seq, entry)) in plan.iter().zip(
-                dead_queue.into_iter().flat_map(|queue| queue.pending.iter()),
-            ) {
+            for placement in &plan {
+                let entry = &self.writers[&placement.source].pending[&placement.original_seq];
                 let provenance = entry.provenance.or_else(|| {
-                    is_real_writer(&dead).then_some(Provenance {
-                        writer: dead,
-                        seq: *original_seq,
+                    is_real_writer(&placement.source).then_some(Provenance {
+                        writer: placement.source,
+                        seq: placement.original_seq,
                     })
                 });
-                persist_pending(db, target, *seq, &entry.changeset, *hash, provenance)?;
+                persist_pending(
+                    db,
+                    target,
+                    placement.seq,
+                    &entry.changeset,
+                    placement.hash,
+                    provenance,
+                    entry.position,
+                )?;
             }
             if !plan.is_empty() {
                 persist_writer_state(db, target, next_seq, &head)?;
             }
-            drop_writer_state(db, &dead)
+            for writer in dead {
+                #[cfg(feature = "device-identity")]
+                if let WriterRef::Device(key) = writer {
+                    persist_retired_key(db, *key)?;
+                }
+                drop_writer_state(db, writer)?;
+            }
+            Ok(())
         })?;
-        if let Some(dead_queue) = self.writers.remove(&dead)
-            && !plan.is_empty()
-        {
-            let queue = self.writers.entry(*target).or_insert_with(WriterQueue::fresh);
+        if !plan.is_empty() {
+            let mut queue = self
+                .writers
+                .remove(target)
+                .unwrap_or_else(WriterQueue::fresh);
             queue.next_seq = next_seq;
             queue.head = head;
-            for ((dst_seq, hash), (src_seq, mut entry)) in
-                plan.into_iter().zip(dead_queue.pending.into_iter())
-            {
-                entry.hash = hash;
+            for placement in plan {
+                let mut entry = self
+                    .writers
+                    .get_mut(&placement.source)
+                    .expect("the planned source exists")
+                    .pending
+                    .remove(&placement.original_seq)
+                    .expect("the planned entry exists");
+                entry.hash = placement.hash;
                 entry.provenance = entry.provenance.or_else(|| {
-                    is_real_writer(&dead).then_some(Provenance {
-                        writer: dead,
-                        seq: src_seq,
+                    is_real_writer(&placement.source).then_some(Provenance {
+                        writer: placement.source,
+                        seq: placement.original_seq,
                     })
                 });
-                queue.pending.insert(dst_seq, entry);
+                queue.pending.insert(placement.seq, entry);
+            }
+            self.writers.insert(*target, queue);
+        }
+        for writer in dead {
+            self.writers.remove(writer);
+            #[cfg(feature = "device-identity")]
+            if let WriterRef::Device(key) = writer {
+                self.retired_keys.insert(*key);
             }
         }
         Ok(())
     }
 
-    /// The writer a tail travels to when its writer dies, the enrolled device
-    /// while its key is live, the number otherwise, the unissued one until
-    /// the server issues it, never the dead writer itself.
-    fn tail_target(&mut self, dead: &WriterRef) -> WriterRef {
-        #[cfg(feature = "device-identity")]
-        match self.device_bindable() {
-            Ok(true) => {
-                if let Ok(Some(held)) = self.device_certificate() {
-                    let key_id = *held.leaf.identity().key().as_bytes();
-                    let device = WriterRef::Device(key_id);
-                    if device != *dead {
-                        return device;
-                    }
-                }
-            }
-            Ok(false) => {}
-            Err(err) => {
-                tracing::warn!(error = %err, "the tail's target writer could not be read");
-            }
-        }
+    /// The writer a tail travels to when its writer dies: a live number when
+    /// one holds, the unissued one until the server issues it, never a
+    /// device queue, which would join the tail behind its own later entries,
+    /// and never the dead writer itself.
+    fn tail_target(&self, dead: &WriterRef) -> WriterRef {
         match self.number_identity() {
             Some(number) if WriterRef::Number(number) != *dead => WriterRef::Number(number),
             _ => unissued(),
@@ -4026,18 +4205,19 @@ where
     /// the same way the fatal that drove the carry does.
     fn carry_to_live(&mut self, dead: WriterRef) {
         let target = self.tail_target(&dead);
-        if let Err(err) = self.carry_writer(dead, &target) {
+        if let Err(err) = self.carry_writers(&[dead], &target) {
             tracing::warn!(error = %err, "the tail could not be re-queued");
         }
     }
 
-    /// Atomically appends an entry and its writer frontier.
+    /// Atomically appends an entry, its position and its writer frontier.
     fn append_entry(
         &mut self,
         writer: &WriterRef,
         changeset: &[u8],
         provenance: Option<Provenance>,
     ) -> Result<u64, ClientError> {
+        let position = self.next_position;
         let (seq, head) = match self.writers.get(writer) {
             Some(queue) => (queue.next_seq, queue.head),
             None => (1, GENESIS),
@@ -4046,12 +4226,21 @@ where
         let entry = PendingEntry {
             changeset: changeset.to_vec(),
             hash,
+            position,
             provenance,
         };
         let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
         self.db.transaction::<(), ClientError, _>(|db| {
             persist_writer_state(db, writer, seq + 1, &hash)?;
-            persist_pending(db, writer, seq, &entry.changeset, entry.hash, entry.provenance)?;
+            persist_pending(
+                db,
+                writer,
+                seq,
+                &entry.changeset,
+                entry.hash,
+                entry.provenance,
+                position,
+            )?;
             Ok(())
         })?;
         let queue = self
@@ -4061,6 +4250,7 @@ where
         queue.next_seq = seq + 1;
         queue.head = hash;
         queue.pending.insert(seq, entry);
+        self.next_position = position + 1;
         Ok(seq)
     }
 
@@ -4073,29 +4263,48 @@ where
             .collect()
     }
 
-    /// Carry every device tail to a fresh writer and steer the enrolment task
-    /// to a fresh key, device identity only.
-    fn retire_device(&mut self) -> ClientEvent {
-        for writer in self.device_writers() {
-            self.carry_to_live(writer);
-        }
-        // The connection is no longer bound to the retired device, so it
-        // writes as the tail's target, the number or the unissued one, and
-        // the re-enrolled certificate's hook can plan the fresh key's bind.
-        if let Some(dead) = self
-            .bound_writer
-            .filter(|writer| matches!(writer, WriterRef::Device(_)))
+    /// Durably retires device queues before requesting fresh enrolment.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] if the carry and key exclusion cannot commit together.
+    fn retire_device(&mut self) -> Result<ClientEvent, ClientError> {
+        let mut writers = self.device_writers();
+        #[cfg(feature = "device-identity")]
+        if writers.is_empty()
+            && let Some(held) = self.device_certificate()?
         {
-            self.bound_writer = Some(self.tail_target(&dead));
+            writers.push(WriterRef::Device(*held.leaf.identity().key().as_bytes()));
+        }
+        let target = self
+            .number_identity()
+            .map_or_else(unissued, WriterRef::Number);
+        self.carry_writers(&writers, &target)?;
+        #[cfg(feature = "device-identity")]
+        {
+            self.pending_bind = None;
+            self.writer_tasks.retain(|task| {
+                !matches!(
+                    &task.kind,
+                    WriterTaskKind::Bind { key_id, .. }
+                        if self.retired_keys.contains(key_id)
+                )
+            });
+        }
+        if self
+            .bound_writer
+            .is_some_and(|writer| matches!(writer, WriterRef::Device(_)))
+        {
+            self.bound_writer = Some(target);
         }
         #[cfg(feature = "device-identity")]
         if let Some(sender) = &self.writer_retired {
             let _ = sender.send(crate::enrolment::Command::WriterRetired);
         }
-        ClientEvent::NonFatal {
+        Ok(ClientEvent::NonFatal {
             related_to: None,
             detail: "the device's writer retired, a fresh key enrolls".to_owned(),
-        }
+        })
     }
 
     /// The armed resend of writes the server deferred, when there is one.
@@ -4444,12 +4653,19 @@ where
                 account: self.account(),
                 synced_rows,
                 local_rows,
-                pending: self
-                    .writers
-                    .values()
-                    .flat_map(|queue| queue.pending.values())
-                    .map(|entry| entry.changeset.clone())
-                    .collect(),
+                pending: {
+                    // The list order is the append-position order, the one a
+                    // restoring replica re-queues in, so it sorts before the
+                    // changesets leave the queues.
+                    let mut queued: Vec<(u64, Vec<u8>)> = self
+                        .writers
+                        .values()
+                        .flat_map(|queue| queue.pending.values())
+                        .map(|entry| (entry.position, entry.changeset.clone()))
+                        .collect();
+                    queued.sort_unstable_by_key(|(position, _)| *position);
+                    queued.into_iter().map(|(_, changeset)| changeset).collect()
+                },
                 attachments,
             },
         )
@@ -4636,7 +4852,8 @@ where
     }
 
     /// Re-queue the archive's writes as fresh entries under this replica's
-    /// writer, each taking a fresh sequence and chain hash.
+    /// writer, in the archive's list order, each taking a fresh sequence,
+    /// chain hash and position.
     ///
     /// # Errors
     ///
@@ -5272,13 +5489,16 @@ where
     }
 
     /// The writer a new local write queues under: the enrolled device's key
-    /// when the device holds a certificate, the number otherwise, the
-    /// unissued one until the server issues it.
+    /// when the device holds a certificate a completed retirement has not
+    /// excluded, the number otherwise, the unissued one until the server
+    /// issues it.
     fn choose_writer(&mut self) -> WriterRef {
         #[cfg(feature = "device-identity")]
         if let Ok(Some(held)) = self.device_certificate() {
             let key_id = *held.leaf.identity().key().as_bytes();
-            return WriterRef::Device(key_id);
+            if !self.retired_keys.contains(&key_id) {
+                return WriterRef::Device(key_id);
+            }
         }
         match self.number_identity() {
             Some(number) => WriterRef::Number(number),
@@ -5601,7 +5821,7 @@ where
             }
             // The server says why it is closing. Surfaced rather than treated
             // as a violation: the server behaved exactly as the protocol says.
-            ControlMessage::FatalError(fatal) => Ok(self.server_closed(fatal.reason)),
+            ControlMessage::FatalError(fatal) => self.server_closed(fatal.reason),
             ControlMessage::DeliveryPaused { cause } => Ok(ClientEvent::DeliveryPaused { cause }),
             ControlMessage::DeliveryResumed => Ok(ClientEvent::DeliveryResumed),
             ControlMessage::MembershipOpened(opened) => {
@@ -5626,14 +5846,20 @@ where
 
     /// Apply the writer-state change a writer fatal carries, then surface the
     /// close, the pump redialing under the fresh writer.
-    fn server_closed(&mut self, reason: FatalErrorReason) -> ClientEvent {
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when a device retirement cannot be made durable; the
+    /// queues then stand as they did before the transition.
+    fn server_closed(&mut self, reason: FatalErrorReason) -> Result<ClientEvent, ClientError> {
         match reason {
             FatalErrorReason::WriterRetired | FatalErrorReason::WriterUnknown => {
                 match self.bound_writer {
                     Some(WriterRef::Device(_)) => {
-                        // The device's writer is gone, so the tail travels
-                        // under a fresh number and a fresh key enrols.
-                        self.retire_device();
+                        // The device's writer is gone, so its tails travel
+                        // under a number, the key is excluded before the
+                        // cleanup runs, and a fresh key enrols.
+                        self.retire_device()?;
                     }
                     Some(writer) => {
                         // A number died, so its tail travels to the live
@@ -5644,15 +5870,14 @@ where
                 }
             }
             FatalErrorReason::DeviceRevoked => {
-                // R74 revocation deletes the key; the device tails travel
-                // under a number until a fresh enrolment.
-                for writer in self.device_writers() {
-                    self.carry_to_live(writer);
-                }
+                // R74 revocation deletes the key through the enrolment task,
+                // which the same transition steers, so the exclusion stands
+                // while the key is cleared, the number writer untouched.
+                self.retire_device()?;
             }
             _ => {}
         }
-        ClientEvent::ServerClosed { reason }
+        Ok(ClientEvent::ServerClosed { reason })
     }
 
     /// Retire an entry the server applied durably, under the bound writer.
@@ -6090,7 +6315,7 @@ where
     }
 
     /// Put this replica's own unacknowledged writes back after a replacement
-    /// snapshot has landed.
+    /// snapshot has landed, in append-position order across every writer.
     ///
     /// **The clear ahead of a resync deletes rows the server has never seen.**
     /// A local insert that is still queued lives in the replica and in
@@ -6113,12 +6338,14 @@ where
     /// and the server refuses the upload for the same reason. Capture stays
     /// suspended so re-applying does not queue the writes a second time.
     fn reapply_pending(&mut self) -> Result<(), ClientError> {
-        let queued: Vec<Vec<u8>> = self
+        let mut queued: Vec<(u64, Vec<u8>)> = self
             .writers
             .values()
             .flat_map(|queue| queue.pending.values())
-            .map(|entry| entry.changeset.clone())
+            .map(|entry| (entry.position, entry.changeset.clone()))
             .collect();
+        queued.sort_unstable_by_key(|(position, _)| *position);
+        let queued: Vec<Vec<u8>> = queued.into_iter().map(|(_, changeset)| changeset).collect();
         if queued.is_empty() {
             return Ok(());
         }

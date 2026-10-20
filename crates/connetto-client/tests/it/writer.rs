@@ -55,6 +55,7 @@ diesel::table! {
         seq -> BigInt,
         changeset -> Binary,
         entry_hash -> Binary,
+        position -> BigInt,
         prov_writer -> Nullable<Text>,
         prov_seq -> Nullable<BigInt>,
     }
@@ -785,6 +786,7 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
                 _connetto_pending::seq.eq(1_i64),
                 _connetto_pending::changeset.eq(b"one"),
                 _connetto_pending::entry_hash.eq([0u8; 32]),
+                _connetto_pending::position.eq(1_i64),
             ))
             .execute(conn.conn())
             .expect("undecodable writer row");
@@ -794,6 +796,7 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
                 _connetto_pending::seq.eq(-3_i64),
                 _connetto_pending::changeset.eq(b"two"),
                 _connetto_pending::entry_hash.eq([0u8; 32]),
+                _connetto_pending::position.eq(2_i64),
             ))
             .execute(conn.conn())
             .expect("negative sequence row");
@@ -803,6 +806,7 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
                 _connetto_pending::seq.eq(7_i64),
                 _connetto_pending::changeset.eq(b"three"),
                 _connetto_pending::entry_hash.eq([0u8; 31]),
+                _connetto_pending::position.eq(3_i64),
             ))
             .execute(conn.conn())
             .expect("short hash row");
@@ -946,7 +950,7 @@ async fn a_failed_carry_retains_the_complete_source_and_the_restart_resends_it()
     conn.attach(
         Wire::default()
             .silent()
-            .closing_with(FatalErrorReason::WriterUnknown),
+            .closing(FatalErrorReason::WriterUnknown),
     )
     .await
     .expect("attach");
@@ -1277,4 +1281,411 @@ async fn a_writer_answer_naming_a_foreign_request_is_a_protocol_failure() {
         let log = wire.log.lock();
         assert_eq!(log.retires.len(), 1, "the retirement went up once");
     }
+}
+
+#[cfg(feature = "device-identity")]
+diesel::table! {
+    _connetto_device_certificate (id) {
+        /// The single row's identifier.
+        id -> Integer,
+        certificate -> Binary,
+        issuer -> Binary,
+        lifetime_secs -> Nullable<BigInt>,
+    }
+}
+
+/// Issue a profile-valid device certificate for a fresh key, returning the
+/// leaf and issuer DER beside the key id a writer queue names.
+#[cfg(feature = "device-identity")]
+fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+    use connetto_core::device_cert::{
+        AttestationLevel, CertificateRequest, CertificateSerial, DeploymentId, DeviceCertificate,
+        DeviceIssuer, RootCa,
+    };
+    use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
+    use std::time::{Duration, SystemTime};
+
+    let now = SystemTime::now();
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::new_v4()),
+        now,
+        Duration::from_secs(365 * 24 * 3600),
+    )
+    .expect("root");
+    let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let issuer_cert = root
+        .sign_issuer(
+            &issuer_key.subject_public_key_info(),
+            now,
+            Duration::from_secs(90 * 24 * 3600),
+            CertificateSerial::new([1; 16]).expect("serial"),
+        )
+        .expect("issuer");
+    let issuer =
+        DeviceIssuer::new(issuer_cert.clone(), issuer_key, root.certificate()).expect("issuer");
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key");
+    let csr = CertificateRequest::build(&key, &[7; 32]).expect("request builds");
+    let request = CertificateRequest::parse(&csr).expect("request parses");
+    let leaf = issuer
+        .issue(
+            &request,
+            account,
+            now,
+            Duration::from_secs(30 * 24 * 3600),
+            CertificateSerial::new([2; 16]).expect("serial"),
+            AttestationLevel::Unproven,
+        )
+        .expect("issued");
+    let key_id = *DeviceCertificate::parse(&leaf)
+        .expect("profile")
+        .identity()
+        .key()
+        .as_bytes();
+    (leaf, issuer_cert, key_id)
+}
+
+/// Stand a device certificate the enrolment task would have stored.
+#[cfg(feature = "device-identity")]
+fn store_certificate(conn: &mut ConnettoConnection<Wire>, leaf: &[u8], issuer: &[u8]) {
+    diesel::replace_into(_connetto_device_certificate::table)
+        .values((
+            _connetto_device_certificate::id.eq(1),
+            _connetto_device_certificate::certificate.eq(leaf),
+            _connetto_device_certificate::issuer.eq(issuer),
+            _connetto_device_certificate::lifetime_secs.eq(Some(30 * 24 * 3600_i64)),
+        ))
+        .execute(conn.conn())
+        .expect("the certificate stores");
+}
+
+/// The retired-key window: a revoked device keeps its certificate until the
+/// enrolment task clears it, and a write captured inside that window must
+/// not resurrect the retired key's queue. The write stands under the live
+/// number, survives a restart, and settles when the connection is healthy,
+/// while the fresh key takes the writes after it.
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_deliverable() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    // The number writer takes the first write, then the enrolment stands a
+    // certificate and the device takes the next one.
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    let (leaf_a, issuer_a, key_a) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf_a, &issuer_a);
+    write(&mut conn, 2);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Device(key_a),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+        ],
+        "the enrolled device takes the newer write, the number keeps the older"
+    );
+
+    // The server revokes the device. Its tail travels to the number, but the
+    // certificate stays held until the enrolment task clears it.
+    let wire = Wire::default()
+        .silent()
+        .closing(FatalErrorReason::DeviceRevoked);
+    conn.attach(wire).await.expect("revocation");
+    drain(&mut conn).await;
+
+    // The window: a write captured before the cleanup runs.
+    write(&mut conn, 3);
+    assert_eq!(conn.push().await.expect("queue"), Some(3));
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 2
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 3
+            },
+        ],
+        "the window write stands under the live number, not the retired key"
+    );
+
+    // The fresh key arrives and takes the next write, the retired key never
+    // re-selected.
+    let (leaf_b, issuer_b, key_b) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf_b, &issuer_b);
+    write(&mut conn, 4);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Device(key_b),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 2
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 3
+            },
+        ],
+        "the fresh key takes the new write, the number keeps the window write"
+    );
+
+    // A restart keeps the window write deliverable under the number, and the
+    // fresh key's queue whole.
+    drop(conn);
+    let mut conn = open(&dir).await;
+    write(&mut conn, 5);
+    assert_eq!(conn.push().await.expect("queue"), Some(2));
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Device(key_b),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Device(key_b),
+                seq: 2
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 2
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: 3
+            },
+        ],
+        "the restart keeps the window write under the number"
+    );
+
+    // The healthy connection settles the number's tail, the window write in
+    // it, and the fresh key's queue stays whole for its bind.
+    let wire = Wire::default().grant(1, 0);
+    conn.attach(wire.clone()).await.expect("attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.mutations,
+            vec![1, 2, 3],
+            "the number's tail, the window write included, went up in order"
+        );
+    }
+    assert_eq!(
+        conn.unsynced(),
+        vec![
+            UnsyncedWrite {
+                writer: WriterRef::Device(key_b),
+                seq: 1
+            },
+            UnsyncedWrite {
+                writer: WriterRef::Device(key_b),
+                seq: 2
+            },
+        ],
+        "the window write settled, the fresh key's queue stands whole"
+    );
+}
+
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn a_failed_retirement_preserves_the_device_tail_for_retry() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    conn.push().await.expect("number write");
+    let (leaf, issuer, _) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf, &issuer);
+    write(&mut conn, 2);
+    conn.push().await.expect("device write");
+    let before = conn.unsynced();
+    conn.conn()
+        .batch_execute(
+            "CREATE TRIGGER fail_retirement BEFORE INSERT ON _connetto_retired_keys \
+         BEGIN SELECT RAISE(FAIL, 'retirement failure'); END;",
+        )
+        .expect("arm retirement failure");
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::DeviceRevoked),
+    )
+    .await
+    .expect("attach revoked device");
+    let _error = pump_to_error(&mut conn).await;
+    assert_eq!(
+        conn.unsynced(),
+        before,
+        "a failed marker cannot publish a carry"
+    );
+    conn.conn()
+        .batch_execute("DROP TRIGGER fail_retirement")
+        .expect("disarm failure");
+    drop(conn);
+    let mut conn = open(&dir).await;
+    assert_eq!(conn.unsynced(), before, "the source survives restart");
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::DeviceRevoked),
+    )
+    .await
+    .expect("retry retirement");
+    drain(&mut conn).await;
+    drop(conn);
+    let mut conn = open(&dir).await;
+    write(&mut conn, 3);
+    assert_eq!(conn.push().await.expect("write after retirement"), Some(3));
+    let wire = Wire::default();
+    conn.attach(wire.clone())
+        .await
+        .expect("deliver carried writes");
+    drain(&mut conn).await;
+    assert_eq!(wire.log.lock().mutations, [1, 2, 3]);
+    assert!(conn.unsynced().is_empty());
+}
+
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete() {
+    use connetto_client::{ExportScope, ImportChoices};
+    use connetto_core::messages::{
+        FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
+    };
+
+    let dir = tempdir().expect("source directory");
+    let mut source = open(&dir).await;
+    source
+        .attach(Wire::default().silent())
+        .await
+        .expect("attach");
+    write(&mut source, 1);
+    source.push().await.expect("number insert");
+    diesel::delete(t::table.filter(t::id.eq(1)))
+        .execute(source.conn())
+        .expect("device delete");
+    source.push().await.expect("queue device delete");
+    let first_hash: Vec<u8> = _connetto_pending::table
+        .filter(_connetto_pending::seq.eq(1_i64))
+        .select(_connetto_pending::entry_hash)
+        .first(source.conn())
+        .expect("number head");
+    let second: Vec<u8> = _connetto_pending::table
+        .filter(_connetto_pending::seq.eq(2_i64))
+        .select(_connetto_pending::changeset)
+        .first(source.conn())
+        .expect("later delete");
+    let device = format!("device:{}", "01".repeat(32));
+    let device_head = entry_hash(&GENESIS, 1, &second);
+    diesel::update(_connetto_pending::table.filter(_connetto_pending::seq.eq(2_i64)))
+        .set((
+            _connetto_pending::writer.eq(&device),
+            _connetto_pending::seq.eq(1_i64),
+            _connetto_pending::entry_hash.eq(device_head),
+        ))
+        .execute(source.conn())
+        .expect("device tail");
+    diesel::update(_connetto_writers::table)
+        .set((
+            _connetto_writers::next_seq.eq(2_i64),
+            _connetto_writers::head.eq(first_hash),
+        ))
+        .execute(source.conn())
+        .expect("number frontier");
+    diesel::insert_into(_connetto_writers::table)
+        .values((
+            _connetto_writers::id.eq(device),
+            _connetto_writers::next_seq.eq(2_i64),
+            _connetto_writers::head.eq(device_head),
+        ))
+        .execute(source.conn())
+        .expect("device frontier");
+    drop(source);
+    let mut source = open(&dir).await;
+    let source_wire = Wire::default().silent();
+    source.attach(source_wire.clone()).await.expect("reattach");
+    source
+        .subscribe("ordered", "SELECT id FROM t")
+        .await
+        .expect("subscribe");
+    source_wire.log.lock().outbox.extend([
+        IncomingFrame::Control(ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "ordered".to_owned(),
+            reason: FullResyncReason::CursorOutsideRetention,
+        })),
+        IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
+            sub_id: "ordered".to_owned(),
+            priority: SubscriptionPriority::default(),
+        })),
+        IncomingFrame::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
+            sub_id: "ordered".to_owned(),
+            cursor: Cursor::new(Vec::new()),
+        })),
+    ]);
+    drain(&mut source).await;
+    let rows: Vec<i32> = t::table
+        .select(t::id)
+        .load(source.conn())
+        .expect("resynced rows");
+    assert_eq!(
+        rows,
+        Vec::<i32>::new(),
+        "resync must reapply the delete after its insert"
+    );
+    let archive = source
+        .export_local_data(ExportScope::Everything, Vec::new())
+        .expect("export");
+    let fresh = tempdir().expect("destination directory");
+    let mut restored = open(&fresh).await;
+    let plan = restored
+        .import_local_data(std::io::Cursor::new(archive))
+        .expect("read archive");
+    restored
+        .apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("restore");
+    let rows: Vec<i32> = t::table
+        .select(t::id)
+        .load(restored.conn())
+        .expect("restored rows");
+    assert_eq!(
+        rows,
+        Vec::<i32>::new(),
+        "the later delete must follow its insert"
+    );
+    let wire = Wire::default();
+    restored
+        .attach(wire.clone())
+        .await
+        .expect("deliver restored writes");
+    drain(&mut restored).await;
+    assert_eq!(wire.log.lock().mutations, [1, 2]);
+    assert!(restored.unsynced().is_empty());
 }
