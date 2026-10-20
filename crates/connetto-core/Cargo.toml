@@ -99,3 +99,5 @@ tokio = { version = "1", default-features = false, features = ["rt"] }
 # The device certificate tests check issued chains with the verifier peers use.
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "alloc"] }
 rustls-pki-types = "1"
+# The device certificate tests verify a signature the way the server does.
+ring = "0.17"

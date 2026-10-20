@@ -1322,6 +1322,7 @@ dependencies = [
  "diesel",
  "futures-util",
  "rcgen",
+ "ring",
  "rmp-serde",
  "rustls",
  "rustls-pki-types",

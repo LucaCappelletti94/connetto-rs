@@ -18,6 +18,7 @@ pub mod reconnect;
 pub mod registration;
 pub mod share_keys;
 pub mod subscription;
+pub mod writer;
 
 pub use aggregate::AggregateUpdate;
 pub use bulk::{BulkMessage, LivePatch, MutationPatch, SnapshotPatch};
@@ -47,4 +48,8 @@ pub use share_keys::{ReplaceShareKeys, ShareKeysReplaced};
 pub use subscription::{
     BindValue, MembershipOpened, SnapshotBegin, SnapshotEnd, Subscribe, SubscriptionPriority,
     SubscriptionSpec, Unsubscribe,
+};
+pub use writer::{
+    BindDevice, Provenance, RetireWriter, WRITER_BIND_DOMAIN, WriterAnswer, WriterGrant,
+    WriterOutcome, WriterRef, WriterRequest, writer_bind_message,
 };

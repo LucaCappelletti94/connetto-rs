@@ -21,7 +21,9 @@ pub use attestation::{ANDROID_ATTESTATION_CHALLENGE, ATTESTATION_EXTENSION, Atte
 pub use authority::{DeviceIssuer, IssueError, IssuerError, RootCa, RootError, deployment_of_root};
 pub use certificate::{DeviceCertificate, ProfileError};
 pub use identity::{DeploymentId, DeviceIdentity, IdentityError, KeyId};
-pub use key::{CertificateSigner, DeviceKey, DeviceKeyError, KeyHome, key_id, public_key_info};
+pub use key::{
+    CertificateSigner, DeviceKey, DeviceKeyError, KeyHome, key_id, public_key_info, spki_point,
+};
 pub use request::{CertificateRequest, RequestError};
 pub use revocation::{
     ListError, RevocationList, Revoked, certificate_key_id, certificate_serial, verify_chain,
