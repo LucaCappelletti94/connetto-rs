@@ -4921,10 +4921,6 @@ where
         }
     }
 
-    #[expect(
-        clippy::too_many_lines,
-        reason = "one dispatch arm per control message, each delegating to its own handler"
-    )]
     async fn handle_control<T: Transport>(
         &self,
         transport: &mut T,
