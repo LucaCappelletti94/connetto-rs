@@ -4,6 +4,7 @@ pub mod auth;
 pub mod backoff;
 pub mod bots;
 pub mod chain;
+pub mod clock;
 pub mod codec;
 pub mod cursor;
 pub mod custody;

@@ -562,6 +562,26 @@ pub(crate) fn pins(db: &mut SqliteConnection) -> Result<Vec<(String, String)>, C
         .load(db)?)
 }
 
+/// Store the replica's `now` as the stop moment of every record whose stop the
+/// clock has not reached, a wall clock stepped back, so its countdown runs from
+/// `now` and outlives a restart (`docs/architecture/21-clocks.md`). The caller
+/// holds capture suspended, as for every other `_connetto_subscription` write.
+///
+/// # Errors
+///
+/// [`ClientError::Session`] when the replica rejects the read or the write.
+pub(crate) fn reanchor_ahead(db: &mut SqliteConnection) -> Result<(), ClientError> {
+    let now = now_secs(db)?;
+    let ahead = subscription::table.filter(subscription::stopped_at.gt(Some(now)));
+    // The pump asks on every step, so the write lock is taken only on a step.
+    if diesel::select(diesel::dsl::exists(ahead)).get_result::<bool>(db)? {
+        diesel::update(ahead)
+            .set(subscription::stopped_at.eq(Some(now)))
+            .execute(db)?;
+    }
+    Ok(())
+}
+
 /// Every watch whose grace has run out, so the caller can unsubscribe each and
 /// drop its record. Reading this never deletes anything on its own.
 ///
@@ -728,6 +748,71 @@ mod tests {
             expired(&mut db).expect("expired"),
             vec!["wire-1".to_owned()],
             "no grace at all, so dropping ends it at once"
+        );
+    }
+
+    /// A wall step after the drop leaves the stop moment ahead of the
+    /// replica's clock, and the countdown must not run from that future
+    /// moment, or a step back a week keeps a dropped watch streaming the
+    /// whole week. The first read stores a stop at the current clock, so
+    /// the re-anchored countdown outlives a restart.
+    #[test]
+    fn a_clock_stepped_back_reanchors_a_dropped_watch() {
+        let mut db = replica();
+        let spec = SubscriptionSpec::new("SELECT * FROM orders");
+        remember(&mut db, "wire-0", &spec, DEFAULT_GRACE).expect("remember");
+        release(&mut db, "wire-0").expect("release");
+
+        // The step itself: the row keeps the pre-step stop, a week ahead of
+        // what the clock reads now.
+        let stopped = now_secs(&mut db).expect("now") + 7 * 24 * 3600;
+        diesel::update(subscription::table.filter(subscription::id.eq("wire-0")))
+            .set(subscription::stopped_at.eq(Some(stopped)))
+            .execute(&mut db)
+            .expect("step the clock back");
+
+        reanchor_ahead(&mut db).expect("re-anchor");
+        let records = declared(&mut db).expect("declared");
+        assert!(records[0].live, "still inside the re-anchored grace");
+        assert!(
+            expired(&mut db).expect("expired").is_empty(),
+            "the re-anchored grace has not run out"
+        );
+        let stored: i64 = subscription::table
+            .filter(subscription::id.eq("wire-0"))
+            .select(subscription::stopped_at.assume_not_null())
+            .first(&mut db)
+            .expect("read stop");
+        assert!(
+            stored <= now_secs(&mut db).expect("now"),
+            "the countdown runs from the current clock, not the future stop"
+        );
+        assert_ne!(
+            stored, stopped,
+            "the future stop is replaced rather than kept"
+        );
+    }
+
+    /// An ended record carries no grace, so a step back after its end must
+    /// not hold it back. The next read re-anchors it, and it expires at
+    /// once.
+    #[test]
+    fn a_clock_stepped_back_does_not_hold_back_an_ended_record() {
+        let mut db = replica();
+        let spec = SubscriptionSpec::new("SELECT * FROM orders");
+        remember(&mut db, "wire-0", &spec, DEFAULT_GRACE).expect("remember");
+        end(&mut db, "wire-0").expect("end");
+        let stopped = now_secs(&mut db).expect("now") + 7 * 24 * 3600;
+        diesel::update(subscription::table.filter(subscription::id.eq("wire-0")))
+            .set(subscription::stopped_at.eq(Some(stopped)))
+            .execute(&mut db)
+            .expect("step the clock back");
+
+        reanchor_ahead(&mut db).expect("re-anchor");
+        assert_eq!(
+            expired(&mut db).expect("expired"),
+            vec!["wire-0".to_owned()],
+            "no grace at all, so the re-anchored stop is already past"
         );
     }
 

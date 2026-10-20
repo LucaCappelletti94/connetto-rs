@@ -5868,9 +5868,17 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica cannot be read.
+    /// [`ClientError::Session`] when the replica cannot be read or written.
     pub fn expired_subscriptions(&mut self) -> Result<Vec<String>, ClientError> {
+        self.reanchor_subscriptions()?;
         subscriptions::expired(&mut self.db)
+    }
+
+    /// Re-anchor every stop moment a stepped-back wall clock left ahead of the
+    /// replica clock, with capture suspended so the write never rides an upload.
+    fn reanchor_subscriptions(&mut self) -> Result<(), ClientError> {
+        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+        subscriptions::reanchor_ahead(&mut self.db)
     }
 
     /// The current wall time in seconds since the epoch, from the replica's
@@ -5960,10 +5968,11 @@ where
     ///
     /// # Errors
     ///
-    /// [`ClientError::Session`] when the replica cannot be read.
+    /// [`ClientError::Session`] when the replica cannot be read or written.
     pub fn declared_subscriptions(
         &mut self,
     ) -> Result<Vec<(String, SubscriptionSpec)>, ClientError> {
+        self.reanchor_subscriptions()?;
         Ok(subscriptions::declared(&mut self.db)?
             .into_iter()
             .map(|record| (record.sub_id, record.spec))
@@ -5978,6 +5987,7 @@ where
     /// the second kind is live at launch and re-claimed as screens mount, so
     /// there is no second case to write here.
     async fn replay_subscriptions(&mut self) -> Result<(), ClientError> {
+        self.reanchor_subscriptions()?;
         for record in subscriptions::declared(&mut self.db)? {
             if record.live {
                 self.send_subscribe(&record.sub_id, record.spec).await?;

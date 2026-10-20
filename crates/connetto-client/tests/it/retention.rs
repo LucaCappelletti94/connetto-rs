@@ -805,3 +805,69 @@ async fn an_offline_unsubscribe_defers_eviction_to_the_next_connected_attach() {
         "an ended record is never replayed as a subscription",
     );
 }
+
+diesel::table! {
+    /// connetto's internal subscription record, named here only so a test can
+    /// put a stop moment ahead of the replica clock.
+    #[sql_name = "_connetto_subscription"]
+    connetto_subscription (id) {
+        /// The subscription id.
+        id -> Text,
+        /// When the last handle dropped, in replica seconds.
+        stopped_at -> Nullable<BigInt>,
+    }
+}
+
+/// A stop moment a stepped-back clock put ahead of the replica clock is
+/// re-anchored outside capture, so the next upload names the app's table alone.
+#[tokio::test]
+async fn a_reanchored_grace_never_rides_the_next_upload() {
+    let mut conn = ClientBuilder::new(
+        super::support::bundle(DDL),
+        super::support::NeverDial::<LoopbackTransport>::default(),
+    )
+    .signed_in(super::support::held("r72"))
+    .open_driven()
+    .expect("open offline");
+    conn.subscribe_spec("a", SubscriptionSpec::new("SELECT * FROM orders"))
+        .await
+        .expect("record subscription");
+    conn.release_subscription("a")
+        .expect("drop the last handle");
+    let week_ahead = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs()
+        + 7 * 24 * 60 * 60;
+    diesel::update(connetto_subscription::table.filter(connetto_subscription::id.eq("a")))
+        .set(connetto_subscription::stopped_at.eq(i64::try_from(week_ahead).expect("fits")))
+        .execute(conn.conn())
+        .expect("step the stop moment ahead");
+    // The step is this test's own captured write, recorded here and not below.
+    conn.push().await.expect("record the setup");
+
+    assert_eq!(
+        conn.expired_subscriptions().expect("expired"),
+        Vec::<String>::new(),
+        "a week of grace has not run out"
+    );
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(1_i64),
+            orders::price.eq(1.0),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("x"),
+        ))
+        .execute(conn.conn())
+        .expect("the app's write");
+    let seq = conn
+        .push()
+        .await
+        .expect("push")
+        .expect("the app's write records");
+    assert_eq!(
+        super::support::captured_tables(conn.conn(), seq),
+        vec!["orders".to_owned()],
+        "the re-anchor rides no upload"
+    );
+}

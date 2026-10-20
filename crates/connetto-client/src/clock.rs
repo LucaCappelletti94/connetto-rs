@@ -1,10 +1,8 @@
-//! The one clock this crate reads.
+//! The replica's wall clock, which every countdown the replica stores reads.
 //!
-//! The client library deliberately never calls a clock of its own: `chrono` is
-//! a dev dependency and the one `SystemTime::now` is in a test, which is what
-//! keeps it compiling for wasm, where `SystemTime::now` panics. The replica is
-//! open on both targets and carries a clock, so anything measuring elapsed time
-//! measures it through the same connection it stores state in.
+//! Native-only code may read the host clock, as certificate windows and the
+//! away gate do, and wasm code never calls `SystemTime::now`, which panics in
+//! the browser (`docs/architecture/21-clocks.md`).
 
 use diesel::prelude::*;
 use diesel::sqlite::SqliteConnection;

@@ -5,6 +5,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::{DeviceCertificate, KeyId};
 use rustls::pki_types::CertificateDer;
 use serde_bytes::ByteBuf;
@@ -15,7 +16,6 @@ use crate::error::{CloseReason, Refusal};
 use crate::event::PeerEvent;
 use crate::frame::{FrameError, FrameReader, PeerFrame, write_frame};
 use crate::node::{HELLO_TIMEOUT, LinkCommand, NodeState, WRITE_BOUND};
-use crate::verify::TOLERANCE;
 
 /// How long a link whose write failed reads on for a close the peer queued.
 /// The frames sit in the receive buffer already, so the bound only matters
@@ -46,7 +46,7 @@ pub(crate) async fn run<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 DeviceCertificate::parse(&slot.leaf)
                     .expect("the peer's leaf was verified at the handshake")
                     .not_after()
-                    + TOLERANCE
+                    + DEVICE_SKEW
             }
             _ => return,
         }
@@ -275,7 +275,7 @@ fn renew(
     if certificate.identity().key() != key {
         return Err(CloseReason::Protocol);
     }
-    *deadline = certificate.not_after() + TOLERANCE;
+    *deadline = certificate.not_after() + DEVICE_SKEW;
     let mut links = state.links.lock();
     if let Some(crate::node::SlotState::Live(slot)) = links.get_mut(&key)
         && slot.seq == seq

@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime};
 
 use base64::Engine as _;
+use connetto_core::clock::DEVICE_SKEW;
 use connetto_core::device_cert::{
     AttestationLevel, CertificateRequest, CertificateSerial, CertificateSigner, DeploymentId,
     DeviceCertificate, DeviceIssuer, DeviceKey, DeviceKeyError, KeyHome, RevocationList, Revoked,
@@ -28,7 +29,7 @@ use super::Peer;
 use super::task::next_look;
 use super::{
     Answer, CERTIFICATE_DDL, CertificateError, DeviceKeys, EnrolHandle, Enroller, Held, Intake,
-    KeptList, Link, ListInbox, Standing, TOLERANCE, delete, intake, load, run, store,
+    KeptList, Link, ListInbox, Standing, delete, intake, load, run, store,
 };
 use crate::ClientError;
 use crate::ClientEvent;
@@ -140,21 +141,21 @@ async fn standing_follows_the_lifecycle_boundaries() {
     assert_eq!(at(Duration::from_secs(12 * 3600 - 1)), Standing::Fresh);
     assert_eq!(at(12 * HOUR), Standing::Aging, "half-life is the boundary");
     assert_eq!(
-        at(24 * HOUR + TOLERANCE),
+        at(24 * HOUR + DEVICE_SKEW),
         Standing::Aging,
         "within the tolerance past its end"
     );
     assert_eq!(
-        at(24 * HOUR + TOLERANCE + Duration::from_secs(1)),
+        at(24 * HOUR + DEVICE_SKEW + Duration::from_secs(1)),
         Standing::Expired
     );
     assert_eq!(
-        before(TOLERANCE),
+        before(DEVICE_SKEW),
         Standing::Fresh,
         "within the tolerance before its start"
     );
     assert_eq!(
-        before(TOLERANCE + Duration::from_secs(1)),
+        before(DEVICE_SKEW + Duration::from_secs(1)),
         Standing::ClockOff
     );
 }
@@ -177,7 +178,7 @@ async fn a_fresh_certificate_is_looked_at_again_at_half_life_or_within_the_hour(
     assert_eq!(next_look(None, start), HOUR);
     assert_eq!(
         next_look(Some(&short), start + 3 * HOUR + HOUR / 2),
-        HOUR / 2 + TOLERANCE,
+        HOUR / 2 + DEVICE_SKEW,
         "an aging one wakes at its expiry plus the tolerance"
     );
     // An aging certificate far from its expiry is still looked at within
@@ -1947,7 +1948,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         positive_serial(5),
     );
     let task_identity = held.leaf.identity().clone();
-    let deadline = held.leaf.not_after() + TOLERANCE;
+    let deadline = held.leaf.not_after() + DEVICE_SKEW;
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
@@ -2062,7 +2063,7 @@ async fn a_wake_past_the_expiry_closes_the_live_peer_links() {
         positive_serial(5),
     );
     let task_identity = held.leaf.identity().clone();
-    let deadline = held.leaf.not_after() + TOLERANCE;
+    let deadline = held.leaf.not_after() + DEVICE_SKEW;
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
@@ -2143,7 +2144,7 @@ async fn a_granted_renewal_keeps_the_peer_port_and_the_live_link() {
         2 * MINUTE,
         positive_serial(5),
     );
-    let deadline = held.leaf.not_after() + TOLERANCE;
+    let deadline = held.leaf.not_after() + DEVICE_SKEW;
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());

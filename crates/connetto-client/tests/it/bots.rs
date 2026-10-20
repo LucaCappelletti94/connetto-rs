@@ -8,12 +8,12 @@
 
 use std::time::Duration;
 
+use super::support::captured_tables;
 use connetto_client::bots::{Install, create_registration_code, install};
 use connetto_client::{ClientBuilder, ClientError, ConnettoConnection};
 use connetto_server::LoopbackTransport;
 use diesel::prelude::*;
 use sha2::{Digest, Sha256};
-use sqlite_diff_rs::ParsedDiffSet;
 use uuid::Uuid;
 
 const DDL: &str = "\
@@ -44,31 +44,6 @@ fn client() -> ConnettoConnection<LoopbackTransport> {
     )
     .open_driven()
     .expect("the builder opens offline")
-}
-
-/// One row of the durable pending queue, read raw because `_connetto_pending`
-/// is an internal table the typed schema does not name.
-#[derive(QueryableByName)]
-struct PendingRow {
-    #[diesel(sql_type = diesel::sql_types::Binary)]
-    changeset: Vec<u8>,
-}
-
-/// The tables a captured changeset names, read from the durable pending record.
-fn captured_tables(replica: &mut SqliteConnection, seq: u64) -> Vec<String> {
-    // The test sequence is a small counter, so it fits the pending i64 column.
-    let seq: i64 = i64::try_from(seq).expect("a test sequence fits an i64");
-    let row: PendingRow =
-        diesel::sql_query("SELECT changeset FROM _connetto_pending WHERE seq = ?")
-            .bind::<diesel::sql_types::BigInt, _>(seq)
-            .get_result(replica)
-            .expect("the pending record is durable");
-    let ParsedDiffSet::Changeset(set) =
-        ParsedDiffSet::parse(&row.changeset).expect("a captured changeset parses")
-    else {
-        panic!("the captured record is not a changeset");
-    };
-    set.iter().map(|op| op.table().name().to_owned()).collect()
 }
 
 /// `install` writes connetto's rows beside the app's membership row in the
