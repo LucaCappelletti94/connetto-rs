@@ -594,8 +594,8 @@ impl BackgroundTask {
 }
 
 /// Spawn the writer sweep (R75 decision 5), the loop that prunes the settled
-/// rows of every device writer whose enrolment no longer stands, at the fixed
-/// cadence, the first pass at once.
+/// rows of every device writer whose enrolment has been revoked or has gone
+/// absent, at the fixed cadence, the first pass at once.
 fn spawn_writer_sweep<D: ConnettoSchema>(manager: Arc<ServerManager<D>>) -> BackgroundTask {
     BackgroundTask::new(tokio::spawn(async move {
         let mut ticker = tokio::time::interval(WRITER_SWEEP_CADENCE);

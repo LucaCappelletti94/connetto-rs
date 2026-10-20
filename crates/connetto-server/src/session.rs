@@ -5293,11 +5293,13 @@ where
 
     /// Settle a range the courier carried from the author's device (R75).
     ///
-    /// The author's signature verifies against the author's live enrolment,
-    /// the entries continue the author's settled chain from the writer's
+    /// The author's signature verifies against the author's live enrolment
+    /// over the range's chain and every entry's provenance original, the
+    /// entries continue the author's settled chain from the writer's
     /// frontier, and each entry settles at the frontier plus one, in order,
     /// under the author's identity, so an entry another path settled is
-    /// answered from the record and never applied twice.
+    /// answered from the record and never applied twice. A carried entry
+    /// settles its provenance original the way the direct upload does.
     ///
     /// # Errors
     ///
@@ -5379,13 +5381,18 @@ where
             expected = entry.seq.saturating_add(1);
             hashes.push(hash);
         }
-        // The author vouches the chain up to its last entry, or its own head
-        // when the range carries none.
+        // The author vouches the range's chain up to its last entry, or its
+        // own head when the range carries none, and every entry's provenance.
         let (vouch_seq, vouch_head) = match entries.last() {
             Some(last) => (last.seq, previous),
             None => (frontier, head),
         };
-        let message = chain::range_message(author.as_bytes(), vouch_seq, &vouch_head);
+        let message = chain::courier_range_message(
+            author.as_bytes(),
+            vouch_seq,
+            &vouch_head,
+            entries.iter().map(|entry| (entry.seq, entry.provenance)),
+        );
         let Some(point) = spki_point(&record.public_key) else {
             return Ok(CourierDelivery::Refused(CourierRefusal::NotEnrolled));
         };
@@ -5397,6 +5404,7 @@ where
         }
         // The author's identity every entry applies under.
         let session = SessionId::from_uuid(Uuid::new_v4());
+        let session_uuid = *session.as_uuid();
         let mut author_principal = Principal::unidentified(session);
         author_principal
             .accept(Subject::Identity(VerifiedSession {
@@ -5407,16 +5415,19 @@ where
             .expect("one identity settles one run");
         let author: Arc<Principal<Id, Key>> = Arc::new(author_principal);
         let mut outcomes: Vec<SettledOutcome> = Vec::with_capacity(entries.len());
+        let mut previous = head;
         for (entry, hash) in entries.iter().zip(hashes.iter()) {
             let outcome = self
                 .courier_entry(
                     &author,
+                    session_uuid,
                     writer_row.writer,
-                    entry.seq,
+                    entry,
                     *hash,
-                    &entry.changeset,
+                    previous,
                 )
                 .await?;
+            previous = *hash;
             // A refusal stops the range.
             let stops = matches!(outcome, SettledOutcome::Rejected(_));
             outcomes.push(outcome);
@@ -5433,22 +5444,32 @@ where
     ///
     /// [`SessionError::WriteTarget`] when the apply database or the writer
     /// tables fail.
-    /// [`SessionError::Protocol`] when the changeset will not compress.
+    /// [`SessionError::Protocol`] when the changeset will not compress, or
+    /// the provenance sequence is past the original's frontier.
     async fn courier_entry(
         &self,
         author: &Arc<Principal<Id, Key>>,
+        session_id: uuid::Uuid,
         writer: i64,
-        seq: u64,
+        entry: &CourierEntry,
         entry_hash: [u8; 32],
-        changeset: &[u8],
+        previous_hash: [u8; 32],
     ) -> Result<SettledOutcome, SessionError> {
-        let settle = SettleSpec {
+        let changeset = entry.changeset.as_slice();
+        let mut settle = SettleSpec {
             writer,
-            seq,
+            seq: entry.seq,
             entry_hash,
+            previous_hash,
             path: SettlePath::Courier,
             original: None,
         };
+        if let Some(outcome) = self
+            .courier_original(author, session_id, entry, &mut settle)
+            .await?
+        {
+            return Ok(outcome);
+        }
         let payload = compress(changeset).map_err(|err| {
             SessionError::Protocol(format!("the changeset will not compress, {err}"))
         })?;
@@ -5456,7 +5477,7 @@ where
             Ok(plan) => plan,
             Err(err) => {
                 return self
-                    .courier_settle_refusal(&settle, reject_reason(&err))
+                    .courier_settle_refusal(author, &settle, reject_reason(&err))
                     .await;
             }
         };
@@ -5465,7 +5486,7 @@ where
             WriteVerdict::Denied => {
                 let _ = self.guard.rejected_write(Self::caller(author));
                 return self
-                    .courier_settle_refusal(&settle, MutationRejectReason::Unauthorized)
+                    .courier_settle_refusal(author, &settle, MutationRejectReason::Unauthorized)
                     .await;
             }
             // Settles nothing, so the range re-offers from this entry.
@@ -5492,52 +5513,76 @@ where
                 pk_columns,
                 pk_values,
             }),
-            Ok(WriteOutcome::Settled { row, hash_matches }) => {
-                let user_id = author.identity().map(|identity| identity.user_id.clone());
-                if hash_matches {
-                    if row.path != SettlePath::Courier {
-                        // A cross-path delivery stands on both paths' audit.
-                        self.guard.record(
-                            AuthEvent::new(author.session_id(), user_id, AuthOp::WriteRedelivered)
-                                .about_write(
-                                    writer,
-                                    i64::try_from(seq).unwrap_or(i64::MAX),
-                                    SettlePath::Courier,
-                                    row.path,
-                                ),
-                        );
-                    }
-                    Ok(SettledOutcome::from_json(&row.outcome)
-                        .map_err(|err| SessionError::WriteTarget(err.to_string()))?)
-                } else {
-                    self.guard.record(
-                        AuthEvent::new(author.session_id(), user_id, AuthOp::WriteForked)
-                            .about_write(
-                                writer,
-                                i64::try_from(seq).unwrap_or(i64::MAX),
-                                SettlePath::Courier,
-                                row.path,
-                            ),
-                    );
-                    Ok(SettledOutcome::Rejected(MutationRejectReason::Forked))
-                }
+            Ok(WriteOutcome::Settled(settlement)) => {
+                self.recorded_outcome(author, &settle, &settlement)
             }
             Err(WriteError::Unauthorized) => {
-                self.courier_settle_refusal(&settle, MutationRejectReason::Unauthorized)
+                self.courier_settle_refusal(author, &settle, MutationRejectReason::Unauthorized)
                     .await
             }
             Err(WriteError::Materializer(err)) => {
-                self.courier_settle_refusal(&settle, reject_reason(&err))
+                self.courier_settle_refusal(author, &settle, reject_reason(&err))
                     .await
             }
             Err(WriteError::Backend(detail)) => {
-                self.courier_settle_refusal(&settle, MutationRejectReason::Other { detail })
+                self.courier_settle_refusal(author, &settle, MutationRejectReason::Other { detail })
                     .await
             }
             // Settles nothing, so the range re-offers from this entry.
             Err(WriteError::Frontier | WriteError::Transient(_)) => Ok(SettledOutcome::Rejected(
                 MutationRejectReason::Indeterminate,
             )),
+        }
+    }
+
+    /// Settle a courier copy of a recorded original or bind its next sequence.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the writer tables fail or provenance skips the original frontier.
+    async fn courier_original(
+        &self,
+        author: &Arc<Principal<Id, Key>>,
+        session_id: uuid::Uuid,
+        entry: &CourierEntry,
+        settle: &mut SettleSpec,
+    ) -> Result<Option<SettledOutcome>, SessionError> {
+        let Some(provenance) = entry.provenance else {
+            return Ok(None);
+        };
+        match self
+            .provenance_original(&provenance, &entry.changeset, author, session_id)
+            .await?
+        {
+            Some((writer, frontier, _, _)) if provenance.seq <= frontier => {
+                let stored = self
+                    .target
+                    .settled_row(writer, provenance.seq)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                let outcome = match stored {
+                    // A pruned record stands applied.
+                    None => SettledOutcome::Applied,
+                    Some(row) => {
+                        self.recorded_outcome(author, settle, &Settlement { row, forked: false })?
+                    }
+                };
+                let settlement = self
+                    .target
+                    .settle_refusal(settle, &outcome)
+                    .await
+                    .map_err(|err| SessionError::WriteTarget(err.detail()))?;
+                self.recorded_outcome(author, settle, &settlement).map(Some)
+            }
+            Some((writer, frontier, hash, previous)) if provenance.seq == frontier + 1 => {
+                settle.original = Some((writer, provenance.seq, hash, previous));
+                Ok(None)
+            }
+            Some((_, frontier, _, _)) => Err(SessionError::Protocol(format!(
+                "a provenance sequence {} past the original frontier {frontier}",
+                provenance.seq
+            ))),
+            None => Ok(None),
         }
     }
 
@@ -5549,22 +5594,27 @@ where
     /// [`SessionError::WriteTarget`] when the writer tables fail.
     async fn courier_settle_refusal(
         &self,
+        author: &Principal<Id, Key>,
         settle: &SettleSpec,
         reason: MutationRejectReason,
     ) -> Result<SettledOutcome, SessionError> {
-        self.target
-            .settle_refusal(settle, &SettledOutcome::Rejected(reason.clone()))
+        let settlement = self
+            .target
+            .settle_refusal(settle, &SettledOutcome::Rejected(reason))
             .await
             .map_err(|err| SessionError::WriteTarget(err.detail()))?;
-        Ok(SettledOutcome::Rejected(reason))
+        self.recorded_outcome(author, settle, &settlement)
     }
 
     /// One sweep pass (R75 decision 5).
     ///
     /// Prunes the settled rows of every device writer whose enrolment is
-    /// absent, revoked, or holds no live certificate, and reports how many
-    /// writers it pruned. The writer row itself stands, its frontier and head
-    /// intact, so a re-enrolled key resumes the chain where it left it.
+    /// revoked or has gone absent, and reports how many writers it pruned.
+    /// An expired certificate does not prune: the key renews on the same key
+    /// and its settled rows keep the replay and fork evidence its still-bound
+    /// sessions and its renewal consult. The writer row itself stands, its
+    /// frontier and head intact, so a re-enrolled key resumes the chain where
+    /// it left it.
     ///
     /// Fails closed on a store error, a writer whose enrolment record could
     /// not be read keeps its rows, and returns zero when no enrolment is
@@ -5597,7 +5647,7 @@ where
                 .key_record(None, KeyId::from_bytes(bytes))
                 .await
                 .map_err(|_| SessionError::Protocol("the enrolment store did not answer".into()))?;
-            let dead = record.is_none_or(|record| record.revoked || !record.certificate_live);
+            let dead = record.is_none_or(|record| record.revoked);
             if dead {
                 self.target
                     .prune_writer(writer)
@@ -6035,7 +6085,15 @@ where
         // A provenance entry the original already settled settles this copy
         // with the stored outcome, so the logical write applies once.
         if let Some(provenance) = header.provenance {
-            match self.provenance_original(&provenance, bytes, state).await? {
+            match self
+                .provenance_original(
+                    &provenance,
+                    bytes,
+                    &state.principal,
+                    *state.session_id.as_uuid(),
+                )
+                .await?
+            {
                 Some((orig_writer, orig_frontier, _orig_hash, _orig_previous))
                     if provenance.seq <= orig_frontier =>
                 {
@@ -6152,13 +6210,11 @@ where
         &self,
         provenance: &Provenance,
         bytes: &[u8],
-        state: &SessionState<Id, Key>,
+        caller: &Arc<Principal<Id, Key>>,
+        session_id: uuid::Uuid,
     ) -> Result<Option<(i64, u64, [u8; 32], [u8; 32])>, SessionError> {
-        let user_id = state
-            .principal
-            .identity()
-            .map(|identity| identity.user_id.clone());
-        let bind_session = user_id.is_none().then(|| *state.session_id.as_uuid());
+        let user_id = caller.identity().map(|identity| identity.user_id.clone());
+        let bind_session = user_id.is_none().then_some(session_id);
         let row = match provenance.writer {
             WriterRef::Number(number) => {
                 let writer = i64::try_from(number).unwrap_or(i64::MAX);
