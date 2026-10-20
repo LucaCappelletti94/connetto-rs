@@ -34,9 +34,7 @@ use diesel::sqlite::{
     AutoVacuumMode, CommitDecision, Sqlite, SqliteChangeOps, SqliteFunctionBehavior,
     SqliteUpdateRouter, WalCheckpointMode,
 };
-use diesel::{
-    Connection, ExpressionMethods, OptionalExtension, QueryDsl, RunQueryDsl, SqliteConnection,
-};
+use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
 use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
@@ -3313,7 +3311,6 @@ where
                 queue.next_seq = raised;
                 persist_writer_state(&mut self.db, &writer, queue.next_seq, &queue.head)?;
             }
-
         }
         self.replay_pending().await
     }
@@ -4086,7 +4083,6 @@ where
                         })?;
                     outcome.writes_restored += 1;
                 }
-                record_next_seq(db, next_seq)?;
                 bookkeeping(db)?;
                 Ok(())
             })?;
