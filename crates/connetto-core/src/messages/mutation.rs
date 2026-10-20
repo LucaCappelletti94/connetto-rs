@@ -109,6 +109,21 @@ pub enum MutationRejectReason {
     Forked,
 }
 
+/// Formats the refusal and any driver detail for display.
+impl core::fmt::Display for MutationRejectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unauthorized => f.write_str("unauthorized"),
+            Self::SchemaMismatch => f.write_str("schema mismatch"),
+            Self::Constraint { detail } => write!(f, "constraint violation: {detail}"),
+            Self::Malformed { detail } => write!(f, "malformed patchset: {detail}"),
+            Self::Other { detail } => f.write_str(detail),
+            Self::Indeterminate => f.write_str("cannot tell yet, retrying"),
+            Self::Forked => f.write_str("another write already settled at this sequence"),
+        }
+    }
+}
+
 /// Server rejects a mutation without applying it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationReject {
@@ -169,5 +184,47 @@ mod tests {
         };
         assert_ne!(a, b);
         assert_ne!(b, c);
+    }
+
+    /// An application shows the reason's message, so no two reasons may read
+    /// alike and the driver's detail must reach the reader.
+    #[test]
+    fn every_reject_reason_displays_its_own_message_with_its_detail() {
+        let detail = "duplicate key value violates unique constraint";
+        let reasons = [
+            MutationRejectReason::Unauthorized,
+            MutationRejectReason::SchemaMismatch,
+            MutationRejectReason::Constraint {
+                detail: detail.into(),
+            },
+            MutationRejectReason::Malformed {
+                detail: detail.into(),
+            },
+            MutationRejectReason::Other {
+                detail: "a server-side failure".into(),
+            },
+            MutationRejectReason::Indeterminate,
+            MutationRejectReason::Forked,
+        ];
+        let messages: Vec<String> = reasons.iter().map(ToString::to_string).collect();
+        for (i, message) in messages.iter().enumerate() {
+            assert!(!message.is_empty(), "{:?} displays nothing", reasons[i]);
+            for other in &messages[i + 1..] {
+                assert_ne!(message, other, "two reasons read alike");
+            }
+        }
+        for (reason, message) in reasons.iter().zip(&messages) {
+            match reason {
+                MutationRejectReason::Constraint { detail }
+                | MutationRejectReason::Malformed { detail }
+                | MutationRejectReason::Other { detail } => {
+                    assert!(
+                        message.contains(detail.as_str()),
+                        "{message} drops {detail}"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }

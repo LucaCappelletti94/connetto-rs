@@ -3903,11 +3903,9 @@ where
             }
             Ok(())
         }
-        ClientEvent::MutationRejected { client_seq, .. } => reject_tab_mutation(
-            state,
-            client_seq,
-            "the upstream server rejected the forwarded mutation",
-        ),
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => reject_tab_mutation(state, client_seq, reason),
         ClientEvent::MutationConflict {
             client_seq,
             rows,
@@ -4062,10 +4060,7 @@ where
     Ok(())
 }
 
-/// Map an upstream rejection back to the owning tab's sequence number.
-///
-/// The worker client already rolled the change back out of its replica. The
-/// reject tells the tab to do the same to its mirror, so both converge.
+/// Returns the server's refusal under the owning tab's sequence number.
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the event dispatch calls every handler through the same fallible signature"
@@ -4073,7 +4068,7 @@ where
 fn reject_tab_mutation(
     state: &mut HubState,
     worker_seq: u64,
-    detail: &str,
+    reason: MutationRejectReason,
 ) -> Result<(), RelayError> {
     let Some((tab_id, tab_seq)) = state.seq_map.remove(&worker_seq) else {
         return Ok(());
@@ -4082,9 +4077,7 @@ fn reject_tab_mutation(
         let _ = tab.out.send(TabOut::Control(ControlMessage::MutationReject(
             MutationReject {
                 client_seq: tab_seq,
-                reason: MutationRejectReason::Other {
-                    detail: detail.to_owned(),
-                },
+                reason,
             },
         )));
     }
