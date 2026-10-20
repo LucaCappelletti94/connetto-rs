@@ -3512,18 +3512,15 @@ where
         )
         .await
         {
-            // The server does not hold the number the handshake presented, so
-            // its tail travels to the live writer before the refusal surfaces
-            // and the next run asks for a fresh number.
-            Err(ClientError::Refused {
-                reason: FatalErrorReason::WriterUnknown,
-            }) => {
+            Err(
+                error @ ClientError::Refused {
+                    reason: FatalErrorReason::WriterUnknown | FatalErrorReason::WriterRetired,
+                },
+            ) => {
                 if let WriterRequest::Number(number) = writer {
                     self.carry_to_live(WriterRef::Number(number));
                 }
-                return Err(ClientError::Refused {
-                    reason: FatalErrorReason::WriterUnknown,
-                });
+                return Err(error);
             }
             Ok(ack) => ack,
             Err(err) => return Err(err),
@@ -4269,13 +4266,34 @@ where
     ///
     /// [`ClientError`] if the carry and key exclusion cannot commit together.
     fn retire_device(&mut self) -> Result<ClientEvent, ClientError> {
-        let mut writers = self.device_writers();
+        self.exclude_device_writers()?;
         #[cfg(feature = "device-identity")]
-        if writers.is_empty()
-            && let Some(held) = self.device_certificate()?
-        {
-            writers.push(WriterRef::Device(*held.leaf.identity().key().as_bytes()));
+        if let Some(sender) = &self.writer_retired {
+            let _ = sender.send(crate::enrolment::Command::WriterRetired);
         }
+        Ok(ClientEvent::NonFatal {
+            related_to: None,
+            detail: "the device's writer retired, a fresh key enrolls".to_owned(),
+        })
+    }
+
+    /// Durably excludes held device keys and carries their tails.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] if the carry and key exclusion cannot commit together.
+    fn exclude_device_writers(&mut self) -> Result<(), ClientError> {
+        let writers = self.device_writers();
+        #[cfg(feature = "device-identity")]
+        let writers = {
+            let mut writers = writers;
+            if writers.is_empty()
+                && let Some(held) = self.device_certificate()?
+            {
+                writers.push(WriterRef::Device(*held.leaf.identity().key().as_bytes()));
+            }
+            writers
+        };
         let target = self
             .number_identity()
             .map_or_else(unissued, WriterRef::Number);
@@ -4297,14 +4315,7 @@ where
         {
             self.bound_writer = Some(target);
         }
-        #[cfg(feature = "device-identity")]
-        if let Some(sender) = &self.writer_retired {
-            let _ = sender.send(crate::enrolment::Command::WriterRetired);
-        }
-        Ok(ClientEvent::NonFatal {
-            related_to: None,
-            detail: "the device's writer retired, a fresh key enrolls".to_owned(),
-        })
+        Ok(())
     }
 
     /// The armed resend of writes the server deferred, when there is one.
@@ -5870,10 +5881,7 @@ where
                 }
             }
             FatalErrorReason::DeviceRevoked => {
-                // R74 revocation deletes the key through the enrolment task,
-                // which the same transition steers, so the exclusion stands
-                // while the key is cleared, the number writer untouched.
-                self.retire_device()?;
+                self.exclude_device_writers()?;
             }
             _ => {}
         }

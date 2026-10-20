@@ -5614,8 +5614,8 @@ where
                 .about_write(
                     writer,
                     i64::try_from(seq).unwrap_or(i64::MAX),
-                    SettlePath::Direct,
                     row.path,
+                    SettlePath::Direct,
                 ),
             );
         }
@@ -5746,8 +5746,8 @@ where
                                     .about_write(
                                         writer,
                                         i64::try_from(seq).unwrap_or(i64::MAX),
-                                        SettlePath::Direct,
                                         row.path,
+                                        SettlePath::Direct,
                                     ),
                                 );
                             }
@@ -5938,8 +5938,8 @@ where
                 .about_write(
                     settle.writer,
                     i64::try_from(settle.seq).unwrap_or(i64::MAX),
-                    settle.path,
                     row.path,
+                    settle.path,
                 ),
             );
         }

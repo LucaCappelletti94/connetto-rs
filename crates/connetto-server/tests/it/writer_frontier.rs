@@ -2072,8 +2072,8 @@ async fn a_restore_then_reupload_is_answered_from_the_record_and_audited() {
     assert_eq!(event.user_id.as_deref(), Some("alice"));
     assert_eq!(event.writer, Some(writer_b));
     assert_eq!(event.seq, Some(2));
-    assert_eq!(event.path, Some(SettlePath::Direct));
-    assert_eq!(event.other_path, Some(SettlePath::Restore));
+    assert_eq!(event.path, Some(SettlePath::Restore));
+    assert_eq!(event.other_path, Some(SettlePath::Direct));
     let rows_b = settled_rows(fixture.admin(), writer_b).await;
     assert_eq!(rows_b.len(), 2);
     assert_eq!(rows_b[1].seq, 2);
@@ -2183,8 +2183,8 @@ async fn a_device_restore_then_reupload_is_answered_from_the_record_and_audited(
     assert_eq!(event.user_id.as_deref(), Some("alice"));
     assert_eq!(event.writer, Some(writer_k2));
     assert_eq!(event.seq, Some(2));
-    assert_eq!(event.path, Some(SettlePath::Direct));
-    assert_eq!(event.other_path, Some(SettlePath::Restore));
+    assert_eq!(event.path, Some(SettlePath::Restore));
+    assert_eq!(event.other_path, Some(SettlePath::Direct));
     let rows_k2 = settled_rows(fixture.admin(), writer_k2).await;
     assert_eq!(rows_k2.len(), 2);
     assert_eq!(rows_k2[1].outcome, "\"applied\"");
@@ -3114,8 +3114,8 @@ async fn a_restore_path_entry_reuploaded_at_its_sequence_audits_redelivered() {
     assert_eq!(event.user_id.as_deref(), Some("alice"));
     assert_eq!(event.writer, Some(writer_a));
     assert_eq!(event.seq, Some(1));
-    assert_eq!(event.path, Some(SettlePath::Direct));
-    assert_eq!(event.other_path, Some(SettlePath::Restore));
+    assert_eq!(event.path, Some(SettlePath::Restore));
+    assert_eq!(event.other_path, Some(SettlePath::Direct));
     let rows_a = settled_rows(fixture.admin(), writer_a).await;
     assert_eq!(rows_a.len(), 1, "the redelivery settles no second row");
     assert_eq!(

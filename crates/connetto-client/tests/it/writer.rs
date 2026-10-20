@@ -1021,76 +1021,74 @@ async fn a_failed_carry_retains_the_complete_source_and_the_restart_resends_it()
     assert!(conn.unsynced().is_empty(), "the answers retired the tail");
 }
 
-/// A handshake the server refuses as `WriterUnknown` before the ack carries
-/// the presented number's tail to the unissued number, so the next run
-/// re-issues instead of re-presenting a number the server does not hold.
+/// A refused numbered handshake preserves its tail for a fresh writer.
 #[tokio::test]
-async fn a_handshake_refusal_carries_the_unknown_numbers_tail() {
-    let dir = tempdir().expect("temp dir");
-    let mut conn = open(&dir).await;
-    conn.attach(Wire::default().silent()).await.expect("attach");
-    write(&mut conn, 1);
-    assert_eq!(conn.push().await.expect("queue"), Some(1));
-    write(&mut conn, 2);
-    assert_eq!(conn.push().await.expect("queue"), Some(2));
-    drain(&mut conn).await;
+async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
+    for reason in [
+        FatalErrorReason::WriterUnknown,
+        FatalErrorReason::WriterRetired,
+    ] {
+        let dir = tempdir().expect("temp dir");
+        let mut conn = open(&dir).await;
+        conn.attach(Wire::default().silent()).await.expect("attach");
+        write(&mut conn, 1);
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        write(&mut conn, 2);
+        assert_eq!(conn.push().await.expect("queue"), Some(2));
+        drain(&mut conn).await;
 
-    // The reconnect presents the number and the server refuses the handshake
-    // itself, before any ack.
-    let error = conn
-        .attach(Wire::default().refusing_with(FatalErrorReason::WriterUnknown))
-        .await
-        .expect_err("the refused handshake fails the attach");
-    assert!(
-        matches!(
-            error,
-            ClientError::Refused {
-                reason: FatalErrorReason::WriterUnknown
-            }
-        ),
-        "the refusal surfaces, saw {error:?}"
-    );
-    assert_eq!(
-        writers(&mut conn),
-        vec!["number:0".to_owned()],
-        "the unknown number's tail re-keyed under the unissued number"
-    );
-    assert_eq!(
-        conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Number(0),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(0),
-                seq: 2
-            },
-        ],
-        "both writes survive the carry"
-    );
-
-    // The next run asks for a fresh number and resends the carried tail.
-    let wire = Wire::default();
-    conn.attach(wire.clone()).await.expect("re-attach");
-    drain(&mut conn).await;
-    {
-        let log = wire.log.lock();
-        assert_eq!(
-            log.handshakes,
-            vec![WriterRequest::Issue],
-            "the carried tail presents no number, so a fresh one is asked"
+        // The reconnect presents the number and the server refuses the handshake
+        // itself, before any ack.
+        let error = conn
+            .attach(Wire::default().refusing_with(reason.clone()))
+            .await
+            .expect_err("the refused handshake fails the attach");
+        assert!(
+            matches!(&error, ClientError::Refused { reason: actual } if actual == &reason),
+            "the refusal surfaces, saw {error:?}"
         );
         assert_eq!(
-            log.mutations,
-            vec![1, 2],
-            "the carried tail resends in order"
+            writers(&mut conn),
+            vec!["number:0".to_owned()],
+            "the refused number's tail travels under the unissued number"
+        );
+        assert_eq!(
+            conn.unsynced(),
+            vec![
+                UnsyncedWrite {
+                    writer: WriterRef::Number(0),
+                    seq: 1
+                },
+                UnsyncedWrite {
+                    writer: WriterRef::Number(0),
+                    seq: 2
+                },
+            ],
+            "both writes survive the carry"
+        );
+
+        // The next run asks for a fresh number and resends the carried tail.
+        let wire = Wire::default();
+        conn.attach(wire.clone()).await.expect("re-attach");
+        drain(&mut conn).await;
+        {
+            let log = wire.log.lock();
+            assert_eq!(
+                log.handshakes,
+                vec![WriterRequest::Issue],
+                "the carried tail presents no number, so a fresh one is asked"
+            );
+            assert_eq!(
+                log.mutations,
+                vec![1, 2],
+                "the carried tail resends in order"
+            );
+        }
+        assert!(
+            conn.unsynced().is_empty(),
+            "the applied answers retired the carried entries"
         );
     }
-    assert!(
-        conn.unsynced().is_empty(),
-        "the applied answers retired the carried entries"
-    );
 }
 
 /// The split table's local replica writes the physical table under the view,

@@ -48,7 +48,7 @@ The server keeps a record of each settled write, its chain hash, its outcome and
 
 Outstanding writes have durable append positions across writers. Reapplication and archive export follow those positions, which carries preserve. Older number and unissued tails drain before device binding, and the archive's pending list preserves their causal order.
 
-Device retirement commits the carried tail and a durable key-exclusion marker together before application access resumes. Key custody cleanup and fresh enrolment run afterward. A held or renewed certificate cannot reactivate an excluded writer.
+Device retirement commits the carried tail and a durable key-exclusion marker together before custody cleanup and fresh enrolment. Device revocation uses the same queue transaction and then deletes custody through its revocation lifecycle, without requesting writer-retirement enrolment. A held or renewed certificate cannot reactivate an excluded writer.
 
 ## Transport
 
