@@ -80,6 +80,7 @@ fn state() -> (State, mpsc::UnboundedReceiver<Outbound>) {
             deferred: BTreeMap::new(),
             session_id,
             writer_row: None,
+            bind_nonce: [0; 32],
             indeterminate: None,
             resume: Resume::Fresh,
             resume_read_budget: Duration::from_secs(10),
