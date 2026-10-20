@@ -211,7 +211,7 @@ pub const ENROLMENT_DDL: [&str; 3] = [
     "CREATE TABLE connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, \
-     revoked_at TIMESTAMPTZ, attestation TEXT NOT NULL)",
+     revoked_at TIMESTAMPTZ, public_key BYTEA NOT NULL, attestation TEXT NOT NULL)",
     "CREATE TABLE connetto_device_certificates (\
      serial BYTEA PRIMARY KEY, \
      key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \

@@ -56,13 +56,15 @@ pub(crate) enum WriteOutcome {
         /// The server's copy of the row.
         server_row: Option<ConflictRow>,
     },
-    /// The sequence is already settled: answer from the stored row, never apply again.
-    Settled {
-        /// The stored settled row.
-        row: SettledRow,
-        /// Whether the stored entry hash matches this upload's.
-        hash_matches: bool,
-    },
+    /// The write resolves to a first-seen settlement without another apply.
+    Settled(Settlement),
+}
+
+/// The winning current or original record and its current-identity fork check.
+#[derive(Debug)]
+pub(crate) struct Settlement {
+    pub(crate) row: SettledRow,
+    pub(crate) forked: bool,
 }
 
 /// A failure while committing a mutation.
@@ -138,6 +140,8 @@ pub(crate) struct SettleSpec {
     pub previous_hash: [u8; 32],
     /// The path that settles the entry.
     pub path: SettlePath,
+    /// The original writer, sequence, entry hash and predecessor for shared settlement.
+    pub original: Option<(i64, u64, [u8; 32], [u8; 32])>,
 }
 
 /// A Postgres write target that applies under the caller's RLS context.
@@ -248,6 +252,55 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
             .map_err(WriteError::from)
     }
 
+    /// The device writer `device_key`, absent when none exists.
+    pub(crate) async fn writer_by_key(
+        &self,
+        device_key: &[u8],
+    ) -> Result<Option<WriterRow<D::Id>>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::by_key(&mut conn, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The first bind or first provenance of a device writer, absent when the
+    /// row stood already.
+    pub(crate) async fn insert_device_writer(
+        &self,
+        user_id: Option<D::Id>,
+        device_key: &[u8],
+    ) -> Result<Option<(i64, i64)>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::insert_key(&mut conn, user_id, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The same insert opening the row retired, the retirement of a device key
+    /// that never bound, absent when the row stood already.
+    pub(crate) async fn insert_retired_device_writer(
+        &self,
+        user_id: Option<D::Id>,
+        device_key: &[u8],
+    ) -> Result<Option<i64>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::insert_retired_key(&mut conn, user_id, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// Retire the writer `writer`, reporting whether this call retired it.
+    pub(crate) async fn mark_writer_retired(
+        &self,
+        writer: i64,
+        device_key: Option<&[u8]>,
+    ) -> Result<bool, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::mark_retired(&mut conn, writer, device_key)
+            .await
+            .map_err(WriteError::from)
+    }
+
     /// The settled row of `(writer, seq)`, absent when pruned or never settled.
     pub(crate) async fn settled_row(
         &self,
@@ -319,6 +372,13 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         settle: &SettleSpec,
     ) -> Result<WriteOutcome, WriteError> {
         let seq = seq_storage(settle.seq)?;
+        let original = settle
+            .original
+            .filter(|(writer, seq, _, _)| *writer != settle.writer || *seq != settle.seq)
+            .map(|(writer, seq, hash, previous)| {
+                seq_storage(seq).map(|seq| (writer, seq, hash, previous))
+            })
+            .transpose()?;
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
@@ -327,15 +387,14 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         let catalog = &self.catalog;
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(async move |c| {
-                // Reserve the sequence before touching any table, so a settled
-                // entry is answered from the record and a lost apply leaves no row.
+                let applied = SettledOutcome::Applied.json();
                 let reserved = D::Writers::settle(
                     c,
                     settle.writer,
                     seq,
                     &settle.entry_hash,
                     &settle.previous_hash,
-                    &SettledOutcome::Applied.json(),
+                    &applied,
                     settle.path,
                 )
                 .await?;
@@ -343,10 +402,20 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                     let row = D::Writers::settled(c, settle.writer, seq)
                         .await?
                         .ok_or(diesel::result::Error::NotFound)?;
-                    return Ok(WriteOutcome::Settled {
-                        hash_matches: row.entry_hash == settle.entry_hash,
+                    return Ok(WriteOutcome::Settled(Settlement {
+                        forked: row.entry_hash != settle.entry_hash,
                         row,
-                    });
+                    }));
+                }
+                if let Some(row) = Self::reserve_original(c, original, &applied).await? {
+                    let text = std::str::from_utf8(&row.outcome).map_err(|err| {
+                        diesel::result::Error::DeserializationError(Box::new(err))
+                    })?;
+                    D::Writers::settle_outcome(c, settle.writer, seq, text).await?;
+                    if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
+                        return Err(CommitError::Frontier);
+                    }
+                    return Ok(WriteOutcome::Settled(Settlement { row, forked: false }));
                 }
                 binding.apply(c).await?;
                 for op in &plan.ops {
@@ -357,8 +426,6 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         .await
                         .map_err(CommitError::Probe)?
                     {
-                        // The reserved row keeps the sequence; restate its outcome
-                        // to the conflict so the record matches the refusal.
                         let outcome = SettledOutcome::Conflict {
                             table: conflict.table.clone(),
                             version_column: conflict.version_column.clone(),
@@ -369,8 +436,15 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                                 .map(crate::materializer::stored_value)
                                 .collect(),
                         };
-                        D::Writers::settle_outcome(c, settle.writer, seq, &outcome.json()).await?;
-                        D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await?;
+                        let text = outcome.json();
+                        D::Writers::settle_outcome(c, settle.writer, seq, &text).await?;
+                        if let Some((writer, oseq, _, _)) = original {
+                            D::Writers::settle_outcome(c, writer, oseq, &text).await?;
+                        }
+                        Self::advance_original(c, original).await?;
+                        if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
+                            return Err(CommitError::Frontier);
+                        }
                         return Ok(conflict_outcome(conflict, row));
                     }
                 }
@@ -381,6 +455,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }
+                Self::advance_original(c, original).await?;
                 if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
                     return Err(CommitError::Frontier);
                 }
@@ -390,16 +465,62 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         outcome.map_err(commit_failure)
     }
 
-    /// Settle a refused entry after its apply rolled back, in its own transaction.
-    /// Loses silently when a concurrent copy settled the sequence first.
+    async fn reserve_original(
+        conn: &mut AsyncPgConnection,
+        original: Option<(i64, i64, [u8; 32], [u8; 32])>,
+        outcome: &str,
+    ) -> Result<Option<SettledRow>, CommitError> {
+        let Some((writer, seq, hash, previous)) = original else {
+            return Ok(None);
+        };
+        if D::Writers::settle(
+            conn,
+            writer,
+            seq,
+            &hash,
+            &previous,
+            outcome,
+            SettlePath::Restore,
+        )
+        .await?
+        {
+            return Ok(None);
+        }
+        Ok(Some(
+            D::Writers::settled(conn, writer, seq)
+                .await?
+                .ok_or(diesel::result::Error::NotFound)?,
+        ))
+    }
+
+    async fn advance_original(
+        conn: &mut AsyncPgConnection,
+        original: Option<(i64, i64, [u8; 32], [u8; 32])>,
+    ) -> Result<(), CommitError> {
+        if let Some((writer, seq, hash, _)) = original
+            && !D::Writers::advance(conn, writer, seq, &hash).await?
+        {
+            return Err(CommitError::Frontier);
+        }
+        Ok(())
+    }
+
+    /// Settles a terminal outcome and returns the first-seen record.
     pub(crate) async fn settle_refusal(
         &self,
         settle: &SettleSpec,
         outcome: &SettledOutcome,
-    ) -> Result<(), WriteError> {
+    ) -> Result<Settlement, WriteError> {
         let seq = seq_storage(settle.seq)?;
+        let original = settle
+            .original
+            .filter(|(writer, seq, _, _)| *writer != settle.writer || *seq != settle.seq)
+            .map(|(writer, seq, hash, previous)| {
+                seq_storage(seq).map(|seq| (writer, seq, hash, previous))
+            })
+            .transpose()?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        conn.transaction::<(), CommitError, _>(async move |c| {
+        conn.transaction::<Settlement, CommitError, _>(async move |c| {
             let text = outcome.json();
             let won = D::Writers::settle(
                 c,
@@ -411,10 +532,36 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 settle.path,
             )
             .await?;
-            if won {
-                D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await?;
+            if !won {
+                let row = D::Writers::settled(c, settle.writer, seq)
+                    .await?
+                    .ok_or(diesel::result::Error::NotFound)?;
+                return Ok(Settlement {
+                    forked: row.entry_hash != settle.entry_hash,
+                    row,
+                });
             }
-            Ok(())
+            let result = if let Some(row) = Self::reserve_original(c, original, &text).await? {
+                let stored = std::str::from_utf8(&row.outcome)
+                    .map_err(|err| diesel::result::Error::DeserializationError(Box::new(err)))?;
+                D::Writers::settle_outcome(c, settle.writer, seq, stored).await?;
+                Settlement { row, forked: false }
+            } else {
+                Self::advance_original(c, original).await?;
+                Settlement {
+                    row: SettledRow {
+                        entry_hash: settle.entry_hash.to_vec(),
+                        previous_hash: settle.previous_hash.to_vec(),
+                        outcome: text.into_bytes(),
+                        path: settle.path,
+                    },
+                    forked: false,
+                }
+            };
+            if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
+                return Err(CommitError::Frontier);
+            }
+            Ok(result)
         })
         .await
         .map_err(commit_failure)

@@ -170,7 +170,7 @@ impl<D: DeviceDescriptor> DeviceEntry<D> {
     }
 }
 
-enum Command {
+pub(crate) enum Command {
     Reissue {
         lifetime: Duration,
         reply: oneshot::Sender<Result<(), CertificateError>>,
@@ -182,6 +182,9 @@ enum Command {
         key: KeyId,
         reply: oneshot::Sender<Result<(), CertificateError>>,
     },
+    /// The device's writer is retired, so the task deletes the key and the
+    /// certificate and a fresh enrolment follows through the connection.
+    WriterRetired,
     /// `link_peer` refused as expired, so the task raises the event (R76).
     #[cfg(feature = "peer")]
     CertificateExpired,
@@ -409,6 +412,12 @@ impl EnrolHandle {
             .send(Command::Revoke { key, reply })
             .map_err(|_| CertificateError::Offline)?;
         answer.await.unwrap_or(Err(CertificateError::Offline))
+    }
+
+    /// The task's command channel, so the client can steer a fresh key after
+    /// a writer retirement (R75).
+    pub(crate) fn writer_retirement(&self) -> mpsc::UnboundedSender<Command> {
+        self.commands.clone()
     }
 
     /// The certificate this device holds.
@@ -1000,6 +1009,21 @@ impl<L: Link> Run<L> {
         self.peer_stop(CloseReason::Revoked);
     }
 
+    /// Delete the key and certificate of a retired writer, keeping the
+    /// enrolment's ordinary connection path for the fresh key (R75).
+    async fn retired_writer(&mut self) {
+        if let Err(err) = self.enroller.keys.delete().await {
+            tracing::warn!(error = %err, "the retired device key could not be deleted");
+        }
+        if let Err(err) = self.link.forget().await {
+            tracing::warn!(error = %err, "the retired certificate could not be deleted");
+        }
+        self.key = None;
+        self.enroller.home.send_replace(None);
+        self.held = None;
+        self.publish();
+    }
+
     /// Keep each verified list newer than the one kept from its signer, and
     /// take this device's own listed certificate as its revocation (lifecycle
     /// row "Newer list from server or peer", decision 22).
@@ -1345,6 +1369,10 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 }
                 Some(Command::Revoke { key, reply }) => {
                     let _ = reply.send(run.revoke(key).await);
+                }
+                Some(Command::WriterRetired) => {
+                    run.retired_writer().await;
+                    due = run.link.connected().await;
                 }
                 #[cfg(feature = "peer")]
                 Some(Command::CertificateExpired) => {

@@ -4,8 +4,9 @@
 //! hold: a handshake acknowledged with no writer yet keeps the issued number
 //! and re-keys the queue; a handshake with a number writer reconciles the
 //! queue against the reported frontier without retiring anything locally; a
-//! write whose answer was lost is rolled back when its resend is refused; the
-//! number's sequence and chain head outlive an emptied queue and a restart.
+//! `WriterRetired` fatal re-queues the tail with provenance under a fresh
+//! number. The device-writer rows need an enrolled key, which the native
+//! suites steer through the enrolment task.
 
 use std::collections::VecDeque;
 use std::future::{Future, ready};
@@ -18,7 +19,8 @@ use connetto_core::Cursor;
 use connetto_core::chain::{GENESIS, entry_hash};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, MutationApplied,
-    MutationReject, MutationRejectReason, WriterGrant, WriterRef, WriterRequest,
+    MutationReject, MutationRejectReason, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
+    WriterRequest,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -37,7 +39,6 @@ diesel::table! {
         id -> Integer,
     }
 }
-
 diesel::table! {
     /// The client's private writer-state table, read by the assertions.
     _connetto_writers (id) {
@@ -45,6 +46,37 @@ diesel::table! {
         next_seq -> BigInt,
         head -> Binary,
     }
+}
+
+diesel::table! {
+    /// The client's private pending-queue table, read by the assertions.
+    _connetto_pending (writer, seq) {
+        writer -> Text,
+        seq -> BigInt,
+        changeset -> Binary,
+        entry_hash -> Binary,
+        position -> BigInt,
+        prov_writer -> Nullable<Text>,
+        prov_seq -> Nullable<BigInt>,
+    }
+}
+
+diesel::table! {
+    /// The client's private retirement-owed table, seeded by an assertion.
+    _connetto_retire (writer) {
+        /// The writer to retire, the replica's spelling of the wire name.
+        writer -> Text,
+    }
+}
+
+/// One row of the durable pending queue, the bookkeeping columns the
+/// assertions read.
+#[derive(diesel::Queryable, Debug, PartialEq, Eq)]
+struct PendingRow {
+    writer: String,
+    seq: i64,
+    prov_writer: Option<String>,
+    prov_seq: Option<i64>,
 }
 
 /// How the fake answers the mutation headers it is handed.
@@ -71,12 +103,13 @@ struct Log {
     handshakes: Vec<WriterRequest>,
     mutations: Vec<u64>,
     bulks: Vec<Vec<u8>>,
+    retires: Vec<connetto_core::messages::RetireWriter>,
     outbox: VecDeque<IncomingFrame>,
 }
 
 /// A transport that plays a fresh server: it grants a writer number at the
-/// handshake, records what it is sent, and answers mutations from its own
-/// record.
+/// handshake, records what it is sent, and answers mutations, binds and
+/// retirements from its own record.
 #[derive(Clone)]
 struct Wire {
     log: Arc<Mutex<Log>>,
@@ -86,6 +119,7 @@ struct Wire {
     lie: Option<Lie>,
     closing: Option<FatalErrorReason>,
     refuse: Option<FatalErrorReason>,
+    retire_answer: Option<String>,
 }
 
 impl Default for Wire {
@@ -98,6 +132,7 @@ impl Default for Wire {
             lie: None,
             closing: None,
             refuse: None,
+            retire_answer: None,
         }
     }
 }
@@ -131,8 +166,8 @@ impl Wire {
         self
     }
 
-    /// Close the session deliberately with `reason` right after the handshake.
-    fn closing_with(mut self, reason: FatalErrorReason) -> Self {
+    /// Close the connection right after the handshake with `reason`.
+    fn closing(mut self, reason: FatalErrorReason) -> Self {
         self.closing = Some(reason);
         self
     }
@@ -140,6 +175,12 @@ impl Wire {
     /// Refuse the handshake itself with `reason`, before any ack.
     fn refusing_with(mut self, reason: FatalErrorReason) -> Self {
         self.refuse = Some(reason);
+        self
+    }
+
+    /// Answer a retirement under a request id the connection did not send.
+    fn retire_answer_with(mut self, request_id: impl Into<String>) -> Self {
+        self.retire_answer = Some(request_id.into());
         self
     }
 }
@@ -215,6 +256,18 @@ impl Transport for Wire {
                 };
                 self.log.lock().outbox.push_back(frame);
             }
+            ControlMessage::RetireWriter(retire) => {
+                let mut log = self.log.lock();
+                log.retires.push(retire.clone());
+                let request_id = self.retire_answer.clone().unwrap_or(retire.request_id);
+                log.outbox
+                    .push_back(IncomingFrame::Control(ControlMessage::WriterAnswer(
+                        WriterAnswer {
+                            request_id,
+                            outcome: WriterOutcome::Retired,
+                        },
+                    )));
+            }
             _ => {}
         }
         ready(Ok(()))
@@ -259,6 +312,19 @@ fn writers(conn: &mut ConnettoConnection<Wire>) -> Vec<String> {
         .expect("read the writer states")
 }
 
+fn pending(conn: &mut ConnettoConnection<Wire>) -> Vec<PendingRow> {
+    _connetto_pending::table
+        .select((
+            _connetto_pending::writer,
+            _connetto_pending::seq,
+            _connetto_pending::prov_writer,
+            _connetto_pending::prov_seq,
+        ))
+        .order(_connetto_pending::seq)
+        .load(conn.conn())
+        .expect("read the queue")
+}
+
 /// Pump until the wire is gone, keeping the events the run announced.
 async fn drain(conn: &mut ConnettoConnection<Wire>) -> Vec<ClientEvent> {
     let mut seen = Vec::new();
@@ -269,6 +335,17 @@ async fn drain(conn: &mut ConnettoConnection<Wire>) -> Vec<ClientEvent> {
         }
     }
     seen
+}
+
+/// Pump until the connection fails, past any notices the attach pushed first.
+async fn pump_to_error(conn: &mut ConnettoConnection<Wire>) -> ClientError {
+    for _ in 0..16 {
+        match conn.pump_one().await {
+            Ok(_) => {}
+            Err(err) => return err,
+        }
+    }
+    panic!("no protocol failure surfaced");
 }
 
 fn write(conn: &mut ConnettoConnection<Wire>, id: i32) {
@@ -351,8 +428,8 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
     conn.attach(Wire::default().silent()).await.expect("attach");
     drain(&mut conn).await;
 
-    // A second connection that reports a frontier ahead of the queue, the
-    // way a run presenting the number with its settled sequences would.
+    // A second connection that reports a frontier ahead of the queue, as a
+    // courier settling this number's writes would.
     let wire = Wire::default().silent().grant(1, 5);
     conn.attach(wire.clone()).await.expect("attach");
     {
@@ -388,6 +465,66 @@ async fn a_handshake_ack_reconciles_the_number_against_the_frontier() {
         conn.push().await.expect("queue"),
         Some(6),
         "the next sequence starts past the frontier"
+    );
+}
+
+/// The table's `WriterRetired` row for a number writer: the tail re-queues
+/// with provenance under a fresh number, and the key is left alone.
+#[tokio::test]
+async fn a_writer_retired_fatal_requeues_the_tail_with_provenance() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    drain(&mut conn).await;
+
+    // The server retires the writer and closes the connection over it.
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::WriterRetired),
+    )
+    .await
+    .expect("attach");
+    let seen = drain(&mut conn).await;
+    assert!(
+        seen.iter().any(|event| matches!(
+            event,
+            ClientEvent::ServerClosed {
+                reason: FatalErrorReason::WriterRetired
+            }
+        )),
+        "the fatal surfaced as a server close"
+    );
+
+    // A fresh connection asks a fresh number, and the tail goes up again under
+    // it, provenance intact.
+    let wire = Wire::default().silent().grant(2, 0);
+    conn.attach(wire.clone()).await.expect("attach");
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.handshakes,
+            vec![WriterRequest::Issue],
+            "the retired number is no longer presented"
+        );
+    }
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.mutations, vec![1], "the tail went up again");
+    }
+    assert_eq!(
+        pending(&mut conn),
+        vec![PendingRow {
+            writer: "number:2".to_owned(),
+            seq: 1,
+            prov_writer: Some("number:1".to_owned()),
+            prov_seq: Some(1),
+        }],
+        "the entry carries the writer and sequence it was first written under"
     );
 }
 
@@ -466,20 +603,6 @@ async fn sequences_survive_an_emptied_queue_and_a_restart() {
             seq: 3
         }]
     );
-}
-
-diesel::table! {
-    /// The client's private pending table, seeded by the boot-skip test.
-    _connetto_pending (writer, seq) {
-        /// The writer the entry stands under.
-        writer -> Text,
-        /// The entry's sequence.
-        seq -> BigInt,
-        /// The captured changeset.
-        changeset -> Binary,
-        /// The entry's chain hash.
-        entry_hash -> Binary,
-    }
 }
 
 /// A handshake acknowledged with no writer at all refuses the issue: the
@@ -579,7 +702,7 @@ async fn a_writer_unknown_fatal_carries_the_tail_to_the_unissued_number() {
 
     let wire = Wire::default()
         .silent()
-        .closing_with(FatalErrorReason::WriterUnknown);
+        .closing(FatalErrorReason::WriterUnknown);
     conn.attach(wire.clone()).await.expect("attach");
     write(&mut conn, 1);
     assert_eq!(conn.push().await.expect("queue"), Some(1));
@@ -663,6 +786,7 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
                 _connetto_pending::seq.eq(1_i64),
                 _connetto_pending::changeset.eq(b"one"),
                 _connetto_pending::entry_hash.eq([0u8; 32]),
+                _connetto_pending::position.eq(1_i64),
             ))
             .execute(conn.conn())
             .expect("undecodable writer row");
@@ -672,6 +796,7 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
                 _connetto_pending::seq.eq(-3_i64),
                 _connetto_pending::changeset.eq(b"two"),
                 _connetto_pending::entry_hash.eq([0u8; 32]),
+                _connetto_pending::position.eq(2_i64),
             ))
             .execute(conn.conn())
             .expect("negative sequence row");
@@ -681,6 +806,7 @@ async fn corrupt_pending_rows_are_skipped_at_boot() {
                 _connetto_pending::seq.eq(7_i64),
                 _connetto_pending::changeset.eq(b"three"),
                 _connetto_pending::entry_hash.eq([0u8; 31]),
+                _connetto_pending::position.eq(3_i64),
             ))
             .execute(conn.conn())
             .expect("short hash row");
@@ -824,7 +950,7 @@ async fn a_failed_carry_retains_the_complete_source_and_the_restart_resends_it()
     conn.attach(
         Wire::default()
             .silent()
-            .closing_with(FatalErrorReason::WriterUnknown),
+            .closing(FatalErrorReason::WriterUnknown),
     )
     .await
     .expect("attach");
@@ -895,76 +1021,74 @@ async fn a_failed_carry_retains_the_complete_source_and_the_restart_resends_it()
     assert!(conn.unsynced().is_empty(), "the answers retired the tail");
 }
 
-/// A handshake the server refuses as `WriterUnknown` before the ack carries
-/// the presented number's tail to the unissued number, so the next run
-/// re-issues instead of re-presenting a number the server does not hold.
+/// A refused numbered handshake preserves its tail for a fresh writer.
 #[tokio::test]
-async fn a_handshake_refusal_carries_the_unknown_numbers_tail() {
-    let dir = tempdir().expect("temp dir");
-    let mut conn = open(&dir).await;
-    conn.attach(Wire::default().silent()).await.expect("attach");
-    write(&mut conn, 1);
-    assert_eq!(conn.push().await.expect("queue"), Some(1));
-    write(&mut conn, 2);
-    assert_eq!(conn.push().await.expect("queue"), Some(2));
-    drain(&mut conn).await;
+async fn a_handshake_refusal_carries_the_unknown_or_retired_numbers_tail() {
+    for reason in [
+        FatalErrorReason::WriterUnknown,
+        FatalErrorReason::WriterRetired,
+    ] {
+        let dir = tempdir().expect("temp dir");
+        let mut conn = open(&dir).await;
+        conn.attach(Wire::default().silent()).await.expect("attach");
+        write(&mut conn, 1);
+        assert_eq!(conn.push().await.expect("queue"), Some(1));
+        write(&mut conn, 2);
+        assert_eq!(conn.push().await.expect("queue"), Some(2));
+        drain(&mut conn).await;
 
-    // The reconnect presents the number and the server refuses the handshake
-    // itself, before any ack.
-    let error = conn
-        .attach(Wire::default().refusing_with(FatalErrorReason::WriterUnknown))
-        .await
-        .expect_err("the refused handshake fails the attach");
-    assert!(
-        matches!(
-            error,
-            ClientError::Refused {
-                reason: FatalErrorReason::WriterUnknown
-            }
-        ),
-        "the refusal surfaces, saw {error:?}"
-    );
-    assert_eq!(
-        writers(&mut conn),
-        vec!["number:0".to_owned()],
-        "the unknown number's tail re-keyed under the unissued number"
-    );
-    assert_eq!(
-        conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Number(0),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(0),
-                seq: 2
-            },
-        ],
-        "both writes survive the carry"
-    );
-
-    // The next run asks for a fresh number and resends the carried tail.
-    let wire = Wire::default();
-    conn.attach(wire.clone()).await.expect("re-attach");
-    drain(&mut conn).await;
-    {
-        let log = wire.log.lock();
-        assert_eq!(
-            log.handshakes,
-            vec![WriterRequest::Issue],
-            "the carried tail presents no number, so a fresh one is asked"
+        // The reconnect presents the number and the server refuses the handshake
+        // itself, before any ack.
+        let error = conn
+            .attach(Wire::default().refusing_with(reason.clone()))
+            .await
+            .expect_err("the refused handshake fails the attach");
+        assert!(
+            matches!(&error, ClientError::Refused { reason: actual } if actual == &reason),
+            "the refusal surfaces, saw {error:?}"
         );
         assert_eq!(
-            log.mutations,
-            vec![1, 2],
-            "the carried tail resends in order"
+            writers(&mut conn),
+            vec!["number:0".to_owned()],
+            "the refused number's tail travels under the unissued number"
+        );
+        assert_eq!(
+            conn.unsynced(),
+            vec![
+                UnsyncedWrite {
+                    writer: WriterRef::Number(0),
+                    seq: 1
+                },
+                UnsyncedWrite {
+                    writer: WriterRef::Number(0),
+                    seq: 2
+                },
+            ],
+            "both writes survive the carry"
+        );
+
+        // The next run asks for a fresh number and resends the carried tail.
+        let wire = Wire::default();
+        conn.attach(wire.clone()).await.expect("re-attach");
+        drain(&mut conn).await;
+        {
+            let log = wire.log.lock();
+            assert_eq!(
+                log.handshakes,
+                vec![WriterRequest::Issue],
+                "the carried tail presents no number, so a fresh one is asked"
+            );
+            assert_eq!(
+                log.mutations,
+                vec![1, 2],
+                "the carried tail resends in order"
+            );
+        }
+        assert!(
+            conn.unsynced().is_empty(),
+            "the applied answers retired the carried entries"
         );
     }
-    assert!(
-        conn.unsynced().is_empty(),
-        "the applied answers retired the carried entries"
-    );
 }
 
 /// The split table's local replica writes the physical table under the view,
@@ -1095,4 +1219,433 @@ async fn a_failed_number_grant_preserves_the_unissued_queue_for_retry() {
     drain(&mut conn).await;
     assert_eq!(wire.log.lock().mutations, [1]);
     assert_eq!(conn.unsynced(), Vec::<UnsyncedWrite>::new());
+}
+
+/// A `WriterAnswer` with no bind or retirement in flight is a protocol
+/// failure, the connection never settling a task it never sent.
+#[tokio::test]
+async fn a_writer_answer_with_nothing_in_flight_is_a_protocol_failure() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    let wire = Wire::default();
+    conn.attach(wire.clone()).await.expect("attach");
+
+    // The handshake settled and nothing is owed, so the connection holds no
+    // writer task. The server must not answer one.
+    wire.log
+        .lock()
+        .outbox
+        .push_back(IncomingFrame::Control(ControlMessage::WriterAnswer(
+            WriterAnswer {
+                request_id: "spurious".to_owned(),
+                outcome: WriterOutcome::Retired,
+            },
+        )));
+    let err = pump_to_error(&mut conn).await;
+    let ClientError::Protocol(detail) = err else {
+        panic!("the spurious answer must fail the protocol, got {err:?}");
+    };
+    assert_eq!(
+        detail, "a writer answer arrived with nothing in flight",
+        "the connection names the violation it refused"
+    );
+}
+
+/// A `WriterAnswer` naming a request the connection never sent is a protocol
+/// failure, and the retirement it owes stays owed for the next answer.
+#[tokio::test]
+async fn a_writer_answer_naming_a_foreign_request_is_a_protocol_failure() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    // A retirement owed before the connection stands goes up at the attach.
+    diesel::insert_into(_connetto_retire::table)
+        .values(_connetto_retire::writer.eq("number:1"))
+        .on_conflict_do_nothing()
+        .execute(conn.conn())
+        .expect("remember the retirement");
+    let wire = Wire::default().retire_answer_with("foreign");
+    conn.attach(wire.clone()).await.expect("attach");
+
+    let err = pump_to_error(&mut conn).await;
+    let ClientError::Protocol(detail) = err else {
+        panic!("the foreign answer must fail the protocol, got {err:?}");
+    };
+    assert_eq!(
+        detail, "the writer answer names a foreign request",
+        "the connection names the violation it refused"
+    );
+    {
+        let log = wire.log.lock();
+        assert_eq!(log.retires.len(), 1, "the retirement went up once");
+    }
+}
+
+#[cfg(feature = "device-identity")]
+diesel::table! {
+    _connetto_device_certificate (id) {
+        /// The single row's identifier.
+        id -> Integer,
+        certificate -> Binary,
+        issuer -> Binary,
+        lifetime_secs -> Nullable<BigInt>,
+    }
+}
+
+/// Issue a profile-valid device certificate for a fresh key, returning the
+/// leaf and issuer DER beside the key id a writer queue names.
+#[cfg(feature = "device-identity")]
+fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
+    use connetto_core::device_cert::{
+        AttestationLevel, CertificateRequest, CertificateSerial, DeploymentId, DeviceCertificate,
+        DeviceIssuer, RootCa,
+    };
+    use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData as _};
+    use std::time::{Duration, SystemTime};
+
+    let now = SystemTime::now();
+    let root = RootCa::create(
+        DeploymentId::from_uuid(uuid::Uuid::new_v4()),
+        now,
+        Duration::from_hours(8760),
+    )
+    .expect("root");
+    let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
+    let issuer_cert = root
+        .sign_issuer(
+            &issuer_key.subject_public_key_info(),
+            now,
+            Duration::from_hours(2160),
+            CertificateSerial::new([1; 16]).expect("serial"),
+        )
+        .expect("issuer");
+    let issuer =
+        DeviceIssuer::new(issuer_cert.clone(), issuer_key, root.certificate()).expect("issuer");
+    let key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("device key");
+    let csr = CertificateRequest::build(&key, &[7; 32]).expect("request builds");
+    let request = CertificateRequest::parse(&csr).expect("request parses");
+    let leaf = issuer
+        .issue(
+            &request,
+            account,
+            now,
+            Duration::from_hours(720),
+            CertificateSerial::new([2; 16]).expect("serial"),
+            AttestationLevel::Unproven,
+        )
+        .expect("issued");
+    let key_id = *DeviceCertificate::parse(&leaf)
+        .expect("profile")
+        .identity()
+        .key()
+        .as_bytes();
+    (leaf, issuer_cert, key_id)
+}
+
+/// Stand a device certificate the enrolment task would have stored.
+#[cfg(feature = "device-identity")]
+fn store_certificate(conn: &mut ConnettoConnection<Wire>, leaf: &[u8], issuer: &[u8]) {
+    diesel::replace_into(_connetto_device_certificate::table)
+        .values((
+            _connetto_device_certificate::id.eq(1),
+            _connetto_device_certificate::certificate.eq(leaf),
+            _connetto_device_certificate::issuer.eq(issuer),
+            _connetto_device_certificate::lifetime_secs.eq(Some(30 * 24 * 3600_i64)),
+        ))
+        .execute(conn.conn())
+        .expect("the certificate stores");
+}
+
+#[cfg(feature = "device-identity")]
+fn unsynced_write(writer: WriterRef, seq: u64) -> UnsyncedWrite {
+    UnsyncedWrite { writer, seq }
+}
+
+/// The retired-key window: a revoked device keeps its certificate until the
+/// enrolment task clears it, and a write captured inside that window must
+/// not resurrect the retired key's queue. The write stands under the live
+/// number, survives a restart, and settles when the connection is healthy,
+/// while the fresh key takes the writes after it.
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_deliverable() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+
+    // The number writer takes the first write, then the enrolment stands a
+    // certificate and the device takes the next one.
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    let (leaf_a, issuer_a, key_a) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf_a, &issuer_a);
+    write(&mut conn, 2);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    assert_eq!(
+        conn.unsynced(),
+        [
+            unsynced_write(WriterRef::Device(key_a), 1),
+            unsynced_write(WriterRef::Number(1), 1),
+        ],
+        "the enrolled device takes the newer write, the number keeps the older"
+    );
+
+    // The server revokes the device. Its tail travels to the number, but the
+    // certificate stays held until the enrolment task clears it.
+    let wire = Wire::default()
+        .silent()
+        .closing(FatalErrorReason::DeviceRevoked);
+    conn.attach(wire).await.expect("revocation");
+    drain(&mut conn).await;
+
+    // The window: a write captured before the cleanup runs.
+    write(&mut conn, 3);
+    assert_eq!(conn.push().await.expect("queue"), Some(3));
+    assert_eq!(
+        conn.unsynced(),
+        [
+            unsynced_write(WriterRef::Number(1), 1),
+            unsynced_write(WriterRef::Number(1), 2),
+            unsynced_write(WriterRef::Number(1), 3),
+        ],
+        "the window write stands under the live number, not the retired key"
+    );
+
+    // The fresh key arrives and takes the next write, the retired key never
+    // re-selected.
+    let (leaf_b, issuer_b, key_b) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf_b, &issuer_b);
+    write(&mut conn, 4);
+    assert_eq!(conn.push().await.expect("queue"), Some(1));
+    assert_eq!(
+        conn.unsynced(),
+        [
+            unsynced_write(WriterRef::Device(key_b), 1),
+            unsynced_write(WriterRef::Number(1), 1),
+            unsynced_write(WriterRef::Number(1), 2),
+            unsynced_write(WriterRef::Number(1), 3),
+        ],
+        "the fresh key takes the new write, the number keeps the window write"
+    );
+
+    // A restart keeps the window write deliverable under the number, and the
+    // fresh key's queue whole.
+    drop(conn);
+    let mut conn = open(&dir).await;
+    write(&mut conn, 5);
+    assert_eq!(conn.push().await.expect("queue"), Some(2));
+    assert_eq!(
+        conn.unsynced(),
+        [
+            unsynced_write(WriterRef::Device(key_b), 1),
+            unsynced_write(WriterRef::Device(key_b), 2),
+            unsynced_write(WriterRef::Number(1), 1),
+            unsynced_write(WriterRef::Number(1), 2),
+            unsynced_write(WriterRef::Number(1), 3),
+        ],
+        "the restart keeps the window write under the number"
+    );
+
+    // The healthy connection settles the number's tail, the window write in
+    // it, and the fresh key's queue stays whole for its bind.
+    let wire = Wire::default().grant(1, 0);
+    conn.attach(wire.clone()).await.expect("attach");
+    drain(&mut conn).await;
+    {
+        let log = wire.log.lock();
+        assert_eq!(
+            log.mutations,
+            vec![1, 2, 3],
+            "the number's tail, the window write included, went up in order"
+        );
+    }
+    assert_eq!(
+        conn.unsynced(),
+        [
+            unsynced_write(WriterRef::Device(key_b), 1),
+            unsynced_write(WriterRef::Device(key_b), 2),
+        ],
+        "the window write settled, the fresh key's queue stands whole"
+    );
+}
+
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn a_failed_retirement_preserves_the_device_tail_for_retry() {
+    let dir = tempdir().expect("temp dir");
+    let mut conn = open(&dir).await;
+    conn.attach(Wire::default().silent()).await.expect("attach");
+    write(&mut conn, 1);
+    conn.push().await.expect("number write");
+    let (leaf, issuer, _) = mint_device_certificate("tester");
+    store_certificate(&mut conn, &leaf, &issuer);
+    write(&mut conn, 2);
+    conn.push().await.expect("device write");
+    let before = conn.unsynced();
+    conn.conn()
+        .batch_execute(
+            "CREATE TRIGGER fail_retirement BEFORE INSERT ON _connetto_retired_keys \
+         BEGIN SELECT RAISE(FAIL, 'retirement failure'); END;",
+        )
+        .expect("arm retirement failure");
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::DeviceRevoked),
+    )
+    .await
+    .expect("attach revoked device");
+    let _error = pump_to_error(&mut conn).await;
+    assert_eq!(
+        conn.unsynced(),
+        before,
+        "a failed marker cannot publish a carry"
+    );
+    conn.conn()
+        .batch_execute("DROP TRIGGER fail_retirement")
+        .expect("disarm failure");
+    drop(conn);
+    let mut conn = open(&dir).await;
+    assert_eq!(conn.unsynced(), before, "the source survives restart");
+    conn.attach(
+        Wire::default()
+            .silent()
+            .closing(FatalErrorReason::DeviceRevoked),
+    )
+    .await
+    .expect("retry retirement");
+    drain(&mut conn).await;
+    drop(conn);
+    let mut conn = open(&dir).await;
+    write(&mut conn, 3);
+    assert_eq!(conn.push().await.expect("write after retirement"), Some(3));
+    let wire = Wire::default();
+    conn.attach(wire.clone())
+        .await
+        .expect("deliver carried writes");
+    drain(&mut conn).await;
+    assert_eq!(wire.log.lock().mutations, [1, 2, 3]);
+    assert_eq!(conn.unsynced(), Vec::<UnsyncedWrite>::new());
+}
+
+#[cfg(feature = "device-identity")]
+fn split_pending_writers(source: &mut ConnettoConnection<Wire>) {
+    let first_hash: Vec<u8> = _connetto_pending::table
+        .filter(_connetto_pending::seq.eq(1_i64))
+        .select(_connetto_pending::entry_hash)
+        .first(source.conn())
+        .expect("number head");
+    let second: Vec<u8> = _connetto_pending::table
+        .filter(_connetto_pending::seq.eq(2_i64))
+        .select(_connetto_pending::changeset)
+        .first(source.conn())
+        .expect("later delete");
+    let device = format!("device:{}", "01".repeat(32));
+    let device_head = entry_hash(&GENESIS, 1, &second);
+    diesel::update(_connetto_pending::table.filter(_connetto_pending::seq.eq(2_i64)))
+        .set((
+            _connetto_pending::writer.eq(&device),
+            _connetto_pending::seq.eq(1_i64),
+            _connetto_pending::entry_hash.eq(device_head),
+        ))
+        .execute(source.conn())
+        .expect("device tail");
+    diesel::update(_connetto_writers::table)
+        .set((
+            _connetto_writers::next_seq.eq(2_i64),
+            _connetto_writers::head.eq(first_hash),
+        ))
+        .execute(source.conn())
+        .expect("number frontier");
+    diesel::insert_into(_connetto_writers::table)
+        .values((
+            _connetto_writers::id.eq(device),
+            _connetto_writers::next_seq.eq(2_i64),
+            _connetto_writers::head.eq(device_head),
+        ))
+        .execute(source.conn())
+        .expect("device frontier");
+}
+
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete() {
+    use connetto_client::{ExportScope, ImportChoices};
+    use connetto_core::messages::{
+        FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
+    };
+
+    let dir = tempdir().expect("source directory");
+    let mut source = open(&dir).await;
+    source
+        .attach(Wire::default().silent())
+        .await
+        .expect("attach");
+    write(&mut source, 1);
+    source.push().await.expect("number insert");
+    diesel::delete(t::table.filter(t::id.eq(1)))
+        .execute(source.conn())
+        .expect("device delete");
+    source.push().await.expect("queue device delete");
+    split_pending_writers(&mut source);
+    drop(source);
+    let mut source = open(&dir).await;
+    let source_wire = Wire::default().silent();
+    source.attach(source_wire.clone()).await.expect("reattach");
+    source
+        .subscribe("ordered", "SELECT id FROM t")
+        .await
+        .expect("subscribe");
+    source_wire.log.lock().outbox.extend([
+        IncomingFrame::Control(ControlMessage::FullResyncRequired(FullResyncRequired {
+            sub_id: "ordered".to_owned(),
+            reason: FullResyncReason::CursorOutsideRetention,
+        })),
+        IncomingFrame::Control(ControlMessage::SnapshotBegin(SnapshotBegin {
+            sub_id: "ordered".to_owned(),
+            priority: SubscriptionPriority::default(),
+        })),
+        IncomingFrame::Control(ControlMessage::SnapshotEnd(SnapshotEnd {
+            sub_id: "ordered".to_owned(),
+            cursor: Cursor::new(Vec::new()),
+        })),
+    ]);
+    drain(&mut source).await;
+    let rows: Vec<i32> = t::table
+        .select(t::id)
+        .load(source.conn())
+        .expect("resynced rows");
+    assert_eq!(
+        rows,
+        Vec::<i32>::new(),
+        "resync must reapply the delete after its insert"
+    );
+    let archive = source
+        .export_local_data(ExportScope::Everything, Vec::new())
+        .expect("export");
+    let fresh = tempdir().expect("destination directory");
+    let mut restored = open(&fresh).await;
+    let plan = restored
+        .import_local_data(std::io::Cursor::new(archive))
+        .expect("read archive");
+    restored
+        .apply_import(&plan, &ImportChoices::keeping_the_file())
+        .expect("restore");
+    let rows: Vec<i32> = t::table
+        .select(t::id)
+        .load(restored.conn())
+        .expect("restored rows");
+    assert_eq!(
+        rows,
+        Vec::<i32>::new(),
+        "the later delete must follow its insert"
+    );
+    let wire = Wire::default();
+    restored
+        .attach(wire.clone())
+        .await
+        .expect("deliver restored writes");
+    drain(&mut restored).await;
+    assert_eq!(wire.log.lock().mutations, [1, 2]);
+    assert_eq!(restored.unsynced(), Vec::<UnsyncedWrite>::new());
 }

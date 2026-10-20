@@ -45,7 +45,7 @@ const DDL: [&str; 3] = [
     "CREATE TABLE connetto_device_enrolments (\
      key_id BYTEA PRIMARY KEY, user_id TEXT NOT NULL, session_id UUID NOT NULL, \
      enrolled_at TIMESTAMPTZ NOT NULL, last_seen TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, \
-     attestation TEXT NOT NULL, name TEXT NOT NULL, model TEXT)",
+     public_key BYTEA NOT NULL, attestation TEXT NOT NULL, name TEXT NOT NULL, model TEXT)",
     "CREATE TABLE connetto_device_certificates (\
      serial BYTEA PRIMARY KEY, \
      key_id BYTEA NOT NULL REFERENCES connetto_device_enrolments (key_id), \
@@ -97,6 +97,7 @@ fn enrolment(
         issued_at: at,
         expires_at: at + HOUR,
         session: session(u128::from(serial)),
+        public_key: Vec::new(),
         descriptor: phone(&format!("{user} {serial}")),
         attestation,
     }
@@ -367,5 +368,104 @@ async fn a_descriptor_of_another_shape_is_refused_and_recorded_nowhere() {
             .expect("alice")
             .is_empty(),
         "the refused enrolment left no row"
+    );
+}
+
+/// The record a bind, a retirement and a provenance read answers on: the
+/// account the key is enrolled under, its revocation, whether a certificate
+/// of it is still live, and the public key the bind signs are checked
+/// against. `None` when the key is unknown or is enrolled under another
+/// account than the one named.
+#[tokio::test]
+async fn a_key_record_reports_its_account_revocation_and_liveness() {
+    let fixture = Fixture::acquire().await;
+    let store = store(&fixture).await;
+    let now = SystemTime::now();
+    let alice_key = key(1);
+    let mut live = enrolment(
+        "alice",
+        alice_key,
+        1,
+        key(9),
+        now,
+        AttestationLevel::Unproven,
+    );
+    live.public_key = vec![0xab; 64];
+    assert_eq!(store.record(live).await.expect("record"), Recorded::Granted);
+
+    let found = store
+        .key_record(Some(&"alice".to_owned()), alice_key)
+        .await
+        .expect("record")
+        .expect("the key is enrolled under alice");
+    assert_eq!(found.user, "alice");
+    assert!(!found.revoked, "the enrolment is not revoked");
+    assert!(
+        found.certificate_live,
+        "the certificate stands an hour past its issue"
+    );
+    assert_eq!(found.public_key, vec![0xab; 64]);
+
+    assert!(
+        store
+            .key_record(Some(&"bob".to_owned()), alice_key)
+            .await
+            .expect("bob")
+            .is_none(),
+        "another account's key record names nothing"
+    );
+    assert!(
+        store
+            .key_record(None, alice_key)
+            .await
+            .expect("no account")
+            .is_some(),
+        "no account named still reads the record"
+    );
+    assert!(
+        store
+            .key_record(Some(&"alice".to_owned()), key(2))
+            .await
+            .expect("unknown")
+            .is_none(),
+        "an unenrolled key names nothing"
+    );
+
+    let expired = enrolment(
+        "bob",
+        key(3),
+        2,
+        key(8),
+        now - 2 * HOUR,
+        AttestationLevel::Unproven,
+    );
+    assert_eq!(
+        store.record(expired).await.expect("expired"),
+        Recorded::Granted
+    );
+    let expired = store
+        .key_record(Some(&"bob".to_owned()), key(3))
+        .await
+        .expect("bob")
+        .expect("enrolled");
+    assert!(
+        !expired.certificate_live,
+        "the certificate expired an hour ago"
+    );
+
+    store
+        .revoke(Some(&"alice".to_owned()), alice_key, now)
+        .await
+        .expect("revoke");
+    let revoked = store
+        .key_record(Some(&"alice".to_owned()), alice_key)
+        .await
+        .expect("after")
+        .expect("still enrolled");
+    assert!(revoked.revoked, "the revocation stands");
+    assert_eq!(
+        revoked.public_key,
+        vec![0xab; 64],
+        "the revocation keeps the public key"
     );
 }

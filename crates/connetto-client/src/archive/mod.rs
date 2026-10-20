@@ -109,7 +109,8 @@ pub(crate) struct Archive<'a> {
     pub(crate) synced_rows: Option<Vec<u8>>,
     /// The device-private tier's rows, absent when no tier is attached.
     pub(crate) local_rows: Option<Vec<u8>>,
-    /// The writes that never reached the server, in the order they were made.
+    /// The writes that never reached the server, in their append-position
+    /// order across every writer, the order an import re-queues them in.
     ///
     /// Their sequence numbers are deliberately not carried: a number means
     /// something only inside one durable session handle, and an archive is

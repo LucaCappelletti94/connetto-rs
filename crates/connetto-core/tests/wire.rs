@@ -13,15 +13,16 @@ use connetto_core::{
         encode_control_framed,
     },
     messages::{
-        AckCredits, AggregateUpdate, BotListEntry, BotRegistered, BulkMessage, Challenge,
-        ConflictRow, ControlMessage, DeviceAttestation, DeviceRevokedAck, DeviceSummary,
+        AckCredits, AggregateUpdate, BindDevice, BotListEntry, BotRegistered, BulkMessage,
+        Challenge, ConflictRow, ControlMessage, DeviceAttestation, DeviceRevokedAck, DeviceSummary,
         DevicesList, DevicesRequest, EnrolChallenge, EnrolChallengeRequest, EnrolGrant,
         EnrolRefusal, EnrolRefused, EnrolRequest, FatalError, FatalErrorReason, FullResyncReason,
         FullResyncRequired, Grant, Handshake, HandshakeAck, LivePatch, MutationConflict,
         MutationHeader, MutationPatch, MutationReject, MutationRejectReason, NonFatalError,
-        PauseCause, Ping, Pong, RateLimited, RegisterBot, ReplaceShareKeys, RevocationUpdate,
-        RevokeDeviceRequest, ShareKeysReplaced, SignedList, SnapshotBegin, SnapshotEnd,
-        SnapshotPatch, Subscribe, SubscriptionPriority, SubscriptionSpec, Unsubscribe, WriterGrant,
+        PauseCause, Ping, Pong, Provenance, RateLimited, RegisterBot, ReplaceShareKeys,
+        RetireWriter, RevocationUpdate, RevokeDeviceRequest, ShareKeysReplaced, SignedList,
+        SnapshotBegin, SnapshotEnd, SnapshotPatch, Subscribe, SubscriptionPriority,
+        SubscriptionSpec, Unsubscribe, WriterAnswer, WriterGrant, WriterOutcome, WriterRef,
         WriterRequest,
     },
     version::PROTOCOL_VERSION,
@@ -167,6 +168,32 @@ fn a_known_empty_subject_checkpoint_survives_the_wire_distinct_from_an_unspecifi
 }
 
 #[test]
+fn writer_frames_round_trip() {
+    round_trip_control(&ControlMessage::BindDevice(BindDevice {
+        request_id: "bind-1".into(),
+        key_id: [3; 32],
+        signature: vec![0x30, 0x45, 0x02],
+    }));
+    for writer in [WriterRef::Device([4; 32]), WriterRef::Number(7)] {
+        round_trip_control(&ControlMessage::RetireWriter(RetireWriter {
+            request_id: "retire-1".into(),
+            writer,
+        }));
+    }
+    for outcome in [
+        WriterOutcome::Bound { frontier: 5 },
+        WriterOutcome::Retired,
+        WriterOutcome::NotEnrolled,
+        WriterOutcome::Unknown,
+    ] {
+        round_trip_control(&ControlMessage::WriterAnswer(WriterAnswer {
+            request_id: "bind-1".into(),
+            outcome,
+        }));
+    }
+}
+
+#[test]
 fn share_key_frames_round_trip() {
     round_trip_control(&ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
         request_id: "keys-1".into(),
@@ -210,6 +237,12 @@ fn subscription_lifecycle_round_trips() {
 #[test]
 fn mutation_control_frames_round_trip() {
     round_trip_control(&ControlMessage::MutationHeader(MutationHeader::new(17, 4)));
+    round_trip_control(&ControlMessage::MutationHeader(
+        MutationHeader::new(18, 1).with_provenance(Provenance {
+            writer: WriterRef::Device([5; 32]),
+            seq: 3,
+        }),
+    ));
     round_trip_control(&ControlMessage::MutationReject(MutationReject {
         client_seq: 17,
         reason: MutationRejectReason::Constraint {
@@ -366,6 +399,9 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             expected: 4,
             got: 6,
         },
+        // SessionManager::retire_writer, closing a connection bound to the
+        // retired writer, and run_handshake on a retired number (R75).
+        FatalErrorReason::WriterRetired,
         // SessionManager::run_handshake, on a number no writer of the
         // account carries (R75).
         FatalErrorReason::WriterUnknown,
@@ -382,6 +418,7 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             | FatalErrorReason::ChangeStreamGap
             | FatalErrorReason::DatabaseTimelineChanged
             | FatalErrorReason::SequenceGap { .. }
+            | FatalErrorReason::WriterRetired
             | FatalErrorReason::WriterUnknown => {}
         }
     }

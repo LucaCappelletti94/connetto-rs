@@ -13,6 +13,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::writer::Provenance;
+
 /// Control-plane header announcing a mutation upload.
 ///
 /// The matching `BulkMessage::MutationPatch { client_seq, .. }` carries the
@@ -29,6 +31,10 @@ pub struct MutationHeader {
     /// Advisory: lets the server pre-size buffers and reject implausible
     /// headers. The authoritative op count is what the patchset parser sees.
     pub op_count: u32,
+    /// The writer and sequence this entry was first written under, for an
+    /// entry an import restored or a retired writer's device carried forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
 
 impl MutationHeader {
@@ -37,7 +43,15 @@ impl MutationHeader {
         Self {
             client_seq,
             op_count,
+            provenance: None,
         }
+    }
+
+    /// Name where this entry was first written.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 }
 

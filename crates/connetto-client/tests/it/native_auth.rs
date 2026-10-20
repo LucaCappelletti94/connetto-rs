@@ -993,16 +993,18 @@ async fn a_provider_build_reports_its_session_and_forgets_its_device() {
     let store = SharedRefreshStore::default();
     let dir = tempfile::tempdir().expect("a temporary directory");
 
-    let client = offline_builder()
-        .signed_in(
-            provider(&base, &store, AccountChoice::New)
-                .with_browser_opener(fake_browser("builder-user")),
-        )
-        .durable(dir.path(), super::support::SharedKeys::default())
-        .with_gate(Gate::off())
-        .connect()
-        .await
-        .expect("the provider build signs in and opens offline");
+    let client = Box::pin(
+        offline_builder()
+            .signed_in(
+                provider(&base, &store, AccountChoice::New)
+                    .with_browser_opener(fake_browser("builder-user")),
+            )
+            .durable(dir.path(), super::support::SharedKeys::default())
+            .with_gate(Gate::off())
+            .connect(),
+    )
+    .await
+    .expect("the provider build signs in and opens offline");
 
     let session = client
         .session()
