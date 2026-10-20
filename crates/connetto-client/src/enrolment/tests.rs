@@ -1820,10 +1820,6 @@ async fn a_certificate_less_device_refuses_to_link() {
 /// links and the listener (R76 proof 5).
 #[cfg(feature = "peer")]
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the enrolment, the live link and the closing look are one scenario, in the order the expiry crosses them"
-)]
 async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     let (key, der) = attesting_key();
     let now = SystemTime::now();
@@ -1907,18 +1903,15 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         "the device's node reports its live peer"
     );
 
-    // The look wakes at the expiry plus the tolerance and closes the link.
+    // The look wakes at the expiry plus the tolerance and closes the link. A late
+    // wake can make this task and the look ready at once, so the close is polled for.
     tokio::time::sleep(
         deadline
             .duration_since(SystemTime::now())
-            .unwrap_or_default()
-            + Duration::from_secs(3),
+            .unwrap_or_default(),
     )
     .await;
-    assert!(
-        handle.peer_address().is_none(),
-        "the listener closed at the expiry"
-    );
+    poll_until(|| handle.peer_address().is_none()).await;
     let task_reason = state.lock().emitted.iter().find_map(|event| {
         if let ClientEvent::PeerUnlinked { reason, .. } = event {
             Some(*reason)
