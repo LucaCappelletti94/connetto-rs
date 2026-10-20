@@ -147,14 +147,13 @@ pub struct AuthEvent<Id> {
     /// as they were read and
     /// [`ConnettoAuditSchema::row_key`] maps them to the column.
     pub pk: Option<Vec<Value<Postgres>>>,
-    /// The writer this event names, the server-issued writer row, absent
-    /// except `write_forked`.
+    /// The server-issued writer named by a write-state event.
     pub writer: Option<i64>,
-    /// The writer's sequence the event names, absent except `write_forked`.
+    /// The writer sequence named by a write-state event.
     pub seq: Option<i64>,
-    /// The settle path of the standing entry, absent except `write_forked`.
+    /// The standing entry's settlement path.
     pub path: Option<SettlePath>,
-    /// The path the arriving write travelled, absent except `write_forked`.
+    /// The arriving write's path.
     pub other_path: Option<SettlePath>,
 }
 
@@ -332,17 +331,13 @@ macro_rules! connetto_audit_table {
                 table_name -> diesel::sql_types::Nullable<diesel::sql_types::Text>,
                 /// The row a share key names, absent for everything else.
                 pk -> diesel::sql_types::Nullable<$pk_sql>,
-                /// The writer `write_forked` names, the server-issued writer
-                /// row, absent for everything else.
+                /// The server-issued writer named by a write-state event.
                 writer -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
-                /// The writer's sequence `write_forked` names, absent for
-                /// everything else.
+                /// The writer sequence named by a write-state event.
                 seq -> diesel::sql_types::Nullable<diesel::sql_types::BigInt>,
-                /// The settle path of the standing entry `write_forked`
-                /// names, absent for everything else.
+                /// The standing entry's settlement path.
                 path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
-                /// The path the arriving write travelled, the second of the
-                /// two paths `write_forked` names.
+                /// The arriving write's path.
                 other_path -> diesel::sql_types::Nullable<$crate::writer_schema::SettlePathSql>,
             }
         }
