@@ -2539,6 +2539,22 @@ async fn wait_broadcast(
     }
 }
 
+/// Wait, bounded, until `live` holds exactly `expected`.
+async fn until_rows<R>(live: &mut LiveQuery<R>, expected: &[R])
+where
+    R: Clone + PartialEq + core::fmt::Debug,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while live.rows() != expected {
+        tokio::time::timeout_at(deadline, live.changed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the rows never became {expected:?}, last {:?}", live.rows())
+            })
+            .expect("driver alive");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     let fixture = Fixture::acquire().await;
@@ -2588,23 +2604,15 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         )
         .await
         .expect("watch");
-    assert!(
-        live.rows().is_empty(),
-        "the replica is empty before the snapshot lands",
-    );
-
-    // The server snapshot (one seed row) applies, and the handle refreshes.
-    // Race the refresh against a rejection so a refused subscription names its
-    // reason instead of timing out.
+    // The snapshot may land before `watch` returns, so the wait is for the rows
+    // and never for one refresh. A refused subscription names its reason.
+    let seed = [order(1, 1.0, 3, "seed")];
     tokio::select! {
-        changed = tokio::time::timeout(Duration::from_secs(5), live.changed()) => {
-            changed.expect("snapshot refresh timed out").expect("driver alive");
-        }
+        () = until_rows(&mut live, &seed) => {}
         rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
             panic!("subscription rejected: {rejected:?}");
         }
     }
-    assert_eq!(live.rows(), vec![order(1, 1.0, 3, "seed")]);
 
     // A CDC insert fans out as a live patch, and the handle refreshes again.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -2617,14 +2625,11 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         ))
         .expect("emu insert withheld");
     drain_events(&manager, &mut source).await;
-    tokio::time::timeout(Duration::from_secs(5), live.changed())
-        .await
-        .expect("live refresh timed out")
-        .expect("driver alive");
-    assert_eq!(
-        live.rows(),
-        vec![order(1, 1.0, 3, "seed"), order(2, 2.0, 7, "live")],
-    );
+    until_rows(
+        &mut live,
+        &[order(1, 1.0, 3, "seed"), order(2, 2.0, 7, "live")],
+    )
+    .await;
 
     // Dropping the handle queues the unsubscribe. Fence with a ping: control
     // frames are ordered, so the pong proves the server handled it.
@@ -3339,28 +3344,18 @@ async fn watch_fn_drives_a_boxed_row_query() {
         .watch_fn(|| gadgets::table.order(gadgets::label).into_boxed())
         .await
         .expect("watch_fn");
-    assert!(
-        live.rows().is_empty(),
-        "the replica is empty before the snapshot lands",
-    );
-
+    // Both seed rows surface, decoded from the replica: the uuid keys and the
+    // bool flag in both its true and false forms.
+    let seed = [
+        gadget(alpha_id, true, "alpha"),
+        gadget(inactive_id, false, "zulu"),
+    ];
     tokio::select! {
-        changed = tokio::time::timeout(Duration::from_secs(5), live.changed()) => {
-            changed.expect("snapshot refresh timed out").expect("driver alive");
-        }
+        () = until_rows(&mut live, &seed) => {}
         rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
             panic!("subscription rejected: {rejected:?}");
         }
     }
-    // Both seed rows surface, decoded from the replica: the uuid keys and the
-    // bool flag in both its true and false forms.
-    assert_eq!(
-        live.rows(),
-        vec![
-            gadget(alpha_id, true, "alpha"),
-            gadget(inactive_id, false, "zulu"),
-        ],
-    );
 
     // A CDC insert of a third gadget refreshes the boxed query. The typed
     // insert binds the uuid key as a blob and the flag as an integer, the exact

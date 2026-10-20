@@ -277,7 +277,6 @@ async fn a_key_swap_replaces_the_statistic_the_old_keys_answered() {
     };
     assert_eq!(answer.request_id, "swap");
 }
-
 /// A grouped statistic over an RLS table still answers as its row objects,
 /// which a keyed handle takes its group keys from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

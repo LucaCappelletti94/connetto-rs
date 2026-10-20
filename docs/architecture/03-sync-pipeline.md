@@ -29,7 +29,7 @@ CREATE TABLE _connetto_pending (
 );
 ```
 
-The queue survives process restart and network interruption.
+The queue survives process restart and network interruption. So does the next sequence number, kept in the one-row `_connetto_sequence` table and written whenever it moves, since the server's exactly-once watermark is keyed on a session handle that outlives the process. A write made after a restart with an empty queue would otherwise take a number the server had already applied, and the handshake would retire it as a duplicate without sending it.
 
 **This replaces a seven-column sketch, and the difference is the design rather than the detail.** That sketch gave a row per operation, carrying the table name, the verb as one of three words in a text column, the key, the values and the base version as separate columns. What is built stores one sqlite-diff changeset per client sequence, which already carries the table, the verb, the key, the new values and the old image, in the same encoding the upload rides in. So the queue holds exactly what it sends rather than a parallel description of it, nothing has to be re-encoded on the way out, and the verb is a decoded value rather than a string nothing checks.
 

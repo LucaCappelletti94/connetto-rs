@@ -42,7 +42,6 @@ impl KeyedSnapshot {
     fn reads(&self) -> usize {
         self.callers.lock().expect("capture lock").len()
     }
-
     fn last(&self) -> Principal {
         self.callers
             .lock()
@@ -215,7 +214,6 @@ async fn swap<T: Transport>(client: &mut T, request_id: &str, keys: &[&str]) {
         .await
         .expect("send swap");
 }
-
 /// The control frames up to and including the first `stop` accepts.
 async fn controls_until<T: Transport>(
     client: &mut T,
@@ -235,7 +233,6 @@ async fn controls_until<T: Transport>(
 fn is_answer(request_id: &str) -> impl Fn(&ControlMessage) -> bool + '_ {
     move |msg| matches!(msg, ControlMessage::ShareKeysReplaced(answer) if answer.request_id == request_id)
 }
-
 fn is_end(msg: &ControlMessage) -> bool {
     matches!(msg, ControlMessage::SnapshotEnd(_))
 }
@@ -507,7 +504,6 @@ async fn a_resume_under_other_keys_resends_instead_of_catching_up() {
     );
     assert_eq!(snapshot.reads(), reads);
 }
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_unbounded_grant_keeps_a_key_held_by_an_earlier_finite_grant() {
     let fixture = Fixture::acquire().await;

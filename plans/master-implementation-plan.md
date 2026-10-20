@@ -220,7 +220,7 @@ Execution order and nothing else. Status, blockers, landing dates and what each 
 | R92 synced tables carry no local references | **DONE** (2026-10-18, merged `e89f61e` #167, `e8b2694` #168, `46d2bef` #169), minted and designed 2026-09-22 by R21's decision 8 | nothing. Six decisions in the section | no |
 | R93 the file replica for bots | NOT STARTED, minted and designed 2026-09-22 by R71's decision 8 | R91. Two decisions in the section | no |
 | R94 one client builder per platform | **DONE** (2026-09-30, merged `5b7f616`, #110), minted and designed 2026-09-25 while planning R51 | nothing. Twenty-seven decisions in the section | no |
-| R95 share keys on a running client | NOT STARTED, minted and designed 2026-09-25 by R94's decision 10 | nothing since R94 (2026-09-30). One decision and one open question in the section | no |
+| R95 share keys on a running client | STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10, designed 2026-10-17 | nothing since R94 (2026-09-30). Fifteen decisions and seven planned pull requests in the section | no |
 | R96 one server builder | **DONE** (2026-10-03), minted 2026-09-25 by R94's decision 11, designed 2026-10-03 | nothing. Nine decisions in the section | no |
 | R97 the desktop login tab | **DONE** (2026-10-04), built 2026-10-02, proven on Windows and macOS 2026-10-03 and on GNOME 2026-10-04 | nothing. GNOME on Wayland answers the raise with its notification that the app is ready, decided with the maintainer as the platform's answer | no |
 | R98 one schema contract | **DONE** (2026-10-05, #126) | nothing | no |
@@ -5967,25 +5967,56 @@ Both platforms build their clients from one builder each over the shared pieces,
 
 ## R95: share keys added and removed on a running client
 
-**Status.** NOT STARTED, minted 2026-09-25 by R94's decision 10.
+**Status.** STARTED 2026-10-18, minted 2026-09-25 by R94's decision 10 and designed 2026-10-17, the server's route and the aggregate notice decided with the maintainer and the rest from research reported to the maintainer. The wire is #177. The working record, with the tree facts, the prior art, the state tables of every event against every client and server situation and the sources read, is `plans/design-r95-share-keys.md`, copied to `~/.local/share/connetto-r88/notes/design-r95-share-keys.md` with the research reports in `notes/r95-research/`.
 
 **Blocked on nothing** since R94 landed on 2026-09-30. Its `Auth` holds the starting set this phase persists.
 
 ### Purpose
 
-A share key usually reaches an application while it runs, when a user opens a share link, but both platforms take share keys only before the handshake (`ClientConfig::with_share_keys`, `DbWorkerConfig::with_share_keys`), and neither has a call to change them afterwards. The same keys feed the replica's subjects function, which every translated policy and `INSTEAD OF` trigger reads locally.
+A share key usually reaches an application while it runs, when a user opens a share link, but both platforms take share keys only on the builder (`with_share_keys`, R94 decision 20), before the handshake, and neither has a call to change them afterwards. The same keys feed the replica's subjects function, which every translated policy and `INSTEAD OF` trigger reads locally. The server resolves grants only at the handshake (`resolve_grants`), so an open connection also keeps a key past its `exp`.
 
 ### Decisions
 
 1. **The running client gets a call to add and remove share keys** (2026-09-25, with the maintainer). It re-renders the subjects function and refreshes the live queries it affects, so rows a new key reveals appear at once rather than after the next reconnect. It persists the set in the store that holds the refresh token, gated like it under R51 and R52, and the keys an application gives R94's builder at connect join the stored set and are stored with it, so there is one list (R94 decision 10).
+2. **A control message replaces the session's grant set** (decided with the maintainer 2026-10-17). It carries the whole new set and is answered once the server has swapped the principal on the session and on every route, re-registered the subscriptions the change reaches and queued their resends as `Outbound::Resnapshot` with `FullResyncReason::AuthorizationChange`. A resend is needed whichever route is taken, because a catch-up replays only entries after the cursor and never shows or hides an unchanged row. Convex's `Authenticate`, Zero's `updateAuth`, Supabase's `access_token` and Ably's `AUTH` take this shape. Rejected: a reconnect under the hood, which needs the same resend and adds a redial, R2 supersession and a catch-up to every change.
+3. **No consistency token.** Adding or removing a key writes no permission, since the relation row is written at mint time and moves through the change log in commit order. The ordering the swap needs is against one session's own frames, which the session task already serializes. Connetto has no zookie (`README.md`, OpenFGA lists it as future work).
+4. **Connetto holds keys and never turns them into account rows.** Chapter 12 rejected connetto writing the sharing row. An application that wants a signed-in user's key to follow the account writes its own relation row for that user, and chapter 12 names that recipe. Google Drive keeps link access apart from account permissions in the same way, through resource keys.
+5. **A key that fails to check is silent mid-session as at the handshake** and is metered as a refused grant at the same tier, so a live session probes keys no faster than a reconnecting one.
+6. **Each swap counts against the subscription-creation signal** once for every subscription it reaches, so toggling a valid key cannot force unbounded resends.
+7. **Removal hides rows locally at once and removes them through the server.** The re-rendered subjects function hides them from every view, and the resend deletes them from the backing tables within one sync cycle, the bound PowerSync, Electric and Couchbase Lite state. Writes queued under a removed key keep today's contract, `Unauthorized` and a local rollback.
+8. **A key expires on both sides as a removal.** The client re-renders at the earliest `exp` it holds and deletes the key, and the server drops the subject at its `exp` and resends what it reached. Chapter 12 states a key lives until its expiry.
+9. **A resume cursor carries completed durable authorization coverage.** `cursor_subjects: None` means unknown or unfinished coverage, while `Some([])` means a known empty set. The client persists unknown coverage before authorization replacement can change its backing rows and retains it while any key request, reached delivery or subscription replay remains unfinished. It commits a known subject set and its covered cursor together after those operations settle. Unknown coverage or a known set differing from the resolved principal requires `AuthorizationChange` snapshots for reached subscriptions, including a resolved empty set. A known equal set permits ordinary catch-up, and the cursor remains available for unreached subscriptions. A committed key change also invalidates the connection's remaining known resume coverage, including when repeated changes restore the handshake's subject set. `ShareKeysReplaced` and `HandshakeAck` alone do not establish coverage. No trust rests on the supplied metadata, and neither server-owned key state nor a consistency token is introduced.
+10. **The browser persists a signed-in durable client's set in `IdbKeyStore`**, one wrapped record per identity under the replica key's non-extractable key-encryption key and passkey gate. That is decision 1 under R90, which left `IdbKeyStore` as the browser's only gated store for secrets, and its limits are the replica key's (chapter 14, RFC 10017 sections 8.5 and 8.6). `wipe_replica` removes it. Anonymous clients and in-memory bots store nothing (R94 decision 20). Rejected: a set kept server-side for the browser session, which re-delivers application credentials across chapter 12's delivery boundary and dies with the session while the key and the replica outlive it. Rejected: no browser persistence, which fails this phase's restart proof.
+11. **A change while the client is locked is refused with `ClientError::Locked`**, as the gate refuses every other application call.
+12. **In a relay the worker holds the set.** A tab's add or remove travels to the worker as a relay request whose reply quotes its id, and after the swap the worker states `TabIdentity` to every tab, which the tab's mirror already applies.
+13. **Chapter 12 gains carrying guidance, and delivery stays the application's.** The key goes in the URL fragment, which RFC 3986 keeps out of the request and so out of logs and the Referer header, links open through Universal Links or verified App Links rather than a custom scheme (RFC 8252 section 8.2), and the browser strips the fragment with `history.replaceState` after reading it.
+14. **A swap replaces a per-viewer aggregate behind the resend notice** (decided with the maintainer 2026-10-18). An aggregate over a key-gated table registers per viewer (R85), so a swap registers it again, and a grouped answer's re-bootstrap arrives one group at a time and would leave a group the removed key revealed. So `FullResyncRequired` naming an aggregate tells the client to drop that aggregate's resting answer before the full re-bootstrap follows, as Electric's must-refetch discards a shape. Rejected: the server reading the old registration's groups and removing each one absent from the new answer, an extra read per swap repeating the diff the engine already makes on re-execution.
+15. **A swap holds the dispatch of change events while it replaces the principal.** The swap runs on the session's task and the fan-out on the ingest task, so without a shared gate a patch filtered under the old keys could be queued behind the swap's resends and put back a row they took away. R7 needs none, because its moves are produced on the ingest task itself.
 
-### Open question
+### Steps
 
-1. How the server learns of a key added mid-session. Grants are presented at the handshake today, so the call either sends a new grant over the live session, which the protocol has no message for, or reconnects under the hood. Decided before building.
+Seven pull requests, each building and passing CI on its own.
+
+1. The wire. The set message and its answer and the handshake's optional cursor-subject checkpoint in `connetto-core`, with chapter 02.
+2. The aggregate notice. The client drops an aggregate's resting answer when `FullResyncRequired` names it (decision 14), which is safe ahead of the server because today the notice is a no-op for an aggregate.
+3. A key leaves an open connection at its expiry. The grant check reports each key's `exp`, the model reports which tables the keys reach, and the session swaps its keys under the dispatch gate, registers again what read them, resends what they reached and drops the frames of the old answer still waiting for credit (decision 8).
+4. The swap on request. `ReplaceShareKeys` with its metering and queued-only answer, and authorization snapshots for unknown or differing cursor coverage at resume (decisions 2, 5, 6 and 9).
+5. The native client. The add and remove call, persistence beside the refresh token under the gate, durable checkpoint invalidation and publication, the re-render and the client expiry timer.
+6. The browser. The worker's call and durable checkpoint ownership, the tab relay request and `TabIdentity` after a swap, and the `IdbKeyStore` record.
+7. The documents. Chapters 12 and 13 with the carrying guidance.
 
 ### Proof
 
-A key added on a running client makes its rows appear in an open live query without a reconnect, a removed one makes them disappear, and both survive a restart.
+1. A key added on a running client makes its rows appear in an open live query without a reconnect, a removed one makes them disappear from the backing tables, and both survive a restart, natively and in the browser.
+2. A key added or removed while offline reaches the server at the next handshake, which resends only the subscriptions the change reaches.
+3. A key reaching its `exp` on an open connection removes its rows on both sides without a reconnect.
+4. A key that fails to check draws the same silence and the same metering mid-session as at the handshake, and repeated swaps are limited.
+5. A change while locked is refused, and a tab's change reaches every tab of the relay.
+6. Interrupted replacements and repeated key changes, including a return to the starting set, preserve unchanged rows across reconnects and late subscription replay. Unknown coverage requires authorization snapshots even when no key resolves, while a matching known empty checkpoint permits catch-up.
+
+### Done when
+
+Both platforms add and remove share keys on a running client, persist them where the client is durable, and chapters 02, 12 and 13 describe the messages, durable authorization checkpoints and carrying guidance.
 
 ---
 

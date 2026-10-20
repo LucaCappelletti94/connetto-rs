@@ -96,6 +96,10 @@ sqlparser_derive = { git = "https://github.com/apache/datafusion-sqlparser-rs", 
 [patch."https://github.com/diesel-rs/diesel"]
 diesel = { git = "https://github.com/LucaCappelletti94/diesel", branch = "master" }
 
+# Headless tests retain function names without loading DWARF into each browser worker.
+[profile.test]
+strip = "debuginfo"
+
 # Fast test iteration: release-grade optimization without the fat link.
 # Mirrors the root workspace profile of the same name.
 [profile.testfast]

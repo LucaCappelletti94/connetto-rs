@@ -1164,7 +1164,6 @@ impl GrantSource<'_> {
 fn rendered_keys<Key: CapabilityKey>(keys: &[CapabilitySubject<Key>]) -> BTreeSet<String> {
     keys.iter().map(|key| key.key().to_string()).collect()
 }
-
 /// What a list of grants resolved to.
 struct ResolvedGrants<Id, Key> {
     /// The caller the grants name, on the handle they were checked for.
@@ -4404,7 +4403,6 @@ where
                 ShareKeysReplaced { request_id },
             )));
     }
-
     /// Drop every held key whose expiry has passed (R95).
     async fn expire_keys(&self, state: &mut SessionState<Id, Key>) {
         let now = self
