@@ -290,13 +290,17 @@ impl TicketVerifier {
     /// Verifies `token` and returns the payload if the signature is valid and
     /// the token is not expired.
     ///
+    /// A ticket stays usable until `SERVER_SKEW` past its expiry, since the
+    /// server that minted it read its own clock (chapter 21).
+    ///
     /// # Errors
     ///
     /// Returns `TicketError::Malformed` if `token` does not contain a dot separator.
     /// Returns `TicketError::Base64` if the payload or signature segment is not valid URL-safe base64.
     /// Returns `TicketError::InvalidSignature` if the Ed25519 signature does not verify against the stored public key.
     /// Returns `TicketError::Postcard` if the payload bytes cannot be deserialized.
-    /// Returns `TicketError::Expired` if the token's expiry timestamp is in the past.
+    /// Returns `TicketError::Expired` if the token's expiry is more than
+    /// `SERVER_SKEW` in the past.
     pub fn verify(&self, token: &str) -> Result<TicketPayload, TicketError> {
         let dot = token.rfind('.').ok_or(TicketError::Malformed)?;
         let payload_b64 = &token[..dot];
@@ -307,8 +311,10 @@ impl TicketVerifier {
             .verify(&payload_bytes, &sig_bytes)
             .map_err(|_| TicketError::InvalidSignature)?;
         let payload: TicketPayload = postcard::from_bytes(&payload_bytes)?;
-        let now = chrono::Utc::now().timestamp();
-        if payload.expiry < now {
+        let cutoff = chrono::Utc::now()
+            .timestamp()
+            .saturating_sub_unsigned(connetto_core::clock::SERVER_SKEW.as_secs());
+        if payload.expiry < cutoff {
             return Err(TicketError::Expired);
         }
         Ok(payload)

@@ -4,8 +4,6 @@
 //! laundered query sources so the table names remain deployment-controlled.
 //! Every function uses the typed DSL.
 
-use chrono::{DateTime, Utc};
-
 use connetto_file_core::{ChunkHash, ChunkMeta, FileId, Manifest};
 use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
 use diesel_async::{AsyncConnection, AsyncConnectionCore, AsyncPgConnection, RunQueryDsl};
@@ -104,7 +102,6 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
     let file_id_bytes = file_id.as_bytes().to_vec();
     let caller_owned = caller.to_owned();
     let chunks_owned: Vec<ChunkMeta> = chunks.to_vec();
-    let now = Utc::now();
 
     conn.transaction::<InsertManifestOutcome, IntentTxErr, _>(async move |c| {
         // Collect unique hashes in sorted order for deterministic locking.
@@ -136,7 +133,6 @@ pub(crate) async fn insert_manifest<S: ConnettoFileSchema>(
                 file_id_bytes.clone(),
                 total_len,
                 caller_owned.clone(),
-                now,
             ))
             .await?;
 
@@ -510,11 +506,11 @@ fn chunk_rows(chunks: &[ChunkMeta]) -> Result<Vec<(i32, Vec<u8>, i64)>, diesel::
 /// `mark_unreferenced_deleting` sees the post-CASCADE reference count.
 pub(crate) async fn prepare_sweep<S: ConnettoFileSchema>(
     conn: &mut AsyncPgConnection,
-    cutoff: DateTime<Utc>,
+    grace: i32,
 ) -> Result<usize, diesel::result::Error> {
     conn.transaction::<usize, diesel::result::Error, _>(async move |c| {
-        let candidates = S::lock_sweep_rows_stmt(cutoff).load(c).await?;
-        let orphan_ids = S::delete_orphaned_stmt(cutoff).load(c).await?;
+        let candidates = S::lock_sweep_rows_stmt(grace).load(c).await?;
+        let orphan_ids = S::delete_orphaned_stmt(grace).load(c).await?;
         if !candidates.is_empty() {
             S::mark_unreferenced_deleting_stmt(candidates)
                 .load(c)

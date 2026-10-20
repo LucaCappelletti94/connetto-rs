@@ -131,13 +131,13 @@ async fn expired_ticket_answers_404() {
         "valid ticket on committed file must answer 200"
     );
 
-    // An expired ticket must be refused regardless of the manifest.
+    // A ticket past its expiry by more than `SERVER_SKEW` must be refused.
     let expired_token = signer
         .mint(&TicketPayload {
             file_id: file_id_bytes,
             verb: Verb::Read,
             ceiling: 0,
-            expiry: chrono::Utc::now().timestamp() - 1,
+            expiry: chrono::Utc::now().timestamp() - 120,
             caller: crate::fixture::identified("alice"),
         })
         .unwrap();

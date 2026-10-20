@@ -207,7 +207,7 @@ fn spawn_sweep<D: crate::schema::ConnettoSchema>(
                 return;
             }
         };
-        let mut ticker = tokio::time::interval(cadence);
+        let mut ticker = super::sweep_interval(cadence);
         // The first tick completes at once, before the deployment can have
         // orphaned anything, so spend it here.
         ticker.tick().await;

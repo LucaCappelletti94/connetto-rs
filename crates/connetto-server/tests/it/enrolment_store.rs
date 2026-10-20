@@ -311,7 +311,7 @@ async fn a_list_names_every_unexpired_serial_of_its_issuer_for_a_revoked_key() {
     }
     assert!(
         store
-            .revoked_serials(issuer, now)
+            .revoked_serials(issuer)
             .await
             .expect("before")
             .is_empty(),
@@ -319,7 +319,7 @@ async fn a_list_names_every_unexpired_serial_of_its_issuer_for_a_revoked_key() {
     );
 
     store.revoke(None, key(1), now).await.expect("revoke");
-    let named = store.revoked_serials(issuer, now).await.expect("after");
+    let named = store.revoked_serials(issuer).await.expect("after");
     assert_eq!(
         named
             .iter()
@@ -329,6 +329,56 @@ async fn a_list_names_every_unexpired_serial_of_its_issuer_for_a_revoked_key() {
         "the expired serial, the other issuer's and the live key's are left out"
     );
     assert_eq!(micros(named[0].at), micros(now));
+}
+
+/// A peer accepts a certificate up to `DEVICE_SKEW` past its `not_after`, so a
+/// revoked serial stays on the list that long after the certificate lapses,
+/// and no longer after that (chapter 21, class G).
+#[tokio::test]
+async fn a_revoked_serial_stays_named_until_device_skew_past_expiry() {
+    let fixture = Fixture::acquire().await;
+    names_a_revoked_serial_until_device_skew(&*store(&fixture).await).await;
+}
+
+/// The in-memory store keeps the same window as the database store.
+#[tokio::test]
+async fn the_memory_store_names_a_revoked_serial_until_device_skew() {
+    let store = connetto_server::device_cert::MemoryEnrolments::<String>::default();
+    names_a_revoked_serial_until_device_skew(&store).await;
+}
+
+async fn names_a_revoked_serial_until_device_skew(store: &dyn EnrolmentStore<String>) {
+    let now = SystemTime::now();
+    let issuer = key(9);
+    for (serial, at) in [
+        (1u8, now - HOUR - Duration::from_secs(61)),
+        (2, now - HOUR - Duration::from_secs(361)),
+    ] {
+        let record = enrolment(
+            "alice",
+            key(serial),
+            serial,
+            issuer,
+            at,
+            AttestationLevel::Unproven,
+        );
+        assert_eq!(
+            store.record(record).await.expect("record"),
+            Recorded::Granted
+        );
+    }
+    for key in [key(1), key(2)] {
+        store.revoke(None, key, now).await.expect("revoke");
+    }
+    let named = store.revoked_serials(issuer).await.expect("named");
+    assert_eq!(
+        named
+            .iter()
+            .map(|revoked| revoked.serial.clone())
+            .collect::<Vec<_>>(),
+        vec![vec![1u8; 16]],
+        "the serial lapsed 61s ago stays named, the one lapsed 6min1s ago does not"
+    );
 }
 
 #[tokio::test]

@@ -6,7 +6,6 @@
 
 use std::time::Duration;
 
-use chrono::{TimeDelta, Utc};
 use thiserror::Error;
 
 use crate::{db, router::DbPool, schema::ConnettoFileSchema, store::AnyStore};
@@ -24,7 +23,7 @@ pub enum SweepError {
     /// Chunk store deletion error.
     #[error("store: {0}")]
     Store(#[from] crate::store::StoreError),
-    /// Grace period Duration exceeds chrono's representable range.
+    /// Grace period Duration exceeds the `make_interval` seconds range.
     #[error("grace period out of range")]
     GracePeriodOutOfRange,
 }
@@ -39,7 +38,7 @@ impl<E: std::error::Error + 'static> From<bb8::RunError<E>> for SweepError {
 ///
 /// # Errors
 ///
-/// Returns `SweepError::GracePeriodOutOfRange` if `grace` cannot be converted to a `chrono::TimeDelta`.
+/// Returns `SweepError::GracePeriodOutOfRange` if `grace` exceeds the `make_interval` seconds range.
 /// Returns `SweepError::Pool` if a database connection cannot be acquired from the pool.
 /// Returns `SweepError::Db` on any database query failure.
 /// Returns `SweepError::Store` if the chunk store fails to delete a chunk.
@@ -48,11 +47,13 @@ pub async fn sweep<S: ConnettoFileSchema>(
     store: &AnyStore,
     grace: Duration,
 ) -> Result<usize, SweepError> {
-    let delta = TimeDelta::from_std(grace).map_err(|_| SweepError::GracePeriodOutOfRange)?;
+    // The cutoff is written as `now() - grace` inside the statements, so the
+    // grace runs from the database's own clock (chapter 21, class H).
+    let grace_secs =
+        i32::try_from(grace.as_secs()).map_err(|_| SweepError::GracePeriodOutOfRange)?;
     let mut conn = pool.get().await?;
-    let cutoff = Utc::now() - delta;
 
-    let removed_manifests = db::prepare_sweep::<S>(&mut conn, cutoff).await?;
+    let removed_manifests = db::prepare_sweep::<S>(&mut conn, grace_secs).await?;
     let deleting = db::list_deleting_hashes::<S>(&mut conn).await?;
     drop(conn);
 

@@ -48,6 +48,8 @@ pub mod builder;
 pub mod capability;
 pub mod counters;
 pub mod courier;
+#[doc(hidden)]
+pub mod db_clock;
 pub mod defaults;
 pub mod device_cert;
 pub mod epoch;

@@ -608,12 +608,21 @@ impl BackgroundTask {
     }
 }
 
+/// The ticker a sweep loop runs on. A pass slower than the cadence delays the
+/// next pass by the missed time, so a slow database draws one delayed pass
+/// rather than a burst of the passes it skipped (chapter 21, class C).
+fn sweep_interval(cadence: Duration) -> tokio::time::Interval {
+    let mut ticker = tokio::time::interval(cadence);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker
+}
+
 /// Spawn the writer sweep (R75 decision 5), the loop that prunes the settled
 /// rows of every device writer whose enrolment has been revoked or has gone
 /// absent, at the fixed cadence, the first pass at once.
 fn spawn_writer_sweep<D: ConnettoSchema>(manager: Arc<ServerManager<D>>) -> BackgroundTask {
     BackgroundTask::new(tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(WRITER_SWEEP_CADENCE);
+        let mut ticker = sweep_interval(WRITER_SWEEP_CADENCE);
         // The first tick completes at once, so the first pass does not wait
         // a full cadence.
         ticker.tick().await;
@@ -2034,6 +2043,22 @@ mod tests {
             None,
             connetto_core::BOT_LIST_WILDCARD.to_owned(),
         )
+    }
+
+    /// A pass slower than the cadence must delay the next pass by the missed
+    /// time, not fire a burst of the passes it skipped (chapter 21, class C).
+    #[tokio::test(start_paused = true)]
+    async fn a_sweep_interval_drops_a_missed_period() {
+        let mut ticker = sweep_interval(Duration::from_secs(60));
+        ticker.tick().await;
+        tokio::time::sleep(Duration::from_secs(180)).await;
+        ticker.tick().await;
+        let started = tokio::time::Instant::now();
+        ticker.tick().await;
+        assert!(
+            started.elapsed() >= Duration::from_secs(59),
+            "the next pass must be a full cadence away, not a catch-up burst"
+        );
     }
 
     /// A service that accepts the connection and never answers fails the call

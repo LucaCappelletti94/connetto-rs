@@ -135,8 +135,8 @@ impl EnrolmentStore<String> for FailingListStore {
         self.inner.revoke(user, key, at)
     }
 
-    fn revoked_serials(&self, issuer: KeyId, now: SystemTime) -> EnrolmentFuture<'_, Vec<Revoked>> {
-        self.inner.revoked_serials(issuer, now)
+    fn revoked_serials(&self, issuer: KeyId) -> EnrolmentFuture<'_, Vec<Revoked>> {
+        self.inner.revoked_serials(issuer)
     }
 
     fn next_list_number(&self, issuer: KeyId) -> EnrolmentFuture<'_, u64> {
