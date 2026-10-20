@@ -300,6 +300,8 @@ enum TabOut {
 /// hub-fatal error.
 enum TabFault {
     /// Close the offending tab, telling it why.
+    /// Close the tab with a typed refusal it can act on.
+    Refuse(FatalErrorReason),
     Close(String),
     /// The hub itself failed.
     Hub(RelayError),
@@ -2506,21 +2508,21 @@ where
         }
         IncomingFrame::Bulk(bulk) => handle_tab_bulk(worker, state, content, walk, id, bulk).await,
     };
-    match outcome {
-        Ok(()) => Ok(()),
-        Err(TabFault::Close(reason)) => {
-            tracing::warn!(tab = %id, reason = %reason, "relay hub closed a tab");
-            if let Some(tab) = state.tabs.remove(&id) {
-                // The shovel delivers this before it sees the dropped sender and closes the tab.
-                let _ = tab.out.send(TabOut::Control(ControlMessage::FatalError(
-                    FatalError::new(FatalErrorReason::ProtocolViolation { detail: reason }),
-                )));
-            }
-            state.pending_resolve.retain(|resolve| resolve.tab != id);
-            Ok(())
-        }
-        Err(TabFault::Hub(err)) => Err(err),
+    let reason = match outcome {
+        Ok(()) => return Ok(()),
+        Err(TabFault::Hub(err)) => return Err(err),
+        Err(TabFault::Close(detail)) => FatalErrorReason::ProtocolViolation { detail },
+        Err(TabFault::Refuse(reason)) => reason,
+    };
+    tracing::warn!(tab = %id, reason = ?reason, "relay hub closed a tab");
+    if let Some(tab) = state.tabs.remove(&id) {
+        // The shovel delivers this before it sees the dropped sender and closes the tab.
+        let _ = tab.out.send(TabOut::Control(ControlMessage::FatalError(
+            FatalError::new(reason),
+        )));
     }
+    state.pending_resolve.retain(|resolve| resolve.tab != id);
+    Ok(())
 }
 
 /// Multiplex a tab aggregate subscription onto the worker connection.
@@ -2686,6 +2688,17 @@ where
         ControlMessage::Handshake(handshake) => {
             if tab.handshaken {
                 return Err(TabFault::Close("second handshake".to_owned()));
+            }
+            // A tab from another build of the application would read the
+            // worker's replica through a schema it was not built for, so it is
+            // refused exactly as the server refuses the worker (R31).
+            if let Some(worker_major) = worker.schema_major()
+                && handshake.schema_major != Some(worker_major)
+            {
+                return Err(TabFault::Refuse(FatalErrorReason::MajorMismatch {
+                    server: worker_major,
+                    client: handshake.schema_major,
+                }));
             }
             let client_uuid = tab_key(&handshake.client_id);
             tab.handshaken = true;
@@ -4578,6 +4591,8 @@ mod tests {
     use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
     wasm_bindgen_test_configure!(run_in_dedicated_worker);
+    /// The major line the test schema source declares.
+    const SOURCE: &str = "-- connetto:major 1";
 
     const DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
@@ -4586,14 +4601,17 @@ mod tests {
         ddl: &str,
     ) -> connetto_client::ClientBuilder<connetto_core::test_support::FakeTransport> {
         connetto_client::ClientBuilder::new(
-            connetto_client::SyncSchema::new(connetto_core::schema::SchemaBundle::new(
-                "",
-                "",
-                ddl,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
-                None::<&str>,
-            )),
+            connetto_client::SyncSchema::new(
+                connetto_core::schema::SchemaBundle::new(
+                    SOURCE,
+                    "",
+                    ddl,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                    None::<&str>,
+                )
+                .expect("the source declares major 1"),
+            ),
             || async { Err::<connetto_core::test_support::FakeTransport, _>("offline") },
         )
     }
@@ -5611,14 +5629,17 @@ mod tests {
         tokio::sync::mpsc::UnboundedReceiver<super::TabOut>,
     ) {
         let mut worker = connetto_client::ClientBuilder::new(
-            connetto_client::SyncSchema::new(connetto_core::schema::SchemaBundle::new(
-                "",
-                "",
-                DDL,
-                Vec::<(String, String)>::new(),
-                Vec::<String>::new(),
-                Some(FOLDERS_TIER),
-            )),
+            connetto_client::SyncSchema::new(
+                connetto_core::schema::SchemaBundle::new(
+                    SOURCE,
+                    "",
+                    DDL,
+                    Vec::<(String, String)>::new(),
+                    Vec::<String>::new(),
+                    Some(FOLDERS_TIER),
+                )
+                .expect("the source declares major 1"),
+            ),
             || async { Err::<connetto_core::test_support::FakeTransport, _>("offline") },
         )
         .open_driven()

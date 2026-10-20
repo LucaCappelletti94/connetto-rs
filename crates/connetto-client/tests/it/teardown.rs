@@ -32,6 +32,8 @@ const MARKER: &str = "connetto-teardown-canary-9d4e21b7";
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// Test table for items in the replica.
@@ -177,14 +179,17 @@ async fn seed_replica_with_tier(
     let credential = super::support::held(user_id);
     let record = credential.replica_name().to_owned();
     let path = dir.join(&record);
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::Once::new(FakeTransport::accepting()),
@@ -520,14 +525,17 @@ async fn a_client_whose_schema_has_policies_forgets_its_device() {
 CREATE TABLE orders_rls (id INTEGER PRIMARY KEY, owner_id TEXT NOT NULL) STRICT;
 CREATE VIEW orders AS SELECT id, owner_id FROM orders_rls WHERE owner_id = current_app_user();
 ";
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        ddl,
-        vec![("orders", "orders_rls")],
-        vec!["orders"],
-        None::<&str>,
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            ddl,
+            vec![("orders", "orders_rls")],
+            vec!["orders"],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    );
     let dir = tempfile::tempdir().expect("a temporary directory");
     let keys = super::support::SharedKeys::default();
     let credential = super::support::held("alice");

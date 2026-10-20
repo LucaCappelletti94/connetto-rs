@@ -22,6 +22,9 @@ use connetto_file_client::{ContentClient, ContentHttp, FsStore, HttpFailure, Htt
 use connetto_file_core::{FileId, MimeClass};
 use diesel::prelude::*;
 
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 /// The application's own table: a photo entry naming its content.
 pub const DDL: &str = "CREATE TABLE IF NOT EXISTS photos (id INTEGER PRIMARY KEY, \
                        content_id BLOB NOT NULL, content_state TEXT)";
@@ -306,14 +309,17 @@ where
     T::Error: core::fmt::Display,
 {
     ClientBuilder::new(
-        SyncSchema::new(SchemaBundle::new(
-            "",
-            "",
-            DDL,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        )),
+        SyncSchema::new(
+            SchemaBundle::new(
+                SOURCE,
+                "",
+                DDL,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )
+            .expect("the source declares major 1"),
+        ),
         || async { Err::<T, _>("no server") },
     )
     .signed_in(

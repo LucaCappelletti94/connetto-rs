@@ -1,11 +1,10 @@
-//! Schema version shared between client and server.
+//! Schema identity shared between client and server.
 //!
-//! The client compares the [`SchemaVersion`] it was built against with the one
-//! the server advertises in `HandshakeAck`. connetto does not migrate schemas at
-//! runtime (the client never runs DDL), so a mismatch means this app build is
-//! stale and must reload, not that a migration should run. A version is a
-//! content hash of the schema, so two schemas are interchangeable iff their
-//! hashes match.
+//! Two values identify a schema. The [`Major`] is the application schema
+//! major its source declares, the number a handshake is routed and refused
+//! by and the number a replica and its device-private tier record. The
+//! [`SchemaVersion`] is a content hash of the whole build artifact, which
+//! catches the same major built from a different schema.
 //!
 //! A [`SchemaVersion`] always holds a real content hash. The absence of a
 //! declared version is modeled out of band, as `Option<SchemaVersion>` on the
@@ -21,11 +20,13 @@
 //! whole bundle, so a client and its server that translate the same sources
 //! with the same pg2sqlite agree bit-for-bit, and a different pg2sqlite
 //! revision, which emits a different replica DDL for the same sources, reads
-//! as an outdated build.
+//! as an outdated build. Its `major()` is read from the schema source, so it
+//! cannot drift from the document it describes.
 //!
 //! [`HandshakeAck`]: crate::messages::HandshakeAck
 
 use core::fmt;
+use core::num::NonZeroU32;
 
 use serde::{Deserialize, Serialize};
 
@@ -55,6 +56,82 @@ pub const BOT_LIST_FUNCTION: &str = "current_bot_list";
 
 /// The separator a bot list packs its `table:verb` entries with.
 pub const BOT_LIST_SEPARATOR: char = ',';
+
+/// The comment a schema source declares its major with, alone on its line
+/// and followed by the number, as in `-- connetto:major 3`.
+pub const MAJOR_DIRECTIVE: &str = "-- connetto:major";
+
+/// An application schema major, the number every incompatible schema change
+/// increments. Majors start at 1.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Major(NonZeroU32);
+
+impl Major {
+    /// The major `value`, or `None` for 0, which no schema declares.
+    #[must_use]
+    pub const fn new(value: u32) -> Option<Self> {
+        match NonZeroU32::new(value) {
+            Some(value) => Some(Self(value)),
+            None => None,
+        }
+    }
+
+    /// The number.
+    #[must_use]
+    pub const fn get(self) -> u32 {
+        self.0.get()
+    }
+
+    /// The major `source` declares through [`MAJOR_DIRECTIVE`].
+    ///
+    /// # Errors
+    ///
+    /// [`MajorError::Missing`] when no line carries the directive,
+    /// [`MajorError::Repeated`] when more than one does, and
+    /// [`MajorError::Invalid`] when its value is not a number from 1 up.
+    pub fn declared_in(source: &str) -> Result<Self, MajorError> {
+        let mut values = source
+            .lines()
+            .filter_map(|line| line.trim().strip_prefix(MAJOR_DIRECTIVE));
+        let value = values.next().ok_or(MajorError::Missing)?;
+        if values.next().is_some() {
+            return Err(MajorError::Repeated);
+        }
+        let value = value.trim();
+        value
+            .parse::<u32>()
+            .ok()
+            .and_then(Self::new)
+            .ok_or_else(|| MajorError::Invalid(value.to_owned()))
+    }
+}
+
+impl fmt::Display for Major {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl fmt::Debug for Major {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Major({})", self.0)
+    }
+}
+
+/// Why a schema source does not declare a usable major.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum MajorError {
+    /// No line carries [`MAJOR_DIRECTIVE`].
+    #[error("the schema source declares no major, add a `{MAJOR_DIRECTIVE} N` line")]
+    Missing,
+    /// More than one line carries it.
+    #[error("the schema source declares its major more than once")]
+    Repeated,
+    /// The value is not a number from 1 up.
+    #[error("the schema source declares major {0:?}, which is not a number from 1 up")]
+    Invalid(String),
+}
 
 /// The list entry every person's connection carries, which every generated
 /// cap policy admits, so a person is held to its own rules alone.
@@ -91,7 +168,9 @@ const BUNDLE_DOMAIN_TAG: &str = "connetto-schema-bundle-v1\0";
 /// The version is always the hash of these contents, computed by
 /// [`version`](SchemaBundle::version), and there is no other way to obtain
 /// the version of a bundle. A bundle cannot be given a version, so the DDL an
-/// application applies and the version it presents cannot drift apart.
+/// application applies and the version it presents cannot drift apart. The
+/// [`major`](SchemaBundle::major) is read from the schema source the same
+/// way, so it sits inside the version too.
 #[derive(Clone)]
 pub struct SchemaBundle {
     schema_source: String,
@@ -100,6 +179,7 @@ pub struct SchemaBundle {
     policy_tables: Vec<(String, String)>,
     policy_views: Vec<String>,
     local_tier_ddl: Option<String>,
+    major: Major,
 }
 
 impl SchemaBundle {
@@ -110,7 +190,11 @@ impl SchemaBundle {
     /// split, `policy_views` every view it emitted, and `local_tier_ddl` the
     /// translated local tier, when the build has one. Order of the pairs and
     /// views does not matter, the hash sorts them.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// The [`MajorError`] when `schema_source` does not declare its major
+    /// through [`MAJOR_DIRECTIVE`].
     pub fn new<S, P, D, T, TL, TP, V, VN, L>(
         schema_source: S,
         policies_source: P,
@@ -118,7 +202,7 @@ impl SchemaBundle {
         policy_tables: T,
         policy_views: V,
         local_tier_ddl: Option<L>,
-    ) -> Self
+    ) -> Result<Self, MajorError>
     where
         S: Into<String>,
         P: Into<String>,
@@ -130,8 +214,11 @@ impl SchemaBundle {
         VN: Into<String>,
         L: Into<String>,
     {
-        Self {
-            schema_source: schema_source.into(),
+        let schema_source = schema_source.into();
+        let major = Major::declared_in(&schema_source)?;
+        let local_tier_ddl: Option<String> = local_tier_ddl.map(Into::into);
+        Ok(Self {
+            schema_source,
             policies_source: policies_source.into(),
             replica_ddl: replica_ddl.into(),
             policy_tables: policy_tables
@@ -139,8 +226,15 @@ impl SchemaBundle {
                 .map(|(logical, physical)| (logical.into(), physical.into()))
                 .collect(),
             policy_views: policy_views.into_iter().map(Into::into).collect(),
-            local_tier_ddl: local_tier_ddl.map(Into::into),
-        }
+            local_tier_ddl,
+            major,
+        })
+    }
+
+    /// The application schema major the schema source declares.
+    #[must_use]
+    pub const fn major(&self) -> Major {
+        self.major
     }
 
     /// Return a copy of this bundle with its translated local tier, for the
@@ -241,6 +335,7 @@ impl SchemaBundle {
 impl fmt::Debug for SchemaBundle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SchemaBundle")
+            .field("major", &self.major)
             .field("version", &self.version())
             .field("policy_tables", &self.policy_tables)
             .field("policy_views", &self.policy_views)
@@ -339,66 +434,90 @@ pub fn schema_hash(source: &str) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_major_is_read_from_its_directive_line() {
+        let source = "CREATE TABLE a (id INT);\n  -- connetto:major 3  \nCREATE TABLE b (id INT);";
+        assert_eq!(Major::declared_in(source).map(Major::get), Ok(3));
+    }
+
+    #[test]
+    fn a_source_without_the_directive_declares_no_major() {
+        assert_eq!(
+            Major::declared_in("CREATE TABLE a (id INT); -- a comment"),
+            Err(MajorError::Missing)
+        );
+    }
+
+    #[test]
+    fn the_directive_may_appear_once() {
+        assert_eq!(
+            Major::declared_in("-- connetto:major 1\n-- connetto:major 1"),
+            Err(MajorError::Repeated)
+        );
+    }
+
+    #[test]
+    fn zero_and_non_numbers_are_refused() {
+        for value in ["0", "-1", "two", ""] {
+            assert_eq!(
+                Major::declared_in(&format!("-- connetto:major {value}")),
+                Err(MajorError::Invalid(value.to_owned())),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// `source` with the major directive every bundle requires, major 1.
+    fn majored(source: &str) -> String {
+        format!("{MAJOR_DIRECTIVE} 1\n{source}")
+    }
+
     /// One bundle of known contents, the reference every case below varies.
     fn reference() -> SchemaBundle {
         SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
             "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
             [("orders", "orders_rls")],
             ["orders", "orders_rls_violations"],
             None::<&str>,
         )
+        .expect("the source declares major 1")
     }
 
     #[test]
     fn every_field_of_the_bundle_changes_the_version() {
         let base = reference().version();
         let varied = [
-            SchemaBundle::new(
-                "CREATE TABLE orders (id INT, extra INT);",
-                "CREATE POLICY orders_p ON orders USING (true);",
-                "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-                [("orders", "orders_rls")],
-                ["orders", "orders_rls_violations"],
-                None::<&str>,
-            )
+            SchemaBundle::new(majored("CREATE TABLE orders (id INT, extra INT);"), "CREATE POLICY orders_p ON orders USING (true);",
+            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+            [("orders", "orders_rls")],
+            ["orders", "orders_rls_violations"],
+            None::<&str>,).expect("the source declares major 1")
             .version(),
-            SchemaBundle::new(
-                "CREATE TABLE orders (id INT);",
-                "CREATE POLICY orders_p ON orders USING (id > 0);",
-                "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-                [("orders", "orders_rls")],
-                ["orders", "orders_rls_violations"],
-                None::<&str>,
-            )
+            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (id > 0);",
+            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+            [("orders", "orders_rls")],
+            ["orders", "orders_rls_violations"],
+            None::<&str>,).expect("the source declares major 1")
             .version(),
-            SchemaBundle::new(
-                "CREATE TABLE orders (id INT);",
-                "CREATE POLICY orders_p ON orders USING (true);",
-                "CREATE TABLE orders_rls (id INTEGER NOT NULL); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-                [("orders", "orders_rls")],
-                ["orders", "orders_rls_violations"],
-                None::<&str>,
-            )
+            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (true);",
+            "CREATE TABLE orders_rls (id INTEGER NOT NULL); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+            [("orders", "orders_rls")],
+            ["orders", "orders_rls_violations"],
+            None::<&str>,).expect("the source declares major 1")
             .version(),
-            SchemaBundle::new(
-                "CREATE TABLE orders (id INT);",
-                "CREATE POLICY orders_p ON orders USING (true);",
-                "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-                [("orders", "orders_split")],
-                ["orders", "orders_rls_violations"],
-                None::<&str>,
-            )
+            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (true);",
+            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+            [("orders", "orders_split")],
+            ["orders", "orders_rls_violations"],
+            None::<&str>,).expect("the source declares major 1")
             .version(),
-            SchemaBundle::new(
-                "CREATE TABLE orders (id INT);",
-                "CREATE POLICY orders_p ON orders USING (true);",
-                "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
-                [("orders", "orders_rls")],
-                ["orders"],
-                None::<&str>,
-            )
+            SchemaBundle::new(majored("CREATE TABLE orders (id INT);"), "CREATE POLICY orders_p ON orders USING (true);",
+            "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
+            [("orders", "orders_rls")],
+            ["orders"],
+            None::<&str>,).expect("the source declares major 1")
             .version(),
         ];
         assert_ne!(base, varied[0], "the schema source is part of the version");
@@ -427,22 +546,24 @@ mod tests {
     #[test]
     fn pair_and_view_order_does_not_change_the_version() {
         let base = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
             "CREATE TABLE orders_rls (id INTEGER);",
             [("orders", "orders_rls"), ("notes", "notes_rls")],
             ["notes", "orders", "orders_rls_violations"],
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         let reordered = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
             "CREATE TABLE orders_rls (id INTEGER);",
             [("notes", "notes_rls"), ("orders", "orders_rls")],
             ["orders_rls_violations", "orders", "notes"],
             None::<&str>,
-        );
+        )
+        .expect("the source declares major 1");
         assert_eq!(base, reordered.version(), "the hash sorts both lists");
     }
 
@@ -450,13 +571,14 @@ mod tests {
     fn pair_names_are_case_insensitive() {
         let base = reference().version();
         let recased = SchemaBundle::new(
-            "CREATE TABLE orders (id INT);",
+            majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
             "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
             [("ORDERS", "ORDERS_RLS")],
             ["ORDERS", "ORDERS_RLS_VIOLATIONS"],
             None::<&str>,
-        );
+        )
+        .expect("the source declares major 1");
         assert_eq!(
             base,
             recased.version(),
@@ -473,42 +595,46 @@ mod tests {
         // scheme that hashed the concatenation would read the two bundles as
         // equal. The length prefixes make the split part of the identity.
         let left = SchemaBundle::new(
-            "AB",
+            majored("AB"),
             "",
             "DDL",
             NO_TABLES.iter().copied(),
             NO_VIEWS.iter().copied(),
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         let right = SchemaBundle::new(
-            "A",
+            majored("A"),
             "B",
             "DDL",
             NO_TABLES.iter().copied(),
             NO_VIEWS.iter().copied(),
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         assert_ne!(left, right, "the split at the field boundary is hashed");
 
         let left = SchemaBundle::new(
-            "A\nB",
+            majored("A\nB"),
             "C",
             "DDL",
             NO_TABLES.iter().copied(),
             NO_VIEWS.iter().copied(),
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         let right = SchemaBundle::new(
-            "A",
+            majored("A"),
             "B\nC",
             "DDL",
             NO_TABLES.iter().copied(),
             NO_VIEWS.iter().copied(),
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         assert_ne!(left, right, "so is a split across a newline");
     }
@@ -532,7 +658,7 @@ mod tests {
     fn the_version_is_the_documented_digest() {
         let bundle = reference();
         let expected = manual_digest(&[
-            "CREATE TABLE orders (id INT);",
+            &majored("CREATE TABLE orders (id INT);"),
             "CREATE POLICY orders_p ON orders USING (true);",
             "CREATE TABLE orders_rls (id INTEGER); CREATE VIEW orders AS SELECT * FROM orders_rls;",
             "orders\u{0}orders_rls",
@@ -546,22 +672,24 @@ mod tests {
     #[test]
     fn crlf_and_lf_sources_hash_equal() {
         let lf = SchemaBundle::new(
-            "A\nB\nC",
+            majored("A\nB\nC"),
             "D\nE",
             "F\nG",
             NO_TABLES.iter().copied(),
             NO_VIEWS.iter().copied(),
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         let crlf = SchemaBundle::new(
-            "A\r\nB\r\nC",
+            majored("A\r\nB\r\nC"),
             "D\r\nE",
             "F\r\nG",
             NO_TABLES.iter().copied(),
             NO_VIEWS.iter().copied(),
             None::<&str>,
         )
+        .expect("the source declares major 1")
         .version();
         assert_eq!(lf, crlf);
     }

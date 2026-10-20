@@ -41,6 +41,9 @@ use wasm_bindgen_test::{wasm_bindgen_test, wasm_bindgen_test_configure};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
 
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
+
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)";
 
@@ -70,14 +73,17 @@ diesel::table! {
 
 /// The client schema over [`SQLITE_DDL`].
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// The replica at exactly `url`, fresh or already there as the test says.

@@ -21,6 +21,8 @@ use diesel::prelude::*;
 use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const DDL: &str = "CREATE TABLE orders (id INTEGER PRIMARY KEY, label TEXT);";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// The one synced table these builds read back.
@@ -42,14 +44,17 @@ struct Order {
 
 /// The translated bundle these builds present, one table and no policies.
 fn bundle() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "schema",
-        "policies",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "policies",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// The refusal a one-shot dialer hands back after it has handed out its
@@ -712,14 +717,17 @@ fn an_anonymous_build_answers_the_caller_and_subjects_functions_as_nobody() {
     let ddl = "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT); \
                CREATE VIEW visible AS SELECT * FROM notes \
                WHERE owner = current_app_user() OR owner = current_app_subjects();";
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "schema",
-        "policies",
-        ddl,
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "policies",
+            ddl,
+            Vec::<(String, String)>::new(),
+            vec!["visible".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(schema, OneShot { transport: None })
         .open_driven()
         .expect("a schema whose views call both functions opens anonymous");

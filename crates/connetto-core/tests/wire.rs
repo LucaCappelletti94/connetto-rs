@@ -6,7 +6,7 @@
 //! silently break the wire will fail one of these tests.
 
 use connetto_core::{
-    Cursor, SchemaVersion,
+    Cursor, Major, SchemaVersion,
     codec::{
         DEFAULT_MAX_FRAME_LEN, decode_bulk, decode_bulk_framed, decode_control,
         decode_control_framed, encode_bulk, encode_bulk_framed, encode_control,
@@ -98,7 +98,8 @@ fn handshake_and_ack_round_trip() {
             .with_grants([Grant::new("login-token"), Grant::new("share-key")])
             .with_resume_token("prior-run")
             .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef]))
-            .with_cursor_subjects(["key:a", "key:b"]),
+            .with_cursor_subjects(["key:a", "key:b"])
+            .with_major(Major::new(3).expect("three is a major")),
     ));
     round_trip_control(&ControlMessage::Handshake(Handshake::new(
         PROTOCOL_VERSION,
@@ -370,6 +371,16 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
             expected: PROTOCOL_VERSION,
             got: 999,
         },
+        // SessionManager::run_handshake, on a major that is not the server's
+        // (R31), and on a handshake from before majors existed.
+        FatalErrorReason::MajorMismatch {
+            server: Major::new(2).expect("two is a major"),
+            client: Major::new(1),
+        },
+        FatalErrorReason::MajorMismatch {
+            server: Major::new(2).expect("two is a major"),
+            client: None,
+        },
         // SessionManager::close_session, from the auth service's revoke hook.
         FatalErrorReason::SessionRevoked,
         // DeviceEnrolment::revoke, closing a reported device's connections (R74).
@@ -409,6 +420,7 @@ fn every_fatal_reason() -> Vec<FatalErrorReason> {
     for reason in &reasons {
         match reason {
             FatalErrorReason::ProtocolVersionMismatch { .. }
+            | FatalErrorReason::MajorMismatch { .. }
             | FatalErrorReason::SessionRevoked
             | FatalErrorReason::DeviceRevoked
             | FatalErrorReason::ConnectionSuperseded

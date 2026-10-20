@@ -235,10 +235,10 @@ async fn hub_enforces_the_per_tab_credit_window() {
     // is what governs delivery.
     let (mut tab, relay_end) = loopback();
     hub.attach(relay_end);
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        rosetta_uuid::Uuid::new_v4().to_string(),
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, rosetta_uuid::Uuid::new_v4().to_string())
+            .with_major(raw_schema(DDL).major()),
+    ))
     .await
     .expect("tab handshake");
     let ack = match recv(&mut tab).await {
@@ -436,10 +436,10 @@ async fn a_tabs_snapshot_end_waits_for_its_rows() {
 
     let (mut tab, relay_end) = loopback();
     hub.attach(relay_end);
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        rosetta_uuid::Uuid::new_v4().to_string(),
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, rosetta_uuid::Uuid::new_v4().to_string())
+            .with_major(raw_schema(DDL).major()),
+    ))
     .await
     .expect("tab handshake");
     let IncomingFrame::Control(ControlMessage::HandshakeAck(_)) = recv(&mut tab).await else {

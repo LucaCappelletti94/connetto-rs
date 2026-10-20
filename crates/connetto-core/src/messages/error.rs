@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::schema::Major;
+
 /// The one detail text a refused subscription carries.
 ///
 /// Every refusal on the subscribe path reads exactly like this, whatever the
@@ -82,6 +84,16 @@ pub enum FatalErrorReason {
         expected: u32,
         /// Version declared by the client.
         got: u32,
+    },
+    /// The client was built against another application schema major than the
+    /// server's. A client whose major is older than the server's has to update,
+    /// and one whose major is newer is ahead of the server it reached.
+    MajorMismatch {
+        /// The server's major.
+        server: Major,
+        /// The major the client declared, absent from a client built before
+        /// majors existed.
+        client: Option<Major>,
     },
     /// Session was administratively revoked mid-connection.
     SessionRevoked,

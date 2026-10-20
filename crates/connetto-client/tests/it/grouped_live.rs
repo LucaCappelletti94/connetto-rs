@@ -28,7 +28,7 @@ use diesel::prelude::*;
 use subql::{CdcSource, PgSqliteEmuSource, SourceItem};
 use tokio::net::{TcpListener, TcpStream};
 
-const PG_DDL: &str = "CREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
+const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE orders (id INT PRIMARY KEY, status TEXT);";
 // `IF NOT EXISTS` because `connect` replays the caller's DDL on every open.
 const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS orders (id INTEGER PRIMARY KEY, status TEXT);";
 

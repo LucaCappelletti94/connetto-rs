@@ -63,7 +63,7 @@ const PHASE: &str = "CONNETTO_R74_PHASE";
 
 /// A one-table fixture schema the client and the server each name in their own
 /// DDL, the way the suites that sync a table spell it.
-const PG_DDL: &str = "CREATE TABLE devices (id INT PRIMARY KEY, label TEXT);";
+const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE devices (id INT PRIMARY KEY, label TEXT);";
 // `IF NOT EXISTS` because `connect` replays the caller's DDL on every open.
 const SQLITE_DDL: &str = "CREATE TABLE IF NOT EXISTS devices (id INTEGER PRIMARY KEY, label TEXT);";
 

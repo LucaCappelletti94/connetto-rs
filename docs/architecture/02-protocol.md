@@ -136,6 +136,14 @@ Both sides derive it through one build step, `connetto_schema::translate`, with 
 
 A client always declares a version, because the builders take a `SyncSchema` built from a bundle and give no way to leave it out. A server that declares none still skips the check.
 
+## Application schema major
+
+**Built (R31).** Every incompatible application schema change is a new major, an integer from 1 up that the Postgres schema source declares on a line of its own, `-- connetto:major N`. `connetto_core::SchemaBundle::major` reads it from the source, so the directive sits inside the version hash and cannot drift from the document it describes, and a source without it fails translation.
+
+The client sends its major as `Handshake.schema_major`. The server compares it with its own before checking any grant and refuses a mismatch with `FatalErrorReason::MajorMismatch { server, client }`, sent before the ack as `ProtocolVersionMismatch` is. A client whose major is older than the server's, or that sent none, surfaces `ClientError::UpdateRequired`, and one whose major is newer surfaces `ClientError::ServerBehind`. A deployment hosting several majors puts a proxy in front of one server per major and routes on that field, so every client keeps one URL. A browser relay hub holds its tabs to the worker's major the same way, so a tab left open across a deploy is refused rather than reading a replica built for another schema.
+
+The major and the version answer different questions. The major is what routing, refusal and the replica's record use. The version still catches the same major built from different sources.
+
 ---
 
 ## Session token

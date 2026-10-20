@@ -23,6 +23,8 @@ const MIXED_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)
 
 /// One keyed table, so a test can create its own tables afterwards.
 const KEYED_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 fn key() -> ReplicaKey {
     ReplicaKey::from_bytes([0x62; ReplicaKey::LEN])
@@ -176,14 +178,17 @@ async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
     let dir = tempdir().expect("temp dir");
     let credential = super::support::held("test");
     let store = super::support::key_store_with(&credential, key()).await;
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        KEYED_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)"),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            KEYED_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some("CREATE TABLE drafts (id INTEGER PRIMARY KEY, body TEXT)"),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(
         schema,
         super::support::NeverDial::<FakeTransport>::default(),
@@ -214,14 +219,17 @@ async fn a_tier_table_created_after_open_is_caught_at_the_next_write() {
 /// table through a session diff and an unkeyed one delivers nothing.
 #[test]
 fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        KEYED_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some("CREATE TABLE scratch (body TEXT)"),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            KEYED_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some("CREATE TABLE scratch (body TEXT)"),
+        )
+        .expect("the source declares major 1"),
+    );
     let tables = refused(
         ClientBuilder::new(
             schema,
@@ -240,14 +248,17 @@ fn an_unkeyed_tier_table_is_refused_on_the_create_path() {
 #[tokio::test]
 async fn an_unkeyed_tier_table_is_refused_on_the_existing_path() {
     let dir = tempdir().expect("temp dir");
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        KEYED_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some("CREATE TABLE scratch (body TEXT)"),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            KEYED_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some("CREATE TABLE scratch (body TEXT)"),
+        )
+        .expect("the source declares major 1"),
+    );
     let accepted = schema.clone().with_unrecorded_tables(["scratch"]);
     // The tier is created with the table accepted, which is the only way one
     // gets written at all, and then reopened without the acceptance.

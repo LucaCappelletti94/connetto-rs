@@ -76,10 +76,10 @@ async fn tab_handshake_ack_carries_the_upstream_schema_version() {
     // A raw frame-level tab: hand-send the handshake and read the ack directly.
     let (mut tab, relay_end) = loopback();
     hub.attach(relay_end);
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        rosetta_uuid::Uuid::new_v4().to_string(),
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, rosetta_uuid::Uuid::new_v4().to_string())
+            .with_major(raw_schema(DDL).major()),
+    ))
     .await
     .expect("tab handshake");
     let ack = match tab.recv().await.expect("tab recv").expect("tab frame") {

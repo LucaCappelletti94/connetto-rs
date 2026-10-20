@@ -34,6 +34,8 @@ const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
 
 const SQLITE_DDL: &str = "CREATE TABLE items (id INTEGER PRIMARY KEY, label TEXT)";
 const TIER_DDL: &str = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// Test table for items in the replica.
@@ -314,14 +316,17 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
     let tier_path = dir
         .path()
         .join(format!("{}-tier", credential.replica_name()));
-    let bundle = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let bundle = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
 
     // First boot. The tier is created through the replica connection, which is
     // what makes its key salt agree with the replica's, and nothing else does.
@@ -381,14 +386,17 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
 
 #[tokio::test]
 async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_replica() {
-    let bundle = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        SQLITE_DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(TIER_DDL),
-    ));
+    let bundle = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            SQLITE_DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(TIER_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
 
     // Two ways an app reaches this: a plaintext baked template, which is what a
     // build-time artifact always is, and an encrypted file some other connection

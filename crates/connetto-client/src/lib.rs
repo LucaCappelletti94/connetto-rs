@@ -26,7 +26,9 @@ use connetto_core::messages::{
 #[cfg(feature = "device-identity")]
 use connetto_core::messages::{BindDevice, WriterOutcome, writer_bind_message};
 use connetto_core::traits::{IncomingFrame, Transport};
-use connetto_core::{Backoff, Cursor, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident};
+use connetto_core::{
+    Backoff, Cursor, Major, PROTOCOL_VERSION, RetryPolicy, SchemaVersion, quote_ident,
+};
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use diesel::connection::SimpleConnection;
@@ -225,6 +227,27 @@ pub enum ClientError {
         client: Option<SchemaVersion>,
         /// The version the server advertised in the handshake ack.
         server: SchemaVersion,
+    },
+    /// The server runs a newer application schema major than this build, or
+    /// this build declared none, so the app must update (R31).
+    #[error(
+        "update required: this build speaks major {}, the server major {server}",
+        .client.map_or_else(|| "none".to_owned(), |major| major.to_string())
+    )]
+    UpdateRequired {
+        /// The major this build declared, if any.
+        client: Option<Major>,
+        /// The server's major.
+        server: Major,
+    },
+    /// The server runs an older application schema major than this build, so
+    /// the deployment has not yet put this major up (R31).
+    #[error("server behind: this build speaks major {client}, the server major {server}")]
+    ServerBehind {
+        /// The major this build declared.
+        client: Major,
+        /// The server's major.
+        server: Major,
     },
     /// The operation needs a server and this connection has none.
     ///
@@ -805,6 +828,9 @@ pub(crate) struct ClientConfig {
     /// with [`ClientError::SchemaOutdated`] so the app can reload. Either side
     /// being `None` skips the check.
     schema_version: Option<SchemaVersion>,
+    /// The application schema major this build declares at handshake, or
+    /// `None` to declare none, which every server with a major refuses.
+    schema_major: Option<Major>,
     /// Custom SQLite functions connetto registers on the replica connection it
     /// opens for this client, before any DDL or insert. Empty by default. A
     /// schema whose column `DEFAULT` calls a function (a `uuidv7` key
@@ -861,6 +887,7 @@ impl ClientConfig {
             client_id: client_id.into(),
             login: None,
             schema_version: None,
+            schema_major: None,
             sql_functions: SqlFunctions::default(),
             policy_tables: PolicyTables::default(),
             unrecorded_tables: HashSet::new(),
@@ -937,6 +964,12 @@ impl ClientConfig {
     #[must_use]
     pub fn with_schema_version(mut self, schema_version: Option<SchemaVersion>) -> Self {
         self.schema_version = schema_version;
+        self
+    }
+    /// The application schema major this build declares at handshake.
+    #[must_use]
+    pub const fn with_schema_major(mut self, schema_major: Option<Major>) -> Self {
+        self.schema_major = schema_major;
         self
     }
 
@@ -2841,30 +2874,12 @@ struct HandshakeInput<'a> {
     cursor_subjects: Option<&'a [String]>,
 }
 
-/// Run the opening handshake and read the ack, shared by the first connect
-/// and every resume.
-#[expect(
-    clippy::too_many_lines,
-    reason = "The opening exchange keeps its ordered protocol checks together."
-)]
-async fn exchange_handshake<T>(
-    transport: &mut T,
-    input: HandshakeInput<'_>,
-) -> Result<HandshakeOk, ClientError>
-where
-    T: Transport,
-    T::Error: core::fmt::Display,
-{
-    let HandshakeInput {
-        config,
-        token_source,
-        resume,
-        resume_token,
-        writer,
-        settled_through,
-        now,
-        cursor_subjects,
-    } = input;
+/// Collect the login and unexpired share grants for a handshake.
+async fn presented_grants(
+    config: &ClientConfig,
+    token_source: Option<&AccessTokenSource>,
+    now: i64,
+) -> Result<Vec<Grant>, ClientError> {
     let mut grants = Vec::with_capacity(
         1 + config
             .subjects
@@ -2887,11 +2902,37 @@ where
             .filter(|grant| !grant_expiry::has_expired(grant, now))
             .cloned(),
     );
+    Ok(grants)
+}
+
+/// Run the opening handshake and read the ack, shared by the first connect
+/// and every resume.
+async fn exchange_handshake<T>(
+    transport: &mut T,
+    input: HandshakeInput<'_>,
+) -> Result<HandshakeOk, ClientError>
+where
+    T: Transport,
+    T::Error: core::fmt::Display,
+{
+    let HandshakeInput {
+        config,
+        token_source,
+        resume,
+        resume_token,
+        writer,
+        settled_through,
+        now,
+        cursor_subjects,
+    } = input;
     let mut handshake = Handshake::new(PROTOCOL_VERSION, config.client_id.clone())
-        .with_grants(grants)
+        .with_grants(presented_grants(config, token_source, now).await?)
         .with_writer(writer);
     if let Some(seq) = settled_through {
         handshake = handshake.with_settled_through(seq);
+    }
+    if let Some(major) = config.schema_major {
+        handshake = handshake.with_major(major);
     }
     if let Some(cursor) = resume {
         handshake = handshake.with_cursor(cursor.clone());
@@ -2962,8 +3003,12 @@ where
             })
         }
         Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
-            Err(ClientError::Refused {
-                reason: fatal.reason,
+            Err(match fatal.reason {
+                FatalErrorReason::MajorMismatch { server, client } => match client {
+                    Some(client) if client > server => ClientError::ServerBehind { client, server },
+                    client => ClientError::UpdateRequired { client, server },
+                },
+                reason => ClientError::Refused { reason },
             })
         }
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
@@ -5159,6 +5204,12 @@ where
         self.run
             .as_ref()
             .and_then(|run| run.schema_version.as_ref())
+    }
+    /// The application schema major this build declares, which a relay hub
+    /// holds its tabs to (R31).
+    #[must_use]
+    pub const fn schema_major(&self) -> Option<Major> {
+        self.config.schema_major
     }
 
     /// The logical-to-physical table map this connection renames with.

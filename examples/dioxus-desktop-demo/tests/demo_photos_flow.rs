@@ -57,7 +57,7 @@ const ROLES_SQL: &str = include_str!("../roles.sql");
 /// `gen_random_uuid()` defaults and foreign-key references that the `subql` parser
 /// does not need and may not handle.
 const CATALOG_DDL: &str = concat!(
-    "CREATE TABLE orders (id UUID PRIMARY KEY, quantity BIGINT NOT NULL,",
+    "-- connetto:major 1\nCREATE TABLE orders (id UUID PRIMARY KEY, quantity BIGINT NOT NULL,",
     " created_at TIMESTAMPTZ NOT NULL);",
     "CREATE TABLE order_lines (order_id UUID NOT NULL, line_no INTEGER NOT NULL,",
     " quantity BIGINT NOT NULL, PRIMARY KEY (order_id, line_no));",
@@ -528,14 +528,17 @@ async fn wait_for_replica_state(
 
 /// The client schema over the test's translated DDL.
 fn schema(ddl: &str) -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        SCHEMA_SQL,
-        "",
-        ddl,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SCHEMA_SQL,
+            "",
+            ddl,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// Splits DDL that contains no dollar-quoted bodies on semicolons.

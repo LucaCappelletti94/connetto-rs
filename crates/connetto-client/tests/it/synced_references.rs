@@ -21,7 +21,8 @@ use diesel::prelude::*;
 /// A folder belongs to one person, and a note can sit in somebody else's
 /// folder. Alice owns notes in Bob's folder, so she sees the children and
 /// never the parent.
-const PG_DDL: &str = "CREATE TABLE folders (id INT PRIMARY KEY, owner TEXT NOT NULL);
+const PG_DDL: &str = "-- connetto:major 1
+CREATE TABLE folders (id INT PRIMARY KEY, owner TEXT NOT NULL);
 CREATE TABLE notes (id INT PRIMARY KEY, folder_id INT NOT NULL REFERENCES folders(id), owner TEXT NOT NULL, body TEXT);";
 
 const POLICIES: &str = "ALTER TABLE folders ENABLE ROW LEVEL SECURITY;

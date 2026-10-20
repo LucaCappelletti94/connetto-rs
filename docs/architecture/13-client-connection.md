@@ -293,6 +293,12 @@ One consequence reaches the application: trusted schema off means a function the
 
 ---
 
+## Application schema majors and the update path (R31)
+
+**The major is declared once, in the schema source.** A line `-- connetto:major N` in the Postgres schema source is read by `SchemaBundle::new` into `SchemaBundle::major()`, majors start at 1, and a source without the line fails. The application's `build.rs` and the server's boot translation read the same file, so the two cannot disagree, and the line sits inside the bundle hash. The client sends its major in the `Handshake` and the server refuses another with `FatalErrorReason::MajorMismatch { server, client }`. The client reads an older own major as `ClientError::UpdateRequired` and a newer one as `ClientError::ServerBehind`. The bundle-hash check stays and catches the same major built from a different schema. Chapter 02 describes the wire side.
+
+---
+
 ## Open Questions
 
 1. ~~**Query serialization for `ConnettoProxyConnection`**: what is the format for serializing a Diesel query + bind parameters over `postMessage`? Raw SQL string + binds as MessagePack? Or a higher-level representation?~~ **Decided (Q2.1, `crates/connetto-web/src/port.rs`):** The tab-to-worker channel uses the same binary framing as the WebSocket transport: one tag byte followed by MessagePack-encoded payload (`ControlMessage` or `BulkMessage`). Query messages are `ControlMessage` frames carrying the SQL text and typed binds.

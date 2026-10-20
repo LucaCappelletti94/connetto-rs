@@ -152,17 +152,20 @@ fn snapshot_end(sub_id: &str) -> IncomingFrame {
 }
 
 fn schema() -> SyncSchema {
-    SyncSchema::new(connetto_core::SchemaBundle::new(
-        "",
-        "",
-        "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
+    SyncSchema::new(
+        connetto_core::SchemaBundle::new(
+            "-- connetto:major 1",
+            "",
+            "CREATE TABLE notes (id INTEGER PRIMARY KEY, owner TEXT NOT NULL); \
          CREATE VIEW visible AS SELECT * FROM notes \
          WHERE owner = current_app_user() \
             OR instr(',' || current_app_subjects() || ',', ',' || owner || ',') > 0;",
-        Vec::<(String, String)>::new(),
-        vec!["visible".to_owned()],
-        None::<&str>,
-    ))
+            Vec::<(String, String)>::new(),
+            vec!["visible".to_owned()],
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// base64url without padding, for minting the JWT-shaped grants this suite holds.

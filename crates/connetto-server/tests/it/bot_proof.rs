@@ -37,8 +37,8 @@ use super::ticket_shared::{OkSigner, do_handshake_with, request_ticket};
 
 /// The one synced table a bot's list may name, and the second one only a
 /// person's wildcard reaches.
-const PG_DDL: &str = "CREATE TABLE t (id INT PRIMARY KEY, file_id BYTEA, label TEXT);\
-     CREATE TABLE u (id INT PRIMARY KEY, label TEXT);";
+const PG_DDL: &str = "-- connetto:major 1\nCREATE TABLE t (id INT PRIMARY KEY, file_id \
+     BYTEA, label TEXT);CREATE TABLE u (id INT PRIMARY KEY, label TEXT);";
 /// The deployment carries no policy at all, so the cap is the only rule a
 /// person's wildcard is held to, and nothing at all.
 const NO_POLICIES: &str = "";

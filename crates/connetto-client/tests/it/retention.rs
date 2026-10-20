@@ -22,6 +22,8 @@ use sqlite_diff_rs::{DiffOps, Insert, PatchSet, SimpleTable, Value};
 
 const DDL: &str =
     "CREATE TABLE orders (id INTEGER PRIMARY KEY, price REAL, quantity INTEGER, status TEXT);";
+/// The major line the schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 diesel::table! {
     /// The one synced table these tests subscribe, evict, and trim.
@@ -530,14 +532,17 @@ async fn a_local_tier_row_survives_eviction_of_synced_rows() {
         ("seed", vec![(1, "x".into()), (2, "x".into())], 1),
         ("keep", Vec::new(), 2),
     ]);
-    let schema = SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        Some(LOCAL_DDL),
-    ));
+    let schema = SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            Some(LOCAL_DDL),
+        )
+        .expect("the source declares major 1"),
+    );
     let mut conn = ClientBuilder::new(schema, super::support::Once::new(server))
         .signed_in(super::support::held("r15"))
         .connect_driven()

@@ -9,8 +9,6 @@ use std::rc::Rc;
 
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{ClientBuilder, FirstThen, Grant, HeldCredential, SyncSchema};
-use connetto_core::Cursor;
-use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
     BulkMessage, CONTENT_TICKET_REFUSED, ContentTicketGrant, ControlMessage, Handshake,
     HandshakeAck, MutationHeader, MutationPatch, MutationReject, MutationRejectReason,
@@ -18,6 +16,7 @@ use connetto_core::messages::{
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
+use connetto_core::{Cursor, Major, PROTOCOL_VERSION};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
 use connetto_file_core::{FileId, FileIdHasher, MimeClass};
 use connetto_web::content_wire::{ContentFrame, WireResolve, mime_code};
@@ -44,6 +43,9 @@ mod support;
 use support::{install_content_transport, timeout_ms, until};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
+
+/// The major line the test schema source declares.
+const SOURCE: &str = "-- connetto:major 1";
 
 const DDL: &str = "CREATE TABLE photos (id INTEGER PRIMARY KEY, content_id BLOB NOT NULL)";
 const TEST_LOCK: &str = "connetto-content-relay-test";
@@ -164,14 +166,17 @@ impl Transport for Upstream {
 
 /// The client schema over [`DDL`].
 fn schema() -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        "",
-        "",
-        DDL,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        None::<&str>,
-    ))
+    SyncSchema::new(
+        SchemaBundle::new(
+            SOURCE,
+            "",
+            DDL,
+            Vec::<(String, String)>::new(),
+            Vec::<String>::new(),
+            None::<&str>,
+        )
+        .expect("the source declares major 1"),
+    )
 }
 
 /// A dialer handing out `transport` once and nothing after.
@@ -248,10 +253,10 @@ async fn relay_tab(
     let channel = web_sys::MessageChannel::new().expect("message channel");
     hub.attach_with_content(MessageTransport::<MessagePort>::new(channel.port1()));
     let mut tab = MessageTransport::<MessagePort>::new(channel.port2());
-    tab.send_control(ControlMessage::Handshake(Handshake::new(
-        PROTOCOL_VERSION,
-        TAB_CLIENT_ID,
-    )))
+    tab.send_control(ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, TAB_CLIENT_ID)
+            .with_major(Major::declared_in(SOURCE).expect("the source declares major 1")),
+    ))
     .await
     .expect("post handshake");
     let ack = tokio::select! {

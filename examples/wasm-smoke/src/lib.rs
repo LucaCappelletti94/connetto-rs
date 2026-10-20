@@ -104,14 +104,17 @@ pub mod build {
     /// whose tables are its own rather than the deployment's.
     #[must_use]
     pub fn raw_schema(ddl: &str) -> SyncSchema {
-        SyncSchema::new(SchemaBundle::new(
-            "",
-            "",
-            ddl,
-            Vec::<(String, String)>::new(),
-            Vec::<String>::new(),
-            None::<&str>,
-        ))
+        SyncSchema::new(
+            SchemaBundle::new(
+                "-- connetto:major 1",
+                "",
+                ddl,
+                Vec::<(String, String)>::new(),
+                Vec::<String>::new(),
+                None::<&str>,
+            )
+            .expect("the source declares major 1"),
+        )
     }
 
     /// A credential for the session a suite minted, `token` standing for
