@@ -721,7 +721,7 @@ pub async fn sign_in_phone(
     unlock: Unlock<'_>,
     shot: &str,
 ) -> Result<PageSession> {
-    crate::step(&format!("sign in {user} on {}", phone.serial));
+    crate::step(&format!("sign in on {}", phone.serial));
     phone.launch().await?;
     let mut tab = phone.login_tab(issuer).await?;
     phone
