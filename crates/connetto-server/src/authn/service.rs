@@ -15,7 +15,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use connetto_core::SessionId;
 use connetto_core::auth::Subject;
 use connetto_core::messages::Grant;
-use connetto_core::traits::{GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority};
+use connetto_core::traits::{
+    CheckedGrant, GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority,
+};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -493,27 +495,33 @@ where
 {
     fn check_grant<'a>(&'a self, grant: &'a Grant) -> GrantCheckFuture<'a, S::Id, Key> {
         Box::pin(async move {
-            let subject = self
+            let checked = self
                 .authority
                 .check_grant::<S::Id, Key>(grant)
                 .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
-            // Only a login has something to keep alive. A capability is
-            // withdrawn by deleting the relation that grants it, which the
-            // authorization model answers per question, so asking a store here
-            // would invent a liveness concept the design deliberately has not.
-            let session = match subject {
-                Subject::Capability(subject) => return Ok(Subject::Capability(subject)),
-                Subject::Identity(session) => session,
+            let subject = match checked.subject {
+                // Only a login has something to keep alive. A capability is
+                // withdrawn by deleting the relation that grants it, which the
+                // authorization model answers per question, so asking a store
+                // here would invent a liveness concept the design deliberately
+                // has not.
+                Subject::Identity(session) => {
+                    let live = self
+                        .store
+                        .session_is_live(session.session_id, SystemTime::now())
+                        .await
+                        .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
+                    if !live {
+                        return Err(GrantRefused::Revoked);
+                    }
+                    Subject::Identity(session)
+                }
+                subject @ Subject::Capability(_) => subject,
             };
-            let live = self
-                .store
-                .session_is_live(session.session_id, SystemTime::now())
-                .await
-                .map_err(|err| GrantRefused::Invalid(err.to_string()))?;
-            if !live {
-                return Err(GrantRefused::Revoked);
-            }
-            Ok(Subject::Identity(session))
+            Ok(CheckedGrant {
+                subject,
+                expires_at: checked.expires_at,
+            })
         })
     }
 

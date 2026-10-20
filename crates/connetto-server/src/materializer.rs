@@ -367,6 +367,9 @@ pub struct ComputedCapture {
     pub consumer_id: u64,
     /// How the first answer is produced.
     pub seed: SeedPlan,
+    /// Whether every read answers as the registering caller (R85), so a change
+    /// of what that caller holds needs the subscription registered again.
+    pub per_viewer: bool,
 }
 
 /// How a computed subscription's first answer is produced.
@@ -1011,6 +1014,7 @@ where
                     subscription_id,
                     consumer_id,
                     seed: SeedPlan::Fold { bootstrap },
+                    per_viewer: false,
                 }),
                 None => Registration::Row(subscription_id),
             },
@@ -1021,12 +1025,14 @@ where
                     query,
                     kind: column_kind,
                 },
+                per_viewer: false,
             }),
             Tier::GroupedScalar { .. } | Tier::KeyedRows { .. } | Tier::WholeRows { .. } => {
                 Registration::Computed(ComputedCapture {
                     subscription_id,
                     consumer_id,
                     seed: SeedPlan::Snapshot,
+                    per_viewer: false,
                 })
             }
         })
@@ -1985,16 +1991,17 @@ where
                 ..
             })) if viewer.is_some() => {
                 let setup = viewer.expect("matched Some above");
-                let registered = self.register_request_with(
+                let mut registered = self.register_request_with(
                     consumer_id,
                     build(retry_seed).database_reads_per_consumer(),
                     setup,
                 )?;
-                // The refusal names an aggregate, so one ungrouped projection is a scalar one.
-                if let Registration::Computed(capture) = &registered
-                    && answers_one_value(pg_sql)
-                {
-                    self.scalar_rereads.insert(capture.subscription_id);
+                if let Registration::Computed(capture) = &mut registered {
+                    capture.per_viewer = true;
+                    // The refusal names an aggregate, so one ungrouped projection is a scalar one.
+                    if answers_one_value(pg_sql) {
+                        self.scalar_rereads.insert(capture.subscription_id);
+                    }
                 }
                 Ok(registered)
             }

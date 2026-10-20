@@ -16,7 +16,9 @@ use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{
     GrantCheckFuture, GrantRefused, HandleError, HandshakeAuthority, IncomingFrame, Transport,
 };
-use connetto_core::{Cursor, PROTOCOL_VERSION, Principal, SessionId, Subject, VerifiedSession};
+use connetto_core::{
+    CheckedGrant, Cursor, PROTOCOL_VERSION, Principal, SessionId, Subject, VerifiedSession,
+};
 use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, SnapshotEstimate, SnapshotPage,
     SnapshotSource, loopback, pg_write_target,
@@ -84,13 +86,16 @@ impl HandshakeAuthority for FixedVerifier {
     fn check_grant<'a>(&'a self, _grant: &'a Grant) -> GrantCheckFuture<'a> {
         let context = self.0.clone();
         Box::pin(async move {
-            Ok(Subject::Identity(VerifiedSession {
-                context,
-                // A fixed id so every connection this stub verifies shares one
-                // watermark key, which is what the exactly-once assertions rely on.
-                session_id: SessionId::from_token_hash("fixed-session"),
-                bot_list: None,
-            }))
+            Ok(CheckedGrant {
+                subject: Subject::Identity(VerifiedSession {
+                    context,
+                    // A fixed id so every connection this stub verifies shares one
+                    // watermark key, which is what the exactly-once assertions rely on.
+                    session_id: SessionId::from_token_hash("fixed-session"),
+                    bot_list: None,
+                }),
+                expires_at: None,
+            })
         })
     }
 

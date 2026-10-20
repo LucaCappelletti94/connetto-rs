@@ -29,12 +29,17 @@ pub fn replica_key() -> ReplicaKey {
 /// `test-support` precisely because it checks nothing, so no production build
 /// can reach it and no constructor installs it by default.
 ///
-/// A grant is `user:<id>`, optionally `user:<id>#<run>`, `key:<subject>`, or
-/// `bot:<id>#<entries>`. Anything else is refused. The prefix stands in for
+/// A grant is `user:<id>`, optionally `user:<id>#<run>`, `key:<subject>`,
+/// optionally `key:<subject>@<unix seconds>`, or `bot:<id>#<entries>`.
+/// Anything else is refused. The prefix stands in for
 /// the `knd` claim the real checker reads out of a verified token: this
 /// stand-in has no signature to carry one, so the string is all there is, and
 /// mirroring the claim keeps every test explicit about which kind of grant it
 /// presents.
+///
+/// The `@` form names the same subject with an expiry in unix seconds, the
+/// stand-in for the `exp` claim a real capability token carries, and a
+/// non-numeric suffix is refused like any other bad grant.
 ///
 /// A `user:<id>#<run>` grant names one person holding several concurrent runs:
 /// the part between the prefix and the `#` is the `user_id` and the whole
@@ -57,15 +62,29 @@ impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
     ) -> crate::traits::GrantCheckFuture<'a, String> {
         Box::pin(async move {
             let token = grant.as_str();
-            if let Some(subject) = token.strip_prefix("key:") {
+            if let Some(named) = token.strip_prefix("key:") {
+                let (subject, expires_at) = match named.split_once('@') {
+                    None => (named.to_owned(), None),
+                    Some((name, seconds)) => {
+                        let seconds: u64 = seconds.parse().map_err(|_| {
+                            crate::traits::GrantRefused::Invalid(format!(
+                                "a capability grant's expiry spells no seconds: {seconds:?}"
+                            ))
+                        })?;
+                        (name.to_owned(), Some(seconds))
+                    }
+                };
                 if subject.is_empty() {
                     return Err(crate::traits::GrantRefused::Invalid(
                         "a capability grant named no subject".to_owned(),
                     ));
                 }
-                return Ok(crate::auth::Subject::Capability(
-                    crate::auth::CapabilitySubject::new(token),
-                ));
+                return Ok(crate::traits::CheckedGrant {
+                    subject: crate::auth::Subject::Capability(crate::auth::CapabilitySubject::new(
+                        format!("key:{subject}"),
+                    )),
+                    expires_at,
+                });
             }
             if let Some(bot) = token.strip_prefix("bot:") {
                 let (user_id, entries) = bot.split_once('#').ok_or_else(|| {
@@ -97,13 +116,14 @@ impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
                         list.push((table.to_owned(), verb));
                     }
                 }
-                return Ok(crate::auth::Subject::Identity(
-                    crate::auth::VerifiedSession {
+                return Ok(crate::traits::CheckedGrant {
+                    subject: crate::auth::Subject::Identity(crate::auth::VerifiedSession {
                         context: crate::auth::AuthContext::new(user_id),
                         session_id: crate::SessionId::from_token_hash(token),
                         bot_list: Some(crate::bots::BotList::new(list)),
-                    },
-                ));
+                    }),
+                    expires_at: None,
+                });
             }
             let Some(named) = token.strip_prefix("user:") else {
                 return Err(crate::traits::GrantRefused::Invalid(format!(
@@ -116,13 +136,14 @@ impl crate::traits::HandshakeAuthority<String> for TestGrantChecker {
                     "a login grant named no user".to_owned(),
                 ));
             }
-            Ok(crate::auth::Subject::Identity(
-                crate::auth::VerifiedSession {
+            Ok(crate::traits::CheckedGrant {
+                subject: crate::auth::Subject::Identity(crate::auth::VerifiedSession {
                     context: crate::auth::AuthContext::new(user_id),
                     session_id: crate::SessionId::from_token_hash(token),
                     bot_list: None,
-                },
-            ))
+                }),
+                expires_at: None,
+            })
         })
     }
 
@@ -551,13 +572,13 @@ pub async fn two_accounts_keep_their_own_key<S: crate::traits::ReplicaKeyStore>(
 
 #[cfg(test)]
 mod tests {
-    use crate::auth::Subject;
+    use crate::auth::{CapabilitySubject, Subject};
     use crate::messages::Grant;
-    use crate::traits::{GrantRefused, HandshakeAuthority};
+    use crate::traits::{CheckedGrant, GrantRefused, HandshakeAuthority};
 
     use super::TestGrantChecker;
 
-    fn check(grant: &str) -> Result<Subject, GrantRefused> {
+    fn check(grant: &str) -> Result<CheckedGrant, GrantRefused> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .build()
             .expect("build a runtime");
@@ -568,9 +589,10 @@ mod tests {
     /// a person's grant resolves none.
     #[test]
     fn a_bot_grant_binds_the_list_it_names() {
-        let Subject::Identity(session) =
-            check("bot:bot-a#t:read,t:insert").expect("the grant resolves")
-        else {
+        let subject = check("bot:bot-a#t:read,t:insert")
+            .expect("the grant resolves")
+            .subject;
+        let Subject::Identity(session) = subject else {
             panic!("a bot grant resolves a login");
         };
         assert_eq!(session.context.user_id, "bot-a");
@@ -583,7 +605,8 @@ mod tests {
             ]
         );
 
-        let Subject::Identity(person) = check("user:alice").expect("the grant resolves") else {
+        let subject = check("user:alice").expect("the grant resolves").subject;
+        let Subject::Identity(person) = subject else {
             panic!("a person grant resolves a login");
         };
         assert!(person.bot_list.is_none());
@@ -592,7 +615,8 @@ mod tests {
     /// A bot grant naming no entries binds the empty list, which sees nothing.
     #[test]
     fn a_bot_grant_with_no_entries_is_an_empty_list() {
-        let Subject::Identity(session) = check("bot:bot-a#").expect("the grant resolves") else {
+        let subject = check("bot:bot-a#").expect("the grant resolves").subject;
+        let Subject::Identity(session) = subject else {
             panic!("a bot grant resolves a login");
         };
         assert!(session.bot_list.expect("the grant names a list").is_empty());
@@ -608,6 +632,46 @@ mod tests {
             "bot:bot-a#t",
             "bot:bot-a#:read",
             "bot:bot-a#t:read,,",
+        ] {
+            assert!(check(grant).is_err(), "{grant:?} is refused");
+        }
+    }
+
+    /// A `key:` grant never expires, the `@` form names its expiry in unix
+    /// seconds, and a login names none.
+    #[test]
+    fn a_key_grant_reports_the_expiry_it_names() {
+        let plain = check("key:abc").expect("the grant resolves");
+        assert_eq!(
+            plain,
+            CheckedGrant {
+                subject: Subject::Capability(CapabilitySubject::new("key:abc")),
+                expires_at: None,
+            }
+        );
+
+        let bounded = check("key:abc@1700000000").expect("the grant resolves");
+        assert_eq!(
+            bounded,
+            CheckedGrant {
+                subject: Subject::Capability(CapabilitySubject::new("key:abc")),
+                expires_at: Some(1_700_000_000),
+            }
+        );
+
+        let login = check("user:alice").expect("the grant resolves");
+        assert_eq!(login.expires_at, None);
+    }
+
+    /// A capability expiry that spells no seconds is refused like any other
+    /// bad grant.
+    #[test]
+    fn a_key_grant_with_a_bad_expiry_is_refused() {
+        for grant in [
+            "key:@1700000000",
+            "key:abc@",
+            "key:abc@soon",
+            "key:abc@17:00",
         ] {
             assert!(check(grant).is_err(), "{grant:?} is refused");
         }

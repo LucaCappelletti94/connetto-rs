@@ -361,13 +361,24 @@ impl GrantRefused {
 
 impl std::error::Error for GrantRefused {}
 
+/// A grant that checked out, with the `exp` claim in unix seconds, or
+/// `None` when the authority knows none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckedGrant<Id = String, Key = String> {
+    /// The subject the grant names.
+    pub subject: Subject<Id, Key>,
+    /// When the grant dies, in unix seconds.
+    pub expires_at: Option<u64>,
+}
+
 /// Boxed future produced by [`HandshakeAuthority::check_grant`].
 ///
 /// A trait object cannot carry an `async fn` directly, so checking returns an
 /// explicitly boxed `Send` future. Checking fires once per grant per connection
 /// off any hot path, so the box allocation is irrelevant.
-pub type GrantCheckFuture<'a, Id = String, Key = String> =
-    core::pin::Pin<Box<dyn Future<Output = Result<Subject<Id, Key>, GrantRefused>> + Send + 'a>>;
+pub type GrantCheckFuture<'a, Id = String, Key = String> = core::pin::Pin<
+    Box<dyn Future<Output = Result<CheckedGrant<Id, Key>, GrantRefused>> + Send + 'a>,
+>;
 
 /// A resume blob could not be minted or was not one this server signed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -413,6 +424,9 @@ pub trait HandshakeAuthority<Id = String, Key = String>: Send + Sync {
     /// token's remaining lifetime. A capability needs no such call, because
     /// withdrawing one is deleting the relation that grants it and there is
     /// nothing to keep alive.
+    ///
+    /// A capability's expiry rides the result, which is what lets a running
+    /// session drop the key when it dies.
     ///
     /// # Errors
     ///

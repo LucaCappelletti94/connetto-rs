@@ -471,7 +471,7 @@ async fn an_expired_capability_is_refused() {
         .check_grant::<String, String>(&connetto_core::messages::Grant::new(live))
         .expect("a live capability checks out");
     assert_eq!(
-        checked,
+        checked.subject,
         Subject::Capability(subject),
         "the check reads back the subject that was signed"
     );

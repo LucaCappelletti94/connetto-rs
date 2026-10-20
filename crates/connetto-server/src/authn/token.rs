@@ -10,6 +10,7 @@
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use connetto_core::CheckedGrant;
 use connetto_core::SessionId;
 pub use connetto_core::auth::VerifiedSession;
 use connetto_core::auth::{AuthContext, CapabilitySubject, Subject};
@@ -420,8 +421,8 @@ impl TokenAuthority {
             .map_err(|err| TokenError::Mint(err.to_string()))
     }
 
-    /// Check one grant's signature, algorithm, issuer, audience and expiry, and
-    /// read the subject it names.
+    /// Check one grant's signature, algorithm, issuer, audience and expiry,
+    /// and read the subject and the expiry it names.
     ///
     /// Self-contained: it needs no store, because the signature is the proof.
     /// A login grant's liveness is checked separately, which is what makes
@@ -433,19 +434,25 @@ impl TokenAuthority {
     pub fn check_grant<Id: DeserializeOwned, Key: DeserializeOwned>(
         &self,
         grant: &Grant,
-    ) -> Result<Subject<Id, Key>, TokenError> {
+    ) -> Result<CheckedGrant<Id, Key>, TokenError> {
         let data =
             decode::<GrantClaims<Id, Key>>(grant.as_str(), &self.decoding, &self.validation())
                 .map_err(|err| TokenError::Verify(err.to_string()))?;
         Ok(match data.claims {
-            GrantClaims::User(claims) => Subject::Identity(VerifiedSession {
-                context: AuthContext {
-                    user_id: claims.sub,
-                },
-                session_id: claims.sid,
-                bot_list: None,
-            }),
-            GrantClaims::Key(claims) => Subject::Capability(CapabilitySubject::new(claims.sub)),
+            GrantClaims::User(claims) => CheckedGrant {
+                subject: Subject::Identity(VerifiedSession {
+                    context: AuthContext {
+                        user_id: claims.sub,
+                    },
+                    session_id: claims.sid,
+                    bot_list: None,
+                }),
+                expires_at: Some(claims.exp),
+            },
+            GrantClaims::Key(claims) => CheckedGrant {
+                subject: Subject::Capability(CapabilitySubject::new(claims.sub)),
+                expires_at: Some(claims.exp),
+            },
         })
     }
 

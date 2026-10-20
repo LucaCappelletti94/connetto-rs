@@ -70,6 +70,9 @@ struct FactKind {
 #[derive(Debug, Default)]
 pub struct GrantReach {
     reached: HashMap<FactKind, Vec<String>>,
+    /// The same tables per relation name alone, so a caller holding no type
+    /// can still find them.
+    keyed: HashMap<String, Vec<String>>,
 }
 
 impl GrantReach {
@@ -121,10 +124,21 @@ impl GrantReach {
                 }
             }
         }
+        let mut keyed: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for (kind, tables) in &reached {
+            keyed
+                .entry(kind.relation.clone())
+                .or_default()
+                .extend(tables.iter().cloned());
+        }
         Ok(Self {
             reached: reached
                 .into_iter()
                 .map(|(kind, tables)| (kind, tables.into_iter().collect()))
+                .collect(),
+            keyed: keyed
+                .into_iter()
+                .map(|(relation, tables)| (relation, tables.into_iter().collect()))
                 .collect(),
         })
     }
@@ -154,6 +168,16 @@ impl GrantReach {
                 relation: relation.to_owned(),
             })
             .map_or(&[], Vec::as_slice)
+    }
+
+    /// The tables whose read answer depends on a fact of this relation,
+    /// taken over every type that defines the name.
+    ///
+    /// The caller's own keys complete a relation the model reports by its
+    /// name alone, so a change of the set is reached by the union (R95).
+    #[must_use]
+    pub fn tables_for_relation(&self, relation: &str) -> &[String] {
+        self.keyed.get(relation).map_or(&[], Vec::as_slice)
     }
 }
 

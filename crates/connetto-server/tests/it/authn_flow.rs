@@ -183,6 +183,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let Subject::Identity(minted) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };
@@ -199,6 +200,7 @@ async fn login_token_opens_a_handshake_then_revocation_refuses_it() {
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };
@@ -401,12 +403,14 @@ async fn refresh_rotates_and_reusing_the_old_token_revokes_the_session() {
     let Subject::Identity(first) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify first")
+        .subject
     else {
         panic!("expected identity subject");
     };
     let Subject::Identity(second) = authority
         .check_grant::<String, String>(&Grant::new(&rotated.access_token))
         .expect("verify rotated")
+        .subject
     else {
         panic!("expected identity subject");
     };
@@ -441,6 +445,7 @@ async fn expired_access_token_is_refused() {
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };
@@ -475,6 +480,7 @@ async fn a_token_from_another_key_is_refused() {
     let Subject::Identity(verified) = authority
         .check_grant::<String, String>(&Grant::new(&pair.access_token))
         .expect("verify")
+        .subject
     else {
         panic!("expected identity subject");
     };
