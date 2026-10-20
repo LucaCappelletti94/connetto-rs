@@ -750,10 +750,7 @@ fn parse_arguments(args: &[String]) -> Result<ParsedArguments> {
                 arguments.android_unlock_pin = Some(argument_value(&mut args, arg)?.to_owned());
             }
             "--join" => {
-                arguments.join = Some(
-                    star::Join::parse(argument_value(&mut args, arg)?)
-                        .map_err(|err| anyhow!("{err}"))?,
-                );
+                arguments.join = Some(star::Join::parse(argument_value(&mut args, arg)?)?);
             }
             other => bail!("unknown argument {other:?}"),
         }
@@ -3710,8 +3707,14 @@ async fn iphone_hosts_round(
         }
     };
     // A VPN the demo cannot bypass refuses its join's network binding, so
-    // the M52's Tailscale stays off until the round's restore.
-    let tailscale_off = set_tailscale(android, false).await;
+    // the Android's Tailscale, when it holds the VPN, stays off until the
+    // round's restore, which puts back only what the round switched.
+    let tailscale_held = tailscale_holds_vpn(android).await;
+    let tailscale_off = match &tailscale_held {
+        Ok(true) => set_tailscale(android, false).await,
+        Ok(false) => Ok(()),
+        Err(err) => Err(anyhow!("reading the VPN: {err:#}")),
+    };
     // The hotspot's gateway, once a joiner's page names it.
     let mut gateway = None;
     let join1 = {
@@ -3886,7 +3889,10 @@ async fn iphone_hosts_round(
     )
     .await;
     let restore = {
-        let back_on = set_tailscale(android, true).await;
+        let back_on = match tailscale_held {
+            Ok(true) => set_tailscale(android, true).await,
+            Ok(false) | Err(_) => Ok(()),
+        };
         let failed = tailscale_off
             .and(back_on)
             .map_err(|err| format!("the M52's Tailscale: {err:#}"));
@@ -3917,6 +3923,19 @@ async fn iphone_hosts_round(
             outcome: restore.1,
         },
     }
+}
+
+/// Whether the Android phone's connected VPN belongs to its Tailscale.
+async fn tailscale_holds_vpn(android: &StarAndroid) -> Result<bool> {
+    let connectivity = android
+        .device
+        .adb(&["shell", "dumpsys", "connectivity"])
+        .await?;
+    let package = android
+        .device
+        .adb(&["shell", "dumpsys", "package", "com.tailscale.ipn"])
+        .await?;
+    Ok(star::tailscale_holds_vpn(&connectivity, &package)?)
 }
 
 /// Connect or disconnect the Android phone's Tailscale through its own

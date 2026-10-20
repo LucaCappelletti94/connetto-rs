@@ -967,7 +967,9 @@ async fn one_join(
         bluetooth = bluetooth.and(bluetooth_off(phone).await);
     }
     let networks = match &offer_ssid {
-        Some(ssid) => restore_joiner_networks(host, joiner, ssid, usual_ssid).await,
+        Some(ssid) => {
+            restore_joiner_networks(host, joiner, ssid, usual_ssid.map(String::as_str)).await
+        }
         None => Ok(()),
     };
     let cleanup = restored.and(bluetooth).and(networks);

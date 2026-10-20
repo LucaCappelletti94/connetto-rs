@@ -1048,7 +1048,7 @@ pub async fn restore_joiner_networks(
     host: &Device,
     joiner: &Device,
     ssid: &str,
-    usual_ssid: Option<&String>,
+    usual_ssid: Option<&str>,
 ) -> Result<()> {
     crate::step("clean up the networks");
     // A saved profile the platform may have kept, best effort.
@@ -1058,7 +1058,7 @@ pub async fn restore_joiner_networks(
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let current = joiner.current_ssid().await?;
-        if current.as_deref() == usual_ssid.map(String::as_str) {
+        if current.as_deref() == usual_ssid {
             return Ok(());
         }
         if Instant::now() >= deadline {

@@ -122,16 +122,50 @@ impl Join {
     /// # Errors
     ///
     /// When the name is neither join.
-    pub fn parse(name: &str) -> std::result::Result<Self, String> {
+    pub fn parse(name: &str) -> Result<Self, StarError> {
         match name {
             "beacon" => Ok(Self::Beacon),
             "payload" => Ok(Self::Payload),
             "form" => Ok(Self::Form),
-            other => Err(format!(
-                "unknown join {other}, expected beacon, payload or form"
-            )),
+            other => Err(StarError::UnknownJoin(other.to_owned())),
         }
     }
+}
+
+/// Why the star could not read a join or the Android phone's VPN.
+#[derive(Debug, thiserror::Error)]
+pub enum StarError {
+    /// The command line named no join.
+    #[error("unknown join {0}, expected beacon, payload or form")]
+    UnknownJoin(String),
+    /// `dumpsys connectivity` shows a connected VPN without its owner's uid.
+    #[error("the connected VPN names no owner uid")]
+    VpnWithoutOwner,
+}
+
+/// Whether the connected VPN in `connectivity`, the Android phone's
+/// `dumpsys connectivity`, belongs to the app `package` describes, the
+/// phone's `dumpsys package com.tailscale.ipn`. No connected VPN, another
+/// app's VPN, or no Tailscale installed all answer `false`.
+///
+/// # Errors
+///
+/// When a connected VPN names no `OwnerUid`.
+pub fn tailscale_holds_vpn(connectivity: &str, package: &str) -> Result<bool, StarError> {
+    let Some(vpn) = connectivity
+        .lines()
+        .find(|line| line.contains("ni{VPN CONNECTED"))
+    else {
+        return Ok(false);
+    };
+    let owner = vpn
+        .split_once("OwnerUid: ")
+        .and_then(|(_, rest)| rest.split(|c: char| !c.is_ascii_digit()).next())
+        .filter(|uid| !uid.is_empty())
+        .ok_or(StarError::VpnWithoutOwner)?;
+    Ok(package
+        .lines()
+        .any(|line| line.trim().strip_prefix("userId=") == Some(owner)))
 }
 
 /// One round's plan: who hosts, who joins in which order, and how.
@@ -307,9 +341,14 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Device, Join, LinkMatrix, Round, RoundReport, StepReport, hotspot_gateway,
-        names_hotspot_link, plan, summary,
+        Device, Join, LinkMatrix, Round, RoundReport, StarError, StepReport, hotspot_gateway,
+        names_hotspot_link, plan, summary, tailscale_holds_vpn,
     };
+
+    /// The M52's VPN agent line, trimmed to the fields the read uses.
+    const TAILSCALE_VPN: &str = "  NetworkAgentInfo{network{145}  handle{626175954957}  ni{VPN CONNECTED extra: } lp{{InterfaceName: tun1 Domains: tail0b5119.ts.net}} nc{[ Transports: VPN Capabilities: NOT_METERED&INTERNET OwnerUid: 10522 AdminUids: [10522] TransportInfo: <VpnTransportInfo{type=1, sessionId=null, bypassable=false}>]}";
+    const TAILSCALE_PACKAGE: &str =
+        "Packages:\n  Package [com.tailscale.ipn] (8c6c1e5):\n    userId=10522\n";
 
     fn step(name: &str, outcome: Result<(), String>) -> StepReport {
         StepReport {
@@ -497,5 +536,27 @@ mod tests {
         ] {
             assert!(text.contains(line), "the summary lacks {line}:\n{text}");
         }
+    }
+
+    #[test]
+    fn tailscale_holds_the_vpn_only_when_it_owns_the_connected_one() {
+        let wifi = "  NetworkAgentInfo{network{151}  ni{WIFI CONNECTED extra: } nc{[ Transports: WIFI OwnerUid: 1000]}";
+        let with_vpn = format!("{wifi}\n{TAILSCALE_VPN}\n");
+        assert!(tailscale_holds_vpn(&with_vpn, TAILSCALE_PACKAGE).unwrap());
+        assert!(!tailscale_holds_vpn(wifi, TAILSCALE_PACKAGE).unwrap());
+        let other_owner = with_vpn.replace("OwnerUid: 10522", "OwnerUid: 10377");
+        assert!(!tailscale_holds_vpn(&other_owner, TAILSCALE_PACKAGE).unwrap());
+        assert!(!tailscale_holds_vpn(&with_vpn, "Packages:\n").unwrap());
+        let prefix_uid = TAILSCALE_PACKAGE.replace("userId=10522", "userId=105221");
+        assert!(!tailscale_holds_vpn(&with_vpn, &prefix_uid).unwrap());
+    }
+
+    #[test]
+    fn a_connected_vpn_without_an_owner_is_an_error() {
+        let ownerless = TAILSCALE_VPN.replace("OwnerUid: 10522 ", "");
+        assert!(matches!(
+            tailscale_holds_vpn(&ownerless, TAILSCALE_PACKAGE),
+            Err(StarError::VpnWithoutOwner)
+        ));
     }
 }
