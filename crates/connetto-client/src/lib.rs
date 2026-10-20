@@ -1,31 +1,4 @@
-//! connetto-client: the native local-first sync client.
-//!
-//! A transparent sync layer over a `connetto-server`. The application runs
-//! ordinary diesel queries against a managed local SQLite connection; the client
-//! does the rest.
-//!
-//! * **Local writes** are captured by a SQLite session hooked onto the
-//!   application's connection ([`SqliteSessionExt`]). [`ConnettoConnection::push`] drains
-//!   that session into a changeset (which carries the old row image, so the
-//!   server's conflict check works), compresses it, and uploads it as a
-//!   `MutationHeader` plus `MutationPatch`.
-//! * **Server patches** (the initial snapshot and live updates) apply on the
-//!   same connection with capture suspended: the session's recording is
-//!   switched off around the apply (`sqlite3session_enable`), so
-//!   server-originated changes are never re-uploaded (no echo loop). One
-//!   connection serves both directions, which is also the only topology
-//!   `sqlite-wasm-rs` supports on wasm (no multiple connections per
-//!   database), so native and wasm share it.
-//!
-//! The server produces its patches with `sqlite-diff-rs`, whose output is the
-//! native SQLite session patchset format, so the client applies them directly
-//! with [`SqliteSessionExt::apply_patchset`]. No catalog or `subql` engine lives
-//! on the client.
-//!
-//! The client is single-threaded ([`diesel_sqlite_session::Session`] holds a raw
-//! SQLite handle and is `!Send`): drive it from one task with
-//! [`ConnettoConnection::pump_one`], interleaving [`ConnettoConnection::push`] after local
-//! writes.
+#![doc = include_str!("../README.md")]
 
 pub use connetto_core::messages::{FullResyncReason, Grant, PauseCause, SyncStatus};
 pub use connetto_core::{Custody, NoGate};
@@ -4606,7 +4579,7 @@ where
             return Ok(false);
         };
         match crate::live::coverage_of(&record.spec)? {
-            // No replica rows for a named aggregate; drop its resting answer so the re-bootstrap rebuilds it (R95).
+            // A named aggregate has no replica rows to clear.
             None => {
                 self.clear_aggregate_resting(sub_id)?;
                 Ok(true)

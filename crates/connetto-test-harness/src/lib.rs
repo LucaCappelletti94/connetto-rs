@@ -1,21 +1,4 @@
-//! In-process CDC-loop test harness over a real Postgres.
-//!
-//! This crate wires the full connetto sync loop in one process using only
-//! production paths, so an integration test drives the same code the server
-//! binary runs. The write direction goes through [`pg_write_target`] under an RLS role,
-//! the read direction through [`PgSnapshotSource`] and a real
-//! [`PgStreamingCdcSource`] over a live replication slot and publication, and
-//! aggregate re-execution through [`PgReadConnector`]. It mirrors the
-//! wiring in `crates/connetto-server/src/bin/connetto-server.rs` main.
-//!
-//! Every test starts its own Postgres and authorization service. Fixtures overlap unless a process-global counter measurement calls [`Fixture::acquire_exclusive`], which excludes other fixtures in that test binary.
-//!
-//! The fixture-setup helpers run schema, role, policy, publication, and slot
-//! statements through [`diesel::sql_query`]. These are DDL and vendor
-//! replication-management statements (for example
-//! `pg_create_logical_replication_slot`) that the diesel query DSL cannot
-//! express, which is the sanctioned raw-SQL case. Read-back assertions in a test
-//! MUST instead define a typed `diesel::table!` and load through the DSL.
+#![doc = include_str!("../README.md")]
 
 use std::collections::VecDeque;
 use std::process::Command;
