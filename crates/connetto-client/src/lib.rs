@@ -58,7 +58,9 @@ use diesel::sqlite::{
     AutoVacuumMode, CommitDecision, Sqlite, SqliteChangeOps, SqliteFunctionBehavior,
     SqliteUpdateRouter, WalCheckpointMode,
 };
-use diesel::{Connection, ExpressionMethods, QueryDsl, RunQueryDsl, SqliteConnection};
+use diesel::{
+    Connection, ExpressionMethods, OptionalExtension, QueryDsl, RunQueryDsl, SqliteConnection,
+};
 use diesel_sqlite_session::{
     ConflictAction, ConflictType, Session, SqliteSessionExt, invert_changeset,
 };
@@ -1521,14 +1523,24 @@ fn count_ops(changeset: &[u8]) -> u32 {
     }
 }
 
-/// DDL for the replica-local metadata: the persisted resume cursor and the
-/// pending mutation records awaiting a durable-apply acknowledgement. Both
-/// written only under capture suspension, so they never ride a mutation
-/// upload.
+/// DDL for the replica-local metadata, written only under capture suspension.
 const META_DDL: &str = "CREATE TABLE IF NOT EXISTS _connetto_meta \
     (id INTEGER PRIMARY KEY CHECK (id = 1), cursor BLOB NOT NULL); \
     CREATE TABLE IF NOT EXISTS _connetto_pending \
-    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL)";
+    (seq INTEGER PRIMARY KEY, changeset BLOB NOT NULL); \
+    CREATE TABLE IF NOT EXISTS _connetto_sequence \
+    (id INTEGER PRIMARY KEY CHECK (id = 1), next INTEGER NOT NULL)";
+
+diesel::table! {
+    /// The next client sequence, durable because the server's watermark outlives the process.
+    #[sql_name = "_connetto_sequence"]
+    next_sequence (id) {
+        /// Always 1.
+        id -> Integer,
+        /// The sequence the next write takes.
+        next -> BigInt,
+    }
+}
 
 /// The attach name of the local tier database. An internal constant: authored
 /// SQL never names it, since bare table names resolve across attached
@@ -2305,6 +2317,28 @@ fn delete_pending(db: &mut SqliteConnection, seq: u64) -> Result<(), ClientError
     Ok(())
 }
 
+/// The next sequence a previous run recorded, 0 when none did.
+fn load_next_seq(db: &mut SqliteConnection) -> Result<u64, ClientError> {
+    let stored: Option<i64> = next_sequence::table
+        .select(next_sequence::next)
+        .first(db)
+        .optional()?;
+    Ok(stored
+        .and_then(|next| u64::try_from(next).ok())
+        .unwrap_or(0))
+}
+
+/// Record `next` as the sequence the next write takes, under suspended capture.
+fn record_next_seq(db: &mut SqliteConnection, next: u64) -> Result<(), ClientError> {
+    let next = seq_storage(next)?;
+    diesel::insert_into(next_sequence::table)
+        .values((next_sequence::id.eq(1), next_sequence::next.eq(next)))
+        .on_conflict(next_sequence::id)
+        .do_update()
+        .set(next_sequence::next.eq(next))
+        .execute(db)?;
+    Ok(())
+}
 /// The pending mutations persisted by a previous run against this replica.
 fn load_pending(db: &mut SqliteConnection) -> Result<BTreeMap<u64, Vec<u8>>, ClientError> {
     #[derive(diesel::QueryableByName)]
@@ -2827,7 +2861,10 @@ where
         // Read after every statement this open applies, so the first write
         // re-checks only what the application changed since.
         let main_schema = schema_cookie(&mut db, "main")?;
-        let next_seq = pending.last_key_value().map_or(0, |(seq, _)| seq + 1);
+        let next_seq = pending
+            .last_key_value()
+            .map_or(0, |(seq, _)| seq + 1)
+            .max(load_next_seq(&mut db)?);
         let mut conn = Self {
             wire: None,
             run: None,
@@ -3026,6 +3063,8 @@ where
                 }
             }
             self.next_seq = self.next_seq.max(watermark.saturating_add(1));
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            record_next_seq(&mut self.db, self.next_seq)?;
         }
         self.replay_pending().await
     }
@@ -3563,6 +3602,7 @@ where
                     next_seq += 1;
                     outcome.writes_restored += 1;
                 }
+                record_next_seq(db, next_seq)?;
                 bookkeeping(db)?;
                 Ok(())
             })?;
@@ -4163,6 +4203,7 @@ where
         self.next_seq += 1;
         {
             let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            record_next_seq(&mut self.db, self.next_seq)?;
             persist_pending(&mut self.db, seq, &changeset)?;
         }
         // Reset capture: a fresh session records only writes after this push.
