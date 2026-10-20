@@ -1307,7 +1307,7 @@ fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
     let root = RootCa::create(
         DeploymentId::from_uuid(uuid::Uuid::new_v4()),
         now,
-        Duration::from_secs(365 * 24 * 3600),
+        Duration::from_hours(8760),
     )
     .expect("root");
     let issuer_key = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).expect("issuer key");
@@ -1315,7 +1315,7 @@ fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
         .sign_issuer(
             &issuer_key.subject_public_key_info(),
             now,
-            Duration::from_secs(90 * 24 * 3600),
+            Duration::from_hours(2160),
             CertificateSerial::new([1; 16]).expect("serial"),
         )
         .expect("issuer");
@@ -1329,7 +1329,7 @@ fn mint_device_certificate(account: &str) -> (Vec<u8>, Vec<u8>, [u8; 32]) {
             &request,
             account,
             now,
-            Duration::from_secs(30 * 24 * 3600),
+            Duration::from_hours(720),
             CertificateSerial::new([2; 16]).expect("serial"),
             AttestationLevel::Unproven,
         )
@@ -1356,6 +1356,11 @@ fn store_certificate(conn: &mut ConnettoConnection<Wire>, leaf: &[u8], issuer: &
         .expect("the certificate stores");
 }
 
+#[cfg(feature = "device-identity")]
+fn unsynced_write(writer: WriterRef, seq: u64) -> UnsyncedWrite {
+    UnsyncedWrite { writer, seq }
+}
+
 /// The retired-key window: a revoked device keeps its certificate until the
 /// enrolment task clears it, and a write captured inside that window must
 /// not resurrect the retired key's queue. The write stands under the live
@@ -1378,15 +1383,9 @@ async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_del
     assert_eq!(conn.push().await.expect("queue"), Some(1));
     assert_eq!(
         conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Device(key_a),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 1
-            },
+        [
+            unsynced_write(WriterRef::Device(key_a), 1),
+            unsynced_write(WriterRef::Number(1), 1),
         ],
         "the enrolled device takes the newer write, the number keeps the older"
     );
@@ -1404,19 +1403,10 @@ async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_del
     assert_eq!(conn.push().await.expect("queue"), Some(3));
     assert_eq!(
         conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 2
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 3
-            },
+        [
+            unsynced_write(WriterRef::Number(1), 1),
+            unsynced_write(WriterRef::Number(1), 2),
+            unsynced_write(WriterRef::Number(1), 3),
         ],
         "the window write stands under the live number, not the retired key"
     );
@@ -1429,23 +1419,11 @@ async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_del
     assert_eq!(conn.push().await.expect("queue"), Some(1));
     assert_eq!(
         conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Device(key_b),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 2
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 3
-            },
+        [
+            unsynced_write(WriterRef::Device(key_b), 1),
+            unsynced_write(WriterRef::Number(1), 1),
+            unsynced_write(WriterRef::Number(1), 2),
+            unsynced_write(WriterRef::Number(1), 3),
         ],
         "the fresh key takes the new write, the number keeps the window write"
     );
@@ -1458,27 +1436,12 @@ async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_del
     assert_eq!(conn.push().await.expect("queue"), Some(2));
     assert_eq!(
         conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Device(key_b),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Device(key_b),
-                seq: 2
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 2
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Number(1),
-                seq: 3
-            },
+        [
+            unsynced_write(WriterRef::Device(key_b), 1),
+            unsynced_write(WriterRef::Device(key_b), 2),
+            unsynced_write(WriterRef::Number(1), 1),
+            unsynced_write(WriterRef::Number(1), 2),
+            unsynced_write(WriterRef::Number(1), 3),
         ],
         "the restart keeps the window write under the number"
     );
@@ -1498,15 +1461,9 @@ async fn a_write_in_the_retired_key_window_queues_under_the_number_and_stays_del
     }
     assert_eq!(
         conn.unsynced(),
-        vec![
-            UnsyncedWrite {
-                writer: WriterRef::Device(key_b),
-                seq: 1
-            },
-            UnsyncedWrite {
-                writer: WriterRef::Device(key_b),
-                seq: 2
-            },
+        [
+            unsynced_write(WriterRef::Device(key_b), 1),
+            unsynced_write(WriterRef::Device(key_b), 2),
         ],
         "the window write settled, the fresh key's queue stands whole"
     );
@@ -1568,29 +1525,11 @@ async fn a_failed_retirement_preserves_the_device_tail_for_retry() {
         .expect("deliver carried writes");
     drain(&mut conn).await;
     assert_eq!(wire.log.lock().mutations, [1, 2, 3]);
-    assert!(conn.unsynced().is_empty());
+    assert_eq!(conn.unsynced(), Vec::<UnsyncedWrite>::new());
 }
 
 #[cfg(feature = "device-identity")]
-#[tokio::test]
-async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete() {
-    use connetto_client::{ExportScope, ImportChoices};
-    use connetto_core::messages::{
-        FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
-    };
-
-    let dir = tempdir().expect("source directory");
-    let mut source = open(&dir).await;
-    source
-        .attach(Wire::default().silent())
-        .await
-        .expect("attach");
-    write(&mut source, 1);
-    source.push().await.expect("number insert");
-    diesel::delete(t::table.filter(t::id.eq(1)))
-        .execute(source.conn())
-        .expect("device delete");
-    source.push().await.expect("queue device delete");
+fn split_pending_writers(source: &mut ConnettoConnection<Wire>) {
     let first_hash: Vec<u8> = _connetto_pending::table
         .filter(_connetto_pending::seq.eq(1_i64))
         .select(_connetto_pending::entry_hash)
@@ -1626,6 +1565,29 @@ async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete
         ))
         .execute(source.conn())
         .expect("device frontier");
+}
+
+#[cfg(feature = "device-identity")]
+#[tokio::test]
+async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete() {
+    use connetto_client::{ExportScope, ImportChoices};
+    use connetto_core::messages::{
+        FullResyncReason, FullResyncRequired, SnapshotBegin, SnapshotEnd, SubscriptionPriority,
+    };
+
+    let dir = tempdir().expect("source directory");
+    let mut source = open(&dir).await;
+    source
+        .attach(Wire::default().silent())
+        .await
+        .expect("attach");
+    write(&mut source, 1);
+    source.push().await.expect("number insert");
+    diesel::delete(t::table.filter(t::id.eq(1)))
+        .execute(source.conn())
+        .expect("device delete");
+    source.push().await.expect("queue device delete");
+    split_pending_writers(&mut source);
     drop(source);
     let mut source = open(&dir).await;
     let source_wire = Wire::default().silent();
@@ -1685,5 +1647,5 @@ async fn resync_and_archive_preserve_a_number_insert_followed_by_a_device_delete
         .expect("deliver restored writes");
     drain(&mut restored).await;
     assert_eq!(wire.log.lock().mutations, [1, 2]);
-    assert!(restored.unsynced().is_empty());
+    assert_eq!(restored.unsynced(), Vec::<UnsyncedWrite>::new());
 }
