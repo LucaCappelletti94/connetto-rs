@@ -932,25 +932,17 @@ where
                             >| {
                                 let handle = dial_handle.clone();
                                 tokio::spawn(async move {
-                                    let outcome = match handle.link_peer(addr).await {
-                                        Ok(_) => crate::hotspot::DialAnswer::Linked,
-                                        Err(PeerError::Link(
-                                            connetto_peer::LinkError::Unreachable(err),
-                                        )) if err.get_ref().is_some_and(|inner| {
-                                            inner.is::<crate::hotspot::VpnBlocksJoin>()
-                                        }) =>
-                                        {
-                                            crate::hotspot::DialAnswer::BlockedByVpn
-                                        }
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                %addr,
-                                                ?err,
-                                                "the dial to the joined hotspot's gateway failed"
-                                            );
-                                            crate::hotspot::DialAnswer::Failed
-                                        }
-                                    };
+                                    let dial = handle.link_peer(addr).await;
+                                    let outcome = crate::hotspot::DialAnswer::of(&dial);
+                                    if let (crate::hotspot::DialAnswer::Failed, Err(err)) =
+                                        (outcome, &dial)
+                                    {
+                                        tracing::debug!(
+                                            %addr,
+                                            ?err,
+                                            "the dial to the joined hotspot's gateway failed"
+                                        );
+                                    }
                                     let _ = answer.send(outcome);
                                 });
                             },

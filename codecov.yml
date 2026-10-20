@@ -13,6 +13,7 @@ coverage:
     - crates/connetto-test-harness/src/leg.rs
     - crates/connetto-test-harness/src/stack.rs
     - crates/connetto-test-harness/src/peer_devices.rs
+    - crates/connetto-test-harness/src/android_phone/steps.rs
     - crates/connetto-web/**
     - examples/**
     - crates/connetto-app-attest/src/ios.rs

@@ -359,6 +359,24 @@ pub(crate) enum DialAnswer {
     BlockedByVpn,
 }
 
+impl DialAnswer {
+    /// The answer a finished dial gives, an unreachable gateway whose error
+    /// carries [`VpnBlocksJoin`] read as the VPN's refusal.
+    pub(crate) fn of<T>(dial: &Result<T, crate::PeerError>) -> Self {
+        match dial {
+            Ok(_) => Self::Linked,
+            Err(crate::PeerError::Link(connetto_peer::LinkError::Unreachable(err)))
+                if err
+                    .get_ref()
+                    .is_some_and(<dyn std::error::Error + Send + Sync>::is::<VpnBlocksJoin>) =>
+            {
+                Self::BlockedByVpn
+            }
+            Err(_) => Self::Failed,
+        }
+    }
+}
+
 /// The refusal a socket bind meets under a VPN the app cannot bypass (R76).
 #[derive(Debug, thiserror::Error)]
 #[error("a VPN on this device blocks its own connections over the joined hotspot")]
@@ -1713,6 +1731,40 @@ mod tests {
             h.events.lock().as_slice(),
             &[ClientEvent::JoinedNetworkBlockedByVpn],
             "the bound adds no JoinedHostUnreached"
+        );
+    }
+
+    /// A dial the Android binding refused with [`VpnBlocksJoin`] reads as the
+    /// VPN's refusal, and every other ending as linked or failed.
+    #[test]
+    fn a_dial_refused_by_the_vpn_reads_as_blocked_and_any_other_failure_as_failed() {
+        use connetto_peer::LinkError;
+        use std::io::{Error, ErrorKind};
+
+        let unreachable =
+            |err: Error| Err::<(), _>(crate::PeerError::Link(LinkError::Unreachable(err)));
+        assert_eq!(
+            DialAnswer::of(&unreachable(Error::new(
+                ErrorKind::PermissionDenied,
+                VpnBlocksJoin
+            ))),
+            DialAnswer::BlockedByVpn
+        );
+        assert_eq!(
+            DialAnswer::of(&unreachable(Error::new(
+                ErrorKind::PermissionDenied,
+                "the joined network will not take the dial's socket"
+            ))),
+            DialAnswer::Failed,
+            "the same kind without the VPN's refusal is an ordinary failure"
+        );
+        assert_eq!(
+            DialAnswer::of(&Err::<(), _>(crate::PeerError::Link(LinkError::Timeout))),
+            DialAnswer::Failed
+        );
+        assert_eq!(
+            DialAnswer::of(&Ok::<(), crate::PeerError>(())),
+            DialAnswer::Linked
         );
     }
 

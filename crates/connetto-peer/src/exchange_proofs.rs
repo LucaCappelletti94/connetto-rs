@@ -1092,3 +1092,95 @@ fn a_peer_frame_offer_redacts_its_passphrase_in_its_debug_form() {
         "the passphrase stays out of the log"
     );
 }
+
+/// Every frame but the offer prints as a derived `Debug` would, and every
+/// frame's diagnostic name names its own variant, so a hand-written arm can
+/// neither drop a field nor name another frame.
+#[test]
+fn every_frame_names_itself_and_only_the_offer_hides_a_field() {
+    use serde_bytes::ByteBuf;
+
+    #[derive(Debug)]
+    #[expect(dead_code, reason = "read only through the derived Debug")]
+    enum Derived {
+        Hello {
+            version: u16,
+            dial: u64,
+            numbers: Vec<(ByteBuf, u64)>,
+        },
+        List {
+            list: ByteBuf,
+            signer: ByteBuf,
+        },
+        Close {
+            reason: CloseReason,
+        },
+        Certificate {
+            leaf: ByteBuf,
+            issuer: ByteBuf,
+        },
+        Ping,
+        Pong,
+    }
+
+    let bytes = |byte: u8| ByteBuf::from(vec![byte; 3]);
+    let cases = [
+        (
+            PeerFrame::Hello {
+                version: 1,
+                dial: 7,
+                numbers: vec![(bytes(1), 9)],
+            },
+            Derived::Hello {
+                version: 1,
+                dial: 7,
+                numbers: vec![(bytes(1), 9)],
+            },
+            "a Hello",
+        ),
+        (
+            PeerFrame::List {
+                list: bytes(2),
+                signer: bytes(3),
+            },
+            Derived::List {
+                list: bytes(2),
+                signer: bytes(3),
+            },
+            "a List",
+        ),
+        (
+            PeerFrame::Close {
+                reason: CloseReason::Closed,
+            },
+            Derived::Close {
+                reason: CloseReason::Closed,
+            },
+            "a Close",
+        ),
+        (
+            PeerFrame::Certificate {
+                leaf: bytes(4),
+                issuer: bytes(5),
+            },
+            Derived::Certificate {
+                leaf: bytes(4),
+                issuer: bytes(5),
+            },
+            "a Certificate",
+        ),
+        (PeerFrame::Ping, Derived::Ping, "a Ping"),
+        (PeerFrame::Pong, Derived::Pong, "a Pong"),
+    ];
+    for (frame, derived, named) in cases {
+        assert_eq!(format!("{frame:?}"), format!("{derived:?}"));
+        assert_eq!(frame.named(), named);
+    }
+    let offer = PeerFrame::Offer {
+        ssid: "camp".to_owned(),
+        passphrase: "opensesame".to_owned(),
+        security: 1,
+        port: None,
+    };
+    assert_eq!(offer.named(), "an Offer");
+}
