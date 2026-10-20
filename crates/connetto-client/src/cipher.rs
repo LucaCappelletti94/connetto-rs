@@ -62,39 +62,30 @@ pub const CIPHER_VFS_PREFIX: &str = "multipleciphers";
 pub const CIPHER_PRAGMAS: &str = "PRAGMA cipher = 'sqlcipher'; PRAGMA legacy = 4;";
 
 /// Why applying a cipher to a connection failed.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum UnlockError {
     /// The linked SQLite carries no page codec, so an encrypted database is not
     /// merely unreadable, it is impossible. This is a build or deployment fault
     /// rather than a runtime condition, and it is checked because the failure it
     /// replaces is silent: in a codec-less SQLite `PRAGMA key` is an
     /// unrecognised pragma, which succeeds and leaves every page in the clear.
+    #[error(
+        "this build links a SQLite with no page codec, so it cannot open an encrypted database"
+    )]
     CodecMissing,
     /// Applying the key, or selecting the cipher scheme, failed outright.
+    #[error("applying the replica key failed: {0}")]
     Pragma(diesel::result::Error),
     /// The key was accepted syntactically but does not decrypt this file, so the
     /// first read of the schema failed. A wrong key and a corrupt file are
     /// indistinguishable to the codec, by design.
+    #[error("the replica key does not decrypt this file: {0}")]
     WrongKey(diesel::result::Error),
     /// Another connection held the file locked for longer than the open waits,
     /// so nothing is known about the key and the open may simply be retried.
+    #[error("another connection holds the replica locked: {0}")]
     Busy(diesel::result::Error),
 }
-
-impl std::fmt::Display for UnlockError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::CodecMissing => f.write_str(
-                "this build links a SQLite with no page codec, so it cannot open an encrypted database",
-            ),
-            Self::Pragma(err) => write!(f, "applying the replica key failed: {err}"),
-            Self::WrongKey(err) => write!(f, "the replica key does not decrypt this file: {err}"),
-            Self::Busy(err) => write!(f, "another connection holds the replica locked: {err}"),
-        }
-    }
-}
-
-impl std::error::Error for UnlockError {}
 
 /// How long opening a replica waits for another connection's lock.
 pub(crate) const BUSY_WAIT: core::time::Duration = core::time::Duration::from_secs(5);
