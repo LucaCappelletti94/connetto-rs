@@ -136,7 +136,10 @@ fn resync_server() -> LoopbackTransport {
                 resume_token: "resync".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await
             .expect("ack");
@@ -257,7 +260,10 @@ fn aggregate_resync_server() -> LoopbackTransport {
                 resume_token: "agg-resync".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await;
         loop {
@@ -357,7 +363,10 @@ fn aggregate_resync_live_server(
                 resume_token: "agg-live".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await;
         // The watch's wire subscription, by the id the client chose.

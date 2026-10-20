@@ -25,11 +25,8 @@ mod visibility {
     }
 }
 
-use connetto_core::SessionId;
 use connetto_core::auth::Principal;
 use connetto_core::messages::ConflictRow;
-use diesel::OptionalExtension;
-use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
 use sqlparser::dialect::PostgreSqlDialect;
@@ -38,13 +35,14 @@ use subql::patchset::{PgAdapter, apply_diffset_bytes_async_with_catalog};
 
 use crate::capability::CallerBinding;
 use crate::schema::ConnettoSchema;
-use crate::watermark_schema::ConnettoWatermarkSchema;
+use crate::writer_schema::{
+    ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow,
+};
 use connetto_core::auth::CapabilityKey;
 
 use crate::materializer::{
     ConflictProbe, MaterializerError, PlannedConflict, ServerRow, WritePlan, probe_conflict_pg,
 };
-
 /// The outcome of committing one mutation upload.
 #[derive(Debug)]
 pub(crate) enum WriteOutcome {
@@ -58,6 +56,13 @@ pub(crate) enum WriteOutcome {
         /// The server's copy of the row.
         server_row: Option<ConflictRow>,
     },
+    /// The sequence is already settled: answer from the stored row, never apply again.
+    Settled {
+        /// The stored settled row.
+        row: SettledRow,
+        /// Whether the stored entry hash matches this upload's.
+        hash_matches: bool,
+    },
 }
 
 /// A failure while committing a mutation.
@@ -70,6 +75,8 @@ pub(crate) enum WriteError {
     Materializer(MaterializerError),
     /// A transaction or watermark storage failure that trying again cannot clear.
     Backend(String),
+    /// The writer's frontier moved under this write, so the write re-races the settled record.
+    Frontier,
     /// The database could not be reached or cut the connection, so the same write may succeed later.
     Transient(String),
 }
@@ -81,6 +88,7 @@ impl WriteError {
             Self::Unauthorized => "unauthorized".to_owned(),
             Self::Materializer(err) => err.to_string(),
             Self::Backend(detail) | Self::Transient(detail) => detail.clone(),
+            Self::Frontier => "the writer's frontier moved".to_owned(),
         }
     }
 }
@@ -118,6 +126,20 @@ fn conflict_outcome(conflict: &PlannedConflict, row: Option<ServerRow>) -> Write
     }
 }
 
+/// One entry's settle instruction, what `commit` records once it applies.
+pub(crate) struct SettleSpec {
+    /// The writer the entry settles under.
+    pub writer: i64,
+    /// The entry's sequence for that writer.
+    pub seq: u64,
+    /// The entry's chain hash.
+    pub entry_hash: [u8; 32],
+    /// The chain head the entry hashed under.
+    pub previous_hash: [u8; 32],
+    /// The path that settles the entry.
+    pub path: SettlePath,
+}
+
 /// A Postgres write target that applies under the caller's RLS context.
 ///
 /// Holds the pool and the parsed catalog. `commit` applies the changeset through
@@ -129,10 +151,10 @@ pub struct PgWriteTarget<D> {
     catalog: ParserDB,
     /// The setting a policy reads the caller's identity from.
     user_setting: std::sync::Arc<str>,
-    /// The deployment's watermark schema, carried only in the type system so
-    /// `commit`/`last_applied` name its watermark table. `fn() -> D` keeps the
-    /// target `Send`/`Sync` regardless of `D`.
-    _watermark: PhantomData<fn() -> D>,
+    /// The deployment's writer schema, carried only in the type system so
+    /// `commit` names its writer tables. `fn() -> D` keeps the target
+    /// `Send`/`Sync` regardless of `D`.
+    _writers: PhantomData<fn() -> D>,
 }
 
 /// Build a Postgres write target over a pool and the catalog DDL.
@@ -150,7 +172,7 @@ pub fn pg_write_target<D: ConnettoSchema>(
         user_setting: connetto_core::auth::DEFAULT_USER_SETTING.into(),
         pool,
         catalog,
-        _watermark: PhantomData,
+        _writers: PhantomData,
     })
 }
 
@@ -161,6 +183,8 @@ enum CommitError {
     Probe(MaterializerError),
     /// Fewer rows changed than the upload carried: RLS hid the rest.
     Denied,
+    /// The frontier did not advance because it moved: the write must re-race the record.
+    Frontier,
 }
 
 impl From<diesel::result::Error> for CommitError {
@@ -195,11 +219,92 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         std::sync::Arc::clone(&self.user_setting)
     }
 
-    /// Probe conflicts, apply one upload, and advance the durable watermark in
-    /// the same transaction, reporting the outcome. The apply runs under the
-    /// caller's identity and share keys, so Postgres RLS gates it, and the
-    /// watermark is keyed by `session_id` alone, the durable handle every run
-    /// has, so a reconnect reusing the same run dedupes replayed uploads.
+    /// A fresh number writer issued for the account `user_id` at frontier 0,
+    /// bound to `session_id` when the caller has no identity.
+    pub(crate) async fn issue_writer(
+        &self,
+        user_id: Option<D::Id>,
+        session_id: Option<uuid::Uuid>,
+    ) -> Result<(i64, i64), WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::issue(&mut conn, user_id, session_id)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The number writer `writer` of the caller, absent when no such writer
+    /// exists. An identified caller is admitted to a writer of its account and
+    /// nothing else; an anonymous caller is admitted to the writer its run
+    /// handle `session_id` holds and nothing else.
+    pub(crate) async fn writer_by_number(
+        &self,
+        writer: i64,
+        user_id: Option<&D::Id>,
+        session_id: Option<&uuid::Uuid>,
+    ) -> Result<Option<WriterRow<D::Id>>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::by_number(&mut conn, writer, user_id, session_id)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The settled row of `(writer, seq)`, absent when pruned or never settled.
+    pub(crate) async fn settled_row(
+        &self,
+        writer: i64,
+        seq: u64,
+    ) -> Result<Option<SettledRow>, WriteError> {
+        let seq = seq_storage(seq)?;
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::settled(&mut conn, writer, seq)
+            .await
+            .map_err(WriteError::from)
+    }
+
+    /// The current row a re-answered settled conflict reads fresh, under the
+    /// caller's RLS context on the owner pool.
+    pub(crate) async fn settled_conflict_row<Key: CapabilityKey>(
+        &self,
+        caller: &Principal<D::Id, Key>,
+        table: &str,
+        version_column: &str,
+        pk_columns: &[String],
+        pk_values: &[crate::writer_schema::StoredValue],
+    ) -> Result<Option<ServerRow>, WriteError> {
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting))
+            .apply(&mut conn)
+            .await
+            .map_err(WriteError::from)?;
+        crate::materializer::read_settled_conflict_row(
+            &mut conn,
+            table,
+            version_column,
+            pk_columns,
+            pk_values,
+        )
+        .await
+        .map_err(|err| WriteError::Backend(err.to_string()))
+    }
+
+    /// Drop the settled rows of `writer` at or below `seq`.
+    pub(crate) async fn prune_settled(&self, writer: i64, seq: u64) -> Result<(), WriteError> {
+        let seq = seq_storage(seq)?;
+        let mut conn = self.pool.get().await.map_err(pool_failure)?;
+        D::Writers::prune(&mut conn, writer, seq)
+            .await
+            .map_err(WriteError::from)?;
+        Ok(())
+    }
+
+    /// Probe conflicts, apply one upload, and settle its sequence in the same
+    /// transaction, reporting the outcome. The apply runs under the caller's
+    /// identity and share keys, so Postgres RLS gates it.
+    ///
+    /// The entry settles by `(writer, seq)`, so a redelivery of a settled
+    /// sequence is answered from the stored row and never applies twice. The
+    /// reserved settle row rolls back with a lost apply, so an indeterminate
+    /// write settles nothing and the client may retry it.
     ///
     /// A caller with neither an identity nor a capability binds nothing, so
     /// every owner policy's `WITH CHECK` fails and the write is refused. A
@@ -211,25 +316,37 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
         caller: &Principal<D::Id, Key>,
         plan: &WritePlan,
         payload_zstd: &[u8],
-        session_id: SessionId,
-        client_seq: u64,
+        settle: &SettleSpec,
     ) -> Result<WriteOutcome, WriteError> {
-        let seq = seq_storage(client_seq)?;
+        let seq = seq_storage(settle.seq)?;
         let bytes = crate::materializer::decompress(payload_zstd)
             .map_err(|err| WriteError::Backend(format!("decompress: {err}")))?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
         let binding = CallerBinding::of(caller, std::sync::Arc::clone(&self.user_setting));
-        let watermark_session = session_id;
         let expected = plan.ops.len();
         let catalog = &self.catalog;
         let outcome = conn
             .transaction::<WriteOutcome, CommitError, _>(async move |c| {
-                // A commit whose answer was lost is already covered, and applying it again would write it twice.
-                if watermark_of::<D::Watermark>(c, watermark_session)
-                    .await?
-                    .is_some_and(|last| last >= seq)
-                {
-                    return Ok(WriteOutcome::Applied);
+                // Reserve the sequence before touching any table, so a settled
+                // entry is answered from the record and a lost apply leaves no row.
+                let reserved = D::Writers::settle(
+                    c,
+                    settle.writer,
+                    seq,
+                    &settle.entry_hash,
+                    &settle.previous_hash,
+                    &SettledOutcome::Applied.json(),
+                    settle.path,
+                )
+                .await?;
+                if !reserved {
+                    let row = D::Writers::settled(c, settle.writer, seq)
+                        .await?
+                        .ok_or(diesel::result::Error::NotFound)?;
+                    return Ok(WriteOutcome::Settled {
+                        hash_matches: row.entry_hash == settle.entry_hash,
+                        row,
+                    });
                 }
                 binding.apply(c).await?;
                 for op in &plan.ops {
@@ -240,6 +357,20 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                         .await
                         .map_err(CommitError::Probe)?
                     {
+                        // The reserved row keeps the sequence; restate its outcome
+                        // to the conflict so the record matches the refusal.
+                        let outcome = SettledOutcome::Conflict {
+                            table: conflict.table.clone(),
+                            version_column: conflict.version_column.clone(),
+                            pk_columns: conflict.pk_columns.clone(),
+                            pk_values: conflict
+                                .pk_values
+                                .iter()
+                                .map(crate::materializer::stored_value)
+                                .collect(),
+                        };
+                        D::Writers::settle_outcome(c, settle.writer, seq, &outcome.json()).await?;
+                        D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await?;
                         return Ok(conflict_outcome(conflict, row));
                     }
                 }
@@ -250,29 +381,43 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
                 if affected < expected {
                     return Err(CommitError::Denied);
                 }
-                // Advance the durable watermark in the SAME transaction: the
-                // apply and its dedupe record are one atomic step. The
-                // deployment owns the table; connetto keeps the monotone
-                // GREATEST advance inside `watermark_upsert`.
-                D::Watermark::watermark_upsert(watermark_session, seq)
-                    .execute(c)
-                    .await?;
+                if !D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await? {
+                    return Err(CommitError::Frontier);
+                }
                 Ok(WriteOutcome::Applied)
             })
             .await;
         outcome.map_err(commit_failure)
     }
 
-    /// The highest `client_seq` durably applied for this session handle, read
-    /// at handshake so the ack can carry it. The deployment owns the watermark
-    /// table; connetto emits no DDL for it.
-    pub(crate) async fn last_applied(
+    /// Settle a refused entry after its apply rolled back, in its own transaction.
+    /// Loses silently when a concurrent copy settled the sequence first.
+    pub(crate) async fn settle_refusal(
         &self,
-        session_id: SessionId,
-    ) -> Result<Option<u64>, WriteError> {
+        settle: &SettleSpec,
+        outcome: &SettledOutcome,
+    ) -> Result<(), WriteError> {
+        let seq = seq_storage(settle.seq)?;
         let mut conn = self.pool.get().await.map_err(pool_failure)?;
-        let last_seq = watermark_of::<D::Watermark>(&mut conn, session_id).await?;
-        Ok(last_seq.and_then(|seq| u64::try_from(seq).ok()))
+        conn.transaction::<(), CommitError, _>(async move |c| {
+            let text = outcome.json();
+            let won = D::Writers::settle(
+                c,
+                settle.writer,
+                seq,
+                &settle.entry_hash,
+                &settle.previous_hash,
+                &text,
+                settle.path,
+            )
+            .await?;
+            if won {
+                D::Writers::advance(c, settle.writer, seq, &settle.entry_hash).await?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(commit_failure)
     }
 
     /// Whether `caller` may see `file_id` per the deployment's
@@ -307,21 +452,10 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     }
 }
 
-/// The highest `client_seq` durably applied for `session_id`, read on `conn`.
-async fn watermark_of<W: ConnettoWatermarkSchema>(
-    conn: &mut AsyncPgConnection,
-    session_id: SessionId,
-) -> diesel::QueryResult<Option<i64>> {
-    let filtered = FilterDsl::filter(W::WatermarkQuery::default(), W::wm_pk(session_id));
-    SelectDsl::select(filtered, W::LastSeq::default())
-        .first(conn)
-        .await
-        .optional()
-}
-
 /// The write error a failed commit transaction reports.
 fn commit_failure(err: CommitError) -> WriteError {
     match err {
+        CommitError::Frontier => WriteError::Frontier,
         CommitError::Denied => WriteError::Unauthorized,
         CommitError::Db(err) if is_rls_violation(&err.to_string()) => WriteError::Unauthorized,
         CommitError::Db(err) => err.into(),

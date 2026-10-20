@@ -167,7 +167,6 @@ async fn stack(fixture: &Fixture) -> (Server, Pool<AsyncPgConnection>) {
              SELECT ARRAY(SELECT f FROM UNNEST(p_file_ids) AS f \
              WHERE EXISTS (SELECT 1 FROM public.t p WHERE p.file_id = f)) $$",
             "GRANT EXECUTE ON FUNCTION connetto_visible_files(BYTEA[]) TO bp_reader",
-            "GRANT SELECT ON _connetto_mutations TO bp_reader",
             &format!(
                 "INSERT INTO t (id, file_id, label) VALUES \
              (1, '\\x{file_id}'::bytea, 'one'), (2, NULL, 'two')"

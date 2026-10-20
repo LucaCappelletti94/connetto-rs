@@ -6,6 +6,7 @@
 //! `cargo nextest run --cargo-profile testfast --all-features -E 'test(subscription_translate::)'`.
 
 mod abuse;
+mod anonymous_writer;
 mod bot_cap;
 mod bot_proof;
 mod bot_registration;
@@ -127,5 +128,7 @@ mod subscription_translate;
 mod throttle;
 
 mod write_path;
+
+mod writer_frontier;
 
 mod upkeep_consulted;

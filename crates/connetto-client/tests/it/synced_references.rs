@@ -71,7 +71,7 @@ async fn server(fixture: &Fixture) -> Server {
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
             "DROP TABLE IF EXISTS folders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             PG_DDL,
@@ -81,9 +81,12 @@ async fn server(fixture: &Fixture) -> Server {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
+        .exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled \
+             TO app_writer",
+        )
         .await;
     fixture
         .exec(

@@ -171,7 +171,7 @@ async fn seed_owned_rls(pool: &Pool<AsyncPgConnection>, user_id: &str) {
         OWNED_PG_DDL,
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT ON owned TO app_reader",
-        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
     ] {
         exec(pool, stmt).await;
     }
@@ -1825,11 +1825,11 @@ async fn a_missing_schema_table_refuses_naming_it() {
         }
     }
 
-    exec(&pool, "DROP TABLE _connetto_mutations").await;
-    let watermark = missing(&fixture, |builder| builder).await;
+    exec(&pool, "DROP TABLE _connetto_writers").await;
+    let writers = missing(&fixture, |builder| builder).await;
     assert!(
-        watermark.starts_with("table _connetto_mutations does not exist"),
-        "{watermark}"
+        writers.starts_with("table _connetto_writers does not exist"),
+        "{writers}"
     );
 
     exec(&pool, "DROP TABLE connetto_provider_tokens").await;

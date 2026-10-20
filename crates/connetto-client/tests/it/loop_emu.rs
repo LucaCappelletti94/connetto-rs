@@ -514,11 +514,11 @@ async fn reset_orders(fixture: &Fixture) {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
 }
 
 /// The server target's orders, read as admin, mapped to the client `Order`.
@@ -673,7 +673,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         .await
         .expect("push")
         .expect("a mutation was sent");
-    assert_eq!(seq, 0, "first mutation carries client_seq 0");
+    assert_eq!(seq, 1, "first mutation carries client_seq 1");
 
     // Barrier: the pong proves the server handled the mutation frames first.
     client.ping(1).await.expect("ping");
@@ -715,7 +715,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         .await
         .expect("push")
         .expect("withheld mutation sent");
-    assert_eq!(withheld_seq, 1, "withheld mutation carries client_seq 1");
+    assert_eq!(withheld_seq, 2, "withheld mutation carries client_seq 2");
     let refused = pump_until(&mut client, |e| {
         matches!(e, ClientEvent::MutationRejected { .. })
     })
@@ -987,7 +987,7 @@ async fn connection_is_a_diesel_connection() {
         .await
         .expect("flush")
         .expect("a mutation was auto-submitted");
-    assert_eq!(seq, 0, "first auto-submitted mutation carries client_seq 0");
+    assert_eq!(seq, 1, "first auto-submitted mutation carries client_seq 1");
 
     // Barrier: the pong proves the server handled the mutation.
     client.ping(1).await.expect("ping");
@@ -1111,7 +1111,7 @@ async fn rejected_write_rolls_back_locally() {
     assert_eq!(
         event,
         ClientEvent::MutationRejected {
-            client_seq: 0,
+            client_seq: 1,
             rows: vec![AffectedRow {
                 table: "orders".to_owned(),
                 key: vec![KeyValue::Int(99)],
@@ -1247,7 +1247,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     else {
         panic!("expected a mutation conflict");
     };
-    assert_eq!(client_seq, 0);
+    assert_eq!(client_seq, 1);
     assert_eq!(
         rows,
         vec![AffectedRow {

@@ -111,3 +111,5 @@ mod uuid_rls_default;
 mod verified_topology;
 
 mod write_surface;
+
+mod writer;

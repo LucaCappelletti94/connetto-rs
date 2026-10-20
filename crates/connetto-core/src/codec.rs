@@ -188,7 +188,7 @@ mod tests {
     use super::*;
     use crate::{
         cursor::Cursor,
-        messages::{Handshake, HandshakeAck},
+        messages::{Handshake, HandshakeAck, WriterGrant},
         schema::SchemaVersion,
         version::PROTOCOL_VERSION,
     };
@@ -201,7 +201,10 @@ mod tests {
             current_cursor: Cursor::new(vec![9, 8, 7]),
             schema_version: Some(SchemaVersion::from_hash(vec![0xab, 0xcd])),
             initial_credits: 64,
-            last_applied_seq: Some(7),
+            writer: Some(WriterGrant {
+                number: 3,
+                frontier: 7,
+            }),
         })
     }
 

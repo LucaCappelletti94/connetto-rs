@@ -34,7 +34,7 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
                 'logged_out', 'session_revoked', 'token_replayed', \
                 'capability_minted', 'permission_change', 'model_change', \
-                'banned', 'ban_lifted')"
+                'banned', 'ban_lifted', 'write_forked')"
         ),
         format!(
             "CREATE TABLE auth_events (\
@@ -43,7 +43,9 @@ async fn reset_audit_table(pool: &Pool<AsyncPgConnection>) {
                 user_id TEXT, \
                 op {AUTH_OP_TYPE} NOT NULL, \
                 table_name TEXT, \
-                pk UUID)"
+                pk UUID, \
+                writer BIGINT, seq BIGINT, \
+                path connetto_settle_path, other_path connetto_settle_path)"
         ),
     ] {
         sql_query(stmt).execute(&mut conn).await.expect("ddl");
@@ -73,6 +75,7 @@ async fn every_auth_op_round_trips_through_postgres() {
         AuthOp::ModelChange,
         AuthOp::Banned,
         AuthOp::BanLifted,
+        AuthOp::WriteForked,
     ];
     for op in all {
         let session = SessionId::from_uuid(uuid::Uuid::new_v4());

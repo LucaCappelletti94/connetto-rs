@@ -1626,7 +1626,7 @@ impl NativeSession {
 trait Forget: Send + Sync {
     fn forget<'a>(
         &'a self,
-        unsynced: &'a [u64],
+        unsynced: &'a [crate::UnsyncedWrite],
         force: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>>;
 }
@@ -1647,7 +1647,7 @@ where
 {
     fn forget<'a>(
         &'a self,
-        unsynced: &'a [u64],
+        unsynced: &'a [crate::UnsyncedWrite],
         force: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>> {
         Box::pin(async move {

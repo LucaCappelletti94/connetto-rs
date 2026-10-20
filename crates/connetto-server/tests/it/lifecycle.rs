@@ -392,20 +392,24 @@ async fn an_unusable_change_stream_on_a_model_table_refuses_to_serve() {
     // with a shape and the store's diff reads its previous image.
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
-        "DROP TABLE IF EXISTS _connetto_mutations",
+        "DROP TABLE IF EXISTS _connetto_settled",
+        "DROP TABLE IF EXISTS _connetto_writers",
         OWNED_PG_DDL,
         "ALTER TABLE owned ENABLE ROW LEVEL SECURITY",
         "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
-        "CREATE TABLE _connetto_mutations \
-         (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
          THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
         "GRANT USAGE ON SCHEMA public TO app_reader",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_reader",
-        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_reader",
     ] {
         exec(&pool, stmt).await;
     }
+    connetto_test_harness::provision_writers(&pool).await;
+    exec(
+        &pool,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+    )
+    .await;
     provision_cap_policies(&pool, OWNED_PG_DDL, OWNED_POLICIES).await;
     exec(&pool, "INSERT INTO owned VALUES (1, 'alice', 'seed')").await;
     fixture.start_replication(&["owned"]).await;

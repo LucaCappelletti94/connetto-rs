@@ -42,7 +42,9 @@ The lifetime is application-requested per case under a server ceiling and refuse
 
 ## One exactly-once domain: the per-device applied frontier
 
-**Decided (R75), and it reshapes the R2 watermark contract.** Every write carries its durable identity, the pair of its writer and its pending-queue sequence. A native device's writer is its device key, and a browser's writer is a number the server assigns, since browsers never join a peer link and no browser API offers an application a chip-held signing key (decided 2026-10-02). The server keeps one applied frontier per writer, the normal reconnect path, the courier path and an archive restore all consult it, and the session watermark becomes a cache of that frontier. A collision at one (writer, sequence) is first-seen-wins, audited, with the second refused, the Secure Scuttlebutt fork rule, adopted after the review mapped SSB's known fork condition onto archive restore. An archive import therefore always retires the archived writer and gives the importing replica a fresh one, with restored entries carrying their original identity as provenance so the frontier deduplicates the logical writes across the restore. The pending queue holds every unsent write and evicts none, so every provisional copy a peer holds stays confirmable or retractable.
+**Decided (R75).** Every write carries its durable identity, the pair of its writer and its pending-queue sequence. Every client writes under a number the server issues, since browsers never join a peer link and no browser API offers an application a chip-held signing key (decided 2026-10-02 and 2026-10-17). The server keeps one frontier per writer below which every sequence is settled, applied or refused, and every path takes only the next sequence. The normal reconnect path, the courier path and an archive restore all settle through it, and the per-connection watermark is a cache of it.
+
+The server keeps a record of each settled write, its chain hash, its outcome and the path that settled it, for as long as its writer can still deliver it, a number writer's records going once the author reports it has settled past them. A re-delivery is answered from that record, and audited when it arrives through another path than the one that settled it. A different entry at a settled (writer, sequence) is refused and audited, first-seen-wins, the Secure Scuttlebutt fork rule, adopted after the review mapped SSB's known fork condition onto archive restore. An archive import re-queues the restored writes as fresh entries under the importer's own writer. The pending queue holds every unsent write and evicts none, so every provisional copy a peer holds stays confirmable or retractable, and every entry chains to the one before it, so a range a device signs vouches for everything below it.
 
 ## Transport
 
@@ -96,7 +98,7 @@ Offline authorization is the translated replica policy evaluated with the author
 
 ## The archive
 
-**Decided (R75, R77).** Provisional rows and all peer bookkeeping (provenance, cursors, the retraction log) travel in the R26/R56 archive because they live in the tiers it already carries, so a restored device resumes exchanges correctly. Peer-fetched cache chunks stay out, and the archive is not the survivability mechanism, the courier path is. The one archive rule the frontier adds: an import retires the archived enrolment and mints a fresh device key.
+**Decided (R75, R77).** Provisional rows and all peer bookkeeping (provenance, cursors, the retraction log) travel in the R26/R56 archive because they live in the tiers it already carries, so a restored device resumes exchanges correctly. Peer-fetched cache chunks stay out, and the archive is not the survivability mechanism, the courier path is. The one archive rule the frontier adds is that an import re-queues the restored writes as fresh entries under the importer's own writer.
 
 ## Phases
 

@@ -116,7 +116,10 @@ fn ack_control() -> ControlMessage {
         current_cursor: Cursor::from(Vec::new()),
         schema_version: None,
         initial_credits: 64,
-        last_applied_seq: None,
+        writer: Some(connetto_core::messages::WriterGrant {
+            number: 1,
+            frontier: 0,
+        }),
     })
 }
 /// The schema every build in this file carries.

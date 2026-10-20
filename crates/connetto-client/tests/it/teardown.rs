@@ -18,7 +18,7 @@ use connetto_client::teardown::{
 };
 use connetto_client::{
     ClientBuilder, ClientError, DataDir, Gate, NativeClientBuilder, ReplicaKey, SyncSchema,
-    provision_replica_key,
+    UnsyncedWrite, provision_replica_key,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -56,7 +56,7 @@ async fn seed_replica(
     dir: &Path,
     keys: &super::support::SharedKeys,
     user_id: &str,
-) -> (PathBuf, String, Vec<u64>) {
+) -> (PathBuf, String, Vec<UnsyncedWrite>) {
     let credential = super::support::held(user_id);
     let record = credential.replica_name().to_owned();
     let path = dir.join(&record);
@@ -165,7 +165,7 @@ async fn seed_replica_with_tier(
     dir: &Path,
     keys: &super::support::SharedKeys,
     user_id: &str,
-) -> (PathBuf, String, Vec<u64>) {
+) -> (PathBuf, String, Vec<UnsyncedWrite>) {
     let credential = super::support::held(user_id);
     let record = credential.replica_name().to_owned();
     let path = dir.join(&record);

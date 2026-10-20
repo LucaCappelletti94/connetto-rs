@@ -6,7 +6,7 @@
 //! [`connetto_schema!`](crate::connetto_schema), and names it as the `Bans`
 //! member of its [`ConnettoSchema`](crate::schema::ConnettoSchema), the same
 //! arrangement as [`ConnettoStoreSchema`](crate::authn::ConnettoStoreSchema),
-//! [`ConnettoWatermarkSchema`](crate::watermark_schema::ConnettoWatermarkSchema)
+//! [`ConnettoWriterSchema`](crate::writer_schema::ConnettoWriterSchema)
 //! and [`ConnettoAuditSchema`](crate::audit::ConnettoAuditSchema).
 //!
 //! Current state, not history. One row per banned identity, replaced when a

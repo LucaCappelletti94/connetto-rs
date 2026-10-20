@@ -3,7 +3,7 @@
 
 use connetto_client::{ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir};
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, LivePatch,
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, LivePatch, WriterGrant,
 };
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::connection::SimpleConnection;
@@ -120,7 +120,10 @@ fn ack() -> IncomingFrame {
         current_cursor: connetto_core::Cursor::from(Vec::new()),
         schema_version: None,
         initial_credits: 64,
-        last_applied_seq: None,
+        writer: Some(WriterGrant {
+            number: 1,
+            frontier: 0,
+        }),
     }))
 }
 

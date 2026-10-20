@@ -5,7 +5,10 @@
 //! crates and both targets need the same fake, and the only things it depends on
 //! are the transport trait and the message types, which are here.
 
-use crate::messages::{BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck};
+use crate::messages::{
+    BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, WriterGrant,
+    WriterRequest,
+};
 use crate::traits::{IncomingFrame, Transport};
 use crate::{Cursor, ReplicaKey, SchemaVersion};
 use std::collections::VecDeque;
@@ -213,6 +216,12 @@ pub struct FakeTransport {
     post_handshake: VecDeque<IncomingFrame>,
     /// Fail every bulk send, as a connection reset under an upload does.
     bulk_fails: bool,
+    /// The number a `WriterRequest::Issue` is issued, and the number a
+    /// `WriterRequest::Number` is confirmed against, the server's own choice
+    /// in the test.
+    issued: u64,
+    /// The frontier the grant carries, everything at or below it settled.
+    issued_frontier: u64,
 }
 
 impl FakeTransport {
@@ -286,10 +295,12 @@ impl FakeTransport {
             closing: None,
             post_handshake: VecDeque::new(),
             bulk_fails: false,
+            issued: 1,
+            issued_frontier: 0,
         }
     }
 
-    fn answer(&self) -> IncomingFrame {
+    fn answer(&self, writer: Option<WriterGrant>) -> IncomingFrame {
         match &self.reply {
             HandshakeReply::Accept => {
                 IncomingFrame::Control(ControlMessage::HandshakeAck(HandshakeAck {
@@ -299,7 +310,7 @@ impl FakeTransport {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None::<SchemaVersion>,
                     initial_credits: 64,
-                    last_applied_seq: None,
+                    writer,
                 }))
             }
             HandshakeReply::Refuse(reason) => {
@@ -317,8 +328,15 @@ impl Transport for FakeTransport {
         reason = "the trait method is async and this body finishes without awaiting"
     )]
     async fn send_control(&mut self, message: ControlMessage) -> Result<(), FakeTransportError> {
-        if matches!(message, ControlMessage::Handshake(_)) {
-            let frame = self.answer();
+        if let ControlMessage::Handshake(handshake) = &message {
+            let writer = match &handshake.writer {
+                WriterRequest::Device => None,
+                WriterRequest::Issue | WriterRequest::Number(_) => Some(WriterGrant {
+                    number: self.issued,
+                    frontier: self.issued_frontier,
+                }),
+            };
+            let frame = self.answer(writer);
             self.inbox.push_back(frame);
             self.inbox.append(&mut self.post_handshake);
             if let Some(reason) = self.closing.take() {

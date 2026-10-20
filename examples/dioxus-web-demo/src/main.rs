@@ -839,7 +839,7 @@ async fn poll_expiry_warn(
         now,
         expires_at,
         Duration::from_secs(7 * 24 * 3600),
-        pending.mutation_seqs,
+        pending.unsynced,
         pending.content_files,
     ));
 }

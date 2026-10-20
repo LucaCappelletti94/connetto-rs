@@ -13,15 +13,19 @@
 //! until the second half, and the transport used there answers a handshake and
 //! records what it is sent.
 
+use std::collections::VecDeque;
 use std::future::{Future, ready};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use connetto_client::{
-    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, SyncStatus,
+    ClientBuilder, ClientError, ClientEvent, ConnettoConnection, DataDir, SyncStatus, UnsyncedWrite,
 };
 use connetto_core::Cursor;
-use connetto_core::messages::{BulkMessage, ControlMessage, HandshakeAck, SubscriptionSpec};
+use connetto_core::messages::{
+    BulkMessage, ControlMessage, HandshakeAck, MutationApplied, SubscriptionSpec, WriterGrant,
+    WriterRef,
+};
 use connetto_core::traits::{IncomingFrame, Transport};
 use diesel::prelude::*;
 use tempfile::{TempDir, tempdir};
@@ -50,8 +54,10 @@ struct Recorder {
     greeted: Arc<AtomicBool>,
     uploads: Arc<Mutex<Vec<u64>>>,
     subscribes: Arc<Mutex<Vec<(String, String)>>>,
-    /// The durable watermark the handshake reports.
-    watermark: Option<u64>,
+    /// The server's answers to the mutation headers it was handed.
+    answers: Arc<Mutex<VecDeque<ControlMessage>>>,
+    /// Answer each mutation header with its applied frame.
+    apply: bool,
 }
 
 impl Transport for Recorder {
@@ -67,6 +73,13 @@ impl Transport for Recorder {
                     .lock()
                     .expect("uploads lock")
                     .push(header.client_seq);
+                if self.apply {
+                    self.answers.lock().expect("answers lock").push_back(
+                        ControlMessage::MutationApplied(MutationApplied {
+                            client_seq: header.client_seq,
+                        }),
+                    );
+                }
             }
             ControlMessage::Subscribe(subscribe) => {
                 self.subscribes
@@ -88,8 +101,11 @@ impl Transport for Recorder {
 
     fn recv(&mut self) -> impl Future<Output = Result<Option<IncomingFrame>, Self::Error>> {
         if self.greeted.swap(true, Ordering::Relaxed) {
-            // Nothing further to say, and the connection stays usable.
-            return ready(Ok(None));
+            match self.answers.lock().expect("answers lock").pop_front() {
+                Some(frame) => return ready(Ok(Some(IncomingFrame::Control(frame)))),
+                // Nothing further to say, and the connection stays usable.
+                None => return ready(Ok(None)),
+            }
         }
         ready(Ok(Some(IncomingFrame::Control(
             ControlMessage::HandshakeAck(HandshakeAck {
@@ -99,7 +115,10 @@ impl Transport for Recorder {
                 current_cursor: Cursor::new(Vec::new()),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: self.watermark,
+                writer: Some(WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }),
         ))))
     }
@@ -159,7 +178,10 @@ async fn a_connection_opens_and_serves_reads_with_no_server() {
     let seq = conn.push().await.expect("queue the write").expect("a seq");
     assert_eq!(
         conn.unsynced(),
-        vec![seq],
+        vec![UnsyncedWrite {
+            writer: WriterRef::Number(0),
+            seq,
+        }],
         "the write is queued and visibly unsent"
     );
 
@@ -181,12 +203,25 @@ async fn no_waiting_write_is_evicted_however_many_queue() {
             .expect("write with no server");
         queued.push(conn.push().await.expect("queue the write").expect("a seq"));
     }
-    assert_eq!(conn.unsynced(), queued, "every write still waits, in order");
+    let expected = queued
+        .iter()
+        .map(|seq| UnsyncedWrite {
+            writer: WriterRef::Number(0),
+            seq: *seq,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        conn.unsynced(),
+        expected,
+        "every write still waits, in order"
+    );
 }
 
-/// A write the server applied while its answer was lost is reported applied when the next handshake's watermark retires it, as the browser hub needs to answer the tab that made it.
+/// A write the server applied while its answer was lost is resent on the
+/// next connection and reported applied as the server re-answers it from its
+/// own record, as the browser hub needs to answer the tab that made it.
 #[tokio::test]
-async fn a_write_the_handshake_watermark_retires_is_reported_applied() {
+async fn a_write_answered_applied_but_lost_is_resent_and_reported_applied() {
     let dir = tempdir().expect("temp dir");
     let mut conn = open_offline(&dir).await;
     let mut queued = Vec::new();
@@ -199,12 +234,11 @@ async fn a_write_the_handshake_watermark_retires_is_reported_applied() {
     }
 
     conn.attach(Recorder {
-        watermark: Some(queued[0]),
+        apply: true,
         ..Recorder::default()
     })
     .await
     .expect("attach");
-    assert_eq!(conn.unsynced(), vec![queued[1]]);
     let mut applied = Vec::new();
     loop {
         match conn.pump_one().await.expect("pump") {
@@ -220,10 +254,10 @@ async fn a_write_the_handshake_watermark_retires_is_reported_applied() {
             }
         }
     }
-    assert_eq!(
-        applied,
-        vec![queued[0]],
-        "the retired write is reported applied"
+    assert_eq!(applied, queued, "each resent write is re-answered applied");
+    assert!(
+        conn.unsynced().is_empty(),
+        "the re-answered writes retired with their final answer"
     );
 }
 
@@ -263,7 +297,7 @@ async fn attaching_a_transport_later_replays_what_was_queued() {
     );
     assert_eq!(labels(&mut conn), vec![Some("queued".to_owned())]);
     assert!(
-        conn.unsynced().contains(&seq),
+        conn.unsynced().iter().any(|write| write.seq == seq),
         "and it stays pending until the server acknowledges it, which this \
          transport never does"
     );
