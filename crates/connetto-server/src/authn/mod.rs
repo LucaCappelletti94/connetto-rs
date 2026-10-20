@@ -26,7 +26,8 @@ pub use identity::{
 };
 pub use provider::{
     AssuranceRequirement, AuthCodes, IdentityProvider, IssuedAuthCode, LoginRedirect, PendingLogin,
-    PendingLogins, ProviderError, ProviderRegistry, RetainedProviderToken, VerifiedLogin,
+    PendingLogins, ProviderError, ProviderRegistry, RetainedProviderToken, StoredProviderToken,
+    VerifiedLogin,
 };
 pub use provider_oidc::{GenericOidcProvider, OidcProviderConfig};
 pub use service::{AuthError, AuthService, ConnettoHandshakeAuthority, TokenPair};
@@ -35,5 +36,5 @@ pub use store::{
 };
 pub use token::{AuthConfig, RefreshLifetimes, TokenAuthority, TokenError, VerifiedSession};
 
-pub use schema::{ConnettoStoreSchema, StoreColumn};
+pub use schema::{ConnettoStoreSchema, SessionRow};
 pub use store::DbAuthStore;

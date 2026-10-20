@@ -11,7 +11,6 @@
 //! issuer pattern and validates it after verification.
 
 use std::fmt;
-use std::time::SystemTime;
 
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken, CoreProviderMetadata};
 use openidconnect::reqwest;
@@ -365,7 +364,7 @@ fn retained_from(
         issuer,
         access_token: access_token.secret().clone(),
         refresh_token: refresh_token.map(|token| token.secret().clone()),
-        expires_at: expires_in.map(|delta| SystemTime::now() + delta),
+        expires_in,
     }
 }
 
@@ -454,7 +453,7 @@ impl IdentityProvider for GenericOidcProvider {
                 issuer: self.issuer_match.index_key().to_owned(),
                 access_token: response.access_token().secret().clone(),
                 refresh_token: Some(rotated),
-                expires_at: response.expires_in().map(|delta| SystemTime::now() + delta),
+                expires_in: response.expires_in(),
             })
         })
     }

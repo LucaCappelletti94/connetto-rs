@@ -52,13 +52,10 @@
 use std::collections::{BTreeSet, HashSet};
 use std::marker::PhantomData;
 use std::pin::Pin;
-use std::time::SystemTime;
 
 use diesel::QueryResult;
 use diesel_async::pooled_connection::bb8::Pool;
 use diesel_async::{AsyncConnection as _, AsyncPgConnection};
-
-use crate::authn::schema::Instant;
 
 #[doc(hidden)]
 pub use uuid::Uuid;
@@ -130,10 +127,10 @@ pub struct CodeFacts<Id> {
     pub creator: Id,
     /// The bot the code names, absent for a first registration.
     pub bot: Option<Uuid>,
-    /// When the code stops being usable.
-    pub expires_at: Instant,
-    /// When a registration spent it.
-    pub used_at: Option<Instant>,
+    /// Whether a registration spent the code.
+    pub spent: bool,
+    /// Whether the database's clock is past the code's expiry plus `DEVICE_SKEW`.
+    pub expired: bool,
 }
 
 /// A bot row the registration inserts.
@@ -231,18 +228,15 @@ pub trait ConnettoBotSchema: Send + Sync + 'static {
     type IdSql: BotRegistryIdSql;
 
     /// The code row `code_hash` names, locked `FOR UPDATE`, and its creator,
-    /// the bot it names, when it expires and when it spent.
+    /// the bot it names, whether it spent and whether it lapsed by the
+    /// database's clock.
     fn code_facts(
         conn: &mut AsyncPgConnection,
         code_hash: [u8; 32],
     ) -> Statement<'_, Option<CodeFacts<Self::Id>>>;
 
-    /// Mark the code used at `at`.
-    fn use_code(
-        conn: &mut AsyncPgConnection,
-        code_hash: [u8; 32],
-        at: SystemTime,
-    ) -> Statement<'_, ()>;
+    /// Mark the code used, stamped by the statement's `now()`.
+    fn use_code(conn: &mut AsyncPgConnection, code_hash: [u8; 32]) -> Statement<'_, ()>;
 
     /// Insert a bot row.
     fn insert_bot(conn: &mut AsyncPgConnection, bot: NewBot<Self::Id>) -> Statement<'_, ()>;
@@ -332,15 +326,13 @@ impl<S: ConnettoBotSchema> PgBotRegistry<S> {
         public_key: [u8; 32],
         name: String,
         list: &[ListEntry],
-        now: SystemTime,
     ) -> Result<Registered, RegistryError> {
         let mut conn = self.pool.get().await.map_err(RegistryError::Pool)?;
         conn.transaction::<_, RegistryError, _>(async move |c| {
             let facts = S::code_facts(c, code_hash)
                 .await?
                 .ok_or(RegistryError::Refused)?;
-            let deadline = Instant::from(now);
-            if facts.used_at.is_some() || facts.expires_at <= deadline {
+            if facts.spent || facts.expired {
                 return Err(RegistryError::Refused);
             }
             let (bot, version) = match facts.bot {
@@ -383,7 +375,7 @@ impl<S: ConnettoBotSchema> PgBotRegistry<S> {
                     (id, version)
                 }
             };
-            S::use_code(c, code_hash, now).await?;
+            S::use_code(c, code_hash).await?;
             Ok(Registered { bot, version })
         })
         .await
@@ -468,43 +460,48 @@ macro_rules! connetto_bots_tables {
                 Box::pin(async move {
                     use diesel::{ExpressionMethods as _, OptionalExtension as _, QueryDsl};
                     use diesel_async::RunQueryDsl;
-                    let found: Option<(
-                        $id,
-                        Option<$crate::bots::Uuid>,
-                        $crate::ban::Instant,
-                        Option<$crate::ban::Instant>,
-                    )> = RunQueryDsl::first(
-                        QueryDsl::for_update(QueryDsl::select(
-                            QueryDsl::filter(
-                                connetto_registration_codes::table,
-                                connetto_registration_codes::code_hash.eq(code_hash.to_vec()),
-                            ),
-                            (
-                                connetto_registration_codes::creator,
-                                connetto_registration_codes::bot,
-                                connetto_registration_codes::expires_at,
-                                connetto_registration_codes::used_at,
-                            ),
-                        )),
-                        conn,
-                    )
-                    .await
-                    .optional()?;
-                    Ok(found.map(
-                        |(creator, bot, expires_at, used_at)| $crate::bots::CodeFacts {
+                    let found: Option<($id, Option<$crate::bots::Uuid>, bool, bool)> =
+                        RunQueryDsl::first(
+                            QueryDsl::for_update(QueryDsl::select(
+                                QueryDsl::filter(
+                                    connetto_registration_codes::table,
+                                    connetto_registration_codes::code_hash.eq(code_hash.to_vec()),
+                                ),
+                                (
+                                    connetto_registration_codes::creator,
+                                    connetto_registration_codes::bot,
+                                    connetto_registration_codes::used_at.is_not_null(),
+                                    // The minting device's clock wrote the
+                                    // expiry, so it gets `DEVICE_SKEW` (chapter 21).
+                                    connetto_registration_codes::expires_at.le(diesel::dsl::sql::<
+                                        diesel::sql_types::Timestamptz,
+                                    >(
+                                        "now() - make_interval(secs => ",
+                                    )
+                                    .bind::<diesel::sql_types::Double, _>(
+                                        $crate::db_clock::DEVICE_SKEW_SECS,
+                                    )
+                                    .sql(")")),
+                                ),
+                            )),
+                            conn,
+                        )
+                        .await
+                        .optional()?;
+                    Ok(
+                        found.map(|(creator, bot, spent, expired)| $crate::bots::CodeFacts {
                             creator,
                             bot,
-                            expires_at,
-                            used_at,
-                        },
-                    ))
+                            spent,
+                            expired,
+                        }),
+                    )
                 })
             }
 
             fn use_code(
                 conn: &mut diesel_async::AsyncPgConnection,
                 code_hash: [u8; 32],
-                at: std::time::SystemTime,
             ) -> $crate::bots::Statement<'_, ()> {
                 Box::pin(async move {
                     use diesel::{ExpressionMethods as _, QueryDsl};
@@ -513,10 +510,9 @@ macro_rules! connetto_bots_tables {
                         connetto_registration_codes::table,
                         connetto_registration_codes::code_hash.eq(code_hash.to_vec()),
                     ))
-                    .set(
-                        connetto_registration_codes::used_at
-                            .eq(Some($crate::ban::Instant::from(at))),
-                    )
+                    .set(connetto_registration_codes::used_at.eq(diesel::dsl::sql::<
+                        diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                    >("now()")))
                     .execute(conn)
                     .await?;
                     Ok(())

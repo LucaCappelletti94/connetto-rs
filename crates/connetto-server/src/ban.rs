@@ -14,14 +14,15 @@
 //! impose and lift is `auth_events`, which is why an expiry that merely lapses
 //! leaves no trace here or there.
 //!
-//! **A ban has no sweeper.** An expiry that passes stops matching
-//! [`Ban::applies_at`] immediately, declaratively, with nothing running, and its
-//! row stays until [`BanStore::lift`] clears it. A deployment wanting rows
-//! cleared promptly schedules its own task calling the lift, which puts the
-//! scheduling where scheduling is easy and works identically on one server or
-//! ten. A sweeper inside connetto was rejected because a deployment may run
-//! several servers over replicated databases, so each would sweep the same rows
-//! and race.
+//! **A ban has no sweeper.** An expiry that passes stops applying immediately,
+//! declaratively, with nothing running, and its row stays until
+//! [`BanStore::lift`] clears it. The `applies` verdict a read returns is the
+//! statement's, judged against the database's clock (chapter 21). A deployment
+//! wanting rows cleared promptly schedules its own task calling the lift, which
+//! puts the scheduling where scheduling is easy and works identically on one
+//! server or ten. A sweeper inside connetto was rejected because a deployment
+//! may run several servers over replicated databases, so each would sweep the
+//! same rows and race.
 //!
 //! ```sql
 //! CREATE TABLE connetto_bans (
@@ -33,28 +34,25 @@
 //! );
 //! ```
 //!
-//! `banned_at` carries no column default, unlike `auth_events.at`, because
-//! connetto computes `expires_at` from a duration and the two have to come from
-//! one clock or the recorded span is a lie. `session` is the run the crossing
-//! happened on, kept because `auth_events.session` is `NOT NULL` and a lift
-//! performed months later has no run of its own to name.
+//! `banned_at` carries no column default, unlike `auth_events.at`, because the
+//! insert stamps both columns from one `now()` in one statement, and a ban
+//! whose start and expiry disagree would be a lie. `session` is the run the
+//! crossing happened on, kept because `auth_events.session` is `NOT NULL` and
+//! a lift performed months later has no run of its own to name.
 
+use core::pin::Pin;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_core::SessionId;
-use diesel::OptionalExtension as _;
-use diesel::helper_types::{Filter, Limit, Select};
-use diesel::query_dsl::methods::{FilterDsl, LimitDsl, SelectDsl};
-use diesel::sql_types::{Nullable, Text, Timestamptz, Uuid};
-use diesel_async::methods::{ExecuteDsl, LoadQuery as AsyncLoadQuery};
+use diesel::QueryResult;
+use diesel_async::AsyncPgConnection;
 use diesel_async::pooled_connection::bb8::Pool;
-use diesel_async::{AsyncPgConnection, RunQueryDsl as _};
 
 pub use crate::authn::schema::Instant;
 
-/// A ban as stored.
+/// A ban as stored, with the read's verdict on whether it still applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ban {
     /// The run the crossing happened on.
@@ -65,17 +63,12 @@ pub struct Ban {
     pub banned_at: Instant,
     /// When it lapses. Absent is permanent.
     pub expires_at: Option<Instant>,
+    /// Whether the database's clock is still within the ban's span.
+    pub applies: bool,
 }
 
-impl Ban {
-    /// Whether this ban still refuses the caller at `now`.
-    #[must_use]
-    pub fn applies_at(&self, now: Instant) -> bool {
-        self.expires_at.is_none_or(|expiry| expiry > now)
-    }
-}
-
-/// A ban about to be written.
+/// A ban about to be written. The store stamps `banned_at` and `expires_at`
+/// from the database's clock, so this carries only the span.
 #[derive(Debug, Clone)]
 pub struct NewBan<Id> {
     /// Who is banned.
@@ -84,17 +77,14 @@ pub struct NewBan<Id> {
     pub session: SessionId,
     /// Which threshold they crossed.
     pub reason: String,
-    /// When the ban starts.
-    pub banned_at: Instant,
-    /// When it lapses. Absent is permanent.
-    pub expires_at: Option<Instant>,
+    /// The ban's span. Absent is permanent.
+    pub ttl: Option<Duration>,
 }
 
 impl<Id> NewBan<Id> {
-    /// A ban starting now, lasting `ttl` or forever when absent.
+    /// A ban stamped at insert, lasting `ttl` or forever when absent.
     ///
-    /// A `ttl` too large for a timestamp is taken as permanent, since asking for
-    /// longer than the calendar means forever.
+    /// A `ttl` too large for a `BIGINT` of seconds is stored as permanent.
     #[must_use]
     pub fn starting_now(
         user_id: Id,
@@ -102,21 +92,17 @@ impl<Id> NewBan<Id> {
         reason: impl Into<String>,
         ttl: Option<Duration>,
     ) -> Self {
-        let banned_at = chrono::Utc::now();
-        let expires_at = ttl.and_then(|ttl| {
-            chrono::TimeDelta::from_std(ttl)
-                .ok()
-                .and_then(|delta| banned_at.checked_add_signed(delta))
-        });
         Self {
             user_id,
             session,
             reason: reason.into(),
-            banned_at,
-            expires_at,
+            ttl,
         }
     }
 }
+
+/// One statement of a [`ConnettoBanSchema`], run on a borrowed connection.
+pub type Statement<'c, T> = Pin<Box<dyn Future<Output = QueryResult<T>> + Send + 'c>>;
 
 /// The ban list could not be reached.
 ///
@@ -152,10 +138,8 @@ pub type BanFuture<'a, T> =
 /// statement types and so cannot be one, which is why [`pg_ban_store`] confines
 /// that generic to a factory.
 pub trait BanStore<Id>: Send + Sync + 'static {
-    /// The ban on `user_id`, as stored.
-    ///
-    /// Return the row untouched. connetto decides whether it still applies, so
-    /// an implementation must not filter on the expiry.
+    /// The ban on `user_id`, as stored, with the read's verdict on whether it
+    /// still applies.
     fn check<'a>(&'a self, user_id: &'a Id) -> BanFuture<'a, Option<Ban>>;
 
     /// Write `ban`, replacing whatever ban that identity already had.
@@ -168,31 +152,12 @@ pub trait BanStore<Id>: Send + Sync + 'static {
     fn lift<'a>(&'a self, user_id: &'a Id) -> BanFuture<'a, bool>;
 }
 
-/// The tables, columns and pre-built statements a [`BanStore`] runs.
+/// The statements a [`BanStore`] runs over the deployment's ban table.
 ///
-/// Every associated table and column member derives `Default` (as
-/// `diesel::table!` output does), so the store constructs each marker with
-/// `T::default()`. The `fn` members build the pieces carrying runtime data.
-pub trait ConnettoBanSchema: Send + Sync + 'static
-where
-    // The plain `SELECT session, reason, banned_at, expires_at WHERE user_id = ?`.
-    // Laundered query source plus opaque predicate, so filtering does not route
-    // through the delegating blanket `impl<T: QueryRelation> FilterDsl for T`
-    // whose `Output` never terminates for an opaque type.
-    Self::BansQuery: FilterDsl<Self::BanPk>,
-    Filter<Self::BansQuery, Self::BanPk>:
-        SelectDsl<(Self::Session, Self::Reason, Self::BannedAt, Self::ExpiresAt)>,
-    Select<
-        Filter<Self::BansQuery, Self::BanPk>,
-        (Self::Session, Self::Reason, Self::BannedAt, Self::ExpiresAt),
-    >: LimitDsl,
-    for<'q> Limit<
-        Select<
-            Filter<Self::BansQuery, Self::BanPk>,
-            (Self::Session, Self::Reason, Self::BannedAt, Self::ExpiresAt),
-        >,
-    >: AsyncLoadQuery<'q, AsyncPgConnection, (SessionId, String, Instant, Option<Instant>)> + Send,
-{
+/// A deadline the table holds is stamped `now() + interval` and judged against
+/// `now()` in the statement that reads it, never against the process's clock
+/// (chapter 21).
+pub trait ConnettoBanSchema: Send + Sync + 'static {
     /// The deployment's typed distributed user id, the same one
     /// [`ConnettoAuditSchema`](crate::audit::ConnettoAuditSchema) carries.
     type Id: Clone + core::fmt::Display + Send + Sync + 'static;
@@ -201,33 +166,22 @@ where
     /// requires to exist (R98 decision 5).
     const TABLES: &'static [&'static str];
 
-    /// The bans table laundered as an opaque query source for the plain SELECT.
-    type BansQuery: Default + Send;
-    /// The `session` column (`Uuid`).
-    type Session: diesel::Expression<SqlType = Uuid> + Default + Send;
-    /// The `reason` column (`Text`).
-    type Reason: diesel::Expression<SqlType = Text> + Default + Send;
-    /// The `banned_at` column (`Timestamptz`).
-    type BannedAt: diesel::Expression<SqlType = Timestamptz> + Default + Send;
-    /// The `expires_at` column (`Nullable<Timestamptz>`).
-    type ExpiresAt: diesel::Expression<SqlType = Nullable<Timestamptz>> + Default + Send;
-    /// The opaque `user_id = ?` predicate.
-    type BanPk: Send;
+    /// The ban on `user_id`, with the statement's verdict on whether it still
+    /// applies, absent when no such row exists.
+    fn ban_row<'c>(
+        conn: &'c mut AsyncPgConnection,
+        user_id: &'c Self::Id,
+    ) -> Statement<'c, Option<Ban>>;
 
-    /// The whole `INSERT ... ON CONFLICT (user_id) DO UPDATE` statement,
-    /// laundered as one executable value because the diesel trait solver cannot
-    /// name an upsert statement type generically.
-    type Impose: ExecuteDsl<AsyncPgConnection> + Send;
-    /// The whole `DELETE ... WHERE user_id = ?` statement, laundered the same
-    /// way.
-    type Lift: ExecuteDsl<AsyncPgConnection> + Send;
+    /// The `INSERT ... ON CONFLICT (user_id) DO UPDATE` that stamps one ban
+    /// from the database's clock, replacing whatever ban that identity held.
+    fn ban_upsert(conn: &mut AsyncPgConnection, ban: NewBan<Self::Id>) -> Statement<'_, ()>;
 
-    /// Build the `user_id = ?` predicate.
-    fn ban_pk(user_id: &Self::Id) -> Self::BanPk;
-    /// Build the upsert for one ban.
-    fn ban_upsert(ban: NewBan<Self::Id>) -> Self::Impose;
-    /// Build the delete for one identity.
-    fn ban_delete(user_id: &Self::Id) -> Self::Lift;
+    /// The `DELETE` for one identity, returning how many rows it removed.
+    fn ban_delete<'c>(
+        conn: &'c mut AsyncPgConnection,
+        user_id: &'c Self::Id,
+    ) -> Statement<'c, usize>;
 }
 
 /// A [`BanStore`] over the deployment's ban table, `D`'s [`Bans`] member, on
@@ -263,36 +217,14 @@ impl<B: ConnettoBanSchema> BanStore<B::Id> for PgBanStore<B> {
     fn check<'a>(&'a self, user_id: &'a B::Id) -> BanFuture<'a, Option<Ban>> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(BanError::new)?;
-            let filtered = FilterDsl::filter(B::BansQuery::default(), B::ban_pk(user_id));
-            let query = SelectDsl::select(
-                filtered,
-                (
-                    B::Session::default(),
-                    B::Reason::default(),
-                    B::BannedAt::default(),
-                    B::ExpiresAt::default(),
-                ),
-            );
-            let row: Option<(SessionId, String, Instant, Option<Instant>)> = query
-                .first(&mut conn)
-                .await
-                .optional()
-                .map_err(BanError::new)?;
-            Ok(row.map(|(session, reason, banned_at, expires_at)| Ban {
-                session,
-                reason,
-                banned_at,
-                expires_at,
-            }))
+            B::ban_row(&mut conn, user_id).await.map_err(BanError::new)
         })
     }
 
     fn impose(&self, ban: NewBan<B::Id>) -> BanFuture<'_, ()> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(BanError::new)?;
-            ExecuteDsl::execute(B::ban_upsert(ban), &mut conn)
-                .await
-                .map_err(BanError::new)?;
+            B::ban_upsert(&mut conn, ban).await.map_err(BanError::new)?;
             Ok(())
         })
     }
@@ -300,7 +232,7 @@ impl<B: ConnettoBanSchema> BanStore<B::Id> for PgBanStore<B> {
     fn lift<'a>(&'a self, user_id: &'a B::Id) -> BanFuture<'a, bool> {
         Box::pin(async move {
             let mut conn = self.pool.get().await.map_err(BanError::new)?;
-            let removed = ExecuteDsl::execute(B::ban_delete(user_id), &mut conn)
+            let removed = B::ban_delete(&mut conn, user_id)
                 .await
                 .map_err(BanError::new)?;
             Ok(removed > 0)
@@ -317,8 +249,8 @@ impl<B: ConnettoBanSchema> BanStore<B::Id> for PgBanStore<B> {
 /// hand against any table. The reference SQL is in the module documentation.
 ///
 /// Invoked at module scope, it emits the `connetto_bans` `diesel::table!`
-/// module, an insertable row struct, and a unit struct `ConnettoBans`
-/// implementing the trait. The caller needs `diesel` in scope.
+/// module and a unit struct `ConnettoBans` implementing the trait. The caller
+/// needs `diesel` in scope.
 ///
 /// ```ignore
 /// connetto_server::connetto_ban_table!(String, diesel::sql_types::Text);
@@ -339,23 +271,12 @@ macro_rules! connetto_ban_table {
                 session -> diesel::sql_types::Uuid,
                 /// Which threshold they crossed, as connetto recorded it.
                 reason -> diesel::sql_types::Text,
-                /// When the ban started, bound by connetto so it shares a clock
-                /// with the expiry.
+                /// When the ban started, stamped by the insert's `now()`.
                 banned_at -> diesel::sql_types::Timestamptz,
-                /// When it lapses. Null is permanent.
+                /// When it lapses, `now()` plus the ban's span. Null is
+                /// permanent.
                 expires_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
             }
-        }
-
-        /// Insertable ban row for [`ConnettoBans`].
-        #[derive(diesel::Insertable)]
-        #[diesel(table_name = connetto_bans)]
-        pub struct ConnettoNewBan {
-            user_id: $id,
-            session: $crate::SessionId,
-            reason: String,
-            banned_at: $crate::ban::Instant,
-            expires_at: Option<$crate::ban::Instant>,
         }
 
         /// The default connetto ban list over the deployment's `Id` type.
@@ -365,104 +286,121 @@ macro_rules! connetto_ban_table {
         impl $crate::ban::ConnettoBanSchema for ConnettoBans {
             type Id = $id;
             const TABLES: &'static [&'static str] = &["connetto_bans"];
-            type BansQuery = connetto_bans::table;
-            type Session = connetto_bans::session;
-            type Reason = connetto_bans::reason;
-            type BannedAt = connetto_bans::banned_at;
-            type ExpiresAt = connetto_bans::expires_at;
-            type BanPk = diesel::dsl::Eq<connetto_bans::user_id, $id>;
-            type Impose = diesel::helper_types::Set<
-                diesel::helper_types::DoUpdate<
-                    diesel::helper_types::OnConflict<
-                        diesel::query_builder::InsertStatement<
-                            connetto_bans::table,
-                            <ConnettoNewBan as diesel::Insertable<connetto_bans::table>>::Values,
-                        >,
-                        connetto_bans::user_id,
-                    >,
-                >,
-                (
-                    diesel::dsl::Eq<connetto_bans::session, $crate::SessionId>,
-                    diesel::dsl::Eq<connetto_bans::reason, String>,
-                    diesel::dsl::Eq<connetto_bans::banned_at, $crate::ban::Instant>,
-                    diesel::dsl::Eq<connetto_bans::expires_at, Option<$crate::ban::Instant>>,
-                ),
-            >;
-            type Lift = diesel::dsl::delete<
-                diesel::helper_types::Filter<
-                    connetto_bans::table,
-                    diesel::dsl::Eq<connetto_bans::user_id, $id>,
-                >,
-            >;
 
-            fn ban_pk(user_id: &Self::Id) -> Self::BanPk {
-                use diesel::ExpressionMethods as _;
-                connetto_bans::user_id.eq(user_id.clone())
+            fn ban_row<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                user_id: &'c Self::Id,
+            ) -> $crate::ban::Statement<'c, Option<$crate::ban::Ban>> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel::OptionalExtension as _;
+                    use diesel_async::RunQueryDsl;
+                    // The applies verdict is the statement's, judged against
+                    // the database's clock (chapter 21).
+                    let found: Option<(
+                        $crate::SessionId,
+                        String,
+                        $crate::ban::Instant,
+                        Option<$crate::ban::Instant>,
+                        bool,
+                        Option<bool>,
+                    )> = diesel::QueryDsl::select(
+                        diesel::QueryDsl::filter(
+                            connetto_bans::table,
+                            connetto_bans::user_id.eq(user_id.clone()),
+                        ),
+                        (
+                            connetto_bans::session,
+                            connetto_bans::reason,
+                            connetto_bans::banned_at,
+                            connetto_bans::expires_at,
+                            connetto_bans::expires_at.is_null(),
+                            connetto_bans::expires_at.gt(diesel::dsl::sql::<
+                                diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                            >("now()")),
+                        ),
+                    )
+                    .first(conn)
+                    .await
+                    .optional()?;
+                    Ok(
+                        found.map(|(session, reason, banned_at, expires_at, open, fresh)| {
+                            $crate::ban::Ban {
+                                session,
+                                reason,
+                                banned_at,
+                                expires_at,
+                                applies: open || fresh.unwrap_or(false),
+                            }
+                        }),
+                    )
+                })
             }
 
             fn ban_upsert(
+                conn: &mut diesel_async::AsyncPgConnection,
                 $crate::ban::NewBan {
                     user_id,
                     session,
                     reason,
-                    banned_at,
-                    expires_at,
+                    ttl,
                 }: $crate::ban::NewBan<Self::Id>,
-            ) -> Self::Impose {
-                use diesel::ExpressionMethods as _;
-                diesel::insert_into(connetto_bans::table)
-                    .values(ConnettoNewBan {
-                        user_id,
-                        session,
-                        reason: reason.clone(),
-                        banned_at,
-                        expires_at,
-                    })
-                    .on_conflict(connetto_bans::user_id)
-                    .do_update()
-                    .set((
-                        connetto_bans::session.eq(session),
-                        connetto_bans::reason.eq(reason),
-                        connetto_bans::banned_at.eq(banned_at),
-                        connetto_bans::expires_at.eq(expires_at),
-                    ))
+            ) -> $crate::ban::Statement<'_, ()> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel_async::RunQueryDsl as _;
+                    // The expiry is the database's clock plus the ban's span, NULL
+                    // for a permanent ban or a span too long for an i64 of seconds
+                    // (chapter 21).
+                    let span = ttl
+                        .filter(|span| i64::try_from(span.as_secs()).is_ok())
+                        .map(|span| span.as_secs_f64());
+                    let expiry = || {
+                        diesel::dsl::sql::<
+                            diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+                        >("CASE WHEN ")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(span)
+                        .sql(" IS NULL THEN NULL ELSE now() + make_interval(secs => ")
+                        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Double>, _>(span)
+                        .sql(") END")
+                    };
+                    diesel::insert_into(connetto_bans::table)
+                        .values((
+                            connetto_bans::user_id.eq(user_id),
+                            connetto_bans::session.eq(session.clone()),
+                            connetto_bans::reason.eq(reason.clone()),
+                            connetto_bans::banned_at.eq($crate::db_clock::now()),
+                            connetto_bans::expires_at.eq(expiry()),
+                        ))
+                        .on_conflict(connetto_bans::user_id)
+                        .do_update()
+                        .set((
+                            connetto_bans::session.eq(session),
+                            connetto_bans::reason.eq(reason),
+                            connetto_bans::banned_at.eq($crate::db_clock::now()),
+                            connetto_bans::expires_at.eq(expiry()),
+                        ))
+                        .execute(conn)
+                        .await?;
+                    Ok(())
+                })
             }
 
-            fn ban_delete(user_id: &Self::Id) -> Self::Lift {
-                use diesel::ExpressionMethods as _;
-                diesel::delete(diesel::QueryDsl::filter(
-                    connetto_bans::table,
-                    connetto_bans::user_id.eq(user_id.clone()),
-                ))
+            fn ban_delete<'c>(
+                conn: &'c mut diesel_async::AsyncPgConnection,
+                user_id: &'c Self::Id,
+            ) -> $crate::ban::Statement<'c, usize> {
+                Box::pin(async move {
+                    use diesel::ExpressionMethods as _;
+                    use diesel_async::RunQueryDsl as _;
+                    diesel::delete(diesel::QueryDsl::filter(
+                        connetto_bans::table,
+                        connetto_bans::user_id.eq(user_id.clone()),
+                    ))
+                    .execute(conn)
+                    .await
+                })
             }
         }
     };
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn ban(expires_at: Option<Instant>) -> Ban {
-        Ban {
-            session: SessionId::from_uuid(uuid::Uuid::nil()),
-            reason: "refused_grant".to_owned(),
-            banned_at: chrono::Utc::now(),
-            expires_at,
-        }
-    }
-
-    #[test]
-    fn a_ban_with_no_expiry_always_applies() {
-        assert!(ban(None).applies_at(chrono::Utc::now()));
-    }
-
-    #[test]
-    fn an_expiry_that_has_passed_stops_applying_with_nothing_having_run() {
-        let now = chrono::Utc::now();
-        let lapsed = ban(Some(now - chrono::TimeDelta::seconds(1)));
-        assert!(!lapsed.applies_at(now));
-        let live = ban(Some(now + chrono::TimeDelta::seconds(1)));
-        assert!(live.applies_at(now));
-    }
 }

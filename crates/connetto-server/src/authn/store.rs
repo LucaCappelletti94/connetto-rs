@@ -9,7 +9,6 @@
 //!
 //! The refresh token is `"<session_id>.<secret>"`. Only the SHA-256 of the
 //! secret is stored, and every rotation replaces it. A presented secret whose
-//! hash does not match the stored one, on a session that still exists, is
 //! treated as reuse of a rotated-out token (theft) and revokes the session.
 
 use std::time::SystemTime;
@@ -142,12 +141,11 @@ pub trait AuthStore: Send + Sync {
         + Sync
         + 'static;
 
-    /// Resolve `identity` to a `user_id`, create a session, and return it with
-    /// its first refresh token. `now` seeds the refresh deadlines.
+    /// Resolve `identity` to a `user_id`, create a session, and return it
+    /// with its first refresh token.
     fn create_session(
         &self,
         identity: &ResolvedIdentity,
-        now: SystemTime,
     ) -> impl Future<Output = Result<IssuedSession<Self::Id>, AuthStoreError>> + Send;
 
     /// Whether the session still exists, is not revoked, and is within its
@@ -156,15 +154,14 @@ pub trait AuthStore: Send + Sync {
     fn session_is_live(
         &self,
         session_id: SessionId,
-        now: SystemTime,
     ) -> impl Future<Output = Result<bool, AuthStoreError>> + Send;
 
-    /// Validate the presented refresh token, rotate it, extend the idle window,
-    /// and return the rotated token plus the identity to re-mint access from.
+    /// Validate the presented refresh token, rotate it, extend the idle
+    /// window, and return the rotated token plus the identity to re-mint
+    /// access from.
     fn rotate_refresh(
         &self,
         refresh_token: &str,
-        now: SystemTime,
     ) -> impl Future<Output = Result<RefreshOutcome<Self::Id>, AuthStoreError>> + Send;
 
     /// Revoke the session, refusing it on the next handshake even while its
@@ -191,20 +188,21 @@ pub trait AuthStore: Send + Sync {
         refresh_token: &str,
     ) -> impl Future<Output = Result<Option<SessionId>, AuthStoreError>> + Send;
 
-    /// Store the retained provider tokens for a session, replacing any existing.
+    /// Store the retained provider tokens for a session, replacing any
+    /// existing.
     fn set_retained_provider_token(
         &self,
         session_id: SessionId,
         token: &crate::authn::provider::RetainedProviderToken,
-        now: SystemTime,
     ) -> impl Future<Output = Result<(), AuthStoreError>> + Send;
 
-    /// Read a session's retained provider tokens, if any were stored.
+    /// Read a session's retained provider tokens, if any were stored, with
+    /// the store's verdict on the access token's lifetime.
     fn retained_provider_token(
         &self,
         session_id: SessionId,
     ) -> impl Future<
-        Output = Result<Option<crate::authn::provider::RetainedProviderToken>, AuthStoreError>,
+        Output = Result<Option<crate::authn::provider::StoredProviderToken>, AuthStoreError>,
     > + Send;
 }
 
@@ -257,10 +255,14 @@ pub(crate) fn split_refresh(token: &str) -> Option<(SessionId, &str)> {
 /// The in-memory auth store. Single-server and ephemeral: a restart drops every
 /// session and forces re-login. Identity resolves through a supplied resolver
 /// (deterministic UUID v5 by default), so no lookup and no linking table.
+///
+/// It serves one process, so its deadlines live on the process clock, held
+/// in a seam that defaults to `SystemTime::now` (chapter 21).
 pub struct InMemoryAuthStore<Id = String> {
     lifetimes: RefreshLifetimes,
     sessions: std::sync::Mutex<std::collections::HashMap<SessionId, SessionRecord<Id>>>,
     resolver: std::sync::Arc<dyn IdentityResolver<Id = Id>>,
+    clock: std::sync::Arc<dyn Fn() -> SystemTime + Send + Sync>,
 }
 
 struct SessionRecord<Id> {
@@ -269,7 +271,16 @@ struct SessionRecord<Id> {
     idle_deadline: SystemTime,
     absolute_deadline: SystemTime,
     revoked: bool,
-    retained: Option<crate::authn::provider::RetainedProviderToken>,
+    retained: Option<RetainedRecord>,
+}
+
+/// The store's own copy of a session's retained provider tokens, stamped with
+/// the expiry the process clock projects.
+struct RetainedRecord {
+    issuer: String,
+    access_token: String,
+    refresh_token: Option<String>,
+    expires_at: Option<SystemTime>,
 }
 
 #[cfg(feature = "test-seams")]
@@ -299,6 +310,7 @@ impl<Id> InMemoryAuthStore<Id> {
             lifetimes,
             sessions: std::sync::Mutex::new(std::collections::HashMap::new()),
             resolver,
+            clock: std::sync::Arc::new(SystemTime::now),
         }
     }
 }
@@ -318,8 +330,8 @@ impl<
     async fn create_session(
         &self,
         identity: &ResolvedIdentity,
-        now: SystemTime,
     ) -> Result<IssuedSession<Id>, AuthStoreError> {
+        let now = (self.clock)();
         let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
         let context = AuthContext { user_id };
         let session_id = new_session_id();
@@ -350,11 +362,8 @@ impl<
         clippy::unused_async_trait_impl,
         reason = "the trait method is async and this body finishes without awaiting"
     )]
-    async fn session_is_live(
-        &self,
-        session_id: SessionId,
-        now: SystemTime,
-    ) -> Result<bool, AuthStoreError> {
+    async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
+        let now = (self.clock)();
         let sessions = self.sessions.lock().expect("auth store lock");
         Ok(sessions
             .get(&session_id)
@@ -368,8 +377,8 @@ impl<
     async fn rotate_refresh(
         &self,
         refresh_token: &str,
-        now: SystemTime,
     ) -> Result<RefreshOutcome<Id>, AuthStoreError> {
+        let now = (self.clock)();
         let (session_id, secret) = split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
         let mut sessions = self.sessions.lock().expect("auth store lock");
         let record = sessions
@@ -461,15 +470,21 @@ impl<
         &self,
         session_id: SessionId,
         token: &crate::authn::provider::RetainedProviderToken,
-        _now: SystemTime,
     ) -> Result<(), AuthStoreError> {
+        let now = (self.clock)();
+        let expires_at = token.expires_in.map(|lifetime| now + lifetime);
         if let Some(record) = self
             .sessions
             .lock()
             .expect("auth store lock")
             .get_mut(&session_id)
         {
-            record.retained = Some(token.clone());
+            record.retained = Some(RetainedRecord {
+                issuer: token.issuer.clone(),
+                access_token: token.access_token.clone(),
+                refresh_token: token.refresh_token.clone(),
+                expires_at,
+            });
         }
         Ok(())
     }
@@ -481,13 +496,23 @@ impl<
     async fn retained_provider_token(
         &self,
         session_id: SessionId,
-    ) -> Result<Option<crate::authn::provider::RetainedProviderToken>, AuthStoreError> {
-        Ok(self
-            .sessions
-            .lock()
-            .expect("auth store lock")
-            .get(&session_id)
-            .and_then(|record| record.retained.clone()))
+    ) -> Result<Option<crate::authn::provider::StoredProviderToken>, AuthStoreError> {
+        let now = (self.clock)();
+        let sessions = self.sessions.lock().expect("auth store lock");
+        let Some(record) = sessions.get(&session_id) else {
+            return Ok(None);
+        };
+        Ok(record.retained.as_ref().map(|retained| {
+            let still_valid = retained.expires_at.is_none_or(|deadline| {
+                deadline > now + crate::authn::provider::PROVIDER_TOKEN_MARGIN
+            });
+            crate::authn::provider::StoredProviderToken {
+                issuer: retained.issuer.clone(),
+                access_token: retained.access_token.clone(),
+                refresh_token: retained.refresh_token.clone(),
+                still_valid,
+            }
+        }))
     }
 }
 
@@ -495,14 +520,11 @@ pub use db::DbAuthStore;
 
 mod db {
     use std::sync::Arc;
-    use std::time::SystemTime;
 
     use connetto_core::SessionId;
     use connetto_core::auth::AuthContext;
-    use diesel::prelude::*;
-    use diesel::query_dsl::methods::{FilterDsl, SelectDsl};
     use diesel_async::pooled_connection::bb8::Pool;
-    use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+    use diesel_async::{AsyncConnection, AsyncPgConnection};
 
     use super::{
         AuthStore, AuthStoreError, IssuedSession, RefreshOutcome, ResolvedIdentity, format_refresh,
@@ -510,25 +532,12 @@ mod db {
     };
     use crate::authn::identity::IdentityResolver;
     use crate::authn::provider::RetainedProviderToken;
-    use crate::authn::schema::{ConnettoStoreSchema, Instant};
+    use crate::authn::schema::{ConnettoStoreSchema, SessionRow};
     use crate::authn::token::RefreshLifetimes;
     use crate::schema::ConnettoSchema;
 
-    /// The rotation columns a `SELECT ... FOR UPDATE` loads: the typed
-    /// `user_id`, the refresh hash, and the two deadlines plus the revoked
-    /// flag.
-    type SessionRow<S> = (
-        <S as ConnettoStoreSchema>::Id,
-        Vec<u8>,
-        Instant,
-        Instant,
-        bool,
-    );
-
     /// The Postgres auth store, generic over the deployment's schema. Durable
-    /// across restart and the only variant a promoted standby carries. Identity resolves
-    /// through the deployment's [`IdentityResolver`], which owns the users table
-    /// the `sessions.user_id` column foreign-keys, so connetto owns no schema.
+    /// across restart and the only variant a promoted standby carries.
     pub struct DbAuthStore<D: ConnettoSchema> {
         pool: Pool<AsyncPgConnection>,
         lifetimes: RefreshLifetimes,
@@ -555,137 +564,105 @@ mod db {
         AuthStoreError::Backend(err.to_string())
     }
 
-    /// The instant a `Timestamptz` column carries, from the `SystemTime` the
-    /// [`AuthStore`] API speaks. Total and lossless in both directions, unlike
-    /// the count of milliseconds these columns used to hold.
-    fn to_instant(time: SystemTime) -> Instant {
-        Instant::from(time)
-    }
-
-    fn from_instant(instant: Instant) -> SystemTime {
-        instant.into()
-    }
-
     impl<D: ConnettoSchema> AuthStore for DbAuthStore<D> {
         type Id = <D::Auth as ConnettoStoreSchema>::Id;
 
         async fn create_session(
             &self,
             identity: &ResolvedIdentity,
-            now: SystemTime,
         ) -> Result<IssuedSession<<D::Auth as ConnettoStoreSchema>::Id>, AuthStoreError> {
             let user_id = self.resolver.resolve(&identity.verified_claims()).await?;
-            let idle = to_instant(now + self.lifetimes.idle_window());
-            let absolute = to_instant(now + self.lifetimes.absolute_ceiling());
             let secret = new_refresh_secret();
             let refresh_hash = hash_secret(&secret).to_vec();
             let session_id = new_session_id();
-            let row = <D::Auth as ConnettoStoreSchema>::new_session(
+            let mut conn = self.pool.get().await.map_err(backend)?;
+            // The deadlines are stamped by the database's clock, not this
+            // process's (chapter 21).
+            let (idle_deadline, absolute_deadline) = <D::Auth as ConnettoStoreSchema>::new_session(
+                &mut conn,
                 session_id,
                 user_id.clone(),
                 refresh_hash,
-                idle,
-                absolute,
-                false,
-            );
-            let mut conn = self.pool.get().await.map_err(backend)?;
-            diesel::insert_into(<D::Auth as ConnettoStoreSchema>::Sessions::default())
-                .values(row)
-                .execute(&mut conn)
-                .await
-                .map_err(backend)?;
+                self.lifetimes.idle_window(),
+                self.lifetimes.absolute_ceiling(),
+            )
+            .await
+            .map_err(backend)?;
             let context = AuthContext { user_id };
             Ok(IssuedSession {
                 session_id,
                 context,
                 refresh_token: format_refresh(session_id, &secret),
-                session_expires_at: from_instant(idle.min(absolute)),
+                session_expires_at: idle_deadline.min(absolute_deadline).into(),
             })
         }
 
-        async fn session_is_live(
-            &self,
-            session_id: SessionId,
-            now: SystemTime,
-        ) -> Result<bool, AuthStoreError> {
+        async fn session_is_live(&self, session_id: SessionId) -> Result<bool, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let now = to_instant(now);
-            let base = FilterDsl::filter(
-                <D::Auth as ConnettoStoreSchema>::SessionsQuery::default(),
-                <D::Auth as ConnettoStoreSchema>::session_pk(session_id),
-            );
-            let query = SelectDsl::select(
-                base,
-                (
-                    <D::Auth as ConnettoStoreSchema>::Revoked::default(),
-                    <D::Auth as ConnettoStoreSchema>::AbsoluteDeadline::default(),
-                ),
-            );
-            let live: Option<(bool, Instant)> =
-                query.first(&mut conn).await.optional().map_err(backend)?;
-            Ok(live.is_some_and(|(revoked, absolute)| !revoked && now <= absolute))
+            let live = <D::Auth as ConnettoStoreSchema>::live_session(&mut conn, session_id)
+                .await
+                .map_err(backend)?;
+            Ok(live.is_some_and(|revoked| !revoked))
         }
 
         async fn rotate_refresh(
             &self,
             refresh_token: &str,
-            now: SystemTime,
         ) -> Result<RefreshOutcome<<D::Auth as ConnettoStoreSchema>::Id>, AuthStoreError> {
             let (session_id, secret) =
                 split_refresh(refresh_token).ok_or(AuthStoreError::NotFound)?;
             let presented_hash = hash_secret(secret).to_vec();
-            let idle = to_instant(now + self.lifetimes.idle_window());
-            let now = to_instant(now);
             let new_secret = new_refresh_secret();
             let new_hash = hash_secret(&new_secret).to_vec();
             let mut conn = self.pool.get().await.map_err(backend)?;
             let outcome = {
                 conn.transaction::<_, AuthStoreError, _>(async move |conn| {
-                    // Lock the row so two concurrent refreshers cannot both
-                    // rotate and trip the reuse defense.
-                    let row: Option<SessionRow<D::Auth>> =
-                        <D::Auth as ConnettoStoreSchema>::session_row_for_update(session_id)
-                            .get_result(conn)
+                    // The lapsed verdict is the database's, judged in the
+                    // statement (chapter 21).
+                    let row: Option<SessionRow<<D::Auth as ConnettoStoreSchema>::Id>> =
+                        <D::Auth as ConnettoStoreSchema>::session_row_for_update(conn, session_id)
                             .await
-                            .optional()
                             .map_err(backend)?;
-                    let (user_id, current_hash, idle_deadline, absolute_deadline, revoked) =
-                        row.ok_or(AuthStoreError::NotFound)?;
+                    let SessionRow {
+                        user_id,
+                        current_refresh_hash,
+                        revoked,
+                        idle_lapsed,
+                        absolute_lapsed,
+                    } = row.ok_or(AuthStoreError::NotFound)?;
                     if revoked {
                         return Err(AuthStoreError::NotFound);
                     }
-                    if now > absolute_deadline || now > idle_deadline {
+                    if absolute_lapsed || idle_lapsed {
                         return Err(AuthStoreError::Expired);
                     }
-                    if !hashes_match(&presented_hash, &current_hash) {
-                        // Reuse of a rotated-out token. Signal theft, but do
-                        // not revoke inside the transaction: returning an
-                        // error rolls it back, so the revoke lands below in
-                        // its own committed statement.
+                    if !hashes_match(&presented_hash, &current_refresh_hash) {
+                        // Reuse of a rotated-out token signals theft, but the
+                        // error rolls this transaction back, so the revoke
+                        // lands below in its own committed statement.
                         return Err(AuthStoreError::Reuse { session_id });
                     }
-                    let capped_idle = idle.min(absolute_deadline);
-                    <D::Auth as ConnettoStoreSchema>::rotation_update(
-                        session_id,
-                        new_hash,
-                        capped_idle,
-                    )
-                    .execute(conn)
-                    .await
-                    .map_err(backend)?;
+                    let (idle_deadline, absolute_deadline) =
+                        <D::Auth as ConnettoStoreSchema>::rotation_update(
+                            conn,
+                            session_id,
+                            new_hash,
+                            self.lifetimes.idle_window(),
+                        )
+                        .await
+                        .map_err(backend)?;
                     let context = AuthContext { user_id };
                     Ok(RefreshOutcome {
                         session_id,
                         context,
                         refresh_token: format_refresh(session_id, &new_secret),
-                        session_expires_at: from_instant(capped_idle),
+                        session_expires_at: idle_deadline.min(absolute_deadline).into(),
                     })
                 })
                 .await
             };
             if matches!(outcome, Err(AuthStoreError::Reuse { .. })) {
-                <D::Auth as ConnettoStoreSchema>::revoke_update(session_id)
-                    .execute(&mut conn)
+                <D::Auth as ConnettoStoreSchema>::revoke_update(&mut conn, session_id)
                     .await
                     .map_err(backend)?;
             }
@@ -694,8 +671,7 @@ mod db {
 
         async fn revoke_session(&self, session_id: SessionId) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            <D::Auth as ConnettoStoreSchema>::revoke_update(session_id)
-                .execute(&mut conn)
+            <D::Auth as ConnettoStoreSchema>::revoke_update(&mut conn, session_id)
                 .await
                 .map_err(backend)?;
             Ok(())
@@ -703,8 +679,7 @@ mod db {
 
         async fn revoke_every_session(&self) -> Result<u64, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update()
-                .execute(&mut conn)
+            let revoked = <D::Auth as ConnettoStoreSchema>::revoke_every_update(&mut conn)
                 .await
                 .map_err(backend)?;
             Ok(u64::try_from(revoked).unwrap_or(u64::MAX))
@@ -719,20 +694,20 @@ mod db {
             };
             let presented_hash = hash_secret(secret).to_vec();
             let mut conn = self.pool.get().await.map_err(backend)?;
-            // The rotation read is reused rather than adding a narrower one to
-            // the schema trait: it already selects the refresh hash and the
+            // The rotation read already selects the refresh hash and the
             // revoked flag, and its row lock serializes a logout against a
             // refresh landing at the same moment.
-            let row: Option<SessionRow<D::Auth>> =
-                <D::Auth as ConnettoStoreSchema>::session_row_for_update(session_id)
-                    .get_result(&mut conn)
-                    .await
-                    .optional()
-                    .map_err(backend)?;
-            let Some((_, current_hash, _, _, revoked)) = row else {
+            let Some(SessionRow {
+                current_refresh_hash,
+                revoked,
+                ..
+            }) = <D::Auth as ConnettoStoreSchema>::session_row_for_update(&mut conn, session_id)
+                .await
+                .map_err(backend)?
+            else {
                 return Ok(None);
             };
-            if revoked || !hashes_match(&presented_hash, &current_hash) {
+            if revoked || !hashes_match(&presented_hash, &current_refresh_hash) {
                 return Ok(None);
             }
             Ok(Some(session_id))
@@ -742,63 +717,29 @@ mod db {
             &self,
             session_id: SessionId,
             token: &RetainedProviderToken,
-            _now: SystemTime,
         ) -> Result<(), AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let expires_at = token.expires_at.map(to_instant);
-            let row = <D::Auth as ConnettoStoreSchema>::new_provider_token(
+            <D::Auth as ConnettoStoreSchema>::set_provider_token(
+                &mut conn,
                 session_id,
                 token.issuer.clone(),
                 token.access_token.clone(),
                 token.refresh_token.clone(),
-                expires_at,
-            );
-            diesel::insert_into(<D::Auth as ConnettoStoreSchema>::ProviderTokens::default())
-                .values(row)
-                .on_conflict(<D::Auth as ConnettoStoreSchema>::PtSessionId::default())
-                .do_update()
-                .set((
-                    <D::Auth as ConnettoStoreSchema>::PtIssuer::default().eq(token.issuer.clone()),
-                    <D::Auth as ConnettoStoreSchema>::PtAccessToken::default()
-                        .eq(token.access_token.clone()),
-                    <D::Auth as ConnettoStoreSchema>::PtRefreshToken::default()
-                        .eq(token.refresh_token.clone()),
-                    <D::Auth as ConnettoStoreSchema>::PtExpiresAt::default().eq(expires_at),
-                ))
-                .execute(&mut conn)
-                .await
-                .map_err(backend)?;
+                token.expires_in,
+            )
+            .await
+            .map_err(backend)?;
             Ok(())
         }
 
         async fn retained_provider_token(
             &self,
             session_id: SessionId,
-        ) -> Result<Option<RetainedProviderToken>, AuthStoreError> {
+        ) -> Result<Option<crate::authn::provider::StoredProviderToken>, AuthStoreError> {
             let mut conn = self.pool.get().await.map_err(backend)?;
-            let base = FilterDsl::filter(
-                <D::Auth as ConnettoStoreSchema>::ProviderTokensQuery::default(),
-                <D::Auth as ConnettoStoreSchema>::pt_pk(session_id),
-            );
-            let query = SelectDsl::select(
-                base,
-                (
-                    <D::Auth as ConnettoStoreSchema>::PtIssuer::default(),
-                    <D::Auth as ConnettoStoreSchema>::PtAccessToken::default(),
-                    <D::Auth as ConnettoStoreSchema>::PtRefreshToken::default(),
-                    <D::Auth as ConnettoStoreSchema>::PtExpiresAt::default(),
-                ),
-            );
-            let row: Option<(String, String, Option<String>, Option<Instant>)> =
-                query.first(&mut conn).await.optional().map_err(backend)?;
-            Ok(row.map(
-                |(issuer, access_token, refresh_token, expires_at)| RetainedProviderToken {
-                    issuer,
-                    access_token,
-                    refresh_token,
-                    expires_at: expires_at.map(from_instant),
-                },
-            ))
+            <D::Auth as ConnettoStoreSchema>::provider_token(&mut conn, session_id)
+                .await
+                .map_err(backend)
         }
     }
 }

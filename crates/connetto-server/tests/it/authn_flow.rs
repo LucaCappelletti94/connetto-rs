@@ -1335,29 +1335,26 @@ impl connetto_server::AuthStore for LookupOutageStore {
     fn create_session(
         &self,
         identity: &ResolvedIdentity,
-        now: SystemTime,
     ) -> impl Future<
         Output = Result<connetto_server::IssuedSession<Self::Id>, connetto_server::AuthStoreError>,
     > + Send {
-        self.inner.create_session(identity, now)
+        self.inner.create_session(identity)
     }
 
     fn session_is_live(
         &self,
         session_id: connetto_server::SessionId,
-        now: SystemTime,
     ) -> impl Future<Output = Result<bool, connetto_server::AuthStoreError>> + Send {
-        self.inner.session_is_live(session_id, now)
+        self.inner.session_is_live(session_id)
     }
 
     fn rotate_refresh(
         &self,
         refresh_token: &str,
-        now: SystemTime,
     ) -> impl Future<
         Output = Result<connetto_server::RefreshOutcome<Self::Id>, connetto_server::AuthStoreError>,
     > + Send {
-        self.inner.rotate_refresh(refresh_token, now)
+        self.inner.rotate_refresh(refresh_token)
     }
 
     fn revoke_session(
@@ -1396,10 +1393,8 @@ impl connetto_server::AuthStore for LookupOutageStore {
         &self,
         session_id: connetto_server::SessionId,
         token: &connetto_server::RetainedProviderToken,
-        now: SystemTime,
     ) -> impl Future<Output = Result<(), connetto_server::AuthStoreError>> + Send {
-        self.inner
-            .set_retained_provider_token(session_id, token, now)
+        self.inner.set_retained_provider_token(session_id, token)
     }
 
     fn retained_provider_token(
@@ -1407,7 +1402,7 @@ impl connetto_server::AuthStore for LookupOutageStore {
         session_id: connetto_server::SessionId,
     ) -> impl Future<
         Output = Result<
-            Option<connetto_server::RetainedProviderToken>,
+            Option<connetto_server::StoredProviderToken>,
             connetto_server::AuthStoreError,
         >,
     > + Send {
@@ -1556,4 +1551,42 @@ async fn the_refresh_cookie_lives_until_the_session_lapses() {
     assert_eq!(rotated.status(), StatusCode::OK, "marked refresh");
     let (_, max_age, lapses_at) = cookie_lifetime(rotated).await;
     assert_lives_until(max_age, lapses_at, "rotation");
+}
+
+/// The in-memory store spends a retained provider token once less than the
+/// margin of its lifetime remains, as the database store does.
+#[tokio::test]
+async fn in_memory_store_spends_a_provider_token_inside_the_margin() {
+    use connetto_server::authn::provider::PROVIDER_TOKEN_MARGIN;
+    use connetto_server::{AuthStore as _, RetainedProviderToken};
+
+    let store = InMemoryAuthStore::new(AuthConfig::default().refresh_lifetimes());
+    let issued = store
+        .create_session(&identity("ines"))
+        .await
+        .expect("create");
+    for (lifetime, usable) in [
+        (
+            PROVIDER_TOKEN_MARGIN.saturating_sub(Duration::from_secs(1)),
+            false,
+        ),
+        (PROVIDER_TOKEN_MARGIN + Duration::from_secs(60), true),
+    ] {
+        let token = RetainedProviderToken {
+            issuer: "https://issuer.example".to_owned(),
+            access_token: "provider-access".to_owned(),
+            refresh_token: None,
+            expires_in: Some(lifetime),
+        };
+        store
+            .set_retained_provider_token(issued.session_id, &token)
+            .await
+            .expect("store");
+        let read = store
+            .retained_provider_token(issued.session_id)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(read.still_valid, usable, "lifetime {lifetime:?}");
+    }
 }
