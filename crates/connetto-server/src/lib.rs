@@ -139,7 +139,7 @@ pub use schema::ConnettoSchema;
 pub use session::{
     FailedAuthorization, NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, ResumePoint,
     SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    StreamCheck, StreamCheckError, subject_set_reach,
+    StreamCheck, StreamCheckError, TermSeedRead, subject_set_reach,
 };
 pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};

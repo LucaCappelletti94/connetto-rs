@@ -4046,6 +4046,7 @@ fn status_manager<O: Oplog>(
         server_write_target(fixture),
     )
     .with_oplog(oplog)
+    .with_upkeep(Arc::new(super::support::KeyIndependentUpkeep))
     .build()
 }
 

@@ -250,6 +250,33 @@ async fn an_expired_key_replaces_the_statistic_it_answered() {
     assert_eq!(count_of(&next_aggregate(&mut holder, "mine").await), 1);
 }
 
+/// Swapping a viewer's share keys replaces its statistic with the one the new
+/// keys answer, and the swap is answered after the replacement (R95).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_swap_replaces_the_statistic_the_old_keys_answered() {
+    let fixture = Fixture::acquire().await;
+    let manager = manager_under(&fixture, OWNER_IS_CALLER_OR_SUBJECT, SessionConfig::new()).await;
+    fixture
+        .exec("INSERT INTO notes VALUES (1, 'key:k1'), (2, 'key:k1'), (3, 'key:k2')")
+        .await;
+    let mut holder = connect(&manager);
+    holder.handshake_with("holder", "key:k1").await;
+    holder.subscribe("mine", QUERY).await;
+    assert_eq!(count_of(&next_aggregate(&mut holder, "mine").await), 2);
+
+    holder.replace_share_keys("swap", &["key:k2"]).await;
+
+    let ControlMessage::FullResyncRequired(notice) = holder.next_control().await else {
+        panic!("expected the old statistic to be dropped first");
+    };
+    assert_eq!(notice.sub_id, "mine");
+    assert_eq!(notice.reason, FullResyncReason::AuthorizationChange);
+    assert_eq!(count_of(&next_aggregate(&mut holder, "mine").await), 1);
+    let ControlMessage::ShareKeysReplaced(answer) = holder.next_control().await else {
+        panic!("expected the swap answered after the replacement");
+    };
+    assert_eq!(answer.request_id, "swap");
+}
 /// A grouped statistic over an RLS table still answers as its row objects,
 /// which a keyed handle takes its group keys from.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

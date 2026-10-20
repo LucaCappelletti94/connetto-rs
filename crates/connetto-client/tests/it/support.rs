@@ -6,6 +6,8 @@
 //! credential, the durable key lives in a store, and the transport is a
 //! dialer the builder owns.
 
+use std::pin::Pin;
+
 use connetto_client::{
     ClientError, Custody, Grant, HeldCredential, MemoryKeyStore, NoGate, SyncSchema,
     TransportFactory,
@@ -13,6 +15,23 @@ use connetto_client::{
 use connetto_core::ReplicaKey;
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{MaybeSend, ReplicaKeyStore, Transport};
+use connetto_server::openfga::{GrantMove, StoreUpkeep, UpkeepError};
+
+/// Authorization metadata for static policies that do not depend on share keys.
+pub struct KeyIndependentUpkeep;
+
+impl StoreUpkeep for KeyIndependentUpkeep {
+    fn keep_current<'a>(
+        &'a self,
+        _event: &'a subql::PgChangeEvent,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<GrantMove>, UpkeepError>> + Send + 'a>> {
+        Box::pin(async { Ok(Vec::new()) })
+    }
+
+    fn key_tables(&self) -> &[String] {
+        &[]
+    }
+}
 
 /// A test schema bundle over one raw DDL, no policies, no local tier.
 ///

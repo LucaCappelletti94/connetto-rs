@@ -114,6 +114,39 @@ fn handshake_and_ack_round_trip() {
 }
 
 #[test]
+fn a_known_empty_subject_checkpoint_survives_the_wire_distinct_from_an_unspecified_one() {
+    // A client that states the share-key set covering its resume cursor (here
+    // none, because it held no share key) holds a different checkpoint from
+    // one that states nothing, and the wire must keep the two apart.
+    let unspecified = ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "client-a")
+            .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef])),
+    );
+    // An empty array literal cannot name the element type, so the stated
+    // empty set goes in as a typed empty iterator.
+    let known_empty = ControlMessage::Handshake(
+        Handshake::new(PROTOCOL_VERSION, "client-a")
+            .with_cursor(Cursor::new(vec![0xde, 0xad, 0xbe, 0xef]))
+            .with_cursor_subjects(core::iter::empty::<&str>()),
+    );
+    let unspecified_payload = encode_control(&unspecified).expect("encode_control");
+    let known_empty_payload = encode_control(&known_empty).expect("encode_control");
+    assert_ne!(
+        unspecified_payload, known_empty_payload,
+        "the stated empty checkpoint must serialize differently from the unstated one"
+    );
+    let decoded = decode_control(&known_empty_payload).expect("decode_control");
+    assert_eq!(
+        known_empty, decoded,
+        "the stated empty checkpoint must survive a round trip"
+    );
+    assert_ne!(
+        decoded, unspecified,
+        "decoding the stated empty checkpoint must not yield the unstated one"
+    );
+}
+
+#[test]
 fn share_key_frames_round_trip() {
     round_trip_control(&ControlMessage::ReplaceShareKeys(ReplaceShareKeys {
         request_id: "keys-1".into(),
