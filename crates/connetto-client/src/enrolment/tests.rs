@@ -1847,7 +1847,6 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
-    #[cfg(feature = "peer")]
     let peer = peer(&authority);
     let (far, mut far_events) = far_peer(&authority, positive_serial(9));
     let link = FakeLink {
@@ -1860,9 +1859,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         gate: None,
         grant_from: None,
     };
-    #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
-    #[cfg(feature = "peer")]
     let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1873,9 +1870,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         Vec::new(),
         inbox(),
         peer,
-        #[cfg(feature = "peer")]
         hotspot_tx,
-        #[cfg(feature = "peer")]
         bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));

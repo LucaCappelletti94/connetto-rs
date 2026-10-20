@@ -2350,11 +2350,11 @@ fn is_real_writer(writer: &WriterRef) -> bool {
     !matches!(writer, WriterRef::Number(number) if *number == UNISSUED_NUMBER)
 }
 
-fn hex_digit(byte: u8) -> u8 {
+fn hex_digit(byte: u8) -> Option<u8> {
     match byte {
-        b'0'..=b'9' => byte - b'0',
-        b'a'..=b'f' => byte - b'a' + 10,
-        _ => u8::MAX,
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
     }
 }
 
@@ -2383,9 +2383,9 @@ fn writer_from_id(id: &str) -> Option<WriterRef> {
         "device" if rest.len() == 64 => {
             let bytes = (0..32)
                 .map(|i| {
-                    let hi = hex_digit(rest.as_bytes()[i * 2]);
-                    let lo = hex_digit(rest.as_bytes()[i * 2 + 1]);
-                    (hi != u8::MAX && lo != u8::MAX).then_some(hi * 16 + lo)
+                    let hi = hex_digit(rest.as_bytes()[i * 2])?;
+                    let lo = hex_digit(rest.as_bytes()[i * 2 + 1])?;
+                    Some(hi * 16 + lo)
                 })
                 .collect::<Option<Vec<u8>>>()?;
             Some(WriterRef::Device(bytes.try_into().ok()?))
