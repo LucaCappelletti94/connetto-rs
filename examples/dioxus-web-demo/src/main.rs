@@ -432,20 +432,20 @@ async fn run_db_worker() -> Result<(), JsValue> {
     Ok(())
 }
 
-/// The served URL of this app's wasm-bindgen glue module, recovered from the
-/// wasm fetch the page already performed. Under `dx serve` the glue is
-/// `/wasm/<name>.js` beside `/wasm/<name>_bg.wasm`, so the wasm resource entry
-/// names the glue by suffix swap. Only the main thread can see these entries,
-/// which is why the worker receives the glue URL as a spawn parameter.
+/// The served URL of this app's wasm-bindgen glue module, the module script
+/// the page itself loads. `dx serve` names it `/wasm/<name>.js`, and a release
+/// build hashes it as `/assets/<name>-dxh<hash>.js` apart from the wasm's own
+/// hash, so neither name can be derived from the other, while the page's
+/// script tag carries it in both. Only the main thread has the page, which is
+/// why the worker receives the glue URL as a spawn parameter.
 fn glue_url() -> String {
-    let found = js_sys::eval(
-        r#"performance.getEntriesByType("resource").map((e) => e.name).find((n) => n.endsWith("_bg.wasm"))"#,
-    )
+    js_sys::eval(&format!(
+        r#"[...document.querySelectorAll('script[type="module"][src]')].map((s) => s.src).find((s) => s.split("/").pop().startsWith("{}"))"#,
+        env!("CARGO_PKG_NAME")
+    ))
     .ok()
     .and_then(|value| value.as_string())
-    .expect("a loaded wasm resource entry");
-    let base = found.strip_suffix("_bg.wasm").expect("wasm suffix");
-    format!("{base}.js")
+    .expect("the page loads the app's glue module")
 }
 
 /// The window's live connection to the DB worker, plus the topology tokens it
