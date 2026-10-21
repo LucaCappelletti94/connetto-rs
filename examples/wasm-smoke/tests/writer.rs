@@ -52,6 +52,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -84,7 +85,11 @@ async fn upload_one(
     let before: HashSet<rosetta_uuid::Uuid> =
         load_orders(writer).iter().map(|row| row.id).collect();
     diesel::insert_into(orders::table)
-        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
+        .values((
+            orders::owner_id.eq(identity),
+            orders::quantity.eq(5_i64),
+            orders::created_at.eq(common::now_rfc3339()),
+        ))
         .execute(writer.conn())
         .expect("insert the row");
     let id = load_orders(writer)
@@ -171,7 +176,11 @@ async fn the_number_writer_survives_a_reload() {
     // The session keeps the number: the next write is the writer's sequence
     // two, not a fresh writer's sequence one.
     diesel::insert_into(orders::table)
-        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(9_i64)))
+        .values((
+            orders::owner_id.eq(&user_id),
+            orders::quantity.eq(9_i64),
+            orders::created_at.eq(common::now_rfc3339()),
+        ))
         .execute(worker.conn())
         .expect("insert the row");
     worker.push().await.expect("push").expect("mutation sent");
@@ -214,7 +223,11 @@ async fn a_restore_of_a_settled_write_is_answered_from_the_settled_record() {
         .map(|row| row.id)
         .collect();
     diesel::insert_into(orders::table)
-        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(5_i64)))
+        .values((
+            orders::owner_id.eq(&user_id),
+            orders::quantity.eq(5_i64),
+            orders::created_at.eq(common::now_rfc3339()),
+        ))
         .execute(fixture.direct.conn())
         .expect("insert the row");
     let id = load_orders(&mut fixture.direct)
@@ -320,14 +333,20 @@ async fn a_forged_changeset_at_a_settled_sequence_is_refused_forked() {
 
     // A valid insert the server never saw, compressed as the bulk frame carries it.
     let insert_patch = |id: rosetta_uuid::Uuid| {
-        let table = SimpleTable::new("orders", &["id", "owner_id", "quantity"], &[0]);
+        let table = SimpleTable::new(
+            "orders",
+            &["id", "owner_id", "quantity", "created_at"],
+            &[0],
+        );
         let insert = Insert::<_, String, Vec<u8>>::from(table)
             .set(0, Value::Blob(<[u8; 16]>::from(id).to_vec()))
             .expect("set the id")
             .set(1, Value::Text(user_id.clone()))
             .expect("set the owner")
             .set(2, Value::Integer(5))
-            .expect("set the quantity");
+            .expect("set the quantity")
+            .set(3, Value::Text(common::now_rfc3339()))
+            .expect("set the created at");
         let changeset = ChangeSet::<SimpleTable, String, Vec<u8>>::new()
             .insert(insert)
             .build();

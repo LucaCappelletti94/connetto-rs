@@ -99,6 +99,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -126,6 +127,7 @@ struct Order {
     id: rosetta_uuid::Uuid,
     owner_id: String,
     quantity: i64,
+    created_at: String,
 }
 
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
@@ -173,6 +175,12 @@ fn fresh_quantity() -> i64 {
     // Math::random is [0, 1); scale to 0..=8. Deliberate truncation.
     debug_assert!(scaled.is_finite() && (0.0..9.0).contains(&scaled));
     (scaled as i64 + 1) * 5
+}
+
+/// The order write time, RFC 3339 from the browser clock, named on insert
+/// because the replica's default leaves the changeset value NULL.
+fn now_rfc3339() -> String {
+    js_sys::Date::new_0().to_json().into()
 }
 
 /// The tab mirror's physical footprint: total pages and free pages a trim can reclaim.
@@ -1267,7 +1275,10 @@ fn dashboard(props: &DashboardProps) -> Html {
     let client = (*props.client.0).clone();
     let identity = props.identity.clone();
 
-    let orders = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
+    let orders = use_live::<_, _, Order>(
+        &client,
+        orders::table.order((orders::created_at.desc(), orders::id.desc())),
+    );
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
     let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
     let count = use_live(&client, orders::table.count());
@@ -1333,7 +1344,7 @@ fn dashboard(props: &DashboardProps) -> Html {
     let (pages, free) = *footprint;
     let kb = pages * 4;
 
-    let newest_order = order_rows.last().map(|o| o.id);
+    let newest_order = order_rows.first().map(|o| o.id);
 
     let add_order = {
         let client = client.clone();
@@ -1349,6 +1360,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                             .values((
                                 orders::owner_id.eq(identity.as_str()),
                                 orders::quantity.eq(quantity),
+                                orders::created_at.eq(now_rfc3339()),
                             ))
                             .execute(conn.conn())
                     })
@@ -1452,6 +1464,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                                     .values((
                                         orders::owner_id.eq(stage_identity.as_str()),
                                         orders::quantity.eq(1_i64),
+                                        orders::created_at.eq(now_rfc3339()),
                                     ))
                                     .execute(conn)?;
                                 let order_id = orders::table

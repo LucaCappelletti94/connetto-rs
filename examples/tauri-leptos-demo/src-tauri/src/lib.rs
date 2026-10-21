@@ -28,6 +28,7 @@ include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 diesel::table! {
     orders (id) {
         id -> rosetta_uuid::sql_types::Uuid,
+        owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
         created_at -> diesel::sql_types::Timestamp,
     }
@@ -223,12 +224,23 @@ fn insert_backend(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError>
 
 #[tauri::command]
 async fn insert_local(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError> {
-    let client = core.client().ok_or(CommandError::NotReady)?;
+    let session = core.session().ok_or(CommandError::NotReady)?;
+    let client = session.native.client().clone();
+    // The deployment policy names the owner on the row, and created_at must
+    // ride the changeset, since a replica default leaves it NULL.
+    let user = session
+        .native
+        .session()
+        .map_or_else(String::new, |session| session.user_id().to_owned());
     let quantity = demo_quantity();
     client
         .with_conn(move |conn| {
             diesel::insert_into(orders::table)
-                .values(orders::quantity.eq(quantity))
+                .values((
+                    orders::owner_id.eq(user),
+                    orders::quantity.eq(quantity),
+                    orders::created_at.eq(chrono::Utc::now().to_rfc3339()),
+                ))
                 .execute(conn.conn())
         })
         .await??;
@@ -506,7 +518,7 @@ async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Re
     core.update(&app, |view| {
         *view = View {
             stage: "ready",
-            user,
+            user: user.clone(),
             custody,
             ..View::default()
         };
@@ -517,7 +529,7 @@ async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Re
         tasks.spawn(pump);
         tasks.spawn(feed_events(app.clone(), Arc::clone(&core), client.clone()));
         tasks.spawn(feed_count(app.clone(), Arc::clone(&core), client));
-        tasks.spawn(write_backend(pg_url, commands));
+        tasks.spawn(write_backend(pg_url, user, commands));
         tasks.spawn(feed_device(app, Arc::clone(&core), Weak::clone(session)));
         Session {
             native,
@@ -576,8 +588,13 @@ async fn feed_count(app: AppHandle, core: Arc<Core>, client: ConnettoClient<Ws>)
     }
 }
 
-/// The backend writer, straight to Postgres.
-async fn write_backend(pg_url: String, mut commands: mpsc::UnboundedReceiver<BackendCmd>) {
+/// The backend writer, straight to Postgres, as the signed-in user, since
+/// the deployment policy names the owner on the row it writes.
+async fn write_backend(
+    pg_url: String,
+    user: String,
+    mut commands: mpsc::UnboundedReceiver<BackendCmd>,
+) {
     use diesel_async::AsyncConnection as _;
     let mut pg = match diesel_async::AsyncPgConnection::establish(&pg_url).await {
         Ok(pg) => pg,
@@ -589,7 +606,10 @@ async fn write_backend(pg_url: String, mut commands: mpsc::UnboundedReceiver<Bac
     while let Some(BackendCmd::Insert) = commands.recv().await {
         let insert = diesel_async::RunQueryDsl::execute(
             diesel::insert_into(orders::table)
-                .values(orders::quantity.eq(demo_quantity()))
+                .values((
+                    orders::owner_id.eq(user.as_str()),
+                    orders::quantity.eq(demo_quantity()),
+                ))
                 .on_conflict_do_nothing(),
             &mut pg,
         )

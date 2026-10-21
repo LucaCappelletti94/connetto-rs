@@ -37,6 +37,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -133,6 +134,7 @@ async fn the_trim_pass_shrinks_the_opfs_replica() {
         .values((
             orders::owner_id.eq(user_id.as_str()),
             orders::quantity.eq(1_i64),
+            orders::created_at.eq(common::now_rfc3339()),
         ))
         .execute(conn.conn())
         .expect("seed row insert");

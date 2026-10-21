@@ -39,6 +39,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -56,6 +57,7 @@ struct Order {
     id: rosetta_uuid::Uuid,
     owner_id: String,
     quantity: i64,
+    created_at: String,
 }
 
 #[derive(Queryable, Selectable, Debug, PartialEq, Clone)]
@@ -111,7 +113,11 @@ async fn write_row(
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
+        .values((
+            orders::owner_id.eq(identity),
+            orders::quantity.eq(5_i64),
+            orders::created_at.eq(common::now_rfc3339()),
+        ))
         .execute(writer.conn())
         .expect("writer insert");
     let id = orders::table
@@ -291,6 +297,7 @@ async fn relay_forwards_tab_writes_upstream_over_a_message_port() {
         .values((
             orders::owner_id.eq(identity.as_str()),
             orders::quantity.eq(7_i64),
+            orders::created_at.eq(common::now_rfc3339()),
         ))
         .execute(tab.conn())
         .expect("tab insert");

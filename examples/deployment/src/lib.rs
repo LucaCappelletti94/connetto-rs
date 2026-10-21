@@ -24,6 +24,9 @@ pub const POLICIES_SQL: &str = include_str!("../policies.sql");
 /// The roles the deployment grants, the reader role among them.
 pub const ROLES_SQL: &str = include_str!("../roles.sql");
 
+/// The file server's deployment contracts, applied beside the roles.
+pub const CONTENT_SQL: &str = include_str!("../content.sql");
+
 /// The browser stack's sync endpoint, as `CONNETTO_TEST_WS` named it when this
 /// crate was built.
 pub const DEMO_WS_URL: &str = match option_env!("CONNETTO_TEST_WS") {

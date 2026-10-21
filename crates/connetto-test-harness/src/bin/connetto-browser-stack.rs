@@ -74,7 +74,7 @@ const PAGE_PORT_VAR: &str = "CONNETTO_STACK_PAGE_PORT";
 const DEPLOYMENT: Deployment = Deployment {
     schema: include_str!("../../../../examples/deployment/schema.sql"),
     roles: include_str!("../../../../examples/deployment/roles.sql"),
-    content: include_str!("../../../../examples/wasm-smoke/content.sql"),
+    content: include_str!("../../../../examples/deployment/content.sql"),
     policies: include_str!("../../../../examples/deployment/policies.sql"),
     published: &["orders", "order_lines", "photos"],
     writable: "orders,photos",

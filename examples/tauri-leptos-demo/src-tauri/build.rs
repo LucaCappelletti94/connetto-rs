@@ -1,4 +1,4 @@
-//! Tauri's build step, the dioxus demo's schema translated for the replica,
+//! Tauri's build step, the deployment schema translated for the replica,
 //! and the deployment root a `device-identity` build ships.
 
 /// The path of the deployment root's `root.der`, which `connetto-demo-stack`
@@ -6,10 +6,10 @@
 const DEVICE_ROOT: &str = "CONNETTO_DEMO_BUILD_DEVICE_ROOT";
 
 fn main() {
-    // The same server-side schema as the dioxus demo, so one demo stack serves both.
+    // The deployment schema the demos share, so one demo stack serves both.
     connetto_schema::emit::<String, connetto_schema::TextIds>(
-        std::path::Path::new("../../dioxus-desktop-demo/schema.sql"),
-        std::path::Path::new("../../dioxus-desktop-demo/policies.sql"),
+        std::path::Path::new("../../deployment/schema.sql"),
+        std::path::Path::new("../../deployment/policies.sql"),
         None,
         &[],
     )

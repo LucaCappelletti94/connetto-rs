@@ -198,7 +198,7 @@ pub async fn run_leg() -> Result<()> {
     let root = tokio::fs::read(&root_path)
         .await
         .with_context(|| format!("reading the demo's device root {root_path}"))?;
-    let demo = crate::stack::repo_path(&["examples", "dioxus-desktop-demo"])?;
+    let demo = crate::stack::repo_path(&["examples", "deployment"])?;
     let schema_sql = tokio::fs::read_to_string(demo.join("schema.sql"))
         .await
         .context("reading the demo schema")?;

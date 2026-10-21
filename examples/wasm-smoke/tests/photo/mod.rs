@@ -21,6 +21,7 @@ diesel::table! {
         id -> rosetta_uuid::sql_types::Uuid,
         owner_id -> diesel::sql_types::Text,
         quantity -> diesel::sql_types::BigInt,
+        created_at -> diesel::sql_types::Timestamp,
     }
 }
 
@@ -137,7 +138,11 @@ pub async fn stage_photo(
                             .into_iter()
                             .collect();
                     diesel::insert_into(orders::table)
-                        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
+                        .values((
+                            orders::owner_id.eq(identity),
+                            orders::quantity.eq(5_i64),
+                            orders::created_at.eq(crate::common::now_rfc3339()),
+                        ))
                         .execute(connection)?;
                     let order_id = orders::table
                         .select(orders::id)

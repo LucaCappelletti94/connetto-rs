@@ -14,7 +14,10 @@
 -- the caller. It has no default: pg2sqlite maps current_setting only inside a
 -- policy expression, so a default naming the caller would translate into a
 -- call the replica cannot resolve, and every write names the owner instead.
-CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0));
+-- created_at names when the order was written. Every client insert supplies
+-- it, since a replica default leaves the changeset value NULL, and Postgres
+-- refuses that on the non-null column.
+CREATE TABLE orders (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), owner_id TEXT NOT NULL, quantity BIGINT NOT NULL CHECK (quantity >= 0), created_at TIMESTAMPTZ NOT NULL DEFAULT now());
 
 -- The lines of an order, keyed by the order and the line number together. It is
 -- the one table here whose key spans two columns, and the translation below
