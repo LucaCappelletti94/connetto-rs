@@ -8,10 +8,15 @@
 //! wrapped rather than the raw key, and the passkey-derived rung works end to
 //! end from `adopt_derived` through the locked-refusal invariant.
 
+use std::rc::Rc;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use connetto_client::share_keys::share_key_record;
+use connetto_client::{Grant, ShareKeySet, ShareKeyStore};
+use connetto_core::CapabilitySubject;
 use connetto_core::ReplicaKey;
 use connetto_core::traits::ReplicaKeyStore as _;
-use connetto_web::auth::{IdbKeyStore, LOCKED_MESSAGE, provision_replica_key};
+use connetto_web::auth::{BuilderKeyStore, IdbKeyStore, LOCKED_MESSAGE, provision_replica_key};
 use indexed_db_futures::database::Database as IdbDatabase;
 use indexed_db_futures::prelude::*;
 use indexed_db_futures::query_source::QuerySource;
@@ -36,6 +41,33 @@ fn key_from_byte(byte: u8) -> ReplicaKey {
 /// database (as production does) without colliding on records.
 fn name(test: &str) -> String {
     format!("replica-{test}")
+}
+
+/// The record a share-key set persists under, named from the replica it rides
+/// beside.
+fn share_record(replica: &str) -> String {
+    share_key_record(replica)
+}
+
+/// The two grant tokens the fixture set holds, the strings a store that
+/// leaked the set would sit on.
+const SHARE_GRANT_ONE: &str = "connetto-share-grant-0f1e2d3c4b5a6978";
+const SHARE_GRANT_TWO: &str = "connetto-share-grant-9a8b7c6d5e4f3021";
+
+/// A variable-length share-key set, so a roundtrip or a re-wrap that assumed
+/// the 32-byte replica-key length fails loudly. The subjects differ in length
+/// and content, so a swapped or truncated pair is not silently correct.
+fn share_set() -> ShareKeySet {
+    ShareKeySet::new::<String>(vec![
+        (
+            Grant::new(SHARE_GRANT_ONE),
+            CapabilitySubject::new("doc:7f3a9c1d"),
+        ),
+        (
+            Grant::new(SHARE_GRANT_TWO),
+            CapabilitySubject::new("doc:2b4d6e8f0a1c3d5e7f90:long-subject"),
+        ),
+    ])
 }
 
 /// Empty all three object stores, so a test starts on the ungated rung with
@@ -584,5 +616,347 @@ async fn two_hkdf_source_keys_derive_different_encryption_keys() {
     assert!(
         result.is_err(),
         "loading with a different derived key must fail, proving the keys differ"
+    );
+}
+
+// ───────────────────────── share-key record tests ─────────────────────────
+
+#[wasm_bindgen_test]
+async fn a_share_key_set_survives_a_cold_reopen() {
+    on_the_ungated_rung().await;
+    let replica = name("share-cold");
+    let record = share_record(&replica);
+    let set = share_set();
+
+    {
+        let store = IdbKeyStore::open().await.expect("open the key store");
+        let adapter = BuilderKeyStore::new(Rc::new(store));
+        ShareKeyStore::save(&adapter, &record, &set)
+            .await
+            .expect("save the share keys");
+    }
+
+    // A fresh handle, as a new worker generation gets. The wrapping key has
+    // to come from IndexedDB and the variable-length payload has to come
+    // back whole.
+    let reopened = IdbKeyStore::open().await.expect("reopen the key store");
+    let adapter = BuilderKeyStore::new(Rc::new(reopened));
+    let loaded = ShareKeyStore::load(&adapter, &record)
+        .await
+        .expect("load the share keys")
+        .expect("a set");
+
+    assert_eq!(loaded, set, "the share keys survive a cold reopen");
+
+    // The record at rest is wrapped, and a bearer grant is not readable
+    // straight out of it.
+    let raw = read_raw_record(&format!("{record}#")).await;
+    let at_rest = String::from_utf8_lossy(&raw);
+    assert!(
+        !at_rest.contains(SHARE_GRANT_ONE) && !at_rest.contains(SHARE_GRANT_TWO),
+        "a bearer grant must not sit in the stored record"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn an_enrolled_store_refuses_share_key_access_without_a_derived_key() {
+    on_the_ungated_rung().await;
+    let replica = name("share-locked");
+    let record = share_record(&replica);
+    let cred_id = [0xcbu8; 16];
+
+    // Enrol through one handle, after a replica record exists so the re-wrap
+    // has something to move.
+    {
+        let writer = IdbKeyStore::open().await.expect("open the writer");
+        writer
+            .store(&replica, &key_from_byte(0x61))
+            .await
+            .expect("store before enrolment");
+        let hkdf = hkdf_key_from_bytes(&[0x66u8; 32]).await;
+        writer
+            .adopt_derived(hkdf, &cred_id)
+            .await
+            .expect("adopt derived");
+    }
+
+    // A fresh handle holds no derived key, so both halves are refused.
+    let locked = IdbKeyStore::open().await.expect("open the locked handle");
+    let adapter = BuilderKeyStore::new(Rc::new(locked));
+
+    let load_err = ShareKeyStore::load(&adapter, &record)
+        .await
+        .expect_err("a share load must fail on a locked enrolled store");
+    assert!(
+        load_err.to_string().contains(LOCKED_MESSAGE),
+        "the share load error must carry the locked message, got: {load_err}"
+    );
+
+    let save_err = ShareKeyStore::save(&adapter, &record, &share_set())
+        .await
+        .expect_err("a share save must fail on a locked enrolled store");
+    assert!(
+        save_err.to_string().contains(LOCKED_MESSAGE),
+        "the share save error must carry the locked message, got: {save_err}"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_share_record_is_rewrapped_with_the_credential_suffix_on_adopt() {
+    on_the_ungated_rung().await;
+    let replica = name("share-rewrap");
+    let record = share_record(&replica);
+    let set = share_set();
+    let cred_id = TEST_CRED_ID;
+    let holder = URL_SAFE_NO_PAD.encode(cred_id);
+    // The payload is variable length by construction, so this is a test of
+    // the re-wrap against a length assumption, not of a 32-byte key.
+    assert_ne!(
+        serde_json::to_vec(&set).expect("encode the set").len(),
+        32,
+        "the fixture must not be 32 bytes long"
+    );
+
+    let store = Rc::new(IdbKeyStore::open().await.expect("open the key store"));
+    // Write before enrolment. The record lives under the ungated rung.
+    {
+        let adapter = BuilderKeyStore::new(Rc::clone(&store));
+        ShareKeyStore::save(&adapter, &record, &set)
+            .await
+            .expect("store before enrolment");
+    }
+    assert!(
+        has_wrapped_key(&format!("{record}#")).await,
+        "the ungated share record is present"
+    );
+
+    let hkdf = hkdf_key_from_bytes(&[0x23u8; 32]).await;
+    store
+        .adopt_derived(hkdf, cred_id)
+        .await
+        .expect("adopt derived");
+
+    // The old ungated key is gone, and the enrolled one is present.
+    assert!(
+        !has_wrapped_key(&format!("{record}#")).await,
+        "the ungated share record is gone after adopt"
+    );
+    assert!(
+        has_wrapped_key(&format!("{record}#{holder}")).await,
+        "the enrolled share record is present after adopt"
+    );
+
+    // Loading through the same handle returns the original set byte for
+    // byte, the re-wrap having changed only the key and the suffix.
+    let adapter = BuilderKeyStore::new(Rc::clone(&store));
+    let loaded = ShareKeyStore::load(&adapter, &record)
+        .await
+        .expect("load after adopt")
+        .expect("a set");
+    assert_eq!(
+        loaded, set,
+        "adopt re-wrapped the share keys without changing them"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_clear_shreds_the_share_record_of_one_identity_only() {
+    on_the_ungated_rung().await;
+    let store = Rc::new(IdbKeyStore::open().await.expect("open the key store"));
+    let alice = name("share-wipe-alice");
+    let bob = name("share-wipe-bob");
+    let alice_record = share_record(&alice);
+    let bob_record = share_record(&bob);
+    let set = share_set();
+
+    // Both identities hold a replica key and a share set on the ungated rung.
+    store
+        .store(&alice, &key_from_byte(0x31))
+        .await
+        .expect("save alice's key");
+    store
+        .store(&bob, &key_from_byte(0x32))
+        .await
+        .expect("save bob's key");
+    {
+        let adapter = BuilderKeyStore::new(Rc::clone(&store));
+        ShareKeyStore::save(&adapter, &alice_record, &set)
+            .await
+            .expect("save alice's set");
+        ShareKeyStore::save(&adapter, &bob_record, &set)
+            .await
+            .expect("save bob's set");
+    }
+
+    // The wipe names alice's replica only, and her share record rides along.
+    store.clear(&alice).await.expect("wipe alice");
+
+    assert_eq!(
+        store.load(&alice).await.expect("load"),
+        None,
+        "alice's key is shredded"
+    );
+    assert!(
+        !has_wrapped_key(&format!("{alice_record}#")).await,
+        "alice's share record is shredded with her replica key"
+    );
+
+    // Bob is untouched. The other identity keeps its key and its set.
+    assert_eq!(
+        store.load(&bob).await.expect("load"),
+        Some(key_from_byte(0x32)),
+        "bob's key survives alice's wipe"
+    );
+    let adapter = BuilderKeyStore::new(Rc::clone(&store));
+    assert_eq!(
+        ShareKeyStore::load(&adapter, &bob_record)
+            .await
+            .expect("load"),
+        Some(set),
+        "bob's share set survives alice's wipe"
+    );
+}
+
+#[wasm_bindgen_test]
+async fn a_share_record_clear_removes_only_that_record() {
+    on_the_ungated_rung().await;
+    let store = Rc::new(IdbKeyStore::open().await.expect("open the key store"));
+    let alice = name("share-forget-alice");
+    let bob = name("share-forget-bob");
+    let alice_record = share_record(&alice);
+    let bob_record = share_record(&bob);
+    let set = share_set();
+
+    store
+        .store(&alice, &key_from_byte(0x41))
+        .await
+        .expect("save alice's key");
+    store
+        .store(&bob, &key_from_byte(0x42))
+        .await
+        .expect("save bob's key");
+    let adapter = BuilderKeyStore::new(Rc::clone(&store));
+    ShareKeyStore::save(&adapter, &alice_record, &set)
+        .await
+        .expect("save alice's set");
+    ShareKeyStore::save(&adapter, &bob_record, &set)
+        .await
+        .expect("save bob's set");
+
+    // The forget path names the record, not the replica.
+    ShareKeyStore::clear(&adapter, &alice_record)
+        .await
+        .expect("clear alice's share record");
+
+    assert_eq!(
+        ShareKeyStore::load(&adapter, &alice_record)
+            .await
+            .expect("load"),
+        None,
+        "alice's share record is gone"
+    );
+    assert_eq!(
+        ShareKeyStore::load(&adapter, &bob_record)
+            .await
+            .expect("load"),
+        Some(set),
+        "bob's share record survives"
+    );
+    assert_eq!(
+        store.load(&alice).await.expect("load"),
+        Some(key_from_byte(0x41)),
+        "the replica keys were never named by this clear"
+    );
+    assert_eq!(
+        store.load(&bob).await.expect("load"),
+        Some(key_from_byte(0x42))
+    );
+}
+
+/// A marker a codec that echoed the stored bytes would print into its
+/// error.
+const MALFORMED_MARKER: &str = "R95-browser-share-marker-c3a91d77";
+
+/// Replace an ungated record with encrypted malformed plaintext.
+async fn write_malformed_wrapped(key: &str, plaintext: &[u8]) {
+    let db = IdbDatabase::open(KEY_STORE_DB)
+        .await
+        .expect("open the key store database");
+    let tx = db.transaction([STORE_KEK]).build().expect("malformed tx");
+    let kek_value: wasm_bindgen::JsValue = tx
+        .object_store(STORE_KEK)
+        .expect("kek store")
+        .get(1u32)
+        .primitive()
+        .expect("kek get")
+        .await
+        .expect("kek get await")
+        .expect("the at-rest kek exists");
+    let kek: web_sys::CryptoKey = kek_value.unchecked_into();
+    tx.commit().await.expect("finish reading the wrapping key");
+    let scope: web_sys::WorkerGlobalScope = js_sys::global().unchecked_into();
+    let subtle = scope.crypto().expect("crypto").subtle();
+    let iv = js_sys::Uint8Array::from([0u8; 12].as_slice());
+    let params = js_sys::Object::new();
+    js_sys::Reflect::set(
+        &params,
+        &wasm_bindgen::JsValue::from("name"),
+        &wasm_bindgen::JsValue::from("AES-GCM"),
+    )
+    .expect("AES-GCM name");
+    js_sys::Reflect::set(&params, &wasm_bindgen::JsValue::from("iv"), iv.as_ref())
+        .expect("AES-GCM iv");
+    let promise = subtle
+        .encrypt_with_object_and_u8_array(&params, &kek, plaintext)
+        .expect("encrypt promise");
+    let ct = JsFuture::from(promise).await.expect("encrypt await");
+    let ct = js_sys::Uint8Array::new(&ct);
+    let ct_len = usize::try_from(ct.length()).expect("ciphertext length fits");
+    let mut record = Vec::with_capacity(12 + ct_len);
+    record.extend_from_slice([0u8; 12].as_slice());
+    record.extend_from_slice(&ct.to_vec());
+    let value: wasm_bindgen::JsValue = js_sys::Uint8Array::from(record.as_slice()).into();
+    let tx = db
+        .transaction([STORE_WRAPPED])
+        .with_mode(indexed_db_futures::transaction::TransactionMode::Readwrite)
+        .build()
+        .expect("malformed write transaction");
+    tx.object_store(STORE_WRAPPED)
+        .expect("wrapped store")
+        .put(value)
+        .with_key(key)
+        .primitive()
+        .expect("put")
+        .await
+        .expect("put await");
+    tx.commit().await.expect("malformed commit");
+}
+
+#[wasm_bindgen_test]
+async fn a_malformed_share_record_error_does_not_echo_its_bytes() {
+    on_the_ungated_rung().await;
+    let replica = name("share-malformed");
+    let record = share_record(&replica);
+    // A valid save first, so the ungated rung and its wrapping key exist.
+    {
+        let store = IdbKeyStore::open().await.expect("open the key store");
+        let adapter = BuilderKeyStore::new(Rc::new(store));
+        ShareKeyStore::save(&adapter, &record, &share_set())
+            .await
+            .expect("seed the rung");
+    }
+    // A record whose separator field is the marker. An unsanitized read
+    // would print the marker back from serde's refused value.
+    let malformed = format!(r#"{{"separator":"{MALFORMED_MARKER}","keys":[]}}"#);
+    write_malformed_wrapped(&format!("{record}#"), malformed.as_bytes()).await;
+    let reopened = IdbKeyStore::open().await.expect("reopen the key store");
+    let adapter = BuilderKeyStore::new(Rc::new(reopened));
+    let err = ShareKeyStore::load(&adapter, &record)
+        .await
+        .expect_err("a malformed record refuses");
+    let rendered = err.to_string();
+    assert!(
+        !rendered.contains(MALFORMED_MARKER),
+        "the error must not echo the stored record, got: {rendered}"
     );
 }

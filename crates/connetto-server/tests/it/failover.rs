@@ -154,10 +154,9 @@ async fn live(client: &mut LoopbackTransport, id: i64) -> Cursor {
                     return patch.cursor;
                 }
             }
+            // A catchup's completion names rows the client already holds, so it is skipped like the other control frames.
             IncomingFrame::Control(
-                ControlMessage::FullResyncRequired(_)
-                | ControlMessage::SnapshotBegin(_)
-                | ControlMessage::SnapshotEnd(_),
+                ControlMessage::FullResyncRequired(_) | ControlMessage::SnapshotBegin(_),
             ) => panic!("a resuming cursor inside the window must not resync"),
             IncomingFrame::Control(ControlMessage::FatalError(fatal)) => panic!(
                 "the connection closed with {:?} while waiting for order {id}",

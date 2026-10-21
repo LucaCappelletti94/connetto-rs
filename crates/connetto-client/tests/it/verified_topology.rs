@@ -16,7 +16,9 @@
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use connetto_client::{ClientBuilder, ClientError, DataDir, Grant, HeldCredential, SyncSchema};
+use connetto_client::{
+    ClientBuilder, ClientError, DataDir, Grant, HeldCredential, MemoryRefreshStore, SyncSchema,
+};
 use connetto_core::transport::WebSocketTransport;
 use sha2::{Digest as _, Sha256};
 use std::process::{Child, Command, Stdio};
@@ -267,7 +269,11 @@ async fn handshake_with(token: &str) -> Result<String, ClientError> {
         super::support::Once::new(transport),
     )
     .signed_in(credential)
-    .durable(DataDir::new(data_dir.path().to_path_buf()), key_store)
+    .durable(
+        DataDir::new(data_dir.path().to_path_buf()),
+        key_store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .map(|conn| {

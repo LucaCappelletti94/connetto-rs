@@ -51,7 +51,9 @@ impl RefreshTokenStore for MemoryRefreshStore {
             .lock()
             .expect("refresh store lock")
             .keys()
-            .filter(|name| !crate::is_reserved_record(name))
+            .filter(|name| {
+                !crate::is_reserved_record(name) && !crate::share_keys::is_share_key_record(name)
+            })
             .cloned()
             .collect();
         Box::pin(std::future::ready(Ok(accounts)))

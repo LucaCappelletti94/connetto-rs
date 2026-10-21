@@ -352,11 +352,11 @@ impl WebSignIn for HeldCredential {
 
 #[cfg(feature = "native-transport")]
 impl NativeSignIn for HeldCredential {
-    type Storage = NoKeyring;
+    type Storage = Held;
 
     #[doc(hidden)]
-    fn into_parts(self) -> (SignInKind, NoKeyring) {
-        (SignInKind::Held(self), NoKeyring { store: None })
+    fn into_parts(self) -> (SignInKind, Held) {
+        (SignInKind::Held(self), Held)
     }
 }
 
@@ -542,7 +542,32 @@ impl StorageMarker for NoKeyring {
     }
 }
 
+/// The credential the caller held. It names no storage at all, so the
+/// durable step must name the key store and the share-key store itself.
+#[cfg(feature = "native-transport")]
+#[derive(Clone)]
+pub struct Held;
+
+#[cfg(feature = "native-transport")]
+impl StorageMarker for Held {
+    fn refresh_store(
+        &self,
+    ) -> Option<Arc<dyn RefreshTokenStore<Error = ClientError> + Send + Sync>> {
+        None
+    }
+
+    fn arm_gate(&self, _on: bool) -> Result<Option<Arc<dyn GateMechanism>>, ClientError> {
+        Ok(None)
+    }
+    #[cfg(feature = "device-identity")]
+    fn device_service(&self) -> Option<&str> {
+        None
+    }
+}
+
 mod private {
+    #[cfg(feature = "native-transport")]
+    use super::Held;
     #[cfg(feature = "native-transport")]
     use super::NoKeyring;
     use super::{Auth, HeldCredential};
@@ -556,6 +581,9 @@ mod private {
 
     #[cfg(feature = "native-transport")]
     impl Sealed for NoKeyring {}
+
+    #[cfg(feature = "native-transport")]
+    impl Sealed for Held {}
 
     #[cfg(feature = "native-auth")]
     impl Sealed for Keyring {}

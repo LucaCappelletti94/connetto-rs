@@ -4,10 +4,11 @@
 //! The builder composes the shared pieces, the schema, the tuning, the
 //! reconnect policy, the content seam and the share keys, over an injected
 //! dialer and an injected backoff sleep, forks on a held credential, and ends
-//! in a durable step that names the replica location and the key store the
-//! platform uses. No stage spawns anything, because spawning is the platform
-//! layer's job. Every stage ends in the client and its pump future, or in the
-//! connected, unstarted connection a caller drives frame by frame.
+//! in a durable step that names the replica location, the key store and the
+//! share-key store the platform uses. No stage spawns anything, because
+//! spawning is the platform layer's job. Every stage ends in the client and
+//! its pump future, or in the connected, unstarted connection a caller
+//! drives frame by frame.
 
 use core::fmt::Display;
 use core::pin::Pin;
@@ -38,6 +39,9 @@ use crate::reconnect::{ReconnectPolicy, Sleeper};
 use crate::replica::Encrypted;
 #[cfg(feature = "native-transport")]
 use crate::replica::provision_replica_key;
+use crate::share_keys::{
+    ErasedShareKeyStore, ShareKeyPersistence, ShareKeySet, ShareKeyStore, share_key_record,
+};
 use crate::{AccessTokenSource, ClientConfig, ClientError, ConnettoConnection};
 use crate::{GateAskOutcome, GateMechanism};
 
@@ -206,37 +210,13 @@ pub(crate) struct Base<T: Transport, C> {
     /// The share keys the build presents, when it holds any. The build applies
     /// them to the replica's subjects function and the handshake on every
     /// platform, so an anonymous and a signed-in client hold the same keys.
-    pub(crate) share_keys: Option<ShareKeys>,
+    pub(crate) share_keys: Option<ShareKeySet>,
     /// The dialer the first dial and every reconnect use.
     pub(crate) dialer: BoxedDialer<T>,
     /// The backoff sleep the platform injected, when it named one.
     pub(crate) sleeper: Option<SleeperFn>,
     /// The client id an anonymous build presents, when the app named one.
     pub(crate) client_id: Option<String>,
-}
-
-/// The share keys a build presents, normalized to the subject rendering.
-#[derive(Clone)]
-pub(crate) struct ShareKeys {
-    /// The separator the subjects function packs with.
-    pub(crate) separator: char,
-    /// Each grant beside the subject string it renders as.
-    pub(crate) keys: Vec<(Grant, String)>,
-}
-
-impl ShareKeys {
-    /// The keys `keys` names, rendered through their own key type.
-    pub(crate) fn new<K: CapabilityKey>(
-        keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
-    ) -> Self {
-        Self {
-            separator: K::SEPARATOR,
-            keys: keys
-                .into_iter()
-                .map(|(grant, subject)| (grant, subject.key().to_string()))
-                .collect(),
-        }
-    }
 }
 
 impl<T: Transport, C> Base<T, C> {
@@ -321,7 +301,7 @@ macro_rules! base_setters {
             mut self,
             keys: impl IntoIterator<Item = (Grant, CapabilitySubject<K>)>,
         ) -> Self {
-            self.base.share_keys = Some(ShareKeys::new(keys));
+            self.base.share_keys = Some($crate::ShareKeySet::new(keys));
             self
         }
     };
@@ -350,6 +330,8 @@ pub(crate) struct RunInputs {
     pub(crate) gate: Option<(Gate, Arc<dyn GateMechanism>)>,
     /// Whether the replica is fresh, which decides connect from open.
     pub(crate) fresh: bool,
+    /// The share keys the build presents, absent for in-memory builds.
+    pub(crate) share_key_store: Option<ShareKeyPersistence>,
 }
 
 /// The custody a build reports, the weakest claim of the stores it uses. An
@@ -404,11 +386,11 @@ pub(crate) fn build_config(
 /// about the keys held.
 pub(crate) fn fold_config_aspects(
     config: ClientConfig,
-    share_keys: Option<ShareKeys>,
+    share_keys: Option<ShareKeySet>,
 ) -> ClientConfig {
     // The subjects function is registered even for a build holding no key,
     // because a translated view calls it whatever the caller holds.
-    let keys = share_keys.unwrap_or_else(|| ShareKeys {
+    let keys = share_keys.unwrap_or_else(|| ShareKeySet {
         separator: <String as CapabilityKey>::SEPARATOR,
         keys: Vec::new(),
     });
@@ -630,6 +612,7 @@ where
                 custody: Custody::Ephemeral,
                 gate: None,
                 fresh: true,
+                share_key_store: None,
             },
         )
         .await
@@ -684,6 +667,7 @@ where
             custody: Custody::Ephemeral,
             token_source: None,
             replica: DrivenReplica::InMemory,
+            share_key_store: None,
         }
     }
 }
@@ -734,30 +718,41 @@ where
                 custody: Custody::Ephemeral,
                 gate: None,
                 fresh: true,
+                share_key_store: None,
             },
         )
         .await
     }
 
     /// Move to the durable stage, naming where the replica lives and the key
-    /// store the build will use.
+    /// store and share-key store the build will use.
     ///
     /// `place` locates the replica file from the name the credential carries,
     /// and says whether one is already there, so two identities on one
     /// device keep separate files and keys. A platform without a platform
     /// RNG, the browser among them, holds the key of a fresh replica in the
-    /// store before this step runs.
+    /// store before this step runs. The share-key store persists the build's
+    /// share keys beside its other records, and a restart reloads them
+    /// before the dial.
     #[must_use]
-    pub fn durable<P, KS>(self, place: P, key_store: KS) -> CoreDurable<T, C, KS, P>
+    pub fn durable<P, KS, SS>(
+        self,
+        place: P,
+        key_store: KS,
+        share_key_store: SS,
+    ) -> CoreDurable<T, C, KS, P>
     where
         P: ReplicaPlace,
         KS: ReplicaKeyStore<Error = ClientError> + MaybeSend + 'static,
+        SS: ShareKeyStore<Error = ClientError> + MaybeSend + 'static,
     {
+        let share_key_store: ErasedShareKeyStore = Arc::new(share_key_store);
         CoreDurable {
             base: self.base,
             credential: self.credential,
             place,
             key_store,
+            share_key_store,
             claims: Vec::new(),
             gate: Gate::default(),
             mechanism: None,
@@ -810,6 +805,7 @@ where
             custody: Custody::Ephemeral,
             token_source,
             replica: DrivenReplica::InMemory,
+            share_key_store: None,
         }
     }
 }
@@ -877,15 +873,20 @@ impl Located {
 }
 
 /// The durable stage of a platform-neutral build, a replica file under a
-/// key beside its content, gated on the away input when the gate is on.
+/// key beside its share keys and its content, gated on the away input when
+/// the gate is on.
 ///
-/// Only this stage has the place, the key store and the gate, because a
-/// build that names a file names its key and its lock together.
+/// Only this stage has the place, the key store, the share-key store and
+/// the gate, because a build that names a file names its key, its keys and
+/// its lock together.
 pub struct CoreDurable<T: Transport, C, KS, P> {
     pub(crate) base: Base<T, C>,
     pub(crate) credential: HeldCredential,
     pub(crate) place: P,
     pub(crate) key_store: KS,
+    /// The share-key store erased to the trait, the keys a durable build
+    /// presents on every run.
+    pub(crate) share_key_store: ErasedShareKeyStore,
     /// Protection claims from stores beside the key store, which a platform
     /// layer adds for the refresh store it signed in through.
     pub(crate) claims: Vec<Custody>,
@@ -915,6 +916,8 @@ struct DurableResolved<T: Transport, C> {
     custody: Custody,
     /// The away-and-return gate and its mechanism, when the gate is on.
     gate: Option<(Gate, Arc<dyn GateMechanism>)>,
+    /// The share keys the build presents, persisted with the credential.
+    share_key_store: ShareKeyPersistence,
 }
 
 impl<T, C, KS, P> CoreDurable<T, C, KS, P>
@@ -968,6 +971,7 @@ where
             ddl,
             custody,
             gate,
+            share_key_store,
         } = self.resolve().await?;
         let replica = open_encrypted_replica(&located.url, &key, !located.exists, ddl.as_ref())?;
         run_core(
@@ -983,6 +987,7 @@ where
                 custody,
                 gate,
                 fresh: !located.exists,
+                share_key_store: Some(share_key_store),
             },
         )
         .await
@@ -1006,7 +1011,10 @@ where
         };
         let mut claims = self.claims;
         claims.push(self.key_store.protection());
+        claims.push(self.share_key_store.protection());
         let custody = custody_of(&claims);
+        let share_key_store =
+            ShareKeyPersistence::new(Arc::clone(&self.share_key_store), share_key_record(&name));
         let gate = if self.gate.on() {
             self.mechanism.map(|mechanism| (self.gate, mechanism))
         } else {
@@ -1024,6 +1032,7 @@ where
             ddl,
             custody,
             gate,
+            share_key_store,
         })
     }
 }
@@ -1107,15 +1116,16 @@ where
         self.driven().await?.connect().await
     }
 
-    /// Open the durable replica with no transport, returning the unstarted
-    /// connection for a caller that attaches one by hand later.
+    /// Open the durable replica with no transport, loading and merging the
+    /// durable share-key store before the unstarted connection is returned
+    /// for a caller that attaches one by hand later.
     /// [`connect_driven`](Self::connect_driven) without the dial.
     ///
     /// # Errors
     ///
     /// [`ClientError`] on a key, database, or cipher failure.
     pub async fn open_driven(self) -> Result<ConnettoConnection<T>, ClientError> {
-        self.driven().await?.open()
+        self.driven().await?.open_prepared().await
     }
 
     /// The durable build's driven inputs, once its key is resolved.
@@ -1129,6 +1139,7 @@ where
             key,
             located,
             custody,
+            share_key_store,
             ..
         } = self.resolve().await?;
         Ok(Driven {
@@ -1139,6 +1150,7 @@ where
             custody,
             token_source,
             replica: DrivenReplica::Encrypted { located, key },
+            share_key_store: Some(share_key_store),
         })
     }
 }
@@ -1161,6 +1173,8 @@ struct Driven<T: Transport> {
     custody: Custody,
     token_source: Option<AccessTokenSource>,
     replica: DrivenReplica,
+    /// The share keys the build presents, when the build is durable.
+    share_key_store: Option<ShareKeyPersistence>,
 }
 
 impl<T> Driven<T>
@@ -1188,6 +1202,7 @@ where
             mut base,
             token_source,
             replica,
+            share_key_store,
             ..
         } = self;
         let tier = base.schema.local_tier_ddl().map(str::to_owned);
@@ -1202,6 +1217,7 @@ where
                     token_source,
                     &mut base.dialer,
                     FirstDial::Required,
+                    share_key_store,
                 )
                 .await
             }
@@ -1216,6 +1232,7 @@ where
                     token_source,
                     &mut base.dialer,
                     FirstDial::Required,
+                    share_key_store,
                 )
                 .await
             }
@@ -1229,20 +1246,45 @@ where
             base,
             token_source,
             replica,
+            share_key_store,
             ..
         } = self;
         let tier = base.schema.local_tier_ddl().map(str::to_owned);
         match replica {
             DrivenReplica::InMemory => {
                 let replica = in_memory_replica(tier.as_deref());
-                open_driven_core(&replica, &base.schema, &config, true, token_source)
+                open_driven_core(
+                    &replica,
+                    &base.schema,
+                    &config,
+                    true,
+                    token_source,
+                    share_key_store,
+                )
             }
             DrivenReplica::Encrypted { located, key } => {
                 let fresh = !located.exists;
                 let replica = open_encrypted_replica(&located.url, &key, fresh, tier.as_ref())?;
-                open_driven_core(&replica, &base.schema, &config, fresh, token_source)
+                open_driven_core(
+                    &replica,
+                    &base.schema,
+                    &config,
+                    fresh,
+                    token_source,
+                    share_key_store,
+                )
             }
         }
+    }
+
+    /// Load durable authorization before exposing the offline replica.
+    async fn open_prepared(self) -> Result<ConnettoConnection<T>, ClientError> {
+        let persistent = self.share_key_store.is_some();
+        let mut conn = self.open()?;
+        if persistent {
+            conn.prepare_share_keys().await?;
+        }
+        Ok(conn)
     }
 }
 
@@ -1259,6 +1301,10 @@ pub(crate) enum FirstDial {
 /// tries one dial and attaches it on success. A refusal no retry can cure fails
 /// the build either way, and any other failure follows `first_dial`. The
 /// replica is opened by the caller, which knows its storage.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Replica, credentials and first-dial policy are independent inputs."
+)]
 pub(crate) async fn offline_connect_core<T, S>(
     replica: &Replica<'_, S>,
     schema: &SyncSchema,
@@ -1267,6 +1313,7 @@ pub(crate) async fn offline_connect_core<T, S>(
     token_source: Option<AccessTokenSource>,
     dialer: &mut BoxedDialer<T>,
     first_dial: FirstDial,
+    share_key_store: Option<ShareKeyPersistence>,
 ) -> Result<ConnettoConnection<T>, ClientError>
 where
     T: Transport + MaybeSend + 'static,
@@ -1278,6 +1325,16 @@ where
     } else {
         ConnettoConnection::open_existing(replica, config, None)
     }?;
+    // The durable share keys load before the first dial, so a build that
+    // starts offline already carries the durable set when its first query
+    // runs.
+    let persistent = share_key_store.is_some();
+    if let Some(store) = share_key_store {
+        conn.initialize_share_key_store(store);
+    }
+    if persistent {
+        conn.prepare_share_keys().await?;
+    }
     match dialer.connect().await {
         Ok(transport) => conn.attach(transport).await?,
         Err(err) => {
@@ -1305,16 +1362,20 @@ pub(crate) fn open_driven_core<T, S>(
     config: &ClientConfig,
     fresh: bool,
     token_source: Option<AccessTokenSource>,
+    share_key_store: Option<ShareKeyPersistence>,
 ) -> Result<ConnettoConnection<T>, ClientError>
 where
     T: Transport,
     S: ReplicaStorage,
 {
-    let conn = if fresh {
+    let mut conn = if fresh {
         ConnettoConnection::open(replica, schema.replica_ddl(), config, None)
     } else {
         ConnettoConnection::open_existing(replica, config, None)
     }?;
+    if let Some(store) = share_key_store {
+        conn.initialize_share_key_store(store);
+    }
     Ok(match token_source {
         Some(source) => conn.with_token_source(source),
         None => conn,
@@ -1362,6 +1423,7 @@ where
         inputs.token_source,
         &mut dialer,
         FirstDial::MayFail,
+        inputs.share_key_store,
     )
     .await?;
     let sleeper = sleeper.unwrap_or_else(default_sleeper);

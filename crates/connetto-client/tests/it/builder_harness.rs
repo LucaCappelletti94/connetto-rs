@@ -11,8 +11,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use connetto_client::{
-    Custody, Grant, HeldCredential, MemoryKeyStore, NativeClientBuilder, NoGate, SyncSchema,
-    TransportFactory,
+    Custody, Grant, HeldCredential, MemoryKeyStore, MemoryRefreshStore, NativeClientBuilder,
+    NoGate, SyncSchema, TransportFactory,
 };
 use connetto_core::messages::{ControlMessage, HandshakeAck, Pong};
 use connetto_core::traits::{IncomingFrame, MaybeSend, ReplicaKeyStore, Transport};
@@ -350,7 +350,7 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
             .signed_in(
                 HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
             )
-            .durable(dir.path(), store.clone())
+            .durable(dir.path(), store.clone(), MemoryRefreshStore::default())
             .connect(),
     )
     .await
@@ -383,7 +383,7 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
             .signed_in(
                 HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
             )
-            .durable(dir.path(), store)
+            .durable(dir.path(), store, MemoryRefreshStore::default())
             .connect(),
     )
     .await

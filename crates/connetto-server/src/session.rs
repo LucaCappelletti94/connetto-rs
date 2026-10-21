@@ -7797,7 +7797,17 @@ where
             .await
             .map_err(transport_err)?;
         }
-        Ok(())
+        enqueue_and_flush(
+            transport,
+            &mut state.credits,
+            &mut state.pending,
+            Deliverable::SnapshotComplete(SnapshotEnd {
+                sub_id: sub.sub_id,
+                cursor: Cursor::new(self.stamp(ceiling.unwrap_or(from))),
+            }),
+        )
+        .await
+        .map_err(transport_err)
     }
 
     /// The log's records a cursor at `from` resumes with, in commit order.
