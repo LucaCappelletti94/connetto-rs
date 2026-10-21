@@ -531,7 +531,9 @@ async fn compute_expiry_for_session(
 
 /// Registers the account chooser callback that the worker calls when it needs
 /// the user to pick an account. Called on every render so the closure captures
-/// the current render's state handles.
+/// the current render's state handles. A single stored account needs no
+/// choice, so a reload signs it back in without a click, and only several
+/// accounts park the picker for a button click.
 fn register_account_chooser(
     account_picker: UseStateHandle<Option<Vec<String>>>,
     known_accounts: UseStateHandle<Vec<String>>,
@@ -544,6 +546,9 @@ fn register_account_chooser(
         async move {
             *pending_choice.borrow_mut() = None;
             known_accounts.set(accounts.clone());
+            if accounts.len() <= 1 {
+                return AccountChoice::LastUsed;
+            }
             account_picker.set(Some(accounts));
             loop {
                 workers::sleep(core::time::Duration::from_millis(30)).await;
