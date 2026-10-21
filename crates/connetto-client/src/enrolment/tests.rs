@@ -432,7 +432,7 @@ struct FakeLink {
     issuer: Arc<DeviceIssuer>,
     certificate: Vec<u8>,
     ask: Ask,
-    /// A grant answer waits on it first, so a test holds the renewal open.
+    /// An answer waits on it first, so a test holds the enrolment open.
     gate: Option<Arc<tokio::sync::Notify>>,
     /// A granted leaf's `not_before`, so a test's clock can stand past
     /// `not_after` when the grant lands.
@@ -489,7 +489,12 @@ impl Link for FakeLink {
                         state.requests.push(request.attestation);
                     }
                     let answer = match ask {
-                        Ask::Refused(refusal) => Answer::Refused(refusal),
+                        Ask::Refused(refusal) => {
+                            if let Some(gate) = &gate {
+                                gate.notified().await;
+                            }
+                            Answer::Refused(refusal)
+                        }
                         Ask::Silent => {
                             // The request went out and no answer comes.
                             drop(tx);
@@ -1935,6 +1940,87 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         task_reason == Some(connetto_peer::CloseReason::CertificateExpired)
             || far_reasons.contains(&connetto_peer::CloseReason::PeerExpired),
         "one end closed the link with its own deadline reason, task {task_reason:?} far {far_reasons:?}"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The wake a held renewal answer takes back closes the live peer links at
+/// once when it lands past the window (R76 proof 5).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_wake_past_the_expiry_closes_the_live_peer_links() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // The window ends 29 s after the open, within its tolerance, so the link holds a short while.
+    let held = issue_for(
+        &authority,
+        &key,
+        now + Duration::from_secs(29) - 7 * MINUTE,
+        2 * MINUTE,
+        positive_serial(5),
+    );
+    let task_identity = held.leaf.identity().clone();
+    let deadline = held.leaf.not_after() + TOLERANCE;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let peer = peer(&authority);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Refused(EnrolRefusal::IssuerUnavailable),
+        gate: Some(Arc::clone(&gate)),
+        grant_from: None,
+    };
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+    // The open is connected, so the renewal answer waits on the gate across the expiry.
+    // The open serves the aging identity, and a live peer dials it.
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    let peer_identity = far.link(addr).await.expect("the link completes");
+    assert_eq!(
+        peer_identity, task_identity,
+        "the link answers the device's identity"
+    );
+    // The node reports the live link while the task stands on the renewal answer.
+    poll_until(|| !handle.linked_peers().is_empty()).await;
+
+    tokio::time::sleep(
+        (deadline + Duration::from_secs(1))
+            .duration_since(SystemTime::now())
+            .unwrap_or_default(),
+    )
+    .await;
+    gate.notify_one();
+
+    // The wake the refusal takes back must close the links at once (R76 proof 5).
+    poll_until(|| handle.peer_address().is_none()).await;
+    let far_reasons = far_closes(&mut far_events, Duration::from_secs(3)).await;
+    assert!(
+        far_reasons.contains(&connetto_peer::CloseReason::PeerExpired),
+        "the far end closed the link at the window's end, got {far_reasons:?}"
     );
 
     end_tx.send(()).expect("the run ends");
