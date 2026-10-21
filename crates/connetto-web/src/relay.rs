@@ -63,7 +63,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auth::PendingWork;
-use crate::content_wire::{ContentFrame, WirePins, WireResolve, mime_from_code};
+use crate::content_wire::{ContentFrame, WirePins, WireQueue, WireResolve, mime_from_code};
 use crate::frames::{
     InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
 };
@@ -1864,7 +1864,7 @@ where
             handle_tab_frame(worker, state, notices, content, walk, id, frame).await?;
         }
         HubEvent::Internal(id, frame, blob) => {
-            handle_tab_internal(worker, state, content, id, frame, blob).await?;
+            handle_tab_internal(worker, state, content, walk, id, frame, blob).await?;
         }
         HubEvent::Unsynced(reply) => {
             let pending = PendingWork {
@@ -2463,14 +2463,16 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
             | HubEvent::ForgetRetired(_, _)
-            | HubEvent::RefusedContent(_)
-            | HubEvent::RetryRefused(_, _)
             | HubEvent::Internal(
                 _,
                 ContentFrame::Resolve { .. }
                     | ContentFrame::Pin { .. }
                     | ContentFrame::Unpin { .. }
-                    | ContentFrame::ListPins { .. },
+                    | ContentFrame::ListPins { .. }
+                    | ContentFrame::RefusedContent { .. }
+                    | ContentFrame::RetryRefused { .. }
+                    | ContentFrame::RetiredContent { .. }
+                    | ContentFrame::ForgetRetiredContent { .. },
                 _
             )
     )
@@ -3527,6 +3529,7 @@ async fn handle_tab_internal<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
     content: Option<&ContentArchive<BrowserStore>>,
+    walk: &mut WalkState,
     id: TabId,
     frame: ContentFrame,
     blob: Option<web_sys::Blob>,
@@ -3616,7 +3619,16 @@ where
             serve_pin_frame(worker, state, content, id, pin);
             Ok(())
         }
-        ContentFrame::ResolveReply { .. } | ContentFrame::PinReply { .. } => Ok(()),
+        queue @ (ContentFrame::RefusedContent { .. }
+        | ContentFrame::RetryRefused { .. }
+        | ContentFrame::RetiredContent { .. }
+        | ContentFrame::ForgetRetiredContent { .. }) => {
+            serve_queue_frame(worker, state, content, walk, id, queue);
+            Ok(())
+        }
+        ContentFrame::ResolveReply { .. }
+        | ContentFrame::PinReply { .. }
+        | ContentFrame::QueueReply { .. } => Ok(()),
     }
 }
 
@@ -3637,41 +3649,125 @@ fn serve_pin_frame<U: Transport>(
         } => (
             request_id,
             with_archive(content, |archive| {
-                archive
-                    .pin_content(worker, &name, &query, &file_id_column)
-                    .map(|()| WirePins::Done)
-            }),
+                archive.pin_content(worker, &name, &query, &file_id_column)
+            })
+            .map_or_else(WirePins::Refused, |()| WirePins::Done),
         ),
         ContentFrame::Unpin { request_id, name } => (
             request_id,
-            with_archive(content, |archive| {
-                archive
-                    .unpin_content(worker, &name)
-                    .map(|()| WirePins::Done)
-            }),
+            with_archive(content, |archive| archive.unpin_content(worker, &name))
+                .map_or_else(WirePins::Refused, |()| WirePins::Done),
         ),
         ContentFrame::ListPins { request_id } => (
             request_id,
-            with_archive(content, |archive| {
-                archive.content_pins(worker).map(WirePins::Pins)
-            }),
+            with_archive(content, |archive| archive.content_pins(worker))
+                .map_or_else(WirePins::Refused, WirePins::Pins),
         ),
         ContentFrame::Stage { .. }
         | ContentFrame::Resolve { .. }
         | ContentFrame::ResolveReply { .. }
-        | ContentFrame::PinReply { .. } => return,
+        | ContentFrame::PinReply { .. }
+        | ContentFrame::RefusedContent { .. }
+        | ContentFrame::RetryRefused { .. }
+        | ContentFrame::RetiredContent { .. }
+        | ContentFrame::ForgetRetiredContent { .. }
+        | ContentFrame::QueueReply { .. } => return,
     };
     answer_pins(state, tab, request_id, answer);
 }
 
-/// Runs `pin` against the archive, refusing when content is disabled.
-fn with_archive(
+/// Answers a tab's queue read or action from the replica.
+fn serve_queue_frame<U: Transport>(
+    worker: &mut ConnettoConnection<U>,
+    state: &HubState,
     content: Option<&ContentArchive<BrowserStore>>,
-    pin: impl FnOnce(&ContentArchive<BrowserStore>) -> Result<WirePins, ContentError>,
-) -> WirePins {
+    walk: &mut WalkState,
+    tab: TabId,
+    frame: ContentFrame,
+) {
+    let (request_id, answer) = match frame {
+        ContentFrame::RefusedContent { request_id } => (
+            request_id,
+            with_archive(content, |archive| archive.refused_content(worker)).map_or_else(
+                WireQueue::Refused,
+                |refusals| {
+                    WireQueue::Refusals(
+                        refusals
+                            .into_iter()
+                            .map(|(file_id, detail)| (*file_id.as_bytes(), detail))
+                            .collect(),
+                    )
+                },
+            ),
+        ),
+        ContentFrame::RetryRefused {
+            request_id,
+            file_id,
+        } => {
+            let cleared = with_archive(content, |archive| {
+                archive.retry_refused(worker, FileId::from_bytes(file_id))
+            });
+            if cleared.is_ok() {
+                // Wake the outbox driver wherever this request was served, so
+                // neither a reconnect nor an import is needed to attempt the entry.
+                walk.outbox_wake = true;
+            }
+            (
+                request_id,
+                cleared.map_or_else(WireQueue::Refused, |()| WireQueue::Done),
+            )
+        }
+        ContentFrame::RetiredContent { request_id } => (
+            request_id,
+            with_archive(content, |archive| archive.retired_content(worker)).map_or_else(
+                WireQueue::Refused,
+                |retired| {
+                    WireQueue::Retired(
+                        retired
+                            .into_iter()
+                            .map(|file_id| *file_id.as_bytes())
+                            .collect(),
+                    )
+                },
+            ),
+        ),
+        ContentFrame::ForgetRetiredContent {
+            request_id,
+            file_ids,
+        } => {
+            let files: Vec<FileId> = file_ids
+                .iter()
+                .map(|file_id| FileId::from_bytes(*file_id))
+                .collect();
+            (
+                request_id,
+                with_archive(content, |archive| {
+                    archive.forget_retired_content(worker, &files)
+                })
+                .map_or_else(WireQueue::Refused, |()| WireQueue::Done),
+            )
+        }
+        ContentFrame::Stage { .. }
+        | ContentFrame::Resolve { .. }
+        | ContentFrame::ResolveReply { .. }
+        | ContentFrame::Pin { .. }
+        | ContentFrame::Unpin { .. }
+        | ContentFrame::ListPins { .. }
+        | ContentFrame::PinReply { .. }
+        | ContentFrame::QueueReply { .. } => return,
+    };
+    answer_queue(state, tab, request_id, answer);
+}
+
+/// Runs `run` against the archive, refusing with the reason when content is
+/// disabled or the record cannot be served.
+fn with_archive<T>(
+    content: Option<&ContentArchive<BrowserStore>>,
+    run: impl FnOnce(&ContentArchive<BrowserStore>) -> Result<T, ContentError>,
+) -> Result<T, String> {
     match content {
-        Some(archive) => pin(archive).unwrap_or_else(|err| WirePins::Refused(err.to_string())),
-        None => WirePins::Refused("content is not enabled on this worker".to_owned()),
+        Some(archive) => run(archive).map_err(|err| err.to_string()),
+        None => Err("content is not enabled on this worker".to_owned()),
     }
 }
 
@@ -3679,6 +3775,14 @@ fn with_archive(
 fn answer_pins(state: &HubState, tab: TabId, request_id: u64, answer: WirePins) {
     if let Some(entry) = state.tabs.get(&tab) {
         let reply = ContentFrame::PinReply { request_id, answer };
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
+    }
+}
+
+/// Answers a tab's queue frame on its content lane.
+fn answer_queue(state: &HubState, tab: TabId, request_id: u64, answer: WireQueue) {
+    if let Some(entry) = state.tabs.get(&tab) {
+        let reply = ContentFrame::QueueReply { request_id, answer };
         let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
     }
 }

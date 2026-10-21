@@ -6,7 +6,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::content_wire::{ContentFrame, WirePins, WireResolve, mime_code};
+use crate::content_wire::{ContentFrame, WirePins, WireQueue, WireResolve, mime_code};
+
 use crate::frames::{InternalLane, MessageSink, MessageTransport};
 use crate::workers::helpers::sleep_ms;
 use connetto_client::live::ConnettoClient;
@@ -246,16 +247,17 @@ type ResolveAnswer = (WireResolve, Option<Blob>);
 enum LaneAnswer {
     Resolve(ResolveAnswer),
     Pins(WirePins),
+    Queue(WireQueue),
 }
 
-/// Why a tab's pin request did not take effect.
+/// Why a tab's content request did not take effect.
 #[derive(Debug, thiserror::Error)]
-pub enum TabPinError {
+pub enum TabContentError {
     /// The worker refused, with its reason.
-    #[error("the worker refused the pin request: {0}")]
+    #[error("the worker refused the content request: {0}")]
     Refused(String),
     /// No answer arrived in time, or the lane is closed.
-    #[error("the worker did not answer the pin request")]
+    #[error("the worker did not answer the content request")]
     Unanswered,
 }
 
@@ -289,6 +291,9 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
                     let (request_id, answer) = match ContentFrame::from_json(&inbound.json) {
                         Some(ContentFrame::ResolveReply { request_id, answer }) => {
                             (request_id, LaneAnswer::Resolve((answer, inbound.blob)))
+                        }
+                        Some(ContentFrame::QueueReply { request_id, answer }) => {
+                            (request_id, LaneAnswer::Queue(answer))
                         }
                         Some(ContentFrame::PinReply { request_id, answer }) => {
                             (request_id, LaneAnswer::Pins(answer))
@@ -391,14 +396,14 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
     ///
     /// # Errors
     ///
-    /// [`TabPinError::Refused`] when the worker refuses, for a query not returning the
-    /// named column among other reasons, and [`TabPinError::Unanswered`] when no answer comes.
+    /// [`TabContentError::Refused`] when the worker refuses, for a query not returning the
+    /// named column among other reasons, and [`TabContentError::Unanswered`] when no answer comes.
     pub async fn pin_content(
         &self,
         name: &str,
         query: &str,
         file_id_column: &str,
-    ) -> Result<(), TabPinError> {
+    ) -> Result<(), TabContentError> {
         self.pin_request(|request_id| ContentFrame::Pin {
             request_id,
             name: name.to_owned(),
@@ -414,7 +419,7 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
     /// # Errors
     ///
     /// As [`pin_content`](Self::pin_content).
-    pub async fn unpin_content(&self, name: &str) -> Result<(), TabPinError> {
+    pub async fn unpin_content(&self, name: &str) -> Result<(), TabContentError> {
         self.pin_request(|request_id| ContentFrame::Unpin {
             request_id,
             name: name.to_owned(),
@@ -428,24 +433,119 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
     /// # Errors
     ///
     /// As [`pin_content`](Self::pin_content).
-    pub async fn content_pins(&self) -> Result<Vec<(String, String, String)>, TabPinError> {
+    pub async fn content_pins(&self) -> Result<Vec<(String, String, String)>, TabContentError> {
         match self
             .pin_request(|request_id| ContentFrame::ListPins { request_id })
             .await?
         {
             WirePins::Pins(pins) => Ok(pins),
-            WirePins::Done | WirePins::Refused(_) => Err(TabPinError::Unanswered),
+            WirePins::Done | WirePins::Refused(_) => Err(TabContentError::Unanswered),
+        }
+    }
+
+    /// Every refused upload, with its permanent refusal detail.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn refused_content(&self) -> Result<Vec<(FileId, String)>, TabContentError> {
+        match self
+            .queue_request(|request_id| ContentFrame::RefusedContent { request_id })
+            .await?
+        {
+            WireQueue::Refusals(refusals) => Ok(refusals
+                .into_iter()
+                .map(|(file_id, detail)| (FileId::from_bytes(file_id), detail))
+                .collect()),
+            _ => Err(TabContentError::Unanswered),
+        }
+    }
+
+    /// Clears the refusal mark on one outbox entry so the next walk attempts it,
+    /// as the native content client's `retry_refused` does.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn retry_refused(&self, file_id: FileId) -> Result<(), TabContentError> {
+        match self
+            .queue_request(|request_id| ContentFrame::RetryRefused {
+                request_id,
+                file_id: *file_id.as_bytes(),
+            })
+            .await?
+        {
+            WireQueue::Done => Ok(()),
+            _ => Err(TabContentError::Unanswered),
+        }
+    }
+
+    /// Files whose unsent bytes were lost and whose loss is unacknowledged, as
+    /// the native content client's `retired_content` lists them.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn retired_content(&self) -> Result<Vec<FileId>, TabContentError> {
+        match self
+            .queue_request(|request_id| ContentFrame::RetiredContent { request_id })
+            .await?
+        {
+            WireQueue::Retired(files) => Ok(files
+                .iter()
+                .map(|file_id| FileId::from_bytes(*file_id))
+                .collect()),
+            _ => Err(TabContentError::Unanswered),
+        }
+    }
+
+    /// Drops the losses the application has dealt with, as the native content
+    /// client's `forget_retired_content` does.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn forget_retired_content(&self, files: &[FileId]) -> Result<(), TabContentError> {
+        let ids: Vec<[u8; 32]> = files.iter().map(|file_id| *file_id.as_bytes()).collect();
+        match self
+            .queue_request(|request_id| ContentFrame::ForgetRetiredContent {
+                request_id,
+                file_ids: ids,
+            })
+            .await?
+        {
+            WireQueue::Done => Ok(()),
+            _ => Err(TabContentError::Unanswered),
         }
     }
 
     async fn pin_request(
         &self,
         frame: impl FnOnce(u64) -> ContentFrame,
-    ) -> Result<WirePins, TabPinError> {
+    ) -> Result<WirePins, TabContentError> {
         match self.ask(frame).await {
-            Some(LaneAnswer::Pins(WirePins::Refused(reason))) => Err(TabPinError::Refused(reason)),
+            Some(LaneAnswer::Pins(WirePins::Refused(reason))) => {
+                Err(TabContentError::Refused(reason))
+            }
             Some(LaneAnswer::Pins(answer)) => Ok(answer),
-            Some(LaneAnswer::Resolve(_)) | None => Err(TabPinError::Unanswered),
+            Some(LaneAnswer::Resolve(_) | LaneAnswer::Queue(_)) | None => {
+                Err(TabContentError::Unanswered)
+            }
+        }
+    }
+
+    async fn queue_request(
+        &self,
+        frame: impl FnOnce(u64) -> ContentFrame,
+    ) -> Result<WireQueue, TabContentError> {
+        match self.ask(frame).await {
+            Some(LaneAnswer::Queue(WireQueue::Refused(reason))) => {
+                Err(TabContentError::Refused(reason))
+            }
+            Some(LaneAnswer::Queue(answer)) => Ok(answer),
+            Some(LaneAnswer::Resolve(_) | LaneAnswer::Pins(_)) | None => {
+                Err(TabContentError::Unanswered)
+            }
         }
     }
 
