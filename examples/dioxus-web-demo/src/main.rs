@@ -41,8 +41,8 @@ use connetto_client::{
     SyncTuning,
     teardown::{ExpiryWarning, expiry_warning},
 };
-use connetto_core::messages::FatalErrorReason;
 use connetto_dioxus::use_live;
+use connetto_dioxus_web_demo::status_label;
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::{
     MessageTransport, TabContent, TabResolved,
@@ -485,52 +485,6 @@ async fn boot_window() -> Result<Boot, JsValue> {
         membership: Rc::clone(&tab.membership),
         _tab: tab,
     })
-}
-
-/// A short status line word for one client event, or `None` to ignore it.
-fn status_label(event: &ClientEvent) -> Option<String> {
-    match event {
-        ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
-        ClientEvent::Reconnected => Some("reconnected".to_owned()),
-        ClientEvent::MutationApplied { client_seq } => {
-            Some(format!("mutation {client_seq} applied"))
-        }
-        ClientEvent::MutationRejected {
-            client_seq, reason, ..
-        } => Some(format!("mutation {client_seq} rejected: {reason}")),
-        ClientEvent::MutationConflict {
-            client_seq,
-            server_row,
-            ..
-        } => Some(server_row.as_ref().map_or_else(
-            || format!("mutation {client_seq} conflicted, the server row is gone"),
-            |row| {
-                format!(
-                    "mutation {client_seq} conflicted, the server holds {}",
-                    row.row_json
-                )
-            },
-        )),
-        // The reconnect policy uses a fixed backoff and never reads retry_after_ms,
-        // so this value is informational only.
-        ClientEvent::RateLimited {
-            related_to: _,
-            retry_after_ms,
-        } => Some(format!(
-            "rate-limited by server: retry after {retry_after_ms} ms"
-        )),
-        ClientEvent::ServerClosed {
-            reason: FatalErrorReason::RateLimited { retry_after_ms },
-        } => Some(format!(
-            "connection closed: server rate-limited this client (retry after {retry_after_ms} ms)"
-        )),
-        ClientEvent::ServerClosed { reason } => {
-            Some(format!("server closed the session: {reason:?}"))
-        }
-        ClientEvent::Stopped { detail } => Some(format!("the client stopped: {detail}")),
-        ClientEvent::Closed => Some("connection closed".to_owned()),
-        _ => None,
-    }
 }
 
 /// Styling kept minimal: the demo is the topology, not the paint.
@@ -1223,6 +1177,7 @@ fn Dashboard() -> Element {
     let orders = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
     let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
+    let count = use_live(&client, orders::table.count());
 
     let order_rows = orders.value().read().clone();
     let note_rows = notes.value().read().clone();
@@ -1283,6 +1238,11 @@ fn Dashboard() -> Element {
     let orders_error = orders.error().read().clone();
     let notes_error = notes.error().read().clone();
     let photos_error = photos.error().read().clone();
+    let count_text = count
+        .value()
+        .read()
+        .map_or_else(|| "pending".to_owned(), |v| v.to_string());
+    let count_error = count.error().read().clone();
 
     let mut note_text = use_signal(String::new);
     let mut export_status: Signal<Option<String>> = use_signal(|| None);
@@ -1321,6 +1281,7 @@ fn Dashboard() -> Element {
             div { class: "pane",
                 h2 { "orders " span { class: "badge synced", "synced" } }
                 p { "count {order_count}, total quantity {order_sum}. Converges across every window through Postgres." }
+                p { "COUNT(*) pushed by the server: " strong { {count_text} } }
                 div { class: "row",
                     button {
                         disabled: add_order_identity.is_empty(),
@@ -1372,6 +1333,9 @@ fn Dashboard() -> Element {
                 }
                 if let Some(err) = orders_error {
                     p { style: "color:#b00;", "orders error: {err}" }
+                }
+                if let Some(err) = count_error {
+                    p { style: "color:#b00;", "count error: {err}" }
                 }
                 table {
                     thead { tr { th { "id" } th { "quantity" } } }

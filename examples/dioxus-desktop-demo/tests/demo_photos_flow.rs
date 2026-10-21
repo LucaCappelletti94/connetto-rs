@@ -7,7 +7,8 @@
 //!   `content_state` flip via `connetto_set_content_state`, signed-URL resolve,
 //!   bytes-equal fetch on a second device.
 //! - archive export with unsent content then import under a second device key:
-//!   bytes survive re-encryption.
+//!   bytes survive re-encryption, and the device-private tier (`notes`) rides
+//!   along the archive and comes back on the importing device.
 //!
 //! CI does NOT run tests in the examples workspaces (`ci.yml` runs tests only
 //! for root-workspace crates: `connetto-server`, `connetto-client`, and the rest
@@ -29,7 +30,7 @@ use connetto_client::{
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::ReplicaKeyStore as _;
 use connetto_core::transport::LoopbackTransport;
-use connetto_dioxus_desktop_demo::{photos, stage_photo_row};
+use connetto_dioxus_desktop_demo::{notes, photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
 use connetto_file_server::{
     AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,
@@ -41,6 +42,8 @@ use connetto_test_harness::{
 use diesel::prelude::*;
 use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use tempfile::tempdir;
+
+include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 
 /// The bytes staged and verified through the full flow.
 const PHOTO: &[u8] = b"JPEG bytes representing a photo staged through the desktop demo UI";
@@ -106,7 +109,31 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     // starts returning a real transport.
     let (a, gate) = offline_device(replica_dir.path(), "device-a", &server, &ddl).await;
     let mut a_client_events = a.events();
-    let a_content = attach_content(a, chunk_dir.path(), "a").await;
+    let a_content = attach_content(a.clone(), chunk_dir.path(), "a").await;
+
+    // The build bundle's tier rides along with the offline device: the table
+    // is there before anything is written to it.
+    let tier_tables = a
+        .with_conn(|conn| conn.local_tables().iter().cloned().collect::<Vec<_>>())
+        .await
+        .expect("read device A's tier tables");
+    assert!(
+        tier_tables.contains(&"notes".to_owned()),
+        "the tier table must ride along with the offline device, got {tier_tables:?}"
+    );
+
+    // A row written to the tier must ride along the archive to device C.
+    a.with_conn(|conn| {
+        diesel::insert_into(notes::table)
+            .values((
+                notes::id.eq(1),
+                notes::body.eq("a note that stays on this device"),
+            ))
+            .execute(conn.conn())
+    })
+    .await
+    .expect("write into the tier")
+    .expect("insert device-only note");
 
     // Stage using the demo pattern: orders row + photos row in one transaction.
     // `stage_photo_row` is the same function the desktop UI's pick handler calls.
@@ -227,7 +254,7 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     })
     .await;
     let c_content = ContentClient::attach(
-        c_client,
+        c_client.clone(),
         FsStore::new(chunk_dir.path().join("device-c")),
         [7u8; 32],
         ReqwestHttp::new(),
@@ -244,10 +271,33 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
         1,
         "archive carries the one unsent photo"
     );
+    assert_eq!(
+        plan.replica_plan().device_only_rows(),
+        1,
+        "the archive carries the one device-only note"
+    );
     c_content
         .apply_local_data_import(&mut plan, &ImportChoices::keeping_the_file())
         .await
         .expect("apply import");
+
+    // The tier row rides back through the archive into device C's own tier.
+    let imported_note = c_client
+        .with_conn(|conn| {
+            notes::table
+                .select(notes::body)
+                .filter(notes::id.eq(1))
+                .first::<String>(conn.conn())
+                .optional()
+        })
+        .await
+        .expect("read the imported tier row")
+        .expect("read the note");
+    assert_eq!(
+        imported_note.as_deref(),
+        Some("a note that stays on this device"),
+        "the device-only note survives the archive round trip"
+    );
 
     // After import the bytes are in device C's local store under its own key.
     assert!(
@@ -526,7 +576,8 @@ async fn wait_for_replica_state(
     }
 }
 
-/// The client schema over the test's translated DDL.
+/// The client schema over the test's translated DDL, with the build bundle's
+/// device-private tier, so the archive round trip covers both databases.
 fn schema(ddl: &str) -> SyncSchema {
     SyncSchema::new(SchemaBundle::new(
         SCHEMA_SQL,
@@ -534,7 +585,7 @@ fn schema(ddl: &str) -> SyncSchema {
         ddl,
         Vec::<(String, String)>::new(),
         Vec::<String>::new(),
-        None::<&str>,
+        connetto_schema_bundle::bundle().local_tier_ddl(),
     ))
 }
 

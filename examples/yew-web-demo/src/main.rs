@@ -37,7 +37,7 @@ use std::rc::Rc;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::teardown::expiry_warning;
 use connetto_client::{
-    AccountChoice, Auth, ClientEvent, ConnettoClient, ExportScope, SyncSchema, SyncTuning,
+    AccountChoice, Auth, ClientEvent, ConnettoClient, ExportScope, NoGate, SyncSchema, SyncTuning,
 };
 use connetto_core::custody::Custody;
 use connetto_file_core::{FileId, MimeClass};
@@ -46,6 +46,7 @@ use connetto_web::builder::{AttachedTab, TabTopology, WebClientBuilder};
 use connetto_web::unlock::serve_account_choice;
 use connetto_web::{MessageTransport, TabContent, TabResolved, deliver_login_code, workers};
 use connetto_yew::use_live;
+use connetto_yew_web_demo::status_label;
 use diesel::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
@@ -444,50 +445,6 @@ async fn boot_window() -> Result<Boot, JsValue> {
         tab,
         custody,
     })
-}
-
-/// A short status line word for one client event, or `None` to ignore it.
-fn status_label(event: &ClientEvent) -> Option<String> {
-    match event {
-        ClientEvent::Reconnecting { attempt } => Some(format!("reconnecting (attempt {attempt})")),
-        ClientEvent::Reconnected => Some("reconnected".to_owned()),
-        ClientEvent::MutationApplied { client_seq } => {
-            Some(format!("mutation {client_seq} applied"))
-        }
-        ClientEvent::MutationRejected {
-            client_seq, reason, ..
-        } => Some(format!("mutation {client_seq} rejected: {reason}")),
-        ClientEvent::MutationConflict {
-            client_seq,
-            server_row,
-            ..
-        } => Some(server_row.as_ref().map_or_else(
-            || format!("mutation {client_seq} conflicted, the server row is gone"),
-            |row| {
-                format!(
-                    "mutation {client_seq} conflicted, the server holds {}",
-                    row.row_json
-                )
-            },
-        )),
-        // The reconnect policy uses its own fixed backoff and does not read
-        // retry_after_ms. This shows the value so the user can see what the
-        // server asked for, even though nothing here acts on it automatically.
-        ClientEvent::RateLimited { retry_after_ms, .. } => Some(format!(
-            "rate limited, server asks to wait {retry_after_ms} ms before retrying"
-        )),
-        ClientEvent::ServerClosed {
-            reason: connetto_core::messages::FatalErrorReason::RateLimited { retry_after_ms },
-        } => Some(format!(
-            "connection closed: exceeded rate limit, server asks to wait {retry_after_ms} ms"
-        )),
-        ClientEvent::ServerClosed { reason } => {
-            Some(format!("server closed the session: {reason:?}"))
-        }
-        ClientEvent::Stopped { detail } => Some(format!("the client stopped: {detail}")),
-        ClientEvent::Closed => Some("connection closed".to_owned()),
-        _ => None,
-    }
 }
 
 /// Styling kept minimal: the demo is the topology, not the paint.
@@ -1109,9 +1066,60 @@ fn app() -> Html {
             html! {}
         };
 
+        // The passkey gate can only be offered while a passkey is available and
+        // the session is still unverified; once enrolled, custody flips and the
+        // button goes away.
+        let enrol_offerable = matches!(*custody, Custody::Unverified(NoGate::Offerable));
+        let enrol_html = if enrol_offerable {
+            let boot_hold = boot_hold.clone();
+            let custody = custody.clone();
+            let status = status.clone();
+            let enrol_gate = Callback::from(move |_| {
+                // The ceremony runs for as long as the user takes to present a
+                // finger, so the membership handle is cloned out and the borrow
+                // released before the await.
+                let membership = {
+                    let borrow = boot_hold.borrow();
+                    match borrow.as_ref() {
+                        Some(boot) => Rc::clone(&boot.tab.membership),
+                        None => return,
+                    }
+                };
+                // Clone the state handles so the async block owns its copies and
+                // the callback itself only borrows per call, keeping it `Fn`.
+                let custody = custody.clone();
+                let status = status.clone();
+                spawn_local(async move {
+                    match membership.enrol_gate().await {
+                        Ok(true) => {
+                            if let Ok(level) = workers::request_custody().await {
+                                custody.set(level);
+                            }
+                        }
+                        Ok(false) => {
+                            status.set(
+                                "the passkey gate can only be set up in the window that owns the \
+                                 database"
+                                    .to_owned(),
+                            );
+                        }
+                        Err(e) => status.set(format!("enrolment failed: {e:?}")),
+                    }
+                });
+            });
+            html! {
+                <span>
+                    <button onclick={enrol_gate}>{ "Enrol passkey gate" }</button>
+                </span>
+            }
+        } else {
+            html! {}
+        };
+
         html! {
             <div class="auth-bar">
                 { account_line }
+                { enrol_html }
                 { action_row }
                 { confirm_html }
                 { refused_html }
@@ -1157,6 +1165,7 @@ fn dashboard(props: &DashboardProps) -> Html {
     let orders = use_live::<_, _, Order>(&client, orders::table.order(orders::id));
     let notes = use_live::<_, _, Note>(&client, notes::table.order(notes::id));
     let photos = use_live::<_, _, Photo>(&client, photos::table.order(photos::id));
+    let count = use_live(&client, orders::table.count());
 
     let order_rows = orders.value();
     let note_rows = notes.value();
@@ -1165,6 +1174,9 @@ fn dashboard(props: &DashboardProps) -> Html {
     let order_sum: i64 = order_rows.iter().map(|row| row.quantity).sum();
     let note_count = note_rows.len();
     let photo_count = photo_rows.len();
+    let count_text = count
+        .value()
+        .map_or_else(|| "pending".to_owned(), |value| value.to_string());
 
     // Resolved signed URLs for available photos. Refetched (not cached) whenever the
     // set of available photos changes, so a stale ticket never wedges the panel.
@@ -1456,6 +1468,9 @@ fn dashboard(props: &DashboardProps) -> Html {
     let photos_error = photos.error().map(|err| {
         html! { <p style="color:#b00;">{ format!("photos error: {err}") }</p> }
     });
+    let count_error = count.error().map(|err| {
+        html! { <p style="color:#b00;">{ format!("count error: {err}") }</p> }
+    });
     let urls = (*photo_urls).clone();
 
     html! {
@@ -1463,6 +1478,7 @@ fn dashboard(props: &DashboardProps) -> Html {
             <div class="pane">
                 <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ format!("count {order_count}, total quantity {order_sum}. Converges across every window through Postgres.") }</p>
+                <p>{ "COUNT(*) pushed by the server: " }<strong>{ count_text.to_string() }</strong></p>
                 <div class="row">
                     <button onclick={add_order} disabled={identity.is_empty()}>{ "Add order" }</button>
                     if newest_order.is_some() {
@@ -1470,6 +1486,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                     }
                 </div>
                 { orders_error.unwrap_or_default() }
+                { count_error.unwrap_or_default() }
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody>
