@@ -38,7 +38,7 @@ use std::{
 
 use connetto_client::{
     AccountChoice, Auth, ClientEvent, ConnettoClient, Custody, ExportScope, NoGate, SyncSchema,
-    SyncTuning,
+    SyncTuning, decode_identity,
     teardown::{ExpiryWarning, expiry_warning},
 };
 use connetto_dioxus::use_live;
@@ -98,6 +98,8 @@ const AUTH_CALLBACK_PATH: &str = "/auth/callback";
 const DEMO_PROVIDER_CHANNEL: &str = "connetto-demo-provider";
 /// File name the export download is offered under.
 const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
+/// The `localStorage` key holding the account the last successful sign-in used.
+const STORED_ACCOUNT_KEY: &str = "connetto-demo-last-account";
 
 diesel::table! {
     orders (id) {
@@ -244,8 +246,9 @@ fn clear_url_query() {
     let _ = js_sys::eval("history.replaceState(null,'',location.pathname)");
 }
 
-/// Reload the page after logout.
+/// Reload the page after logout, dropping the remembered account first.
 fn reload_page() {
+    clear_stored_account();
     let _ = js_sys::eval("location.reload()");
 }
 
@@ -294,6 +297,37 @@ fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), JsValue> {
     anchor.set_download(name);
     anchor.click();
     web_sys::Url::revoke_object_url(&url)
+}
+
+/// The account the last successful sign-in on this origin used, or `None`.
+///
+/// Read at first paint, before the worker re-acquires the session.
+fn read_stored_account() -> Option<String> {
+    let storage = web_sys::window()?.local_storage().ok().flatten()?;
+    storage.get_item(STORED_ACCOUNT_KEY).ok().flatten()
+}
+
+/// Remember the account a successful sign-in used, so a reload knows a restore is under way.
+fn save_stored_account(account: &str) {
+    if let Some(window) = web_sys::window()
+        && let Some(storage) = window.local_storage().ok().flatten()
+    {
+        let _ = storage.set_item(STORED_ACCOUNT_KEY, account);
+    }
+}
+
+/// Drop the remembered account on logout, so the next load shows the sign-in screen.
+fn clear_stored_account() {
+    if let Some(window) = web_sys::window()
+        && let Some(storage) = window.local_storage().ok().flatten()
+    {
+        let _ = storage.remove_item(STORED_ACCOUNT_KEY);
+    }
+}
+
+/// The display identity behind an account key; the key itself when it does not decode.
+fn stored_identity(account: &str) -> String {
+    decode_identity::<String>(account).unwrap_or_else(|_| account.to_owned())
 }
 
 // -----------------------------------------------------------------------------
@@ -529,6 +563,12 @@ struct BootHold(Rc<RefCell<Option<Boot>>>);
 #[derive(Clone, Copy)]
 struct LiveAccount(Signal<Option<String>>);
 
+/// The account the last sign-in used.
+///
+/// A reload renders the signed-in page straight away while it holds an account.
+#[derive(Clone, Copy)]
+struct StoredAccount(Signal<Option<String>>);
+
 /// Unix-second deadline after which the session lapses if never refreshed.
 #[derive(Clone, Copy)]
 struct SessionExpiresAt(Signal<Option<u64>>);
@@ -572,6 +612,8 @@ fn App() -> Element {
     let login_prompt: Signal<Option<String>> = use_signal(|| None);
     // Multi-account, custody, and session-expiry state broadcast from the worker.
     let mut live_account: Signal<Option<String>> = use_signal(|| None);
+    // The account a reload restores; the session broadcast refreshes it.
+    let mut stored_account: Signal<Option<String>> = use_signal(read_stored_account);
     let mut session_expires_at: Signal<Option<u64>> = use_signal(|| None);
     let mut custody_level: Signal<Option<Custody>> = use_signal(|| None);
     let mut all_accounts: Signal<Vec<String>> = use_signal(Vec::new);
@@ -584,6 +626,7 @@ fn App() -> Element {
     use_context_provider(|| user_id);
     use_context_provider(|| LoginPrompt(login_prompt));
     use_context_provider(|| LiveAccount(live_account));
+    use_context_provider(|| StoredAccount(stored_account));
     use_context_provider(|| SessionExpiresAt(session_expires_at));
     use_context_provider(|| CustodyLevel(custody_level));
     use_context_provider(|| AllAccounts(all_accounts));
@@ -645,11 +688,16 @@ fn App() -> Element {
                 {
                     user_id.set(Some(uid));
                 }
-                live_account.set(
-                    js_sys::Reflect::get(&data, &JsValue::from_str("account"))
-                        .ok()
-                        .and_then(|v| v.as_string()),
-                );
+                let account = js_sys::Reflect::get(&data, &JsValue::from_str("account"))
+                    .ok()
+                    .and_then(|v| v.as_string());
+                if let Some(account) = account {
+                    save_stored_account(&account);
+                    stored_account.set(Some(account.clone()));
+                    live_account.set(Some(account));
+                } else {
+                    live_account.set(None);
+                }
                 session_expires_at.set(
                     js_sys::Reflect::get(&data, &JsValue::from_str("session_expires_at"))
                         .ok()
@@ -746,6 +794,7 @@ fn App() -> Element {
     });
 
     let ready = client_slot.read().is_some();
+    let restoring = stored_account.read().is_some();
     rsx! {
         style { {CSS} }
         div { class: "wrap",
@@ -754,6 +803,8 @@ fn App() -> Element {
             AuthBanner {}
             if ready {
                 Dashboard {}
+            } else if restoring {
+                PanesSkeleton {}
             } else {
                 p { "Connecting to the DB worker and the connetto stack..." }
             }
@@ -846,6 +897,7 @@ fn AuthBanner() -> Element {
     let mut user_id = use_context::<Signal<Option<String>>>();
     let login_prompt = use_context::<LoginPrompt>().0;
     let mut live_account = use_context::<LiveAccount>().0;
+    let stored_account = use_context::<StoredAccount>().0;
     let session_expires_at = use_context::<SessionExpiresAt>().0;
     let mut custody = use_context::<CustodyLevel>().0;
     let all_accounts = use_context::<AllAccounts>().0;
@@ -865,47 +917,59 @@ fn AuthBanner() -> Element {
         spawn(poll_expiry_warn(secs, session_expires_at, expiry_warn));
     });
 
-    if user_id.read().is_none() && login_prompt.read().is_some() {
-        // The worker is waiting for an interactive login. A popup keeps this page
-        // and its worker alive, and it can only be opened from a real click.
-        let url = login_prompt.read().clone().unwrap_or_default();
+    let prompt = login_prompt.read().clone();
+    let stored = stored_account.read().clone();
+    let uid_present = user_id.read().is_some();
+    let live_acc = live_account.read().clone();
+    let accounts = all_accounts.read().clone();
+    let is_active_picker = *picker_active.read();
+
+    // Custody description and derived flags.
+    let (enrol_offerable, custody_text) = custody_description(*custody.read());
+
+    // Session expiry warning text, computed outside RSX to keep the template flat.
+    let expiry_line = {
+        let guard = expiry_warn.read();
+        guard.as_ref().map(format_expiry_line)
+    };
+
+    // Accounts the user can switch to: all stored minus the live one.
+    let switch_targets: Vec<(String, String)> = accounts
+        .iter()
+        .filter(|a| Some(*a) != live_acc.as_ref())
+        .map(|a| (a.clone(), a.clone()))
+        .collect();
+    // Each picker button needs its own (key, label) pair so closures can
+    // capture the key by move without consuming the label.
+    let picker_accounts: Vec<(String, String)> =
+        accounts.iter().map(|a| (a.clone(), a.clone())).collect();
+    // A restore must keep the picker reachable, because the worker waits on it before the session lands.
+    let picker_html: Element = if is_active_picker {
         rsx! {
-            div { class: "auth-banner auth-signed-in",
-                p { "Sign in to begin." }
+            p { "Choose an account to sign in as:" }
+            div { class: "row",
+                for (acc_key, acc_label) in picker_accounts {
+                    button {
+                        key: "{acc_label}",
+                        onclick: move |_| {
+                            account_answer
+                                .set(Some(AccountChoice::Account(acc_key.clone())))
+                        },
+                        "Sign in as {acc_label}"
+                    }
+                }
                 button {
-                    onclick: move |_| open_login_popup(&url),
-                    "Sign in"
+                    onclick: move |_| account_answer.set(Some(AccountChoice::LastUsed)),
+                    "Last used"
                 }
             }
         }
     } else {
-        let uid_text = user_id
-            .read()
-            .clone()
-            .unwrap_or_else(|| "authenticating...".to_owned());
-        let live_acc = live_account.read().clone();
-        let accounts = all_accounts.read().clone();
-        let is_active_picker = *picker_active.read();
+        rsx! {}
+    };
 
-        // Custody description and derived flags.
-        let (enrol_offerable, custody_text) = custody_description(*custody.read());
-
-        // Session expiry warning text, computed outside RSX to keep the template flat.
-        let expiry_line = {
-            let guard = expiry_warn.read();
-            guard.as_ref().map(format_expiry_line)
-        };
-
-        // Accounts the user can switch to: all stored minus the live one.
-        let switch_targets: Vec<(String, String)> = accounts
-            .iter()
-            .filter(|a| Some(*a) != live_acc.as_ref())
-            .map(|a| (a.clone(), a.clone()))
-            .collect();
-        // Each picker button needs its own (key, label) pair so closures can
-        // capture the key by move without consuming the label.
-        let picker_accounts: Vec<(String, String)> =
-            accounts.iter().map(|a| (a.clone(), a.clone())).collect();
+    if uid_present {
+        let uid_text = user_id.read().clone().unwrap_or_default();
 
         rsx! {
             div { class: "auth-banner auth-signed-in",
@@ -973,25 +1037,7 @@ fn AuthBanner() -> Element {
                 if let Some(line) = expiry_line {
                     p { class: "warn", {line} }
                 }
-                if is_active_picker {
-                    p { "Choose an account to sign in as:" }
-                    div { class: "row",
-                        for (acc_key, acc_label) in picker_accounts {
-                            button {
-                                key: "{acc_label}",
-                                onclick: move |_| {
-                                    account_answer
-                                        .set(Some(AccountChoice::Account(acc_key.clone())))
-                                },
-                                "Sign in as {acc_label}"
-                            }
-                        }
-                        button {
-                            onclick: move |_| account_answer.set(Some(AccountChoice::LastUsed)),
-                            "Last used"
-                        }
-                    }
-                }
+                { picker_html }
                 div { class: "row",
                     for (acc_key, acc_label) in switch_targets {
                         button {
@@ -1055,6 +1101,31 @@ fn AuthBanner() -> Element {
                     }
                 }
                 LogoutControls {}
+            }
+        }
+    } else if prompt.is_some() || stored.is_none() {
+        // The Sign in button stays inert until the worker has parked a login URL.
+        rsx! {
+            div { class: "auth-banner auth-signed-in",
+                p { "Sign in to begin." }
+                button {
+                    disabled: prompt.is_none(),
+                    onclick: move |_| {
+                        if let Some(url) = login_prompt.read().clone() {
+                            open_login_popup(&url);
+                        }
+                    },
+                    "Sign in"
+                }
+            }
+        }
+    } else {
+        // The session is still landing, so the bar shows only the account the last sign-in used.
+        let account = stored.unwrap_or_default();
+        rsx! {
+            div { class: "auth-banner auth-signed-in",
+                p { "Signed in as: " strong { {stored_identity(&account)} } }
+                { picker_html }
             }
         }
     }
@@ -1156,6 +1227,51 @@ fn LogoutControls() -> Element {
             p { style: "color:#b00;", "Error: {msg}" }
             button { onclick: on_cancel, "Dismiss" }
         },
+    }
+}
+
+/// The pane layout shown while a stored session is still landing; the Dashboard replaces it once the client attaches.
+#[component]
+fn PanesSkeleton() -> Element {
+    rsx! {
+        div { class: "panes",
+            div { class: "pane",
+                h2 { "orders " span { class: "badge synced", "synced" } }
+                p { "count 0, total quantity 0. Converges across every window through Postgres." }
+                table {
+                    thead { tr { th { "id" } th { "quantity" } } }
+                    tbody {}
+                }
+            }
+            div { class: "pane",
+                h2 { "photos " span { class: "badge synced", "synced" } }
+                p { "count 0. Pick an image file to stage and upload through the content route." }
+                table {
+                    thead { tr { th { "id" } th { "state" } th { "image" } } }
+                    tbody {}
+                }
+            }
+            div { class: "pane",
+                h2 { "notes " span { class: "badge local", "device-only" } }
+                p { "count 0. Converges across this device's windows through the DB worker, never the server." }
+                table {
+                    thead { tr { th { "id" } th { "body" } } }
+                    tbody {}
+                }
+            }
+            div { class: "pane",
+                h2 { "retention " span { class: "badge trim", "R15" } }
+                p { "Replica mirror: 0 pages (~0 KB), 0 free to reclaim. Covered rows: 0." }
+                p { "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }
+            }
+            div { class: "pane",
+                h2 { "your data " span { class: "badge local", "R26" } }
+                p { "Save a zip archive of this device's local data. The archive is not \
+                     encrypted and holds every row the device can read: whoever holds \
+                     the file holds the data." }
+                p { "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }
+            }
+        }
     }
 }
 

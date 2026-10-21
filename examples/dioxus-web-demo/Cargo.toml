@@ -37,6 +37,7 @@ rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
 # `Blob`, `Url` and the anchor element are the export download affordance: a
 # page can only offer a file by clicking a synthetic link at an object URL.
 # `File`, `FileList` and `HtmlInputElement` back the import file picker.
+# `Storage` keeps the last signed-in account across reloads, a non-secret identifier.
 web-sys = { version = "0.3", features = [
   "Blob",
   "BlobPropertyBag",
@@ -52,6 +53,7 @@ web-sys = { version = "0.3", features = [
   "Request",
   "RequestInit",
   "Response",
+  "Storage",
   "UrlSearchParams",
   "Url",
   "Window",

@@ -38,6 +38,7 @@ use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::teardown::expiry_warning;
 use connetto_client::{
     AccountChoice, Auth, ClientEvent, ConnettoClient, ExportScope, NoGate, SyncSchema, SyncTuning,
+    decode_identity,
 };
 use connetto_core::custody::Custody;
 use connetto_file_core::{FileId, MimeClass};
@@ -90,6 +91,8 @@ const AUTH_PROVIDER: &str = "dev-idp";
 const DEMO_PROVIDER_CHANNEL: &str = "connetto-demo-provider";
 /// File name the export download is offered under.
 const EXPORT_FILE_NAME: &str = "connetto-local-data.zip";
+/// The `localStorage` key holding the account the last successful sign-in used.
+const STORED_ACCOUNT_KEY: &str = "connetto-demo-last-account";
 
 diesel::table! {
     orders (id) {
@@ -354,8 +357,9 @@ fn query_param(search: &str, key: &str) -> Option<String> {
     })
 }
 
-/// Reload the page after logout or an account switch.
+/// Reload the page after logout, dropping the remembered account first.
 fn reload_page() {
+    clear_stored_account();
     if let Some(win) = web_sys::window() {
         let _ = win.location().reload();
     }
@@ -388,6 +392,37 @@ fn download_blob(name: &str, blob: &web_sys::Blob) -> Result<(), JsValue> {
     anchor.set_download(name);
     anchor.click();
     web_sys::Url::revoke_object_url(&url)
+}
+
+/// The account the last successful sign-in on this origin used, or `None`.
+///
+/// Read at first paint, before the worker re-acquires the session.
+fn read_stored_account() -> Option<String> {
+    let storage = web_sys::window()?.local_storage().ok().flatten()?;
+    storage.get_item(STORED_ACCOUNT_KEY).ok().flatten()
+}
+
+/// Remember the account a successful sign-in used, so a reload knows a restore is under way.
+fn save_stored_account(account: &str) {
+    if let Some(window) = web_sys::window()
+        && let Some(storage) = window.local_storage().ok().flatten()
+    {
+        let _ = storage.set_item(STORED_ACCOUNT_KEY, account);
+    }
+}
+
+/// Drop the remembered account on logout, so the next load shows the sign-in screen.
+fn clear_stored_account() {
+    if let Some(window) = web_sys::window()
+        && let Some(storage) = window.local_storage().ok().flatten()
+    {
+        let _ = storage.remove_item(STORED_ACCOUNT_KEY);
+    }
+}
+
+/// The display identity behind an account key; the key itself when it does not decode.
+fn stored_identity(account: &str) -> String {
+    decode_identity::<String>(account).unwrap_or_else(|_| account.to_owned())
 }
 
 /// The served URL of this app's wasm-bindgen glue module, recovered from the
@@ -582,13 +617,14 @@ fn decode_boot_message(
 }
 
 /// Custom hook: listens on the identity broadcast channel and updates the
-/// identity, account, session expiry, and expiry warning state.
+/// session state, recording the account a reload will restore.
 #[hook]
 fn use_boot_session_listener(
     identity: UseStateHandle<Option<String>>,
     booted_account: UseStateHandle<Option<String>>,
     session_expires_at: UseStateHandle<Option<u64>>,
     expiry_warn: UseStateHandle<Option<connetto_client::teardown::ExpiryWarning>>,
+    stored: UseStateHandle<Option<String>>,
 ) {
     use_effect_with((), move |()| {
         let channel = BroadcastChannel::new(DEMO_IDENTITY_CHANNEL).expect("identity channel");
@@ -600,6 +636,7 @@ fn use_boot_session_listener(
             let booted_account = booted_account.clone();
             let session_expires_at = session_expires_at.clone();
             let expiry_warn = expiry_warn.clone();
+            let stored = stored.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |event: MessageEvent| {
                 let Some((id, expires_at, account)) = decode_boot_message(&event) else {
                     return;
@@ -608,6 +645,8 @@ fn use_boot_session_listener(
                     identity.set(Some(id));
                 }
                 if let Some(acc) = account {
+                    save_stored_account(&acc);
+                    stored.set(Some(acc.clone()));
                     booted_account.set(Some(acc));
                 }
                 if let Some(exp) = expires_at {
@@ -701,13 +740,13 @@ fn use_boot_window_effect(
     content: UseStateHandle<Option<ContentHandle>>,
     status: UseStateHandle<String>,
     boot_hold: Rc<RefCell<Option<Boot>>>,
-    custody: UseStateHandle<Custody>,
+    custody: UseStateHandle<Option<Custody>>,
 ) {
     use_effect_with((), move |()| {
         spawn_local(async move {
             match boot_window().await {
                 Ok(boot) => {
-                    custody.set(boot.custody);
+                    custody.set(Some(boot.custody));
                     content.set(Some(ContentHandle(Rc::clone(&boot.content))));
                     let mut events = boot.client.events();
                     client.set(Some(ClientHandle(Rc::new(boot.client.clone()))));
@@ -746,8 +785,12 @@ fn app() -> Html {
     let booted_account = use_state(|| None::<String>);
     let session_expires_at = use_state(|| None::<u64>);
 
-    // Passkey custody level, set once after boot_window returns.
-    let custody = use_state(|| Custody::Ephemeral);
+    // The account a reload restores; the session broadcast refreshes it.
+    let stored_account = use_state(read_stored_account);
+
+    // Passkey custody level, unknown until boot_window returns, so the page
+    // shows no passkey line before the worker has said which it is.
+    let custody = use_state(|| None::<Custody>);
 
     // Session expiry warning: Some when the session is near its end and there
     // are unsynced writes that would be lost if it lapses.
@@ -782,6 +825,7 @@ fn app() -> Html {
         booted_account.clone(),
         session_expires_at.clone(),
         expiry_warn.clone(),
+        stored_account.clone(),
     );
 
     use_login_url_listener(login_url.clone());
@@ -942,40 +986,32 @@ fn app() -> Html {
     };
 
     let auth_bar = {
-        let account_line = match ((*identity).clone(), (*booted_account).clone()) {
-            (Some(uid), Some(acc)) => html! {
-                <span>
-                    { format!("Signed in as {} (account: {}).", uid, acc) }
-                    { " " }
-                    { format!("Passkey: {}.", &*custody) }
-                </span>
-            },
-            (Some(uid), None) => html! {
-                <span>
-                    { format!("Signed in as {}.", uid) }
-                    { " " }
-                    { format!("Passkey: {}.", &*custody) }
-                </span>
-            },
-            _ => html! {
-                <span>
-                    { "Signed in (account loading)." }
-                    { " " }
-                    { format!("Passkey: {}.", &*custody) }
-                </span>
-            },
-        };
+        let signed_in = identity.is_some();
+        let prompt_present = (*login_url).is_some();
+        let stored = (*stored_account).clone();
+        if signed_in {
+            let passkey_line = (*custody)
+                .as_ref()
+                .map(|custody| format!(" Passkey: {custody}."))
+                .unwrap_or_default();
+            let account_line = {
+                let uid = (*identity).clone().unwrap_or_default();
+                match (*booted_account).clone() {
+                    Some(acc) => html! {
+                        <span>
+                            { format!("Signed in as {} (account: {}).", uid, acc) }
+                            { passkey_line }
+                        </span>
+                    },
+                    None => html! {
+                        <span>
+                            { format!("Signed in as {}.", uid) }
+                            { passkey_line }
+                        </span>
+                    },
+                }
+            };
 
-        // The login prompt stands only until the account is known.
-        let awaiting_login = identity.is_none();
-        let action_row = if (*login_url).is_some() && awaiting_login {
-            html! {
-                <span>
-                    { "Interactive sign-in required. " }
-                    <button onclick={open_login}>{ "Sign in" }</button>
-                </span>
-            }
-        } else {
             // Switch-account buttons for any known account that is not the live one.
             let switch_buttons: Html = (*known_accounts)
                 .iter()
@@ -1033,110 +1069,126 @@ fn app() -> Html {
                     }
                 })
             };
-            html! {
-                <span>
-                    <button onclick={logout_keep}>{ "Log out, keep local data" }</button>
-                    { " " }
-                    <button onclick={logout_delete}>{ "Delete local data and log out" }</button>
-                    { " " }
-                    { switch_buttons }
-                    <button onclick={add_account}>{ "Add another account" }</button>
-                </span>
-            }
-        };
+            let confirm_html = if let Some(pending) = &*confirm_seqs {
+                let count = pending.len();
+                html! {
+                    <span>
+                        { format!("{count} local item(s) will be lost. ") }
+                        <button onclick={confirm_delete}>{ "Delete anyway" }</button>
+                        { " " }
+                        <button onclick={cancel_confirm.clone()}>{ "Cancel" }</button>
+                    </span>
+                }
+            } else {
+                html! {}
+            };
 
-        let confirm_html = if let Some(pending) = &*confirm_seqs {
-            let count = pending.len();
-            html! {
-                <span>
-                    { format!("{count} local item(s) will be lost. ") }
-                    <button onclick={confirm_delete}>{ "Delete anyway" }</button>
-                    { " " }
-                    <button onclick={cancel_confirm.clone()}>{ "Cancel" }</button>
-                </span>
-            }
-        } else {
-            html! {}
-        };
+            let refused_html = if let Some(pending) = &*refused_seqs {
+                let count = pending.len();
+                html! {
+                    <span>
+                        { format!("Refused: {count} local item(s) still pending. ") }
+                        <button onclick={force_delete}>{ "Force delete" }</button>
+                        { " " }
+                        <button onclick={cancel_confirm}>{ "Cancel" }</button>
+                    </span>
+                }
+            } else {
+                html! {}
+            };
 
-        let refused_html = if let Some(pending) = &*refused_seqs {
-            let count = pending.len();
-            html! {
-                <span>
-                    { format!("Refused: {count} local item(s) still pending. ") }
-                    <button onclick={force_delete}>{ "Force delete" }</button>
-                    { " " }
-                    <button onclick={cancel_confirm}>{ "Cancel" }</button>
-                </span>
-            }
-        } else {
-            html! {}
-        };
-
-        // The passkey gate can only be offered while a passkey is available and
-        // the session is still unverified; once enrolled, custody flips and the
-        // button goes away.
-        let enrol_offerable = matches!(*custody, Custody::Unverified(NoGate::Offerable));
-        let enrol_html = if enrol_offerable {
-            let boot_hold = boot_hold.clone();
-            let custody = custody.clone();
-            let status = status.clone();
-            let enrol_gate = Callback::from(move |_| {
-                // The ceremony runs for as long as the user takes to present a
-                // finger, so the membership handle is cloned out and the borrow
-                // released before the await.
-                let membership = {
-                    let borrow = boot_hold.borrow();
-                    match borrow.as_ref() {
-                        Some(boot) => Rc::clone(&boot.tab.membership),
-                        None => return,
-                    }
-                };
-                // Clone the state handles so the async block owns its copies and
-                // the callback itself only borrows per call, keeping it `Fn`.
+            // The passkey gate can only be offered while a passkey is available and
+            // the session is still unverified; once enrolled, custody flips and the
+            // button goes away.
+            let enrol_offerable = matches!(*custody, Some(Custody::Unverified(NoGate::Offerable)));
+            let enrol_html = if enrol_offerable {
+                let boot_hold = boot_hold.clone();
                 let custody = custody.clone();
                 let status = status.clone();
-                spawn_local(async move {
-                    match membership.enrol_gate().await {
-                        Ok(true) => {
-                            if let Ok(level) = workers::request_custody().await {
-                                custody.set(level);
+                let enrol_gate = Callback::from(move |_| {
+                    // The ceremony runs for as long as the user takes to present a
+                    // finger, so the membership handle is cloned out and the borrow
+                    // released before the await.
+                    let membership = {
+                        let borrow = boot_hold.borrow();
+                        match borrow.as_ref() {
+                            Some(boot) => Rc::clone(&boot.tab.membership),
+                            None => return,
+                        }
+                    };
+                    // Clone the state handles so the async block owns its copies and
+                    // the callback itself only borrows per call, keeping it `Fn`.
+                    let custody = custody.clone();
+                    let status = status.clone();
+                    spawn_local(async move {
+                        match membership.enrol_gate().await {
+                            Ok(true) => {
+                                if let Ok(level) = workers::request_custody().await {
+                                    custody.set(Some(level));
+                                }
                             }
+                            Ok(false) => {
+                                status.set(
+                                    "the passkey gate can only be set up in the window that \
+                                     owns the database"
+                                        .to_owned(),
+                                );
+                            }
+                            Err(e) => status.set(format!("enrolment failed: {e:?}")),
                         }
-                        Ok(false) => {
-                            status.set(
-                                "the passkey gate can only be set up in the window that owns the \
-                                 database"
-                                    .to_owned(),
-                            );
-                        }
-                        Err(e) => status.set(format!("enrolment failed: {e:?}")),
-                    }
+                    });
                 });
-            });
+                html! {
+                    <span>
+                        <button onclick={enrol_gate}>{ "Enrol passkey gate" }</button>
+                    </span>
+                }
+            } else {
+                html! {}
+            };
+
             html! {
-                <span>
-                    <button onclick={enrol_gate}>{ "Enrol passkey gate" }</button>
-                </span>
+                <div class="auth-bar">
+                    { account_line }
+                    { enrol_html }
+                    <span>
+                        <button onclick={logout_keep}>{ "Log out, keep local data" }</button>
+                        { " " }
+                        <button onclick={logout_delete}>{ "Delete local data and log out" }</button>
+                        { " " }
+                        { switch_buttons }
+                        <button onclick={add_account}>{ "Add another account" }</button>
+                    </span>
+                    { confirm_html }
+                    { refused_html }
+                </div>
+            }
+        } else if prompt_present || stored.is_none() {
+            // The button opens the login URL the worker parks; it is inert until one arrives.
+            html! {
+                <div class="auth-bar">
+                    <span>
+                        { "Sign in to begin. " }
+                        <button disabled={!prompt_present} onclick={open_login}>{ "Sign in" }</button>
+                    </span>
+                </div>
             }
         } else {
-            html! {}
-        };
-
-        html! {
-            <div class="auth-bar">
-                { account_line }
-                { enrol_html }
-                { action_row }
-                { confirm_html }
-                { refused_html }
-            </div>
+            let account = stored.unwrap_or_default();
+            html! {
+                <div class="auth-bar">
+                    <span>{ format!("Signed in as {}.", stored_identity(&account)) }</span>
+                </div>
+            }
         }
     };
 
     let dashboard = if let (Some(handle), Some(content_handle)) = (&*client, &*content) {
         let id = (*identity).clone().unwrap_or_default();
         html! { <Dashboard client={handle.clone()} content={content_handle.clone()} identity={id} /> }
+    } else if (*stored_account).is_some() {
+        // A restore is under way, so the page stays a signed-in page.
+        html! { <PanesSkeleton /> }
     } else {
         html! { <p>{ "Connecting to the DB worker and the connetto stack..." }</p> }
     };
@@ -1153,6 +1205,52 @@ fn app() -> Html {
                 { dashboard }
             </div>
         </>
+    }
+}
+
+/// The pane layout shown while a stored session is still landing; the
+/// Dashboard replaces it once the client attaches.
+#[function_component(PanesSkeleton)]
+fn panes_skeleton() -> Html {
+    html! {
+        <div class="panes">
+            <div class="pane">
+                <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
+                <p>{ "count 0, total quantity 0. Converges across every window through Postgres." }</p>
+                <table>
+                    <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2>{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
+                <p>{ "count 0. Pick an image file to stage and upload through the content route." }</p>
+                <table>
+                    <thead><tr><th>{ "id" }</th><th>{ "state" }</th><th>{ "image" }</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2>{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
+                <p>{ "count 0. Converges across this device's windows through the DB worker, never the server." }</p>
+                <table>
+                    <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
+                    <tbody></tbody>
+                </table>
+            </div>
+            <div class="pane">
+                <h2>{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
+                <p>{ "Replica mirror: 0 pages (~0 KB), 0 free to reclaim. Covered rows: 0." }</p>
+                <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
+            </div>
+            <div class="pane">
+                <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
+                <p>{ "Save a zip archive of this device's local data. The archive is not \
+                      encrypted and holds every row the device can read: whoever holds \
+                      the file holds the data." }</p>
+                <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
+            </div>
+        </div>
     }
 }
 
