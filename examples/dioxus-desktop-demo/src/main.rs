@@ -195,16 +195,18 @@ fn demo_quantity() -> i64 {
 
 /// A device-unique integer id for a local-only `notes` row. `notes` stays on
 /// integer keys (device-private, never synced), so the client authors the id.
-/// The millisecond clock plus a random low tag keeps two windows of one device
-/// from colliding within the same millisecond.
+/// The id is the millisecond clock above 21 random bits, so notes list in the
+/// order they were written and two windows of one device saving in the same
+/// millisecond collide about once in two million.
 fn fresh_note_id() -> i64 {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis());
+    let millis = i64::try_from(millis).unwrap_or(0);
+    debug_assert!(millis < 1 << 42, "the shifted clock would overflow an i64");
     let bytes: [u8; 16] = rosetta_uuid::Uuid::new_v4().into();
-    let tag =
-        i64::from_le_bytes(bytes[0..8].try_into().expect("eight bytes")).unsigned_abs() % 1000;
-    i64::try_from(millis).unwrap_or(0) * 1000 + i64::try_from(tag).unwrap_or(0)
+    let tag = u32::from_le_bytes(bytes[0..4].try_into().expect("four bytes")) >> 11;
+    (millis << 21) | i64::from(tag)
 }
 
 type Ws = NativeTransport;

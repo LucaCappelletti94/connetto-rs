@@ -146,17 +146,19 @@ struct Photo {
 
 /// A device-unique integer id for a local-only `notes` row. `notes` stays on
 /// integer keys (device-private, never synced), so the client authors the id.
-/// The millisecond clock plus a random low tag keeps two windows of one device
-/// from colliding within the same millisecond.
+/// The id is the millisecond clock above 21 random bits, so notes list in the
+/// order they were written and two windows of one device saving in the same
+/// millisecond collide about once in two million.
 fn fresh_note_id() -> i64 {
+    let span = f64::from(1u32 << 21);
     let now = js_sys::Date::now();
-    debug_assert!(now.is_finite() && now >= 0.0);
-    // Intended truncation: whole milliseconds since the epoch.
+    debug_assert!(now.is_finite() && (0.0..span * span).contains(&now));
+    // Deliberate truncation: whole milliseconds, below 2^42 until 2109.
     let millis = now as i64;
-    let tag = js_sys::Math::random() * 1000.0;
-    // Math::random is [0, 1); scale to a 0..=999 tag. Deliberate quantization.
-    debug_assert!(tag.is_finite() && (0.0..1000.0).contains(&tag));
-    millis * 1000 + tag as i64
+    let r = js_sys::Math::random() * span;
+    debug_assert!(r.is_finite() && (0.0..span).contains(&r));
+    // Deliberate quantization: [0.0, 2^21) -> [0, 2^21 - 1].
+    (millis << 21) | r as i64
 }
 
 /// A visible order quantity inside the subscription's `quantity > 0` window.
