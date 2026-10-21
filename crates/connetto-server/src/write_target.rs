@@ -329,7 +329,7 @@ impl<D: ConnettoSchema> PgWriteTarget<D> {
     }
 
     /// The current row a re-answered settled conflict reads fresh, under the
-    /// caller's RLS context on the owner pool.
+    /// caller's RLS context on the reader pool.
     pub(crate) async fn settled_conflict_row<Key: CapabilityKey>(
         &self,
         caller: &Principal<D::Id, Key>,

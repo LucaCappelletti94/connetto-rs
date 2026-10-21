@@ -1126,10 +1126,16 @@ where
             slot_lag_watch,
         )
         .await?;
-        // The engine's reads are global statistics with no RLS by construction, so they take their own connector handle.
-        let connector = PgReadConnector::with_session_setup(pool.clone());
-        let engine_connector = PgReadConnector::with_session_setup(pool.clone());
         let reader_pool_size = reader_reserve.total();
+        let reader_pool = build_pool(&database.reader_url, reader_pool_size).await?;
+        // The computed reads the session and the engine run under a viewer's
+        // binding, so both take the reader role, where the viewer's policies
+        // scope the rows. Their own pool, sized at the owner pool's, keeps a
+        // re-execution hold out of the gated reader pool the reader reserve
+        // splits (R39).
+        let reexec_pool = build_pool(&database.reader_url, owner_pool_size).await?;
+        let connector = PgReadConnector::with_session_setup(reexec_pool.clone());
+        let engine_connector = PgReadConnector::with_session_setup(reexec_pool.clone());
         let guard = build_guard::<D>(&pool, reader_reserve.gate(), &throttle, abuse, bans);
         let (service, registry) = build_auth::<D>(
             &pool,
@@ -1142,10 +1148,15 @@ where
         )
         .await?;
         let authority: Arc<dyn HandshakeAuthority<D::Id>> = Arc::new(service.handshake_authority());
-
-        let reader =
-            build_reader_side::<D>(&database, reader_pool_size, &schema, &publication, content)
-                .await?;
+        let reader = build_reader_side::<D>(
+            &database,
+            reader_pool,
+            reader_pool_size,
+            &schema,
+            &publication,
+            content,
+        )
+        .await?;
         let write_side = build_write_side::<D>(
             Pools {
                 owner: pool.clone(),
@@ -1487,16 +1498,16 @@ async fn build_auth<D: ConnettoSchema>(
     Ok((service, registry))
 }
 
-/// The reader pool's three consumers, the pool itself, the file half and the
-/// snapshot source, all built from the same conninfos.
+/// The reader pool's consumers: the file half, its sweep and the snapshot
+/// source, built over the pool the call site opens from the reader conninfos.
 async fn build_reader_side<D: ConnettoSchema>(
     database: &Database,
+    pool: PgPool,
     reader_pool_size: u32,
     schema: &ServerSchema,
     publication: &str,
     content: Option<ContentSettings>,
 ) -> Result<ReaderSide, BuildError> {
-    let pool = build_pool(&database.reader_url, reader_pool_size).await?;
     let (signer, file_router, sweep) = content::build::<D>(
         content,
         &database.owner_url,

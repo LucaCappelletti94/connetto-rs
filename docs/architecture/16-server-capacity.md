@@ -12,11 +12,13 @@ They also fail differently, which is why they are separate mechanisms rather tha
 
 ---
 
-## The two pools
+## The three pools
 
-**Built, sizes explicit since R39 (2026-08-08).** The server builds two Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/builder/mod.rs`. Both default to bb8's ten connections, now stated rather than implied: `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` set them, and `CONNETTO_READER_RESERVE` (default 3) is expressed against the reader pool's configured total.
+**Built, sizes explicit since R39 (2026-08-08).** The server builds three Postgres pools through one helper, `build_pool` in `crates/connetto-server/src/builder/mod.rs`. `CONNETTO_OWNER_POOL_SIZE` and `CONNETTO_READER_POOL_SIZE` set two of them, each defaulting to bb8's ten connections, now stated rather than implied, and the re-execution pool takes the owner pool's size. `CONNETTO_READER_RESERVE` (default 3) is expressed against the reader pool's configured total.
 
-The **owner pool** connects as the deployment's owning role and carries re-execution (`PgAsyncDieselConnector`), the authentication store (`DbAuthStore`) and audit writes (`pg_audit_hook`). Row-level security does not apply to it, which is the entire reason a second pool exists.
+The **owner pool** connects as the deployment's owning role and carries the authentication store (`DbAuthStore`) and audit writes (`pg_audit_hook`). Row-level security does not apply to it, which is the entire reason the reader-role pools exist.
+
+The **re-execution pool** connects as the reader role and carries the computed reads that run under a caller's binding, the session's scalar and seed first answers and the engine-driven re-reads, all through `PgAsyncDieselConnector`. It is a pool of their own, sized at the owner pool's, so a re-execution hold never reaches the gated reader pool the reserve splits (R39). It is the reader role so the caller's policies scope the rows a read answers.
 
 The **reader pool** connects as a role that row-level security does apply to, and the binary refuses to start without it (R1, see `08-authorization.md`). It carries everything a caller's own request touches: every visibility question (`RlsAuth::visible`), every snapshot read (`PgSnapshotSource`), every mutation apply (`pg_write_target`), and the durable watermark read that `run_handshake` performs before any handshake can complete.
 
