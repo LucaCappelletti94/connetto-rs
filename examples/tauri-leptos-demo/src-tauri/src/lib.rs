@@ -226,8 +226,7 @@ fn insert_backend(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError>
 async fn insert_local(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandError> {
     let session = core.session().ok_or(CommandError::NotReady)?;
     let client = session.native.client().clone();
-    // The deployment policy names the owner on the row, and created_at must
-    // ride the changeset, since a replica default leaves it NULL.
+    // The deployment policy names the owner on the row.
     let user = session
         .native
         .session()
@@ -236,11 +235,7 @@ async fn insert_local(core: tauri::State<'_, Arc<Core>>) -> Result<(), CommandEr
     client
         .with_conn(move |conn| {
             diesel::insert_into(orders::table)
-                .values((
-                    orders::owner_id.eq(user),
-                    orders::quantity.eq(quantity),
-                    orders::created_at.eq(chrono::Utc::now().to_rfc3339()),
-                ))
+                .values((orders::owner_id.eq(user), orders::quantity.eq(quantity)))
                 .execute(conn.conn())
         })
         .await??;

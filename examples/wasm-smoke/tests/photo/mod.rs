@@ -138,11 +138,7 @@ pub async fn stage_photo(
                             .into_iter()
                             .collect();
                     diesel::insert_into(orders::table)
-                        .values((
-                            orders::owner_id.eq(identity),
-                            orders::quantity.eq(5_i64),
-                            orders::created_at.eq(crate::common::now_rfc3339()),
-                        ))
+                        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
                         .execute(connection)?;
                     let order_id = orders::table
                         .select(orders::id)

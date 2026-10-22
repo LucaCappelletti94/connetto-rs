@@ -177,12 +177,6 @@ fn fresh_quantity() -> i64 {
     (scaled as i64 + 1) * 5
 }
 
-/// The order write time, RFC 3339 from the browser clock, named on insert
-/// because the replica's default leaves the changeset value NULL.
-fn now_rfc3339() -> String {
-    js_sys::Date::new_0().to_json().into()
-}
-
 /// The tab mirror's physical footprint: total pages and free pages a trim can reclaim.
 async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
     client
@@ -1360,7 +1354,6 @@ fn dashboard(props: &DashboardProps) -> Html {
                             .values((
                                 orders::owner_id.eq(identity.as_str()),
                                 orders::quantity.eq(quantity),
-                                orders::created_at.eq(now_rfc3339()),
                             ))
                             .execute(conn.conn())
                     })
@@ -1464,7 +1457,6 @@ fn dashboard(props: &DashboardProps) -> Html {
                                     .values((
                                         orders::owner_id.eq(stage_identity.as_str()),
                                         orders::quantity.eq(1_i64),
-                                        orders::created_at.eq(now_rfc3339()),
                                     ))
                                     .execute(conn)?;
                                 let order_id = orders::table

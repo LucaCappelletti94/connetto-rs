@@ -85,11 +85,7 @@ async fn upload_one(
     let before: HashSet<rosetta_uuid::Uuid> =
         load_orders(writer).iter().map(|row| row.id).collect();
     diesel::insert_into(orders::table)
-        .values((
-            orders::owner_id.eq(identity),
-            orders::quantity.eq(5_i64),
-            orders::created_at.eq(common::now_rfc3339()),
-        ))
+        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
         .execute(writer.conn())
         .expect("insert the row");
     let id = load_orders(writer)
@@ -176,11 +172,7 @@ async fn the_number_writer_survives_a_reload() {
     // The session keeps the number: the next write is the writer's sequence
     // two, not a fresh writer's sequence one.
     diesel::insert_into(orders::table)
-        .values((
-            orders::owner_id.eq(&user_id),
-            orders::quantity.eq(9_i64),
-            orders::created_at.eq(common::now_rfc3339()),
-        ))
+        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(9_i64)))
         .execute(worker.conn())
         .expect("insert the row");
     worker.push().await.expect("push").expect("mutation sent");
@@ -223,11 +215,7 @@ async fn a_restore_of_a_settled_write_is_answered_from_the_settled_record() {
         .map(|row| row.id)
         .collect();
     diesel::insert_into(orders::table)
-        .values((
-            orders::owner_id.eq(&user_id),
-            orders::quantity.eq(5_i64),
-            orders::created_at.eq(common::now_rfc3339()),
-        ))
+        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(5_i64)))
         .execute(fixture.direct.conn())
         .expect("insert the row");
     let id = load_orders(&mut fixture.direct)

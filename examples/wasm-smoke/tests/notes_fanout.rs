@@ -249,7 +249,6 @@ async fn local_tier_notes_fan_out_across_tabs() {
                 .values((
                     orders::owner_id.eq(user_id.as_str()),
                     orders::quantity.eq(1_i64),
-                    orders::created_at.eq(common::now_rfc3339()),
                 ))
                 .execute(conn)?;
             Ok(())

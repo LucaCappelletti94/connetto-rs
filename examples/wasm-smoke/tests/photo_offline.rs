@@ -194,7 +194,6 @@ async fn an_offline_photo_replays_on_connect_and_flips_available() {
                     .values((
                         orders::owner_id.eq(identity.as_str()),
                         orders::quantity.eq(5_i64),
-                        orders::created_at.eq(common::now_rfc3339()),
                     ))
                     .execute(connection)?;
                 let order_id = orders::table

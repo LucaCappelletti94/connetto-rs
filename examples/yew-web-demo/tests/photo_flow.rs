@@ -24,7 +24,7 @@ use connetto_web::{MessageTransport, TabContent, TabResolved, locks, workers};
 use connetto_yew_web_demo::{AUTH_BASE, auth_landing, demo_schema};
 use diesel::prelude::*;
 use futures_channel::oneshot;
-use js_sys::{Array, Date, Uint8Array};
+use js_sys::{Array, Uint8Array};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -82,12 +82,6 @@ struct Photo {
 
 fn stage(msg: &str) {
     web_sys::console::log_1(&msg.into());
-}
-
-/// The order write time, RFC 3339, named on insert because the replica's
-/// default leaves the changeset value NULL.
-fn now_rfc3339() -> String {
-    Date::new_0().to_json().into()
 }
 
 fn play_the_tab() {
@@ -358,7 +352,6 @@ async fn a_tab_order_reaches_the_replica_through_the_demo_boot_path() {
                 .values((
                     orders::owner_id.eq(id_str.as_str()),
                     orders::quantity.eq(qty),
-                    orders::created_at.eq(now_rfc3339()),
                 ))
                 .execute(conn.conn())
         })
@@ -441,7 +434,6 @@ async fn a_photo_round_trips_through_stage_commit_resolve_and_http_fetch() {
                     .values((
                         orders::owner_id.eq(identity.as_str()),
                         orders::quantity.eq(1_i64),
-                        orders::created_at.eq(now_rfc3339()),
                     ))
                     .execute(conn)?;
                 let order_id = orders::table

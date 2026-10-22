@@ -93,7 +93,6 @@ async fn full_sync_loop_in_a_dedicated_worker() {
         .values((
             orders::owner_id.eq(identity.as_str()),
             orders::quantity.eq(7_i64),
-            orders::created_at.eq(common::now_rfc3339()),
         ))
         .execute(conn.conn())
         .expect("local insert");

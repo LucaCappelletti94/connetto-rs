@@ -172,11 +172,7 @@ async fn write_row(
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values((
-            orders::owner_id.eq(identity),
-            orders::quantity.eq(5_i64),
-            orders::created_at.eq(common::now_rfc3339()),
-        ))
+        .values((orders::owner_id.eq(identity), orders::quantity.eq(5_i64)))
         .execute(writer.conn())
         .expect("writer insert");
     let id = orders::table
@@ -267,11 +263,7 @@ async fn leader_topology_serves_tabs_and_reaps_the_dead() {
         .into_iter()
         .collect();
     diesel::insert_into(orders::table)
-        .values((
-            orders::owner_id.eq(&user_id),
-            orders::quantity.eq(7_i64),
-            orders::created_at.eq(common::now_rfc3339()),
-        ))
+        .values((orders::owner_id.eq(&user_id), orders::quantity.eq(7_i64)))
         .execute(tab_a.conn())
         .expect("tab a insert");
     let tab_write_id: rosetta_uuid::Uuid = orders::table

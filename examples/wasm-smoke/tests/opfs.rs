@@ -118,7 +118,6 @@ async fn opfs_encrypted_boot_live_query_and_persistence() {
                 .values((
                     orders::owner_id.eq(user_id.as_str()),
                     orders::quantity.eq(3_i64),
-                    orders::created_at.eq(common::now_rfc3339()),
                 ))
                 .execute(conn.conn())?;
             Ok::<rosetta_uuid::Uuid, diesel::result::Error>(
