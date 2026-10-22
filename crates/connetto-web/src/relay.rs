@@ -638,7 +638,11 @@ impl RelayHub {
     /// drops: it backs off per the policy, obtains a fresh connection,
     /// resumes the session with the highest applied cursor, and re-declares
     /// its upstream subscriptions. Tabs keep reading the replica during the
-    /// outage and their queued frames are served after the resume.
+    /// outage and their queued frames are served after the resume. A
+    /// refusal the hub's build can never attach under ends the hub instead,
+    /// telling every attached tab the typed fatal it already tells a
+    /// refused tab, and a live `ServerClosed` of that class skips the first
+    /// redial.
     ///
     /// # Errors
     ///
@@ -1389,6 +1393,12 @@ where
         S: Sleeper,
     {
         match event {
+            // A live close of the terminal class names the refusal a redial
+            // would only repeat, so the hub ends over its tabs here.
+            Ok(ClientEvent::ServerClosed { reason }) if reason.is_build_mismatch() => {
+                refuse_tabs(&self.state, &reason);
+                Ok(false)
+            }
             Ok(ClientEvent::Closed | ClientEvent::ServerClosed { .. })
             | Err(ClientError::Transport(_) | ClientError::NotConnected) => {
                 self.retry.delay = None;
@@ -2023,12 +2033,17 @@ enum RecoveryAttempt {
     Failed,
     Interrupted(HubEvent),
     Closed,
+    /// The attach drew a refusal the hub's build can never attach under.
+    Mismatched(ClientError),
 }
 
 enum RecoveryCycle {
     Connected,
     Failed,
     Closed,
+    /// The attach drew a refusal the hub's build can never attach under, and
+    /// the hub told its tabs why before ending.
+    Mismatched(ClientError),
 }
 
 enum ConnectAttempt<U> {
@@ -2048,6 +2063,53 @@ where
     events: &'a mut UnboundedReceiver<HubEvent>,
     deferred: &'a mut VecDeque<HubEvent>,
     walk: &'a mut WalkState,
+    /// The wait floor a rate-limited refusal stated, kept across attempts so
+    /// the next backoff floors on it.
+    min_wait: Option<core::time::Duration>,
+}
+
+/// Send every attached tab the typed fatal that ends the hub, so a tab
+/// reads the reason rather than a channel that merely vanishes.
+fn refuse_tabs(state: &HubState, reason: &FatalErrorReason) {
+    for (id, tab) in &state.tabs {
+        tracing::warn!(tab = %id, reason = ?reason, "relay hub ended over its tabs");
+        let _ = tab.out.send(TabOut::Control(ControlMessage::FatalError(
+            FatalError::new(reason.clone()),
+        )));
+    }
+}
+
+/// The wire reason a terminal refusal names for the tabs. The refusal the
+/// hub drew is a client-side classification, and the tabs read wire
+/// reasons, so the classification maps back onto the wire. A stale schema
+/// has no wire name, so the tabs redial a fresh hub whose ack carries the
+/// version the tab's own client checks.
+fn hub_mismatch_reason(err: &ClientError) -> FatalErrorReason {
+    match err {
+        ClientError::UpdateRequired { client, server } => FatalErrorReason::MajorMismatch {
+            server: *server,
+            client: *client,
+        },
+        ClientError::ServerBehind { client, server } => FatalErrorReason::MajorMismatch {
+            server: *server,
+            client: Some(*client),
+        },
+        ClientError::Refused { reason } => reason.clone(),
+        // A stale schema and anything outside the terminal class redial,
+        // because a fresh hub's ack carries the answer the tab's own client checks.
+        _ => FatalErrorReason::ServerShuttingDown,
+    }
+}
+
+/// The wait floor a refusal carries, so the hub waits once for the
+/// server's stated window instead of probing it.
+fn retry_after(err: &ClientError) -> Option<core::time::Duration> {
+    match err {
+        ClientError::Refused {
+            reason: FatalErrorReason::RateLimited { retry_after_ms },
+        } => Some(core::time::Duration::from_millis(*retry_after_ms)),
+        _ => None,
+    }
 }
 
 async fn hub_recover<U, F, S>(
@@ -2076,6 +2138,7 @@ where
         events,
         deferred: &mut deferred,
         walk,
+        min_wait: None,
     };
     loop {
         attempt = attempt.saturating_add(1);
@@ -2087,7 +2150,12 @@ where
             return Ok(false);
         }
         tracing::warn!(attempt, "relay hub upstream reconnecting");
-        if !wait_recovery_backoff(&mut recovery_io, &mut driver.sleeper, backoff).await? {
+        // A rate-limited refusal from a past attempt states how long the server will take, so the next wait floors on it.
+        let wait = recovery_io
+            .min_wait
+            .take()
+            .map_or(backoff, |floor| backoff.max(floor));
+        if !wait_recovery_backoff(&mut recovery_io, &mut driver.sleeper, wait).await? {
             return Ok(false);
         }
         backoff = backoff.saturating_mul(2).min(driver.policy.max_backoff());
@@ -2095,6 +2163,10 @@ where
             RecoveryCycle::Connected => return Ok(true),
             RecoveryCycle::Failed => {}
             RecoveryCycle::Closed => return Ok(false),
+            RecoveryCycle::Mismatched(err) => {
+                refuse_tabs(recovery_io.state, &hub_mismatch_reason(&err));
+                return Ok(false);
+            }
         }
     }
 }
@@ -2119,6 +2191,10 @@ where
             RecoveryAttempt::Failed => {
                 context.worker.disconnect();
                 return Ok(RecoveryCycle::Failed);
+            }
+            RecoveryAttempt::Mismatched(err) => {
+                context.worker.disconnect();
+                return Ok(RecoveryCycle::Mismatched(err));
             }
             RecoveryAttempt::Interrupted(event) => {
                 if !context.worker.is_connected() {
@@ -2167,7 +2243,11 @@ where
             result = &mut recovery => {
                 return match result {
                     Ok(()) => RecoveryAttempt::Connected,
-                    Err(_) => RecoveryAttempt::Failed,
+                    Err(err) if err.is_build_mismatch() => RecoveryAttempt::Mismatched(err),
+                    Err(err) => {
+                        context.min_wait = retry_after(&err);
+                        RecoveryAttempt::Failed
+                    }
                 };
             }
             event = events.recv() => match event {
@@ -2315,7 +2395,11 @@ where
             result = &mut recovery => {
                 return match result {
                     Ok(()) => RecoveryAttempt::Connected,
-                    Err(_) => RecoveryAttempt::Failed,
+                    Err(err) if err.is_build_mismatch() => RecoveryAttempt::Mismatched(err),
+                    Err(err) => {
+                        context.min_wait = retry_after(&err);
+                        RecoveryAttempt::Failed
+                    }
                 };
             }
             event = events.recv() => match event {

@@ -171,6 +171,16 @@ The notice waits for the read (R38). `FullResyncRequired` is sent only once the 
 
 If `HandshakeAck.schema_version` differs from the version the client was built with, the client build is stale. connetto bakes the schema into the app at build time and runs no DDL at runtime, so there is no runtime migration. The client surfaces a terminal stale-build condition at the handshake, before any subscription catchup or pending replay, and the app reloads. The reload boots a fresh baked template and full-resyncs the data under the new schema (Case 2's full-replacement path) rather than migrating in place.
 
+### Case 4: The server moved to another major while the transport was gone
+
+Case 3 is the fresh-open story, and the handshake refusal is the only place a build learns the deployment moved. A lost transport meets the same moved server on the way back, and the reconnect path says the same thing there rather than retrying a refusal a retry can never cure.
+
+**Built (R31, 2026-10-22).** The native recovery loop ends on the refusals the build can never attach under. `UpdateRequired`, `ServerBehind`, `SchemaOutdated` and a `Refused` carrying `ProtocolVersionMismatch` end the pump the way `Auth` already ends it as `ReauthRequired`, so the app hears `ClientEvent::Stopped` naming the reason and `Closed` after it. A server that closed the live session with one of those reasons said so once as `ServerClosed` before the loop began, so the loop skips the first redial of the terminal class. Everything else keeps the retry the policy gives it. `RateLimited` and `ServerShuttingDown` wait for a server that comes back, and after a `RateLimited` refusal the next wait is at least the server's `retry_after_ms`, the field the reason carries so a client waits once rather than probing for the answer. The default policy has no attempt ceiling, and the application bounds it with `with_reconnect`.
+
+The relay hub holds a tab to the worker's major at the tab's own handshake, so a tab that arrives while the hub redials is already checked, and a stale build is refused with the reason named. The case the handshake leaves open is the tab attached before the deploy. When the hub's own attach draws a refusal the hub's build can never attach under, the hub ends the retry there and tells every attached tab the typed fatal it already tells a refused tab, so the platform glue logs the ended hub and the tabs redial a fresh hub whose handshake names the reason to a stale build. A live `ServerClosed` of the terminal class skips the hub's first redial for the same reason, and a `RateLimited` refusal sets the same floor on the hub's next wait. No wire reason names a stale schema, so a hub that draws `SchemaOutdated` tells its tabs `ServerShuttingDown`, and the fresh hub's ack carries the schema version the tab's own client checks.
+
+Proven natively by `mismatch_recovery` in `crates/connetto-client/tests/it/` and by `hub_mismatch` in `crates/connetto-web/tests/`.
+
 ---
 
 ## Pending Mutations on Reconnect

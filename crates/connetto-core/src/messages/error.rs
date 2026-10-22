@@ -147,6 +147,22 @@ pub enum FatalErrorReason {
     WriterUnknown,
 }
 
+impl FatalErrorReason {
+    /// Whether the close names a build the peer can never attach under.
+    ///
+    /// The peer speaks a major or a wire version this build was not built
+    /// for, and no retry against the same peer changes the answer. A client
+    /// ends its recovery here with the reason named, and a relay hub ends
+    /// the same way over its tabs.
+    #[must_use]
+    pub fn is_build_mismatch(&self) -> bool {
+        matches!(
+            self,
+            Self::MajorMismatch { .. } | Self::ProtocolVersionMismatch { .. }
+        )
+    }
+}
+
 /// Session-terminating error frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FatalError {

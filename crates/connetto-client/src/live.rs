@@ -28,7 +28,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock, Weak};
 
 use connetto_core::auth::{CapabilityKey, CapabilitySubject};
-use connetto_core::messages::{BindValue, Grant, SubscriptionSpec};
+use connetto_core::messages::{BindValue, FatalErrorReason, Grant, SubscriptionSpec};
 use connetto_core::quote_ident;
 use connetto_core::traits::{MaybeSend, Transport};
 use diesel::associations::{HasTable, Identifiable};
@@ -2824,7 +2824,8 @@ async fn wait_timer<D, F: Future<Output = ()> + ?Sized>(
 /// A transport drop ends the pump, unless a reconnect driver is present, in
 /// which case the pump recovers: backoff, fresh transport, session resume,
 /// re-declared subscriptions. Local faults (session, apply, protocol) stay
-/// terminal either way and are announced as [`ClientEvent::Stopped`].
+/// terminal either way and are announced as [`ClientEvent::Stopped`], as is
+/// a refusal the build can never attach under.
 async fn pump<T, F, S>(
     shared: Arc<Shared<T>>,
     alive: Weak<ClientToken>,
@@ -2836,6 +2837,8 @@ async fn pump<T, F, S>(
     S: Sleeper + MaybeSend + 'static,
 {
     let mut needs_recovery = false;
+    // A live close of the terminal class names the refusal the redial would only repeat.
+    let mut last_close: Option<FatalErrorReason> = None;
     // The sleep for the armed resend, kept across steps so arriving frames do not restart it.
     let mut resend = None;
     let mut key_timer = None;
@@ -2856,7 +2859,15 @@ async fn pump<T, F, S>(
         // the state lock, so watch and with_conn callers are only blocked
         // during the brief resume itself, never during backoff sleeps.
         if needs_recovery {
-            match drive_recovery(&shared, &mut reconnect, &alive, &mut key_timer).await {
+            match drive_recovery(
+                &shared,
+                &mut reconnect,
+                &alive,
+                &mut key_timer,
+                last_close.take(),
+            )
+            .await
+            {
                 Recovered::Live => needs_recovery = false,
                 // The top of the loop ends the pump through the close path.
                 Recovered::Closing => continue,
@@ -2928,6 +2939,9 @@ async fn pump<T, F, S>(
         shared.gate.apply_outcome(&mut ask, ask_outcome);
         if let Some(ask) = ask {
             shared.gate.restore_ask(ask);
+        }
+        if let Ok(Some(ClientEvent::ServerClosed { reason })) = &stepped {
+            last_close = Some(reason.clone());
         }
         match route_step_result(&mut state, &shared, stepped, reconnect.is_some()) {
             PumpFlow::Proceed => {}
@@ -3187,6 +3201,7 @@ async fn drive_recovery<T, F, S>(
     reconnect: &mut Option<ReconnectDriver<F, S>>,
     alive: &Weak<ClientToken>,
     key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
+    last_close: Option<FatalErrorReason>,
 ) -> Recovered
 where
     T: Transport + MaybeSend + 'static,
@@ -3195,13 +3210,20 @@ where
     S: Sleeper + MaybeSend + 'static,
 {
     let outcome = match reconnect.as_mut() {
-        Some(driver) => recover(shared, driver, alive, key_timer).await,
+        Some(driver) => recover(shared, driver, alive, key_timer, last_close).await,
         None => Recovery::Exhausted,
     };
     match outcome {
         Recovery::Live => Recovered::Live,
         Recovery::Closing => Recovered::Closing,
         Recovery::ReauthRequired => Recovered::Ended(ClientEvent::AuthenticationRequired),
+        Recovery::Mismatched(err) => {
+            let detail = err.to_string();
+            // Set before the senders drop, so a woken handle reads the fault.
+            let _ = shared.reaper.stopped.set(detail.clone());
+            let _ = shared.events.send(ClientEvent::Stopped { detail });
+            Recovered::Ended(ClientEvent::Closed)
+        }
         Recovery::Exhausted => Recovered::Ended(ClientEvent::Closed),
         Recovery::Failed(err) => Recovered::Failed(err),
     }
@@ -3534,6 +3556,9 @@ enum Recovery {
     /// never signals this: a grant it refuses leaves the connection open and
     /// says nothing, so the client learns it from its own token source.
     ReauthRequired,
+    /// A refusal the build can never attach under, so the pump ends with the
+    /// reason named rather than retrying it.
+    Mismatched(ClientError),
     /// A close was asked for during a backoff.
     Closing,
     Failed(ClientError),
@@ -3614,8 +3639,23 @@ where
     }
 }
 
+/// The wait floor a refusal carries, so the driver waits once for the
+/// server's stated window instead of probing it.
+fn retry_after(err: &ClientError) -> Option<Duration> {
+    match err {
+        ClientError::Refused {
+            reason: FatalErrorReason::RateLimited { retry_after_ms },
+        } => Some(Duration::from_millis(*retry_after_ms)),
+        _ => None,
+    }
+}
+
 /// Run the reconnect sequence to completion: backoff, fresh transport,
 /// session resume, re-declared subscriptions.
+///
+/// A live close or a refusal the build can never attach under ends the
+/// sequence as [`Recovery::Mismatched`] naming the reason, since the next
+/// attach would draw the same answer.
 ///
 /// Sleeps and connect attempts run WITHOUT the state lock. Only the resume
 /// handshake and the re-subscribes hold it, so application reads and writes
@@ -3625,6 +3665,7 @@ async fn recover<T, F, S>(
     driver: &mut ReconnectDriver<F, S>,
     alive: &Weak<ClientToken>,
     key_timer: &mut Option<(ShareKeyTimer, KeySleep)>,
+    last_close: Option<FatalErrorReason>,
 ) -> Recovery
 where
     T: Transport + MaybeSend + 'static,
@@ -3632,11 +3673,21 @@ where
     F: TransportFactory<Transport = T>,
     S: Sleeper + 'static,
 {
+    // The server that closed the live session said the answer once, so a
+    // close of the terminal class skips the first redial it would repeat.
+    if let Some(reason) = last_close
+        && reason.is_build_mismatch()
+    {
+        return Recovery::Mismatched(crate::refusal_error(&reason));
+    }
     let mut episode = driver.policy.start();
+    // The wait floor a rate-limited refusal states, consumed by the next wait.
+    let mut min_wait: Option<Duration> = None;
     loop {
         let Some(wait) = episode.next_wait() else {
             return Recovery::Exhausted;
         };
+        let wait = min_wait.take().map_or(wait, |floor| wait.max(floor));
         let _ = shared.events.send(ClientEvent::Reconnecting {
             attempt: episode.attempt(),
         });
@@ -3661,7 +3712,13 @@ where
             // A rejected credential is not a transport blip: stop the backoff
             // loop and let the pump surface a re-login requirement.
             Err(ClientError::Auth(_)) => return Recovery::ReauthRequired,
-            Err(_) => continue,
+            // A refusal the build can never attach under is not a server that
+            // will come back, so the pump ends with the reason named.
+            Err(err) if err.is_build_mismatch() => return Recovery::Mismatched(err),
+            Err(err) => {
+                min_wait = retry_after(&err);
+                continue;
+            }
         }
         // Re-declaring every live subscription under its original id is
         // `attach`'s own job now, from the persisted set, which is the same

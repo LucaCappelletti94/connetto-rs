@@ -59,6 +59,8 @@ mod local_tier;
 
 mod loop_emu;
 
+mod mismatch_recovery;
+
 mod mutation_replay;
 
 #[cfg(feature = "native-auth")]

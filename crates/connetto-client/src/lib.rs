@@ -401,6 +401,25 @@ pub enum ClientError {
     Locked,
 }
 
+impl ClientError {
+    /// Whether this fault names a build the peer can never attach under.
+    ///
+    /// The peer's major, its schema version or its wire version moved out
+    /// from under this build, and no retry against the same peer changes
+    /// the answer. The recovery driver ends the pump here with the reason
+    /// named, the way it ends on a rejected credential.
+    #[must_use]
+    pub fn is_build_mismatch(&self) -> bool {
+        match self {
+            ClientError::UpdateRequired { .. }
+            | ClientError::ServerBehind { .. }
+            | ClientError::SchemaOutdated { .. } => true,
+            ClientError::Refused { reason } => reason.is_build_mismatch(),
+            _ => false,
+        }
+    }
+}
+
 /// Why a peer link could not be opened (R76).
 #[cfg(feature = "peer")]
 #[derive(Debug, thiserror::Error)]
@@ -1200,8 +1219,11 @@ pub enum ClientEvent {
     ///
     /// Distinct from [`Closed`](Self::Closed), which is the transport simply
     /// ending. The reconnect driver treats this as a lost connection and backs
-    /// off, so a server going away is not hammered with immediate retries. The
-    /// reason is what lets an app tell a restart from a sign-out.
+    /// off, so a server going away is not hammered with immediate retries,
+    /// except that a reason the build can never attach under, a moved major
+    /// or a wire version, skips the first redial and ends the pump as
+    /// [`Stopped`](Self::Stopped) naming the reason. The reason is what lets
+    /// an app tell a restart from a sign-out.
     ServerClosed {
         /// Why the server closed the session.
         reason: FatalErrorReason,
@@ -2905,6 +2927,27 @@ async fn presented_grants(
     Ok(grants)
 }
 
+/// The typed client error a peer's refusal names, shared by the first
+/// handshake and the recovery driver, so a refusal that ends the pump ends
+/// it with the same words a fresh open would have used.
+fn refusal_error(reason: &FatalErrorReason) -> ClientError {
+    match reason {
+        FatalErrorReason::MajorMismatch { server, client } => match client {
+            Some(client) if client > server => ClientError::ServerBehind {
+                client: *client,
+                server: *server,
+            },
+            client => ClientError::UpdateRequired {
+                client: *client,
+                server: *server,
+            },
+        },
+        reason => ClientError::Refused {
+            reason: reason.clone(),
+        },
+    }
+}
+
 /// Run the opening handshake and read the ack, shared by the first connect
 /// and every resume.
 async fn exchange_handshake<T>(
@@ -3003,13 +3046,7 @@ where
             })
         }
         Some(IncomingFrame::Control(ControlMessage::FatalError(fatal))) => {
-            Err(match fatal.reason {
-                FatalErrorReason::MajorMismatch { server, client } => match client {
-                    Some(client) if client > server => ClientError::ServerBehind { client, server },
-                    client => ClientError::UpdateRequired { client, server },
-                },
-                reason => ClientError::Refused { reason },
-            })
+            Err(refusal_error(&fatal.reason))
         }
         Some(_) => Err(ClientError::Protocol("expected handshake ack".into())),
         None => Err(ClientError::Protocol("connection closed before ack".into())),
