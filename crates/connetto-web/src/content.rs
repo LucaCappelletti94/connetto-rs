@@ -6,9 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::content_wire::{
-    ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_code,
-};
+use crate::content_wire::{ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_code};
 
 use crate::frames::{InternalLane, MessageSink, MessageTransport};
 use crate::workers::helpers::sleep_ms;
@@ -302,14 +300,8 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
                             (request_id, LaneAnswer::Pins(answer))
                         }
                         Some(
-                            ContentFrame::FetchPinnedReply {
-                                request_id,
-                                answer,
-                            }
-                            | ContentFrame::TidyReply {
-                                request_id,
-                                answer,
-                            },
+                            ContentFrame::FetchPinnedReply { request_id, answer }
+                            | ContentFrame::TidyReply { request_id, answer },
                         ) => (request_id, LaneAnswer::Fetch(answer)),
                         _ => continue,
                     };
@@ -547,10 +539,7 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
             .fetch_request(|request_id| ContentFrame::FetchPinned { request_id })
             .await?
         {
-            WireFetch::Arrived(ids) => Ok(ids
-                .into_iter()
-                .map(FileId::from_bytes)
-                .collect()),
+            WireFetch::Arrived(ids) => Ok(ids.into_iter().map(FileId::from_bytes).collect()),
             _ => Err(TabContentError::Unanswered),
         }
     }

@@ -87,12 +87,12 @@ use connetto_core::messages::{
 };
 use connetto_core::traits::MaybeSend;
 use connetto_core::{Cursor, IncomingFrame, Transport, quote_ident};
+use connetto_file_client::http::ContentHttp;
 use connetto_file_client::{
     BrowserHttp, BrowserStore, ChunkScan, ContentArchive, ContentError, ContentFlush,
     ContentFlushStart, ContentFlushState, ContentUpload, FileId, PendingConnectionResolve,
     ResolveRoute, ResolveStart, Resolved, ScanStep, StageCommitError,
 };
-use connetto_file_client::http::ContentHttp;
 use connetto_file_core::MimeClass;
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
@@ -1547,20 +1547,16 @@ where
         &mut self,
         settled: Vec<(TabId, u64, FileId, Result<String, ContentError>)>,
     ) {
-        let Self { worker, state, content, .. } = self;
+        let Self {
+            worker,
+            state,
+            content,
+            ..
+        } = self;
         for (tab, request_id, file_id, result) in settled {
             if let Some(content) = content.as_ref() {
                 if let Ok(url) = result {
-                    fetch_settle_one(
-                        worker,
-                        content,
-                        state,
-                        tab,
-                        request_id,
-                        file_id,
-                        &url,
-                    )
-                    .await;
+                    fetch_settle_one(worker, content, state, tab, request_id, file_id, &url).await;
                 } else {
                     tracing::warn!(tab = %tab, request_id, "the pinned file's ticket did not reach a grant");
                 }
@@ -3681,8 +3677,7 @@ async fn resolve_frame<U>(
     id: TabId,
     request_id: u64,
     file_id: [u8; 32],
-)
-where
+) where
     U: Transport,
     U::Error: core::fmt::Display,
 {
@@ -3929,8 +3924,7 @@ async fn fetch_pinned_frame<U>(
     content: Option<&ContentArchive<BrowserStore>>,
     tab: TabId,
     request_id: u64,
-)
-where
+) where
     U: Transport,
     U::Error: core::fmt::Display,
 {
@@ -4010,11 +4004,14 @@ where
         .any(|fetch| fetch.tab == tab && fetch.request_id == request_id)
     {
         if !arrived.is_empty() {
-            state.fetch_arrived.entry((tab, request_id)).or_default().extend(arrived);
+            state
+                .fetch_arrived
+                .entry((tab, request_id))
+                .or_default()
+                .extend(arrived);
         }
     } else {
-        let arrived: Vec<[u8; 32]> =
-            arrived.iter().map(|file_id| *file_id.as_bytes()).collect();
+        let arrived: Vec<[u8; 32]> = arrived.iter().map(|file_id| *file_id.as_bytes()).collect();
         answer_fetch(
             state,
             tab,
@@ -4034,8 +4031,7 @@ async fn serve_tidy_frame<U>(
     content: Option<&ContentArchive<BrowserStore>>,
     tab: TabId,
     request_id: u64,
-)
-where
+) where
     U: Transport,
     U::Error: core::fmt::Display,
 {
@@ -4150,7 +4146,11 @@ where
         );
         return false;
     }
-    state.fetch_arrived.entry((tab, request_id)).or_default().push(file_id);
+    state
+        .fetch_arrived
+        .entry((tab, request_id))
+        .or_default()
+        .push(file_id);
     true
 }
 

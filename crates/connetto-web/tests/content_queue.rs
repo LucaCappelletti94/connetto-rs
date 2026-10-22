@@ -19,9 +19,7 @@ use connetto_core::messages::{
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
-use connetto_file_core::{
-    ChunkHash, ChunkInventory, ChunkStore, FileId, FileIdHasher, MimeClass,
-};
+use connetto_file_core::{ChunkHash, ChunkInventory, ChunkStore, FileId, FileIdHasher, MimeClass};
 use connetto_web::content_wire::{ContentFrame, mime_code};
 use connetto_web::relay::HubReconnect;
 use connetto_web::workers::DB_ALIVE_LOCK;
@@ -514,7 +512,10 @@ fn response(body: Option<&str>, status: u16) -> JsValue {
 
 /// Answers like a `web_sys::Response` of `status` with an optional byte body.
 fn response_bytes(body: Option<&[u8]>, status: u16) -> JsValue {
-    response_with(body.map(|body| JsValue::from(Uint8Array::from(body))), status)
+    response_with(
+        body.map(|body| JsValue::from(Uint8Array::from(body))),
+        status,
+    )
 }
 
 fn blob_of(bytes: &[u8]) -> web_sys::Blob {
