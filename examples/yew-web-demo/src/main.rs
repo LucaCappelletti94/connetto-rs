@@ -178,6 +178,36 @@ fn fresh_quantity() -> i64 {
     (scaled as i64 + 1) * 5
 }
 
+/// The header's gate line for the custody standing and the worker's reported
+/// unlock state, the lock standing where a gate guards the data, the no-gate
+/// statement where there is none.
+fn gate_text(custody: Custody, state: &'static str) -> &'static str {
+    match custody {
+        Custody::Verified => state,
+        Custody::Unverified(_) | Custody::Ephemeral => {
+            "none, local data opens without user verification"
+        }
+    }
+}
+
+/// The header's custody line for the standing, naming the at-rest policy and
+/// the reason it stands as it does in this browser.
+fn custody_text(custody: Custody) -> &'static str {
+    match custody {
+        Custody::Verified => "released only after user verification",
+        Custody::Unverified(NoGate::Offerable) => {
+            "stored without user verification, a passkey can be set up"
+        }
+        Custody::Unverified(NoGate::Declined) => {
+            "stored without user verification, the passkey was declined"
+        }
+        Custody::Unverified(NoGate::Unsupported) => {
+            "stored without user verification, the browser refused a passkey for this address"
+        }
+        Custody::Ephemeral => "no durable key, nothing is kept",
+    }
+}
+
 /// The tab mirror's physical footprint: total pages and free pages a trim can reclaim.
 async fn replica_footprint(client: &ConnettoClient<Tab>) -> (i64, i64) {
     client
@@ -766,6 +796,7 @@ fn use_boot_window_effect(
     status: UseStateHandle<String>,
     boot_hold: Rc<RefCell<Option<Boot>>>,
     custody: UseStateHandle<Option<Custody>>,
+    gate: UseStateHandle<&'static str>,
 ) {
     use_effect_with((), move |()| {
         spawn_local(async move {
@@ -778,6 +809,14 @@ fn use_boot_window_effect(
                     status.set("connected".to_owned());
                     *boot_hold.borrow_mut() = Some(boot);
                     while let Ok(event) = events.recv().await {
+                        // The header's gate line tracks the worker's reported unlock state.
+                        match event {
+                            ClientEvent::Locked | ClientEvent::UnlockDismissed => {
+                                gate.set("locked");
+                            }
+                            ClientEvent::Unlocked => gate.set("open"),
+                            _ => {}
+                        }
                         if let Some(label) = status_label(&event) {
                             status.set(label);
                         }
@@ -813,9 +852,12 @@ fn app() -> Html {
     // The account a reload restores; the session broadcast refreshes it.
     let stored_account = use_state(read_stored_account);
 
-    // Passkey custody level, unknown until boot_window returns, so the page
-    // shows no passkey line before the worker has said which it is.
+    // The passkey custody level, unknown until boot_window returns, so the
+    // header shows no gate or custody line before the worker has said which it is.
     let custody = use_state(|| None::<Custody>);
+    // The gate line's lock standing, open until the worker reports the data
+    // waiting on user verification.
+    let gate = use_state(|| "open");
 
     // Session expiry warning: Some when the session is near its end and there
     // are unsynced writes that would be lost if it lapses.
@@ -863,6 +905,7 @@ fn app() -> Html {
         status.clone(),
         boot_hold.clone(),
         custody.clone(),
+        gate.clone(),
     );
 
     let open_login = {
@@ -1020,10 +1063,6 @@ fn app() -> Html {
         let prompt_present = (*login_url).is_some();
         let stored = (*stored_account).clone();
         if signed_in {
-            let passkey_line = (*custody)
-                .as_ref()
-                .map(|custody| format!(" Passkey: {custody}."))
-                .unwrap_or_default();
             let account_line = {
                 let uid = (*identity).clone().unwrap_or_default();
                 let decoded = (*booted_account).clone().map(|acc| stored_identity(&acc));
@@ -1035,7 +1074,6 @@ fn app() -> Html {
                             { " (account: " }
                             <code class="id" title={acc.clone()}>{ short_id(&acc) }</code>
                             { ")." }
-                            { passkey_line }
                         </span>
                     },
                     _ => html! {
@@ -1043,7 +1081,6 @@ fn app() -> Html {
                             { "Signed in as " }
                             <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
                             { "." }
-                            { passkey_line }
                         </span>
                     },
                 }
@@ -1274,12 +1311,30 @@ fn app() -> Html {
         html! { <p>{ "Connecting to the DB worker and the connetto stack..." }</p> }
     };
 
+    // The header's gate and custody lines, shown once the worker has said
+    // which custody level the page runs under.
+    let gate_line_html = match *custody {
+        Some(custody) => html! {
+            <p class="status">{ format!("gate: {}", gate_text(custody, *gate)) }</p>
+        },
+        None => html! {},
+    };
+    let custody_line_html = match *custody {
+        Some(custody) => html! {
+            <p class="status">{ format!("custody: {}", custody_text(custody)) }</p>
+        },
+        None => html! {},
+    };
+
     html! {
         <>
             <style>{ CSS }</style>
             <div class="wrap">
                 <h1>{ "connetto web demo (Yew)" }</h1>
                 <p class="status">{ format!("status: {}", &*status) }</p>
+                { gate_line_html }
+                <p class="status">{ "device: no device identity in this build" }</p>
+                { custody_line_html }
                 { picker_html }
                 { expiry_html }
                 { auth_bar }
