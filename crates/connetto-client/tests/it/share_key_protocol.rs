@@ -49,8 +49,10 @@ struct Script {
 }
 
 #[derive(Debug, Error)]
-#[error("the scripted socket is gone")]
-struct Gone;
+enum Gone {
+    #[error("the scripted socket is gone")]
+    Closed,
+}
 
 impl Script {
     fn say(&self, frame: IncomingFrame) {
@@ -74,7 +76,7 @@ impl Transport for Script {
             _ => {}
         }
         if self.closed.load(Ordering::Acquire) {
-            ready(Err(Gone))
+            ready(Err(Gone::Closed))
         } else {
             ready(Ok(()))
         }
@@ -241,8 +243,9 @@ async fn client(keys: Vec<(Grant, String)>) -> (ConnettoConnection<Script>, Scri
 }
 
 async fn pump(conn: &mut ConnettoConnection<Script>, bound: Duration) -> ClientEvent {
+    let deadline = tokio::time::Instant::now() + bound;
     loop {
-        let event = tokio::time::timeout(bound, conn.pump_one())
+        let event = tokio::time::timeout_at(deadline, conn.pump_one())
             .await
             .expect("the pump yields in time")
             .expect("the frame applies");
@@ -942,4 +945,247 @@ async fn refused_computed_declarations_keep_coverage_unknown_until_retired() {
         step_or_idle(&mut conn).await;
         assert_eq!(coverage(&mut conn), Some(known(&["a"])));
     }
+}
+
+#[tokio::test]
+async fn an_elapsed_retry_waits_for_the_declaration_fence_without_spinning() {
+    let (mut conn, script) = client(vec![(mint(None), "a".to_owned())]).await;
+    conn.subscribe("s1", "SELECT * FROM notes")
+        .await
+        .expect("subscribe rows");
+    first_sync(&mut conn, &script).await;
+    conn.add_share_key(&mint(None), &CapabilitySubject::<String>::new("b"))
+        .await
+        .expect("add a key");
+    step_or_idle(&mut conn).await;
+    let first = replacement(&script);
+    script.say(IncomingFrame::Control(ControlMessage::RateLimited(
+        RateLimited {
+            related_to: Some(first.request_id.clone()),
+            retry_after_ms: 300,
+        },
+    )));
+    pump(&mut conn, Duration::from_secs(5)).await;
+    conn.subscribe("agg", "SELECT COUNT(*) FROM notes")
+        .await
+        .expect("subscribe computed");
+    script.say(aggregate_bootstrap());
+    pump(&mut conn, Duration::from_secs(5)).await;
+    let nonce = *script.pings.lock().last().expect("declaration fence");
+    tokio::time::sleep(
+        conn.share_key_timer().expect("retry timer").wait() + Duration::from_millis(20),
+    )
+    .await;
+    conn.process_share_keys(true)
+        .await
+        .expect("process elapsed retry");
+    assert!(
+        conn.share_key_timer().expect("fence deadline").wait() >= Duration::from_secs(20),
+        "an elapsed retry must wait for the outstanding fence"
+    );
+    assert_eq!(script.replacements.lock().len(), 1);
+    script.say(pong(nonce));
+    pump(&mut conn, Duration::from_secs(5)).await;
+    step_or_idle(&mut conn).await;
+    let retried = replacement(&script);
+    assert_ne!(retried.request_id, first.request_id);
+    assert_eq!(retried.keys, first.keys);
+    assert_eq!(script.replacements.lock().len(), 2);
+}
+
+#[tokio::test]
+async fn refused_row_declarations_keep_coverage_unknown_until_retired() {
+    for response in [
+        ControlMessage::NonFatalError(connetto_core::messages::NonFatalError {
+            related_to: Some("refused".to_owned()),
+            detail: "subscription refused".to_owned(),
+        }),
+        ControlMessage::RateLimited(RateLimited {
+            related_to: Some("refused".to_owned()),
+            retry_after_ms: 100,
+        }),
+    ] {
+        let (mut conn, script) = client(vec![(mint(None), "a".to_owned())]).await;
+        conn.subscribe("s1", "SELECT * FROM notes")
+            .await
+            .expect("subscribe rows");
+        first_sync(&mut conn, &script).await;
+        conn.subscribe("refused", "SELECT id FROM notes")
+            .await
+            .expect("declare another query");
+        script.say(IncomingFrame::Control(response));
+        pump(&mut conn, Duration::from_secs(5)).await;
+        assert_eq!(coverage(&mut conn), None);
+        conn.unsubscribe("refused")
+            .await
+            .expect("retire refused query");
+        step_or_idle(&mut conn).await;
+        assert_eq!(coverage(&mut conn), Some(known(&["a"])));
+    }
+}
+
+#[tokio::test]
+async fn unrelated_replacement_answers_cannot_settle_the_current_generation() {
+    let (mut conn, script) = client(vec![(mint(None), "a".to_owned())]).await;
+    conn.subscribe("s1", "SELECT * FROM notes")
+        .await
+        .expect("subscribe rows");
+    first_sync(&mut conn, &script).await;
+    for with_request in [false, true] {
+        if with_request {
+            conn.add_share_key(&mint(None), &CapabilitySubject::<String>::new("b"))
+                .await
+                .expect("add a key");
+            step_or_idle(&mut conn).await;
+        }
+        script.say(IncomingFrame::Control(ControlMessage::ShareKeysReplaced(
+            ShareKeysReplaced {
+                request_id: "foreign-replacement".to_owned(),
+            },
+        )));
+        let result = tokio::time::timeout(Duration::from_secs(5), conn.pump_one())
+            .await
+            .expect("bounded foreign answer");
+        assert!(matches!(
+            result,
+            Err(connetto_client::ClientError::Protocol(_))
+        ));
+        assert_eq!(
+            coverage(&mut conn),
+            if with_request {
+                None
+            } else {
+                Some(known(&["a"]))
+            }
+        );
+    }
+    settle(&mut conn, &script).await;
+    assert_eq!(coverage(&mut conn), Some(known(&["a", "b"])));
+    assert_eq!(script.replacements.lock().len(), 1);
+}
+
+#[tokio::test]
+async fn identical_additions_and_absent_removals_preserve_completed_coverage() {
+    let held = mint(None);
+    let (mut conn, script) = client(vec![(held.clone(), "a".to_owned())]).await;
+    conn.subscribe("s1", "SELECT * FROM notes")
+        .await
+        .expect("subscribe rows");
+    first_sync(&mut conn, &script).await;
+    conn.add_share_key(&held, &CapabilitySubject::<String>::new("a"))
+        .await
+        .expect("add an identical pair");
+    conn.remove_share_key(&CapabilitySubject::<String>::new("absent"))
+        .await
+        .expect("remove an absent subject");
+    step_or_idle(&mut conn).await;
+    assert!(script.replacements.lock().is_empty());
+    assert_eq!(coverage(&mut conn), Some(known(&["a"])));
+}
+
+async fn unanswered_request_disconnects(computed: bool) {
+    let (mut conn, script) = client(vec![(mint(None), "a".to_owned())]).await;
+    conn.subscribe("s1", "SELECT * FROM notes")
+        .await
+        .expect("subscribe rows");
+    first_sync(&mut conn, &script).await;
+    if computed {
+        conn.subscribe("agg", "SELECT COUNT(*) FROM notes")
+            .await
+            .expect("subscribe computed");
+    } else {
+        conn.add_share_key(&mint(None), &CapabilitySubject::<String>::new("b"))
+            .await
+            .expect("add a key");
+    }
+    step_or_idle(&mut conn).await;
+    assert_eq!(coverage(&mut conn), None);
+    let timer = conn.share_key_timer().expect("answer deadline");
+    tokio::time::timeout(Duration::from_secs(35), async {
+        tokio::time::sleep(timer.wait() + Duration::from_millis(20)).await;
+        conn.process_share_keys(true)
+            .await
+            .expect("process unanswered request");
+    })
+    .await
+    .expect("bounded request timeout");
+    assert!(matches!(
+        conn.ping(42).await,
+        Err(connetto_client::ClientError::NotConnected)
+    ));
+    assert_eq!(coverage(&mut conn), None);
+    let next = Script::default();
+    next.say(ack());
+    tokio::time::timeout(Duration::from_secs(5), conn.attach(next.clone()))
+        .await
+        .expect("bounded reattach")
+        .expect("reattach after timeout");
+    assert_eq!(
+        next.handshakes
+            .lock()
+            .last()
+            .expect("resume handshake")
+            .cursor_subjects,
+        None
+    );
+}
+
+#[tokio::test]
+async fn unanswered_replacements_and_fences_disconnect_without_publishing_coverage() {
+    tokio::join!(
+        unanswered_request_disconnects(false),
+        unanswered_request_disconnects(true)
+    );
+}
+
+#[tokio::test]
+async fn expiry_preempts_a_rate_limit_without_retrying_the_replacement_early() {
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("wall clock")
+        .as_secs()
+        + 3;
+    let expiring = mint(Some(i64::try_from(expires).expect("expiry fits")));
+    let retained = Grant::new("retained");
+    let (mut conn, script) = client(vec![(expiring, "a".to_owned())]).await;
+    conn.subscribe("s1", "SELECT * FROM notes")
+        .await
+        .expect("subscribe rows");
+    first_sync(&mut conn, &script).await;
+    conn.add_share_key(&retained, &CapabilitySubject::<String>::new("b"))
+        .await
+        .expect("add retained key");
+    step_or_idle(&mut conn).await;
+    let first = replacement(&script);
+    script.say(IncomingFrame::Control(ControlMessage::RateLimited(
+        RateLimited {
+            related_to: Some(first.request_id),
+            retry_after_ms: 5000,
+        },
+    )));
+    pump(&mut conn, Duration::from_secs(5)).await;
+    let timer = conn.share_key_timer().expect("expiry before retry");
+    assert!(timer.wait() <= Duration::from_secs(3));
+    tokio::time::sleep(timer.wait() + Duration::from_millis(20)).await;
+    assert!(
+        conn.process_share_keys(true)
+            .await
+            .expect("expire held key")
+    );
+    assert_eq!(
+        diesel::select(current_app_subjects())
+            .get_result::<Option<String>>(conn.conn())
+            .expect("read live subjects"),
+        Some("b".to_owned()),
+    );
+    step_or_idle(&mut conn).await;
+    assert_eq!(script.replacements.lock().len(), 1);
+    let retry = conn.share_key_timer().expect("remaining retry delay");
+    tokio::time::sleep(retry.wait() + Duration::from_millis(20)).await;
+    conn.process_share_keys(true)
+        .await
+        .expect("process retry deadline");
+    step_or_idle(&mut conn).await;
+    assert_eq!(replacement(&script).keys, vec![retained]);
+    assert_eq!(script.replacements.lock().len(), 2);
 }

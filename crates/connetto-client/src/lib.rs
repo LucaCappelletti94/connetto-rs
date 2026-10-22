@@ -3301,6 +3301,7 @@ pub struct ConnettoConnection<T: Transport> {
 }
 
 /// The schema and metadata tables an open installs, in dependency order.
+#[deny(clippy::ref_patterns)]
 fn install_replica_schema(
     db: &mut SqliteConnection,
     sqlite_ddl: Option<&str>,
@@ -3316,7 +3317,7 @@ fn install_replica_schema(
     db.batch_execute(META_DDL)?;
     match db.batch_execute("ALTER TABLE _connetto_meta ADD COLUMN cursor_subjects BLOB") {
         Ok(()) => {}
-        Err(diesel::result::Error::DatabaseError(_, ref info))
+        Err(diesel::result::Error::DatabaseError(_, info))
             if info.message().contains("duplicate column name") => {}
         Err(error) => return Err(error.into()),
     }
@@ -4713,7 +4714,7 @@ where
     /// when it moves.
     fn recompute_share_key_deadline(&mut self) {
         let now = crate::away::SystemClock.monotonic();
-        let mut deadline = self.share_key_retry_at;
+        let mut deadline = self.share_key_retry_at.filter(|at| *at > now);
         if let Some(expiry) = self.share_key_expiry {
             let remaining = if expiry <= 0 {
                 Duration::ZERO

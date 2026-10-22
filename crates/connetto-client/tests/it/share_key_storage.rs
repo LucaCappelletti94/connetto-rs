@@ -9,11 +9,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use connetto_client::share_keys::{
-    ShareKeyFuture, ShareKeySet, ShareKeyStore, is_share_key_record, share_key_record,
-};
+use connetto_client::share_keys::{ShareKeyFuture, ShareKeySet, ShareKeyStore, share_key_record};
 use connetto_client::{
     ClientBuilder, ConnettoConnection, DataDir, Grant, NativeClientBuilder, REPLICA_PREFIX,
     SyncSchema, is_reserved_record, replica_db_name,
@@ -24,6 +22,7 @@ use connetto_core::custody::{Custody, NoGate};
 use connetto_core::test_support::{FakeTransport, replica_key};
 use connetto_core::traits::{RefreshFuture, RefreshTokenStore, ReplicaKeyStore};
 use diesel::prelude::*;
+use parking_lot::Mutex;
 
 /// The grant the suite hands to a subject, distinct per use so one test
 /// cannot pass on the subject alone.
@@ -92,28 +91,17 @@ struct SharedStoreState {
 impl SharedStore {
     /// The raw record under `name`, if the store holds one.
     fn record(&self, name: &str) -> Option<String> {
-        self.inner
-            .lock()
-            .expect("the store lock is not poisoned")
-            .records
-            .get(name)
-            .cloned()
+        self.inner.lock().records.get(name).cloned()
     }
 
     /// Refuse every load and store with `reason`.
     fn set_refusal(&self, reason: &'static str) {
-        self.inner
-            .lock()
-            .expect("the store lock is not poisoned")
-            .refusal = Some(reason);
+        self.inner.lock().refusal = Some(reason);
     }
 
     /// Lift the refusal.
     fn lift_refusal(&self) {
-        self.inner
-            .lock()
-            .expect("the store lock is not poisoned")
-            .refusal = None;
+        self.inner.lock().refusal = None;
     }
 
     fn refused(state: &SharedStoreState) -> Option<String> {
@@ -129,7 +117,7 @@ impl RefreshTokenStore for SharedStore {
         account: &'a str,
     ) -> RefreshFuture<'a, Option<String>, connetto_client::ClientError> {
         Box::pin(async move {
-            let state = self.inner.lock().expect("the store lock is not poisoned");
+            let state = self.inner.lock();
             match Self::refused(&state) {
                 Some(reason) => Err(connetto_client::ClientError::Auth(reason)),
                 None => Ok(state.records.get(account).cloned()),
@@ -143,7 +131,7 @@ impl RefreshTokenStore for SharedStore {
         token: &'a str,
     ) -> RefreshFuture<'a, (), connetto_client::ClientError> {
         Box::pin(async move {
-            let mut state = self.inner.lock().expect("the store lock is not poisoned");
+            let mut state = self.inner.lock();
             if let Some(reason) = Self::refused(&state) {
                 return Err(connetto_client::ClientError::Auth(reason));
             }
@@ -158,7 +146,7 @@ impl RefreshTokenStore for SharedStore {
         account: &'a str,
     ) -> RefreshFuture<'a, (), connetto_client::ClientError> {
         Box::pin(async move {
-            let mut state = self.inner.lock().expect("the store lock is not poisoned");
+            let mut state = self.inner.lock();
             if let Some(reason) = Self::refused(&state) {
                 return Err(connetto_client::ClientError::Auth(reason));
             }
@@ -171,10 +159,9 @@ impl RefreshTokenStore for SharedStore {
         Box::pin(std::future::ready(Ok(self
             .inner
             .lock()
-            .expect("the store lock is not poisoned")
             .records
             .keys()
-            .filter(|name| !is_reserved_record(name) && !is_share_key_record(name))
+            .filter(|name| !is_reserved_record(name))
             .cloned()
             .collect())))
     }
@@ -684,4 +671,235 @@ async fn a_locked_expiry_defers_its_secret_write_until_unlock() {
         .await
         .expect("pump exits")
         .expect("no panic");
+}
+
+#[tokio::test]
+async fn a_failed_removal_preserves_durable_keys_and_local_visibility() {
+    let dir = tempfile::tempdir().expect("replica directory");
+    let share = SharedStore::default();
+    let keys = seeded_keys("alice").await;
+    let subject = CapabilitySubject::<String>::new("a1");
+    let mut conn = durable_build(
+        "alice",
+        dir.path(),
+        keys.clone(),
+        share.clone(),
+        vec![(grant("held"), subject.clone())],
+    )
+    .await
+    .expect("open durable replica");
+    seed(&mut conn);
+    let held = held_set("alice", &share);
+    share.set_refusal("removal refused");
+    assert!(matches!(
+        conn.remove_share_key(&subject).await,
+        Err(connetto_client::ClientError::Auth(_))
+    ));
+    assert_eq!(visible_ids(&mut conn), vec![1]);
+    assert_eq!(held_set("alice", &share), held);
+    share.lift_refusal();
+    drop(conn);
+    let mut reopened = durable_build("alice", dir.path(), keys, share, Vec::new())
+        .await
+        .expect("reopen after refused removal");
+    assert_eq!(visible_ids(&mut reopened), vec![1]);
+}
+
+#[tokio::test]
+async fn an_expiry_save_failure_hides_rows_and_stops_connected_or_offline_pumps() {
+    use connetto_client::{ClientEvent, ConnettoClient};
+    use std::time::{Duration, SystemTime};
+
+    for connected in [false, true] {
+        let dir = tempfile::tempdir().expect("replica directory");
+        let share = SharedStore::default();
+        let subject = CapabilitySubject::<String>::new("a1");
+        let authority =
+            connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
+                .expect("token authority");
+        let token = authority
+            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
+            .expect("short-lived key");
+        let mut conn = durable_build(
+            "alice",
+            dir.path(),
+            seeded_keys("alice").await,
+            share.clone(),
+            vec![(Grant::new(token), subject)],
+        )
+        .await
+        .expect("open durable replica");
+        seed(&mut conn);
+        conn.disconnect();
+        if connected {
+            conn.attach(FakeTransport::accepting_but_silent())
+                .await
+                .expect("attach silent peer");
+        }
+        let held = held_set("alice", &share);
+        let (client, pump) = ConnettoClient::with_pump(conn);
+        let mut query: connetto_client::LiveQuery<i32> = client
+            .watch(visible::table.select(visible::id).order(visible::id))
+            .await
+            .expect("watch policy rows");
+        assert_eq!(query.rows(), vec![1]);
+        let mut events = client.events();
+        share.set_refusal("expiry persistence refused");
+        let pump = tokio::spawn(pump);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let ClientEvent::Stopped { detail } = events.recv().await.expect("pump event") {
+                    assert!(detail.contains("expiry persistence refused"));
+                    break;
+                }
+            }
+            assert_eq!(
+                events.recv().await.expect("terminal event"),
+                ClientEvent::Closed
+            );
+            pump.await.expect("pump exits without panic");
+        })
+        .await
+        .expect("expiry failure stops the pump");
+        assert_eq!(query.rows(), [] as [i32; 0]);
+        assert!(matches!(
+            query.changed().await,
+            Err(connetto_client::ClientError::Stopped(_))
+        ));
+        assert_eq!(held_set("alice", &share), held);
+        let local: connetto_client::LiveQuery<i32> = client
+            .watch(visible::table.select(visible::id).order(visible::id))
+            .await
+            .expect("read after stop");
+        assert_eq!(local.rows(), [] as [i32; 0]);
+    }
+}
+
+#[tokio::test]
+async fn an_expiry_save_failure_terminates_recovery_during_backoff_or_dial() {
+    use connetto_client::{ClientEvent, ReconnectPolicy};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, SystemTime};
+
+    for during_dial in [false, true] {
+        let dir = tempfile::tempdir().expect("replica directory");
+        let share = SharedStore::default();
+        let subject = CapabilitySubject::<String>::new("a1");
+        let authority =
+            connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
+                .expect("token authority");
+        let token = authority
+            .mint_capability(&subject, SystemTime::now(), Duration::from_secs(5))
+            .expect("short-lived key");
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let probe = Arc::clone(&attempts);
+        let factory = move || {
+            let first = probe.fetch_add(1, Ordering::Relaxed) == 0;
+            async move {
+                if first {
+                    Err(super::support::Unreachable)
+                } else {
+                    core::future::pending::<Result<FakeTransport, super::support::Unreachable>>()
+                        .await
+                }
+            }
+        };
+        let delay = if during_dial {
+            Duration::from_millis(10)
+        } else {
+            Duration::from_secs(30)
+        };
+        let (running, pump) = ClientBuilder::new(schema(), factory)
+            .with_share_keys([(Grant::new(token), subject)])
+            .with_reconnect(
+                ReconnectPolicy::new()
+                    .with_initial_backoff(delay)
+                    .with_max_backoff(delay)
+                    .with_jitter(false),
+            )
+            .with_sleeper(tokio::time::sleep)
+            .signed_in(super::support::held("alice"))
+            .durable(
+                DataDir::new(dir.path().to_path_buf()),
+                seeded_keys("alice").await,
+                share.clone(),
+            )
+            .connect_with_pump()
+            .await
+            .expect("open offline replica");
+        let client = running.client();
+        client.with_conn(seed).await.expect("seed cached rows");
+        let query: connetto_client::LiveQuery<i32> = client
+            .watch(visible::table.select(visible::id).order(visible::id))
+            .await
+            .expect("watch policy rows");
+        assert_eq!(query.rows(), vec![1]);
+        let mut events = client.events();
+        share.set_refusal("recovery expiry refused");
+        let pump = tokio::spawn(pump);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if let ClientEvent::Stopped { detail } = events.recv().await.expect("pump event") {
+                    assert!(detail.contains("recovery expiry refused"));
+                    break;
+                }
+            }
+            assert_eq!(
+                events.recv().await.expect("terminal event"),
+                ClientEvent::Closed
+            );
+            pump.await.expect("recovery exits without panic");
+        })
+        .await
+        .expect("expiry failure stops recovery");
+        assert_eq!(
+            attempts.load(Ordering::Relaxed),
+            if during_dial { 2 } else { 1 }
+        );
+        let local: connetto_client::LiveQuery<i32> = client
+            .watch(visible::table.select(visible::id).order(visible::id))
+            .await
+            .expect("read after recovery stops");
+        assert_eq!(local.rows(), [] as [i32; 0]);
+    }
+}
+
+#[tokio::test]
+async fn an_unlocked_expiry_persists_the_reduced_set_before_restart() {
+    use std::time::{Duration, SystemTime};
+
+    let dir = tempfile::tempdir().expect("replica directory");
+    let keys = seeded_keys("alice").await;
+    let share = SharedStore::default();
+    let subject = CapabilitySubject::<String>::new("a1");
+    let authority =
+        connetto_server::TokenAuthority::generate(&connetto_server::AuthConfig::default())
+            .expect("token authority");
+    let token = authority
+        .mint_capability(&subject, SystemTime::now(), Duration::from_secs(3))
+        .expect("short-lived key");
+    let mut conn = durable_build(
+        "alice",
+        dir.path(),
+        keys.clone(),
+        share.clone(),
+        vec![(Grant::new(token), subject)],
+    )
+    .await
+    .expect("open durable replica");
+    seed(&mut conn);
+    assert_eq!(visible_ids(&mut conn), vec![1]);
+    let wait = conn.share_key_timer().expect("expiry timer").wait();
+    tokio::time::sleep(wait + Duration::from_millis(20)).await;
+    assert!(conn.process_share_keys(true).await.expect("persist expiry"));
+    assert_eq!(
+        held_set("alice", &share),
+        Some(ShareKeySet::new::<String>([]))
+    );
+    assert_eq!(visible_ids(&mut conn), Vec::<i32>::new());
+    drop(conn);
+    let mut reopened = durable_build("alice", dir.path(), keys, share, Vec::new())
+        .await
+        .expect("reopen expired set");
+    assert_eq!(visible_ids(&mut reopened), Vec::<i32>::new());
 }

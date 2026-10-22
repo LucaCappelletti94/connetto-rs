@@ -619,8 +619,6 @@ async fn two_hkdf_source_keys_derive_different_encryption_keys() {
     );
 }
 
-// ───────────────────────── share-key record tests ─────────────────────────
-
 #[wasm_bindgen_test]
 async fn a_share_key_set_survives_a_cold_reopen() {
     on_the_ungated_rung().await;

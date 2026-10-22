@@ -207,7 +207,7 @@ impl<B: Backend> SecretGate<B> {
     /// The secret under `name`, moving a copy an earlier launch stored under the
     /// other storage to the one this launch uses.
     pub(crate) fn read(&self, name: &str) -> Result<Option<String>, ClientError> {
-        if crate::is_reserved_record(name) {
+        if crate::replica::is_ungated_record(name) {
             return Ok(self.backend.read(&self.service, name, PLAIN)?);
         }
         let storage = self.gated_storage()?;
@@ -241,7 +241,7 @@ impl<B: Backend> SecretGate<B> {
 
     /// Store `secret` under `name`, removing any copy under the other storage.
     pub(crate) fn write(&self, name: &str, secret: &str) -> Result<(), ClientError> {
-        if crate::is_reserved_record(name) {
+        if crate::replica::is_ungated_record(name) {
             return Ok(self.backend.write(&self.service, name, secret, PLAIN)?);
         }
         let storage = self.gated_storage()?;
@@ -270,7 +270,7 @@ impl<B: Backend> SecretGate<B> {
     /// Remove the entry under `name` from both storages, never prompting.
     pub(crate) fn clear(&self, name: &str) -> Result<(), ClientError> {
         self.backend.clear(&self.service, name, PLAIN)?;
-        if !crate::is_reserved_record(name) {
+        if !crate::replica::is_ungated_record(name) {
             self.backend.clear(&self.service, name, Storage::Gated)?;
         }
         let mut state = self.state();
@@ -598,6 +598,31 @@ mod tests {
             Some("pkcs8")
         );
         assert_eq!(fake.prompts(), 0, "the device key signs without a prompt");
+    }
+
+    #[test]
+    fn share_key_secrets_stay_gated_and_clear_both_copies_while_locked() {
+        for script in STORES {
+            let (gate, fake) = gate(script);
+            let name = crate::share_keys::share_key_record("\"alice\"");
+            gate.write(&name, "shares").expect("store share keys");
+            assert_eq!(fake.storage_of(&name), Some(Storage::Gated));
+            assert_eq!(
+                gate.read(&name).expect("read shares").as_deref(),
+                Some("shares")
+            );
+            gate.lock();
+            assert!(matches!(gate.read(&name), Err(ClientError::Locked)));
+            assert!(matches!(
+                gate.write(&name, "new shares"),
+                Err(ClientError::Locked)
+            ));
+            fake.seed(&name, "stranded", PLAIN);
+            let prompts = fake.prompts();
+            gate.clear(&name).expect("clear while locked");
+            assert_eq!(fake.storage_of(&name), None);
+            assert_eq!(fake.prompts(), prompts);
+        }
     }
 
     #[test]

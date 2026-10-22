@@ -80,9 +80,9 @@ A spawn announces its boot and keeps answering for it, because a broadcast is no
 
 **Share keys change on a running native client.** `add_share_key(&grant, &subject)` commits a grant-subject pair, and `remove_share_key(&subject)` removes every grant for that subject. Both refresh local policy views and live queries immediately, while the pump reconciles the whole accepted set over the existing connection. Identical additions and absent removals leave the set unchanged, and locked or closed clients refuse changes.
 
-Durable share-key records stay outside the encrypted replica under the secret store's gate. Construction merges stored and builder pairs, excludes expired grants, and folds the store's protection into custody. Forgetting an identity clears its share-key record.
+Durable share-key records stay outside the encrypted replica under the secret store's gate and are reserved from account enumeration. Construction merges stored and builder pairs, excludes expired grants, and folds the store's protection into custody. Forgetting an identity clears its share-key record.
 
-Expiry remains active while connected, offline or dialing. A locked gate defers the secret-store write while local authorization loses the expired grant, and unlocking persists the deferred set. Replacement refusals preserve the accepted local set and observe the server's retry delay.
+Expiry remains active while connected, offline or dialing. A locked gate defers the secret-store write while local authorization loses the expired grant, and unlocking persists the deferred set. Replacement refusals preserve the accepted local set and observe the server's retry delay. An elapsed retry waits on any outstanding declaration fence without arming an immediate wake.
 
 The replica persists its cursor together with `cursor_subjects`, with `None` meaning unknown and `Some([])` meaning completed empty coverage. Key changes and authorization resends persist unknown before backing rows change, and overlapping subscriptions share one table clear per attach or replacement batch. A handshake or replacement acknowledgment cannot publish known coverage until every declaration fence and row delivery has completed.
 

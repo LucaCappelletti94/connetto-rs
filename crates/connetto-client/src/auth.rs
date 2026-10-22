@@ -97,10 +97,7 @@ impl KeyringStore {
 ///
 /// Keep credential-storage records out of the account picker.
 fn indexed_with(known: &[String], account: &str) -> Option<Vec<String>> {
-    if crate::is_reserved_record(account)
-        || crate::share_keys::is_share_key_record(account)
-        || known.iter().any(|name| name == account)
-    {
+    if crate::is_reserved_record(account) || known.iter().any(|name| name == account) {
         return None;
     }
     let mut updated = known.to_vec();
@@ -110,10 +107,7 @@ fn indexed_with(known: &[String], account: &str) -> Option<Vec<String>> {
 
 /// `known` with `account` removed, or `None` when it was not there.
 fn indexed_without(known: &[String], account: &str) -> Option<Vec<String>> {
-    if crate::is_reserved_record(account)
-        || crate::share_keys::is_share_key_record(account)
-        || !known.iter().any(|name| name == account)
-    {
+    if crate::is_reserved_record(account) || !known.iter().any(|name| name == account) {
         return None;
     }
     Some(
