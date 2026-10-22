@@ -394,21 +394,34 @@ fn format_expiry_line(warn: &ExpiryWarning) -> String {
     format!("Session lapses in {days} day(s). {n} local item(s) at risk. Connect to refresh.")
 }
 
-/// Whether the passkey gate can be enrolled here and the header's custody line.
-fn custody_description(snap: Option<Custody>) -> (bool, Option<String>) {
-    let offerable = matches!(snap, Some(Custody::Unverified(NoGate::Offerable)));
-    let text = snap.as_ref().map(|c| match c {
-        Custody::Verified => "gate: verified by passkey".to_owned(),
+/// The header's gate line for the custody standing and the worker's reported
+/// unlock state, the lock standing where a gate guards the data, the no-gate
+/// statement where there is none.
+fn gate_text(custody: Custody, state: &'static str) -> &'static str {
+    match custody {
+        Custody::Verified => state,
+        Custody::Unverified(_) | Custody::Ephemeral => {
+            "none, local data opens without user verification"
+        }
+    }
+}
+
+/// The header's custody line for the standing, naming the at-rest policy and
+/// the reason it stands as it does in this browser.
+fn custody_text(custody: Custody) -> &'static str {
+    match custody {
+        Custody::Verified => "released only after user verification",
         Custody::Unverified(NoGate::Offerable) => {
-            "gate: not verified (passkey available)".to_owned()
+            "stored without user verification, a passkey can be set up"
         }
-        Custody::Unverified(NoGate::Declined) => "gate: not verified (passkey declined)".to_owned(),
+        Custody::Unverified(NoGate::Declined) => {
+            "stored without user verification, the passkey was declined"
+        }
         Custody::Unverified(NoGate::Unsupported) => {
-            "gate: not verified (passkey not available on this device)".to_owned()
+            "stored without user verification, the browser refused a passkey for this address"
         }
-        Custody::Ephemeral => "gate: no persistent key (anonymous session)".to_owned(),
-    });
-    (offerable, text)
+        Custody::Ephemeral => "no durable key, nothing is kept",
+    }
 }
 
 /// Export this device's local data through the worker and offer the archive
@@ -452,8 +465,7 @@ pub struct Ops {
     user_id: Signal<Option<String>>,
     live_account: Signal<Option<String>>,
     enrol_offerable: Signal<bool>,
-    gate_line: Signal<Option<String>>,
-    custody_line: Signal<Option<String>>,
+    custody_snap: Signal<Option<Custody>>,
     enrol_msg: Signal<Option<String>>,
     logout_state: Signal<LogoutState>,
     login_prompt: Signal<Option<String>>,
@@ -552,8 +564,7 @@ impl Ops {
     /// await.
     pub async fn enrol_gate(&self) {
         let mut enrol_offerable = self.enrol_offerable;
-        let mut gate_line = self.gate_line;
-        let mut custody_line = self.custody_line;
+        let mut custody_snap = self.custody_snap;
         let mut enrol_msg = self.enrol_msg;
         let Some(membership) = self.boot() else {
             return;
@@ -561,11 +572,8 @@ impl Ops {
         match membership.enrol_gate().await {
             Ok(true) => {
                 if let Ok(level) = workers::request_custody().await {
-                    let (offerable, gate) = custody_description(Some(level));
-                    let custody = format!("custody: {level}");
-                    enrol_offerable.set(offerable);
-                    gate_line.set(gate);
-                    custody_line.set(Some(custody));
+                    enrol_offerable.set(matches!(level, Custody::Unverified(NoGate::Offerable)));
+                    custody_snap.set(Some(level));
                 }
             }
             Ok(false) => {
@@ -578,8 +586,15 @@ impl Ops {
         }
     }
 
-    /// The stored-secrets gate is the worker's to hold, and a web build never
-    /// locks it, so the header's unlock affordance never offers here.
+    /// The header's unlock affordance is never offered here, because the
+    /// stored-secrets gate is the worker's to hold and the worker's unlock
+    /// prompt is the browser's own ceremony.
+    pub fn offers_unlock(&self) -> bool {
+        false
+    }
+
+    /// The gate unlock, which the header never reaches here, kept for the
+    /// platform interface the shared page calls through.
     pub async fn unlock(&self) {}
 
     /// Open the parked login URL in a popup, or no-op when none is parked yet.
@@ -625,9 +640,10 @@ pub fn App() -> Element {
     let mut custody_line: Signal<Option<String>> = use_signal(|| None);
     let enrol_msg: Signal<Option<String>> = use_signal(|| None);
     let mut gate_line: Signal<Option<String>> = use_signal(|| None);
+    let mut custody_snap: Signal<Option<Custody>> = use_signal(|| None);
     let device_line: Signal<String> = use_signal(|| "no device identity in this build".to_owned());
     let logout_state: Signal<LogoutState> = use_signal(|| LogoutState::Idle);
-    let gate: Signal<&'static str> = use_signal(|| "open");
+    let mut gate: Signal<&'static str> = use_signal(|| "open");
     let clock: Signal<Option<&'static str>> = use_signal(|| None);
 
     use_context_provider(|| Status(status));
@@ -648,6 +664,17 @@ pub fn App() -> Element {
     use_context_provider(|| Gate(gate));
     use_context_provider(|| Clock(clock));
     use_context_provider(|| SignInReady(sign_in_ready));
+
+    // The header's gate and custody lines stand on the custody snapshot and,
+    // where a gate exists, the worker's reported unlock state.
+    use_effect(move || {
+        let Some(custody) = *custody_snap.read() else {
+            return;
+        };
+        let state = *gate.read();
+        gate_line.set(Some(format!("gate: {}", gate_text(custody, state))));
+        custody_line.set(Some(format!("custody: {}", custody_text(custody))));
+    });
 
     // The account bar's list of every stored account as key, decoded label
     // and signed in right now, refreshed as the worker's list or the live
@@ -803,8 +830,7 @@ pub fn App() -> Element {
         user_id,
         live_account,
         enrol_offerable,
-        gate_line,
-        custody_line,
+        custody_snap,
         enrol_msg,
         logout_state,
         login_prompt,
@@ -818,12 +844,11 @@ pub fn App() -> Element {
         spawn(async move {
             match boot_window().await {
                 Ok(boot) => {
-                    // Fetch the custody level now that the worker has settled.
+                    // Fetch the custody standing now that the worker has settled.
                     if let Ok(level) = workers::request_custody().await {
-                        let (offerable, gate) = custody_description(Some(level));
-                        enrol_offerable.set(offerable);
-                        gate_line.set(gate);
-                        custody_line.set(Some(format!("custody: {level}")));
+                        enrol_offerable
+                            .set(matches!(level, Custody::Unverified(NoGate::Offerable)));
+                        custody_snap.set(Some(level));
                     }
                     content_slot.set(Some(DemoContent::new(Rc::clone(&boot.content))));
                     let mut events = boot.client.events();
@@ -831,6 +856,15 @@ pub fn App() -> Element {
                     status.set("connected".to_owned());
                     *boot_inner.borrow_mut() = Some(boot);
                     while let Ok(event) = events.recv().await {
+                        // The worker states its gate to every tab as the
+                        // away-and-return re-check locks and unlocks it.
+                        match event {
+                            ClientEvent::Locked | ClientEvent::UnlockDismissed => {
+                                gate.set("locked")
+                            }
+                            ClientEvent::Unlocked => gate.set("open"),
+                            _ => {}
+                        }
                         if let Some(label) = crate::status_label(&event) {
                             status.set(label);
                         }

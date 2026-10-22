@@ -9,8 +9,9 @@ use std::time::Duration;
 
 use connetto_client::teardown::expiry_warning;
 use connetto_client::{
-    AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, ImportChoices, KeyringAuth,
-    KeyringStore, NativeAuthenticator, NativeClient, NativeClientBuilder, SyncTuning,
+    AccountChoice, Auth, ClientError, ClientEvent, ConnettoClient, Custody, ImportChoices,
+    KeyringAuth, KeyringStore, NativeAuthenticator, NativeClient, NativeClientBuilder, NoGate,
+    SyncTuning,
 };
 use connetto_core::traits::RefreshTokenStore;
 use connetto_dioxus::{use_away_input, use_live};
@@ -589,8 +590,7 @@ fn Session(parts: SessionParts) -> Element {
             let mut rx = event_rx;
             while let Ok(event) = rx.recv().await {
                 match event {
-                    ClientEvent::Locked => gate.set("locked, verify it is you to continue"),
-                    ClientEvent::UnlockDismissed => gate.set("unlock dismissed, still locked"),
+                    ClientEvent::Locked | ClientEvent::UnlockDismissed => gate.set("locked"),
                     ClientEvent::Unlocked => gate.set("open"),
                     ClientEvent::ClockOutsideWindow { ahead } => clock.set(Some(if ahead {
                         "the clock runs ahead of the server's, so peers will refuse this device"
@@ -608,9 +608,12 @@ fn Session(parts: SessionParts) -> Element {
             }
         })
     });
+    // The custody standing, read once at mount because native enrolment never
+    // flips it, so the gate and custody lines treat it as a constant.
+    let custody = parts.0.native.custody();
     use_effect(move || {
-        let gate_now = gate.read();
-        gate_line.set(Some(format!("gate: {gate_now}")));
+        let gate_now = *gate.read();
+        gate_line.set(Some(format!("gate: {}", gate_text(gate_now, custody))));
     });
     // The session's standing, read once at mount into the signals the page's
     // account bar and status lines stand on.
@@ -628,7 +631,7 @@ fn Session(parts: SessionParts) -> Element {
                     .collect(),
             );
         }
-        custody_line.set(Some(format!("custody: {}", parts.0.native.custody())));
+        custody_line.set(Some(format!("custody: {}", custody_text(custody))));
         device_line.set(device_label(&parts.0.native));
     }
     {
@@ -798,6 +801,36 @@ fn device_label(_native: &NativeClient<Ws, ContentHandle<Ws>>) -> String {
     "no device identity in this build".to_owned()
 }
 
+/// The header's gate line for the lock standing and the custody, the standing
+/// itself where a gate guards the data, the no-gate statement where nothing
+/// does.
+fn gate_text(gate: &'static str, custody: Custody) -> &'static str {
+    match custody {
+        Custody::Verified => gate,
+        Custody::Unverified(_) | Custody::Ephemeral => {
+            "none, local data opens without user verification"
+        }
+    }
+}
+
+/// The header's custody line for the standing, naming the at-rest policy and
+/// the reason it stands as it does on this system.
+fn custody_text(custody: Custody) -> &'static str {
+    match custody {
+        Custody::Verified => "released only after user verification",
+        Custody::Unverified(NoGate::Offerable) => {
+            "stored without user verification, a passkey can be set up"
+        }
+        Custody::Unverified(NoGate::Declined) => {
+            "stored without user verification, the passkey was declined"
+        }
+        Custody::Unverified(NoGate::Unsupported) => {
+            "stored without user verification, this system offers none"
+        }
+        Custody::Ephemeral => "no durable key, nothing is kept",
+    }
+}
+
 /// The warning shown while the session nears expiry with local writes unsent.
 async fn expiry_text(client: &Client, session_expires_at: std::time::SystemTime) -> Option<String> {
     let unsynced = client.unsynced().await.unwrap_or_default();
@@ -956,6 +989,12 @@ impl Ops {
     pub async fn dismiss(&self) {
         let mut state = self.logout;
         state.set(LogoutState::Idle);
+    }
+
+    /// Whether the header offers the unlock affordance, offered here, the
+    /// gate being this client's own.
+    pub fn offers_unlock(&self) -> bool {
+        true
     }
 
     /// Unlock the stored-secrets gate.

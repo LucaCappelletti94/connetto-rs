@@ -161,7 +161,7 @@ fn Header() -> Element {
         None => device().clone(),
     };
 
-    let unlock: Option<Element> = if gate() != "open" {
+    let unlock: Option<Element> = if ops.offers_unlock() && gate() != "open" {
         let ops = ops.clone();
         Some(rsx! {
             button {
