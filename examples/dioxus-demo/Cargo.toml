@@ -1,57 +1,97 @@
 [package]
-name = "connetto-dioxus-desktop-demo"
-description = "Windowed Dioxus desktop demo of connetto live queries against a real connetto-server and Postgres."
+name = "connetto-dioxus-demo"
+description = "One Dioxus demo of connetto live queries, on one deployment, for the browser, the desktop and the phone."
 version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
 publish = false
 
-[dependencies]
-# The hosted hotspot's `WIFI:` payload drawn as a QR code (R76 decision 23).
-qrcode = { version = "0.14.1", default-features = false, features = ["svg"], optional = true }
-# The peer panel's section and button icons, Font Awesome's solid set.
-dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-solid"], optional = true }
-# Startup failures are reported in the window rather than aborting the process, so
-# the whole setup path is fallible.
-anyhow = "1"
-connetto-client = { path = "../../crates/connetto-client", features = ["native-auth"] }
-connetto-core = { path = "../../crates/connetto-core", features = ["logging"] }
-# Feeds the client's away input from tao's lifecycle and window focus (R94
-# step 5). Pulls dioxus-desktop, which the demo's desktop and mobile builds
-# both already carry.
-connetto-dioxus = { path = "../../crates/connetto-dioxus", features = ["desktop"] }
-diesel = { version = "2", features = ["sqlite", "chrono"] }
-# Backend writer buttons: direct Postgres DML over tokio-postgres, no libpq.
-diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
-# The renderer is a feature so `dx` can pick it per platform: `desktop` by
-# default, `mobile` for the Android and iOS builds.
-dioxus = { version = "0.7.9" }
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
-# Structured logging (R12): this demo emits through `tracing` and installs the
-# stdout destination in `main`.
-tracing = { version = "0.1", default-features = false, features = ["std"] }
-# Client-authored uuid v4 keys: one strongly typed `rosetta_uuid::Uuid` that
-# maps to SQLite BLOB (frontend replica) and Postgres uuid (backend writer)
-# from a single `orders` schema. postgres feature for the typed backend writes.
-rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite", "postgres"] }
-chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
-connetto-file-client = { path = "../../crates/connetto-file-client" }
-base64 = "0.22"
+[lib]
+crate-type = ["cdylib", "rlib"]
 
+[dependencies]
+anyhow = "1"
+# The deployment every build here runs against, documents and all.
+connetto-demo-deployment = { path = "../deployment" }
+connetto-core = { path = "../../crates/connetto-core", features = ["logging"] }
+connetto-dioxus = { path = "../../crates/connetto-dioxus" }
+# FileId and MimeClass for the staging row and the mime guess, on every target.
+connetto-file-core = { path = "../../crates/connetto-file-core" }
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+diesel = { version = "2", features = ["sqlite", "chrono"] }
+# The renderer is a feature so `dx` can pick it per platform: `desktop` by
+# default, `web` for the browser build, `mobile` for the phone builds.
+dioxus = { version = "0.7.9" }
+# Client-authored primary keys: one strongly typed `rosetta_uuid::Uuid` that
+# maps to SQLite BLOB and Postgres uuid from a single schema.
+rosetta-uuid = { version = "0.2.0", features = ["diesel", "sqlite"] }
+# Structured logging (R12): the demo emits through `tracing` and installs its
+# destination in `main`.
+tracing = { version = "0.1", default-features = false, features = ["std"] }
+# The pane and button icons, Font Awesome's solid set, on every renderer.
+dioxus-free-icons = { version = "0.10.0", features = ["font-awesome-solid"] }
+# The hosted hotspot's `WIFI:` payload drawn as a QR code (R76 decision 23),
+# on the builds that carry the peer link.
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"], optional = true }
+
+# The browser platform: the transport, the leader election, the relay hub and
+# the DB worker, booted and attached through the worker glue.
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+connetto-client = { path = "../../crates/connetto-client", default-features = false }
+connetto-web = { path = "../../crates/connetto-web" }
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# `Blob` and `Url` back the export download, `File` the import picker,
+# `BroadcastChannel` the tab-to-worker transport, and `Storage` the last
+# signed-in account across reloads, a non-secret identifier.
+web-sys = { version = "0.3", features = [
+  "Blob",
+  "BlobPropertyBag",
+  "BroadcastChannel",
+  "DedicatedWorkerGlobalScope",
+  "Document",
+  "Element",
+  "File",
+  "FileList",
+  "HtmlAnchorElement",
+  "HtmlElement",
+  "HtmlInputElement",
+  "Request",
+  "RequestInit",
+  "Response",
+  "Storage",
+  "UrlSearchParams",
+  "Url",
+  "Window",
+  "Worker",
+  "WorkerGlobalScope",
+  "WorkerOptions",
+  "WorkerType",
+  "console",
+] }
+
+# The native platform: the OS-keyring-held replica, the durable content store
+# and the platform sign-in, on the desktop and the phone alike.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+base64 = "0.22"
+connetto-client = { path = "../../crates/connetto-client", features = ["native-auth"] }
+connetto-file-client = { path = "../../crates/connetto-file-client" }
+# The runtime the native pumps run on.
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time", "net", "io-util"] }
+connetto-dioxus = { path = "../../crates/connetto-dioxus", features = ["desktop"] }
+
+# The app's private data directory on a phone, read through the activity
+# context, plus the in-app browser sign-in and the log file a proof copies off.
 [target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-# The app's private data directory, `Context.getFilesDir` on Android, read
-# through the activity context Dioxus Mobile publishes, and the container's
-# `Library/Application Support` on iOS.
-robius-directories = "6"
-# Sign-in through the platform's in-app browser tab and the app's own redirect.
 connetto-auth-session = { path = "../../crates/connetto-auth-session" }
-# The writer that sends a phone build's log to stdout and its log file.
+robius-directories = "6"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 
 # Windows Hello prompts over the demo's window (R53).
 [target.'cfg(target_os = "windows")'.dependencies]
-connetto-dioxus = { path = "../../crates/connetto-dioxus", features = ["desktop", "hello"] }
+connetto-dioxus = { path = "../../crates/connetto-dioxus", features = ["hello"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # Bundles `android/`, the manifest that turns off backup and device transfer.
@@ -66,6 +106,9 @@ connetto-peer-apple = { path = "../../crates/connetto-peer-apple" }
 
 [features]
 default = ["desktop"]
+# The web leg builds with `--no-default-features`, which drops the desktop
+# renderer whose websocket bridge links OpenSSL, which a wasm target has none of.
+web = ["dioxus/web", "dioxus/lib", "dioxus/launch", "dioxus/logger", "dioxus/devtools"]
 desktop = ["dioxus/desktop"]
 mobile = ["dioxus/mobile"]
 # Enrols this device under the deployment root `CONNETTO_DEMO_BUILD_DEVICE_ROOT`
@@ -73,23 +116,31 @@ mobile = ["dioxus/mobile"]
 device-identity = ["connetto-client/device-identity", "connetto-auth-session/device-identity"]
 # The peer link and the hotspot it hosts and joins (R76): the device identity
 # the link proves with, and the demo's peer panel.
-peer = ["connetto-client/peer", "dep:qrcode", "dep:dioxus-free-icons"]
-
-[dev-dependencies]
+peer = ["connetto-client/peer", "dep:qrcode"]
+# The end-to-end fixture the native proof runs, on the targets that carry it;
+# the wasm leg's test suite needs none of it.
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
 connetto-test-harness = { path = "../../crates/connetto-test-harness" }
 connetto-file-server = { path = "../../crates/connetto-file-server" }
 connetto-server = { path = "../../crates/connetto-server", features = ["test-seams"] }
+# The test's Postgres polling reads, over the harness' pooled admin connection.
+diesel-async = { version = "0.9", default-features = false, features = ["postgres", "bb8"] }
 tempfile = "3"
 axum = "0.8"
-pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+wasm-bindgen-test = "0.3"
+futures-channel = "0.3"
+serde_json = "1"
 
 [[test]]
 name = "demo_photos_flow"
 path = "tests/demo_photos_flow.rs"
 required-features = []
 
-# The schema step: translates the demo's own schema and empty policies into
-# the bundle the app includes and the version it presents at handshake.
+# The schema step: translates the deployment's shared schema and policies plus
+# the demo's local tier into the bundle the app includes and the version it
+# presents at handshake.
 [build-dependencies]
 connetto-schema = { path = "../../crates/connetto-schema" }
 

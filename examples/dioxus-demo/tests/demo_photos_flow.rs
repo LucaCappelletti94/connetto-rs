@@ -1,7 +1,7 @@
-//! End-to-end proof for the desktop demo's photos surface.
+//! End-to-end proof for the demo's photos surface.
 //!
-//! Applies the demo's own `schema.sql`, `DEPLOYMENT_DDL`, `roles.sql` and
-//! `content.sql` in the documented order, then proves:
+//! Applies the shared deployment's own `schema.sql`, `policies.sql`,
+//! `roles.sql` and `content.sql` in the documented order, then proves:
 //!
 //! - stage (`orders` + `photos` row in one transaction), local resolve, upload,
 //!   `content_state` flip via `connetto_set_content_state`, signed-URL resolve,
@@ -10,12 +10,14 @@
 //!   bytes survive re-encryption, and the device-private tier (`notes`) rides
 //!   along the archive and comes back on the importing device.
 //!
-//! CI does NOT run tests in the examples workspaces (`ci.yml` runs tests only
-//! for root-workspace crates: `connetto-server`, `connetto-client`, and the rest
-//! shard). This proof is local only.
+//! The clients run the demo's own schema bundle, the one `build.rs` translates
+//! from the deployment documents.
+//!
+//! CI does NOT run tests in the examples workspaces. This proof is local only.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
+#![cfg(not(target_arch = "wasm32"))]
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
 use std::marker::PhantomData;
@@ -24,71 +26,49 @@ use std::sync::Arc;
 use connetto_client::live::ConnettoClient;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
-    ClientBuilder, DataDir, ExportScope, Gate, Grant, HeldCredential, ImportChoices,
-    MemoryKeyStore, MemoryRefreshStore, SyncSchema,
+    ClientBuilder, DataDir, ExportScope, Gate, Grant, HeldCredential, ImportChoices, MemoryKeyStore,
+    MemoryRefreshStore,
 };
-use connetto_core::schema::SchemaBundle;
-use connetto_core::traits::ReplicaKeyStore as _;
+use connetto_core::traits::ReplicaKeyStore;
 use connetto_core::transport::LoopbackTransport;
-use connetto_dioxus_desktop_demo::{notes, photos, stage_photo_row};
+use connetto_demo_deployment::{CONTENT_SQL, POLICIES_SQL, ROLES_SQL, SCHEMA_SQL};
+use connetto_dioxus_demo::{demo_schema, notes, photos, stage_photo_row};
 use connetto_file_client::{ContentClient, FsStore, MimeClass, ReqwestHttp, Resolved};
 use connetto_file_server::{
     AppPools, Config, DefaultFileSchema, FsStore as ServerStore, TicketSigner, TicketVerifier,
 };
+use connetto_server::epoch::EPOCH_DDL;
 use connetto_server::{PgSnapshotSource, RlsAuth, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, Server, ServerConfig, pool_for, spawn_server, with_user,
 };
 use diesel::prelude::*;
-use pg2sqlite::prelude::{Pg2Sqlite, Pg2SqliteOptions, SessionVariableMapping, UuidRepresentation};
 use tempfile::tempdir;
 
-include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
-
 /// The bytes staged and verified through the full flow.
-const PHOTO: &[u8] = b"JPEG bytes representing a photo staged through the desktop demo UI";
+const PHOTO: &[u8] = b"JPEG bytes representing a photo staged through the demo UI";
 
-/// The demo's Postgres table DDL, applied as-is.
-const SCHEMA_SQL: &str = include_str!("../schema.sql");
-/// The demo's deployment functions (`connetto_visible_files`, `connetto_set_content_state`).
-const CONTENT_SQL: &str = include_str!("../content.sql");
-/// The demo's roles and grants.
-const ROLES_SQL: &str = include_str!("../roles.sql");
+/// The user the test's devices sign in as, and the `owner_id` every row names.
+/// The deployment's visibility policies compare `owner_id` against
+/// `current_setting('app.user_id')`, which the server binds from the
+/// credential's user id.
+const OWNER: &str = "alice";
 
-/// Simplified DDL for the server's internal catalog (`PgSnapshotSource`, `RlsAuth`).
-/// The actual Postgres tables are created from `SCHEMA_SQL`; this version omits
-/// `gen_random_uuid()` defaults and foreign-key references that the `subql` parser
-/// does not need and may not handle.
+/// Simplified DDL for the server's internal catalog (`PgSnapshotSource`,
+/// `RlsAuth`). The actual Postgres tables are created from the deployment's
+/// `schema.sql`; this version omits the `gen_random_uuid()` defaults and
+/// foreign-key references that the `subql` parser does not need and may not
+/// handle.
 const CATALOG_DDL: &str = concat!(
-    "CREATE TABLE orders (id UUID PRIMARY KEY, quantity BIGINT NOT NULL,",
-    " created_at TIMESTAMPTZ NOT NULL);",
+    "CREATE TABLE orders (id UUID PRIMARY KEY, owner_id TEXT NOT NULL,",
+    " quantity BIGINT NOT NULL, created_at TIMESTAMPTZ NOT NULL);",
     "CREATE TABLE order_lines (order_id UUID NOT NULL, line_no INTEGER NOT NULL,",
-    " quantity BIGINT NOT NULL, PRIMARY KEY (order_id, line_no));",
+    " owner_id TEXT NOT NULL, quantity BIGINT NOT NULL,",
+    " PRIMARY KEY (order_id, line_no));",
     "CREATE TABLE photos (id UUID PRIMARY KEY, order_id UUID NOT NULL,",
-    " content_id BYTEA, content_state TEXT)",
+    " owner_id TEXT NOT NULL, content_id BYTEA NOT NULL, content_state TEXT)"
 );
 
-/// Derive the SQLite replica DDL from `schema.sql` at test time, using the same
-/// `pg2sqlite` options the demo's `build.rs` applies.
-fn sqlite_ddl() -> String {
-    let opts = Pg2SqliteOptions::default()
-        .with_uuid_representation(UuidRepresentation::Blob)
-        .with_uuid_function_name("uuidv4")
-        .with_session_variable(SessionVariableMapping::current_setting(
-            "app.user_id",
-            "current_app_user",
-        ))
-        .with_rls_audit_table_name("rls_audit".to_string())
-        .with_write_exemption_function("connetto_write_exempt");
-    let stmts = Pg2Sqlite::default()
-        .sql(SCHEMA_SQL)
-        .expect("parse schema.sql")
-        .translate_to_sql(&opts)
-        .expect("translate schema.sql to SQLite");
-    let mut ddl = stmts.into_vec().join(";\n");
-    ddl.push(';');
-    ddl
-}
 
 /// Stage, upload, flip, resolve, fetch, and archive round trip.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -96,8 +76,6 @@ fn sqlite_ddl() -> String {
 async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     let fixture = Fixture::acquire().await;
     provision(&fixture).await;
-    let ddl = sqlite_ddl();
-    eprintln!("[diag] sqlite_ddl=\n{ddl}");
 
     let chunk_dir = tempdir().expect("chunk tempdir");
     let (base_url, signer, file_task) = start_file_server(&fixture, chunk_dir.path()).await;
@@ -107,7 +85,7 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 
     // Device A opens offline; the gate controls when its reconnect factory
     // starts returning a real transport.
-    let (a, gate) = offline_device(replica_dir.path(), "device-a", &server, &ddl).await;
+    let (a, open) = offline_device(replica_dir.path(), "device-a", &server).await;
     let mut a_client_events = a.events();
     let a_content = attach_content(a.clone(), chunk_dir.path(), "a").await;
 
@@ -129,23 +107,21 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
                 notes::id.eq(1),
                 notes::body.eq("a note that stays on this device"),
             ))
-            .execute(conn.conn())
+            .execute(&mut *conn.conn())
     })
     .await
     .expect("write into the tier")
     .expect("insert device-only note");
 
-    // Stage using the demo pattern: orders row + photos row in one transaction.
-    // `stage_photo_row` is the same function the desktop UI's pick handler calls.
+    // Stage using the demo pattern: orders row + photos row in one
+    // transaction, the same row the pick handler writes.
     let file_id = a_content
-        .stage(PHOTO, MimeClass::Jpeg, stage_photo_row)
+        .stage(PHOTO, MimeClass::Jpeg, |conn, file_id| {
+            stage_photo_row(conn, file_id, OWNER)
+        })
         .await
         .expect("stage demo photo")
         .0;
-    eprintln!(
-        "[diag] stage done, file_id={}",
-        short_hex_bytes(file_id.as_bytes())
-    );
 
     // Bytes resolve locally before any upload.
     assert!(
@@ -163,37 +139,19 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
         .await
         .expect("export archive with unsent content");
     assert!(!archive.is_empty(), "archive is non-empty");
-    eprintln!("[diag] archive exported ({} bytes)", archive.len());
 
     // Open the gate: mutation lands, then the outbox walk mints a ticket.
-    gate.store(true, Ordering::Relaxed);
-    eprintln!("[diag] gate opened");
-    let deadline_diag = tokio::time::Instant::now() + Duration::from_secs(30);
+    open.store(true, Ordering::Relaxed);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let sent = loop {
         let sent = a_content.flush_outbox().await.expect("flush");
-        eprintln!("[diag] flush_outbox={sent}");
         if sent > 0 {
             break sent;
         }
-        {
-            let mut conn = fixture.admin().get().await.expect("conn");
-            let count = diesel_async::RunQueryDsl::get_result::<i64>(
-                photos::table
-                    .filter(photos::content_id.eq(file_id.as_bytes().to_vec()))
-                    .count(),
-                &mut *conn,
-            )
-            .await
-            .expect("count photos row in Postgres");
-            eprintln!("[diag] pg photos row count={count}");
-        }
         while let Ok(ev) = a_client_events.try_recv() {
-            eprintln!("[diag] client_event={ev:?}");
+            let _ = ev;
         }
-        assert!(
-            tokio::time::Instant::now() < deadline_diag,
-            "upload timeout"
-        );
+        assert!(tokio::time::Instant::now() < deadline, "upload timeout");
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     assert_eq!(sent, 1, "one file uploaded from the outbox");
@@ -207,14 +165,8 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     );
 
     // Device B connects and sees the flip via replication.
-    let (b, b_content) = connect_device(
-        replica_dir.path(),
-        "device-b",
-        &server,
-        chunk_dir.path(),
-        &ddl,
-    )
-    .await;
+    let (b, b_content) =
+        connect_device(replica_dir.path(), "device-b", &server, chunk_dir.path()).await;
     b.pin("photos", "SELECT * FROM photos").await.expect("pin");
     let replica_state = wait_for_replica_state(&b, file_id.as_bytes()).await;
     assert_eq!(
@@ -249,7 +201,7 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
 
     // Import the archive, captured while content was still unsent, on device C
     // under a distinct key, proving re-encryption of the unsent bytes.
-    let c_client = device(replica_dir.path(), "device-c", &ddl, || async {
+    let c_client = device(replica_dir.path(), "device-c", || async {
         Err::<LoopbackTransport, _>("device C stays offline")
     })
     .await;
@@ -287,7 +239,7 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
             notes::table
                 .select(notes::body)
                 .filter(notes::id.eq(1))
-                .first::<String>(conn.conn())
+                .first::<String>(&mut *conn.conn())
                 .optional()
         })
         .await
@@ -314,9 +266,11 @@ async fn demo_photo_flow_stage_upload_resolve_and_archive_round_trip() {
     file_task.abort();
 }
 
-/// Applies `schema.sql`, `DEPLOYMENT_DDL`, `provision_writers`, `roles.sql` and
-/// `content.sql`. `provision_writers` runs before `roles.sql` because `roles.sql`
-/// grants on the writer tables, which the writer step creates.
+/// Applies the deployment's `schema.sql`, the file server's `DEPLOYMENT_DDL`,
+/// the epoch DDL, `roles.sql`, `content.sql` and `policies.sql`, in the order
+/// the deployment documents. `provision_writers` runs before `roles.sql`
+/// because `roles.sql` grants on the writer tables, which the writer step
+/// creates.
 async fn provision(fixture: &Fixture) {
     fixture
         .setup(&[
@@ -333,11 +287,15 @@ async fn provision(fixture: &Fixture) {
     for stmt in split_plain(connetto_file_server::DEPLOYMENT_DDL) {
         fixture.exec(&stmt).await;
     }
+    fixture.exec(EPOCH_DDL).await;
     connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture.exec(ROLES_SQL).await;
     fixture.exec(CONTENT_SQL).await;
-    // `app_writer` is a test-infrastructure writer role; not part of the demo's
-    // SQL files. The server's mutation path uses it to apply changesets.
+    fixture.exec(POLICIES_SQL).await;
+    // `app_writer` is a test-infrastructure writer role; not part of the
+    // deployment's SQL files. The server's mutation path uses it to apply
+    // changesets, and it is subject to the row-level security that
+    // `policies.sql` enables.
     fixture
         .setup(&[
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
@@ -417,13 +375,12 @@ async fn spawn_sync_server(fixture: &Fixture, signer: TicketSigner) -> Server {
     .await
 }
 
-/// A device named `name` in its own directory under `root`, dialing through
-/// `dial` and redialing under the default policy while it cannot reach the
-/// server.
+/// A device named `name` in its own directory under `root`, on the demo's own
+/// schema bundle, dialing through `dial` and redialing under the default
+/// policy while it cannot reach the server.
 async fn device<F, Fut>(
     root: &std::path::Path,
     name: &str,
-    ddl: &str,
     dial: F,
 ) -> ConnettoClient<LoopbackTransport>
 where
@@ -432,7 +389,7 @@ where
 {
     // One user on several devices, each device its own session and its own
     // directory, so an archive from one restores on another.
-    let credential = HeldCredential::new(Grant::new(format!("user:alice#{name}")), "alice")
+    let credential = HeldCredential::new(Grant::new(format!("user:{OWNER}#{name}")), OWNER)
         .expect("a string identity serializes");
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).expect("the device directory");
@@ -443,7 +400,7 @@ where
     )
     .await
     .expect("the in-memory store never fails");
-    let (running, pump) = ClientBuilder::new(schema(ddl), dial)
+    let (running, pump) = ClientBuilder::new(demo_schema(), dial)
         .with_reconnect(ReconnectPolicy::default())
         .signed_in(credential)
         .durable(DataDir::new(dir), keys, MemoryRefreshStore::default())
@@ -459,19 +416,15 @@ async fn offline_device(
     root: &std::path::Path,
     name: &str,
     server: &Arc<Server>,
-    ddl: &str,
 ) -> (ConnettoClient<LoopbackTransport>, Arc<AtomicBool>) {
-    let gate = Arc::new(AtomicBool::new(false));
-    let factory_gate = Arc::clone(&gate);
+    let open = Arc::new(AtomicBool::new(false));
+    let factory_open = Arc::clone(&open);
     let factory_server = Arc::clone(server);
-    let client = device(root, name, ddl, move || {
-        let gate = Arc::clone(&factory_gate);
+    let client = device(root, name, move || {
+        let open = Arc::clone(&factory_open);
         let server = Arc::clone(&factory_server);
         async move {
-            let open = gate.load(Ordering::Relaxed);
-            eprintln!("[diag] factory called gate={open}");
-            if open {
-                eprintln!("[diag] factory returning Ok(transport)");
+            if (*open).load(Ordering::Relaxed) {
                 Ok(server.attach())
             } else {
                 Err("gate not open yet")
@@ -479,7 +432,7 @@ async fn offline_device(
         }
     })
     .await;
-    (client, gate)
+    (client, open)
 }
 
 async fn connect_device(
@@ -487,13 +440,12 @@ async fn connect_device(
     name: &str,
     server: &Arc<Server>,
     chunk_root: &std::path::Path,
-    ddl: &str,
 ) -> (
     ConnettoClient<LoopbackTransport>,
     ContentClient<LoopbackTransport, FsStore, ReqwestHttp>,
 ) {
     let server = Arc::clone(server);
-    let client = device(root, name, ddl, move || {
+    let client = device(root, name, move || {
         let server = Arc::clone(&server);
         async move { Ok(server.attach()) }
     })
@@ -559,7 +511,7 @@ async fn wait_for_replica_state(
                     photos::table
                         .filter(photos::content_id.eq(wanted.clone()))
                         .select(photos::content_state),
-                    conn.conn(),
+                    &mut *conn.conn(),
                 )
                 .expect("read replica state")
             })
@@ -576,19 +528,6 @@ async fn wait_for_replica_state(
     }
 }
 
-/// The client schema over the test's translated DDL, with the build bundle's
-/// device-private tier, so the archive round trip covers both databases.
-fn schema(ddl: &str) -> SyncSchema {
-    SyncSchema::new(SchemaBundle::new(
-        SCHEMA_SQL,
-        "",
-        ddl,
-        Vec::<(String, String)>::new(),
-        Vec::<String>::new(),
-        connetto_schema_bundle::bundle().local_tier_ddl(),
-    ))
-}
-
 /// Splits DDL that contains no dollar-quoted bodies on semicolons.
 fn split_plain(ddl: &str) -> Vec<String> {
     ddl.split(';')
@@ -596,8 +535,4 @@ fn split_plain(ddl: &str) -> Vec<String> {
         .filter(|s| !s.is_empty())
         .map(|s| format!("{s};"))
         .collect()
-}
-
-fn short_hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }

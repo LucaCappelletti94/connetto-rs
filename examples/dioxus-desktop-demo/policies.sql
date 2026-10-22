@@ -1,1 +1,0 @@
--- The demo's row policies, served as CONNETTO_PG_POLICIES. It has none, so every signed-in user sees every row.

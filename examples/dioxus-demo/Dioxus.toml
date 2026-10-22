@@ -1,3 +1,6 @@
+[application]
+name = "connetto-dioxus-demo"
+
 [bundle]
 # The Android applicationId and the iOS bundle identifier. It is also the
 # scheme of the login redirect a phone receives, so it stays lowercase.
@@ -36,3 +39,7 @@ NSLocationWhenInUseUsageDescription = "Join a nearby device's hotspot"
 [ios.entitlements]
 "com.apple.developer.devicecheck.appattest-environment" = "development"
 "com.apple.developer.networking.HotspotConfiguration" = true
+
+[web.watcher]
+# Serve index.html for any unmatched path so the SPA handles /auth/callback.
+index_on_404 = true

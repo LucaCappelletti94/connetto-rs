@@ -1,6 +1,0 @@
-[application]
-name = "connetto-dioxus-web-demo"
-
-[web.watcher]
-# Serve index.html for any unmatched path so the SPA handles /auth/callback.
-index_on_404 = true

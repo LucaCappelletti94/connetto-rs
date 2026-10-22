@@ -1,4 +1,4 @@
-//! Builds `examples/dioxus-desktop-demo` as a macOS `.app` the data protection
+//! Builds `examples/dioxus-demo` as a macOS `.app` the data protection
 //! keychain admits, so its secrets sit behind Touch ID or the login password
 //! (R51). When `connetto-demo-stack` names a device root, the build also
 //! carries the peer link and the hotspot it joins (R76).
@@ -26,9 +26,8 @@ use tokio::process::Command;
 
 const BUNDLE: &str = "dev.connetto.dioxusdemo";
 const PROFILE_NAME: &str = "connetto dioxus demo macos development";
-const DEMO_DIR: [&str; 2] = ["examples", "dioxus-desktop-demo"];
-const APP: &str =
-    "target/dx/connetto-dioxus-desktop-demo/debug/macos/ConnettoDioxusDesktopDemo.app";
+const DEMO_DIR: [&str; 2] = ["examples", "dioxus-demo"];
+const APP: &str = "target/dx/connetto-dioxus-demo/debug/macos/ConnettoDioxusDemo.app";
 
 #[tokio::main]
 async fn main() -> Result<()> {

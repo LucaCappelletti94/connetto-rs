@@ -1,4 +1,4 @@
-//! Photo surface browser tests for the dioxus web demo.
+//! Photo surface browser tests for the dioxus demo, web platform.
 //!
 //! COUPLING: `SchemaVersion` hashes the schema and the policies this demo
 //! includes, and they are the same documents in `examples/deployment` that the
@@ -20,7 +20,7 @@ use connetto_client::dsl::Watchable;
 use connetto_client::{
     Auth, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, FirstThen, LiveQuery,
 };
-use connetto_dioxus_web_demo::{AUTH_BASE, auth_landing, demo_schema};
+use connetto_dioxus_demo::{AUTH_BASE, auth_landing, demo_schema};
 use connetto_file_core::{FileId, MimeClass};
 use connetto_web::auth::{
     AccountStore, Acquired, BrowserAuthenticator, LOGIN_CHANNEL, LoginMessage, deliver_login_code,

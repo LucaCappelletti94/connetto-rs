@@ -1,4 +1,4 @@
-//! Prepares a Mac to sign `examples/dioxus-desktop-demo` for the iOS devices
+//! Prepares a Mac to sign `examples/dioxus-demo` for the iOS devices
 //! paired with it, unattended, through an App Store Connect API key.
 //!
 //! ```text
