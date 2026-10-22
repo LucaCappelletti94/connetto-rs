@@ -190,6 +190,22 @@ pub enum SchemaError {
         /// What the parser reported.
         detail: String,
     },
+    /// The export for one major holds a view or a trigger that names a
+    /// table or view the export does not hold, which a fresh install of the
+    /// export would carry dangling.
+    #[error(
+        "the export for major {major} holds {kind} {name} that names a table or view the export does not hold: {detail}"
+    )]
+    DanglingExportObject {
+        /// The major the export was written for.
+        major: u32,
+        /// The kind of the object, `view` or `trigger`.
+        kind: String,
+        /// The name of the object that names what is absent.
+        name: String,
+        /// What SQLite reported on the probe's rename.
+        detail: String,
+    },
     /// The tier history does not fit the bundle the build just translated.
     #[error(transparent)]
     TierHistory(#[from] connetto_core::TierHistoryError),

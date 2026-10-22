@@ -13,6 +13,16 @@
 //! opens or closes a transaction of its own and never touches the foreign
 //! keys pragma, which the client sets off around the step and checks before
 //! it commits.
+//!
+//! A rebuild suspends the objects that still name the rebuilt table.
+//! SQLite's `ALTER TABLE RENAME` verifies every view and trigger in the
+//! database and rewrites their stored text, and it never checks a foreign
+//! key, so the step drops, before any table moves, every view and trigger
+//! whose stored text names a table the boundary rebuilds by the name that
+//! table carries before the step's renames, the views over the dropped
+//! views included, and it recreates them from the newer export after the
+//! move, the rebuilt table's own indexes and triggers first, then the
+//! foreign triggers, then the views.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -92,11 +102,14 @@ diesel::table! {
 }
 
 /// Read one exported tier into its major, its shape, and the `CREATE`
-/// statement of every index and trigger its DDL builds.
+/// statement of every index and trigger its DDL builds, refusing the export
+/// when a view or a trigger of it names a table or view it does not hold.
 ///
 /// # Errors
 ///
-/// [`SchemaError::Sqlite`] when the export's DDL is not accepted by SQLite.
+/// [`SchemaError::Sqlite`] when the export's DDL is not accepted by SQLite,
+/// [`SchemaError::DanglingExportObject`] when a view or a trigger of the
+/// export names a table or view the export does not hold.
 pub(crate) fn load_export(major: Major, ddl: &str) -> Result<LoadedExport, SchemaError> {
     use diesel::connection::SimpleConnection;
     use diesel::{Connection, RunQueryDsl, SqliteConnection};
@@ -113,6 +126,7 @@ pub(crate) fn load_export(major: Major, ddl: &str) -> Result<LoadedExport, Schem
         tier: "local tier",
         detail: err.to_string(),
     })?;
+    check_export_dangles(&mut conn, major, &shape)?;
     let rows = boundary_catalog::table
         .load::<(String, String, String, Option<String>)>(&mut conn)
         .map_err(|err| SchemaError::Sqlite {
@@ -143,6 +157,93 @@ pub(crate) fn load_export(major: Major, ddl: &str) -> Result<LoadedExport, Schem
         objects,
         trigger_tables,
     })
+}
+
+/// Whether the views and triggers of the export all name what the export
+/// holds, probed by a rename, since SQLite's `ALTER TABLE RENAME` verifies
+/// every view and trigger in the database and reports the one that names
+/// what is gone. The probe runs inside a transaction it rolls back, and it
+/// renames a table it creates when the export holds none, since a trigger
+/// cannot exist without its table and the DDL that applied already proved
+/// every owner is present.
+///
+/// # Errors
+///
+/// [`SchemaError::DanglingExportObject`] when a view or a trigger names a
+/// table or view the export does not hold,
+/// [`SchemaError::Sqlite`] when the probe itself fails to run.
+fn check_export_dangles(
+    conn: &mut diesel::SqliteConnection,
+    major: Major,
+    shape: &TierShape,
+) -> Result<(), SchemaError> {
+    use connetto_core::sql::quote_ident;
+    use diesel::connection::SimpleConnection;
+
+    let probe = quote_ident("connetto_dangle_probe");
+    let probe_moved = quote_ident("connetto_dangle_probe_moved");
+    let statements: Vec<String> = if shape.tables.is_empty() {
+        vec![
+            format!("CREATE TABLE {probe} (x INTEGER);"),
+            format!("ALTER TABLE {probe} RENAME TO {probe_moved};"),
+        ]
+    } else {
+        let table = shape.tables.keys().next().expect("a table holds");
+        vec![format!("ALTER TABLE {table} RENAME TO {probe};")]
+    };
+    if let Err(err) = conn.batch_execute("BEGIN;") {
+        return Err(SchemaError::Sqlite {
+            tier: "local tier",
+            detail: err.to_string(),
+        });
+    }
+    let mut failure: Option<String> = None;
+    for statement in &statements {
+        match conn.batch_execute(statement) {
+            Ok(()) => {}
+            Err(diesel::result::Error::DatabaseError(_, info)) => {
+                failure = Some(info.message().to_owned());
+                break;
+            }
+            Err(err) => {
+                failure = Some(err.to_string());
+                break;
+            }
+        }
+    }
+    // The transaction is still open on a failure, and the rollback is the
+    // thing that proves the probe left the connection clean.
+    let _ = conn.batch_execute("ROLLBACK;");
+    match failure {
+        Some(message) => match dangling_object(&message) {
+            Some((kind, name)) => Err(SchemaError::DanglingExportObject {
+                major: major.get(),
+                kind: kind.to_owned(),
+                name,
+                detail: message,
+            }),
+            None => Err(SchemaError::Sqlite {
+                tier: "local tier",
+                detail: format!("the dangle probe failed: {message}"),
+            }),
+        },
+        None => Ok(()),
+    }
+}
+
+/// One SQLite `error in view X` or `error in trigger X` report, parsed into
+/// the object's kind and name, or nothing when the message is no such
+/// report, the quoted object names arriving unquoted in the report.
+fn dangling_object(message: &str) -> Option<(&'static str, String)> {
+    let rest = message.strip_prefix("error in ")?;
+    let end = rest.find(' ')?;
+    let kind = match &rest[..end] {
+        "view" => "view",
+        "trigger" => "trigger",
+        _ => return None,
+    };
+    let name = rest[end + 1..].split_once(':')?.0;
+    Some((kind, name.to_owned()))
 }
 
 /// The declarations one boundary's `<N>.boundary.toml` file holds, empty
@@ -209,18 +310,11 @@ pub(crate) fn generate(
         "the history feeds only consecutive exports"
     );
     validate_declarations(old, new, decls, decls_path)?;
+    let rebuilt = rebuilt_tables(old, new, decls, boundary)?;
+    let (drop_views, drop_triggers) = suspended_objects(old, new, &rebuilt);
     let mut statements: Vec<String> = Vec::new();
 
-    // The views the change removes, dropped before the tables move so a view
-    // that pointed at a dropped table is gone before the table is.
-    for (name, sql) in &old.shape.views {
-        if new.shape.views.get(name) != Some(sql) {
-            statements.push(format!(
-                "DROP VIEW {}",
-                connetto_core::sql::quote_ident(name)
-            ));
-        }
-    }
+    drop_suspended(&drop_views, &drop_triggers, &mut statements);
 
     // The tables the change keeps or renames, checked against the diff.
     for name in old.shape.tables.keys() {
@@ -274,18 +368,7 @@ pub(crate) fn generate(
             ));
             continue;
         }
-        let new_name = decls
-            .renamed_tables
-            .get(old_name)
-            .map_or_else(|| old_name.as_str(), String::as_str);
-        let new_table =
-            new.shape
-                .tables
-                .get(new_name)
-                .ok_or_else(|| SchemaError::UndeclaredTableDrop {
-                    table: old_name.clone(),
-                    boundary,
-                })?;
+        let (new_name, new_table) = kept_table(old_name, decls, new, boundary)?;
         let diff = column_mapping(old_name, old_table, new_table, decls, boundary)?;
         for column in &diff.added {
             if column.notnull && column.default.is_none() {
@@ -299,19 +382,94 @@ pub(crate) fn generate(
         if rebuild_required(&diff, old_table, new_table) {
             rebuild_table(new_name, new_table, new, &diff, &mut statements);
         } else {
-            stable_table(old_name, new_name, old, new, decls, &diff, &mut statements);
+            stable_table(
+                old_name,
+                new_name,
+                old_table,
+                new,
+                decls,
+                &diff,
+                &mut statements,
+            );
+            stable_triggers(
+                old_name,
+                new_name,
+                old,
+                new,
+                &drop_triggers,
+                &mut statements,
+            );
         }
     }
 
+    reissue_suspended_triggers(new, decls, &rebuilt, &drop_triggers, &mut statements);
+
     // The views the change adds, created after the tables move so a view
-    // that points at a renamed table points at its new name.
+    // that points at a renamed table points at its new name, and the views
+    // the step dropped with their text unchanged, which the change kept.
     for (name, sql) in &new.shape.views {
-        if old.shape.views.get(name) != Some(sql) {
+        if old.shape.views.get(name) != Some(sql) || drop_views.contains(name) {
             statements.push(sql.clone());
         }
     }
 
     Ok(statements_to_ddl(&statements))
+}
+
+/// The views and triggers the step drops, before any table moves, since a
+/// rename refuses the step on any of them whose text names a table that is
+/// gone by then.
+fn drop_suspended(
+    drop_views: &BTreeSet<String>,
+    drop_triggers: &BTreeSet<String>,
+    statements: &mut Vec<String>,
+) {
+    for name in drop_views {
+        statements.push(format!(
+            "DROP VIEW {}",
+            connetto_core::sql::quote_ident(name)
+        ));
+    }
+    for trigger in drop_triggers {
+        statements.push(format!(
+            "DROP TRIGGER {}",
+            connetto_core::sql::quote_ident(trigger)
+        ));
+    }
+}
+
+/// The foreign triggers the step dropped, re-issued from the newer export
+/// after the tables move, the rebuilt tables' own already re-issued with
+/// each rebuild.
+fn reissue_suspended_triggers(
+    new: &LoadedExport,
+    decls: &Declarations,
+    rebuilt: &BTreeSet<String>,
+    drop_triggers: &BTreeSet<String>,
+    statements: &mut Vec<String>,
+) {
+    let rebuilt_final: BTreeSet<String> = rebuilt
+        .iter()
+        .map(|old_name| {
+            decls
+                .renamed_tables
+                .get(old_name)
+                .cloned()
+                .unwrap_or_else(|| old_name.clone())
+        })
+        .collect();
+    for (trigger, owner) in &new.trigger_tables {
+        if !drop_triggers.contains(trigger) {
+            continue;
+        }
+        if rebuilt_final
+            .iter()
+            .any(|final_name| final_name.eq_ignore_ascii_case(owner))
+        {
+            continue;
+        }
+        statements.push(object_sql(new, trigger));
+    }
 }
 
 /// The `CREATE` statement one object holds in the export that built it.
@@ -331,6 +489,87 @@ fn statements_to_ddl(statements: &[String]) -> String {
     let mut ddl = statements.join(";\n");
     ddl.push(';');
     ddl
+}
+
+/// The tables the boundary rebuilds, by the name each carries before the
+/// step's renames.
+///
+/// # Errors
+///
+/// [`SchemaError::UndeclaredTableDrop`] when a table the older export holds
+/// is gone from the newer one without the declarations saying so, and
+/// [`SchemaError::UndeclaredColumnDrop`] as the per-table walk.
+fn rebuilt_tables(
+    old: &LoadedExport,
+    new: &LoadedExport,
+    decls: &Declarations,
+    boundary: u32,
+) -> Result<BTreeSet<String>, SchemaError> {
+    let mut set: BTreeSet<String> = BTreeSet::new();
+    for (old_name, old_table) in &old.shape.tables {
+        if decls.dropped_tables.contains(old_name) {
+            continue;
+        }
+        let new_name = decls
+            .renamed_tables
+            .get(old_name)
+            .map_or_else(|| old_name.as_str(), String::as_str);
+        let new_table =
+            new.shape
+                .tables
+                .get(new_name)
+                .ok_or_else(|| SchemaError::UndeclaredTableDrop {
+                    table: old_name.clone(),
+                    boundary,
+                })?;
+        let diff = column_mapping(old_name, old_table, new_table, decls, boundary)?;
+        if rebuild_required(&diff, old_table, new_table) {
+            set.insert(old_name.clone());
+        }
+    }
+    Ok(set)
+}
+
+/// The views and triggers the step drops before any table moves, the ones
+/// whose stored text names a table the boundary rebuilds by the pre-rename
+/// name, and the views and triggers whose stored text names a view the
+/// step drops.
+fn suspended_objects(
+    old: &LoadedExport,
+    new: &LoadedExport,
+    rebuilt: &BTreeSet<String>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let mut views: BTreeSet<String> = BTreeSet::new();
+    for (name, sql) in &old.shape.views {
+        if new.shape.views.get(name) != Some(sql) {
+            views.insert(name.clone());
+        }
+    }
+    let mut settled = false;
+    while !settled {
+        settled = true;
+        for (name, sql) in &old.shape.views {
+            if views.contains(name) {
+                continue;
+            }
+            if rebuilt.iter().any(|table| names_table(sql, table))
+                || views.iter().any(|dropped| names_table(sql, dropped))
+            {
+                views.insert(name.clone());
+                settled = false;
+            }
+        }
+    }
+    let mut triggers: BTreeSet<String> = BTreeSet::new();
+    for trigger in old.trigger_tables.keys() {
+        let sql = object_sql(old, trigger);
+        if rebuilt.iter().any(|table| names_table(&sql, table))
+            || views.iter().any(|dropped| names_table(&sql, dropped))
+        {
+            triggers.insert(trigger.clone());
+        }
+    }
+    (views, triggers)
 }
 
 /// The columns one table the change keeps moves, adds, and drops.
@@ -537,6 +776,29 @@ fn declaration_mismatch(path: &Path, detail: String) -> SchemaError {
     }
 }
 
+/// The new name and the newer export's table for one old table the change
+/// keeps.
+fn kept_table<'a>(
+    old_name: &'a str,
+    decls: &'a Declarations,
+    new: &'a LoadedExport,
+    boundary: u32,
+) -> Result<(&'a str, &'a TierTable), SchemaError> {
+    let new_name = decls
+        .renamed_tables
+        .get(old_name)
+        .map_or_else(|| old_name, String::as_str);
+    let new_table =
+        new.shape
+            .tables
+            .get(new_name)
+            .ok_or_else(|| SchemaError::UndeclaredTableDrop {
+                table: old_name.to_owned(),
+                boundary,
+            })?;
+    Ok((new_name, new_table))
+}
+
 /// Whether one table the change keeps needs the rebuild path, the only path
 /// that can drop a column, carry a column to a new position, apply a
 /// changed column definition, or add a primary key or a default SQLite
@@ -658,13 +920,12 @@ fn rebuild_table(
 fn stable_table(
     old_name: &str,
     new_name: &str,
-    old: &LoadedExport,
+    old_table: &TierTable,
     new: &LoadedExport,
     decls: &Declarations,
     diff: &ColumnDiff,
     statements: &mut Vec<String>,
 ) {
-    let old_table = &old.shape.tables[old_name];
     let new_table = &new.shape.tables[new_name];
     if let Some(renames) = decls.renamed_columns.get(old_name) {
         for (from, to) in renames {
@@ -710,10 +971,25 @@ fn stable_table(
             ));
         }
     }
+}
+
+/// The trigger sync one stable table gets, the triggers the step does not
+/// suspend, which the pre-move drop and the post-move re-issue own.
+fn stable_triggers(
+    old_name: &str,
+    new_name: &str,
+    old: &LoadedExport,
+    new: &LoadedExport,
+    drop_triggers: &BTreeSet<String>,
+    statements: &mut Vec<String>,
+) {
     // A trigger the older export fires that the newer one keeps unchanged
     // stays, every other one it fires is dropped.
     for (trigger, table) in &old.trigger_tables {
         if !table.eq_ignore_ascii_case(old_name) {
+            continue;
+        }
+        if drop_triggers.contains(trigger) {
             continue;
         }
         let kept = new
@@ -732,6 +1008,9 @@ fn stable_table(
     // unchanged comes back verbatim.
     for (trigger, table) in &new.trigger_tables {
         if !table.eq_ignore_ascii_case(new_name) {
+            continue;
+        }
+        if drop_triggers.contains(trigger) {
             continue;
         }
         let unchanged = old
@@ -848,6 +1127,49 @@ fn find_keyword(haystack: &str, keyword: &str) -> Option<usize> {
         start = at + 1;
     }
     None
+}
+
+/// Whether one stored statement names one table in any of SQLite's four
+/// identifier quoting forms, the way `qualify_ddl` matches a table name in
+/// stored `CREATE` text.
+fn names_table(statement: &str, table: &str) -> bool {
+    // The quoted forms, the quotes delimiting the name.
+    for quoted in [
+        format!("\"{table}\""),
+        format!("`{table}`"),
+        format!("[{table}]"),
+    ] {
+        if contains_ci(statement, &quoted) {
+            return true;
+        }
+    }
+    // The bare form, at a word boundary, so a longer identifier holding the
+    // name as a part does not match.
+    let lowered = statement.to_ascii_lowercase();
+    let name = table.to_ascii_lowercase();
+    let mut start = 0;
+    while let Some(at) = lowered[start..].find(name.as_str()) {
+        let hit = start + at;
+        let before = hit
+            .checked_sub(1)
+            .and_then(|before| lowered[..=before].chars().next_back());
+        let after = lowered[hit + name.len()..].chars().next();
+        let boundary = |character: Option<char>| {
+            character.is_none_or(|character| !character.is_ascii_alphanumeric() && character != '_')
+        };
+        if boundary(before) && boundary(after) {
+            return true;
+        }
+        start = hit + 1;
+    }
+    false
+}
+
+/// Whether a haystack holds a needle, case-insensitively over ASCII.
+fn contains_ci(haystack: &str, needle: &str) -> bool {
+    haystack
+        .to_ascii_lowercase()
+        .contains(needle.to_ascii_lowercase().as_str())
 }
 
 /// Whether one default expression SQLite can apply on an `ADD COLUMN`, the
@@ -1630,6 +1952,419 @@ mod tests {
              CREATE VIEW vb AS SELECT x + 1 FROM a;
              CREATE VIEW stay AS SELECT x FROM a;",
         );
+    }
+
+    /// A view that keeps its text over a table the boundary rebuilds is
+    /// dropped before the move and recreated after, since the rebuild's
+    /// rename verifies every view in the database, and a view over a table
+    /// the boundary does not rebuild stays.
+    #[test]
+    fn an_unchanged_view_over_a_rebuilt_table_is_suspended_and_recreated() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE VIEW stay AS SELECT x FROM o;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE VIEW stay AS SELECT x FROM o;",
+        );
+        let boundary =
+            step(&old, &new, &decls(&[], &[("a", "w")], &[], &[])).expect("generate the step");
+        assert!(boundary.contains("DROP VIEW \"v\""), "the step: {boundary}");
+        assert!(!boundary.contains("DROP VIEW stay"), "the step: {boundary}");
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE VIEW stay AS SELECT x FROM o;",
+            "INSERT INTO a VALUES (1, 'one', 'widow');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE VIEW stay AS SELECT x FROM o;",
+        );
+        assert_eq!(column_values(&mut conn, "a", "y"), vec!["one".to_owned()]);
+    }
+
+    /// A view over a view the step drops is dropped with it, since the
+    /// rename verifies the outer view too.
+    #[test]
+    fn a_view_over_a_changed_view_is_suspended_with_it() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE VIEW vi AS SELECT x FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let boundary =
+            step(&old, &new, &decls(&[], &[("a", "w")], &[], &[])).expect("generate the step");
+        assert!(
+            boundary.contains("DROP VIEW \"vo\""),
+            "the step: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE VIEW vi AS SELECT x FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        assert_eq!(column_values(&mut conn, "a", "x"), vec!["1".to_owned()]);
+    }
+
+    /// The outer view of a chain where nothing changed is suspended through
+    /// the closure, the inner view naming the rebuilt table and the outer
+    /// one naming the inner.
+    #[test]
+    fn a_view_over_an_unchanged_view_over_a_rebuilt_table_is_suspended() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT x FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE VIEW vi AS SELECT x FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let boundary =
+            step(&old, &new, &decls(&[], &[("a", "w")], &[], &[])).expect("generate the step");
+        assert!(
+            boundary.contains("DROP VIEW \"vi\""),
+            "the step: {boundary}"
+        );
+        assert!(
+            boundary.contains("DROP VIEW \"vo\""),
+            "the step: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT x FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE VIEW vi AS SELECT x FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        assert_eq!(column_values(&mut conn, "a", "x"), vec!["1".to_owned()]);
+    }
+
+    /// A plain rename meets the transitive view the same way, the changed
+    /// inner view dropped before the rename leaving the outer one dangling,
+    /// and the declared rename is the statement that verifies it.
+    #[test]
+    fn a_view_over_a_changed_view_is_suspended_across_a_plain_rename() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM b;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let boundary =
+            step(&old, &new, &decls(&[], &[], &[("a", "b")], &[])).expect("generate the step");
+        assert!(
+            boundary.contains("ALTER TABLE \"a\" RENAME TO \"b\""),
+            "the step: {boundary}"
+        );
+        assert!(
+            boundary.contains("DROP VIEW \"vo\""),
+            "the step: {boundary}"
+        );
+        assert!(
+            !boundary.contains("connetto_rebuild"),
+            "a plain rename must not rebuild: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM b;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        assert_eq!(column_values(&mut conn, "b", "w"), vec!["widow".to_owned()]);
+    }
+
+    /// The rename plus a rebuild meets the transitive view the same way,
+    /// the outer view suspended so the rebuild's rename finds no view
+    /// naming a table that is gone.
+    #[test]
+    fn a_view_over_a_changed_view_is_suspended_across_a_rename_and_rebuild() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY);
+             CREATE VIEW vi AS SELECT x FROM b;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        let boundary = step(&old, &new, &decls(&[], &[("a", "w")], &[("a", "b")], &[]))
+            .expect("generate the step");
+        assert!(
+            boundary.contains("DROP VIEW \"vo\""),
+            "the step: {boundary}"
+        );
+        assert!(
+            boundary.contains("connetto_rebuild"),
+            "the step: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE VIEW vi AS SELECT w FROM a;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY);
+             CREATE VIEW vi AS SELECT x FROM b;
+             CREATE VIEW vo AS SELECT * FROM vi;",
+        );
+        assert_eq!(column_values(&mut conn, "b", "x"), vec!["1".to_owned()]);
+    }
+
+    /// A trigger on another table that names a rebuilt table is dropped
+    /// before the move and re-issued from the newer export after, the
+    /// rebuild's rename verifying every trigger in the database.
+    #[test]
+    fn a_trigger_over_a_rebuilt_table_is_suspended_and_recreated() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO a (x) VALUES (1); END;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO a (x) VALUES (1); END;",
+        );
+        let boundary =
+            step(&old, &new, &decls(&[], &[("a", "w")], &[], &[])).expect("generate the step");
+        assert!(
+            boundary.contains("DROP TRIGGER \"ft\""),
+            "the step: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO a (x) VALUES (1); END;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO a (x) VALUES (1); END;",
+        );
+        assert_eq!(column_values(&mut conn, "a", "x"), vec!["1".to_owned()]);
+    }
+
+    /// The same suspension across a rename and a rebuild, the trigger's
+    /// text rewritten for the new table by the newer export.
+    #[test]
+    fn a_trigger_over_a_renamed_and_rebuilt_table_is_suspended_and_recreated() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO a (x) VALUES (1); END;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO b (x) VALUES (1); END;",
+        );
+        let boundary = step(&old, &new, &decls(&[], &[("a", "w")], &[("a", "b")], &[]))
+            .expect("generate the step");
+        assert!(
+            boundary.contains("DROP TRIGGER \"ft\""),
+            "the step: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO a (x) VALUES (1); END;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN INSERT INTO b (x) VALUES (1); END;",
+        );
+        assert_eq!(column_values(&mut conn, "b", "x"), vec!["1".to_owned()]);
+    }
+
+    /// A trigger on another table whose body names a view the step drops is
+    /// dropped with the view and re-issued after the move, since the
+    /// rebuild's rename verifies every trigger in the database.
+    #[test]
+    fn a_trigger_over_a_dropped_view_is_suspended_and_recreated() {
+        let old = export(
+            1,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN SELECT 1 FROM v; END;",
+        );
+        let new = export(
+            2,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN SELECT 1 FROM v; END;",
+        );
+        let boundary =
+            step(&old, &new, &decls(&[], &[("a", "w")], &[], &[])).expect("generate the step");
+        assert!(boundary.contains("DROP VIEW \"v\""), "the step: {boundary}");
+        assert!(
+            boundary.contains("DROP TRIGGER \"ft\""),
+            "the step: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, w TEXT);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN SELECT 1 FROM v; END;",
+            "INSERT INTO a VALUES (1, 'widow');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE TABLE o (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE TRIGGER ft AFTER INSERT ON o BEGIN SELECT 1 FROM v; END;",
+        );
+        assert_eq!(column_values(&mut conn, "a", "x"), vec!["1".to_owned()]);
+        let shape = read_tier_shape(&mut conn).expect("read the shape");
+        assert!(
+            shape.triggers.contains_key("ft"),
+            "the re-issue restores the trigger"
+        );
+        assert!(
+            shape.views.contains_key("v"),
+            "the re-issue restores the view"
+        );
+    }
+
+    /// An export that holds a view naming a table the export does not hold
+    /// is refused at the load, naming the view and the export's major, since
+    /// a fresh install of the export would carry the view dangling.
+    #[test]
+    fn an_export_holding_a_dangling_view_is_refused() {
+        let refused = load_export(
+            Major::new(2).expect("major 2"),
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM gone;",
+        )
+        .expect_err("the load refuses the dangling view");
+        match refused {
+            SchemaError::DanglingExportObject {
+                major,
+                kind,
+                name,
+                detail,
+            } => {
+                assert_eq!(major, 2);
+                assert_eq!(kind, "view");
+                assert_eq!(name, "v");
+                assert!(detail.contains("gone"), "the detail: {detail}");
+            }
+            other => panic!("the refusal names the view, got {other:?}"),
+        }
+    }
+
+    /// An export that holds a trigger whose body names a table the export
+    /// does not hold is refused at the load, naming the trigger.
+    #[test]
+    fn an_export_holding_a_dangling_trigger_body_is_refused() {
+        let refused = load_export(
+            Major::new(2).expect("major 2"),
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE TRIGGER ft AFTER INSERT ON a BEGIN SELECT 1 FROM gone; END;",
+        )
+        .expect_err("the load refuses the dangling trigger");
+        match refused {
+            SchemaError::DanglingExportObject {
+                major,
+                kind,
+                name,
+                detail,
+            } => {
+                assert_eq!(major, 2);
+                assert_eq!(kind, "trigger");
+                assert_eq!(name, "ft");
+                assert!(detail.contains("gone"), "the detail: {detail}");
+            }
+            other => panic!("the refusal names the trigger, got {other:?}"),
+        }
+    }
+
+    /// An export that holds no table is probed over a table the probe
+    /// creates, so its dangling view is refused the same way.
+    #[test]
+    fn an_export_with_no_table_and_a_dangling_view_is_refused() {
+        let refused = load_export(
+            Major::new(3).expect("major 3"),
+            "CREATE VIEW v AS SELECT x FROM gone;",
+        )
+        .expect_err("the load refuses the dangling view");
+        match refused {
+            SchemaError::DanglingExportObject {
+                major,
+                kind,
+                name,
+                detail,
+            } => {
+                assert_eq!(major, 3);
+                assert_eq!(kind, "view");
+                assert_eq!(name, "v");
+                assert!(detail.contains("gone"), "the detail: {detail}");
+            }
+            other => panic!("the refusal names the view, got {other:?}"),
+        }
+    }
+
+    /// An export whose views and triggers name only what it holds loads,
+    /// the probe finding nothing dangling.
+    #[test]
+    fn a_clean_export_loads_with_its_objects() {
+        let export = load_export(
+            Major::new(2).expect("major 2"),
+            "CREATE TABLE a (x INTEGER PRIMARY KEY);
+             CREATE TABLE b (x INTEGER PRIMARY KEY);
+             CREATE VIEW v AS SELECT x FROM a;
+             CREATE TRIGGER ft AFTER INSERT ON a BEGIN SELECT 1 FROM b; END;",
+        )
+        .expect("load the export");
+        assert!(export.shape.views.contains_key("v"), "the view loads");
+        assert!(export.objects.contains_key("ft"), "the trigger loads");
     }
 
     /// A declaration the diff does not back is refused, naming the file and
