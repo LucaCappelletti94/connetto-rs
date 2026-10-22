@@ -6,7 +6,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::content_wire::{ContentFrame, WirePins, WireQueue, WireResolve, mime_code};
+use crate::content_wire::{
+    ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_code,
+};
 
 use crate::frames::{InternalLane, MessageSink, MessageTransport};
 use crate::workers::helpers::sleep_ms;
@@ -248,6 +250,7 @@ enum LaneAnswer {
     Resolve(ResolveAnswer),
     Pins(WirePins),
     Queue(WireQueue),
+    Fetch(WireFetch),
 }
 
 /// Why a tab's content request did not take effect.
@@ -298,6 +301,16 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
                         Some(ContentFrame::PinReply { request_id, answer }) => {
                             (request_id, LaneAnswer::Pins(answer))
                         }
+                        Some(
+                            ContentFrame::FetchPinnedReply {
+                                request_id,
+                                answer,
+                            }
+                            | ContentFrame::TidyReply {
+                                request_id,
+                                answer,
+                            },
+                        ) => (request_id, LaneAnswer::Fetch(answer)),
                         _ => continue,
                     };
                     if let Some(sender) = waiting.borrow_mut().remove(&request_id) {
@@ -519,6 +532,45 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
         }
     }
 
+    /// Fetches every pinned file whose bytes are missing locally and answers
+    /// the ids that arrived, as the native content client's `fetch_pinned`
+    /// does.
+    ///
+    /// Files the server cannot serve are absent from the answer, so an empty
+    /// list is a valid outcome.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn fetch_pinned(&self) -> Result<Vec<FileId>, TabContentError> {
+        match self
+            .fetch_request(|request_id| ContentFrame::FetchPinned { request_id })
+            .await?
+        {
+            WireFetch::Arrived(ids) => Ok(ids
+                .into_iter()
+                .map(FileId::from_bytes)
+                .collect()),
+            _ => Err(TabContentError::Unanswered),
+        }
+    }
+
+    /// Frees the local bytes no pin keeps and answers how many records were
+    /// released, as the native content client's `tidy_content` does.
+    ///
+    /// # Errors
+    ///
+    /// As [`pin_content`](Self::pin_content).
+    pub async fn tidy(&self) -> Result<usize, TabContentError> {
+        match self
+            .fetch_request(|request_id| ContentFrame::Tidy { request_id })
+            .await?
+        {
+            WireFetch::Tidied(freed) => Ok(freed),
+            _ => Err(TabContentError::Unanswered),
+        }
+    }
+
     async fn pin_request(
         &self,
         frame: impl FnOnce(u64) -> ContentFrame,
@@ -528,7 +580,7 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
                 Err(TabContentError::Refused(reason))
             }
             Some(LaneAnswer::Pins(answer)) => Ok(answer),
-            Some(LaneAnswer::Resolve(_) | LaneAnswer::Queue(_)) | None => {
+            Some(LaneAnswer::Resolve(_) | LaneAnswer::Queue(_) | LaneAnswer::Fetch(_)) | None => {
                 Err(TabContentError::Unanswered)
             }
         }
@@ -543,7 +595,22 @@ impl<S: MessageSink + Clone + 'static> TabContent<S> {
                 Err(TabContentError::Refused(reason))
             }
             Some(LaneAnswer::Queue(answer)) => Ok(answer),
-            Some(LaneAnswer::Resolve(_) | LaneAnswer::Pins(_)) | None => {
+            Some(LaneAnswer::Resolve(_) | LaneAnswer::Pins(_) | LaneAnswer::Fetch(_)) | None => {
+                Err(TabContentError::Unanswered)
+            }
+        }
+    }
+
+    async fn fetch_request(
+        &self,
+        frame: impl FnOnce(u64) -> ContentFrame,
+    ) -> Result<WireFetch, TabContentError> {
+        match self.ask(frame).await {
+            Some(LaneAnswer::Fetch(WireFetch::Refused(reason))) => {
+                Err(TabContentError::Refused(reason))
+            }
+            Some(LaneAnswer::Fetch(answer)) => Ok(answer),
+            Some(LaneAnswer::Resolve(_) | LaneAnswer::Pins(_) | LaneAnswer::Queue(_)) | None => {
                 Err(TabContentError::Unanswered)
             }
         }

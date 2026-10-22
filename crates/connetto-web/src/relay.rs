@@ -63,7 +63,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::auth::PendingWork;
-use crate::content_wire::{ContentFrame, WirePins, WireQueue, WireResolve, mime_from_code};
+use crate::content_wire::{
+    ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_from_code,
+};
 use crate::frames::{
     InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
 };
@@ -90,6 +92,8 @@ use connetto_file_client::{
     ContentFlushStart, ContentFlushState, ContentUpload, FileId, PendingConnectionResolve,
     ResolveRoute, ResolveStart, Resolved, ScanStep, StageCommitError,
 };
+use connetto_file_client::http::ContentHttp;
+use connetto_file_core::MimeClass;
 use diesel::SqliteConnection;
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -526,6 +530,15 @@ struct HubState {
     /// request to answer and the `performance.now` instant its wait ends.
     pending_resolve: Vec<PendingHubResolve>,
 
+    /// Fetches waiting on a server ticket answer, each with the tab and
+    /// request to answer and the `performance.now` instant its wait ends.
+    pending_fetch: Vec<PendingHubFetch>,
+
+    /// Files a fetch request already restored, keyed by the tab and request
+    /// it arrived for, so the answer can list them beside the tickets still
+    /// in flight.
+    fetch_arrived: HashMap<(TabId, u64), Vec<FileId>>,
+
     /// The worker's armed resend of writes the server deferred, with the
     /// monotonic reading it falls due at, so arriving frames never restart it.
     resend: Option<(ResendTimer, Duration)>,
@@ -538,6 +551,17 @@ struct PendingHubResolve {
     request_id: u64,
     ticket: PendingConnectionResolve,
     /// The monotonic reading by which the tab hears at the latest.
+    deadline: Duration,
+}
+
+/// One fetched-file ticket still in flight for a `FetchPinned` request, kept
+/// in the hub state so the wait costs a slot rather than the event loop.
+struct PendingHubFetch {
+    tab: TabId,
+    request_id: u64,
+    file_id: FileId,
+    ticket: PendingConnectionResolve,
+    /// The monotonic reading by which the request hears at the latest.
     deadline: Duration,
 }
 
@@ -1225,8 +1249,9 @@ enum Wake {
     Upstream(Result<ClientEvent, ClientError>),
     /// The content integrity walk has a file left to check.
     Verify,
-    /// A resolve's ticket wait ran out while the hub served everything else.
-    Resolve,
+    /// A content ticket wait, for a resolve or a fetch, ran out while the hub
+    /// served everything else.
+    Ticket,
     /// The worker's resend of the writes the server deferred fell due.
     Resend,
     /// The worker's gate prompt resolved.
@@ -1281,17 +1306,22 @@ where
             }
         };
         tokio::pin!(content_wait);
-        // The resolve waits ride a timer here rather than parking a handler:
-        // when one fires, the sweep answers only the waits that have truly
-        // elapsed and the loop keeps serving everything else in between.
+        // The resolve and fetch waits ride a timer here rather than parking a
+        // handler: when one fires, the sweep answers only the waits that have
+        // truly elapsed and the loop keeps serving everything else in between.
         let resolve_ms = resolve_deadline_ms(&self.state.pending_resolve);
-        let resolve_wait = async {
-            match resolve_ms {
+        let fetch_ms = fetch_deadline_ms(&self.state.pending_fetch);
+        let ticket_ms = match (resolve_ms, fetch_ms) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let ticket_wait = async {
+            match ticket_ms {
                 Some(ms) => sleep_ms(ms).await,
                 None => core::future::pending().await,
             }
         };
-        tokio::pin!(resolve_wait);
+        tokio::pin!(ticket_wait);
         let resend_ms = resend_deadline_ms(&mut self.state, &self.worker);
         let resend_wait = async {
             match resend_ms {
@@ -1327,7 +1357,7 @@ where
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
-                () = &mut resolve_wait, if resolve_ms.is_some() => Wake::Resolve,
+                () = &mut ticket_wait, if ticket_ms.is_some() => Wake::Ticket,
                 () = &mut resend_wait, if resend_ms.is_some() => Wake::Resend,
                 outcome = &mut ask_wait, if prompting => Wake::Gate(Some(outcome)),
             }
@@ -1349,8 +1379,9 @@ where
                 Ok(true)
             }
             Wake::Verify => self.verify_turn().await,
-            Wake::Resolve => {
+            Wake::Ticket => {
                 expire_resolves(&mut self.state);
+                expire_fetches(&mut self.state);
                 Ok(true)
             }
             Wake::Resend => {
@@ -1423,7 +1454,11 @@ where
                         | ClientEvent::SnapshotEnd { .. }
                         | ClientEvent::FullResync { .. }
                 );
+                let settled_fetches = route_fetch_tickets(&mut self.state, &event);
                 handle_worker_event(&mut self.worker, &mut self.state, event)?;
+                if !settled_fetches.is_empty() {
+                    self.settle_fetches(settled_fetches).await;
+                }
                 if rows_changed && let Some(content) = &self.content {
                     let archive = content.archive();
                     if archive.heals_lost() {
@@ -1504,6 +1539,34 @@ where
         }
         self.retry.schedule(queued, progressed);
         Ok(true)
+    }
+
+    /// Runs settled fetch tickets past the downloads they name, answering
+    /// every request whose last ticket has settled.
+    async fn settle_fetches(
+        &mut self,
+        settled: Vec<(TabId, u64, FileId, Result<String, ContentError>)>,
+    ) {
+        let Self { worker, state, content, .. } = self;
+        for (tab, request_id, file_id, result) in settled {
+            if let Some(content) = content.as_ref() {
+                if let Ok(url) = result {
+                    fetch_settle_one(
+                        worker,
+                        content,
+                        state,
+                        tab,
+                        request_id,
+                        file_id,
+                        &url,
+                    )
+                    .await;
+                } else {
+                    tracing::warn!(tab = %tab, request_id, "the pinned file's ticket did not reach a grant");
+                }
+            }
+            finish_fetch_if_last(state, tab, request_id);
+        }
     }
 
     /// One outbox attempt, serving local events across its HTTP transfer.
@@ -2013,6 +2076,8 @@ where
 {
     state.tabs.remove(&id);
     state.pending_resolve.retain(|resolve| resolve.tab != id);
+    state.pending_fetch.retain(|fetch| fetch.tab != id);
+    state.fetch_arrived.retain(|(tab, _), _| *tab != id);
     let upstreams: Vec<String> = state
         .agg_routes
         .iter()
@@ -2529,6 +2594,8 @@ where
                 )));
             }
             state.pending_resolve.retain(|resolve| resolve.tab != id);
+            state.pending_fetch.retain(|fetch| fetch.tab != id);
+            state.fetch_arrived.retain(|(tab, _), _| *tab != id);
             Ok(())
         }
         Err(TabFault::Hub(err)) => Err(err),
@@ -3573,44 +3640,7 @@ where
             request_id,
             file_id,
         } => {
-            let start = match content {
-                Some(content) => {
-                    match content
-                        .start_resolve_connection(worker, FileId::from_bytes(file_id))
-                        .await
-                    {
-                        Ok(start) => Some(start),
-                        Err(err) => {
-                            tracing::warn!(
-                                tab = %id,
-                                ?err,
-                                "the resolve's ticket request could not go out"
-                            );
-                            None
-                        }
-                    }
-                }
-                None => None,
-            };
-            match start {
-                Some(ResolveStart::Waiting(ticket)) => {
-                    state.pending_resolve.push(PendingHubResolve {
-                        tab: id,
-                        request_id,
-                        ticket,
-                        deadline: SystemClock.monotonic() + RESOLVE_WAIT,
-                    });
-                }
-                Some(ResolveStart::Answered(Resolved::Remote { url })) => {
-                    answer_resolve(state, id, request_id, WireResolve::Remote { url }, None);
-                }
-                Some(ResolveStart::Answered(Resolved::Local { bytes, .. })) => {
-                    answer_resolve(state, id, request_id, WireResolve::Local, Some(bytes));
-                }
-                Some(ResolveStart::Answered(Resolved::Unavailable)) | None => {
-                    answer_resolve(state, id, request_id, WireResolve::Unavailable, None);
-                }
-            }
+            resolve_frame(worker, state, content, id, request_id, file_id).await;
             Ok(())
         }
         pin @ (ContentFrame::Pin { .. }
@@ -3626,9 +3656,73 @@ where
             serve_queue_frame(worker, state, content, walk, id, queue);
             Ok(())
         }
+        ContentFrame::FetchPinned { request_id } => {
+            fetch_pinned_frame(worker, state, content, id, request_id).await;
+            Ok(())
+        }
+        ContentFrame::Tidy { request_id } => {
+            serve_tidy_frame(worker, state, content, id, request_id).await;
+            Ok(())
+        }
         ContentFrame::ResolveReply { .. }
         | ContentFrame::PinReply { .. }
-        | ContentFrame::QueueReply { .. } => Ok(()),
+        | ContentFrame::QueueReply { .. }
+        | ContentFrame::FetchPinnedReply { .. }
+        | ContentFrame::TidyReply { .. } => Ok(()),
+    }
+}
+
+/// Answers a tab's resolve with the local check, a ticket it sends out or
+/// an unavailable, the way the tab's own lane settles a resolve.
+async fn resolve_frame<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    id: TabId,
+    request_id: u64,
+    file_id: [u8; 32],
+)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let start = match content {
+        Some(content) => {
+            match content
+                .start_resolve_connection(worker, FileId::from_bytes(file_id))
+                .await
+            {
+                Ok(start) => Some(start),
+                Err(err) => {
+                    tracing::warn!(
+                        tab = %id,
+                        ?err,
+                        "the resolve's ticket request could not go out"
+                    );
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    match start {
+        Some(ResolveStart::Waiting(ticket)) => {
+            state.pending_resolve.push(PendingHubResolve {
+                tab: id,
+                request_id,
+                ticket,
+                deadline: SystemClock.monotonic() + RESOLVE_WAIT,
+            });
+        }
+        Some(ResolveStart::Answered(Resolved::Remote { url })) => {
+            answer_resolve(state, id, request_id, WireResolve::Remote { url }, None);
+        }
+        Some(ResolveStart::Answered(Resolved::Local { bytes, .. })) => {
+            answer_resolve(state, id, request_id, WireResolve::Local, Some(bytes));
+        }
+        Some(ResolveStart::Answered(Resolved::Unavailable)) | None => {
+            answer_resolve(state, id, request_id, WireResolve::Unavailable, None);
+        }
     }
 }
 
@@ -3671,7 +3765,11 @@ fn serve_pin_frame<U: Transport>(
         | ContentFrame::RetryRefused { .. }
         | ContentFrame::RetiredContent { .. }
         | ContentFrame::ForgetRetiredContent { .. }
-        | ContentFrame::QueueReply { .. } => return,
+        | ContentFrame::QueueReply { .. }
+        | ContentFrame::FetchPinned { .. }
+        | ContentFrame::Tidy { .. }
+        | ContentFrame::FetchPinnedReply { .. }
+        | ContentFrame::TidyReply { .. } => return,
     };
     answer_pins(state, tab, request_id, answer);
 }
@@ -3754,7 +3852,11 @@ fn serve_queue_frame<U: Transport>(
         | ContentFrame::Unpin { .. }
         | ContentFrame::ListPins { .. }
         | ContentFrame::PinReply { .. }
-        | ContentFrame::QueueReply { .. } => return,
+        | ContentFrame::QueueReply { .. }
+        | ContentFrame::FetchPinned { .. }
+        | ContentFrame::Tidy { .. }
+        | ContentFrame::FetchPinnedReply { .. }
+        | ContentFrame::TidyReply { .. } => return,
     };
     answer_queue(state, tab, request_id, answer);
 }
@@ -3817,6 +3919,248 @@ fn answer_resolve(
     }
 }
 
+/// Fetches every pinned file whose bytes are missing locally, the way the
+/// native client's fetch pass does. A ticket still in flight holds the
+/// answer until the grant settles; files the server cannot serve are absent
+/// from the list.
+async fn fetch_pinned_frame<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    tab: TabId,
+    request_id: u64,
+)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        answer_fetch(
+            state,
+            tab,
+            &ContentFrame::FetchPinnedReply {
+                request_id,
+                answer: WireFetch::Refused("content is not enabled on this worker".to_owned()),
+            },
+        );
+        return;
+    };
+    let archive = content;
+    let pinned = match archive.pinned_files(worker) {
+        Ok(pinned) => pinned,
+        Err(err) => {
+            answer_fetch(
+                state,
+                tab,
+                &ContentFrame::FetchPinnedReply {
+                    request_id,
+                    answer: WireFetch::Refused(err.to_string()),
+                },
+            );
+            return;
+        }
+    };
+    let mut arrived = Vec::new();
+    for file_id in pinned {
+        let local = match archive.resolve_local(worker, file_id).await {
+            Ok(local) => local,
+            Err(err) => {
+                answer_fetch(
+                    state,
+                    tab,
+                    &ContentFrame::FetchPinnedReply {
+                        request_id,
+                        answer: WireFetch::Refused(err.to_string()),
+                    },
+                );
+                return;
+            }
+        };
+        if local.is_some() {
+            continue;
+        }
+        match archive.start_resolve_connection(worker, file_id).await {
+            Ok(ResolveStart::Waiting(ticket)) => {
+                state.pending_fetch.push(PendingHubFetch {
+                    tab,
+                    request_id,
+                    file_id,
+                    ticket,
+                    deadline: SystemClock.monotonic() + RESOLVE_WAIT,
+                });
+            }
+            Ok(ResolveStart::Answered(Resolved::Local { .. })) => arrived.push(file_id),
+            // A remote grant cannot arrive here: the start answers `Local`
+            // or `Unavailable` from the local check before it ever sends a
+            // ticket, and a sent ticket leaves a `Waiting` handle instead.
+            Ok(ResolveStart::Answered(Resolved::Unavailable | Resolved::Remote { .. })) => {}
+            Err(err) => {
+                tracing::warn!(
+                    tab = %tab,
+                    file_id = %file_id,
+                    ?err,
+                    "the pinned file's ticket request could not go out"
+                );
+            }
+        }
+    }
+    if state
+        .pending_fetch
+        .iter()
+        .any(|fetch| fetch.tab == tab && fetch.request_id == request_id)
+    {
+        if !arrived.is_empty() {
+            state.fetch_arrived.entry((tab, request_id)).or_default().extend(arrived);
+        }
+    } else {
+        let arrived: Vec<[u8; 32]> =
+            arrived.iter().map(|file_id| *file_id.as_bytes()).collect();
+        answer_fetch(
+            state,
+            tab,
+            &ContentFrame::FetchPinnedReply {
+                request_id,
+                answer: WireFetch::Arrived(arrived),
+            },
+        );
+    }
+}
+
+/// Frees the local bytes no pin keeps: the record eviction first, then the
+/// chunks the eviction left unreferenced.
+async fn serve_tidy_frame<U>(
+    worker: &mut ConnettoConnection<U>,
+    state: &mut HubState,
+    content: Option<&ContentArchive<BrowserStore>>,
+    tab: TabId,
+    request_id: u64,
+)
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let Some(content) = content else {
+        answer_fetch(
+            state,
+            tab,
+            &ContentFrame::TidyReply {
+                request_id,
+                answer: WireFetch::Refused("content is not enabled on this worker".to_owned()),
+            },
+        );
+        return;
+    };
+    let archive = content;
+    let evicted = match archive.evict_uncovered(worker) {
+        Ok(evicted) => evicted,
+        Err(err) => {
+            answer_fetch(
+                state,
+                tab,
+                &ContentFrame::TidyReply {
+                    request_id,
+                    answer: WireFetch::Refused(err.to_string()),
+                },
+            );
+            return;
+        }
+    };
+    match archive.reclaim_orphans(worker).await {
+        Ok(_) => answer_fetch(
+            state,
+            tab,
+            &ContentFrame::TidyReply {
+                request_id,
+                answer: WireFetch::Tidied(evicted),
+            },
+        ),
+        Err(err) => answer_fetch(
+            state,
+            tab,
+            &ContentFrame::TidyReply {
+                request_id,
+                answer: WireFetch::Refused(err.to_string()),
+            },
+        ),
+    }
+}
+
+/// Downloads one granted read, re-chunks it into the store and records its
+/// manifest, the restore a fetch pass applies per file.
+async fn fetch_settle_one<U>(
+    worker: &mut ConnettoConnection<U>,
+    content: &HubContent,
+    state: &mut HubState,
+    tab: TabId,
+    request_id: u64,
+    file_id: FileId,
+    url: &str,
+) -> bool
+where
+    U: Transport,
+    U::Error: core::fmt::Display,
+{
+    let bytes = match content.http.get(url, None).await {
+        Ok(reply) if reply.status == 200 => reply.body,
+        Ok(reply) => {
+            tracing::warn!(
+                tab = %tab,
+                file_id = %file_id,
+                status = reply.status,
+                "the pinned file's read did not serve its bytes"
+            );
+            return false;
+        }
+        Err(err) => {
+            tracing::warn!(tab = %tab, file_id = %file_id, ?err, "the pinned file's download failed");
+            return false;
+        }
+    };
+    let manifest = match content
+        .archive()
+        .chunk_file(std::io::Cursor::new(&bytes), MimeClass::Generic)
+        .await
+    {
+        Ok(manifest) => manifest,
+        Err(err) => {
+            tracing::warn!(
+                tab = %tab,
+                file_id = %file_id,
+                ?err,
+                "the fetched bytes could not be re-chunked"
+            );
+            return false;
+        }
+    };
+    if manifest.file_id() != file_id {
+        tracing::warn!(
+            tab = %tab,
+            expected = %file_id,
+            actual = %manifest.file_id(),
+            "the fetched bytes are not the pinned file"
+        );
+        return false;
+    }
+    if let Err(err) = content.archive().record_fetched(worker, &manifest) {
+        tracing::warn!(
+            tab = %tab,
+            file_id = %file_id,
+            ?err,
+            "the fetched manifest could not be recorded"
+        );
+        return false;
+    }
+    state.fetch_arrived.entry((tab, request_id)).or_default().push(file_id);
+    true
+}
+
+/// Answers a tab's fetch or tidy frame on its content lane.
+fn answer_fetch(state: &HubState, tab: TabId, reply: &ContentFrame) {
+    if let Some(entry) = state.tabs.get(&tab) {
+        let _ = entry.out.send(TabOut::Internal(reply.to_json(), None));
+    }
+}
+
 /// Runs one upstream event past the resolves waiting on tickets, answering
 /// every tab whose wait it settles. The event goes on to the ordinary
 /// handling: a grant is news the rest of the hub ignores, a refusal detail
@@ -3849,6 +4193,29 @@ fn route_resolves(state: &mut HubState, event: &ClientEvent) {
     }
 }
 
+/// Runs one upstream event past the fetches waiting on tickets, settling
+/// each wait the grant answers for the caller to download.
+fn route_fetch_tickets(
+    state: &mut HubState,
+    event: &ClientEvent,
+) -> Vec<(TabId, u64, FileId, Result<String, ContentError>)> {
+    let mut settled = Vec::new();
+    if state.pending_fetch.is_empty() {
+        return settled;
+    }
+    let mut waiting = Vec::new();
+    for fetch in std::mem::take(&mut state.pending_fetch) {
+        match fetch.ticket.route(event) {
+            ResolveRoute::Settled(result) => {
+                settled.push((fetch.tab, fetch.request_id, fetch.file_id, result));
+            }
+            ResolveRoute::Other => waiting.push(fetch),
+        }
+    }
+    state.pending_fetch = waiting;
+    settled
+}
+
 /// Milliseconds until the earliest resolve wait must answer, `None` when no
 /// resolve waits. Never zero, so a cycle never busy-spins on an elapsed
 /// deadline the sweep has not yet collected.
@@ -3857,6 +4224,16 @@ fn resolve_deadline_ms(pending: &[PendingHubResolve]) -> Option<i32> {
     pending
         .iter()
         .map(|resolve| wait_ms(resolve.deadline, now))
+        .min()
+}
+
+/// Milliseconds until the earliest fetch wait must answer, `None` when no
+/// fetch waits. Bounded the same way the resolve deadline is.
+fn fetch_deadline_ms(pending: &[PendingHubFetch]) -> Option<i32> {
+    let now = SystemClock.monotonic();
+    pending
+        .iter()
+        .map(|fetch| wait_ms(fetch.deadline, now))
         .min()
 }
 
@@ -3908,6 +4285,54 @@ fn expire_resolves(state: &mut HubState) {
         tracing::warn!(tab = %tab, request_id, "the content ticket did not answer in time");
         answer_resolve(state, tab, request_id, WireResolve::Unavailable, None);
     }
+}
+
+/// Answers the arrivals to every fetch request whose wait ran out.
+fn expire_fetches(state: &mut HubState) {
+    if state.pending_fetch.is_empty() {
+        return;
+    }
+    let now = SystemClock.monotonic();
+    let mut settled = Vec::new();
+    let mut waiting = Vec::new();
+    for fetch in std::mem::take(&mut state.pending_fetch) {
+        if now >= fetch.deadline {
+            settled.push((fetch.tab, fetch.request_id));
+        } else {
+            waiting.push(fetch);
+        }
+    }
+    state.pending_fetch = waiting;
+    for (tab, request_id) in settled {
+        tracing::warn!(tab = %tab, request_id, "the pinned file's ticket did not answer in time");
+        finish_fetch_if_last(state, tab, request_id);
+    }
+}
+
+/// Answers a fetch request once no ticket the hub holds for it is left.
+fn finish_fetch_if_last(state: &mut HubState, tab: TabId, request_id: u64) {
+    if state
+        .pending_fetch
+        .iter()
+        .any(|fetch| fetch.tab == tab && fetch.request_id == request_id)
+    {
+        return;
+    }
+    let arrived = state
+        .fetch_arrived
+        .remove(&(tab, request_id))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|file_id| *file_id.as_bytes())
+        .collect();
+    answer_fetch(
+        state,
+        tab,
+        &ContentFrame::FetchPinnedReply {
+            request_id,
+            answer: WireFetch::Arrived(arrived),
+        },
+    );
 }
 
 /// Rewrite a tab's logical-named changeset onto the physical backing tables,

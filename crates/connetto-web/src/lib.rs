@@ -54,7 +54,9 @@ pub use content::{
     BrowserContentClient, BrowserContentError, BrowserResolved, ObjectUrl, ObjectUrlError,
     TabContent, TabContentError, TabResolved, TabStageError, attach_browser_content,
 };
-pub use content_wire::{ContentFrame, WirePins, WireQueue, WireResolve, mime_code, mime_from_code};
+pub use content_wire::{
+    ContentFrame, WireFetch, WirePins, WireQueue, WireResolve, mime_code, mime_from_code,
+};
 pub use frames::{
     InternalInbound, InternalLane, MessageSink, MessageTransport, MessageTransportError,
 };

@@ -19,11 +19,13 @@ use connetto_core::messages::{
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_file_client::{BrowserHttp, BrowserStore, ContentArchive};
-use connetto_file_core::{ChunkHash, ChunkStore, FileId, FileIdHasher, MimeClass};
+use connetto_file_core::{
+    ChunkHash, ChunkInventory, ChunkStore, FileId, FileIdHasher, MimeClass,
+};
 use connetto_web::content_wire::{ContentFrame, mime_code};
 use connetto_web::relay::HubReconnect;
 use connetto_web::workers::DB_ALIVE_LOCK;
-use connetto_web::{MessageTransport, TabContent, locks};
+use connetto_web::{MessageTransport, TabContent, TabResolved, locks};
 use diesel::Connection;
 use diesel::connection::SimpleConnection;
 use futures_channel::mpsc;
@@ -46,6 +48,10 @@ const TAB_CLIENT_ID: &str = "7a2d4e6f-1b3c-4d5e-8f9a-0b1c2d3e4f5a";
 /// its own outbox against whatever `fetch` the current test installed.
 const REFUSED_PHOTO: &[u8] = b"a photograph the file server turns away on storage quota";
 const LOST_PHOTO: &[u8] = b"a photograph whose stored bytes the test lets go";
+const PINNED_PHOTO: &[u8] = b"a photograph a pin keeps after its stored bytes are lost";
+const TIDY_KEPT: &[u8] = b"a photograph a pin keeps when storage is tidied";
+const TIDY_FREED: &[u8] = b"a photograph no pin keeps, so tidying frees it";
+const TIDY_SACRIFICE: &[u8] = b"a photograph the sweep frees so the test sees it settle";
 
 /// How the fake upstream answers content tickets.
 #[derive(Clone)]
@@ -312,6 +318,83 @@ impl StatusFetch {
     }
 }
 
+/// A `fetch` answering the upload intent like the file server does and every
+/// other request, the commit and every granted read URL, with the served
+/// bytes. Restores the original global on drop.
+struct ServingFetch {
+    _restore: Replaced,
+}
+
+impl ServingFetch {
+    fn install(served: &'static [u8]) -> Self {
+        let closure = Closure::<dyn FnMut(JsValue) -> Promise>::new(move |value: JsValue| {
+            let request = value.dyn_into::<Request>().expect("fetch receives Request");
+            future_to_promise(async move {
+                let body = JsFuture::from(request.array_buffer()?).await?;
+                let body = Uint8Array::new(&body).to_vec();
+                if body.is_empty() {
+                    Ok(response_bytes(Some(served), 200))
+                } else {
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&body).expect("decode upload intent");
+                    let needed: Vec<&str> = intent["chunks"]
+                        .as_array()
+                        .expect("intent chunks")
+                        .iter()
+                        .map(|chunk| chunk["hash"].as_str().expect("chunk hash"))
+                        .collect();
+                    let answer = serde_json::json!({ "needed": needed }).to_string();
+                    Ok(response(Some(&answer), 200))
+                }
+            })
+        });
+        let replacement: JsValue = closure.as_ref().clone();
+        Self {
+            _restore: install_global("fetch", &replacement, closure),
+        }
+    }
+}
+
+/// An `fetch` answering the upload intent like the file server does and
+/// every commit with `200`, counting the commits so a test can wait for the
+/// outbox to drain. Restores the original global on drop.
+struct CommitFetch {
+    _restore: Replaced,
+}
+
+impl CommitFetch {
+    fn install(commits: &Rc<Cell<u32>>) -> Self {
+        let held = Rc::clone(commits);
+        let closure = Closure::<dyn FnMut(JsValue) -> Promise>::new(move |value: JsValue| {
+            let request = value.dyn_into::<Request>().expect("fetch receives Request");
+            let held = Rc::clone(&held);
+            future_to_promise(async move {
+                let body = JsFuture::from(request.array_buffer()?).await?;
+                let body = Uint8Array::new(&body).to_vec();
+                if body.is_empty() {
+                    held.set(held.get() + 1);
+                    Ok(response(None, 200))
+                } else {
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&body).expect("decode upload intent");
+                    let needed: Vec<&str> = intent["chunks"]
+                        .as_array()
+                        .expect("intent chunks")
+                        .iter()
+                        .map(|chunk| chunk["hash"].as_str().expect("chunk hash"))
+                        .collect();
+                    let answer = serde_json::json!({ "needed": needed }).to_string();
+                    Ok(response(Some(&answer), 200))
+                }
+            })
+        });
+        let replacement: JsValue = closure.as_ref().clone();
+        Self {
+            _restore: install_global("fetch", &replacement, closure),
+        }
+    }
+}
+
 /// An `XMLHttpRequest` that answers `204` once its body has gone out, and
 /// whose progress events are what a bounded upload observes.
 const UPLOAD_STUB: &str = "(record) => class ScriptedUpload {
@@ -404,8 +487,8 @@ fn install_global(
     }
 }
 
-/// Answers like a `web_sys::Response` of `status` with an optional body.
-fn response(body: Option<&str>, status: u16) -> JsValue {
+/// Answers like a `web_sys::Response` of `status` with the given body.
+fn response_with(body: Option<JsValue>, status: u16) -> JsValue {
     let global = js_sys::global();
     let constructor = Reflect::get(&global, &JsValue::from_str("Response"))
         .expect("Response global")
@@ -419,9 +502,19 @@ fn response(body: Option<&str>, status: u16) -> JsValue {
     )
     .expect("set the status");
     let arguments = Array::new();
-    arguments.push(&body.map_or(JsValue::NULL, JsValue::from_str));
+    arguments.push(&body.unwrap_or(JsValue::NULL));
     arguments.push(&init);
     Reflect::construct(&constructor, &arguments).expect("build the response")
+}
+
+/// Answers like a `web_sys::Response` of `status` with an optional text body.
+fn response(body: Option<&str>, status: u16) -> JsValue {
+    response_with(body.map(JsValue::from_str), status)
+}
+
+/// Answers like a `web_sys::Response` of `status` with an optional byte body.
+fn response_bytes(body: Option<&[u8]>, status: u16) -> JsValue {
+    response_with(body.map(|body| JsValue::from(Uint8Array::from(body))), status)
 }
 
 fn blob_of(bytes: &[u8]) -> web_sys::Blob {
@@ -444,9 +537,10 @@ fn stage(tab: &MessageTransport<MessagePort>, file_id: FileId, blob: &web_sys::B
         .expect("post stage");
 }
 
-/// The changeset of one `photos` insert declaring `content_id`, captured from
-/// a throwaway replica the way a tab's own capture would produce it.
-fn captured_insert(content_id: &[u8]) -> Vec<u8> {
+/// The changeset of one `photos` insert declaring `content_id` in row `row`,
+/// captured from a throwaway replica the way a tab's own capture would
+/// produce it.
+fn captured_insert(row: u32, content_id: &[u8]) -> Vec<u8> {
     use diesel_sqlite_session::SqliteSessionExt;
     let mut hex = String::new();
     for byte in content_id {
@@ -456,7 +550,7 @@ fn captured_insert(content_id: &[u8]) -> Vec<u8> {
     conn.batch_execute(DDL).expect("schema");
     let mut session = conn.create_session().expect("session");
     session.attach_all().expect("attach");
-    conn.batch_execute(&format!("INSERT INTO photos VALUES (1, x'{hex}')"))
+    conn.batch_execute(&format!("INSERT INTO photos VALUES ({row}, x'{hex}')"))
         .expect("insert");
     session.changeset().expect("changeset")
 }
@@ -532,7 +626,7 @@ async fn a_refused_upload_is_listed_then_retried() {
     let content = TabContent::<MessagePort>::new(&mut tab);
     let file_id = declared_id(REFUSED_PHOTO);
     stage(&tab, file_id, &blob_of(REFUSED_PHOTO));
-    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
     assert!(
         until(async || mutations.get() == 1).await,
         "the row commits"
@@ -593,7 +687,7 @@ async fn a_retired_file_is_listed_then_forgotten() {
     let content = TabContent::<MessagePort>::new(&mut tab);
     let file_id = declared_id(LOST_PHOTO);
     stage(&tab, file_id, &blob_of(LOST_PHOTO));
-    send_mutation(&mut tab, 1, &captured_insert(file_id.as_bytes())).await;
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
     assert!(
         until(async || mutations.get() == 1).await,
         "the row commits"
@@ -621,6 +715,157 @@ async fn a_retired_file_is_listed_then_forgotten() {
         })
         .await,
         "a forgotten loss leaves nothing retired"
+    );
+    serial.release();
+}
+
+/// The stored bytes of a pinned file are lost after the upload, and
+/// `fetch_pinned` restores them from the server: the tab lists the file it
+/// restored and the bytes then resolve locally from the fetched chunks.
+#[wasm_bindgen_test]
+async fn a_pinned_file_with_lost_bytes_is_fetched() {
+    let serial = locks::hold_lock(TEST_LOCK).await;
+    let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
+    let uploaded = Rc::new(RefCell::new(Vec::new()));
+    let _upload = UploadRecorder::install(&uploaded);
+    let _fetch = ServingFetch::install(PINNED_PHOTO);
+    let (_hub, _mutations, mut tab, _answers, store) =
+        relay_tab("r69d-fetched", [23; 32], Tickets::Grants).await;
+    let content = TabContent::<MessagePort>::new(&mut tab);
+    let file_id = declared_id(PINNED_PHOTO);
+    stage(&tab, file_id, &blob_of(PINNED_PHOTO));
+    send_mutation(&mut tab, 1, &captured_insert(1, file_id.as_bytes())).await;
+    assert!(
+        until(async || uploads_of(&uploaded, PINNED_PHOTO) == 1).await,
+        "the walk must upload the staged file"
+    );
+    content
+        .pin_content("photos-pin", "SELECT content_id FROM photos", "content_id")
+        .await
+        .expect("pin the photo");
+    let chunk = ChunkHash::from_data(PINNED_PHOTO);
+    // The store may still be settling the chunk the upload just read, so the
+    // drop retries until the store accepts it.
+    assert!(
+        until(async || store.delete_chunk(&chunk).await.is_ok()).await,
+        "the stored chunk must go"
+    );
+    let arrived = tokio::select! {
+        arrived = content.fetch_pinned() => arrived.expect("fetch the pinned file"),
+        () = timeout_ms(2_000) => panic!("fetch_pinned never answered"),
+    };
+    assert_eq!(
+        arrived,
+        vec![file_id],
+        "the fetch answers the file it restored"
+    );
+    let resolved = tokio::select! {
+        resolved = content.resolve(file_id) => resolved,
+        () = timeout_ms(2_000) => panic!("the resolve never answered"),
+    };
+    assert!(
+        matches!(resolved, TabResolved::Local { .. }),
+        "the fetched bytes resolve locally, got {resolved:?}"
+    );
+    assert!(
+        store
+            .stored_hashes()
+            .await
+            .expect("list the store")
+            .contains(&chunk),
+        "the fetch restored the chunk to the store"
+    );
+    serial.release();
+}
+
+/// Three uploaded files, two pinned at first: the hub's retention sweep frees the
+/// unpinned one while the pins hold, which is how the test observes the sweep settling;
+/// then the freed photo's pin goes and `tidy` releases that file's records and chunks
+/// while the pinned file's bytes stay, and the freed file still resolves from the server.
+#[wasm_bindgen_test]
+async fn tidy_frees_unpinned_bytes_and_keeps_pinned() {
+    let serial = locks::hold_lock(TEST_LOCK).await;
+    let _alive = locks::hold_lock(DB_ALIVE_LOCK).await;
+    let uploaded = Rc::new(RefCell::new(Vec::new()));
+    let _upload = UploadRecorder::install(&uploaded);
+    let commits = Rc::new(Cell::new(0u32));
+    let _fetch = CommitFetch::install(&commits);
+    let (_hub, _mutations, mut tab, _answers, store) =
+        relay_tab("r69d-tidy", [24; 32], Tickets::Grants).await;
+    let content = TabContent::<MessagePort>::new(&mut tab);
+    let kept_id = declared_id(TIDY_KEPT);
+    let freed_id = declared_id(TIDY_FREED);
+    let sacrifice_id = declared_id(TIDY_SACRIFICE);
+    // The hub's retention sweep releases any sent file no pin covers, so the pins hold
+    // from the start and the test releases one only after the sweep has settled.
+    content
+        .pin_content(
+            "kept-pin",
+            "SELECT content_id FROM photos WHERE id = 1",
+            "content_id",
+        )
+        .await
+        .expect("pin the kept photo");
+    content
+        .pin_content(
+            "freed-pin",
+            "SELECT content_id FROM photos WHERE id = 2",
+            "content_id",
+        )
+        .await
+        .expect("pin the freed photo");
+    stage(&tab, kept_id, &blob_of(TIDY_KEPT));
+    send_mutation(&mut tab, 1, &captured_insert(1, kept_id.as_bytes())).await;
+    stage(&tab, freed_id, &blob_of(TIDY_FREED));
+    send_mutation(&mut tab, 2, &captured_insert(2, freed_id.as_bytes())).await;
+    stage(&tab, sacrifice_id, &blob_of(TIDY_SACRIFICE));
+    send_mutation(&mut tab, 3, &captured_insert(3, sacrifice_id.as_bytes())).await;
+    assert!(
+        until(async || {
+            uploads_of(&uploaded, TIDY_KEPT) == 1
+                && uploads_of(&uploaded, TIDY_FREED) == 1
+                && uploads_of(&uploaded, TIDY_SACRIFICE) == 1
+        })
+        .await,
+        "the walk must upload all three files"
+    );
+    assert!(
+        until(async || commits.get() == 3).await,
+        "the walk must commit all three uploads before retention can release them"
+    );
+    let sacrifice_chunk = ChunkHash::from_data(TIDY_SACRIFICE);
+    assert!(
+        until(async || {
+            store
+                .stored_hashes()
+                .await
+                .is_ok_and(|hashes| !hashes.contains(&sacrifice_chunk))
+        })
+        .await,
+        "the sweep must release the unpinned file, settling the retention pass"
+    );
+    content
+        .unpin_content("freed-pin")
+        .await
+        .expect("release the freed photo");
+    let freed = tokio::select! {
+        freed = content.tidy() => freed.expect("tidy the local store"),
+        () = timeout_ms(2_000) => panic!("tidy never answered"),
+    };
+    assert_eq!(freed, 1, "tidy answers the one record it released");
+    let held = store.stored_hashes().await.expect("list the store");
+    assert!(
+        held.contains(&ChunkHash::from_data(TIDY_KEPT)),
+        "the pinned file's bytes stay"
+    );
+    assert!(
+        !held.contains(&ChunkHash::from_data(TIDY_FREED)),
+        "the unpinned file's bytes are freed"
+    );
+    let resolved = content.resolve(freed_id).await;
+    assert!(
+        matches!(resolved, TabResolved::Remote { .. }),
+        "the freed file still resolves from the server, got {resolved:?}"
     );
     serial.release();
 }
