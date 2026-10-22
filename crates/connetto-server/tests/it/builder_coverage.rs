@@ -1335,6 +1335,102 @@ async fn a_per_viewer_statistic_keeps_the_viewers_rows_over_the_production_wirin
     stream.abort();
     http.abort();
 }
+/// A row inserted straight into Postgres moves the live count of every
+/// subscriber, including one that subscribes after the count first booted.
+/// The table carries no row policies of its own, but the cap connetto
+/// generates secures it, so a per-viewer read must answer as the viewer to
+/// see the row at all.
+#[tokio::test]
+async fn a_backend_row_moves_the_count_of_a_late_subscriber() {
+    let _keyring = isolated_session_keyring();
+    let _serial = PG_SERIAL.lock().await;
+    let _subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "subql=debug,connetto_server=info,info",
+        ))
+        .try_init();
+    let fixture = Fixture::acquire().await;
+    let pool = admin_pool(&fixture).await;
+
+    let idp = MockOauth::start().await;
+    let (_channel, store) = fixture.fga_store().await;
+    seed_no_rls_orders(&pool).await;
+    fixture.start_replication(&["orders"]).await;
+    fixture.provision_auth_tables().await;
+
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a listener");
+    let port = listener.local_addr().expect("local address").port();
+    let fga_url = fixture.fga_url().await.to_owned();
+    let builder = builder_schema(
+        &fixture,
+        port,
+        &idp,
+        (&fga_url, &store),
+        PG_DDL,
+        NO_POLICIES,
+        "orders",
+    );
+    let base = format!("http://127.0.0.1:{port}");
+
+    let parts = builder.build().await.expect("the deployment assembles");
+    let stream = tokio::spawn(parts.change_stream);
+    let http = tokio::spawn(async move { axum::serve(listener, parts.router).await });
+    wait_ready(&base).await;
+
+    let (access, _uid, _) = mint_tokens(&base, "carol").await;
+    let addr = format!("127.0.0.1:{port}");
+
+    // The first subscriber boots the count over the empty table.
+    let mut first = live_session_as(&addr, &access, "count-first").await;
+    assert_eq!(
+        first_count(&mut first, "count", "SELECT COUNT(*) FROM orders").await,
+        0,
+        "the empty table answers zero"
+    );
+    exec(&pool, "INSERT INTO orders VALUES (1, 1.0, 1, 'first')").await;
+    assert_eq!(
+        count_of(&next_update(&mut first, "count").await),
+        1,
+        "a backend row moves the first subscriber's count"
+    );
+
+    // A subscriber that arrives later reads the count's current value, and a
+    // backend row moves it the same way.
+    let mut second = live_session_as(&addr, &access, "count-second").await;
+    assert_eq!(
+        first_count(&mut second, "count", "SELECT COUNT(*) FROM orders").await,
+        1,
+        "the late subscriber reads the current count"
+    );
+    exec(&pool, "INSERT INTO orders VALUES (2, 2.0, 2, 'second')").await;
+    assert_eq!(
+        count_of(&next_update(&mut second, "count").await),
+        2,
+        "a backend row moves the late subscriber's count"
+    );
+    stream.abort();
+    http.abort();
+}
+
+/// The `orders` table without row-level security, the demo's shape, with the
+/// reader role granted on it and on the writer bookkeeping.
+async fn seed_no_rls_orders(pool: &Pool<AsyncPgConnection>) {
+    for stmt in [
+        "DROP TABLE IF EXISTS orders CASCADE",
+        "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_reader') \
+         THEN CREATE ROLE app_reader LOGIN PASSWORD 'app_reader'; END IF; END $$",
+        PG_DDL,
+        "GRANT USAGE ON SCHEMA public TO app_reader",
+        "GRANT SELECT ON orders TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
+    ] {
+        exec(pool, stmt).await;
+    }
+    provision_cap_policies(pool, PG_DDL, NO_POLICIES).await;
+}
 
 /// Logging out revokes the session the live connection belongs to, the
 /// connection hears the revocation as its last frame, and the audit switch

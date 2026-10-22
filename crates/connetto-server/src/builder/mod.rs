@@ -324,11 +324,26 @@ impl ServerSchema {
     }
 
     /// The one catalog the engine classifies, the policies beside
-    /// [`engine_ddl`](Self::engine_ddl), because a folded read rule reads the
-    /// policy text the engine must hold.
-    #[must_use]
-    pub fn catalog<Id: connetto_core::bots::BotRegistryIdSql>(&self) -> String {
-        format!("{}\n{}", self.engine_ddl::<Id>(), self.pg_policies)
+    /// [`engine_ddl`](Self::engine_ddl) and the cap document the pair
+    /// generates, because a folded read rule reads the policy text the engine
+    /// must hold. The cap is live beside the deployment's own rules, so a
+    /// table it secures refuses a shared fold and answers through the
+    /// per-viewer reads that bind the caller the way a live read does.
+    ///
+    /// # Errors
+    ///
+    /// [`connetto_schema::SchemaError::Translate`] when either document does
+    /// not parse.
+    pub fn catalog<Id: connetto_core::bots::BotRegistryIdSql>(
+        &self,
+    ) -> Result<String, connetto_schema::SchemaError> {
+        let cap = connetto_schema::cap_policies::<Id>(&self.pg_ddl, &self.pg_policies)?;
+        Ok(format!(
+            "{}\n{}\n{}",
+            self.engine_ddl::<Id>(),
+            self.pg_policies,
+            cap
+        ))
     }
 }
 
@@ -1693,7 +1708,8 @@ async fn build_write_side<D: ConnettoSchema>(
         build_authorization::<D>(&pools.owner, &pools.reader, schema, publication, openfga).await?;
     // The engine and the upkeep each classify membership against the deployment's policies, so each takes a translator.
     let upkeep_translator = translator.clone();
-    let materializer = Materializer::builder(&schema.catalog::<RegistryIds<D>>())
+    let catalog = schema.catalog::<RegistryIds<D>>()?;
+    let materializer = Materializer::builder(&catalog)
         .with_write_catalog(writable)
         .with_translator(translator)
         .with_caller(caller_mapping())
