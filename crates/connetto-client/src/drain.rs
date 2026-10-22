@@ -893,6 +893,18 @@ where
                 return Ok(());
             }
             Some(IncomingFrame::Control(ControlMessage::RateLimited(limited))) => {
+                // A held write we sent on this wire and have not settled yet
+                // could never come back on the main wire, so the wire is
+                // dropped and the redial sends it again.
+                if limited
+                    .related_to
+                    .as_deref()
+                    .and_then(|related| related.parse::<u64>().ok())
+                    .is_some_and(|seq| self.drain.in_flight.contains(&seq))
+                {
+                    self.drop_drain_wire().await;
+                    return Ok(());
+                }
                 let event = self.rate_limited(limited);
                 self.notices.push_back(event);
                 return Ok(());

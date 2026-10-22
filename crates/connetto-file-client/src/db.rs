@@ -102,6 +102,8 @@ diesel::table! {
     }
 }
 
+allow_tables_to_appear_in_same_query!(_connetto_content_chunks, _connetto_content_outbox);
+
 /// The bookkeeping schema, applied on every open so a new replica gains all
 /// tables, the same way `_connetto_meta` arrives.
 pub(crate) const CONTENT_DDL: &str = "\
@@ -242,8 +244,6 @@ fn holds_table(conn: &mut SqliteConnection, name: &str) -> Result<bool, diesel::
 
 /// Moves an old major's unsent files into the held tables inside the rebuild
 /// transaction (R31), and says whether it held any.
-///
-/// The copy is a cross-table statement the typed DSL cannot express.
 pub(crate) fn hold(conn: &mut SqliteConnection, major: Major) -> Result<bool, ClientError> {
     conn.batch_execute(HELD_CONTENT_DDL)?;
     if !holds_table(conn, "_connetto_content_outbox")? {
@@ -256,15 +256,43 @@ pub(crate) fn hold(conn: &mut SqliteConnection, major: Major) -> Result<bool, Cl
     if authored == 0 {
         return Ok(false);
     }
-    conn.batch_execute(&format!(
-        "INSERT INTO _connetto_held_content_outbox (major, file_id) \
-         SELECT {}, file_id FROM _connetto_content_outbox WHERE heal = 0; \
-         INSERT INTO _connetto_held_content_chunks (major, file_id, ordinal, hash, len) \
-         SELECT {}, file_id, ordinal, hash, len FROM _connetto_content_chunks \
-         WHERE file_id IN (SELECT file_id FROM _connetto_content_outbox WHERE heal = 0)",
-        major.get(),
-        major.get()
-    ))?;
+    let stored = i64::from(major.get());
+    let source = _connetto_content_outbox::table
+        .filter(_connetto_content_outbox::heal.eq(false))
+        .select(_connetto_content_outbox::file_id);
+    diesel::insert_into(_connetto_held_content_outbox::table)
+        .values(source.select((
+            stored.into_sql::<diesel::sql_types::BigInt>(),
+            _connetto_content_outbox::file_id,
+        )))
+        .into_columns((
+            _connetto_held_content_outbox::major,
+            _connetto_held_content_outbox::file_id,
+        ))
+        .execute(conn)?;
+    diesel::insert_into(_connetto_held_content_chunks::table)
+        .values(
+            _connetto_content_chunks::table
+                .filter(
+                    _connetto_content_chunks::file_id
+                        .eq_any(source.select(_connetto_content_outbox::file_id)),
+                )
+                .select((
+                    stored.into_sql::<diesel::sql_types::BigInt>(),
+                    _connetto_content_chunks::file_id,
+                    _connetto_content_chunks::ordinal,
+                    _connetto_content_chunks::hash,
+                    _connetto_content_chunks::len,
+                )),
+        )
+        .into_columns((
+            _connetto_held_content_chunks::major,
+            _connetto_held_content_chunks::file_id,
+            _connetto_held_content_chunks::ordinal,
+            _connetto_held_content_chunks::hash,
+            _connetto_held_content_chunks::len,
+        ))
+        .execute(conn)?;
     Ok(true)
 }
 

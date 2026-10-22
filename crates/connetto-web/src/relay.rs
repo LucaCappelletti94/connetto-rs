@@ -1344,7 +1344,7 @@ where
             tokio::select! {
                 () = &mut content_wait => Wake::Content,
                 event = events.recv() => Wake::Local(event),
-                event = worker.pump_one(), if !retry.flush.is_waiting() => Wake::Upstream(event),
+                event = worker.pump_one(), if !retry.flush.is_waiting() && !retry.held_flush.is_waiting() => Wake::Upstream(event),
                 // Always ready, so the walk shares the cycle with every other source
                 // rather than holding it or being starved by it.
                 () = core::future::ready(()), if unverified => Wake::Verify,
@@ -1562,7 +1562,8 @@ where
             }
             Some(ContentWalk::Interrupted(Some(event))) => {
                 self.serve(event).await?;
-                Some(true)
+                queued = true;
+                None
             }
             Some(ContentWalk::Interrupted(None)) => Some(false),
             Some(ContentWalk::KeyDue) => Some(true),

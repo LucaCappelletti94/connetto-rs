@@ -11,8 +11,8 @@ use connetto_client::{
 };
 use connetto_core::messages::{
     ControlMessage, FatalError, FatalErrorReason, HandshakeAck, HeldWork, HeldWrite,
-    MutationApplied, MutationReject, MutationRejectReason, Provenance, WriterGrant, WriterRef,
-    WriterRequest,
+    MutationApplied, MutationReject, MutationRejectReason, Provenance, RateLimited, WriterGrant,
+    WriterRef, WriterRequest,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -580,4 +580,80 @@ async fn a_failed_dial_backs_off_and_a_dropped_drain_redials() {
         "the held write is still owed after the drain wire dropped"
     );
     assert_eq!(conn.unsynced().len(), 1);
+}
+
+#[tokio::test]
+async fn a_held_write_the_old_major_rate_limits_drains_over_the_redial() {
+    let dir = tempdir().expect("temp dir");
+    let (mut conn, old_version) = held_under_number(&dir).await;
+    // The first wire names the held write in a rate-limit refusal.
+    let (client_end, mut server_end) = loopback();
+    let limit_version = old_version.clone();
+    tokio::spawn(async move {
+        let _ = server_end.recv().await;
+        let _ = server_end
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "limiter".to_owned(),
+                session_token: "limiter".to_owned(),
+                resume_token: "limiter".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(limit_version),
+                initial_credits: 64,
+                writer: Some(WriterGrant {
+                    number: NUMBER,
+                    frontier: 0,
+                }),
+            }))
+            .await;
+        let Some(IncomingFrame::Control(ControlMessage::MutationHeader(header))) =
+            server_end.recv().await.expect("the write")
+        else {
+            panic!("the write reached the limiter wire");
+        };
+        let _ = server_end
+            .send_control(ControlMessage::RateLimited(RateLimited {
+                related_to: Some(header.client_seq.to_string()),
+                retry_after_ms: 50,
+            }))
+            .await;
+        // The wire stays up after the refusal, which is what the defect needs.
+        while let Ok(Some(_)) = server_end.recv().await {}
+    });
+    let timer = conn.drain_timer().expect("a dial is owed");
+    conn.attach_drain(timer, client_end)
+        .await
+        .expect("attach the drain");
+    for _ in 0..8 {
+        if conn.drain_timer().is_some() {
+            break;
+        }
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), conn.pump_one()).await;
+    }
+    let redial = conn
+        .drain_timer()
+        .expect("the rate-limited held write owes a redial");
+    let (transport, mut rx) = server(Answer::Ack {
+        version: old_version,
+        grant: Some(WriterGrant {
+            number: NUMBER,
+            frontier: 0,
+        }),
+        settle: Settle::Apply,
+    });
+    conn.attach_drain(redial, transport)
+        .await
+        .expect("attach the redial");
+    pump_until(&mut conn, drained).await;
+    let resends: Vec<u64> = seen(&mut rx)
+        .into_iter()
+        .filter_map(|seen| match seen {
+            Seen::Mutation { seq, .. } => Some(seq),
+            Seen::Handshake { .. } => None,
+        })
+        .collect();
+    assert_eq!(resends, vec![1], "the redial resent the rate-limited write");
+    assert!(
+        conn.unsynced().is_empty(),
+        "the settled write leaves the queue"
+    );
 }
