@@ -113,7 +113,7 @@ async fn setup(fixture: &Fixture, snail_secs: f64) -> Pool<AsyncPgConnection> {
             "CREATE POLICY slow_p ON slow_rows FOR SELECT USING (reserve_snail())",
             "GRANT USAGE ON SCHEMA public TO app_reserve",
             "GRANT SELECT ON slow_rows, fast_rows TO app_reserve",
-            "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_reserve",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reserve",
         ])
         .await;
     let mut conn = fixture.admin().get().await.expect("admin connection");
@@ -315,7 +315,7 @@ async fn wait_for_slow_reads(fixture: &Fixture, want: i64) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_identified_caller_completes_under_anonymous_saturation() {
     let fixture = Fixture::acquire().await;
-    let reader = setup(&fixture, 8.0).await;
+    let reader = setup(&fixture, 30.0).await;
     let manager = manager(&reader);
 
     // Three anonymous callers handshake while the share is free. The third
@@ -469,7 +469,7 @@ async fn anonymous_callers_reach_the_full_unreserved_share() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_share_deferred_subscribe_spends_no_subscription_allowance() {
     let fixture = Fixture::acquire().await;
-    let reader = setup(&fixture, 4.0).await;
+    let reader = setup(&fixture, 30.0).await;
     let manager = manager_with(&reader, |tier| {
         tier.with_subscriptions(1, Duration::from_secs(600))
     });

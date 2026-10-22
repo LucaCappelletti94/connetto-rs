@@ -347,6 +347,7 @@ async fn dial_stream(url: &str) -> Result<(String, NativeStream), DialError> {
                 .with_safe_default_protocol_versions()
                 .map_err(|err| DialError::Tls(err.to_string()))?
                 .with_platform_verifier()
+                .map_err(|err| DialError::Tls(err.to_string()))?
                 .with_no_client_auth();
             let connector = tokio_rustls::TlsConnector::from(std::sync::Arc::new(config));
             let name = rustls::pki_types::ServerName::try_from(host)

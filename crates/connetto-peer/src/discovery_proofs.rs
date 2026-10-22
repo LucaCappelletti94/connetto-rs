@@ -1,10 +1,12 @@
 //! The R76 slice 3 loopback proofs, every advertisement and browse running
-//! on the loopback.
+//! on the loopback, and the proofs of the platform DNS-SD seam over a
+//! service the proof scripts.
 //!
-//! Each proof first probes that loopback multicast works, and skips itself
-//! when it does not, so a host without loopback multicast never reads as a
-//! discovery failure.
+//! Each loopback proof first probes that loopback multicast works, and skips
+//! itself when it does not, so a host without loopback multicast never reads
+//! as a discovery failure. The scripted proofs need no network.
 
+use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -17,6 +19,7 @@ use crate::Discovery;
 use crate::DiscoveryEvent;
 use crate::Fingerprint;
 use crate::PeerEvent;
+use crate::discovery::{DnsSd, DnsSdEvent, DnsSdSession, DnsSdSink};
 use crate::test_support::loopback_multicast;
 use crate::tests::{Deployment, Peer, events, node, serve, whole_second};
 
@@ -318,4 +321,264 @@ async fn a_stopped_discovery_serves_again() {
 
     da.stop();
     db.stop();
+}
+
+/// What the scripted service's sessions were asked, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Call {
+    Register { port: u16, fingerprint: String },
+    Unregister,
+}
+
+/// A platform DNS-SD service the proof drives by hand. Each open hands the
+/// session's sink to the proof, the first `refused_opens` opens fail, and a
+/// session refuses its advertisement when `refuse_register` is set.
+struct ScriptedDnsSd {
+    sinks: mpsc::UnboundedSender<DnsSdSink>,
+    calls: Arc<parking_lot::Mutex<Vec<Call>>>,
+    refused_opens: parking_lot::Mutex<usize>,
+    refuse_register: bool,
+}
+
+struct ScriptedSession {
+    calls: Arc<parking_lot::Mutex<Vec<Call>>>,
+    refuse_register: bool,
+}
+
+impl DnsSd for ScriptedDnsSd {
+    fn open(&self, events: DnsSdSink) -> io::Result<Box<dyn DnsSdSession>> {
+        let mut refused_opens = self.refused_opens.lock();
+        if *refused_opens > 0 {
+            *refused_opens -= 1;
+            return Err(io::Error::other("the service will not start"));
+        }
+        drop(refused_opens);
+        self.sinks.send(events).expect("the proof holds the sinks");
+        Ok(Box::new(ScriptedSession {
+            calls: self.calls.clone(),
+            refuse_register: self.refuse_register,
+        }))
+    }
+}
+
+impl DnsSdSession for ScriptedSession {
+    fn register(&mut self, _name: &str, port: u16, txt: &[(&str, &str)]) -> io::Result<()> {
+        if self.refuse_register {
+            return Err(io::Error::other("the advertisement is refused"));
+        }
+        let fingerprint = txt
+            .iter()
+            .find(|(key, _)| *key == "fp")
+            .map(|(_, value)| (*value).to_owned())
+            .unwrap_or_default();
+        self.calls.lock().push(Call::Register { port, fingerprint });
+        Ok(())
+    }
+
+    fn unregister(&mut self, _name: &str) {
+        self.calls.lock().push(Call::Unregister);
+    }
+}
+
+/// A discovery over the scripted service, its sinks and calls handed out.
+struct Scripted {
+    discovery: Discovery,
+    found: mpsc::UnboundedReceiver<DiscoveryEvent>,
+    sinks: mpsc::UnboundedReceiver<DnsSdSink>,
+    calls: Arc<parking_lot::Mutex<Vec<Call>>>,
+    own: Fingerprint,
+    other: Fingerprint,
+}
+
+fn scripted(refused_opens: usize, refuse_register: bool) -> Scripted {
+    let (deployment, alice, bob) = pair(whole_second());
+    let (tx, _rx) = events();
+    let node = node(deployment.root_der(), tx);
+    let (sinks_tx, sinks) = mpsc::unbounded_channel();
+    let calls = Arc::default();
+    let service = ScriptedDnsSd {
+        sinks: sinks_tx,
+        calls: Arc::clone(&calls),
+        refused_opens: parking_lot::Mutex::new(refused_opens),
+        refuse_register,
+    };
+    let (found_tx, found) = mpsc::unbounded_channel();
+    let discovery = Discovery::new(node, false, found_tx).with_dns_sd(Arc::new(service));
+    Scripted {
+        discovery,
+        found,
+        sinks,
+        calls,
+        own: Fingerprint::of(&alice.leaf),
+        other: Fingerprint::of(&bob.leaf),
+    }
+}
+
+async fn next_sink(sinks: &mut mpsc::UnboundedReceiver<DnsSdSink>) -> DnsSdSink {
+    time::timeout(WAIT, sinks.recv())
+        .await
+        .expect("a session opens within the bound")
+        .expect("the service stays")
+}
+
+async fn next_found(found: &mut mpsc::UnboundedReceiver<DiscoveryEvent>) -> DiscoveryEvent {
+    time::timeout(WAIT, found.recv())
+        .await
+        .expect("discovery reports within the bound")
+        .expect("the channel stays open")
+}
+
+fn resolved(fingerprint: Fingerprint, address: SocketAddr) -> DnsSdEvent {
+    DnsSdEvent::Resolved {
+        name: "peer".to_owned(),
+        txt: vec![("fp".to_owned(), Some(fingerprint.to_string().into_bytes()))],
+        addresses: vec![address],
+    }
+}
+
+/// Wait until the scripted sessions were asked `expected`.
+async fn await_calls(calls: &parking_lot::Mutex<Vec<Call>>, expected: &[Call]) {
+    let deadline = Instant::now() + WAIT;
+    while calls.lock().as_slice() != expected {
+        assert!(
+            Instant::now() < deadline,
+            "the sessions were asked {:?}, not {expected:?}",
+            calls.lock()
+        );
+        time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+const PEER_AT: SocketAddr = SocketAddr::new(
+    std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7)),
+    4433,
+);
+
+/// A platform service advertises the node, reports what it resolves and
+/// removes, and ends the advertisement at the stop.
+#[tokio::test]
+async fn a_platform_dns_sd_service_serves_in_place_of_mdns() {
+    let mut s = scripted(0, false);
+    s.discovery.serve(4000, s.own);
+    let mut sink = next_sink(&mut s.sinks).await;
+    let registered = Call::Register {
+        port: 4000,
+        fingerprint: s.own.to_string(),
+    };
+    await_calls(&s.calls, std::slice::from_ref(&registered)).await;
+    sink(resolved(s.other, PEER_AT));
+    assert_eq!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Found {
+            address: PEER_AT,
+            fingerprint: s.other,
+        }
+    );
+    sink(DnsSdEvent::Removed {
+        name: "peer".to_owned(),
+    });
+    assert_eq!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Gone {
+            fingerprint: s.other,
+        }
+    );
+    s.discovery.stop();
+    await_calls(&s.calls, &[registered, Call::Unregister]).await;
+}
+
+/// A fault the service survives leaves the browse reporting.
+#[tokio::test]
+async fn a_dns_sd_fault_leaves_the_browse_serving() {
+    let mut s = scripted(0, false);
+    s.discovery.serve(4000, s.own);
+    let mut sink = next_sink(&mut s.sinks).await;
+    sink(DnsSdEvent::Fault("a resolve timed out".to_owned()));
+    sink(resolved(s.other, PEER_AT));
+    assert!(matches!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Found { fingerprint, .. } if fingerprint == s.other
+    ));
+}
+
+/// A refused advertisement leaves the browse serving, and the stop ends no
+/// advertisement.
+#[tokio::test]
+async fn a_refused_advertisement_leaves_the_browse_serving() {
+    let mut s = scripted(0, true);
+    s.discovery.serve(4000, s.own);
+    let mut sink = next_sink(&mut s.sinks).await;
+    sink(resolved(s.other, PEER_AT));
+    assert!(matches!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Found { fingerprint, .. } if fingerprint == s.other
+    ));
+    s.discovery.stop();
+    drop(sink);
+    time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(s.calls.lock().as_slice(), &[] as &[Call]);
+}
+
+/// A service that will not start leaves discovery waiting, and the next
+/// serve opens it again.
+#[tokio::test]
+async fn a_service_that_will_not_start_opens_again_at_the_next_serve() {
+    let mut s = scripted(1, false);
+    s.discovery.serve(4000, s.own);
+    time::sleep(Duration::from_millis(100)).await;
+    assert!(
+        s.sinks.try_recv().is_err(),
+        "the refused open hands out no session"
+    );
+    s.discovery.serve(4000, s.own);
+    let mut sink = next_sink(&mut s.sinks).await;
+    sink(resolved(s.other, PEER_AT));
+    assert!(matches!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Found { fingerprint, .. } if fingerprint == s.other
+    ));
+}
+
+/// A session that ends ends its round, taking its advertisement down, and
+/// the next serve opens a fresh one.
+#[tokio::test]
+async fn an_ended_dns_sd_session_ends_the_round_until_the_next_serve() {
+    let mut s = scripted(0, false);
+    s.discovery.serve(4000, s.own);
+    let sink = next_sink(&mut s.sinks).await;
+    let registered = Call::Register {
+        port: 4000,
+        fingerprint: s.own.to_string(),
+    };
+    await_calls(&s.calls, std::slice::from_ref(&registered)).await;
+    drop(sink);
+    await_calls(&s.calls, &[registered.clone(), Call::Unregister]).await;
+    s.discovery.serve(4000, s.own);
+    let _sink = next_sink(&mut s.sinks).await;
+    await_calls(
+        &s.calls,
+        &[registered.clone(), Call::Unregister, registered],
+    )
+    .await;
+}
+
+/// An instance whose fingerprint key carries no value, or no UTF-8, is no
+/// instance.
+#[tokio::test]
+async fn an_instance_without_a_readable_fingerprint_is_not_found() {
+    let mut s = scripted(0, false);
+    s.discovery.serve(4000, s.own);
+    let mut sink = next_sink(&mut s.sinks).await;
+    for value in [None, Some(vec![0xff; 64])] {
+        sink(DnsSdEvent::Resolved {
+            name: "unreadable".to_owned(),
+            txt: vec![("fp".to_owned(), value)],
+            addresses: vec![PEER_AT],
+        });
+    }
+    sink(resolved(s.other, PEER_AT));
+    assert!(matches!(
+        next_found(&mut s.found).await,
+        DiscoveryEvent::Found { fingerprint, .. } if fingerprint == s.other
+    ));
 }

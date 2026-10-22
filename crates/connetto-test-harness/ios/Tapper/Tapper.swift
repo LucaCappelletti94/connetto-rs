@@ -16,6 +16,7 @@ enum TapperError: LocalizedError {
 /// `TEST_RUNNER_` environment variables the proof writes into the run's
 /// xctestrun file, since a shell environment does not cross from the Mac to
 /// the device.
+@MainActor
 final class TapperTests: XCTestCase {
     /// The demo the tapper returns to after a Settings action.
     static let demoBundle = "dev.connetto.dioxusdemo"
@@ -23,18 +24,19 @@ final class TapperTests: XCTestCase {
     func testAction() throws {
         let environment = ProcessInfo.processInfo.environment
         let bound = bounded(environment["TEST_RUNNER_TIMEOUT"], default: 90)
-        switch environment["TEST_RUNNER_ACTION"] ?? "" {
-        case "tap-alert":
+        let action = environment["TEST_RUNNER_ACTION"] ?? ""
+        switch action {
+        case "tap-alert", "tap-join-alert":
             let labels = labels(environment["TEST_RUNNER_LABELS"])
             guard !labels.isEmpty else {
                 throw TapperError.action("TEST_RUNNER_LABELS names no button")
             }
-            try tapAlert(labels: labels, bound: bound)
+            try tapAlert(labels: labels, bound: bound, minimum: action == "tap-join-alert" ? bound : 10)
         case "hotspot-on", "hotspot-off":
-            try personalHotspot(on: environment["TEST_RUNNER_ACTION"] == "hotspot-on", bound: bound)
+            try personalHotspot(on: action == "hotspot-on", bound: bound)
         default:
             throw TapperError.action(
-                "no TEST_RUNNER_ACTION, or an unknown one: \(environment["TEST_RUNNER_ACTION"] ?? "")"
+                "the tapper action is missing or unsupported (\(action))"
             )
         }
     }
@@ -52,24 +54,20 @@ final class TapperTests: XCTestCase {
             .filter { !$0.isEmpty }
     }
 
-    /// Tap an alert with a known button as long as such an alert shows, so a
-    /// join and a local-network prompt in one join are both cleared. The
-    /// action holds a floor, since it can start before its trigger, and
-    /// quits on the silence after the last alert, since a prompt appears
-    /// within a couple of seconds of its trigger.
-    private func tapAlert(labels: [String], bound: TimeInterval) throws {
+    /// Handle known alerts through the action's minimum observation window.
+    private func tapAlert(labels: [String], bound: TimeInterval, minimum: TimeInterval) throws {
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
-        let deadline = Date().addingTimeInterval(bound)
-        let floor = min(bound, 10)
+        let started = ProcessInfo.processInfo.systemUptime
+        let deadline = started + bound
+        let floor = min(bound, minimum)
         let quiet: TimeInterval = 8
-        let started = Date()
-        var lastAlert = Date.distantPast
+        var lastAlert = started
         var taps = 0
         var seen = "no alert"
-        while Date() < deadline {
+        while ProcessInfo.processInfo.systemUptime < deadline {
             let alert = springboard.alerts.element
             if alert.exists {
-                lastAlert = Date()
+                lastAlert = ProcessInfo.processInfo.systemUptime
                 // The alert can go at any point between the look and the tap,
                 // answered by its own timeout, by the system or by a person
                 // at the phone, which leaves nothing to tap and nothing wrong.
@@ -88,7 +86,8 @@ final class TapperTests: XCTestCase {
                 }
             }
             Thread.sleep(forTimeInterval: 0.5)
-            if Date().timeIntervalSince(started) > floor, Date().timeIntervalSince(lastAlert) > quiet {
+            let now = ProcessInfo.processInfo.systemUptime
+            if now - started > floor, now - lastAlert > quiet {
                 break
             }
         }

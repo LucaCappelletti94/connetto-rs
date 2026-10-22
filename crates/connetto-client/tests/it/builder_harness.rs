@@ -92,7 +92,10 @@ fn quiet_transport() -> LoopbackTransport {
                 current_cursor: Cursor::from(Vec::new()),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await
             .expect("ack the handshake");
@@ -167,7 +170,7 @@ async fn builder_anonymous_connect_reads_a_synced_row() {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             PG_DDL,
@@ -175,9 +178,12 @@ async fn builder_anonymous_connect_reads_a_synced_row() {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
+        .exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled \
+             TO app_writer",
+        )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let snapshot =
@@ -230,7 +236,7 @@ async fn builder_held_credential_reads_the_callers_own_row() {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             PG_DDL,
@@ -239,9 +245,12 @@ async fn builder_held_credential_reads_the_callers_own_row() {
             "GRANT SELECT, INSERT, UPDATE, DELETE ON orders TO app_writer",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
+        .exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled \
+             TO app_writer",
+        )
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let snapshot =
@@ -333,17 +342,19 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
             .expect("translate the sources"),
     );
 
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
-        .with_dialer(OneShot {
-            transport: Some(quiet_transport()),
-        })
-        .signed_in(
-            HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-        )
-        .durable(dir.path(), store.clone())
-        .connect()
-        .await
-        .expect("a durable build connects");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1", schema.clone())
+            .with_dialer(OneShot {
+                transport: Some(quiet_transport()),
+            })
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), store.clone())
+            .connect(),
+    )
+    .await
+    .expect("a durable build connects");
     client
         .client()
         .with_conn(|conn| {
@@ -364,17 +375,19 @@ async fn builder_durable_replica_reopens_offline_and_reports_its_custody() {
     // The second build dials a quiet socket and reopens the encrypted
     // replica from the same directory and the same key store. The row it
     // reads back is the one the first build wrote.
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema)
-        .with_dialer(OneShot {
-            transport: Some(quiet_transport()),
-        })
-        .signed_in(
-            HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-        )
-        .durable(dir.path(), store)
-        .connect()
-        .await
-        .expect("the second build reopens the same replica");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1", schema)
+            .with_dialer(OneShot {
+                transport: Some(quiet_transport()),
+            })
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), store)
+            .connect(),
+    )
+    .await
+    .expect("the second build reopens the same replica");
     let rows: Vec<Note> = client
         .client()
         .with_conn(|conn| {

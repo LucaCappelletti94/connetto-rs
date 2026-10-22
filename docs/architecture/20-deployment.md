@@ -14,7 +14,7 @@
 |---|---|---|---|
 | Application tables | `CONNETTO_PG_DDL` | Yes | The deployment's own concern |
 | `connetto_sessions`, `connetto_provider_tokens` | `ConnettoSchema::Auth`, emitted by `connetto_schema!` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
-| `_connetto_mutations`, the exactly-once watermark | `ConnettoSchema::Watermark` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
+| `_connetto_writers` and `_connetto_settled`, the per-writer applied frontier (R75) | `ConnettoSchema::Writers`, emitted by `connetto_schema!` | Yes | Refused by `preflight::require` (`Artifact::Table`) |
 | `connetto_bans`, only under `CONNETTO_BANS=database` | `ConnettoSchema::Bans` | Yes | Refused by `preflight::require` (`Artifact::Table`) when bans are on |
 | The audit table, only under `CONNETTO_AUDIT=database` | `ConnettoSchema::Audit` | Yes | Refused by `preflight::require` (`Artifact::Table`) when the audit is on |
 | `connetto_device_enrolments`, `connetto_device_certificates`, `connetto_device_lists`, only with device identity (R74) | `ConnettoSchema::Enrolments` | Yes | Refused by `preflight::require` (`Artifact::Table`) when device identity is on |

@@ -75,17 +75,34 @@ pub(super) fn checked_attachment_total(
 
 #[cfg(test)]
 mod tests {
+    use super::super::ArchivedEntry;
     use super::super::{MAX_ATTACHMENT_BYTES, MAX_ATTACHMENTS_BYTES};
     use super::checked_attachment_total;
     use super::read::decode_pending;
     use super::write::encode_pending;
     use crate::ClientError;
+    use connetto_core::messages::WriterRef;
+
+    /// One entry the framing tests name, with the bytes it carries.
+    fn entry(seq: u64, changeset: &[u8]) -> ArchivedEntry {
+        ArchivedEntry {
+            writer: WriterRef::Number(0),
+            seq,
+            hash: [0u8; 32],
+            changeset: changeset.to_vec(),
+            provenance: None,
+        }
+    }
 
     /// The queue's framing carries every record, in order, whatever the bytes
     /// inside one look like.
     #[test]
     fn the_queue_framing_round_trips() {
-        let records = vec![vec![0u8, 1, 2], Vec::new(), vec![255u8; 300]];
+        let records = vec![
+            entry(1, &[0u8, 1, 2]),
+            entry(2, &[]),
+            entry(3, &[255u8; 300]),
+        ];
         let encoded = encode_pending(&records);
         assert_eq!(decode_pending(&encoded).expect("decode"), records);
     }
@@ -93,7 +110,7 @@ mod tests {
     /// A truncated queue entry is refused rather than read as a shorter one.
     #[test]
     fn a_truncated_queue_entry_is_refused() {
-        let encoded = encode_pending(&[vec![1u8, 2, 3]]);
+        let encoded = encode_pending(&[entry(1, &[1u8, 2, 3])]);
         assert!(decode_pending(&encoded[..encoded.len() - 1]).is_err());
     }
 

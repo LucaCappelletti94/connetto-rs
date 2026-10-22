@@ -36,7 +36,10 @@ fn fake_server(server_version: Option<SchemaVersion>) -> LoopbackTransport {
                 resume_token: "server".to_owned(),
                 schema_version: server_version,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number: 1,
+                    frontier: 0,
+                }),
             }))
             .await;
         while let Ok(Some(_)) = server_end.recv().await {}

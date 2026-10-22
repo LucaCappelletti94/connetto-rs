@@ -463,6 +463,8 @@ async fn setup(
     #[cfg(target_os = "windows")] owner: Arc<dyn connetto_client::HelloOwner>,
 ) -> anyhow::Result<Parts> {
     use anyhow::Context as _;
+    #[cfg(target_os = "android")]
+    connetto_auth_session::initialize_tls()?;
 
     let server = endpoint(
         std::env::var("CONNETTO_DEMO_WS").ok(),
@@ -592,9 +594,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::MutationApplied { client_seq } => {
             Some(format!("mutation {client_seq} applied"))
         }
-        ClientEvent::MutationRejected { client_seq, .. } => {
-            Some(format!("mutation {client_seq} rejected"))
-        }
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => Some(format!("mutation {client_seq} rejected: {reason}")),
         ClientEvent::MutationConflict {
             client_seq,
             server_row,
@@ -669,11 +671,17 @@ enum WipeState {
     Error(String),
 }
 
-/// The line a linked peer takes in the panel, its account and the head of
-/// its key.
+/// The line a linked peer takes in the panel, its account, the head of its
+/// key and, while the link is live, the address it runs to.
 #[cfg(feature = "peer")]
-fn linked_line(peer: &connetto_core::device_cert::DeviceIdentity) -> String {
-    format!("linked: {}", short_identity(peer))
+fn linked_line(
+    peer: &connetto_core::device_cert::DeviceIdentity,
+    remote: Option<std::net::SocketAddr>,
+) -> String {
+    match remote {
+        Some(remote) => format!("linked: {} via {remote}", short_identity(peer)),
+        None => format!("linked: {}", short_identity(peer)),
+    }
 }
 
 /// A device identity as `account/key prefix`, what the panel names devices
@@ -761,6 +769,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     // The listener's port, read again every second, since the listener opens
     // beside the pump the way enrolment does.
     let mut peer_port: Signal<Option<u16>> = use_signal(|| None);
+    // One line per linked peer, read off the node on the same pace, so a
+    // replaced link never leaves its old address on the page.
+    let mut peers: Signal<Vec<String>> = use_signal(Vec::new);
     // The Bluetooth standing and the host's beacon, read on the same pace.
     let mut bluetooth_line: Signal<String> = use_signal(|| "bluetooth: unsupported".to_owned());
     let mut beacon_line: Signal<String> =
@@ -783,13 +794,22 @@ fn PeerPanel(parts: SessionParts) -> Element {
                     if *beacon_line.peek() != line {
                         beacon_line.set(line);
                     }
+                    let mut lines: Vec<String> = parts
+                        .0
+                        .native
+                        .linked_peers()
+                        .iter()
+                        .map(|link| linked_line(&link.peer, link.remote))
+                        .collect();
+                    lines.sort();
+                    if *peers.peek() != lines {
+                        peers.set(lines);
+                    }
                 }
             })
         });
     }
 
-    // One line per linked peer, what the link's events name the peer as.
-    let peers: Signal<Vec<String>> = use_signal(Vec::new);
     // The offer this device hosts, as its plain lines, until the hotspot
     // stops.
     let offer: Signal<Option<OfferLines>> = use_signal(|| None);
@@ -798,6 +818,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     // Whether this device stands joined to a host's hotspot, which hides the
     // joins and the hosting until it leaves.
     let joined: Signal<bool> = use_signal(|| false);
+    // Whether a VPN refused the joined hotspot's dial, shown on its own line
+    // so a join's outcome landing later never hides it.
+    let vpn_blocked: Signal<bool> = use_signal(|| false);
     // A permission a host or join named as missing, which the panel asks for
     // on the UI thread, where the platform's prompt wants to be asked from.
     let missing: Signal<Option<String>> = use_signal(|| None);
@@ -820,39 +843,23 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let client = parts.0.client.clone();
     let event_rx = client.events();
     {
-        let mut peers = peers;
         let mut offer = offer;
         let mut outcome = outcome;
         let mut nearby = nearby;
         let mut joined = joined;
+        let mut vpn_blocked = vpn_blocked;
         use_hook(move || {
             spawn(async move {
                 let mut rx = event_rx;
                 while let Ok(event) = rx.recv().await {
                     match event {
-                        ClientEvent::PeerLinked { peer } => {
-                            let line = linked_line(&peer);
-                            let mut held = peers.peek().clone();
-                            if !held
-                                .iter()
-                                .any(|held_line| held_line.as_str() == line.as_str())
-                            {
-                                held.push(line);
-                                peers.set(held);
-                            }
-                        }
-                        ClientEvent::PeerUnlinked { peer, .. } => {
-                            let line = linked_line(&peer);
-                            let mut held = peers.peek().clone();
-                            held.retain(|held_line| held_line.as_str() != line.as_str());
-                            peers.set(held);
-                        }
                         ClientEvent::HotspotStopped => {
                             offer.set(None);
                             outcome.set("stopped by the system or the user".to_owned());
                         }
                         ClientEvent::HotspotLeft => {
                             joined.set(false);
+                            vpn_blocked.set(false);
                             outcome.set("the joined network was lost".to_owned());
                         }
                         ClientEvent::HostNearby { host, prefix, rssi } => {
@@ -868,6 +875,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
                         }
                         ClientEvent::HotspotUnreached => {
                             outcome.set("unreached".to_owned());
+                        }
+                        ClientEvent::JoinedNetworkBlockedByVpn => {
+                            vpn_blocked.set(true);
                         }
                         _ => {}
                     }
@@ -917,6 +927,7 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let payload_joined = joined;
     let nearby_joined = joined;
     let leave_joined = joined;
+    let leave_vpn_blocked = vpn_blocked;
 
     let me = parts
         .0
@@ -933,6 +944,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
     let outcome = outcome();
     let hosting = offer.is_some();
     let joined_now = joined();
+    let vpn_line = (joined() && vpn_blocked()).then_some(
+        "link: a VPN on this device blocks its own connections over the joined hotspot, only peers that connect to it can link",
+    );
     #[cfg(target_os = "ios")]
     let personal_note: Option<&str> = Some("connetto cannot see whether Personal Hotspot is on");
     #[cfg(not(target_os = "ios"))]
@@ -992,6 +1006,9 @@ fn PeerPanel(parts: SessionParts) -> Element {
                 p {
                     "hotspot: "
                     {outcome}
+                }
+                if let Some(line) = vpn_line {
+                    p { {line} }
                 }
                 div { class: "row",
                     button {
@@ -1283,9 +1300,11 @@ fn PeerPanel(parts: SessionParts) -> Element {
                                     let parts = leave_parts.clone();
                                     let mut outcome = leave_outcome;
                                     let mut joined = leave_joined;
+                                    let mut vpn_blocked = leave_vpn_blocked;
                                     spawn(async move {
                                         parts.0.native.leave_hotspot().await;
                                         joined.set(false);
+                                        vpn_blocked.set(false);
                                         outcome.set("left".to_owned());
                                     });
                                 },

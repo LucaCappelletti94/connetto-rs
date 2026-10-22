@@ -345,13 +345,6 @@ async fn a_row_shaped_watch_replaces_the_answer_whole() {
         .watch_rows::<_, TopOrder>(top_two())
         .await
         .expect("watch rows");
-    assert!(top.rows().is_empty(), "nothing has arrived yet");
-
-    // The first answer arrives whole, newest first.
-    tokio::time::timeout(Duration::from_secs(5), top.changed())
-        .await
-        .expect("first answer timed out")
-        .expect("driver alive");
     let expect = |ids: &[(i64, &str)]| {
         ids.iter()
             .map(|(id, status)| TopOrder {
@@ -360,7 +353,16 @@ async fn a_row_shaped_watch_replaces_the_answer_whole() {
             })
             .collect::<Vec<_>>()
     };
-    assert_eq!(top.rows(), expect(&[(3, "c"), (2, "b")]));
+
+    // The first answer arrives whole, newest first, possibly before `watch_rows` returns.
+    let first = expect(&[(3, "c"), (2, "b")]);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while top.rows() != first {
+        tokio::time::timeout_at(deadline, top.changed())
+            .await
+            .expect("first answer timed out")
+            .expect("driver alive");
+    }
     assert!(top.as_of_secs().is_some(), "the answer carries its as-of");
 
     // A new row enters the window: the change stream triggers a re-read

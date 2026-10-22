@@ -116,7 +116,7 @@ fn parse_scope(scope: &str) -> Result<ExportScope, ClientError> {
 
 fn read_pending_queue<R: Read + Seek>(
     zip: &mut zip::ZipArchive<R>,
-) -> Result<Vec<Vec<u8>>, ClientError> {
+) -> Result<Vec<super::super::ArchivedEntry>, ClientError> {
     match read_entry(zip, PENDING)? {
         Some(bytes) => decode_pending(&bytes),
         None => Ok(Vec::new()),
@@ -295,7 +295,11 @@ fn declare_attachments<R: Read + Seek>(
     Ok(attachments)
 }
 
-pub(super) fn decode_pending(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ClientError> {
+pub(super) fn decode_pending(
+    bytes: &[u8],
+) -> Result<Vec<super::super::ArchivedEntry>, ClientError> {
+    use connetto_core::messages::Provenance;
+
     let malformed = || ClientError::Import("the queue entry is malformed".to_owned());
     let count = u64::from_be_bytes(
         bytes
@@ -304,15 +308,51 @@ pub(super) fn decode_pending(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ClientError> 
             .try_into()
             .map_err(|_| malformed())?,
     );
-    // Every record costs at least its eight length bytes, so a count above what the entry
-    // can hold is refused before one vector per record is allocated.
-    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 8).unwrap_or(u64::MAX);
+    // Every entry costs at least its fixed 51 bytes, so a count above what the
+    // entry can hold is refused before one vector per entry is allocated.
+    let capacity = u64::try_from(bytes.len().saturating_sub(8) / 51).unwrap_or(u64::MAX);
     if count > capacity {
         return Err(malformed());
     }
     let mut at: usize = 8;
-    let mut records = Vec::new();
+    let mut entries = Vec::new();
     for _ in 0..count {
+        let writer = read_writer(bytes, &mut at, &malformed)?;
+        let seq = u64::from_be_bytes(
+            bytes
+                .get(at..at.checked_add(8).ok_or_else(malformed)?)
+                .ok_or_else(malformed)?
+                .try_into()
+                .map_err(|_| malformed())?,
+        );
+        at = at.checked_add(8).ok_or_else(malformed)?;
+        let hash: [u8; 32] = bytes
+            .get(at..at.checked_add(32).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?
+            .try_into()
+            .map_err(|_| malformed())?;
+        at = at.checked_add(32).ok_or_else(malformed)?;
+        let prov_present = *bytes.get(at).ok_or_else(malformed)?;
+        at = at.checked_add(1).ok_or_else(malformed)?;
+        let provenance = if prov_present == 1 {
+            let prov_writer = read_writer(bytes, &mut at, &malformed)?;
+            let prov_seq = u64::from_be_bytes(
+                bytes
+                    .get(at..at.checked_add(8).ok_or_else(malformed)?)
+                    .ok_or_else(malformed)?
+                    .try_into()
+                    .map_err(|_| malformed())?,
+            );
+            at = at.checked_add(8).ok_or_else(malformed)?;
+            Some(Provenance {
+                writer: prov_writer,
+                seq: prov_seq,
+            })
+        } else if prov_present == 0 {
+            None
+        } else {
+            return Err(malformed());
+        };
         let len = usize::try_from(u64::from_be_bytes(
             bytes
                 .get(at..at.checked_add(8).ok_or_else(malformed)?)
@@ -322,15 +362,44 @@ pub(super) fn decode_pending(bytes: &[u8]) -> Result<Vec<Vec<u8>>, ClientError> 
         ))
         .map_err(|_| malformed())?;
         at += 8;
-        records.push(
-            bytes
-                .get(at..at.checked_add(len).ok_or_else(malformed)?)
-                .ok_or_else(malformed)?
-                .to_vec(),
-        );
+        let changeset = bytes
+            .get(at..at.checked_add(len).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?
+            .to_vec();
         at = at.checked_add(len).ok_or_else(malformed)?;
+        entries.push(super::super::ArchivedEntry {
+            writer,
+            seq,
+            hash,
+            changeset,
+            provenance,
+        });
     }
-    Ok(records)
+    Ok(entries)
+}
+
+fn read_writer(
+    bytes: &[u8],
+    at: &mut usize,
+    malformed: &dyn Fn() -> ClientError,
+) -> Result<connetto_core::messages::WriterRef, ClientError> {
+    let len = usize::try_from(u64::from_be_bytes(
+        bytes
+            .get(*at..at.checked_add(8).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?
+            .try_into()
+            .map_err(|_| malformed())?,
+    ))
+    .map_err(|_| malformed())?;
+    *at += 8;
+    let id = std::str::from_utf8(
+        bytes
+            .get(*at..at.checked_add(len).ok_or_else(malformed)?)
+            .ok_or_else(malformed)?,
+    )
+    .map_err(|_| malformed())?;
+    *at += len;
+    crate::writer_from_id(id).ok_or_else(malformed)
 }
 
 #[cfg(test)]
@@ -362,7 +431,13 @@ mod tests {
             account: Some("\"alice\"".to_owned()),
             synced_rows: None,
             local_rows: Some(vec![7u8; 64]),
-            pending: vec![vec![9u8; 16]],
+            pending: vec![crate::archive::ArchivedEntry {
+                writer: connetto_core::messages::WriterRef::Number(0),
+                seq: 1,
+                hash: [9u8; 32],
+                changeset: vec![9u8; 16],
+                provenance: None,
+            }],
             attachments: &[],
         };
         let bytes = write(&archive).expect("write");
@@ -372,14 +447,23 @@ mod tests {
         assert_eq!(read_back.account.as_deref(), Some("\"alice\""));
         assert!(!read_back.synced_present);
         assert_eq!(read_back.local_rows, Some(vec![7u8; 64]));
-        assert_eq!(read_back.pending, vec![vec![9u8; 16]]);
+        assert_eq!(
+            read_back.pending,
+            vec![crate::archive::ArchivedEntry {
+                writer: connetto_core::messages::WriterRef::Number(0),
+                seq: 1,
+                hash: [9u8; 32],
+                changeset: vec![9u8; 16],
+                provenance: None,
+            }]
+        );
     }
 
     #[test]
     fn compressed_attachments_are_refused_before_their_body_is_read() {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 3,
+            "version": 4,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
             "account": null,
@@ -467,7 +551,7 @@ mod tests {
     fn zip_with_entry(entry: &[u8]) -> Vec<u8> {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 3,
+            "version": 4,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
             "account": null,
@@ -549,7 +633,7 @@ mod tests {
     ) {
         let manifest = json!({
             "format": "connetto-local-data",
-            "version": 3,
+            "version": 4,
             "scope": "unsynced",
             "schema_fingerprint": "abc123",
             "account": null,

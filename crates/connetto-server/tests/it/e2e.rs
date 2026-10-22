@@ -592,33 +592,30 @@ pub(super) async fn exec(pool: &Pool<AsyncPgConnection>, sql: &str) {
 /// Reset the orders fixture, auth tables and reader role for one server run.
 pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixture) {
     exec(pool, "DROP TABLE IF EXISTS orders CASCADE").await;
-    // Stale per-session watermarks from a previous run would suppress replayed
-    // mutations, so drop and recreate fresh. connetto emits no DDL and the
-    // shape keys on session_id alone (R2 re-key from the old user_id+session_id pair).
-    exec(pool, "DROP TABLE IF EXISTS _connetto_mutations").await;
-    exec(
-        pool,
-        "CREATE TABLE _connetto_mutations \
-         (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
-    )
-    .await;
+    // Stale writer state from a previous run would suppress replayed
+    // mutations, so recreate the writer tables fresh.
+    exec(pool, "DROP TABLE IF EXISTS _connetto_settled").await;
+    exec(pool, "DROP TABLE IF EXISTS _connetto_writers").await;
+    connetto_test_harness::provision_writers(pool).await;
     // The audit table the server appends access changes to when
-    // `CONNETTO_AUDIT=database`. Dropped and recreated per run so a previous
-    // run's rows cannot be mistaken for this one's.
+    // `CONNETTO_AUDIT=database`, dropped and recreated per run.
     exec(pool, "DROP TABLE IF EXISTS auth_events").await;
     exec(pool, "DROP TYPE IF EXISTS connetto_auth_op").await;
     exec(
         pool,
         "CREATE TYPE connetto_auth_op AS ENUM (\
          'logged_out', 'session_revoked', 'token_replayed', 'capability_minted', \
-         'permission_change', 'model_change', 'banned', 'ban_lifted')",
+         'permission_change', 'model_change', 'banned', 'ban_lifted', \
+         'write_forked', 'write_redelivered')",
     )
     .await;
     exec(
         pool,
         "CREATE TABLE auth_events (\
          at TIMESTAMPTZ NOT NULL DEFAULT now(), session UUID NOT NULL, user_id TEXT, \
-         op connetto_auth_op NOT NULL, table_name TEXT, pk UUID)",
+         op connetto_auth_op NOT NULL, table_name TEXT, pk UUID, \
+         writer BIGINT, seq BIGINT, \
+         path connetto_settle_path, other_path connetto_settle_path)",
     )
     .await;
     exec(pool, PG_DDL).await;
@@ -637,7 +634,7 @@ pub(super) async fn reset_fixture(pool: &Pool<AsyncPgConnection>, fixture: &Fixt
     .await;
     exec(
         pool,
-        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_reader",
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_reader",
     )
     .await;
     exec(pool, "INSERT INTO orders VALUES (1, 1.0, 3, 'seed')").await;
@@ -1052,24 +1049,24 @@ async fn e2e_rls_write_enforced_owned_lands_foreign_refused() {
     // The server applies writes as `app_writer`, which is subject to the policy.
     for stmt in [
         "DROP TABLE IF EXISTS owned CASCADE",
-        "DROP TABLE IF EXISTS _connetto_mutations",
+        "DROP TABLE IF EXISTS _connetto_settled",
+        "DROP TABLE IF EXISTS _connetto_writers",
         "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
          THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
         "CREATE TABLE owned (id INT PRIMARY KEY, owner TEXT, body TEXT)",
         "ALTER TABLE owned ENABLE ROW LEVEL SECURITY",
         "CREATE POLICY owned_p ON owned USING (owner = current_setting('app.user_id', true))",
-        // The test creates the exactly-once watermark table. connetto emits no
-        // DDL, the restricted writer role cannot CREATE in schema public on
-        // Postgres 15+ and the writer only needs DML on it. Keyed on session_id
-        // alone (R2).
-        "CREATE TABLE _connetto_mutations \
-         (session_id UUID PRIMARY KEY, last_seq BIGINT NOT NULL)",
         "GRANT USAGE ON SCHEMA public TO app_writer",
         "GRANT SELECT, INSERT, UPDATE, DELETE ON owned TO app_writer",
-        "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
     ] {
         exec(&admin, stmt).await;
     }
+    connetto_test_harness::provision_writers(&admin).await;
+    exec(
+        &admin,
+        "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer",
+    )
+    .await;
     provision_cap_policies(&admin, OWNED_PG_DDL, OWNED_POLICIES).await;
     fixture.start_replication(&["owned"]).await;
     fixture.provision_auth_tables().await;

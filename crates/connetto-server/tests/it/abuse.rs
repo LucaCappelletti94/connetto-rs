@@ -236,7 +236,7 @@ async fn reset_tables(fixture: &Fixture) {
             "CREATE TYPE {AUTH_OP_TYPE} AS ENUM (\
                 'logged_out', 'session_revoked', 'token_replayed', \
                 'capability_minted', 'permission_change', 'model_change', \
-                'banned', 'ban_lifted')"
+                'banned', 'ban_lifted', 'write_forked', 'write_redelivered')"
         ),
         "CREATE TABLE connetto_bans (\
             user_id TEXT PRIMARY KEY, \
@@ -252,7 +252,9 @@ async fn reset_tables(fixture: &Fixture) {
                 user_id TEXT, \
                 op {AUTH_OP_TYPE} NOT NULL, \
                 table_name TEXT, \
-                pk UUID)"
+                pk UUID, \
+                writer BIGINT, seq BIGINT, \
+                path connetto_settle_path, other_path connetto_settle_path)"
         ),
     ] {
         fixture.exec(&statement).await;

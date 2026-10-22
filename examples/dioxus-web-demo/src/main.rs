@@ -495,9 +495,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::MutationApplied { client_seq } => {
             Some(format!("mutation {client_seq} applied"))
         }
-        ClientEvent::MutationRejected { client_seq, .. } => {
-            Some(format!("mutation {client_seq} rejected"))
-        }
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => Some(format!("mutation {client_seq} rejected: {reason}")),
         ClientEvent::MutationConflict {
             client_seq,
             server_row,
@@ -839,7 +839,7 @@ async fn poll_expiry_warn(
         now,
         expires_at,
         Duration::from_secs(7 * 24 * 3600),
-        pending.mutation_seqs,
+        pending.unsynced,
         pending.content_files,
     ));
 }

@@ -116,18 +116,20 @@ async fn builder_content_stages_a_file_in_memory() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn builder_content_stages_a_file_durable() {
     let dir = tempdir().expect("a temp dir");
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema())
-        .with_dialer(OneShot {
-            transport: Some(FakeTransport::accepting_but_silent()),
-        })
-        .with_content(Content::default())
-        .signed_in(
-            HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-        )
-        .durable(dir.path(), MemoryKeyStore::default())
-        .connect()
-        .await
-        .expect("the durable build connects");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1", schema())
+            .with_dialer(OneShot {
+                transport: Some(FakeTransport::accepting_but_silent()),
+            })
+            .with_content(Content::default())
+            .signed_in(
+                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
+            )
+            .durable(dir.path(), MemoryKeyStore::default())
+            .connect(),
+    )
+    .await
+    .expect("the durable build connects");
     let ContentHandle::Durable(content) = client.content().expect("the build attached content")
     else {
         panic!("a durable build places its content at the content directory");
@@ -204,16 +206,19 @@ async fn a_closed_client_with_unsent_content_reopens_at_once() {
     let dir = tempdir().expect("a temp dir");
     let keys = std::sync::Arc::new(MemoryKeyStore::default());
     for round in 0..20 {
-        let client = NativeClientBuilder::new("ws://127.0.0.1:1", schema())
-            .with_dialer(OneShot { transport: None })
-            .with_content(Content::default())
-            .signed_in(
-                HeldCredential::new(Grant::new("user:bob"), "bob").expect("the credential holds"),
-            )
-            .durable(dir.path(), SharedKeys(std::sync::Arc::clone(&keys)))
-            .connect()
-            .await
-            .unwrap_or_else(|err| panic!("round {round} reopens the replica: {err}"));
+        let client = Box::pin(
+            NativeClientBuilder::new("ws://127.0.0.1:1", schema())
+                .with_dialer(OneShot { transport: None })
+                .with_content(Content::default())
+                .signed_in(
+                    HeldCredential::new(Grant::new("user:bob"), "bob")
+                        .expect("the credential holds"),
+                )
+                .durable(dir.path(), SharedKeys(std::sync::Arc::clone(&keys)))
+                .connect(),
+        )
+        .await
+        .unwrap_or_else(|err| panic!("round {round} reopens the replica: {err}"));
         if round == 0 {
             let ContentHandle::Durable(content) =
                 client.content().expect("the build attached content")

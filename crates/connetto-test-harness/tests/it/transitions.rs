@@ -247,7 +247,7 @@ async fn catching_up_leaves_the_same_rows_as_staying_connected() {
     // full resync would also end with the right rows and would prove nothing
     // about the path this test exists for.
     let mut back = server.connect();
-    back.handshake_resuming("r6-resumed", "user:alice#resumed", resume_from)
+    back.handshake_resuming("r6-resumed", "user:alice#resumed", resume_from, Some(&[]))
         .await;
     back.subscribe("items", QUERY).await;
     let mut replaced = false;
@@ -353,7 +353,7 @@ async fn a_change_committed_during_a_snapshot_read_survives_a_resume_from_its_cu
     alice.close().await;
 
     let mut back = server.connect();
-    back.handshake_resuming("r6-gap", "user:alice#gap", resume_from)
+    back.handshake_resuming("r6-gap", "user:alice#gap", resume_from, Some(&[]))
         .await;
     back.subscribe("items", QUERY).await;
     let mut replaced = false;

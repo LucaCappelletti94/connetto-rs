@@ -71,7 +71,7 @@ async fn a_catchup_compresses_nothing_for_the_changes_it_walks() {
 
     let before = counters::snapshot();
     let mut back = server.connect();
-    back.handshake_resuming("catchup-away", "user:alice#away", resume_from)
+    back.handshake_resuming("catchup-away", "user:alice#away", resume_from, Some(&[]))
         .await;
     back.subscribe("items", QUERY).await;
     let mut received = 0;

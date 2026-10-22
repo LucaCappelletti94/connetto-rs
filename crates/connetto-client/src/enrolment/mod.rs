@@ -17,7 +17,7 @@ mod task;
 #[cfg(feature = "peer")]
 pub(crate) use task::Peer;
 pub use task::{CertificateError, DeviceEntry};
-pub(crate) use task::{DeviceKeys, EnrolHandle, Enroller, Link, PlatformKeys, run};
+pub(crate) use task::{Command, DeviceKeys, EnrolHandle, Enroller, Link, PlatformKeys, run};
 #[cfg(test)]
 use task::{Intake, intake};
 
@@ -304,10 +304,58 @@ where
         load(&mut self.db)
     }
 
-    /// Replace the certificate the replica holds.
-    pub(crate) fn store_device_certificate(&mut self, held: &Held) -> Result<(), ClientError> {
-        let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
-        store(&mut self.db, held)
+    /// Replace the certificate the replica holds, and start the device's
+    /// writer from it.
+    ///
+    /// The device's queue takes the key's identity. A number that still holds
+    /// writes waits to settle its tail before the bind stands, and a number
+    /// that holds nothing retires so the device becomes the writer (R75).
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] on a local database failure, a bind that cannot be
+    /// signed, or a retirement send that fails.
+    pub(crate) async fn store_device_certificate(
+        &mut self,
+        held: &Held,
+    ) -> Result<(), ClientError> {
+        {
+            let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+            store(&mut self.db, held)?;
+        }
+        let key_id = *held.leaf.identity().key().as_bytes();
+        let writer = connetto_core::messages::WriterRef::Device(key_id);
+        if !self.writers.contains_key(&writer) {
+            let queue = crate::WriterQueue::fresh();
+            {
+                let _suspended = SuspendedCapture::new(&mut self.session, &self.write_exempt);
+                crate::persist_writer_state(&mut self.db, &writer, queue.next_seq, &queue.head)?;
+            }
+            self.writers.insert(writer, queue);
+        }
+        if self.is_connected() {
+            self.plan_bind().await?;
+            self.flush_writer_tasks().await?;
+        }
+        let empty_number = self
+            .number_identity()
+            .map(connetto_core::messages::WriterRef::Number)
+            .filter(|number| {
+                self.writers
+                    .get(number)
+                    .is_some_and(|queue| queue.pending.is_empty())
+            });
+        if let Some(number) = empty_number {
+            if self.bound_writer == Some(number) {
+                self.finish_number_tail().await?;
+            } else {
+                self.retire_number(number)?;
+                if self.is_connected() {
+                    self.flush_writer_tasks().await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Forget the certificate the replica holds.

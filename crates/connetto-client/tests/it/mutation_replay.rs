@@ -145,16 +145,16 @@ fn test_verifier() -> Arc<dyn HandshakeAuthority> {
     Arc::new(TestGrantChecker)
 }
 
-/// Reset the fixture to a fresh `orders` table with the watermark provisioned.
+/// Reset the fixture to a fresh `orders` table with the writer tables provisioned.
 async fn reset_orders(fixture: &Fixture) {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
 }
 
 /// A manager whose `orders` table accepts client writes into the real Postgres
@@ -186,16 +186,20 @@ fn open_session(manager: &Arc<Manager>) -> LoopbackTransport {
     client_end
 }
 
-/// Complete the wire handshake as a fake server, then swallow every frame:
-/// the deterministic stand-in for a connection that died with mutation
-/// frames in flight.
+/// Complete the wire handshake as a fake server, echoing the writer number the
+/// client asked for, then swallow every frame: the deterministic stand-in for
+/// a connection that died with mutation frames in flight.
 fn black_hole() -> LoopbackTransport {
     let (mut fake_server, client_end) = loopback();
     tokio::spawn(async move {
-        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(_)))) =
+        let Ok(Some(IncomingFrame::Control(ControlMessage::Handshake(handshake)))) =
             fake_server.recv().await
         else {
             return;
+        };
+        let number = match handshake.writer {
+            connetto_core::messages::WriterRequest::Number(number) => number,
+            _ => 1,
         };
         let _ = fake_server
             .send_control(ControlMessage::HandshakeAck(HandshakeAck {
@@ -205,7 +209,10 @@ fn black_hole() -> LoopbackTransport {
                 resume_token: "black-hole".to_owned(),
                 schema_version: None,
                 initial_credits: 64,
-                last_applied_seq: None,
+                writer: Some(connetto_core::messages::WriterGrant {
+                    number,
+                    frontier: 0,
+                }),
             }))
             .await;
         while let Ok(Some(_)) = fake_server.recv().await {}
@@ -284,14 +291,37 @@ async fn sent_but_unprocessed_mutation_replays_after_resume() {
     let fixture = Fixture::acquire().await;
     reset_orders(&fixture).await;
     let manager = writable_manager(&fixture);
+    let dir = tempfile::tempdir().expect("replica directory");
+    let credential = super::support::held("token");
+    let record = credential.replica_name().to_owned();
+    let keys = super::support::SharedKeys::default();
+    keys.store(&record, &connetto_core::test_support::replica_key())
+        .await
+        .expect("the shared store never fails");
 
-    // Push into the black hole: both frames leave successfully and nothing
-    // ever processes them.
+    // Prime the server with this account's writer number so the resume
+    // handshake is recognized, then drop the connection.
+    {
+        let prime = ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(open_session(&manager)),
+        )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
+        .connect_driven()
+        .await
+        .expect("prime connect");
+        drop(prime);
+    }
+
+    // Push into the black hole: the same replica reconnects to a dead
+    // connection and a mutation is recorded but never processed.
     let mut conn = ClientBuilder::new(
         super::support::bundle(SQLITE_DDL),
         super::support::Once::new(black_hole()),
     )
-    .signed_in(super::support::held("token"))
+    .signed_in(credential)
+    .durable(DataDir::new(dir.path().to_path_buf()), keys)
     .connect_driven()
     .await
     .expect("connect");
@@ -378,17 +408,28 @@ async fn applied_but_unacked_mutation_dedupes_on_resume() {
     .await
     .expect("connect");
     insert_local(&mut conn, 61);
-    conn.push().await.expect("push").expect("mutation sent");
+    let seq = conn.push().await.expect("push").expect("mutation sent");
     relay.await.expect("mitm relay");
     assert_eq!(pending_count(&mut conn), 1, "no ack arrived, record kept");
 
-    // Resume with the SAME client id: the handshake watermark retires the
-    // pending record without a replay, so the row applies exactly once.
+    // Resume with the SAME client id: the frontier retires nothing locally, so
+    // the settled mutation is re-sent and the server answers it from its
+    // record, retiring the record there and applying the row exactly once.
     conn.attach(open_session(&manager)).await.expect("resume");
+    loop {
+        match conn.pump_one().await.expect("pump") {
+            ClientEvent::MutationApplied { client_seq } => {
+                assert_eq!(client_seq, seq, "the replay's re-answer names the sequence");
+                break;
+            }
+            ClientEvent::Closed => panic!("closed before the replay was acknowledged"),
+            _ => {}
+        }
+    }
     assert_eq!(
         pending_count(&mut conn),
         0,
-        "the watermark retired the record at handshake"
+        "the re-answer retired the record"
     );
     assert_eq!(
         target_rows(&fixture, 61).await.len(),
@@ -431,8 +472,20 @@ async fn restart_replays_persisted_pending() {
         .expect("the shared store never fails");
     let manager = writable_manager(&fixture);
 
-    // First process: push into the black hole, then die outright.
+    // First process: prime the server with this account's writer number, push
+    // into the black hole, then die outright.
     {
+        let prime = ClientBuilder::new(
+            super::support::bundle(SQLITE_DDL),
+            super::support::Once::new(open_session(&manager)),
+        )
+        .signed_in(credential.clone())
+        .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
+        .connect_driven()
+        .await
+        .expect("prime connect");
+        drop(prime);
+
         let mut conn = ClientBuilder::new(
             super::support::bundle(SQLITE_DDL),
             super::support::Once::new(black_hole()),
@@ -441,7 +494,7 @@ async fn restart_replays_persisted_pending() {
         .durable(DataDir::new(dir.path().to_path_buf()), keys.clone())
         .connect_driven()
         .await
-        .expect("first connect");
+        .expect("black hole connect");
         insert_local(&mut conn, 62);
         conn.push().await.expect("push").expect("mutation sent");
     }
@@ -460,7 +513,7 @@ async fn restart_replays_persisted_pending() {
     loop {
         match conn.pump_one().await.expect("pump") {
             ClientEvent::MutationApplied { client_seq } => {
-                assert_eq!(client_seq, 0);
+                assert_eq!(client_seq, 1);
                 break;
             }
             ClientEvent::Closed => panic!("closed before the replay was acknowledged"),

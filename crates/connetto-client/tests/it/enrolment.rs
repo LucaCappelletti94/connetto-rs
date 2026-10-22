@@ -22,9 +22,10 @@ use connetto_client::{
 };
 use connetto_core::device_cert::{
     AttestationLevel, CertificateSerial, DeploymentId, DeviceCertificate, DeviceIssuer, KeyHome,
-    RootCa,
+    KeyId, RootCa,
 };
-use connetto_core::messages::EnrolRefusal;
+use connetto_core::messages::{EnrolRefusal, WriterAnswer, WriterOutcome, WriterRef};
+use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{HandshakeAuthority, RefreshTokenStore};
 use connetto_server::device_cert::{
     DeviceCertConfig, DeviceEnrolment, Enrolment, MemoryEnrolments,
@@ -33,14 +34,24 @@ use connetto_server::{
     AbuseConfig, AuthConfig, AuthService, GenericOidcProvider, InMemoryAuthStore, ManagerBuilder,
     Materializer, PgReadConnector, PgSnapshotSource, ProviderRegistry, RedirectPolicy,
     RequestGuard, RuntimeWritableCatalog, SessionManager, ThrottleConfig, TierLimits,
-    TokenAuthority, WebSocketTransport, auth_router, pg_write_target,
+    TokenAuthority, WebSocketTransport, auth_router, loopback, pg_write_target,
 };
 use connetto_test_harness::{
-    ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth,
+    Client, ConnettoDefaults, Fixture, MOCK_OAUTH_PROVIDER, MockOauth, RosterAuth,
 };
+use diesel::insert_into;
+use diesel::prelude::*;
 use openidconnect::reqwest;
 use rcgen::{KeyPair, PKCS_ECDSA_P256_SHA256, PublicKeyData};
 use tempfile::tempdir;
+
+/// App ids the device-writer state phases sign in under, one per phase.
+const APP_WD_TAIL_BIND: &str = "r75-wd-tail-bind";
+const APP_WD_DEVICE_BIND: &str = "r75-wd-device-bind";
+const APP_WD_FIRST_CERT: &str = "r75-wd-first-cert";
+const APP_WD_TAIL_SETTLES: &str = "r75-wd-tail-settles";
+const APP_WD_RETIRING: &str = "r75-wd-retiring";
+const APP_WD_REVOKED: &str = "r75-wd-revoked";
 
 /// The longest any bounded wait in a phase runs.
 const BOUND: Duration = Duration::from_secs(60);
@@ -139,23 +150,29 @@ async fn enrolment_phase() {
         "first" => Box::pin(first_connect()).await,
         "renewal" => Box::pin(renewal()).await,
         "reissue" => Box::pin(reissue()).await,
-        "cap" => cap().await,
+        "cap" => Box::pin(cap()).await,
         "revoke" => Box::pin(revoke()).await,
-        "spectator" => spectator().await,
+        "spectator" => Box::pin(spectator()).await,
         "restart" => Box::pin(restart()).await,
-        "offline" => offline().await,
+        "offline" => Box::pin(offline()).await,
         "forget" => Box::pin(forget()).await,
         "report" => Box::pin(report()).await,
         "learned" => Box::pin(learned_at_connect()).await,
         "untrusted" => Box::pin(untrusted()).await,
-        "no-roots" => no_roots().await,
+        "no-roots" => Box::pin(no_roots()).await,
         "rotation" => Box::pin(rotation_withdraws()).await,
         "clock-behind" => Box::pin(clock_behind()).await,
-        "clock-ahead" => clock_ahead().await,
-        "attestation" => attestation().await,
+        "clock-ahead" => Box::pin(clock_ahead()).await,
+        "attestation" => Box::pin(attestation()).await,
         "lost-key" => Box::pin(lost_key()).await,
         #[cfg(feature = "peer")]
         "peer" => Box::pin(peer_report()).await,
+        "wd-tail-bind" => Box::pin(wd_tail_bind()).await,
+        "wd-device-bind" => Box::pin(wd_device_bind()).await,
+        "wd-first-cert" => Box::pin(wd_first_cert()).await,
+        "wd-tail-settles" => Box::pin(wd_tail_settles()).await,
+        "wd-retiring" => Box::pin(wd_retiring()).await,
+        "wd-revoked" => Box::pin(wd_revoked()).await,
         other => panic!("unknown enrolment phase {other:?}"),
     }
 }
@@ -506,6 +523,30 @@ async fn wait_for_certificate(
     }
 }
 
+/// Poll `device_certificate` until it holds a certificate whose key is not
+/// `retired`, bounded by `deadline`. The enrolment task re-enrols a fresh key
+/// after a retirement, so the first certificate held is the retired one and
+/// the wait must not return it.
+async fn wait_for_fresh_certificate(
+    client: &NativeClient<connetto_client::NativeTransport>,
+    retired: connetto_core::device_cert::KeyId,
+    deadline: Duration,
+) -> Option<DeviceCertificate> {
+    let until = Instant::now() + deadline;
+    loop {
+        if let Some(cert) = client
+            .device_certificate()
+            .filter(|cert| cert.identity().key() != retired)
+        {
+            return Some(cert);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Poll the enrolment store until it holds at least `count` records, bounded
 /// by `deadline`.
 async fn wait_for_records(
@@ -535,6 +576,193 @@ fn span(cert: &DeviceCertificate) -> Duration {
         .expect("not_after follows not_before")
 }
 
+diesel::table! {
+    devices (id) {
+        id -> Integer,
+        label -> Text,
+    }
+}
+
+/// Capture one `devices` row through the client's shared connection, so the
+/// writer takes it under whatever writer it is bound to.
+async fn write_device_row(client: &NativeClient<connetto_client::NativeTransport>, id: i32) {
+    client
+        .client()
+        .with_conn(|conn| {
+            insert_into(devices::table)
+                .values((devices::id.eq(id), devices::label.eq("row")))
+                .execute(conn.conn())
+                .expect("insert a device row")
+        })
+        .await
+        .expect("the write is captured");
+}
+
+diesel::table! {
+    _connetto_writers (writer) {
+        /// The server-issued writer number.
+        writer -> diesel::sql_types::BigInt,
+        /// The device key's id, absent for a number writer.
+        device_key -> diesel::sql_types::Nullable<diesel::sql_types::Bytea>,
+        /// The highest settled sequence, 0 when nothing settled.
+        frontier -> diesel::sql_types::BigInt,
+        /// When the writer retired.
+        retired_at -> diesel::sql_types::Nullable<diesel::sql_types::Timestamptz>,
+    }
+}
+
+diesel::table! {
+    _connetto_settled (writer, seq) {
+        /// The writer the entry settled under.
+        writer -> diesel::sql_types::BigInt,
+        /// The entry's sequence for that writer.
+        seq -> diesel::sql_types::BigInt,
+    }
+}
+
+/// Poll `unsynced` until it names at least one entry, bounded by `deadline`.
+async fn wait_for_unsynced(
+    client: &NativeClient<connetto_client::NativeTransport>,
+    deadline: Duration,
+) -> Option<Vec<connetto_client::UnsyncedWrite>> {
+    let until = Instant::now() + deadline;
+    loop {
+        let entries = client
+            .client()
+            .unsynced()
+            .await
+            .ok()
+            .filter(|entries| !entries.is_empty());
+        if let Some(entries) = entries {
+            return Some(entries);
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Poll `unsynced` until it holds nothing, bounded by `deadline`.
+async fn wait_for_unsynced_empty(
+    client: &NativeClient<connetto_client::NativeTransport>,
+    deadline: Duration,
+) -> bool {
+    let until = Instant::now() + deadline;
+    loop {
+        if client
+            .client()
+            .unsynced()
+            .await
+            .is_ok_and(|entries| entries.is_empty())
+        {
+            return true;
+        }
+        if Instant::now() >= until {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The device key the build holds, from its certificate.
+fn key_id(client: &NativeClient<connetto_client::NativeTransport>) -> KeyId {
+    client
+        .device_certificate()
+        .expect("the build holds a certificate")
+        .identity()
+        .key()
+}
+
+/// The applied frontier of the device writer `key`, or `None` when absent.
+async fn device_frontier(fixture: &Fixture, key: &[u8; 32]) -> Option<i64> {
+    let mut conn = fixture.admin().get().await.expect("an admin connection");
+    let query = _connetto_writers::table
+        .filter(_connetto_writers::device_key.eq(Some(key.to_vec())))
+        .select(_connetto_writers::frontier);
+    diesel_async::RunQueryDsl::first::<i64>(query, &mut *conn)
+        .await
+        .ok()
+}
+
+/// The writer number the server issued for the device writer `key`.
+async fn device_writer_number(fixture: &Fixture, key: &[u8; 32]) -> Option<i64> {
+    let mut conn = fixture.admin().get().await.expect("an admin connection");
+    let query = _connetto_writers::table
+        .filter(_connetto_writers::device_key.eq(Some(key.to_vec())))
+        .select(_connetto_writers::writer);
+    diesel_async::RunQueryDsl::first::<i64>(query, &mut *conn)
+        .await
+        .ok()
+}
+
+/// Whether the device writer `key` is marked retired.
+async fn device_retired(fixture: &Fixture, key: &[u8; 32]) -> bool {
+    let mut conn = fixture.admin().get().await.expect("an admin connection");
+    let query = _connetto_writers::table
+        .filter(_connetto_writers::device_key.eq(Some(key.to_vec())))
+        .filter(_connetto_writers::retired_at.is_not_null())
+        .select(_connetto_writers::writer);
+    diesel_async::RunQueryDsl::first::<i64>(query, &mut *conn)
+        .await
+        .is_ok()
+}
+
+/// The settled sequences of the writer numbered `number`.
+async fn settled_seqs(fixture: &Fixture, number: i64) -> Vec<i64> {
+    let mut conn = fixture.admin().get().await.expect("an admin connection");
+    let query = _connetto_settled::table
+        .filter(_connetto_settled::writer.eq(number))
+        .select(_connetto_settled::seq);
+    diesel_async::RunQueryDsl::load::<i64>(query, &mut *conn)
+        .await
+        .expect("read the settled rows")
+}
+
+/// A manager whose handshake authority reads the subject out of the grant, so
+/// a harness client signed in as the native account can retire its writer.
+fn retiree_manager(fixture: &Fixture) -> Arc<Manager> {
+    let guard = Arc::new(RequestGuard::new(
+        ThrottleConfig::default()
+            .with_identified(TierLimits::identified().with_read_timeout(Duration::from_secs(30))),
+        AbuseConfig::default(),
+    ));
+    let pool = fixture.admin().clone();
+    let authority: Arc<dyn HandshakeAuthority> = Arc::new(TestGrantChecker);
+    ManagerBuilder::new(
+        Materializer::builder(PG_DDL)
+            .with_write_catalog(RuntimeWritableCatalog::default())
+            .with_read_connector(PgReadConnector::with_session_setup(pool.clone()))
+            .build()
+            .expect("build the materializer"),
+        PgSnapshotSource::from_ddl(pool.clone(), PG_DDL).expect("the snapshot source"),
+        RosterAuth::granting_nobody(),
+        authority,
+        PgReadConnector::with_session_setup(pool.clone()),
+        pg_write_target::<ConnettoDefaults>(pool, PG_DDL).expect("build the write target"),
+    )
+    .with_guard(guard)
+    .build()
+}
+
+/// Retire the device writer `key` of the account `user_id` through a harness
+/// client on a test-authority manager, the way an archive importer retires
+/// the writer an archive was made under.
+async fn retire_device(fixture: &Fixture, user_id: &str, key: [u8; 32]) -> WriterAnswer {
+    let (server_end, client_end) = loopback();
+    let manager = retiree_manager(fixture);
+    tokio::spawn(async move {
+        let _ = manager.serve(server_end).await;
+    });
+    let mut client = Client::new(client_end);
+    client
+        .handshake_with("retiree", &format!("user:{user_id}"))
+        .await;
+    client
+        .retire_writer("retire-1", WriterRef::Device(key))
+        .await
+}
+
 /// A first connect enrols the device, and the server's record names the
 /// certificate's key and carries the descriptor as sent.
 #[test]
@@ -559,13 +787,15 @@ async fn first_connect() {
         city: "Milan".into(),
     };
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_ENROL, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_ENROL, "enrol-user"),
+            dir.path(),
+        )
+        .with_device_descriptor(&descriptor)
+        .connect(),
     )
-    .with_device_descriptor(&descriptor)
-    .connect()
     .await
     .expect("the signed-in build connects");
 
@@ -616,13 +846,15 @@ async fn renewal() {
     let dir = tempdir().expect("a data directory");
     let lifetime = Duration::from_secs(4);
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_RENEW, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_RENEW, "enrol-user"),
+            dir.path(),
+        )
+        .with_certificate_lifetime(lifetime)
+        .connect(),
     )
-    .with_certificate_lifetime(lifetime)
-    .connect()
     .await
     .expect("the signed-in build connects");
 
@@ -689,12 +921,14 @@ async fn reissue() {
     let (addr, _server) = sync_server(&fixture, &service, config, Arc::clone(&store)).await;
     let dir = tempdir().expect("a data directory");
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_REISSUE, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REISSUE, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("the signed-in build connects");
 
@@ -764,11 +998,13 @@ async fn cap() {
     let dir = tempdir().expect("a data directory");
     let requested = Duration::from_hours(24);
 
-    let (client, pump) = signed_in(addr, fresh_login(&base, APP_CAP, "enrol-user"), dir.path())
-        .with_certificate_lifetime(requested)
-        .connect_with_pump()
-        .await
-        .expect("the signed-in build connects");
+    let (client, pump) = Box::pin(
+        signed_in(addr, fresh_login(&base, APP_CAP, "enrol-user"), dir.path())
+            .with_certificate_lifetime(requested)
+            .connect_with_pump(),
+    )
+    .await
+    .expect("the signed-in build connects");
     let mut events = client.client().events();
     tokio::spawn(pump);
 
@@ -821,12 +1057,14 @@ async fn revoke() {
     .await;
     let dir = tempdir().expect("a data directory");
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_REVOKE, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_REVOKE, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("the signed-in build connects");
 
@@ -871,14 +1109,15 @@ async fn revoke() {
     );
     client.close().await;
 
-    let second =
+    let second = Box::pin(
         NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
             .signed_in(last_used(&base, APP_REVOKE))
             .durable(dir.path())
             .with_deployment_roots([root()])
-            .connect()
-            .await
-            .expect("the second build signs back in and connects");
+            .connect(),
+    )
+    .await
+    .expect("the second build signs back in and connects");
     let second_cert = wait_for_certificate(&second, BOUND)
         .await
         .expect("the fresh key enrols");
@@ -908,10 +1147,11 @@ async fn spectator() {
     let (addr, _server) = spawn_server(manager(&fixture, &service)).await;
     let dir = tempdir().expect("a data directory");
 
-    let (client, pump) = signed_in(addr, fresh_login(&base, APP_NONE, "enrol-user"), dir.path())
-        .connect_with_pump()
-        .await
-        .expect("the signed-in build connects");
+    let (client, pump) = Box::pin(
+        signed_in(addr, fresh_login(&base, APP_NONE, "enrol-user"), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("the signed-in build connects");
     let mut events = client.client().events();
     tokio::spawn(pump);
 
@@ -958,12 +1198,14 @@ async fn restart() {
     .await;
     let dir = tempdir().expect("a data directory");
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_RESTART, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_RESTART, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("the signed-in build connects");
     let first = wait_for_certificate(&client, BOUND)
@@ -972,10 +1214,10 @@ async fn restart() {
     client.close().await;
     // A second build over the same dir and keyring signs back in silently
     // and picks up the stored certificate, which it does not re-enrol.
-    let (second, pump) = signed_in(addr, last_used(&base, APP_RESTART), dir.path())
-        .connect_with_pump()
-        .await
-        .expect("the second build signs back in and connects");
+    let (second, pump) =
+        Box::pin(signed_in(addr, last_used(&base, APP_RESTART), dir.path()).connect_with_pump())
+            .await
+            .expect("the second build signs back in and connects");
     let restarted = second
         .device_certificate()
         .expect("the stored certificate is held before the pump runs");
@@ -1008,13 +1250,15 @@ async fn offline() {
     let (base, _service, _idp) = spawn_auth().await;
     let dir = tempdir().expect("a data directory");
 
-    let client = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
-        .signed_in(fresh_login(&base, APP_OFFLINE, "enrol-user"))
-        .durable(dir.path())
-        .with_deployment_roots([root()])
-        .connect()
-        .await
-        .expect("the build opens offline");
+    let client = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+            .signed_in(fresh_login(&base, APP_OFFLINE, "enrol-user"))
+            .durable(dir.path())
+            .with_deployment_roots([root()])
+            .connect(),
+    )
+    .await
+    .expect("the build opens offline");
 
     assert!(client.device_certificate().is_none());
     assert!(
@@ -1046,12 +1290,14 @@ async fn forget() {
     .await;
     let dir = tempdir().expect("a data directory");
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_FORGET, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_FORGET, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("the signed-in build connects");
 
@@ -1137,6 +1383,7 @@ fn reporting_a_device_lost_revokes_it_everywhere() {
     run_phase("report");
 }
 
+#[expect(clippy::too_many_lines, reason = "one phase scenario per body")]
 async fn report() {
     let fixture = Fixture::acquire().await;
     let (base, service, _idp) = spawn_auth().await;
@@ -1153,21 +1400,25 @@ async fn report() {
         name: "phone".into(),
         city: "Milan".into(),
     };
-    let phone = signed_in(
-        addr,
-        fresh_login(&base, APP_PHONE, "enrol-user"),
-        phone_dir.path(),
+    let phone = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_PHONE, "enrol-user"),
+            phone_dir.path(),
+        )
+        .with_device_descriptor(&phone_name)
+        .connect(),
     )
-    .with_device_descriptor(&phone_name)
-    .connect()
     .await
     .expect("the phone connects");
-    let laptop = signed_in(
-        addr,
-        fresh_login(&base, APP_LAPTOP, "enrol-user"),
-        laptop_dir.path(),
+    let laptop = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_LAPTOP, "enrol-user"),
+            laptop_dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("the laptop connects");
     let phone_cert = wait_for_certificate(&phone, BOUND)
@@ -1259,12 +1510,14 @@ async fn learned_at_connect() {
     )
     .await;
     let dir = tempdir().expect("dir");
-    let first = signed_in(
-        addr,
-        fresh_login(&base, APP_LEARNED, "enrol-user"),
-        dir.path(),
+    let first = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_LEARNED, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("connects");
     let cert = wait_for_certificate(&first, BOUND).await.expect("enrols");
@@ -1278,10 +1531,10 @@ async fn learned_at_connect() {
             .expect("revoke")
     );
 
-    let (second, pump) = signed_in(addr, last_used(&base, APP_LEARNED), dir.path())
-        .connect_with_pump()
-        .await
-        .expect("signs back in");
+    let (second, pump) =
+        Box::pin(signed_in(addr, last_used(&base, APP_LEARNED), dir.path()).connect_with_pump())
+            .await
+            .expect("signs back in");
     let mut events = second.client().events();
     tokio::spawn(pump);
     assert!(
@@ -1321,14 +1574,15 @@ async fn untrusted() {
         3650 * DAY,
     )
     .expect("another root");
-    let client =
+    let client = Box::pin(
         NativeClientBuilder::new(format!("ws://{addr}/"), super::support::bundle(SQLITE_DDL))
             .signed_in(fresh_login(&base, APP_UNTRUSTED, "enrol-user"))
             .durable(dir.path())
             .with_deployment_roots([stranger.certificate().to_vec()])
-            .connect()
-            .await
-            .expect("connects");
+            .connect(),
+    )
+    .await
+    .expect("connects");
     assert!(
         matches!(
             client.reissue_certificate(Duration::from_secs(3600)).await,
@@ -1351,22 +1605,25 @@ fn a_build_without_roots_refuses_to_connect() {
 async fn no_roots() {
     let (base, _service, _idp) = spawn_auth().await;
     let dir = tempdir().expect("dir");
-    let refused = NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
-        .signed_in(fresh_login(&base, APP_NO_ROOTS, "enrol-user"))
-        .durable(dir.path())
-        .connect()
-        .await;
+    let refused = Box::pin(
+        NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
+            .signed_in(fresh_login(&base, APP_NO_ROOTS, "enrol-user"))
+            .durable(dir.path())
+            .connect(),
+    )
+    .await;
     assert!(matches!(
         refused,
         Err(connetto_client::ClientError::MissingDeploymentRoots)
     ));
-    let malformed =
+    let malformed = Box::pin(
         NativeClientBuilder::new("ws://127.0.0.1:1/", super::support::bundle(SQLITE_DDL))
             .signed_in(fresh_login(&base, APP_NO_ROOTS, "enrol-user"))
             .durable(dir.path())
             .with_deployment_roots([root(), vec![0x30, 0x00]])
-            .connect()
-            .await;
+            .connect(),
+    )
+    .await;
     assert!(matches!(
         malformed,
         Err(connetto_client::ClientError::InvalidDeploymentRoot { index: 1 })
@@ -1393,12 +1650,14 @@ async fn rotation_withdraws() {
     )
     .await;
     let dir = tempdir().expect("dir");
-    let first = signed_in(
-        old_addr,
-        fresh_login(&base, APP_ROTATION, "enrol-user"),
-        dir.path(),
+    let first = Box::pin(
+        signed_in(
+            old_addr,
+            fresh_login(&base, APP_ROTATION, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("connects");
     let old_cert = wait_for_certificate(&first, BOUND).await.expect("enrols");
@@ -1418,10 +1677,11 @@ async fn rotation_withdraws() {
         Arc::clone(&store),
     )
     .await;
-    let (second, pump) = signed_in(new_addr, last_used(&base, APP_ROTATION), dir.path())
-        .connect_with_pump()
-        .await
-        .expect("signs back in");
+    let (second, pump) = Box::pin(
+        signed_in(new_addr, last_used(&base, APP_ROTATION), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("signs back in");
     assert_eq!(
         second
             .device_certificate()
@@ -1495,12 +1755,14 @@ async fn clock_behind() {
     .await;
     let dir = tempdir().expect("a data directory");
 
-    let (client, pump) = signed_in(
-        ahead,
-        fresh_login(&base, APP_CLOCK_BEHIND, "enrol-user"),
-        dir.path(),
+    let (client, pump) = Box::pin(
+        signed_in(
+            ahead,
+            fresh_login(&base, APP_CLOCK_BEHIND, "enrol-user"),
+            dir.path(),
+        )
+        .connect_with_pump(),
     )
-    .connect_with_pump()
     .await
     .expect("the signed-in build connects");
     let mut events = client.client().events();
@@ -1522,10 +1784,11 @@ async fn clock_behind() {
         Arc::clone(&store),
     )
     .await;
-    let (second, pump) = signed_in(agreeing, last_used(&base, APP_CLOCK_BEHIND), dir.path())
-        .connect_with_pump()
-        .await
-        .expect("the second build signs back in and connects");
+    let (second, pump) = Box::pin(
+        signed_in(agreeing, last_used(&base, APP_CLOCK_BEHIND), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("the second build signs back in and connects");
     let mut events = second.client().events();
     tokio::spawn(pump);
     let told = clock_event(&mut events, BOUND).await;
@@ -1571,13 +1834,15 @@ async fn clock_ahead() {
     .await;
     let dir = tempdir().expect("a data directory");
 
-    let (client, pump) = signed_in(
-        behind,
-        fresh_login(&base, APP_CLOCK_AHEAD, "enrol-user"),
-        dir.path(),
+    let (client, pump) = Box::pin(
+        signed_in(
+            behind,
+            fresh_login(&base, APP_CLOCK_AHEAD, "enrol-user"),
+            dir.path(),
+        )
+        .with_certificate_lifetime(Duration::from_hours(1))
+        .connect_with_pump(),
     )
-    .with_certificate_lifetime(Duration::from_hours(1))
-    .connect_with_pump()
     .await
     .expect("the signed-in build connects");
     let mut events = client.client().events();
@@ -1610,12 +1875,14 @@ async fn lost_key() {
     .await;
     let dir = tempdir().expect("a data directory");
 
-    let client = signed_in(
-        addr,
-        fresh_login(&base, APP_LOST_KEY, "enrol-user"),
-        dir.path(),
+    let client = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_LOST_KEY, "enrol-user"),
+            dir.path(),
+        )
+        .connect(),
     )
-    .connect()
     .await
     .expect("the signed-in build connects");
     let first = wait_for_certificate(&client, BOUND)
@@ -1631,8 +1898,7 @@ async fn lost_key() {
         .await
         .expect("the custody record is cleared");
 
-    let second = signed_in(addr, last_used(&base, APP_LOST_KEY), dir.path())
-        .connect()
+    let second = Box::pin(signed_in(addr, last_used(&base, APP_LOST_KEY), dir.path()).connect())
         .await
         .expect("the second build signs back in and connects");
     let until = Instant::now() + BOUND;
@@ -1672,12 +1938,14 @@ async fn attestation() {
     let (addr, _server) = sync_server(&fixture, &service, config, Arc::clone(&store)).await;
     let dir = tempdir().expect("a data directory");
 
-    let (client, pump) = signed_in(
-        addr,
-        fresh_login(&base, APP_ATTESTATION, "enrol-user"),
-        dir.path(),
+    let (client, pump) = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_ATTESTATION, "enrol-user"),
+            dir.path(),
+        )
+        .connect_with_pump(),
     )
-    .connect_with_pump()
     .await
     .expect("the signed-in build connects");
     let mut events = client.client().events();
@@ -1699,10 +1967,11 @@ async fn attestation() {
     client.close().await;
 
     // The next connection over the same dir asks again, and is refused again.
-    let (second, pump) = signed_in(addr, last_used(&base, APP_ATTESTATION), dir.path())
-        .connect_with_pump()
-        .await
-        .expect("the second build signs back in and connects");
+    let (second, pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_ATTESTATION), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("the second build signs back in and connects");
     let mut events = second.client().events();
     tokio::spawn(pump);
     assert!(
@@ -1750,34 +2019,40 @@ async fn peer_report() {
         tempdir().expect("c dir"),
     );
     let listener = "127.0.0.1:0".parse().expect("loopback");
-    let a = signed_in(
-        addr,
-        fresh_login(&base, APP_PEER_A, "peer-user"),
-        dir_a.path(),
+    let a = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_PEER_A, "peer-user"),
+            dir_a.path(),
+        )
+        .with_peer_listener(listener)
+        .with_peer_autolink(false)
+        .connect(),
     )
-    .with_peer_listener(listener)
-    .with_peer_autolink(false)
-    .connect()
     .await
     .expect("a connects");
-    let b = signed_in(
-        addr,
-        fresh_login(&base, APP_PEER_B, "peer-user"),
-        dir_b.path(),
+    let b = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_PEER_B, "peer-user"),
+            dir_b.path(),
+        )
+        .with_peer_listener(listener)
+        .with_peer_autolink(false)
+        .connect(),
     )
-    .with_peer_listener(listener)
-    .with_peer_autolink(false)
-    .connect()
     .await
     .expect("b connects");
-    let c = signed_in(
-        addr,
-        fresh_login(&base, APP_PEER_C, "peer-user"),
-        dir_c.path(),
+    let c = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_PEER_C, "peer-user"),
+            dir_c.path(),
+        )
+        .with_peer_listener(listener)
+        .with_peer_autolink(false)
+        .connect(),
     )
-    .with_peer_listener(listener)
-    .with_peer_autolink(false)
-    .connect()
     .await
     .expect("c connects");
     let a_cert = wait_for_certificate(&a, BOUND).await.expect("a enrols");
@@ -1803,12 +2078,14 @@ async fn peer_report() {
     server.abort();
 
     // B signs back in silently, with no server, and links a.
-    let (b2, b2_pump) = signed_in(addr, last_used(&base, APP_PEER_B), dir_b.path())
-        .with_peer_listener(listener)
-        .with_peer_autolink(false)
-        .connect_with_pump()
-        .await
-        .expect("b reopens");
+    let (b2, b2_pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_PEER_B), dir_b.path())
+            .with_peer_listener(listener)
+            .with_peer_autolink(false)
+            .connect_with_pump(),
+    )
+    .await
+    .expect("b reopens");
     tokio::spawn(b2_pump);
     let mut a_events = a.client().events();
     let mut a_addr = None;
@@ -1852,12 +2129,14 @@ async fn peer_report() {
 
     // C reopens with the server still down and dials b, whose handshake
     // refuses it, since b learned c's revocation from a.
-    let (c2, c2_pump) = signed_in(addr, last_used(&base, APP_PEER_C), dir_c.path())
-        .with_peer_listener(listener)
-        .with_peer_autolink(false)
-        .connect_with_pump()
-        .await
-        .expect("c reopens");
+    let (c2, c2_pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_PEER_C), dir_c.path())
+            .with_peer_listener(listener)
+            .with_peer_autolink(false)
+            .connect_with_pump(),
+    )
+    .await
+    .expect("c reopens");
     tokio::spawn(c2_pump);
     let mut b_events = b2.client().events();
     let mut b_addr = None;
@@ -1900,4 +2179,517 @@ async fn peer_report() {
     a.close().await;
     b2.close().await;
     c2.close().await;
+}
+
+// The R75 device-writer rows, one end-to-end phase per row of the client
+// state table, each against the real server through a native build with a
+// software device key.
+
+/// A number tail the build queued before its first enrolment is handed over
+/// at the handshake, settled, and then the key it meanwhile enrolled binds.
+#[test]
+fn a_number_tail_then_binds_the_key() {
+    run_phase("wd-tail-bind");
+}
+
+async fn wd_tail_bind() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, _manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    let (client, pump) = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_TAIL_BIND, "wd-tail"),
+            dir.path(),
+        )
+        .connect_with_pump(),
+    )
+    .await
+    .expect("connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    // The first write lands before the enrolment's certificate, so it goes
+    // under the number the server just issued and settles there.
+    write_device_row(&client, 1).await;
+    assert!(
+        wait_for_unsynced_empty(&client, BOUND).await,
+        "the number's row settles"
+    );
+    // The certificate lands on the live connection, the number's tail settles
+    // out, the number retires, and the device binds, so the next write settles
+    // under the key.
+    let cert = wait_for_certificate(&client, BOUND).await.expect("enrols");
+    write_device_row(&client, 2).await;
+    assert!(
+        wait_for_unsynced_empty(&client, BOUND).await,
+        "the device's row settles"
+    );
+    let key = cert.identity().key();
+    assert_eq!(
+        device_frontier(&fixture, key.as_bytes()).await,
+        Some(1),
+        "the device frontier is one, the number's row is the number's"
+    );
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::SyncStatus(SyncStatus::Connected)
+        ))
+        .await
+        .is_some(),
+        "the device binds and reconciles"
+    );
+    client.close().await;
+}
+
+/// A build holding nothing under its number binds straight to its device key
+/// and reconciles against the frontier the server applies to it.
+#[test]
+fn a_device_only_bind_reconciles() {
+    run_phase("wd-device-bind");
+}
+
+async fn wd_device_bind() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, _manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    // The first run enrols the device. The build holds the key but is not
+    // bound yet, so it writes nothing.
+    let first = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_DEVICE_BIND, "wd-bind"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("connects");
+    let cert = wait_for_certificate(&first, BOUND).await.expect("enrols");
+    first.close().await;
+    drop(first);
+    // The second run signs back in, presents the device, binds it, and settles
+    // the first row under the key.
+    let (second, pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_WD_DEVICE_BIND), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("signs back in");
+    tokio::spawn(pump);
+    let cert2 = wait_for_certificate(&second, BOUND)
+        .await
+        .expect("holds the certificate");
+    assert_eq!(
+        cert2.identity().key(),
+        cert.identity().key(),
+        "the same device binds again"
+    );
+    write_device_row(&second, 1).await;
+    assert!(
+        wait_for_unsynced_empty(&second, BOUND).await,
+        "the first row settles under the device"
+    );
+    second.close().await;
+    drop(second);
+    // The third run rebinds the device and reconciles against the frontier, so
+    // the next row takes the sequence after it rather than re-sending the first.
+    let (third, pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_WD_DEVICE_BIND), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("signs back in again");
+    let mut events = third.client().events();
+    tokio::spawn(pump);
+    wait_for_certificate(&third, BOUND)
+        .await
+        .expect("holds the certificate");
+    write_device_row(&third, 2).await;
+    assert!(
+        wait_for_unsynced_empty(&third, BOUND).await,
+        "the second row settles"
+    );
+    let key = key_id(&third);
+    let number = device_writer_number(&fixture, key.as_bytes())
+        .await
+        .expect("the device has a writer number");
+    assert_eq!(
+        device_frontier(&fixture, key.as_bytes()).await,
+        Some(2),
+        "the device frontier advanced to two"
+    );
+    assert_eq!(
+        settled_seqs(&fixture, number).await,
+        vec![1, 2],
+        "one settled row per sequence, nothing re-sent"
+    );
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::SyncStatus(SyncStatus::Connected)
+        ))
+        .await
+        .is_some(),
+        "the reconnect reconciles"
+    );
+    third.close().await;
+}
+
+/// The first enrolment turns a number holding nothing into the device writer,
+/// and a row then settles under the key rather than the number.
+#[test]
+fn a_first_certificate_becomes_the_device() {
+    run_phase("wd-first-cert");
+}
+
+async fn wd_first_cert() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, _manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    let (client, pump) = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_FIRST_CERT, "wd-first"),
+            dir.path(),
+        )
+        .connect_with_pump(),
+    )
+    .await
+    .expect("connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    // The first write lands before the enrolment's certificate, so it goes
+    // under the number the server just issued.
+    write_device_row(&client, 1).await;
+    assert!(
+        wait_for_unsynced_empty(&client, BOUND).await,
+        "the number's row settles"
+    );
+    // The certificate lands on the live connection, the number retires, and
+    // the device binds, so the next write settles under the key.
+    let cert = wait_for_certificate(&client, BOUND).await.expect("enrols");
+    write_device_row(&client, 2).await;
+    assert!(
+        wait_for_unsynced_empty(&client, BOUND).await,
+        "the device's row settles"
+    );
+    let key = cert.identity().key();
+    assert_eq!(
+        device_frontier(&fixture, key.as_bytes()).await,
+        Some(1),
+        "the device holds its own frontier, the number's settled"
+    );
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::SyncStatus(SyncStatus::Connected)
+        ))
+        .await
+        .is_some(),
+        "the device binds and reconciles"
+    );
+    client.close().await;
+}
+
+/// A number's last entry settling hands the build to its device writer, the
+/// key enrolling on the way.
+#[test]
+fn a_number_tail_settles_into_the_device() {
+    run_phase("wd-tail-settles");
+}
+
+async fn wd_tail_settles() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, _manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    let (client, pump) = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_TAIL_SETTLES, "wd-settles"),
+            dir.path(),
+        )
+        .connect_with_pump(),
+    )
+    .await
+    .expect("connects");
+    let mut events = client.client().events();
+    tokio::spawn(pump);
+    // The first write lands before the enrolment's certificate, so it goes
+    // under the number the server just issued and settles there.
+    write_device_row(&client, 1).await;
+    assert!(
+        wait_for_unsynced_empty(&client, BOUND).await,
+        "the number's row settles"
+    );
+    // The certificate lands on the live connection, the number's last entry
+    // settles out, the number retires, and the device becomes the writer, so
+    // the next write settles under the key.
+    let cert = wait_for_certificate(&client, BOUND).await.expect("enrols");
+    write_device_row(&client, 2).await;
+    assert!(
+        wait_for_unsynced_empty(&client, BOUND).await,
+        "the device's row settles"
+    );
+    let key = cert.identity().key();
+    assert_eq!(
+        device_frontier(&fixture, key.as_bytes()).await,
+        Some(1),
+        "the device holds its own frontier"
+    );
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::SyncStatus(SyncStatus::Connected)
+        ))
+        .await
+        .is_some(),
+        "the device binds and reconciles"
+    );
+    client.close().await;
+}
+
+/// A device writer the server retires re-enrols a fresh key and carries its
+/// queued tail over under the fresh writer, provenance intact.
+#[test]
+fn a_retired_device_writer_reenrols_with_provenance() {
+    run_phase("wd-retiring");
+}
+
+#[expect(clippy::too_many_lines, reason = "one phase scenario per body")]
+async fn wd_retiring() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, _manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    // The first run enrols the device. The build holds the key but is not
+    // bound yet, so it writes nothing.
+    let first = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_RETIRING, "wd-retiring"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("connects");
+    wait_for_certificate(&first, BOUND).await.expect("enrols");
+    first.close().await;
+    drop(first);
+    // The second run binds the device and settles the first row, then ends its
+    // connection while the build stays alive so a queued write is captured
+    // under the device and never sent.
+    let (second, pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_WD_RETIRING), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("signs back in");
+    tokio::spawn(pump);
+    wait_for_certificate(&second, BOUND)
+        .await
+        .expect("holds the certificate");
+    write_device_row(&second, 1).await;
+    assert!(
+        wait_for_unsynced_empty(&second, BOUND).await,
+        "the first row settles"
+    );
+    let old_key = key_id(&second);
+    let user_id = second.session().expect("a session").user_id().to_owned();
+    second.close().await;
+    write_device_row(&second, 2).await;
+    let entries = wait_for_unsynced(&second, BOUND)
+        .await
+        .expect("a tail is queued");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.writer == WriterRef::Device(*old_key.as_bytes())),
+        "the tail is under the retiring device"
+    );
+    drop(second);
+    let answer = retire_device(&fixture, &user_id, *old_key.as_bytes()).await;
+    assert_eq!(
+        answer.outcome,
+        WriterOutcome::Retired,
+        "the server retires it"
+    );
+    assert!(
+        device_retired(&fixture, old_key.as_bytes()).await,
+        "the writer is marked retired"
+    );
+    // The third run learns of the retirement at its bind and re-enrols a fresh
+    // key, the tail carried over under provenance.
+    let (third, pump) = Box::pin(
+        signed_in(addr, last_used(&base, APP_WD_RETIRING), dir.path()).connect_with_pump(),
+    )
+    .await
+    .expect("signs back in again");
+    tokio::spawn(pump);
+    wait_for_fresh_certificate(&third, old_key, BOUND)
+        .await
+        .expect("re-enrols a fresh key, not the retired one");
+    let new_key = key_id(&third);
+    let carried = {
+        let until = Instant::now() + BOUND;
+        loop {
+            let entries = wait_for_unsynced(&third, BOUND).await;
+            let under_fresh = entries.as_ref().is_some_and(|list| {
+                list.len() == 1
+                    && list[0].writer == WriterRef::Device(*new_key.as_bytes())
+                    && list[0].seq == 1
+            });
+            if under_fresh {
+                break entries.expect("the tail is under the fresh key");
+            }
+            assert!(
+                Instant::now() < until,
+                "the tail never re-queued under the fresh key, saw {entries:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    assert_eq!(
+        carried,
+        vec![connetto_client::UnsyncedWrite {
+            writer: WriterRef::Device(*new_key.as_bytes()),
+            seq: 1
+        }],
+        "the tail re-queues under the fresh key at sequence one"
+    );
+    third.close().await;
+}
+
+/// A device key revoked while the build is away deletes it on the next
+/// handshake and re-queues its tail under a number, provenance intact.
+#[test]
+fn a_revoked_device_tail_requeues_under_a_number() {
+    run_phase("wd-revoked");
+}
+
+async fn wd_revoked() {
+    let fixture = Fixture::acquire().await;
+    let (base, service, _idp) = spawn_auth().await;
+    let store = Arc::new(MemoryEnrolments::default());
+    let (addr, _server, manager) = sync_server_with_manager(
+        &fixture,
+        &service,
+        DeviceCertConfig::new(issuer()),
+        Arc::clone(&store),
+    )
+    .await;
+    let dir = tempdir().expect("dir");
+    // The first run enrols the device. The build holds the key but is not
+    // bound yet, so it writes nothing.
+    let first = Box::pin(
+        signed_in(
+            addr,
+            fresh_login(&base, APP_WD_REVOKED, "wd-revoked"),
+            dir.path(),
+        )
+        .connect(),
+    )
+    .await
+    .expect("connects");
+    wait_for_certificate(&first, BOUND).await.expect("enrols");
+    first.close().await;
+    drop(first);
+    // The second run binds the device and settles the first row, then ends its
+    // connection while the build stays alive so a queued write is captured
+    // under the device and never sent.
+    let (second, pump) =
+        Box::pin(signed_in(addr, last_used(&base, APP_WD_REVOKED), dir.path()).connect_with_pump())
+            .await
+            .expect("signs back in");
+    tokio::spawn(pump);
+    wait_for_certificate(&second, BOUND)
+        .await
+        .expect("holds the certificate");
+    write_device_row(&second, 1).await;
+    assert!(
+        wait_for_unsynced_empty(&second, BOUND).await,
+        "the first row settles"
+    );
+    let old_key = key_id(&second);
+    second.close().await;
+    write_device_row(&second, 2).await;
+    let entries = wait_for_unsynced(&second, BOUND)
+        .await
+        .expect("a tail is queued");
+    assert!(
+        entries
+            .iter()
+            .all(|entry| entry.writer == WriterRef::Device(*old_key.as_bytes())),
+        "the tail is under the revoked device"
+    );
+    drop(second);
+    assert!(
+        manager.revoke_device(old_key).await.expect("revoke"),
+        "the operator revokes the key"
+    );
+    // The third run signs back in, deletes the revoked key, and re-queues the
+    // tail under a number.
+    let (third, pump) =
+        Box::pin(signed_in(addr, last_used(&base, APP_WD_REVOKED), dir.path()).connect_with_pump())
+            .await
+            .expect("signs back in again");
+    let mut events = third.client().events();
+    tokio::spawn(pump);
+    assert!(
+        next_event(&mut events, BOUND, |event| matches!(
+            event,
+            ClientEvent::DeviceRevoked
+        ))
+        .await
+        .is_some(),
+        "the revocation reaches the build"
+    );
+    assert!(third.device_certificate().is_none(), "the key is deleted");
+    let carried = wait_for_unsynced(&third, BOUND)
+        .await
+        .expect("the tail re-queues");
+    assert!(
+        carried
+            .iter()
+            .all(|entry| matches!(entry.writer, WriterRef::Number(_))),
+        "the tail re-queues under a number"
+    );
+    third.close().await;
 }

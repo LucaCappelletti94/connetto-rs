@@ -1,6 +1,7 @@
 //! The link's frame protocol, a four-byte big-endian length ahead of a
 //! messagepack `PeerFrame`.
 
+use std::fmt;
 use std::io;
 
 use serde::{Deserialize, Serialize};
@@ -14,8 +15,8 @@ pub(crate) const MAX_FRAME_LEN: u32 = 4 * 1024 * 1024;
 /// The frame version this crate speaks.
 pub(crate) const PROTOCOL_VERSION: u16 = 1;
 
-/// A frame on the peer link.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// A peer-link frame with hotspot passphrases redacted from its `Debug` output.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PeerFrame {
     /// The first frame from each side, naming the version, the dial the side
     /// made, and the revocation list numbers the side keeps.
@@ -65,6 +66,62 @@ pub enum PeerFrame {
     Ping,
     /// The answer to a liveness probe.
     Pong,
+}
+
+impl PeerFrame {
+    /// The payload-free frame name and article for diagnostics.
+    pub(crate) fn named(&self) -> &'static str {
+        match self {
+            PeerFrame::Hello { .. } => "a Hello",
+            PeerFrame::List { .. } => "a List",
+            PeerFrame::Close { .. } => "a Close",
+            PeerFrame::Certificate { .. } => "a Certificate",
+            PeerFrame::Offer { .. } => "an Offer",
+            PeerFrame::Ping => "a Ping",
+            PeerFrame::Pong => "a Pong",
+        }
+    }
+}
+impl fmt::Debug for PeerFrame {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            PeerFrame::Hello {
+                version,
+                dial,
+                numbers,
+            } => f
+                .debug_struct("Hello")
+                .field("version", version)
+                .field("dial", dial)
+                .field("numbers", numbers)
+                .finish(),
+            PeerFrame::List { list, signer } => f
+                .debug_struct("List")
+                .field("list", list)
+                .field("signer", signer)
+                .finish(),
+            PeerFrame::Close { reason } => f.debug_struct("Close").field("reason", reason).finish(),
+            PeerFrame::Certificate { leaf, issuer } => f
+                .debug_struct("Certificate")
+                .field("leaf", leaf)
+                .field("issuer", issuer)
+                .finish(),
+            PeerFrame::Offer {
+                ssid,
+                security,
+                port,
+                ..
+            } => f
+                .debug_struct("Offer")
+                .field("ssid", ssid)
+                .field("passphrase", &"<redacted>")
+                .field("security", security)
+                .field("port", port)
+                .finish(),
+            PeerFrame::Ping => f.debug_struct("Ping").finish(),
+            PeerFrame::Pong => f.debug_struct("Pong").finish(),
+        }
+    }
 }
 
 /// A frame decode or I/O failure.

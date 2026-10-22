@@ -71,16 +71,20 @@ fn state() -> (State, mpsc::UnboundedReceiver<Outbound>) {
             pending: VecDeque::new(),
             subs: HashMap::new(),
             paging: VecDeque::new(),
+            reader_reservation: crate::reserve::ReaderReservation::default(),
             missed: Vec::new(),
             computed_subs: HashMap::new(),
             outbound,
             principal: Arc::new(principal),
             pending_header: None,
-            deferred: None,
+            deferred: BTreeMap::new(),
             session_id,
-            applied_watermark: None,
+            writer_row: None,
+            bind_nonce: [0; 32],
+            indeterminate: None,
             resume: Resume::Fresh,
             resume_read_budget: Duration::from_secs(10),
+            cursor_subjects: None,
             key_expiry: BTreeMap::new(),
             closing: false,
             enrol_challenge: None,
@@ -136,7 +140,7 @@ async fn swap(manager: &Manager, state: &mut State, key: &str) {
         .principal
         .with_capabilities([CapabilitySubject::new(key)]);
     let reached = manager.reached_by_keys(state);
-    manager.swap_keys(state, next, reached).await;
+    manager.swap_keys(state, next, reached, None).await;
 }
 
 async fn queued(receiver: &mut mpsc::UnboundedReceiver<Outbound>) -> Outbound {
@@ -320,4 +324,48 @@ async fn a_failed_rebootstrap_releases_its_label_for_a_new_subscription() {
     )
     .await;
     answer(&mut client, "30").await;
+}
+
+async fn row_snapshot(client: &mut LoopbackTransport) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let frame = client
+                .recv()
+                .await
+                .expect("snapshot frame")
+                .expect("open connection");
+            if let IncomingFrame::Control(ControlMessage::SnapshotEnd(end)) = frame {
+                assert_eq!(end.sub_id, LABEL);
+                break;
+            }
+        }
+    })
+    .await
+    .expect("row snapshot completes");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reserved_row_resend_cannot_replace_a_new_subscription_using_the_label() {
+    let fixture = Fixture::acquire().await;
+    let manager = manager(&fixture).await;
+    let (mut state, _receiver) = state();
+    let (mut server, mut client) = loopback();
+    subscribe(&manager, &mut server, &mut state, "SELECT * FROM notes").await;
+    row_snapshot(&mut client).await;
+    let row = &state.subs[LABEL];
+    let job = Outbound::ReservedResnapshot {
+        sub_id: LABEL.to_owned(),
+        owner: (row.reg.consumer_id, row.reg.sub_id),
+        permit: crate::reserve::ReaderPermit::none(),
+    };
+    unsubscribe(&manager, &mut server, &mut state).await;
+    subscribe(
+        &manager,
+        &mut server,
+        &mut state,
+        "SELECT * FROM notes WHERE id = 1",
+    )
+    .await;
+    row_snapshot(&mut client).await;
+    assert_no_job_output(&manager, &mut server, &mut client, &mut state, job).await;
 }

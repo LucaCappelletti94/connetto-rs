@@ -125,6 +125,15 @@ pub(crate) enum SlotState {
     AwaitingKeeper(DeviceIdentity),
 }
 
+/// A linked peer and the remote address of the link the node keeps to it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerLink {
+    /// What the peer's certificate names.
+    pub peer: DeviceIdentity,
+    /// The kept link's remote address, `None` while a duplicate close waits for its keeper.
+    pub remote: Option<SocketAddr>,
+}
+
 impl fmt::Debug for NodeState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("NodeState").finish_non_exhaustive()
@@ -135,6 +144,8 @@ impl fmt::Debug for NodeState {
 pub(crate) struct LinkSlot {
     /// What the certificate names.
     pub(crate) peer: DeviceIdentity,
+    /// The connection's remote address.
+    remote: SocketAddr,
     /// The peer's leaf, DER.
     pub(crate) leaf: Vec<u8>,
     /// The peer's issuer, DER.
@@ -361,18 +372,25 @@ impl Node {
         self.state.listener.read().as_ref().map(|slot| slot.addr)
     }
 
-    /// The identities the node reports linked, the live links' peers and,
-    /// among them, a duplicate close's peer while it waits for its keeper,
-    /// whose `PeerUnlinked` has not been emitted yet (R76).
+    /// The peers the node reports linked with each kept link's remote
+    /// address, the live links' peers and, among them, a duplicate close's
+    /// peer while it waits for its keeper, whose `PeerUnlinked` has not been
+    /// emitted yet (R76).
     #[must_use]
-    pub fn linked(&self) -> Vec<DeviceIdentity> {
+    pub fn linked(&self) -> Vec<PeerLink> {
         self.state
             .links
             .lock()
             .values()
             .map(|slot_state| match slot_state {
-                SlotState::Live(slot) => slot.peer.clone(),
-                SlotState::AwaitingKeeper(peer) => peer.clone(),
+                SlotState::Live(slot) => PeerLink {
+                    peer: slot.peer.clone(),
+                    remote: Some(slot.remote),
+                },
+                SlotState::AwaitingKeeper(peer) => PeerLink {
+                    peer: peer.clone(),
+                    remote: None,
+                },
             })
             .collect()
     }
@@ -466,6 +484,7 @@ impl Node {
                 dialer: key_id(&*identity.key),
                 dial,
                 presented: identity.certificate.clone(),
+                remote: addr,
             },
             tls,
         )?;
@@ -601,12 +620,12 @@ fn stop_state(state: &NodeState, reason: CloseReason) {
     if let Some(slot) = state.listener.write().take() {
         let _ = slot.stop.send(true);
     }
-    let drained: Vec<SlotState> = {
+    let drained = {
         let mut links = state.links.lock();
         state.serving.store(false, Ordering::Release);
-        links.drain().map(|(_, slot_state)| slot_state).collect()
+        std::mem::take(&mut *links)
     };
-    for slot_state in drained {
+    for (_, slot_state) in drained {
         match slot_state {
             SlotState::Live(slot) => {
                 let _ = slot.command.send(LinkCommand::Close(reason));
@@ -808,7 +827,7 @@ async fn accept_loop(
         tokio::select! {
             _ = stop.changed() => return,
             accepted = listener.accept() => {
-                let (tcp, _peer_addr) = match accepted {
+                let (tcp, remote) = match accepted {
                     Ok(pair) => pair,
                     Err(err) => {
                         debug!(%err, "the accept failed");
@@ -830,7 +849,7 @@ async fn accept_loop(
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
                     let _permit = permit;
-                    inbound(state, tcp, identity).await;
+                    inbound(state, tcp, remote, identity).await;
                 });
             }
         }
@@ -839,7 +858,7 @@ async fn accept_loop(
 
 /// The listener's side of a handshake, until the link registers or the
 /// peer is refused.
-async fn inbound(state: Arc<NodeState>, tcp: TcpStream, identity: Identity) {
+async fn inbound(state: Arc<NodeState>, tcp: TcpStream, remote: SocketAddr, identity: Identity) {
     let config = server_config_for(
         &state.trust,
         state.verifier.clock(),
@@ -899,6 +918,7 @@ async fn inbound(state: Arc<NodeState>, tcp: TcpStream, identity: Identity) {
             dialer,
             dial,
             presented: identity.certificate.clone(),
+            remote,
         },
         tls,
     );
@@ -995,6 +1015,8 @@ struct Handshaken {
     dial: u64,
     /// The leaf this node presented at the handshake, DER.
     presented: Vec<u8>,
+    /// The connection's remote address.
+    remote: SocketAddr,
 }
 
 /// Send `slot` the presented chain when a renewal swapped it since the
@@ -1032,6 +1054,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         dialer,
         dial,
         presented,
+        remote,
     } = handshaken;
     let peer = &peer;
     let peer_key = peer.key();
@@ -1080,6 +1103,7 @@ fn register_link<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             }
             let slot = LinkSlot {
                 peer: (*peer).clone(),
+                remote: SocketAddr::new(remote.ip().to_canonical(), remote.port()),
                 leaf,
                 issuer,
                 numbers,

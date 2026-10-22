@@ -32,6 +32,44 @@ const TAB_NO_SCREEN: i32 = 2;
 /// app launched while the phone settles, is shown again once.
 const EARLY_CANCEL: Duration = Duration::from_secs(1);
 
+pub(crate) fn initialize_tls() -> Result<(), AuthSessionError> {
+    jni_call(|env, context| {
+        let context = env
+            .call_method(
+                context,
+                "getApplicationContext",
+                "()Landroid/content/Context;",
+                &[],
+            )?
+            .l()?;
+        let raw_vm = env.get_java_vm()?.get_java_vm_pointer();
+        let raw_context = context.into_raw();
+        #[expect(
+            unsafe_code,
+            reason = "the verifier uses jni 0.22 and manganis uses jni 0.21"
+        )]
+        // SAFETY: get_java_vm returns the live process's non-null Android VM, which supports JNI 1.6.
+        let vm = unsafe { jni::JavaVM::from_raw(raw_vm.cast()) };
+        let initialized = vm.with_top_local_frame(|verifier_env| {
+            #[expect(
+                unsafe_code,
+                reason = "the application context crosses the JNI wrapper boundary"
+            )]
+            // SAFETY: into_raw transfers the sole wrapper for this thread's local reference, whose parent frame outlives this callback.
+            let context =
+                unsafe { jni::objects::JObject::from_raw(verifier_env, raw_context.cast()) };
+            rustls_platform_verifier::android::init_with_env(verifier_env, context)
+        });
+        Ok(initialized.map_err(|err| {
+            if matches!(err, jni::errors::Error::JavaException) {
+                bridge_error(env, &manganis::jni::errors::Error::JavaException)
+            } else {
+                AuthSessionError::Bridge(err.to_string())
+            }
+        }))
+    })?
+}
+
 pub(crate) async fn authorize(url: &str, timeout: Duration) -> Result<String, AuthSessionError> {
     let plugin = construct()?;
     jni_call(|env, _| {

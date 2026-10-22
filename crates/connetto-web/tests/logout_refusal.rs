@@ -25,7 +25,7 @@ use std::rc::Rc;
 use connetto_client::reconnect::ReconnectPolicy;
 use connetto_client::{
     ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate,
-    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema,
+    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema, UnsyncedWrite,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::{FakeTransport, replica_key};
@@ -203,7 +203,7 @@ async fn stranded_worker(
 ) -> (
     ConnettoConnection<CountingTransport>,
     ContentArchive<BrowserStore>,
-    Vec<u64>,
+    Vec<UnsyncedWrite>,
 ) {
     let url = storage.db_url(REPLICA);
     let mut worker = ClientBuilder::new(
@@ -272,7 +272,7 @@ async fn a_delete_is_refused_while_a_write_is_stranded_and_force_overrides_it() 
     ticket_sent.notified().await;
 
     let pending = PendingWork {
-        mutation_seqs: stranded.clone(),
+        unsynced: stranded,
         content_files: 1,
         retired_files: Vec::new(),
     };

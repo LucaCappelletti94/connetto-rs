@@ -13,7 +13,7 @@ use connetto_client::{
 };
 use connetto_core::Cursor;
 use connetto_core::messages::{
-    BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, SubscriptionSpec,
+    BulkMessage, ContentTicketGrant, ControlMessage, HandshakeAck, SubscriptionSpec, WriterGrant,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -71,20 +71,24 @@ struct TicketTransport {
     mutation_sent: Rc<Cell<bool>>,
 }
 
+/// The relay worker's writer and the restore target's, distinct as two profiles' numbers are.
+const RELAY_WRITER: u64 = 1;
+const TARGET_WRITER: u64 = 2;
+
 impl TicketTransport {
     fn hanging(completed_subscribes: Rc<Cell<u32>>) -> Self {
         Self {
             completed_subscribes,
             stall_subscribe: true,
-            ..Self::new()
+            ..Self::counted(Rc::new(Cell::new(0)), RELAY_WRITER)
         }
     }
 
     fn new() -> Self {
-        Self::counted(Rc::new(Cell::new(0)))
+        Self::counted(Rc::new(Cell::new(0)), TARGET_WRITER)
     }
 
-    fn counted(completed_subscribes: Rc<Cell<u32>>) -> Self {
+    fn counted(completed_subscribes: Rc<Cell<u32>>, writer: u64) -> Self {
         let (answers, incoming) = mpsc::unbounded();
         answers
             .unbounded_send(IncomingFrame::Control(ControlMessage::HandshakeAck(
@@ -95,7 +99,10 @@ impl TicketTransport {
                     current_cursor: Cursor::new(Vec::new()),
                     schema_version: None,
                     initial_credits: 64,
-                    last_applied_seq: None,
+                    writer: Some(WriterGrant {
+                        number: writer,
+                        frontier: 0,
+                    }),
                 },
             )))
             .expect("queue handshake");
@@ -423,7 +430,7 @@ fn start_recovering_relay(
                 let transport = if attempt == 0 {
                     TicketTransport::hanging(Rc::clone(&completed_subscribes))
                 } else {
-                    TicketTransport::counted(Rc::clone(&completed_subscribes))
+                    TicketTransport::counted(Rc::clone(&completed_subscribes), RELAY_WRITER)
                 };
                 ready(Ok::<_, Infallible>(transport))
             }

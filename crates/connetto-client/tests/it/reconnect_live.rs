@@ -280,6 +280,7 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
+    .with_upkeep(Arc::new(super::support::KeyIndependentUpkeep))
     .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let slot: ServeSlot = Arc::new(Mutex::new(None));
@@ -370,16 +371,16 @@ async fn live_query_resumes_from_cursor_without_a_second_snapshot() {
 async fn offline_write_reflushes_after_resume() {
     let fixture = Fixture::acquire().await;
 
-    // Create the server write target schema and provision the watermark so
-    // the write target can record applied sequence numbers.
+    // Create the server write target schema and provision the writer tables
+    // so the write target can record the applied frontier.
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     // Writes need an explicitly writable table: a default materializer
     // rejects every client mutation.
     let materializer = Materializer::builder(PG_DDL)
@@ -493,11 +494,11 @@ async fn a_deferred_write_stays_local_and_lands_after_the_outage() {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     let writes = diesel_async::pooled_connection::bb8::Pool::builder()
         .max_size(1)
         // Opened at build, so the 100 ms checkout bounds only the outage and never the first connect.
@@ -621,6 +622,7 @@ async fn persisted_replica_resumes_across_restarts_without_a_snapshot() {
         pg_write_target::<ConnettoDefaults>(fixture.admin().clone(), PG_DDL)
             .expect("build write target"),
     )
+    .with_upkeep(Arc::new(super::support::KeyIndependentUpkeep))
     .build();
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
     let slot: ServeSlot = Arc::new(Mutex::new(None));

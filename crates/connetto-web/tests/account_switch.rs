@@ -26,7 +26,7 @@
 use connetto_client::cipher::{UnlockError, unlock};
 use connetto_client::{
     ClientBuilder, ClientError, ConnettoConnection, ContentPlace, Custody, FirstThen, Gate,
-    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema, replica_db_name,
+    HeldCredential, Located, ReplicaKey, ReplicaPlace, SyncSchema, UnsyncedWrite, replica_db_name,
 };
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
@@ -171,9 +171,9 @@ fn open_tier(
 
 /// First-boot the encrypted replica at `url` under `key`, write a row, and leave
 /// the captured mutation queued, since the fake server acknowledges the handshake
-/// and nothing else. Returns the pending sequence numbers, captured before the
-/// connection drops, which it must: one connection per database.
-async fn first_boot_with_a_queued_row(url: &str, key: ReplicaKey) -> Vec<u64> {
+/// and nothing else. Returns the pending writes, captured before the connection
+/// drops, which it must: one connection per database.
+async fn first_boot_with_a_queued_row(url: &str, key: ReplicaKey) -> Vec<UnsyncedWrite> {
     let mut conn = open_at(url, key, true).await.expect("first connect");
     assert!(
         conn.unsynced().is_empty(),

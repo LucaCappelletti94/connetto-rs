@@ -454,9 +454,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::MutationApplied { client_seq } => {
             Some(format!("mutation {client_seq} applied"))
         }
-        ClientEvent::MutationRejected { client_seq, .. } => {
-            Some(format!("mutation {client_seq} rejected"))
-        }
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => Some(format!("mutation {client_seq} rejected: {reason}")),
         ClientEvent::MutationConflict {
             client_seq,
             server_row,
@@ -565,13 +565,7 @@ async fn compute_expiry_for_session(
     let now_secs = (now_ms / 1000.0) as u64;
     let now = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(now_secs);
     let lead = std::time::Duration::from_secs(7 * 24 * 60 * 60);
-    let warning = expiry_warning(
-        now,
-        expires,
-        lead,
-        pending.mutation_seqs,
-        pending.content_files,
-    );
+    let warning = expiry_warning(now, expires, lead, pending.unsynced, pending.content_files);
     warned.set(warning.as_ref().map(|_| exp_secs));
     expiry_warn.set(warning);
 }

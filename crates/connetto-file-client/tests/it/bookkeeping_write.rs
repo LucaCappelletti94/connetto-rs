@@ -261,7 +261,7 @@ async fn provision(fixture: &Fixture) {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS photos CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
         ])
         .await;
     for statement in split_statements(connetto_file_server::DEPLOYMENT_DDL) {
@@ -270,9 +270,12 @@ async fn provision(fixture: &Fixture) {
     for statement in DEPLOYMENT {
         fixture.exec(statement).await;
     }
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
+        .exec(
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled \
+             TO app_writer",
+        )
         .await;
 }
 

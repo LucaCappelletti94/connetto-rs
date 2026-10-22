@@ -11,6 +11,7 @@ android {
 
     defaultConfig {
         minSdk = 24
+        consumerProguardFiles("consumer-rules.pro")
     }
 
     compileOptions {
@@ -26,3 +27,5 @@ android {
 tasks.withType<AbstractArchiveTask>().configureEach {
     archiveBaseName.set("dx-native-connetto-auth-session")
 }
+
+apply(from = file("verifier.gradle"))

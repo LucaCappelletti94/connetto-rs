@@ -12,7 +12,7 @@
 
 #![cfg(all(target_family = "wasm", target_os = "unknown"))]
 
-use connetto_client::cipher::ReplicaKey;
+use connetto_client::{UnsyncedWrite, WriterRef, cipher::ReplicaKey};
 use connetto_core::traits::ReplicaKeyStore;
 use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
@@ -76,7 +76,13 @@ fn read_marker(storage: &ReplicaStorage, name: &str, key: &ReplicaKey) -> String
 
 fn work(seqs: &[u64]) -> PendingWork {
     PendingWork {
-        mutation_seqs: seqs.to_vec(),
+        unsynced: seqs
+            .iter()
+            .map(|seq| UnsyncedWrite {
+                writer: WriterRef::Number(1),
+                seq: *seq,
+            })
+            .collect(),
         content_files: 0,
         retired_files: Vec::new(),
     }

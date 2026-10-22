@@ -47,6 +47,7 @@ pub mod bots;
 pub mod builder;
 pub mod capability;
 pub mod counters;
+pub mod courier;
 pub mod defaults;
 pub mod device_cert;
 pub mod epoch;
@@ -70,8 +71,8 @@ pub mod slot;
 pub mod snapshot;
 pub mod throttle;
 pub mod timeline;
-pub mod watermark_schema;
 pub mod write_target;
+pub mod writer_schema;
 
 pub use abuse::{
     AbuseConfig, AbuseConfigError, AbuseLimits, ConnectionLimits, Crossing, Enforcement,
@@ -81,6 +82,7 @@ pub use auth::{RlsAuth, RlsAuthError};
 pub use ban::{Ban, BanError, BanFuture, BanStore, ConnettoBanSchema, NewBan, pg_ban_store};
 pub use capability::{CapabilityIssuer, IssuedCapability, ShareError, ShareLevel};
 pub use connetto_core::auth::CapabilityKey;
+pub use courier::{CourierDelivery, CourierEntry, CourierRefusal};
 pub use fence::{ReadFence, Unseen, snapshot_cursor, split_snapshot_cursor};
 pub use guard::{PersonCloseHook, RequestGuard};
 // Re-exported because `ShareError::NotWritable` names one, so an application
@@ -139,11 +141,11 @@ pub use schema::ConnettoSchema;
 pub use session::{
     FailedAuthorization, NoSigner, PageKey, PageSpec, ReconnectEvent, ReconnectPolicy, ResumePoint,
     SessionConfig, SessionError, SessionManager, SnapshotEstimate, SnapshotPage, SnapshotSource,
-    StreamCheck, StreamCheckError, subject_set_reach,
+    StreamCheck, StreamCheckError, TermSeedRead, subject_set_reach,
 };
 pub use slot::{SlotError, SlotLag};
 pub use snapshot::{PgSnapshotSource, RowSource, SnapshotError, SourceRow};
 pub use throttle::{Limit, ReadLimits, ThrottleConfig, Tier, TierLimits};
 pub use timeline::{Position, TimelineError, TimelineHistory};
-pub use watermark_schema::ConnettoWatermarkSchema;
 pub use write_target::{PgWriteTarget, pg_write_target};
+pub use writer_schema::{ConnettoWriterSchema, SettlePath, SettledOutcome, SettledRow, WriterRow};

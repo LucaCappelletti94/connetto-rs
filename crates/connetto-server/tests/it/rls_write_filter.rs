@@ -17,7 +17,8 @@ use std::sync::Arc;
 
 use connetto_core::PROTOCOL_VERSION;
 use connetto_core::messages::{
-    BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, Ping,
+    BulkMessage, ControlMessage, Handshake, MutationHeader, MutationPatch, MutationRejectReason,
+    Ping,
 };
 use connetto_core::test_support::TestGrantChecker;
 use connetto_core::traits::{IncomingFrame, Transport};
@@ -38,7 +39,7 @@ pub(crate) const PG_DDL: &str =
 
 /// Shared setup for both tests. `Fixture` holds the process-wide serialization
 /// lock, so the two do not race each other's `DROP TABLE notes`, and it
-/// provisions `_connetto_mutations` fresh, which the writer role is granted on
+/// provisions the writer tables fresh, which the writer role is granted on
 /// below.
 pub(crate) async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
     fixture
@@ -56,7 +57,7 @@ pub(crate) async fn setup(fixture: &Fixture) -> Pool<AsyncPgConnection> {
                OR owner = ANY(string_to_array(current_setting('app.subjects', true), ',')))",
             "GRANT USAGE ON SCHEMA public TO app_writer",
             "GRANT SELECT, INSERT, UPDATE, DELETE ON notes TO app_writer",
-            "GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer",
+            "GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer",
         ])
         .await;
     pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await
@@ -314,6 +315,72 @@ async fn rls_write_filter_applies_owned_and_refuses_foreign() {
     }
 
     // Postgres holds only the owned row.
+    assert_eq!(notes(&admin).await, vec![(1, "alice".to_owned())]);
+
+    client.close().await.expect("close client");
+    server.await.expect("join server").expect("session ok");
+}
+
+/// A refusal that settled its sequence re-answers from the record, so a
+/// redelivery of the refused write is refused again without re-asking the
+/// policy, and the row it names still never applies.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_re_delivered_refused_write_re_answers_the_refusal_from_the_record() {
+    let fixture = Fixture::acquire().await;
+    let admin = fixture.admin().clone();
+    let writer_pool = setup(&fixture).await;
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(
+            RuntimeWritableCatalog::builder()
+                .versioned("notes", "edited_at")
+                .build(),
+        )
+        .build()
+        .expect("build materializer");
+    let target =
+        pg_write_target::<ConnettoDefaults>(writer_pool, PG_DDL).expect("build write target");
+    let manager = ManagerBuilder::new(
+        materializer,
+        NoSnapshot,
+        RosterAuth::granting("alice").withholding(WITHHELD_ID),
+        Arc::new(TestGrantChecker),
+        NoConnector,
+        target,
+    )
+    .build();
+
+    let (server_transport, mut client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+
+    handshake(&mut client, "alice").await;
+
+    // The owned row applies; the foreign one is refused and settled.
+    upload(&mut client, 1, insert_changeset(1, "alice", "mine", "t1")).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 1),
+        other => panic!("owned insert should apply, got {other:?}"),
+    }
+    let foreign = insert_changeset(2, "bob", "theirs", "t1");
+    upload(&mut client, 2, foreign.clone()).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => {
+            assert_eq!(reject.client_seq, 2);
+            assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+        }
+        other => panic!("foreign insert should be refused, got {other:?}"),
+    }
+
+    // The redelivery is answered from the stored refusal.
+    upload(&mut client, 2, foreign).await;
+    match next_control(&mut client).await {
+        ControlMessage::MutationReject(reject) => {
+            assert_eq!(reject.client_seq, 2);
+            assert_eq!(reject.reason, MutationRejectReason::Unauthorized);
+        }
+        other => panic!("the stored refusal should re-answer, got {other:?}"),
+    }
+
+    // Postgres holds only the owned row, twice over.
     assert_eq!(notes(&admin).await, vec![(1, "alice".to_owned())]);
 
     client.close().await.expect("close client");

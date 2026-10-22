@@ -44,7 +44,7 @@ use crate::session::{
     StreamCheck, StreamCheckError,
 };
 use crate::throttle::ThrottleConfig;
-use crate::watermark_schema::ConnettoWatermarkSchema;
+use crate::writer_schema::ConnettoWriterSchema;
 use connetto_core::auth::{CapabilityKey, DEFAULT_USER_SETTING};
 use connetto_core::messages::{ContentVerb, FatalErrorReason};
 use connetto_core::traits::{ContentTicketSigner, HandshakeAuthority};
@@ -78,6 +78,8 @@ pub const SYNC_PATH: &str = ws::SYNC_PATH;
 /// How long a shutdown waits for the live sessions to flush their close frame
 /// and tear down before returning anyway.
 pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+/// The writer sweep's cadence (R75 decision 5).
+pub const WRITER_SWEEP_CADENCE: Duration = Duration::from_secs(60);
 
 /// The file-serving half of the assembled server.
 pub use content::{ContentBuildError, ContentSettings, StoreSpec};
@@ -591,6 +593,30 @@ impl BackgroundTask {
     }
 }
 
+/// Spawn the writer sweep (R75 decision 5), the loop that prunes the settled
+/// rows of every device writer whose enrolment has been revoked or has gone
+/// absent, at the fixed cadence, the first pass at once.
+fn spawn_writer_sweep<D: ConnettoSchema>(manager: Arc<ServerManager<D>>) -> BackgroundTask {
+    BackgroundTask::new(tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(WRITER_SWEEP_CADENCE);
+        // The first tick completes at once, so the first pass does not wait
+        // a full cadence.
+        ticker.tick().await;
+        loop {
+            match manager.sweep_writer_rows().await {
+                Ok(0) => {}
+                Ok(pruned) => {
+                    tracing::info!(pruned, "the writer sweep pruned dead device writers");
+                }
+                Err(err) => {
+                    tracing::warn!(error = %err, "the writer sweep failed, the next pass retries");
+                }
+            }
+            ticker.tick().await;
+        }
+    }))
+}
+
 /// The shutdown half of a built server.
 pub struct ServerHandle<D = ConnettoDefaults>
 where
@@ -600,6 +626,7 @@ where
     lag_watch: Option<BackgroundTask>,
     sweep: Option<BackgroundTask>,
     status: Option<BackgroundTask>,
+    writer_sweep: BackgroundTask,
 }
 
 impl<D> Clone for ServerHandle<D>
@@ -612,6 +639,7 @@ where
             lag_watch: self.lag_watch.clone(),
             sweep: self.sweep.clone(),
             status: self.status.clone(),
+            writer_sweep: self.writer_sweep.clone(),
         }
     }
 }
@@ -631,6 +659,7 @@ where
         if let Some(sweep) = &self.sweep {
             sweep.stop();
         }
+        self.writer_sweep.stop();
         if let Some(status) = &self.status {
             status.stop();
         }
@@ -1275,7 +1304,7 @@ async fn require_schema_tables<D: ConnettoSchema>(
 ) -> Result<(), BuildError> {
     let members: [(&[&str], bool); 6] = [
         (<D::Auth as ConnettoStoreSchema>::TABLES, true),
-        (<D::Watermark as ConnettoWatermarkSchema>::TABLES, true),
+        (<D::Writers as ConnettoWriterSchema>::TABLES, true),
         (<D::Bans as ConnettoBanSchema>::TABLES, bans),
         (<D::Audit as ConnettoAuditSchema>::TABLES, audit),
         (<D::Enrolments as ConnettoEnrolmentSchema>::TABLES, devices),
@@ -1941,6 +1970,8 @@ fn assemble_parts<D: ConnettoSchema>(
     .layer(cors_layer(&settings.cors_origins));
     let sync_routes = ws::sync_routes(Arc::clone(&manager));
     let router = sync_routes.clone().merge(http_routes.clone());
+    // The writer sweep is always on (R75 decision 5).
+    let writer_sweep = spawn_writer_sweep(Arc::clone(&manager));
     ServerParts {
         router,
         sync_routes,
@@ -1957,6 +1988,7 @@ fn assemble_parts<D: ConnettoSchema>(
             lag_watch: wiring.lag_watch,
             sweep: wiring.sweep,
             status: wiring.status,
+            writer_sweep,
         },
     }
 }

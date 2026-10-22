@@ -2324,8 +2324,8 @@ where
         })
     }
 
-    /// The sequence numbers of the local writes the server has not confirmed,
-    /// the ones the pump has not queued yet among them.
+    /// The (writer, sequence) pairs of the local writes the server has not
+    /// confirmed, the ones the pump has not queued yet among them.
     ///
     /// The writes committed since the pump's last flush are queued first, so
     /// a guard reading this right after a write sees it. Non-empty means a
@@ -2335,7 +2335,7 @@ where
     ///
     /// [`ClientError::Locked`] while the gate is locked, and the
     /// [`ClientError`] queueing the writes surfaces.
-    pub async fn unsynced(&self) -> Result<Vec<u64>, ClientError> {
+    pub async fn unsynced(&self) -> Result<Vec<crate::UnsyncedWrite>, ClientError> {
         let mut state = self.shared.lock_interrupting().await;
         if self.shared.gate.is_locked() {
             return Err(ClientError::Locked);
@@ -2919,7 +2919,7 @@ where
 
     async fn store(&self, held: crate::enrolment::Held) -> Result<(), ClientError> {
         let mut state = self.shared.lock_interrupting().await;
-        state.conn.store_device_certificate(&held)
+        state.conn.store_device_certificate(&held).await
     }
 
     async fn forget(&self) -> Result<(), ClientError> {
@@ -2973,6 +2973,23 @@ where
             },
             enroller,
         )
+    }
+
+    /// Give the shared connection the device's keys and the enrolment task's
+    /// retirement steering, so a device writer can be bound (R75). The bind a
+    /// restarted device owed at its handshake arms here, on the live wire, now
+    /// that the keys are handed over.
+    ///
+    /// # Errors
+    ///
+    /// [`ClientError`] when the deferred bind cannot be signed or sent.
+    pub(crate) async fn with_device_writer(
+        &self,
+        keys: Arc<dyn crate::enrolment::DeviceKeys>,
+        retired: tokio::sync::mpsc::UnboundedSender<crate::enrolment::Command>,
+    ) -> Result<(), ClientError> {
+        let mut state = self.shared.lock_interrupting().await;
+        state.conn.with_device_writer(keys, retired).await
     }
 }
 

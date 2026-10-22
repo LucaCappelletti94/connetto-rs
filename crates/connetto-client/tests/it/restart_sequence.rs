@@ -1,12 +1,4 @@
-//! A write made after a restart reaches the server even when the run before
-//! the restart already had writes applied.
-//!
-//! An identified run keys the server's exactly-once watermark on the login
-//! session, which outlives the process, so the client's sequence numbers must
-//! keep climbing across restarts. A number the server has already applied
-//! is retired as a duplicate, and the write behind it never arrives.
-//!
-//! Needs Docker: the fixture starts its own Postgres.
+//! Writes retain their writer sequence across replica restarts.
 
 use core::time::Duration;
 use std::sync::Arc;
@@ -75,7 +67,7 @@ async fn spawn_server(manager: Arc<Manager>) -> std::net::SocketAddr {
     addr
 }
 
-/// The same login on every run, so the server keys every run on one session.
+/// The login credential reused across restarts.
 fn credential() -> HeldCredential {
     super::support::held_grant(Grant::new("user:token#restart"), "token")
 }

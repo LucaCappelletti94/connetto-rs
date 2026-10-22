@@ -14,7 +14,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use connetto_client::{ClientBuilder, ClientError};
-use connetto_core::messages::{ControlMessage, HandshakeAck};
+use connetto_core::messages::{ControlMessage, HandshakeAck, WriterGrant};
 use connetto_core::traits::{IncomingFrame, Transport};
 use connetto_core::{Cursor, LoopbackTransport, SchemaVersion, loopback};
 use connetto_wasm_smoke::RelayHub;
@@ -45,7 +45,10 @@ async fn schema_upstream(mut server: LoopbackTransport, server_version: SchemaVe
             current_cursor: Cursor::new(Vec::new()),
             schema_version: Some(server_version),
             initial_credits: 64,
-            last_applied_seq: None,
+            writer: Some(WriterGrant {
+                number: 1,
+                frontier: 0,
+            }),
         }))
         .await
         .expect("handshake ack");

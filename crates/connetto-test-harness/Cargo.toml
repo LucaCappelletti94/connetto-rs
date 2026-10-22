@@ -120,6 +120,7 @@ futures-util = { version = "0.3", default-features = false, features = ["std", "
 parking_lot = "0.12"
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 # The smoke test reads a table back through the admin pool with a typed row.
 diesel = { workspace = true, features = ["postgres_backend"] }
 # Building the row a mutation uploads, in the outage proof.

@@ -1,13 +1,13 @@
 //! The discovery driver, the discovery table's advertisement, browse and
 //! dials behind the crate's `discovery` feature.
 
-use mdns_sd::{
-    DaemonEvent, IfKind, MDNS_PORT, ResolvedService, ServiceDaemon, ServiceEvent, ServiceInfo,
-};
+use mdns_sd::{DaemonEvent, IfKind, MDNS_PORT, ServiceDaemon, ServiceEvent, ServiceInfo};
 use parking_lot::Mutex;
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::HashMap;
+use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -23,12 +23,175 @@ use crate::fingerprint::Fingerprint;
 use crate::frame::PROTOCOL_VERSION;
 use crate::policy::{Action, DialOutcome, Policy};
 
-/// The service type discovery announces under.
+/// The DNS-SD service type discovery advertises and browses, without its domain.
+pub const DNS_SD_SERVICE: &str = "_connetto-peer._tcp";
+/// The service type in the `local.` domain, as `mdns-sd` names it.
 const SERVICE_TYPE: &str = "_connetto-peer._tcp.local.";
 /// The TXT key the frame version rides under.
 const TXT_VERSION: &str = "v";
 /// The TXT key the leaf fingerprint rides under.
 const TXT_FINGERPRINT: &str = "fp";
+
+/// What a DNS-SD session reports about the service type it browses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DnsSdEvent {
+    /// The instance `name` stands at `addresses` with its TXT pairs, the full set replacing any earlier one.
+    Resolved {
+        /// The instance's name, as the session reports it.
+        name: String,
+        /// The instance's TXT pairs, a key without a value carrying none.
+        txt: Vec<(String, Option<Vec<u8>>)>,
+        /// Every address the instance answers at, with its port.
+        addresses: Vec<SocketAddr>,
+    },
+    /// The instance `name` left.
+    Removed {
+        /// The instance's name, as the session reports it.
+        name: String,
+    },
+    /// The session can no longer serve, so the round opens a fresh one.
+    Restart,
+    /// A fault the session survives, for the log.
+    Fault(String),
+}
+
+/// Where a DNS-SD session reports its events.
+pub type DnsSdSink = Box<dyn FnMut(DnsSdEvent) + Send>;
+
+/// A platform's DNS-SD service, browsing [`DNS_SD_SERVICE`] and advertising under it.
+pub trait DnsSd: Send + Sync {
+    /// Open a session that browses the service type and reports to `events`.
+    ///
+    /// # Errors
+    ///
+    /// When the platform's service will not start.
+    fn open(&self, events: DnsSdSink) -> io::Result<Box<dyn DnsSdSession>>;
+}
+
+/// One browse and its advertisements, all ended when the session drops.
+pub trait DnsSdSession: Send {
+    /// Advertise the instance `name` at `port` with the TXT pairs `txt`.
+    ///
+    /// # Errors
+    ///
+    /// When the session no longer runs or refuses the advertisement.
+    fn register(&mut self, name: &str, port: u16, txt: &[(&str, &str)]) -> io::Result<()>;
+
+    /// End the advertisement `name`.
+    fn unregister(&mut self, name: &str);
+}
+
+/// The `mdns-sd` daemon in the process, the default DNS-SD service.
+#[derive(Debug, Clone, Copy)]
+struct MdnsSd {
+    /// The mDNS port the daemon binds.
+    port: u16,
+    /// The daemon restricted to the loopback, where the proofs run.
+    loopback_only: bool,
+}
+
+/// One `mdns-sd` daemon, its browse forwarded by a task.
+struct MdnsSdSession {
+    daemon: ServiceDaemon,
+    /// The full names the advertisements went out under, by instance name.
+    registered: HashMap<String, String>,
+    forward: tokio::task::JoinHandle<()>,
+}
+
+impl DnsSd for MdnsSd {
+    fn open(&self, mut events: DnsSdSink) -> io::Result<Box<dyn DnsSdSession>> {
+        let daemon = ServiceDaemon::new_with_port(self.port).map_err(io::Error::other)?;
+        let started = (|| {
+            if self.loopback_only {
+                daemon.disable_interface(IfKind::All)?;
+                daemon.enable_interface(IfKind::LoopbackV4)?;
+            }
+            Ok::<_, mdns_sd::Error>((daemon.browse(SERVICE_TYPE)?, daemon.monitor()?))
+        })();
+        let (browse, monitor) = match started {
+            Ok(channels) => channels,
+            Err(err) => {
+                let _ = daemon.shutdown();
+                return Err(io::Error::other(err));
+            }
+        };
+        let forward = tokio::spawn(async move {
+            loop {
+                let event = tokio::select! {
+                    event = browse.recv_async() => {
+                        let Ok(event) = event else { return };
+                        match event {
+                            ServiceEvent::ServiceResolved(resolved) => DnsSdEvent::Resolved {
+                                txt: resolved
+                                    .txt_properties
+                                    .iter()
+                                    .map(|pair| (pair.key().to_owned(), pair.val().map(<[u8]>::to_vec)))
+                                    .collect(),
+                                addresses: resolved
+                                    .addresses
+                                    .iter()
+                                    .map(|ip| SocketAddr::new(ip.to_ip_addr(), resolved.port))
+                                    .collect(),
+                                name: resolved.fullname,
+                            },
+                            ServiceEvent::ServiceRemoved(_service_type, fullname) => {
+                                DnsSdEvent::Removed { name: fullname }
+                            }
+                            // The search's own bookkeeping, which the browse owns.
+                            _ => continue,
+                        }
+                    }
+                    event = monitor.recv_async() => {
+                        let Ok(event) = event else { return };
+                        match event {
+                            // The host's addresses moved, so the round browses again.
+                            DaemonEvent::IpAdd(_) | DaemonEvent::IpDel(_) => DnsSdEvent::Restart,
+                            DaemonEvent::Error(err) => DnsSdEvent::Fault(err.to_string()),
+                            _ => continue,
+                        }
+                    }
+                };
+                events(event);
+            }
+        });
+        Ok(Box::new(MdnsSdSession {
+            daemon,
+            registered: HashMap::new(),
+            forward,
+        }))
+    }
+}
+
+impl DnsSdSession for MdnsSdSession {
+    fn register(&mut self, name: &str, port: u16, txt: &[(&str, &str)]) -> io::Result<()> {
+        // The SRV target is the instance's own hostname, the one name
+        // `mdns-sd` accepts for a `.local.` host.
+        let host = format!("{name}.local.");
+        let info = ServiceInfo::new(SERVICE_TYPE, name, &host, (), port, txt)
+            .map_err(io::Error::other)?
+            .enable_addr_auto();
+        let fullname = info.get_fullname().to_owned();
+        self.daemon.register(info).map_err(io::Error::other)?;
+        self.registered.insert(name.to_owned(), fullname);
+        Ok(())
+    }
+
+    fn unregister(&mut self, name: &str) {
+        if let Some(fullname) = self.registered.remove(name) {
+            let _ = self.daemon.unregister(&fullname);
+        }
+    }
+}
+
+impl Drop for MdnsSdSession {
+    fn drop(&mut self) {
+        for (_, fullname) in self.registered.drain() {
+            let _ = self.daemon.unregister(&fullname);
+        }
+        let _ = self.daemon.shutdown();
+        self.forward.abort();
+    }
+}
 
 /// What discovery tells the device about the instances it sees.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,10 +224,10 @@ pub struct Discovery {
     events: mpsc::UnboundedSender<DiscoveryEvent>,
     /// The driver, once the first serve has spawned the runner.
     running: AtomicBool,
-    /// The mDNS port the daemon binds.
-    mdns_port: u16,
-    /// The daemon restricted to the loopback, where the proofs run.
-    loopback_only: bool,
+    /// The default `mdns-sd` service's settings.
+    mdns: MdnsSd,
+    /// The platform's DNS-SD service, in place of `mdns-sd`.
+    platform: Option<Arc<dyn DnsSd>>,
 }
 
 impl std::fmt::Debug for Discovery {
@@ -109,8 +272,11 @@ impl Discovery {
             rx: Mutex::new(Some(rx)),
             events,
             running: AtomicBool::new(false),
-            mdns_port: MDNS_PORT,
-            loopback_only: false,
+            mdns: MdnsSd {
+                port: MDNS_PORT,
+                loopback_only: false,
+            },
+            platform: None,
         }
     }
 
@@ -118,14 +284,21 @@ impl Discovery {
     /// proofs.
     #[must_use]
     pub fn with_mdns_port(mut self, port: u16) -> Self {
-        self.mdns_port = port;
+        self.mdns.port = port;
         self
     }
 
     /// Restrict the daemon to the loopback interface, where the proofs run.
     #[must_use]
     pub fn loopback_only(mut self) -> Self {
-        self.loopback_only = true;
+        self.mdns.loopback_only = true;
+        self
+    }
+
+    /// Advertise and browse through the platform's DNS-SD service in place of `mdns-sd`.
+    #[must_use]
+    pub fn with_dns_sd(mut self, dns_sd: Arc<dyn DnsSd>) -> Self {
+        self.platform = Some(dns_sd);
         self
     }
 
@@ -140,8 +313,7 @@ impl Discovery {
                     handle.spawn(run(
                         self.node.clone(),
                         self.autolink,
-                        self.mdns_port,
-                        self.loopback_only,
+                        self.platform.clone().unwrap_or_else(|| Arc::new(self.mdns)),
                         rx,
                         self.tx.downgrade(),
                         self.events.clone(),
@@ -190,8 +362,7 @@ impl Discovery {
 async fn run(
     node: Node,
     autolink: bool,
-    mdns_port: u16,
-    loopback_only: bool,
+    dns_sd: Arc<dyn DnsSd>,
     mut commands: mpsc::UnboundedReceiver<Command>,
     commands_tx: mpsc::WeakUnboundedSender<Command>,
     events: mpsc::UnboundedSender<DiscoveryEvent>,
@@ -215,8 +386,7 @@ async fn run(
         loop {
             let re_browse = serve_round(
                 &node,
-                mdns_port,
-                loopback_only,
+                dns_sd.as_ref(),
                 &mut commands,
                 &commands_tx,
                 &events,
@@ -236,15 +406,10 @@ async fn run(
 /// One round of the browse, until the standing leaves or a re-browse is due.
 ///
 /// Answers `true` when the standing holds and a re-browse is due.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "each input is a distinct channel or config"
-)]
 #[expect(clippy::too_many_lines, reason = "the select! loop is one unit")]
 async fn serve_round(
     node: &Node,
-    mdns_port: u16,
-    loopback_only: bool,
+    dns_sd: &dyn DnsSd,
     commands: &mut mpsc::UnboundedReceiver<Command>,
     commands_tx: &mpsc::WeakUnboundedSender<Command>,
     events: &mpsc::UnboundedSender<DiscoveryEvent>,
@@ -252,42 +417,20 @@ async fn serve_round(
     current: &mut (u16, Fingerprint),
 ) -> bool {
     let (port, own) = *current;
-    let daemon = match ServiceDaemon::new_with_port(mdns_port) {
-        Ok(daemon) => daemon,
+    let (found_tx, mut found) = mpsc::unbounded_channel();
+    let sink: DnsSdSink = Box::new(move |event| {
+        let _ = found_tx.send(event);
+    });
+    let mut session = match dns_sd.open(sink) {
+        Ok(session) => session,
         Err(err) => {
-            warn!(%err, "the mDNS daemon will not start, so discovery waits");
-            return false;
-        }
-    };
-    if loopback_only {
-        let loopback = (|| {
-            daemon.disable_interface(IfKind::All)?;
-            daemon.enable_interface(IfKind::LoopbackV4)
-        })();
-        if let Err(err) = loopback {
-            warn!(%err, "the loopback will not select, so discovery waits");
-            return false;
-        }
-    }
-    let browse = match daemon.browse(SERVICE_TYPE) {
-        Ok(browse) => browse,
-        Err(err) => {
-            warn!(%err, "the browse will not start, so discovery waits");
-            return false;
-        }
-    };
-    let monitor = match daemon.monitor() {
-        Ok(monitor) => monitor,
-        Err(err) => {
-            warn!(%err, "the monitor will not start, so discovery waits");
+            warn!(%err, "the DNS-SD service will not start, so discovery waits");
             return false;
         }
     };
     let mut names: HashMap<String, Fingerprint> = HashMap::new();
-    let mut registered: Option<String> = None;
-    if let Some(fullname) = register(&daemon, own, port) {
-        registered = Some(fullname);
-    } else {
+    let mut registered = register(session.as_mut(), own, port);
+    if registered.is_none() {
         warn!("the advertisement will not register, so the browse alone serves");
     }
     // The round's retry timers, one per fingerprint, ending with it.
@@ -305,7 +448,7 @@ async fn serve_round(
                             // fingerprint, and the advertisement follows the
                             // port.
                             if (port, own) != *current {
-                                re_register(&daemon, &mut registered, policy, port, own);
+                                re_register(session.as_mut(), &mut registered, policy, port, own);
                                 *current = (port, own);
                             }
                         }
@@ -340,28 +483,22 @@ async fn serve_round(
                         }
                     }
                 }
-                event = browse.recv_async() => {
-                    let Ok(event) = event else {
-                        warn!("the browse channel closed, so the browse ends");
+                event = found.recv() => {
+                    let Some(event) = event else {
+                        warn!("the DNS-SD session ended, so the browse ends");
                         break false;
                     };
                     match event {
-                        ServiceEvent::ServiceResolved(resolved) => {
-                            let Some(fp) = fingerprint_of(&resolved) else {
+                        DnsSdEvent::Resolved { name, txt, addresses } => {
+                            let Some(fp) = fingerprint_of(&txt) else {
                                 continue;
                             };
-                            let name = resolved.fullname.clone();
                             names.insert(name.clone(), fp);
-                            let addresses: Vec<SocketAddr> = resolved
-                                .addresses
-                                .iter()
-                                .map(|ip| SocketAddr::new(ip.to_ip_addr(), resolved.port))
-                                .collect();
                             let actions = policy.found(&name, fp, &addresses);
                             apply(&actions, fp, node, commands_tx, events, policy);
                         }
-                        ServiceEvent::ServiceRemoved(_service_type, fullname) => {
-                            let Some(fp) = names.remove(&fullname) else {
+                        DnsSdEvent::Removed { name } => {
+                            let Some(fp) = names.remove(&name) else {
                                 continue;
                             };
                             // The peer may have re-advertised under a fresh
@@ -375,25 +512,13 @@ async fn serve_round(
                             };
                             apply(&actions, fp, node, commands_tx, events, policy);
                         }
-                        // The search's own bookkeeping, which the browse owns.
-                        _ => {}
-                    }
-                }
-                event = monitor.recv_async() => {
-                    match event {
-                        // The host's addresses moved, so the same standing
-                        // browses again, the policy holding.
-                        Ok(DaemonEvent::IpAdd(_) | DaemonEvent::IpDel(_)) => {
+                        // The same standing browses again, the policy holding.
+                        DnsSdEvent::Restart => {
                             policy.addresses_changed();
                             break true;
                         }
-                        Ok(DaemonEvent::Error(err)) => {
-                            warn!(%err, "the mDNS daemon met an error");
-                        }
-                        Ok(_) => {}
-                        Err(_) => {
-                            warn!("the monitor channel closed, so the browse ends");
-                            break false;
+                        DnsSdEvent::Fault(fault) => {
+                            warn!(%fault, "the DNS-SD service met a fault");
                         }
                     }
                 }
@@ -404,48 +529,45 @@ async fn serve_round(
     for (_, timer) in retry_timers.drain() {
         timer.abort();
     }
-    if let Some(fullname) = registered {
-        let _ = daemon.unregister(&fullname);
+    if let Some(name) = registered {
+        session.unregister(&name);
     }
-    let _ = daemon.shutdown();
     re_browse
 }
 
 /// Register the advertisement under a fresh name at `port` carrying `own`.
-fn register(daemon: &ServiceDaemon, own: Fingerprint, port: u16) -> Option<String> {
+fn register(session: &mut dyn DnsSdSession, own: Fingerprint, port: u16) -> Option<String> {
     let name = random_name();
-    // The SRV target is the instance's own hostname, the one name
-    // `mdns-sd` accepts for a `.local.` host.
-    let host = format!("{name}.local.");
     let version = PROTOCOL_VERSION.to_string();
     let fingerprint = own.to_string();
     let props = [
         (TXT_VERSION, version.as_str()),
         (TXT_FINGERPRINT, fingerprint.as_str()),
     ];
-    let info = ServiceInfo::new(SERVICE_TYPE, &name, &host, (), port, &props[..])
-        .expect("the service names hold")
-        .enable_addr_auto();
-    let fullname = info.get_fullname().to_string();
-    daemon.register(info).ok().map(|()| fullname)
+    match session.register(&name, port, &props) {
+        Ok(()) => Some(name),
+        Err(err) => {
+            warn!(%err, "the advertisement was refused");
+            None
+        }
+    }
 }
 
 /// Drop the old registration and register the renewal, moving the policy's
 /// own fingerprint with it.
 fn re_register(
-    daemon: &ServiceDaemon,
+    session: &mut dyn DnsSdSession,
     registered: &mut Option<String>,
     policy: &mut Policy,
     port: u16,
     own: Fingerprint,
 ) {
-    if let Some(fullname) = registered.take() {
-        let _ = daemon.unregister(fullname.as_str());
+    if let Some(name) = registered.take() {
+        session.unregister(&name);
     }
     policy.set_own(own);
-    if let Some(fullname) = register(daemon, own, port) {
-        *registered = Some(fullname);
-    } else {
+    *registered = register(session, own, port);
+    if registered.is_none() {
         warn!("the renewed advertisement will not register");
     }
 }
@@ -589,14 +711,14 @@ fn fingerprint_text(text: &str) -> Option<Fingerprint> {
     Some(Fingerprint::new(bytes))
 }
 
-/// The fingerprint a resolved instance carries, when it carries one.
-fn fingerprint_of(resolved: &ResolvedService) -> Option<Fingerprint> {
-    let value = resolved
-        .txt_properties
-        .get_property_val(TXT_FINGERPRINT)
-        .and_then(|value| value)?;
-    let text = std::str::from_utf8(value).ok()?;
-    fingerprint_text(text)
+/// The fingerprint a resolved instance's TXT pairs carry, when they carry one.
+fn fingerprint_of(txt: &[(String, Option<Vec<u8>>)]) -> Option<Fingerprint> {
+    let value = txt
+        .iter()
+        .find(|(key, _)| key == TXT_FINGERPRINT)
+        .and_then(|(_, value)| value.as_deref())?;
+    let hex = std::str::from_utf8(value).ok()?;
+    fingerprint_text(hex)
 }
 
 #[cfg(test)]

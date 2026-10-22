@@ -26,6 +26,7 @@
 //! unreadable and already lost, and no guard can pretend otherwise: the
 //! documented recovery is [`purge_replica`] with `force`.
 
+use crate::UnsyncedWrite;
 use std::time::{Duration, SystemTime};
 
 /// A proactive warning that the local session is near its end while local work
@@ -34,8 +35,8 @@ use std::time::{Duration, SystemTime};
 pub struct ExpiryWarning {
     /// When the session (refresh-token lifetime) lapses if never refreshed.
     pub session_expires_at: SystemTime,
-    /// The unsynced mutation sequence numbers at risk.
-    pub unsynced: Vec<u64>,
+    /// The unsynced (writer, sequence) pairs at risk.
+    pub unsynced: Vec<UnsyncedWrite>,
     /// Additional local items at risk outside the mutation queue.
     pub additional_pending: u64,
 }
@@ -56,7 +57,7 @@ pub fn expiry_warning(
     now: SystemTime,
     session_expires_at: SystemTime,
     lead: Duration,
-    unsynced: Vec<u64>,
+    unsynced: Vec<UnsyncedWrite>,
     additional_pending: u64,
 ) -> Option<ExpiryWarning> {
     if unsynced.is_empty() && additional_pending == 0 {
@@ -79,7 +80,7 @@ pub enum PurgeError {
     /// The replica still holds unsynced mutations and `force` was not set, so
     /// the purge is refused rather than silently discarding them.
     #[error("purge blocked: {} unsynced mutation(s) would be lost", .0.len())]
-    Unsynced(Vec<u64>),
+    Unsynced(Vec<UnsyncedWrite>),
     /// Deleting a replica file failed.
     #[error("purge io error: {0}")]
     Io(String),
@@ -146,7 +147,7 @@ fn remove_absent_ok(path: &std::path::Path) -> Result<(), PurgeError> {
 #[cfg(feature = "native-transport")]
 pub fn purge_replica(
     db_path: &std::path::Path,
-    unsynced: &[u64],
+    unsynced: &[UnsyncedWrite],
     force: bool,
 ) -> Result<(), PurgeError> {
     if !unsynced.is_empty() && !force {
@@ -203,7 +204,7 @@ pub async fn wipe_replica<S>(
     db_path: &std::path::Path,
     key_store: &S,
     key_name: &str,
-    unsynced: &[u64],
+    unsynced: &[UnsyncedWrite],
     force: bool,
 ) -> Result<(), PurgeError>
 where
@@ -263,7 +264,7 @@ pub(crate) async fn forget_device<S>(
     db_path: &std::path::Path,
     key_store: &S,
     key_name: &str,
-    unsynced: &[u64],
+    unsynced: &[UnsyncedWrite],
     force: bool,
 ) -> Result<(), ForgetError>
 where
@@ -280,7 +281,15 @@ where
 #[cfg(all(test, feature = "native-transport"))]
 mod tests {
     use super::{PurgeError, expiry_warning, purge_replica};
+    use crate::{UnsyncedWrite, WriterRef};
     use std::time::{Duration, SystemTime};
+
+    fn pair(number: u64, seq: u64) -> UnsyncedWrite {
+        UnsyncedWrite {
+            writer: WriterRef::Number(number),
+            seq,
+        }
+    }
 
     #[test]
     fn warns_only_when_near_expiry_with_unsynced() {
@@ -290,12 +299,13 @@ mod tests {
         let expires_far = now + Duration::from_secs(600);
 
         // Near expiry with queued work: warn, carrying the deadline and seqs.
-        let warning = expiry_warning(now, expires_soon, lead, vec![1, 2], 0).expect("warn");
+        let warning =
+            expiry_warning(now, expires_soon, lead, vec![pair(1, 1), pair(1, 2)], 0).expect("warn");
         assert_eq!(warning.session_expires_at, expires_soon);
-        assert_eq!(warning.unsynced, vec![1, 2]);
+        assert_eq!(warning.unsynced, vec![pair(1, 1), pair(1, 2)]);
 
         assert!(expiry_warning(now, expires_soon, lead, Vec::new(), 0).is_none());
-        assert!(expiry_warning(now, expires_far, lead, vec![1], 0).is_none());
+        assert!(expiry_warning(now, expires_far, lead, vec![pair(1, 1)], 0).is_none());
         let content = expiry_warning(now, expires_soon, lead, Vec::new(), 1).expect("warn");
         assert_eq!(content.additional_pending, 1);
     }
@@ -308,14 +318,14 @@ mod tests {
         std::fs::write(dir.path().join("replica.sqlite-wal"), b"wal").expect("seed wal");
 
         // Unsynced work without force is refused, and nothing is deleted.
-        match purge_replica(&db, &[7], false) {
-            Err(PurgeError::Unsynced(unsynced)) => assert_eq!(unsynced, vec![7]),
+        match purge_replica(&db, &[pair(1, 7)], false) {
+            Err(PurgeError::Unsynced(unsynced)) => assert_eq!(unsynced, vec![pair(1, 7)]),
             other => panic!("expected Unsynced, got {other:?}"),
         }
         assert!(db.exists(), "blocked purge deletes nothing");
 
         // Forcing past unsynced work removes the file and its sidecar.
-        purge_replica(&db, &[7], true).expect("forced purge");
+        purge_replica(&db, &[pair(1, 7)], true).expect("forced purge");
         assert!(!db.exists(), "forced purge removes the replica");
         assert!(
             !dir.path().join("replica.sqlite-wal").exists(),

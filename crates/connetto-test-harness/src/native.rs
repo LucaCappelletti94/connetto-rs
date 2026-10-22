@@ -176,7 +176,7 @@ mod tests {
     use super::{NativePrograms, POSTGRES_BIN_VAR, POSTGRES_TEMPLATE_VAR};
     use crate::Fixture;
     use crate::stack::TempDir;
-    use connetto_server::defaults::_connetto_mutations;
+    use connetto_server::defaults::_connetto_writers;
 
     /// The directory of the `pg_ctl` on `PATH`, else the newest server
     /// programs of the Debian and Ubuntu layout, which the CI runners ship.
@@ -267,12 +267,12 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(wal_level, "logical");
-        let pending: i64 = _connetto_mutations::table
+        let writers: i64 = _connetto_writers::table
             .count()
             .get_result(&mut conn)
             .await
-            .expect("the watermark table was provisioned");
-        assert_eq!(pending, 0);
+            .expect("the writer tables were provisioned");
+        assert_eq!(writers, 0);
         assert!(
             template.join("postmaster.pid").metadata().is_err(),
             "the server ran on the template itself"

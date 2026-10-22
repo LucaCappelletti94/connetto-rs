@@ -2,7 +2,7 @@
 -- CONNETTO_READER_URL. Kept apart from schema.sql because that file also
 -- feeds CONNETTO_PG_DDL and the pg2sqlite translation in build.rs, which
 -- expect pure table DDL. Apply after schema.sql and after creating the
--- _connetto_mutations watermark table.
+-- _connetto_writers and _connetto_settled writer tables.
 DO $$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'connetto_reader') THEN
     CREATE ROLE connetto_reader LOGIN PASSWORD 'connetto_reader';
@@ -14,4 +14,4 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON order_lines TO connetto_reader;
 -- Photo rows travel the same path as the orders, and the demo write path
 -- inserts them as connetto_reader, so the writer grant sits with the others.
 GRANT SELECT, INSERT, UPDATE, DELETE ON photos TO connetto_reader;
-GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO connetto_reader;
+GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO connetto_reader;

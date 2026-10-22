@@ -114,9 +114,27 @@ CREATE TABLE connetto_provider_tokens (
     expires_at    TIMESTAMPTZ
 );
 
-CREATE TABLE _connetto_mutations (
-    session_id UUID PRIMARY KEY,
-    last_seq   BIGINT NOT NULL
+CREATE TYPE connetto_settle_path AS ENUM ('direct', 'restore', 'courier');
+
+CREATE TABLE _connetto_writers (
+    writer     BIGINT PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    user_id    <IdSqlType>,
+    session_id UUID,
+    device_key BYTEA UNIQUE,
+    frontier   BIGINT NOT NULL DEFAULT 0,
+    head       BYTEA,
+    retired_at TIMESTAMPTZ
+);
+
+CREATE TABLE _connetto_settled (
+    writer     BIGINT NOT NULL,
+    seq        BIGINT NOT NULL,
+    entry_hash BYTEA NOT NULL,
+    previous_hash BYTEA NOT NULL,
+    outcome    TEXT NOT NULL,
+    path       connetto_settle_path NOT NULL,
+    settled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    PRIMARY KEY (writer, seq)
 );
 
 CREATE TYPE connetto_change_op AS ENUM ('insert', 'update', 'delete', 'truncate');
@@ -143,15 +161,17 @@ CREATE TABLE connetto_oplog_commit (
 );
 ```
 
-**Built (R2).** The watermark keys on the session handle alone. It needs a stable per-client handle, which is what a session is, and it does not need to know who the client is, so the earlier `user_id` column only widened the shape the table has to satisfy.
+The writer frontier keys on a server-issued writer number. A device writer additionally has a unique `device_key` and survives its enrolment connection. `user_id` is nullable for anonymous writers. `frontier` is the highest settled sequence and `head` its chain hash. `_connetto_settled` stores each `(writer, seq)` with its entry hash, `previous_hash`, outcome and delivery path. A retained entry verifies against its own predecessor evidence after pruning. Missing or malformed retained hashes fail redelivery explicitly.
 
 **The reconnect log is on this list as of R32 (2026-08-09), and the server refuses to start without it.** It holds what a returning client missed, and it used to live only in the server's memory, so it was empty on every boot and answered "you have missed nothing" to every client that came back after a restart, which sent them nothing and left them silently stale. Durable, it answers from evidence. `CONNETTO_OPLOG_TABLE` names it, defaulting to `connetto_oplog`, and `PgOplog::ensure_schema` creates this schema for a scratch database, each object only when it is absent. The boot check refuses a table that predates the compressed patch, naming the table and the column it lacks.
 
-**A boot-time check on that shape existed and was deleted on 2026-08-06.** It read Postgres's catalogue and refused a table carrying a leftover `user_id`. Two things were wrong with it. It hardcoded connetto's default column names while being generic over `ConnettoWatermarkSchema`, so it would have refused exactly the application-owned table the trait exists to permit, and the trait already carries the typed upsert the compiler checks. And its stated reason, that a mis-keyed record stays silent until a replay, was false: the pre-R2 two-column key fails on the first write with `there is no unique or exclusion constraint matching the ON CONFLICT specification`, and a missing table with `relation "_connetto_mutations" does not exist`. Both are loud, verified against Postgres.
+**The writer tables reference nothing.** `user_id` is a plain column, not a foreign key into `connetto_sessions`, for the same reason an earlier watermark column was dropped. Every run has a writer, and only a login has a row in `connetto_sessions`, so a foreign key would refuse the first write by an anonymous caller. Widening `connetto_sessions` to hold an unidentified visit was considered and rejected: its `user_id` and `current_refresh_hash` would both have to become nullable, which weakens the shape for every real login. So `user_id` is nullable and unkeyed. A deployment that wants a hard link can add the constraint in its own migration, but connetto's reference does not, and an anonymous write stays exactly-once either way.
 
-**Decided (R3), and it is why the watermark table references nothing.** It used to declare `session_id` as a foreign key into `connetto_sessions`, cascading on delete. Every run has a handle, and only a login has a row in `connetto_sessions`, so the first write by a caller with no identity violated that constraint. Widening `connetto_sessions` to hold an unidentified visit was considered and rejected: its `user_id` and `current_refresh_hash` would both have to become nullable, which weakens the shape for every real login, and four of its six columns would be permanently empty for a visit with nothing to keep alive and nothing to revoke. Keeping unidentified callers away from the watermark was also rejected, because it breaks the uniformity the minted handle was chosen to buy and makes an anonymous write no longer exactly-once. So the reference drops the key. A table that still declares one refuses the first write by a caller with no identity, loudly, which is the same treatment every other stale shape now gets. The tidy-up it provided was doing no work: nothing in connetto deletes a session row, so an application pruning old watermark rows always had to do it deliberately.
+A number writer issued to a caller with no identity carries the run's durable handle in `session_id`, set only there, because a caller with no account has no account to check a number against and numbers are sequential, so only that run confirms, prunes, retires, or names the writer as provenance while every other caller, anonymous or identified, meets it as a number that is no writer of its own. An identified caller's number writer leaves `session_id` empty and is matched by `user_id` alone.
 
-`session_id` is connetto-minted and connetto-owned (a `Copy` uuid value type, stored in a native `uuid` column and rendered to text only at the JWT `sid` claim and the refresh token). The `_connetto_mutations` table is the durable exactly-once watermark: the server keys it on the `session_id` from the verified access token (never the client-fabricated `client_id`), so a worker restart or leader failover reusing the same session does not replay already-committed mutations. Its `ConnettoWatermarkSchema` impl and `diesel::table!` come from `connetto_schema!` as the `Watermark` member of `ConnettoSchema`. A deployment with a different shape implements the trait by hand and names it there.
+**A boot-time check on the writer shape exists.** The preflight reads the catalogue and refuses a missing writer table, naming the table it lacks, and it never checks columns. The check is generic over `ConnettoWriterSchema` and names only the tables the trait's `TABLES` member lists, never the column names a deployment may have chosen, so it does not refuse the application-owned table the trait exists to permit. The trait already carries the typed statements the compiler checks, and a missing table fails the first handshake with `relation "_connetto_writers" does not exist`, which is loud.
+
+The `writer` number is connetto-minted and connetto-owned. The server issues it on the handshake and stores it as the primary key of `_connetto_writers`, so a restarted or rebalanced client that reconnects with the same number resumes from its stored frontier instead of replaying what it already settled, and a worker restart or leader failover cannot issue a second number for the same writer. Its `ConnettoWriterSchema` impl and the two `diesel::table!`s come from `connetto_schema!` as the `Writers` member of `ConnettoSchema`. A deployment with a different shape implements the trait by hand and names it there.
 
 ### Multi-factor assurance
 

@@ -1,16 +1,19 @@
 //! Mutation header, acknowledgement, and mutation error responses.
 //!
-//! The client uploads writes as `SQLite` patchsets tagged with a monotonically
-//! increasing `client_seq` (Q2.2). The header travels on the control channel.
-//! The patchset itself rides on the bulk channel as
-//! [`crate::messages::bulk::BulkMessage::MutationPatch`]. The data flows back
-//! via the CDC path per Q3.5, but a durable apply is additionally confirmed
-//! with a [`MutationApplied`] acknowledgement, so the client can retire the
-//! pending record it would otherwise replay on reconnect, and so application
-//! flows can await the server verdict. The server deduplicates replays with a
-//! durable per-client watermark, which makes the upload path exactly-once.
+//! The client uploads writes as `SQLite` patchsets tagged with the sequence
+//! its writer's pending queue gave them (R75), `client_seq` on the wire. The
+//! header travels on the control channel. The patchset itself rides on the
+//! bulk channel as [`crate::messages::bulk::BulkMessage::MutationPatch`]. The
+//! data flows back via the CDC path per Q3.5, but a settled write is
+//! additionally confirmed with a [`MutationApplied`] or a [`MutationReject`],
+//! so the client can retire the pending record it would otherwise replay on
+//! reconnect, and so application flows can await the server verdict. The
+//! server settles each `(writer, sequence)` once, in order, and answers any
+//! later delivery of it from that record, which makes every path exactly-once.
 
 use serde::{Deserialize, Serialize};
+
+use super::writer::Provenance;
 
 /// Control-plane header announcing a mutation upload.
 ///
@@ -19,15 +22,19 @@ use serde::{Deserialize, Serialize};
 /// first, bulk immediately after.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MutationHeader {
-    /// Per-client monotonically increasing sequence number. Survives
-    /// reconnects and process restarts: replayed uploads reuse the original
-    /// number, and the server's watermark makes the replay idempotent.
+    /// The sequence the writer's pending queue gave this write, one past the
+    /// last the server settled for the writer. A replay reuses the original
+    /// number, and the server answers it from the settled record.
     pub client_seq: u64,
     /// Number of ops packaged into the corresponding bulk patchset.
     ///
     /// Advisory: lets the server pre-size buffers and reject implausible
     /// headers. The authoritative op count is what the patchset parser sees.
     pub op_count: u32,
+    /// The writer and sequence this entry was first written under, for an
+    /// entry an import restored or a retired writer's device carried forward.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<Provenance>,
 }
 
 impl MutationHeader {
@@ -36,7 +43,15 @@ impl MutationHeader {
         Self {
             client_seq,
             op_count,
+            provenance: None,
         }
+    }
+
+    /// Name where this entry was first written.
+    #[must_use]
+    pub fn with_provenance(mut self, provenance: Provenance) -> Self {
+        self.provenance = Some(provenance);
+        self
     }
 }
 
@@ -89,6 +104,24 @@ pub enum MutationRejectReason {
     /// later write on the same connection is answered `Indeterminate` too until
     /// this one is settled, so none applies ahead of it.
     Indeterminate,
+    /// The server already settled a different entry at this writer and
+    /// sequence, which stands, so this one never applies.
+    Forked,
+}
+
+/// Formats the refusal and any driver detail for display.
+impl core::fmt::Display for MutationRejectReason {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Unauthorized => f.write_str("unauthorized"),
+            Self::SchemaMismatch => f.write_str("schema mismatch"),
+            Self::Constraint { detail } => write!(f, "constraint violation: {detail}"),
+            Self::Malformed { detail } => write!(f, "malformed patchset: {detail}"),
+            Self::Other { detail } => f.write_str(detail),
+            Self::Indeterminate => f.write_str("cannot tell yet, retrying"),
+            Self::Forked => f.write_str("another write already settled at this sequence"),
+        }
+    }
 }
 
 /// Server rejects a mutation without applying it.
@@ -151,5 +184,47 @@ mod tests {
         };
         assert_ne!(a, b);
         assert_ne!(b, c);
+    }
+
+    /// An application shows the reason's message, so no two reasons may read
+    /// alike and the driver's detail must reach the reader.
+    #[test]
+    fn every_reject_reason_displays_its_own_message_with_its_detail() {
+        let detail = "duplicate key value violates unique constraint";
+        let reasons = [
+            MutationRejectReason::Unauthorized,
+            MutationRejectReason::SchemaMismatch,
+            MutationRejectReason::Constraint {
+                detail: detail.into(),
+            },
+            MutationRejectReason::Malformed {
+                detail: detail.into(),
+            },
+            MutationRejectReason::Other {
+                detail: "a server-side failure".into(),
+            },
+            MutationRejectReason::Indeterminate,
+            MutationRejectReason::Forked,
+        ];
+        let messages: Vec<String> = reasons.iter().map(ToString::to_string).collect();
+        for (i, message) in messages.iter().enumerate() {
+            assert!(!message.is_empty(), "{:?} displays nothing", reasons[i]);
+            for other in &messages[i + 1..] {
+                assert_ne!(message, other, "two reasons read alike");
+            }
+        }
+        for (reason, message) in reasons.iter().zip(&messages) {
+            match reason {
+                MutationRejectReason::Constraint { detail }
+                | MutationRejectReason::Malformed { detail }
+                | MutationRejectReason::Other { detail } => {
+                    assert!(
+                        message.contains(detail.as_str()),
+                        "{message} drops {detail}"
+                    );
+                }
+                _ => {}
+            }
+        }
     }
 }

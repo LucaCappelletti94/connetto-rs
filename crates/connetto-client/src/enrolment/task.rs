@@ -170,7 +170,7 @@ impl<D: DeviceDescriptor> DeviceEntry<D> {
     }
 }
 
-enum Command {
+pub(crate) enum Command {
     Reissue {
         lifetime: Duration,
         reply: oneshot::Sender<Result<(), CertificateError>>,
@@ -182,6 +182,9 @@ enum Command {
         key: KeyId,
         reply: oneshot::Sender<Result<(), CertificateError>>,
     },
+    /// The device's writer is retired, so the task deletes the key and the
+    /// certificate and a fresh enrolment follows through the connection.
+    WriterRetired,
     /// `link_peer` refused as expired, so the task raises the event (R76).
     #[cfg(feature = "peer")]
     CertificateExpired,
@@ -411,6 +414,12 @@ impl EnrolHandle {
         answer.await.unwrap_or(Err(CertificateError::Offline))
     }
 
+    /// The task's command channel, so the client can steer a fresh key after
+    /// a writer retirement (R75).
+    pub(crate) fn writer_retirement(&self) -> mpsc::UnboundedSender<Command> {
+        self.commands.clone()
+    }
+
     /// The certificate this device holds.
     pub(crate) fn certificate(&self) -> Option<DeviceCertificate> {
         self.published.borrow().clone()
@@ -432,9 +441,9 @@ impl EnrolHandle {
         self.peer.local_addr()
     }
 
-    /// The peers the device's node reports linked (R76).
+    /// The peers the device's node reports linked, with their links' remote addresses (R76).
     #[cfg(feature = "peer")]
-    pub(crate) fn linked_peers(&self) -> Vec<DeviceIdentity> {
+    pub(crate) fn linked_peers(&self) -> Vec<connetto_peer::PeerLink> {
         self.peer.linked()
     }
 
@@ -708,7 +717,7 @@ fn unexpected() -> Failed {
 }
 
 /// The task's state across its loop.
-struct Run<L> {
+struct Run<L: Link> {
     link: L,
     enroller: Enroller,
     held: Option<Held>,
@@ -1000,6 +1009,21 @@ impl<L: Link> Run<L> {
         self.peer_stop(CloseReason::Revoked);
     }
 
+    /// Delete the key and certificate of a retired writer, keeping the
+    /// enrolment's ordinary connection path for the fresh key (R75).
+    async fn retired_writer(&mut self) {
+        if let Err(err) = self.enroller.keys.delete().await {
+            tracing::warn!(error = %err, "the retired device key could not be deleted");
+        }
+        if let Err(err) = self.link.forget().await {
+            tracing::warn!(error = %err, "the retired certificate could not be deleted");
+        }
+        self.key = None;
+        self.enroller.home.send_replace(None);
+        self.held = None;
+        self.publish();
+    }
+
     /// Keep each verified list newer than the one kept from its signer, and
     /// take this device's own listed certificate as its revocation (lifecycle
     /// row "Newer list from server or peer", decision 22).
@@ -1246,6 +1270,13 @@ impl<L: Link> Run<L> {
     }
 }
 
+#[cfg(feature = "peer")]
+impl<L: Link> Drop for Run<L> {
+    fn drop(&mut self) {
+        self.peer_stop(CloseReason::Closed);
+    }
+}
+
 /// Run the enrolment task until the client ends.
 #[expect(
     clippy::too_many_lines,
@@ -1317,7 +1348,18 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             run.on_connected(by_look).await;
         }
         by_look = false;
-        let look = next_look(run.held.as_ref(), SystemTime::now());
+        let now = SystemTime::now();
+        // Re-check only the crossing that stops the peer link, so a crossed window closes it at the wake (R76).
+        #[cfg(feature = "peer")]
+        if matches!(run.peer_standing, Standing::Fresh | Standing::Aging)
+            && !matches!(
+                Standing::of(run.held.as_ref(), now),
+                Standing::Fresh | Standing::Aging
+            )
+        {
+            let _ = run.stand_by().await;
+        }
+        let look = next_look(run.held.as_ref(), now);
         tokio::select! {
             () = run.link.ended() => break,
             event = events.recv() => match event {
@@ -1345,6 +1387,10 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
                 }
                 Some(Command::Revoke { key, reply }) => {
                     let _ = reply.send(run.revoke(key).await);
+                }
+                Some(Command::WriterRetired) => {
+                    run.retired_writer().await;
+                    due = run.link.connected().await;
                 }
                 #[cfg(feature = "peer")]
                 Some(Command::CertificateExpired) => {
@@ -1403,7 +1449,4 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             }
         }
     }
-    // The task is done, so the peer link ends with it (R76).
-    #[cfg(feature = "peer")]
-    run.peer_stop(CloseReason::Closed);
 }

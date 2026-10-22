@@ -27,7 +27,7 @@ use connetto_client::{
     AffectedRow, ClientBuilder, ClientEvent, ConnettoClient, ConnettoConnection, DataDir, Grant,
     KeyValue, LiveQuery, Watchable,
 };
-use connetto_core::messages::SUBSCRIPTION_REFUSED;
+use connetto_core::messages::{MutationRejectReason, SUBSCRIPTION_REFUSED};
 use connetto_core::{Cursor, test_support::TestGrantChecker, traits::HandshakeAuthority};
 use connetto_server::{
     ConnettoReadSetup, InMemoryOplog, ManagerBuilder, Materializer, NoConnector, Oplog,
@@ -514,11 +514,11 @@ async fn reset_orders(fixture: &Fixture) {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS orders CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_writers, _connetto_settled CASCADE",
             "CREATE TABLE orders (id INT PRIMARY KEY, price FLOAT, quantity INT, status TEXT)",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
 }
 
 /// The server target's orders, read as admin, mapped to the client `Order`.
@@ -673,7 +673,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         .await
         .expect("push")
         .expect("a mutation was sent");
-    assert_eq!(seq, 0, "first mutation carries client_seq 0");
+    assert_eq!(seq, 1, "first mutation carries client_seq 1");
 
     // Barrier: the pong proves the server handled the mutation frames first.
     client.ping(1).await.expect("ping");
@@ -715,7 +715,7 @@ async fn client_syncs_snapshot_live_and_uploads_a_mutation() {
         .await
         .expect("push")
         .expect("withheld mutation sent");
-    assert_eq!(withheld_seq, 1, "withheld mutation carries client_seq 1");
+    assert_eq!(withheld_seq, 2, "withheld mutation carries client_seq 2");
     let refused = pump_until(&mut client, |e| {
         matches!(e, ClientEvent::MutationRejected { .. })
     })
@@ -987,7 +987,7 @@ async fn connection_is_a_diesel_connection() {
         .await
         .expect("flush")
         .expect("a mutation was auto-submitted");
-    assert_eq!(seq, 0, "first auto-submitted mutation carries client_seq 0");
+    assert_eq!(seq, 1, "first auto-submitted mutation carries client_seq 1");
 
     // Barrier: the pong proves the server handled the mutation.
     client.ping(1).await.expect("ping");
@@ -1111,13 +1111,14 @@ async fn rejected_write_rolls_back_locally() {
     assert_eq!(
         event,
         ClientEvent::MutationRejected {
-            client_seq: 0,
+            client_seq: 1,
+            reason: MutationRejectReason::SchemaMismatch,
             rows: vec![AffectedRow {
                 table: "orders".to_owned(),
                 key: vec![KeyValue::Int(99)],
             }],
         },
-        "the reject event names the rolled-back row by table and primary key",
+        "the reject event names the reason and the rolled-back row by table and primary key",
     );
 
     // The server-rejected write was undone on the client.
@@ -1152,9 +1153,89 @@ async fn rejected_write_rolls_back_locally() {
     })
     .await;
     assert!(
-        matches!(&refused, ClientEvent::MutationRejected { rows, .. }
-            if rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
-        "the withheld row mutation was refused",
+        matches!(&refused, ClientEvent::MutationRejected { reason, rows, .. }
+            if *reason == MutationRejectReason::SchemaMismatch
+                && rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused for the same catalog reason"
+    );
+
+    client.close().await.expect("close");
+    server.await.expect("join server");
+}
+
+/// A write the authorization policy withholds is refused as `Unauthorized`,
+/// and the event carries that reason, so the application can act on a denial
+/// rather than guess one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_write_is_refused_as_unauthorized() {
+    let fixture = Fixture::acquire().await;
+    // The table is writable, so the refusal the withheld row draws is the
+    // authorization one rather than the catalog's.
+    let writable = RuntimeWritableCatalog::builder().writable("orders").build();
+    let materializer = Materializer::builder(PG_DDL)
+        .with_write_catalog(writable)
+        .build()
+        .expect("build materializer");
+    let target = server_write_target(&fixture);
+    let manager = ManagerBuilder::new(
+        materializer,
+        SeedSnapshot,
+        RosterAuth::granting("token").withholding(WITHHELD_ID),
+        test_verifier(),
+        NoConnector,
+        target,
+    )
+    .build();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let serve_manager = manager.clone();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.expect("accept");
+        let transport = WebSocketTransport::accept(stream).await.expect("ws accept");
+        serve_manager.serve(transport).await.expect("session ok");
+    });
+
+    let db = tempfile::tempdir().expect("temp dir");
+    let stream = TcpStream::connect(addr).await.expect("connect");
+    let transport = WebSocketTransport::connect("ws://127.0.0.1/", stream)
+        .await
+        .expect("ws connect");
+    let credential = super::support::held("token");
+    let store = super::support::key_store(&credential).await;
+    let mut client = ClientBuilder::new(
+        super::support::bundle(SQLITE_DDL),
+        super::support::Once::new(transport),
+    )
+    .signed_in(credential)
+    .durable(DataDir::new(db.path().to_path_buf()), store)
+    .connect_driven()
+    .await
+    .expect("client connect");
+
+    diesel::insert_into(orders::table)
+        .values((
+            orders::id.eq(WITHHELD_ID),
+            orders::price.eq(0.0_f64),
+            orders::quantity.eq(1_i64),
+            orders::status.eq("withheld"),
+        ))
+        .execute(&mut client)
+        .expect("optimistic withheld insert");
+    client
+        .flush()
+        .await
+        .expect("flush")
+        .expect("withheld mutation submitted");
+    let refused = pump_until(&mut client, |e| {
+        matches!(e, ClientEvent::MutationRejected { .. })
+    })
+    .await;
+    assert!(
+        matches!(&refused, ClientEvent::MutationRejected { reason, rows, .. }
+            if *reason == MutationRejectReason::Unauthorized
+                && rows.iter().any(|r| r.key.contains(&KeyValue::Int(WITHHELD_ID)))),
+        "the withheld row mutation was refused as unauthorized"
     );
 
     client.close().await.expect("close");
@@ -1247,7 +1328,7 @@ async fn conflicting_write_rolls_back_and_reports_keys() {
     else {
         panic!("expected a mutation conflict");
     };
-    assert_eq!(client_seq, 0);
+    assert_eq!(client_seq, 1);
     assert_eq!(
         rows,
         vec![AffectedRow {
@@ -2539,6 +2620,22 @@ async fn wait_broadcast(
     }
 }
 
+/// Wait, bounded, until `live` holds exactly `expected`.
+async fn until_rows<R>(live: &mut LiveQuery<R>, expected: &[R])
+where
+    R: Clone + PartialEq + core::fmt::Debug,
+{
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while live.rows() != expected {
+        tokio::time::timeout_at(deadline, live.changed())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("the rows never became {expected:?}, last {:?}", live.rows())
+            })
+            .expect("driver alive");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
     let fixture = Fixture::acquire().await;
@@ -2588,23 +2685,15 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         )
         .await
         .expect("watch");
-    assert!(
-        live.rows().is_empty(),
-        "the replica is empty before the snapshot lands",
-    );
-
-    // The server snapshot (one seed row) applies, and the handle refreshes.
-    // Race the refresh against a rejection so a refused subscription names its
-    // reason instead of timing out.
+    // The snapshot may land before `watch` returns, so the wait is for the rows
+    // and never for one refresh. A refused subscription names its reason.
+    let seed = [order(1, 1.0, 3, "seed")];
     tokio::select! {
-        changed = tokio::time::timeout(Duration::from_secs(5), live.changed()) => {
-            changed.expect("snapshot refresh timed out").expect("driver alive");
-        }
+        () = until_rows(&mut live, &seed) => {}
         rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
             panic!("subscription rejected: {rejected:?}");
         }
     }
-    assert_eq!(live.rows(), vec![order(1, 1.0, 3, "seed")]);
 
     // A CDC insert fans out as a live patch, and the handle refreshes again.
     let mut source = PgSqliteEmuSource::open_in_memory(PG_DDL).expect("open emu source");
@@ -2617,14 +2706,11 @@ async fn live_query_stays_fresh_and_unsubscribes_on_drop() {
         ))
         .expect("emu insert withheld");
     drain_events(&manager, &mut source).await;
-    tokio::time::timeout(Duration::from_secs(5), live.changed())
-        .await
-        .expect("live refresh timed out")
-        .expect("driver alive");
-    assert_eq!(
-        live.rows(),
-        vec![order(1, 1.0, 3, "seed"), order(2, 2.0, 7, "live")],
-    );
+    until_rows(
+        &mut live,
+        &[order(1, 1.0, 3, "seed"), order(2, 2.0, 7, "live")],
+    )
+    .await;
 
     // Dropping the handle queues the unsubscribe. Fence with a ping: control
     // frames are ordered, so the pong proves the server handled it.
@@ -3339,28 +3425,18 @@ async fn watch_fn_drives_a_boxed_row_query() {
         .watch_fn(|| gadgets::table.order(gadgets::label).into_boxed())
         .await
         .expect("watch_fn");
-    assert!(
-        live.rows().is_empty(),
-        "the replica is empty before the snapshot lands",
-    );
-
+    // Both seed rows surface, decoded from the replica: the uuid keys and the
+    // bool flag in both its true and false forms.
+    let seed = [
+        gadget(alpha_id, true, "alpha"),
+        gadget(inactive_id, false, "zulu"),
+    ];
     tokio::select! {
-        changed = tokio::time::timeout(Duration::from_secs(5), live.changed()) => {
-            changed.expect("snapshot refresh timed out").expect("driver alive");
-        }
+        () = until_rows(&mut live, &seed) => {}
         rejected = wait_broadcast(&mut events, |e| matches!(e, ClientEvent::NonFatal { .. })) => {
             panic!("subscription rejected: {rejected:?}");
         }
     }
-    // Both seed rows surface, decoded from the replica: the uuid keys and the
-    // bool flag in both its true and false forms.
-    assert_eq!(
-        live.rows(),
-        vec![
-            gadget(alpha_id, true, "alpha"),
-            gadget(inactive_id, false, "zulu"),
-        ],
-    );
 
     // A CDC insert of a third gadget refreshes the boxed query. The typed
     // insert binds the uuid key as a blob and the flag as an integer, the exact
@@ -4051,6 +4127,7 @@ fn status_manager<O: Oplog>(
         server_write_target(fixture),
     )
     .with_oplog(oplog)
+    .with_upkeep(Arc::new(super::support::KeyIndependentUpkeep))
     .build()
 }
 

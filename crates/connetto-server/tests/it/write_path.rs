@@ -7,8 +7,10 @@
 //! replayed `client_seq` applies exactly once. The write lands in Postgres and
 //! is read back through the admin pool; the `notes` table carries its own
 //! version column (`edited_at`). A database the write cannot reach is retried
-//! within the write budget, then answered `Indeterminate` with every later
-//! write of the connection held behind it.
+//! within the write budget, then answered `Indeterminate` with the unsettled
+//! sequence blocking the frontier and every later write of the connection
+//! answered `Indeterminate` too, while a write past the frontier that nothing
+//! unsettled explains closes the link with `SequenceGap`.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
@@ -17,8 +19,13 @@
     reason = "the test walks its scenario in order and a split would hide the sequence"
 )]
 
+use core::fmt::Write as _;
+
 use connetto_core::auth::Principal;
-use connetto_core::messages::{ControlMessage, MutationRejectReason};
+use connetto_core::chain::{GENESIS, entry_hash};
+use connetto_core::messages::{
+    ControlMessage, FatalErrorReason, MutationRejectReason, WriterGrant, WriterRequest,
+};
 use connetto_core::test_support::TestGrantChecker;
 use connetto_server::{
     ManagerBuilder, Materializer, NoConnector, PageSpec, RuntimeWritableCatalog, SessionConfig,
@@ -170,16 +177,17 @@ async fn notes(pool: &Pool<AsyncPgConnection>) -> Vec<Note> {
 }
 
 /// Reset the fixture to a fresh `notes` table seeded with one versioned row and
-/// the watermark table provisioned by the admin.
+/// the writer tables provisioned by the admin.
 async fn seed_notes(fixture: &Fixture) {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_writers",
             "CREATE TABLE notes (id INT PRIMARY KEY, body TEXT, edited_at TEXT)",
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     let mut conn = fixture.admin().get().await.expect("admin connection");
     diesel::insert_into(notes::table)
         .values((
@@ -325,7 +333,7 @@ async fn write_path_applies_conflicts_and_dedups() {
     );
 
     // Exactly-once: the same client_seq applied twice inserts once, and the
-    // replay is re-acknowledged from the durable watermark instead of colliding
+    // replay is re-acknowledged from the settled record instead of colliding
     // on the primary key.
     client.upload(4, insert_changeset(3, "three", "t4")).await;
     client.upload(4, insert_changeset(3, "three", "t4")).await;
@@ -409,18 +417,12 @@ async fn write_path_rejects_unauthorized() {
     server.await.expect("join server").expect("session ok");
 }
 
-/// Exactly-once survives a transport reconnect that reuses the verified session.
-///
-/// This is the Phase 3 acceptance: the watermark keys on the connetto-minted
-/// session id from the verified token, not the client-fabricated `client_id`.
-/// A first connection commits mutations, the transport is torn down, and a
-/// second connection mints a DIFFERENT `client_id` (a worker restart or leader
-/// failover) but presents the SAME token. Its handshake reports the surviving
-/// watermark and the replayed uploads are re-acknowledged without re-applying,
-/// so no primary-key collision occurs. A genuinely different token is a new
-/// session and correctly starts fresh.
+/// The writer frontier keys on the account and survives a transport reconnect
+/// that mints a different `client_id`, so a second connection that presents
+/// the same grant and writes under the same number re-acknowledges its
+/// replays without re-applying, and a different account starts fresh.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn watermark_survives_reconnect_reusing_session() {
+async fn the_writer_frontier_survives_a_reconnect_reusing_the_session() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
 
@@ -442,15 +444,15 @@ async fn watermark_survives_reconnect_reusing_session() {
     )
     .build();
 
-    // Connection 1: a fresh session for token "alice" commits two inserts.
+    // Connection 1: a fresh number writer for token "alice" commits two inserts.
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let ack = client.handshake_with("worker-boot-1", "user:alice").await;
-    assert_eq!(
-        ack.last_applied_seq, None,
-        "a fresh session has no watermark"
-    );
+    let writer = ack
+        .writer
+        .expect("the number handshake is granted a number writer");
+    assert_eq!(writer.frontier, 0, "a fresh number settles nothing");
     client.upload(1, insert_changeset(2, "two", "t1")).await;
     client.upload(2, insert_changeset(3, "three", "t2")).await;
     for expected in [1, 2] {
@@ -473,19 +475,28 @@ async fn watermark_survives_reconnect_reusing_session() {
     client.close().await;
     server.await.expect("join server 1").expect("session 1 ok");
 
-    // Connection 2: a NEW client id but the SAME token. The watermark survived
-    // the reconnect because it is keyed on the verified session, so the ack
-    // reports it and the replayed uploads are deduped, never re-applied (a
-    // re-applied INSERT would collide on the primary key and be rejected).
+    // Connection 2: a new client id, the same account, the same number.
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
-    let ack = client.handshake_with("worker-boot-2", "user:alice").await;
+    let ack = client
+        .handshake_writing(
+            "worker-boot-2",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(writer.number),
+            None,
+        )
+        .await;
     assert_eq!(
-        ack.last_applied_seq,
-        Some(2),
-        "the same session's watermark survives a transport reconnect"
+        ack.writer,
+        Some(WriterGrant {
+            number: writer.number,
+            frontier: 2,
+        }),
+        "the account's number confirms with its surviving frontier"
     );
+    // A re-applied INSERT would collide on the primary key and be rejected.
     client.upload(1, insert_changeset(2, "two", "t1")).await;
     client.upload(2, insert_changeset(3, "three", "t2")).await;
     for expected in [1, 2] {
@@ -494,7 +505,7 @@ async fn watermark_survives_reconnect_reusing_session() {
         };
         assert_eq!(applied.client_seq, expected);
     }
-    // A genuinely new sequence still applies on the reused session.
+    // A genuinely new sequence still applies on the reused number.
     client.upload(3, insert_changeset(4, "four", "t3")).await;
     let ControlMessage::MutationApplied(applied) = client.next_control().await else {
         panic!("expected the durable-apply acknowledgement for the new sequence");
@@ -532,14 +543,21 @@ async fn watermark_survives_reconnect_reusing_session() {
     client.close().await;
     server.await.expect("join server 2").expect("session 2 ok");
 
-    // Connection 3: a different token is a different session and starts fresh.
+    // Connection 3: a different account starts under its own fresh number.
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
     let ack = client.handshake_with("worker-boot-3", "user:bob").await;
+    let bob_writer = ack
+        .writer
+        .expect("the number handshake is granted a number writer");
+    assert_ne!(
+        bob_writer.number, writer.number,
+        "bob's number is his own, not alice's"
+    );
     assert_eq!(
-        ack.last_applied_seq, None,
-        "a different session carries its own watermark"
+        bob_writer.frontier, 0,
+        "bob's number settles nothing of alice's"
     );
     client.close().await;
     server.await.expect("join server 3").expect("session 3 ok");
@@ -593,9 +611,20 @@ async fn expect_applied(client: &mut Client, client_seq: u64) {
     assert_eq!(applied.client_seq, client_seq);
 }
 
-/// A database unreachable past the retry budget answers `Indeterminate`, and no later write of the connection applies ahead of it.
+/// The hex escape Postgres wants in a bytea literal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().fold(String::new(), |mut out, b| {
+        write!(out, "{b:02x}").expect("the write to a string cannot fail");
+        out
+    })
+}
+
+/// A database unreachable past the retry budget answers `Indeterminate` and
+/// settles nothing, the connection's later writes are answered the same way
+/// while the outage stands, and a write past the frontier that nothing
+/// unsettled explains on its connection closes the link with `SequenceGap`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_unreachable_database_defers_the_write_and_every_later_one() {
+async fn an_unreachable_database_defers_the_write_and_a_gap_closes_the_connection() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
     let pool = single_connection_pool(&fixture).await;
@@ -611,15 +640,42 @@ async fn an_unreachable_database_defers_the_write_and_every_later_one() {
     let outage = pool.get_owned().await.expect("hold the only connection");
     client.upload(1, insert_changeset(2, "first", "t1")).await;
     expect_indeterminate(&mut client, 1).await;
+    // The retry of the unsettled sequence and the writes the client sends
+    // behind it are answered the same way while the outage stands.
+    client.upload(1, insert_changeset(2, "first", "t1")).await;
+    expect_indeterminate(&mut client, 1).await;
     client.upload(2, insert_changeset(3, "second", "t2")).await;
     expect_indeterminate(&mut client, 2).await;
     drop(outage);
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
 
-    // Applying 2 first would raise the watermark past 1, and a resent 1 would then be acknowledged unapplied.
+    // A write past the frontier nothing unsettled explains on its connection
+    // closes the link with `SequenceGap`.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake("writer").await;
     client.upload(2, insert_changeset(3, "second", "t2")).await;
-    expect_indeterminate(&mut client, 2).await;
-    assert_eq!(notes(fixture.admin()).await, vec![note(1, "hello", "t0")]);
+    match client.next_control().await {
+        ControlMessage::FatalError(fatal) => assert_eq!(
+            fatal.reason,
+            FatalErrorReason::SequenceGap {
+                expected: 1,
+                got: 2,
+            },
+            "the gap closes the connection"
+        ),
+        other => panic!("the gap must close the connection, got {other:?}"),
+    }
+    client.close().await;
+    server.await.expect("join server").expect("session ok");
 
+    // A fresh connection on the recovered database settles both sequences.
+    let (server_transport, client) = loopback();
+    let server = tokio::spawn(manager.clone().serve(server_transport));
+    let mut client = Client::new(client);
+    client.handshake("writer").await;
     client.upload(1, insert_changeset(2, "first", "t1")).await;
     expect_applied(&mut client, 1).await;
     client.upload(2, insert_changeset(3, "second", "t2")).await;
@@ -701,24 +757,47 @@ async fn a_deferred_write_settled_by_a_refusal_releases_the_writes_behind_it() {
     server.await.expect("join server").expect("session ok");
 }
 
-/// The apply asks the durable watermark itself, so a commit that landed while its answer was lost is acknowledged again rather than applied twice.
+/// A commit that landed while its answer was lost is acknowledged from the
+/// settled record rather than applied twice.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_write_the_durable_watermark_covers_is_acknowledged_unapplied() {
+async fn a_write_the_settled_record_covers_is_acknowledged_unapplied() {
     let fixture = Fixture::acquire().await;
     seed_notes(&fixture).await;
     let manager = writing_manager(fixture.admin(), SessionConfig::default());
     let (server_transport, client) = loopback();
     let server = tokio::spawn(manager.clone().serve(server_transport));
     let mut client = Client::new(client);
-    client.handshake("writer").await;
-    client.upload(1, insert_changeset(2, "two", "t1")).await;
+    let ack = client.handshake_with("writer", "user:writer").await;
+    let writer = ack
+        .writer
+        .expect("the number handshake is granted a number writer");
+    let cs1 = insert_changeset(2, "two", "t1");
+    let cs2 = insert_changeset(3, "three", "t2");
+    client.upload(1, cs1.clone()).await;
     expect_applied(&mut client, 1).await;
 
-    // Stands in for a commit of 2 whose reply never reached this connection.
+    // Stands in for a commit of 2 whose reply never reached the connection.
+    let h1 = entry_hash(&GENESIS, 1, &cs1);
+    let h2 = entry_hash(&h1, 2, &cs2);
     fixture
-        .setup(&["UPDATE _connetto_mutations SET last_seq = 2"])
+        .setup(&[
+            &format!(
+                "UPDATE _connetto_writers SET frontier = 2, head = '\\x{}' \
+                 WHERE writer = {}",
+                hex(&h1),
+                writer.number
+            ),
+            &format!(
+                "INSERT INTO _connetto_settled \
+                 (writer, seq, entry_hash, previous_hash, outcome, path) \
+                 VALUES ({}, 2, '\\x{}', '\\x{}', '\"applied\"', 'direct')",
+                writer.number,
+                hex(&h2),
+                hex(&h1)
+            ),
+        ])
         .await;
-    client.upload(2, insert_changeset(3, "three", "t2")).await;
+    client.upload(2, cs2).await;
     expect_applied(&mut client, 2).await;
     assert_eq!(
         notes(fixture.admin()).await,

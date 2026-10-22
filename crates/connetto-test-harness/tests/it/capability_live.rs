@@ -70,7 +70,8 @@ async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
     fixture
         .setup(&[
             "DROP TABLE IF EXISTS notes, note_shares CASCADE",
-            "DROP TABLE IF EXISTS _connetto_mutations",
+            "DROP TABLE IF EXISTS _connetto_settled",
+            "DROP TABLE IF EXISTS _connetto_writers",
             "DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'app_writer') \
              THEN CREATE ROLE app_writer LOGIN PASSWORD 'app_writer'; END IF; END $$",
             "CREATE TABLE notes (id INT PRIMARY KEY, owner TEXT, body TEXT)",
@@ -92,9 +93,9 @@ async fn a_share_key_filters_the_snapshot_and_the_live_stream_alike() {
             &format!("INSERT INTO note_shares VALUES (1, '{KEY}'), (3, '{KEY}')"),
         ])
         .await;
-    connetto_test_harness::provision_watermark(fixture.admin()).await;
+    connetto_test_harness::provision_writers(fixture.admin()).await;
     fixture
-        .exec("GRANT SELECT, INSERT, UPDATE ON _connetto_mutations TO app_writer")
+        .exec("GRANT SELECT, INSERT, UPDATE, DELETE ON _connetto_writers, _connetto_settled TO app_writer")
         .await;
     let writer_pool = pool_for(&with_user(fixture.admin_url(), "app_writer", "app_writer")).await;
     let server = spawn_server(

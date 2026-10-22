@@ -71,8 +71,8 @@ use crate::workers::helpers::sleep_ms;
 use connetto_client::reconnect::{ReconnectPolicy, Sleeper, TransportFactory};
 use connetto_client::{
     AffectedRow, ClientError, ClientEvent, ConnettoConnection, ExportScope, GateAskOutcome,
-    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer,
-    subscription_is_aggregate, subscription_tables,
+    GateController, GateSink, ImportChoices, ImportOutcome, PolicyTables, ResendTimer, WriterGrant,
+    WriterRequest, subscription_is_aggregate, subscription_tables,
 };
 use connetto_core::messages::{
     AggregateUpdate, BulkMessage, ConflictRow, ControlMessage, FatalError, FatalErrorReason,
@@ -401,7 +401,7 @@ const HUB_META_DDL: &str = "CREATE TABLE IF NOT EXISTS connetto_hub._tab_mutatio
 
 /// DDL for the local tier's durable per-tab mutation watermark. It lives
 /// in the tier database itself so it advances in the same transaction as
-/// the apply, mirroring the server's `_connetto_mutations` design.
+/// the apply, as the server's writer frontier advances with its settle.
 ///
 /// Qualified, because `CREATE TABLE` with a bare name would land in `main`.
 /// Every later read and write of it is unqualified and typed, since a bare
@@ -1858,7 +1858,7 @@ where
         }
         HubEvent::Unsynced(reply) => {
             let pending = PendingWork {
-                mutation_seqs: worker.unsynced(),
+                unsynced: worker.unsynced(),
                 content_files: content_pending_files(worker, content)?,
                 retired_files: retired_content(worker, content)?
                     .iter()
@@ -2664,6 +2664,10 @@ where
 }
 
 /// Handle one control frame from a tab.
+#[expect(
+    clippy::too_many_lines,
+    reason = "one straight match over the tab's control frames"
+)]
 async fn handle_tab_control<U>(
     worker: &mut ConnettoConnection<U>,
     state: &mut HubState,
@@ -2692,18 +2696,25 @@ where
             } else {
                 local_tab_watermark(worker, client_uuid)?
             };
-            // The hub handles a tab's mutations in order and each lands in
-            // exactly one tier, so every sequence at or below the higher of
-            // the two watermarks was already applied or rejected.
-            let last_applied = match (tab.applied_watermark, tab.local_watermark) {
-                (Some(synced), Some(local)) => Some(synced.max(local)),
-                (synced, local) => synced.or(local),
+            // The frontier is the tab's own durable watermark. A fresh tab
+            // presents no number and the protocol answers a fresh number at 0.
+            let (number, frontier) = match handshake.writer {
+                WriterRequest::Issue => (tab_writer_number(client_uuid), 0),
+                WriterRequest::Number(number) => (
+                    number,
+                    match (tab.applied_watermark, tab.local_watermark) {
+                        (Some(synced), Some(local)) => synced.max(local),
+                        (synced, local) => synced.or(local).unwrap_or(0),
+                    },
+                ),
+                WriterRequest::Device => {
+                    return Err(TabFault::Close(
+                        "a tab never writes as a device key".to_owned(),
+                    ));
+                }
             };
             // The hub owns the one upstream run, so a tab has neither a
-            // handle of its own nor anything to resume on: both are named for
-            // the relay and the tab does not act on either. The watermark is
-            // load-bearing: the tab retires pending mutations at or below it
-            // and replays the rest.
+            // handle of its own nor anything to resume on.
             let _ = tab.out.send(TabOut::Control(ControlMessage::HandshakeAck(
                 HandshakeAck {
                     connection_id: format!("relay-{}", handshake.client_id),
@@ -2712,7 +2723,10 @@ where
                     current_cursor: relay_cursor(worker),
                     schema_version: worker.schema_version().cloned(),
                     initial_credits: INITIAL_CREDITS,
-                    last_applied_seq: last_applied,
+                    writer: Some(WriterGrant {
+                        number,
+                        frontier,
+                    }),
                 },
             )));
             // Right after its own ack, so a tab knows from its first moment
@@ -2776,6 +2790,11 @@ where
             tab.credits = tab.credits.saturating_add(ack.credits);
             flush_tab_bulk(tab);
             Ok(())
+        }
+        ControlMessage::BindDevice(_) | ControlMessage::RetireWriter(_) => {
+            Err(TabFault::Close(
+                "a tab never binds or retires a writer, the worker's connection is the profile's one writer".to_owned(),
+            ))
         }
         other => Err(TabFault::Close(format!(
             "unsupported tab frame in this increment: {other:?}"
@@ -3884,11 +3903,9 @@ where
             }
             Ok(())
         }
-        ClientEvent::MutationRejected { client_seq, .. } => reject_tab_mutation(
-            state,
-            client_seq,
-            "the upstream server rejected the forwarded mutation",
-        ),
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => reject_tab_mutation(state, client_seq, reason),
         ClientEvent::MutationConflict {
             client_seq,
             rows,
@@ -4043,10 +4060,7 @@ where
     Ok(())
 }
 
-/// Map an upstream rejection back to the owning tab's sequence number.
-///
-/// The worker client already rolled the change back out of its replica. The
-/// reject tells the tab to do the same to its mirror, so both converge.
+/// Returns the server's refusal under the owning tab's sequence number.
 #[expect(
     clippy::unnecessary_wraps,
     reason = "the event dispatch calls every handler through the same fallible signature"
@@ -4054,7 +4068,7 @@ where
 fn reject_tab_mutation(
     state: &mut HubState,
     worker_seq: u64,
-    detail: &str,
+    reason: MutationRejectReason,
 ) -> Result<(), RelayError> {
     let Some((tab_id, tab_seq)) = state.seq_map.remove(&worker_seq) else {
         return Ok(());
@@ -4063,9 +4077,7 @@ fn reject_tab_mutation(
         let _ = tab.out.send(TabOut::Control(ControlMessage::MutationReject(
             MutationReject {
                 client_seq: tab_seq,
-                reason: MutationRejectReason::Other {
-                    detail: detail.to_owned(),
-                },
+                reason,
             },
         )));
     }
@@ -4476,6 +4488,17 @@ const TAB_KEY_NAMESPACE: uuid::Uuid =
 /// of any shape.
 fn tab_key(client_id: &str) -> rosetta_uuid::Uuid {
     uuid::Uuid::new_v5(&TAB_KEY_NAMESPACE, client_id.as_bytes()).into()
+}
+
+/// The tab's writer number, derived from its client id so a re-attach within
+/// the same page re-presents the number its first handshake was granted.
+/// The 0 a fresh issue must never answer is ruled out by the floor.
+fn tab_writer_number(client_id: rosetta_uuid::Uuid) -> u64 {
+    let id: [u8; 16] = client_id.into();
+    u64::max(
+        1,
+        u64::from_le_bytes(id[8..16].try_into().expect("8 bytes")),
+    )
 }
 
 /// The hub's durable watermark for one tab client id, if any, from the

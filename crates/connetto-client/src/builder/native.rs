@@ -831,11 +831,11 @@ where
                 #[cfg(feature = "peer")]
                 let peer = Peer {
                     node: node.clone(),
-                    discovery: connetto_peer::Discovery::new(
+                    discovery: platform_discovery(connetto_peer::Discovery::new(
                         node,
                         device.peer_autolink,
                         discovery_events,
-                    ),
+                    )),
                     listen: device.peer_listen,
                     events: peer_events_rx,
                     discovery_events: discovery_events_rx,
@@ -843,7 +843,7 @@ where
                     java: device.java.clone(),
                 };
                 let (enroller, handle) = Enroller::new(
-                    keys,
+                    Arc::clone(&keys),
                     device.lifetime,
                     device.descriptor,
                     device.roots,
@@ -857,6 +857,9 @@ where
                     #[cfg(feature = "peer")]
                     bluetooth_tx,
                 );
+                core.client()
+                    .with_device_writer(keys, handle.writer_retirement())
+                    .await?;
                 let enrolment = core.client().enrolment(enroller);
                 #[cfg(feature = "peer")]
                 let (runner, beacon_rx, nearby_rx, bt_backend) = Box::pin(async {
@@ -926,22 +929,24 @@ where
                         Arc::new(move || port_node.local_addr().map(|addr| addr.port())),
                         bind,
                         Arc::new(
-                            move |addr: SocketAddr, answer: tokio::sync::oneshot::Sender<bool>| {
+                            move |addr: SocketAddr,
+                                  answer: tokio::sync::oneshot::Sender<
+                                crate::hotspot::DialAnswer,
+                            >| {
                                 let handle = dial_handle.clone();
                                 tokio::spawn(async move {
-                                    match handle.link_peer(addr).await {
-                                        Ok(_) => {
-                                            let _ = answer.send(true);
-                                        }
-                                        Err(err) => {
-                                            tracing::debug!(
-                                                                                                %addr,
-                                                ?err,
-                                                "the dial to the joined hotspot's gateway failed"
-                                            );
-                                            let _ = answer.send(false);
-                                        }
+                                    let dial = handle.link_peer(addr).await;
+                                    let outcome = crate::hotspot::DialAnswer::of(&dial);
+                                    if let (crate::hotspot::DialAnswer::Failed, Err(err)) =
+                                        (outcome, &dial)
+                                    {
+                                        tracing::debug!(
+                                            %addr,
+                                            ?err,
+                                            "the dial to the joined hotspot's gateway failed"
+                                        );
                                     }
+                                    let _ = answer.send(outcome);
                                 });
                             },
                         ),
@@ -1039,15 +1044,14 @@ where
                         bt_machine.2,
                         bt_state,
                     )
-                }).await;
+                })
+                .await;
                 #[cfg(feature = "peer")]
-                let pump: CorePump = Box::pin(async move {
-                    tokio::join!(pump, enrolment, runner);
-                });
+                let pump: CorePump = Box::pin(with_device_tasks(pump, async move {
+                    tokio::join!(enrolment, runner);
+                }));
                 #[cfg(not(feature = "peer"))]
-                let pump: CorePump = Box::pin(async move {
-                    tokio::join!(pump, enrolment);
-                });
+                let pump: CorePump = Box::pin(with_device_tasks(pump, enrolment));
                 #[cfg(feature = "peer")]
                 {
                     beacon = Some(beacon_rx);
@@ -1117,6 +1121,28 @@ where
     }
 }
 
+#[cfg(feature = "device-identity")]
+async fn with_device_tasks(mut pump: CorePump, tasks: impl Future<Output = ()>) {
+    // Auxiliary tasks retain client handles, so the core pump owns their lifetime.
+    tokio::select! {
+        () = &mut pump => {}
+        () = tasks => pump.await,
+    }
+}
+
+/// Discovery through the system Bonjour service on iOS, which grants an app no raw multicast, and through `mdns-sd` elsewhere (R76).
+#[cfg(feature = "peer")]
+fn platform_discovery(discovery: connetto_peer::Discovery) -> connetto_peer::Discovery {
+    #[cfg(target_os = "ios")]
+    {
+        discovery.with_dns_sd(Arc::new(connetto_peer_apple::discovery::Bonjour))
+    }
+    #[cfg(not(target_os = "ios"))]
+    {
+        discovery
+    }
+}
+
 /// A running native connetto client.
 ///
 /// The platform-neutral client a build's terminal returns, with what the
@@ -1165,7 +1191,7 @@ where
         self.core.custody()
     }
 
-    /// End the pump and close the transport while the clones stay alive.
+    /// Close the transport and end enrolment and radio work while client clones remain alive.
     pub async fn close(&self) {
         self.core.close().await;
     }
@@ -1256,11 +1282,11 @@ where
         self.device.as_ref().and_then(EnrolHandle::peer_address)
     }
 
-    /// The peers this device's node reports linked, an empty list without a
-    /// device or for a build without the `peer` feature (R76).
+    /// The peers this device's node reports linked, each with its kept link's
+    /// remote address, an empty list without a device (R76).
     #[cfg(feature = "peer")]
     #[must_use]
-    pub fn linked_peers(&self) -> Vec<connetto_core::device_cert::DeviceIdentity> {
+    pub fn linked_peers(&self) -> Vec<connetto_peer::PeerLink> {
         self.device
             .as_ref()
             .map_or_else(Vec::new, EnrolHandle::linked_peers)
@@ -1626,7 +1652,7 @@ impl NativeSession {
 trait Forget: Send + Sync {
     fn forget<'a>(
         &'a self,
-        unsynced: &'a [u64],
+        unsynced: &'a [crate::UnsyncedWrite],
         force: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>>;
 }
@@ -1647,7 +1673,7 @@ where
 {
     fn forget<'a>(
         &'a self,
-        unsynced: &'a [u64],
+        unsynced: &'a [crate::UnsyncedWrite],
         force: bool,
     ) -> core::pin::Pin<Box<dyn Future<Output = Result<(), ForgetError>> + Send + 'a>> {
         Box::pin(async move {
@@ -2380,5 +2406,46 @@ mod tests {
             .await
             .expect("the pump ends within its bound")
             .expect("the pump ends");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_native_client_releases_background_tasks_with_clones_alive() {
+        let (core, pump) = ClientBuilder::<FakeTransport>::new(bundle(), NeverDial::default())
+            .signed_in(held("carol"))
+            .connect_with_pump()
+            .await
+            .expect("the build opens offline");
+        let retained_client = core.client().clone();
+        let (started, running) = tokio::sync::oneshot::channel();
+        let (released, release) = tokio::sync::oneshot::channel::<()>();
+        let tasks = async move {
+            let _retained_client = retained_client;
+            let _released = released;
+            started
+                .send("native-background-close")
+                .expect("the observer remains");
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        };
+        let pump = tokio::spawn(super::with_device_tasks(pump, tasks));
+        let client = NativeClient::bare(core);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), running)
+                .await
+                .expect("the background starts within its bound")
+                .expect("the background reports its start"),
+            "native-background-close"
+        );
+        client.close().await;
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), release)
+                .await
+                .expect("close releases background resources within its bound")
+                .is_err()
+        );
+        tokio::time::timeout(Duration::from_secs(1), pump)
+            .await
+            .expect("the native pump ends within its bound")
+            .expect("the native pump completes");
+        drop(client);
     }
 }

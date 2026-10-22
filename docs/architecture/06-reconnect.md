@@ -107,10 +107,12 @@ On reconnect, the client sends:
 
 ```
 Handshake {
-  client_id:     String,
-  last_cursor:   Option<Cursor>, // client's resume cursor, absent if never synced
-  session_token: String,     // Built, defective: see note below
-  grants:        Vec<Grant>, // Decided (R3): zero or more opaque grants
+  client_id:      String,
+  last_cursor:    Option<Cursor>, // client's resume cursor, absent if never synced
+  session_token:  String,         // Built, defective: see note below
+  grants:         Vec<Grant>,     // Decided (R3): zero or more opaque grants
+  writer:         WriterRequest,  // R75: Issue a number, or present a number/device
+  settled_through: Option<u64>,   // R75: prune the server's settled records at or below this
 }
 ```
 
@@ -124,11 +126,11 @@ HandshakeAck {
   current_cursor:   Cursor,           // server's current position
   schema_version:   Option<SchemaVersion>,
   initial_credits:  u32,              // flow-control grant
-  last_applied_seq: Option<u64>,      // durable mutation watermark
+  writer:           Option<WriterGrant>, // R75: the number and frontier the connection writes as
 }
 ```
 
-**Built (R2, R3).** The handle is real and everything operational keys on it: subql's per-subscription cursors resume through it, the exactly-once watermark is keyed on it alone, and the registry serves revocation and supersession by it. `resume_token` proves it, so a handle presented without the credential that proves it starts a fresh run instead of adopting the old one.
+**Built (R2, R3).** The handle is real and everything operational keys on it: subql's per-subscription cursors resume through it, and the registry serves revocation and supersession by it. `resume_token` proves it, so a handle presented without the credential that proves it starts a fresh run instead of adopting the old one. The exactly-once identity is the writer, not the handle: the connection names it in `Handshake.writer` and the server answers the number and its stored frontier in `HandshakeAck.writer`, so a reconnect that presents the same number resumes from the frontier instead of replaying settled writes (R75).
 
 **Built (R3).** A grant that fails to resolve does not end the connection. The handshake succeeds on whatever resolved. See chapter 12.
 

@@ -432,7 +432,7 @@ struct FakeLink {
     issuer: Arc<DeviceIssuer>,
     certificate: Vec<u8>,
     ask: Ask,
-    /// A grant answer waits on it first, so a test holds the renewal open.
+    /// An answer waits on it first, so a test holds the enrolment open.
     gate: Option<Arc<tokio::sync::Notify>>,
     /// A granted leaf's `not_before`, so a test's clock can stand past
     /// `not_after` when the grant lands.
@@ -489,7 +489,12 @@ impl Link for FakeLink {
                         state.requests.push(request.attestation);
                     }
                     let answer = match ask {
-                        Ask::Refused(refusal) => Answer::Refused(refusal),
+                        Ask::Refused(refusal) => {
+                            if let Some(gate) = &gate {
+                                gate.notified().await;
+                            }
+                            Answer::Refused(refusal)
+                        }
                         Ask::Silent => {
                             // The request went out and no answer comes.
                             drop(tx);
@@ -1470,49 +1475,58 @@ async fn far_closes_drains_for_the_whole_bound() {
 #[cfg(feature = "peer")]
 #[tokio::test]
 async fn a_fresh_device_serves_its_peer_listener_at_open() {
-    let (key, der) = attesting_key();
-    let now = whole_second();
-    let authority = authority(now).await;
-    let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
-    let state = Arc::new(Mutex::new(FakeState::default()));
-    let (events, _events) = broadcast::channel(64);
-    let (end_tx, end_rx) = watch::channel(());
-    #[cfg(feature = "peer")]
-    let peer = peer(&authority);
-    let link = FakeLink {
-        state: Arc::clone(&state),
-        events,
-        end: end_rx,
-        issuer: Arc::new(authority.issuer),
-        certificate: authority.certificate,
-        ask: Ask::Lost,
-        gate: None,
-        grant_from: None,
-    };
-    #[cfg(feature = "peer")]
-    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
-    #[cfg(feature = "peer")]
-    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
-    let (enroller, handle) = Enroller::new(
-        Arc::new(RunKeys { der }),
-        Some(HOUR),
-        Vec::new(),
-        vec![authority.root.clone()],
-        Some(held),
-        Vec::new(),
-        inbox(),
-        peer,
-        #[cfg(feature = "peer")]
-        hotspot_tx,
-        #[cfg(feature = "peer")]
-        bluetooth_tx,
-    );
-    let run = tokio::spawn(run(link, enroller));
+    for cancel in [false, true] {
+        let (key, der) = attesting_key();
+        let now = whole_second();
+        let authority = authority(now).await;
+        let held = issue_for(&authority, &key, now, 12 * HOUR, positive_serial(5));
+        let state = Arc::new(Mutex::new(FakeState::default()));
+        let (events, _events) = broadcast::channel(64);
+        let (end_tx, end_rx) = watch::channel(());
+        let peer = peer(&authority);
+        let link = FakeLink {
+            state: Arc::clone(&state),
+            events,
+            end: end_rx,
+            issuer: Arc::new(authority.issuer),
+            certificate: authority.certificate,
+            ask: Ask::Lost,
+            gate: None,
+            grant_from: None,
+        };
+        let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+        let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+        let (enroller, handle) = Enroller::new(
+            Arc::new(RunKeys { der }),
+            Some(HOUR),
+            Vec::new(),
+            vec![authority.root.clone()],
+            Some(held),
+            Vec::new(),
+            inbox(),
+            peer,
+            hotspot_tx,
+            bluetooth_tx,
+        );
+        let run = tokio::spawn(run(link, enroller));
+        poll_until(|| handle.peer_address().is_some()).await;
 
-    poll_until(|| handle.peer_address().is_some()).await;
-
-    end_tx.send(()).expect("the run ends");
-    run.await.expect("the run ends");
+        if cancel {
+            run.abort();
+            assert!(
+                run.await
+                    .expect_err("the task was cancelled")
+                    .is_cancelled()
+            );
+        } else {
+            end_tx.send(()).expect("the run ends");
+            run.await.expect("the run ends");
+        }
+        assert!(
+            handle.peer_address().is_none(),
+            "an ended task retains no listener"
+        );
+    }
 }
 
 /// The refusal of a device past its expiry, which also raises the event
@@ -1820,10 +1834,6 @@ async fn a_certificate_less_device_refuses_to_link() {
 /// links and the listener (R76 proof 5).
 #[cfg(feature = "peer")]
 #[tokio::test]
-#[expect(
-    clippy::too_many_lines,
-    reason = "the enrolment, the live link and the closing look are one scenario, in the order the expiry crosses them"
-)]
 async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     let (key, der) = attesting_key();
     let now = SystemTime::now();
@@ -1842,7 +1852,6 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
     let state = Arc::new(Mutex::new(FakeState::default()));
     let (events, _events) = broadcast::channel(64);
     let (end_tx, end_rx) = watch::channel(());
-    #[cfg(feature = "peer")]
     let peer = peer(&authority);
     let (far, mut far_events) = far_peer(&authority, positive_serial(9));
     let link = FakeLink {
@@ -1855,9 +1864,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         gate: None,
         grant_from: None,
     };
-    #[cfg(feature = "peer")]
     let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
-    #[cfg(feature = "peer")]
     let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
     let (enroller, handle) = Enroller::new(
         Arc::new(RunKeys { der }),
@@ -1868,9 +1875,7 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         Vec::new(),
         inbox(),
         peer,
-        #[cfg(feature = "peer")]
         hotspot_tx,
-        #[cfg(feature = "peer")]
         bluetooth_tx,
     );
     let run = tokio::spawn(run(link, enroller));
@@ -1901,24 +1906,28 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
             _ => None,
         })
         .expect("the link reports its peer");
+    let links = handle.linked_peers();
     assert_eq!(
-        handle.linked_peers(),
-        vec![linked_peer],
+        links.iter().map(|link| &link.peer).collect::<Vec<_>>(),
+        [&linked_peer],
         "the device's node reports its live peer"
     );
+    assert!(
+        links[0]
+            .remote
+            .is_some_and(|remote| remote.ip().is_loopback()),
+        "the live link names its remote address"
+    );
 
-    // The look wakes at the expiry plus the tolerance and closes the link.
+    // The look wakes at the expiry plus the tolerance and closes the link. A late
+    // wake can make this task and the look ready at once, so the close is polled for.
     tokio::time::sleep(
         deadline
             .duration_since(SystemTime::now())
-            .unwrap_or_default()
-            + Duration::from_secs(3),
+            .unwrap_or_default(),
     )
     .await;
-    assert!(
-        handle.peer_address().is_none(),
-        "the listener closed at the expiry"
-    );
+    poll_until(|| handle.peer_address().is_none()).await;
     let task_reason = state.lock().emitted.iter().find_map(|event| {
         if let ClientEvent::PeerUnlinked { reason, .. } = event {
             Some(*reason)
@@ -1931,6 +1940,87 @@ async fn a_look_at_the_expiry_closes_the_live_peer_links() {
         task_reason == Some(connetto_peer::CloseReason::CertificateExpired)
             || far_reasons.contains(&connetto_peer::CloseReason::PeerExpired),
         "one end closed the link with its own deadline reason, task {task_reason:?} far {far_reasons:?}"
+    );
+
+    end_tx.send(()).expect("the run ends");
+    run.await.expect("the run ends");
+}
+
+/// The wake a held renewal answer takes back closes the live peer links at
+/// once when it lands past the window (R76 proof 5).
+#[cfg(feature = "peer")]
+#[tokio::test]
+async fn a_wake_past_the_expiry_closes_the_live_peer_links() {
+    let (key, der) = attesting_key();
+    let now = SystemTime::now();
+    let authority = authority(now).await;
+    // The window ends 29 s after the open, within its tolerance, so the link holds a short while.
+    let held = issue_for(
+        &authority,
+        &key,
+        now + Duration::from_secs(29) - 7 * MINUTE,
+        2 * MINUTE,
+        positive_serial(5),
+    );
+    let task_identity = held.leaf.identity().clone();
+    let deadline = held.leaf.not_after() + TOLERANCE;
+    let state = Arc::new(Mutex::new(FakeState::default()));
+    let (events, _events) = broadcast::channel(64);
+    let (end_tx, end_rx) = watch::channel(());
+    let peer = peer(&authority);
+    let (far, mut far_events) = far_peer(&authority, positive_serial(9));
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let link = FakeLink {
+        state: Arc::clone(&state),
+        events,
+        end: end_rx,
+        issuer: Arc::new(authority.issuer),
+        certificate: authority.certificate,
+        ask: Ask::Refused(EnrolRefusal::IssuerUnavailable),
+        gate: Some(Arc::clone(&gate)),
+        grant_from: None,
+    };
+    let (hotspot_tx, _hotspot_rx) = mpsc::unbounded_channel();
+    let (bluetooth_tx, _bluetooth_rx) = mpsc::unbounded_channel();
+    let (enroller, handle) = Enroller::new(
+        Arc::new(RunKeys { der }),
+        Some(HOUR),
+        Vec::new(),
+        vec![authority.root.clone()],
+        Some(held),
+        Vec::new(),
+        inbox(),
+        peer,
+        hotspot_tx,
+        bluetooth_tx,
+    );
+    let run = tokio::spawn(run(link, enroller));
+    // The open is connected, so the renewal answer waits on the gate across the expiry.
+    // The open serves the aging identity, and a live peer dials it.
+    poll_until(|| handle.peer_address().is_some()).await;
+    let addr = handle.peer_address().expect("the open bound a listener");
+    let peer_identity = far.link(addr).await.expect("the link completes");
+    assert_eq!(
+        peer_identity, task_identity,
+        "the link answers the device's identity"
+    );
+    // The node reports the live link while the task stands on the renewal answer.
+    poll_until(|| !handle.linked_peers().is_empty()).await;
+
+    tokio::time::sleep(
+        (deadline + Duration::from_secs(1))
+            .duration_since(SystemTime::now())
+            .unwrap_or_default(),
+    )
+    .await;
+    gate.notify_one();
+
+    // The wake the refusal takes back must close the links at once (R76 proof 5).
+    poll_until(|| handle.peer_address().is_none()).await;
+    let far_reasons = far_closes(&mut far_events, Duration::from_secs(3)).await;
+    assert!(
+        far_reasons.contains(&connetto_peer::CloseReason::PeerExpired),
+        "the far end closed the link at the window's end, got {far_reasons:?}"
     );
 
     end_tx.send(()).expect("the run ends");

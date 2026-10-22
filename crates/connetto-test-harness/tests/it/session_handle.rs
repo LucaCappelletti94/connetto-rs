@@ -1,9 +1,8 @@
 //! R2 acceptance: the session layer's own durable identity.
 //!
 //! One handle covers one unbroken run of one caller. It is the key the
-//! exactly-once watermark records against, the key the connection registry
-//! addresses for revocation and supersession, and it survives a reconnect
-//! where the per-connection counter never could.
+//! connection registry addresses for revocation and supersession, and it
+//! survives a reconnect where the per-connection counter never could.
 //!
 //! Needs Docker: the fixture starts its own Postgres.
 
@@ -11,7 +10,9 @@ use std::str::FromStr as _;
 use std::time::Duration;
 
 use connetto_core::SessionId;
-use connetto_core::messages::{ControlMessage, FatalErrorReason, MutationRejectReason};
+use connetto_core::messages::{
+    ControlMessage, FatalErrorReason, MutationRejectReason, WriterRequest,
+};
 use connetto_server::{PgSnapshotSource, RuntimeWritableCatalog};
 use connetto_test_harness::{
     Fixture, HarnessAuth, RosterAuth, Server, ServerConfig, WITHHELD_ID, insert_changeset,
@@ -242,9 +243,19 @@ async fn a_handle_does_not_survive_a_change_of_caller() {
         alice_ack.session_token, bob_ack.session_token,
         "a change of caller starts a new run"
     );
+    let alice_writer = alice_ack
+        .writer
+        .expect("alice's handshake asks the server to issue a number writer");
+    let bob_writer = bob_ack
+        .writer
+        .expect("bob's handshake asks the server to issue a number writer");
+    assert_ne!(
+        bob_writer.number, alice_writer.number,
+        "bob writes under his own number, never alice's"
+    );
     assert_eq!(
-        bob_ack.last_applied_seq, None,
-        "bob inherits no watermark from alice"
+        bob_writer.frontier, 0,
+        "bob's number settles nothing of alice's"
     );
 
     // Superseding alice's handle would have closed bob, so prove bob is live.
@@ -263,20 +274,20 @@ async fn a_handle_does_not_survive_a_change_of_caller() {
     drop(server);
 }
 
-/// The exactly-once watermark keys on the handle, so a reconnect that resolves
-/// to the same session sees its own applied sequence and replays nothing,
-/// while a different caller starts clean.
+/// The writer frontier keys on the account, so a reconnect that writes under
+/// the account's own number sees the sequences the server already settled and
+/// replays nothing, while a different account starts clean.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
+async fn the_frontier_resumes_on_the_writer_across_a_reconnect() {
     let fixture = Fixture::acquire().await;
     let server = serve(&fixture).await;
 
     let mut first = server.connect();
     let first_ack = first.handshake_with("socket-one", "user:alice").await;
-    assert_eq!(
-        first_ack.last_applied_seq, None,
-        "a fresh session has applied nothing"
-    );
+    let first_writer = first_ack
+        .writer
+        .expect("a number handshake is granted a number writer");
+    assert_eq!(first_writer.frontier, 0, "a fresh number settles nothing");
     first.upload(1, note(1, "mine")).await;
     match first.next_control().await {
         ControlMessage::MutationApplied(applied) => assert_eq!(applied.client_seq, 1),
@@ -293,29 +304,47 @@ async fn the_watermark_resumes_on_the_handle_across_a_reconnect() {
     }
     first.close().await;
 
-    // A fresh socket, a new per-connection label, the same caller. The handle
-    // is the same, so the server reports the sequence it already applied and
-    // the client retires that pending record instead of replaying it.
+    // A fresh socket, a new per-connection label, the same account writing
+    // under its own number. Both settled sequences count in the frontier, so
+    // the client retires that pending tail instead of replaying it.
     let mut second = server.connect();
-    let second_ack = second.handshake_with("socket-two", "user:alice").await;
+    let second_ack = second
+        .handshake_writing(
+            "socket-two",
+            &["user:alice"],
+            None,
+            WriterRequest::Number(first_writer.number),
+            None,
+        )
+        .await;
     assert_eq!(
         second_ack.session_token, first_ack.session_token,
         "the handle survives the reconnect"
     );
+    let second_writer = second_ack
+        .writer
+        .expect("the confirmed number answers with its frontier");
     assert_eq!(
-        second_ack.last_applied_seq,
-        Some(1),
-        "the watermark resumes on the handle, so seq 1 is never re-applied"
+        second_writer.number, first_writer.number,
+        "the account's number is confirmed, not re-issued"
+    );
+    assert_eq!(
+        second_writer.frontier, 2,
+        "the frontier counts the applied and the refused write, so neither is re-applied"
     );
     second.close().await;
 
-    // A different caller shares none of it.
+    // A different account shares none of it.
     let mut other = server.connect();
     let other_ack = other.handshake_with("socket-three", "user:carol").await;
-    assert_eq!(
-        other_ack.last_applied_seq, None,
-        "another caller's watermark is its own"
+    let other_writer = other_ack
+        .writer
+        .expect("a number handshake is granted a number writer");
+    assert_ne!(
+        other_writer.number, first_writer.number,
+        "another account's number is its own"
     );
+    assert_eq!(other_writer.frontier, 0);
     other.close().await;
     drop(server);
 }

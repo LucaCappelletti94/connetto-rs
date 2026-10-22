@@ -249,7 +249,9 @@ where
         connetto_core::messages::Grant::new(format!("user:{client_id}")),
     );
     if let Some(cursor) = resume {
-        handshake = handshake.with_cursor(cursor);
+        handshake = handshake
+            .with_cursor(cursor)
+            .with_cursor_subjects(core::iter::empty::<&str>());
     }
     client
         .send_control(ControlMessage::Handshake(handshake))
@@ -700,7 +702,8 @@ async fn open_scripted(manager: &Arc<ScriptedManager>, resume: Cursor) -> Loopba
         .with_grant(connetto_core::messages::Grant::new(
             "user:client-a".to_owned(),
         ))
-        .with_cursor(resume);
+        .with_cursor(resume)
+        .with_cursor_subjects(core::iter::empty::<&str>());
     client
         .send_control(ControlMessage::Handshake(handshake))
         .await
@@ -970,7 +973,8 @@ async fn open_restarted_session(
         .with_grant(connetto_core::messages::Grant::new(
             "user:client-a".to_owned(),
         ))
-        .with_cursor(resume);
+        .with_cursor(resume)
+        .with_cursor_subjects(core::iter::empty::<&str>());
     client
         .send_control(ControlMessage::Handshake(handshake))
         .await
@@ -1138,7 +1142,9 @@ async fn open_fenced_session(
         connetto_core::messages::Grant::new("user:client-a".to_owned()),
     );
     if let Some(cursor) = resume {
-        handshake = handshake.with_cursor(cursor);
+        handshake = handshake
+            .with_cursor(cursor)
+            .with_cursor_subjects(core::iter::empty::<&str>());
     }
     client
         .send_control(ControlMessage::Handshake(handshake))

@@ -406,9 +406,9 @@ fn status_label(event: &ClientEvent) -> Option<String> {
         ClientEvent::MutationApplied { client_seq } => {
             Some(format!("mutation {client_seq} applied"))
         }
-        ClientEvent::MutationRejected { client_seq, .. } => {
-            Some(format!("mutation {client_seq} rejected"))
-        }
+        ClientEvent::MutationRejected {
+            client_seq, reason, ..
+        } => Some(format!("mutation {client_seq} rejected: {reason}")),
         ClientEvent::MutationConflict { client_seq, .. } => {
             Some(format!("mutation {client_seq} conflicted"))
         }
@@ -460,6 +460,8 @@ fn device_label(_native: &NativeClient<Ws>) -> String {
 /// Sign in, open the replica and start the pump, then feed the view.
 async fn setup(app: AppHandle, core: Arc<Core>, data_dir: PathBuf) -> anyhow::Result<()> {
     use anyhow::Context as _;
+    #[cfg(target_os = "android")]
+    connetto_auth_session::initialize_tls()?;
     let server = endpoint(
         std::env::var("CONNETTO_DEMO_WS").ok(),
         option_env!("CONNETTO_DEMO_BUILD_WS"),

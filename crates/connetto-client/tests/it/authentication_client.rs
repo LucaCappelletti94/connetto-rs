@@ -118,7 +118,7 @@ async fn first_boot_with_a_queued_row(
         !unsynced.is_empty(),
         "the unacknowledged mutation stays pending"
     );
-    unsynced
+    unsynced.into_iter().map(|entry| entry.seq).collect()
 }
 
 /// Phase E4 acceptance, the native half of the account switch.
@@ -236,7 +236,10 @@ async fn each_identity_opens_its_own_replica() {
         .expect("read alice");
     assert_eq!(seen, vec![Some("alice-row".to_owned())]);
     assert_eq!(
-        conn.unsynced(),
+        conn.unsynced()
+            .into_iter()
+            .map(|entry| entry.seq)
+            .collect::<Vec<_>>(),
         alice_unsynced,
         "her unuploaded mutation survived the switch and replays"
     );
@@ -425,7 +428,10 @@ impl Transport for GrantRecorder {
                         current_cursor: Cursor::new(Vec::new()),
                         schema_version: None,
                         initial_credits: 64,
-                        last_applied_seq: None,
+                        writer: Some(connetto_core::messages::WriterGrant {
+                            number: 1,
+                            frontier: 0,
+                        }),
                     },
                 )));
         }
