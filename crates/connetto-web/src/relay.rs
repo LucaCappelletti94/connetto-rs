@@ -2524,6 +2524,8 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
             | HubEvent::Export(_, _)
             | HubEvent::Import(_, _)
             | HubEvent::ForgetRetired(_, _)
+            | HubEvent::RefusedContent(_)
+            | HubEvent::RetryRefused(_, _)
             | HubEvent::Internal(
                 _,
                 ContentFrame::Resolve { .. }
@@ -2533,7 +2535,8 @@ fn recovery_interrupts_attach(event: &HubEvent) -> bool {
                     | ContentFrame::RefusedContent { .. }
                     | ContentFrame::RetryRefused { .. }
                     | ContentFrame::RetiredContent { .. }
-                    | ContentFrame::ForgetRetiredContent { .. },
+                    | ContentFrame::ForgetRetiredContent { .. }
+                    | ContentFrame::Tidy { .. },
                 _
             )
     )
