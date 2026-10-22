@@ -488,7 +488,8 @@ async fn boot_window() -> Result<Boot, JsValue> {
 }
 
 /// The one stylesheet the demo renders, identical to the dioxus demo's.
-const CSS: &str = r#":root { --accent: #2f6feb; --accent-hover: #2559c7; --danger: #b42318; --border: #d0d7de; --muted: #57606a; --surface: #f6f8fa; }
+const CSS: &str = r#"
+:root { --accent: #2f6feb; --accent-hover: #2559c7; --danger: #b42318; --border: #d0d7de; --muted: #57606a; --surface: #f6f8fa; }
 body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; color: #1f2328; background: #fff; }
 .wrap { padding: 16px; max-width: 960px; margin: 0 auto; }
 h1 { font-size: 1.4em; margin: 0 0 8px; }
@@ -527,7 +528,8 @@ input[type=file] { border: none; padding: 0; }
 .warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
 .error { color: var(--danger); }
 .peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
-img.thumb { max-height: 60px; border-radius: 4px; }"#;
+img.thumb { max-height: 60px; border-radius: 4px; }
+"#;
 
 /// A cheaply clonable, identity-compared client handle for props.
 ///
@@ -1188,12 +1190,10 @@ fn app() -> Html {
                     });
                 });
                 html! {
-                    <span>
-                        <button onclick={enrol_gate}>
-                            <Icon data={IconData::FONT_AWESOME_SOLID_FINGERPRINT} width={"14"} height={"14"} />
-                            { "Enrol passkey gate" }
-                        </button>
-                    </span>
+                    <button onclick={enrol_gate}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_FINGERPRINT} width={"14"} height={"14"} />
+                        { "Enrol passkey gate" }
+                    </button>
                 }
             } else {
                 html! {}
@@ -1201,25 +1201,29 @@ fn app() -> Html {
 
             html! {
                 <div class="auth-banner">
+                    <h2>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_CIRCLE_USER} width={"14"} height={"14"} />
+                        { "Account " }
+                    </h2>
                     { account_line }
-                    { enrol_html }
-                    <span>
-                        <button onclick={logout_keep}>
-                            <Icon data={IconData::FONT_AWESOME_SOLID_RIGHT_FROM_BRACKET} width={"14"} height={"14"} />
-                            { "Log out, keep local data" }
-                        </button>
-                        { " " }
-                        <button class="danger" onclick={logout_delete}>
-                            <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
-                            { "Delete local data and log out" }
-                        </button>
-                        { " " }
+                    <div class="row">
                         { switch_buttons }
                         <button onclick={add_account}>
                             <Icon data={IconData::FONT_AWESOME_SOLID_USER_PLUS} width={"14"} height={"14"} />
                             { "Add another account" }
                         </button>
-                    </span>
+                        { enrol_html }
+                    </div>
+                    <div class="row">
+                        <button onclick={logout_keep}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_RIGHT_FROM_BRACKET} width={"14"} height={"14"} />
+                            { "Log out, keep local data" }
+                        </button>
+                        <button class="danger" onclick={logout_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
+                            { "Delete local data and log out" }
+                        </button>
+                    </div>
                     { confirm_html }
                     { refused_html }
                 </div>
@@ -1228,6 +1232,10 @@ fn app() -> Html {
             // The button opens the login URL the worker parks; it is inert until one arrives.
             html! {
                 <div class="auth-banner">
+                    <h2>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_CIRCLE_USER} width={"14"} height={"14"} />
+                        { "Account " }
+                    </h2>
                     <span>
                         { "Sign in to begin. " }
                         <button class="primary" disabled={!prompt_present} onclick={open_login}>
@@ -1242,6 +1250,10 @@ fn app() -> Html {
             let identity = stored_identity(&account);
             html! {
                 <div class="auth-banner">
+                    <h2>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_CIRCLE_USER} width={"14"} height={"14"} />
+                        { "Account " }
+                    </h2>
                     <span>
                         { "Signed in as " }
                         <code class="id" title={identity.clone()}>{ short_id(&identity) }</code>
@@ -1285,7 +1297,7 @@ fn panes_skeleton() -> Html {
         <div class="panes">
             <div class="pane">
                 <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ "count 0, total quantity 0. Converges across every window through Postgres." }</p>
+                <p>{ "count 0, total quantity 0. Newest first. Converges across every window through Postgres." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
                     <tbody></tbody>
@@ -1654,7 +1666,7 @@ fn dashboard(props: &DashboardProps) -> Html {
         <div class="panes">
             <div class="pane">
                 <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
-                <p>{ format!("count {order_count}, total quantity {order_sum}. Converges across every window through Postgres.") }</p>
+                <p>{ format!("count {order_count}, total quantity {order_sum}. Newest first. Converges across every window through Postgres.") }</p>
                 <p>{ "COUNT(*) pushed by the server: " }<strong>{ count_text.to_string() }</strong></p>
                 <div class="row">
                     <button class="primary" onclick={add_order} disabled={identity.is_empty()}>
