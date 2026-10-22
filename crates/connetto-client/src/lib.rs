@@ -132,7 +132,7 @@ pub use builder::sign_in::{AccountChooser, Keyring, KeyringAuth, StoredAuth};
 pub use builder::sign_in::{NativeSignIn, NoKeyring};
 pub use builder::{
     AttachContent, ClientBuilder, ContentPlace, CoreClient, CoreDurable, CorePump, CoreSignedIn,
-    Gate, Located, REPLICA_PREFIX, ReplicaPlace, SyncSchema, SyncTuning, TierStepOutside,
+    Gate, Located, REPLICA_PREFIX, ReplicaPlace, SyncSchema, SyncTuning, TierStepRefused,
 };
 pub use cipher::{ReplicaKey, UnlockError};
 pub use dsl::Watchable;

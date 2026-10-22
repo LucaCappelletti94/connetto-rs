@@ -425,6 +425,7 @@ async fn a_table_rebuild_stays_in_the_tier() {
         "the rebuilt table landed in the replica: {:?}",
         main_tables.iter().map(|t| &t.name).collect::<Vec<_>>()
     );
+    drop(conn);
     storage
         .delete_db(&tier_name)
         .expect("the tier's handle was released");
@@ -545,6 +546,7 @@ async fn a_tier_a_later_major_introduces_is_created_on_an_existing_install() {
         .execute(conn.conn())
         .expect("write the new tier");
     assert_eq!(tier_major(&mut conn), 2);
+    drop(conn);
     storage
         .delete_db(&tier_name)
         .expect("the tier's handle was released");

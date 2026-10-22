@@ -11,19 +11,22 @@ use crate::PolicyTables;
 use crate::SqlFunctions;
 use crate::tier_migration::{TierPlan, TierStep};
 
-/// A data step registered for a boundary this build carries no generated
-/// step for, so it could never run.
+/// Why a tier step was refused at registration.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "a tier step starts at major {from}, outside the boundaries this build carries, from {oldest} up to {build}"
-)]
-pub struct TierStepOutside {
-    /// The major the step starts at.
-    pub from: Major,
-    /// The oldest major the build migrates from.
-    pub oldest: Major,
-    /// The build's major.
-    pub build: Major,
+pub enum TierStepRefused {
+    /// A data step registered for a boundary this build carries no
+    /// generated step for, so it could never run.
+    #[error(
+        "a tier step starts at major {from}, outside the boundaries this build carries, from {oldest} up to {build}"
+    )]
+    Outside {
+        /// The major the step starts at.
+        from: Major,
+        /// The oldest major the build migrates from.
+        oldest: Major,
+        /// The build's major.
+        build: Major,
+    },
 }
 
 /// A translated schema and the client-side registrations its DDL reaches, as
@@ -80,17 +83,17 @@ impl SyncSchema {
     ///
     /// # Errors
     ///
-    /// [`TierStepOutside`] when `from` is not a boundary this build carries,
+    /// [`TierStepRefused`] when `from` is not a boundary this build carries,
     /// one from the oldest exported major up to the major before its own.
     pub fn with_tier_step(
         mut self,
         from: Major,
         step: impl TierStep,
-    ) -> Result<Self, TierStepOutside> {
+    ) -> Result<Self, TierStepRefused> {
         let history = self.bundle.tier_history();
         let build = self.bundle.major();
         if from < history.oldest() || from >= build {
-            return Err(TierStepOutside {
+            return Err(TierStepRefused::Outside {
                 from,
                 oldest: history.oldest(),
                 build,
