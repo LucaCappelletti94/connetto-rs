@@ -47,7 +47,7 @@ use connetto_web::builder::{AttachedTab, TabTopology, WebClientBuilder};
 use connetto_web::unlock::serve_account_choice;
 use connetto_web::{MessageTransport, TabContent, TabResolved, deliver_login_code, workers};
 use connetto_yew::use_live;
-use connetto_yew_web_demo::status_label;
+use connetto_yew_web_demo::{short_id, status_label};
 use diesel::prelude::*;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
@@ -56,6 +56,7 @@ use web_sys::{BroadcastChannel, Event, HtmlInputElement, MessageEvent};
 
 include!(concat!(env!("OUT_DIR"), "/connetto-schema.rs"));
 use yew::prelude::*;
+use yew_icons::{Icon, IconData};
 
 /// The tab-to-worker transport this window's client rides.
 type Tab = MessageTransport<BroadcastChannel>;
@@ -486,27 +487,47 @@ async fn boot_window() -> Result<Boot, JsValue> {
     })
 }
 
-/// Styling kept minimal: the demo is the topology, not the paint.
-const CSS: &str = r"
-    body { font-family: sans-serif; margin: 0; }
-    .wrap { padding: 16px; max-width: 720px; margin: 0 auto; }
-    .panes { display: flex; gap: 16px; flex-wrap: wrap; }
-    .pane { flex: 1 1 300px; border: 1px solid #ccc; border-radius: 8px; padding: 12px; }
-    .pane h2 { margin-top: 0; font-size: 1.1em; }
-    .badge { font-size: 0.7em; padding: 2px 6px; border-radius: 4px; vertical-align: middle; }
-    .synced { background: #e6f0ff; color: #14458c; }
-    .local { background: #fde6e6; color: #8c1414; }
-    .trim { background: #eef7e6; color: #2e6b14; }
-    .status { color: #555; font-family: monospace; }
-    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
-    th, td { border: 1px solid #ddd; padding: 4px 8px; text-align: left; }
-    input { padding: 4px; }
-    button { padding: 4px 10px; cursor: pointer; }
-    .row { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
-    .auth-bar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 10px 0; padding: 8px; background: #f8f8f8; border-radius: 6px; }
-    .picker { border: 1px solid #bbb; border-radius: 8px; padding: 12px; margin: 8px 0; background: #fffbe6; }
-    .expiry-warn { border: 1px solid #e0a020; border-radius: 6px; padding: 8px 12px; background: #fff8e1; margin: 8px 0; }
-";
+/// The one stylesheet the demo renders, identical to the dioxus demo's.
+const CSS: &str = r#":root { --accent: #2f6feb; --accent-hover: #2559c7; --danger: #b42318; --border: #d0d7de; --muted: #57606a; --surface: #f6f8fa; }
+body { font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; margin: 0; color: #1f2328; background: #fff; }
+.wrap { padding: 16px; max-width: 960px; margin: 0 auto; }
+h1 { font-size: 1.4em; margin: 0 0 8px; }
+h1, h2 { display: flex; align-items: center; gap: 8px; }
+.panes { display: flex; gap: 16px; flex-wrap: wrap; }
+.pane { flex: 1 1 300px; border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; background: #fff; }
+.pane h2 { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 1.05em; }
+.badge { font-size: 0.7em; padding: 2px 8px; border-radius: 999px; font-weight: 600; }
+.synced { background: #ddf4ff; color: #0a3069; }
+.local { background: #ffebe9; color: #82071e; }
+.trim { background: #dafbe1; color: #116329; }
+.status { color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; }
+.id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.9em; background: var(--surface); border-radius: 4px; padding: 0 4px; }
+table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+th, td { border-bottom: 1px solid var(--border); padding: 6px 8px; text-align: left; }
+th { font-size: 0.85em; color: var(--muted); font-weight: 600; }
+input { font: inherit; padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; }
+input:focus { outline: 2px solid var(--accent); outline-offset: -1px; border-color: var(--accent); }
+button { display: inline-flex; align-items: center; gap: 6px; font: inherit; font-size: 0.9em; font-weight: 500; padding: 6px 12px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); color: #1f2328; cursor: pointer; transition: background-color .12s, border-color .12s; }
+button svg { flex: none; fill: currentColor; }
+button:hover:not(:disabled) { background: #eaeef2; border-color: #afb8c1; }
+button:active:not(:disabled) { background: #dde3e9; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+button:disabled { opacity: .5; cursor: not-allowed; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.danger { background: #fff; color: var(--danger); border-color: #f5c2bd; }
+button.danger:hover:not(:disabled) { background: #fff1f0; border-color: var(--danger); }
+input[type=file]::file-selector-button { font: inherit; font-size: 0.9em; padding: 6px 12px; margin-right: 8px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
+input[type=file] { border: none; padding: 0; }
+.row { display: flex; gap: 8px; margin-top: 8px; flex-wrap: wrap; align-items: center; }
+.auth-banner { display: flex; flex-direction: column; gap: 8px; border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; margin-bottom: 12px; background: var(--surface); }
+.auth-banner p { margin: 0; }
+.confirm { background: #fff8c5; border: 1px solid #d4a72c; border-radius: 8px; padding: 8px 12px; }
+.confirm p { margin: 0 0 6px; }
+.warn { color: #7d4e00; background: #fff8c5; border: 1px solid #d4a72c; border-radius: 6px; padding: 4px 8px; margin: 4px 0; }
+.error { color: var(--danger); }
+.peer { border: 1px solid var(--border); border-radius: 10px; padding: 8px 14px; margin-bottom: 12px; }
+img.thumb { max-height: 60px; border-radius: 4px; }"#;
 
 /// A cheaply clonable, identity-compared client handle for props.
 ///
@@ -948,23 +969,28 @@ fn app() -> Html {
             .cloned()
             .map(|account| {
                 let pending_choice = pending_choice.clone();
-                let label = account.clone();
+                let label = stored_identity(&account);
                 html! {
                     <button onclick={Callback::from(move |_| {
                         *pending_choice.borrow_mut() =
                             Some(AccountChoice::Account(account.clone()));
                     })}>
-                        { format!("Sign in as {label}") }
+                        <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
+                        { "Sign in as " }
+                        <code class="id" title={label.clone()}>{ short_id(&label) }</code>
                     </button>
                 }
             })
             .collect();
         html! {
-            <div class="picker">
+            <div class="confirm">
                 <strong>{ "Choose account:" }</strong>
                 <div class="row">
                     { switch_buttons }
-                    <button onclick={add_new}>{ "Add new account" }</button>
+                    <button onclick={add_new}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_USER_PLUS} width={"14"} height={"14"} />
+                        { "Add new account" }
+                    </button>
                 </div>
             </div>
         }
@@ -976,7 +1002,7 @@ fn app() -> Html {
     let expiry_html = if let Some(warn) = (*expiry_warn).clone() {
         let count = warn.pending_count();
         html! {
-            <div class="expiry-warn">
+            <div class="warn">
                 { format!(
                     "Session nearing expiry with {count} pending local item(s). \
                      Reconnect before the session lapses to avoid data loss."
@@ -998,16 +1024,23 @@ fn app() -> Html {
                 .unwrap_or_default();
             let account_line = {
                 let uid = (*identity).clone().unwrap_or_default();
-                match (*booted_account).clone() {
-                    Some(acc) => html! {
+                let decoded = (*booted_account).clone().map(|acc| stored_identity(&acc));
+                match decoded {
+                    Some(acc) if acc != uid => html! {
                         <span>
-                            { format!("Signed in as {} (account: {}).", uid, acc) }
+                            { "Signed in as " }
+                            <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
+                            { " (account: " }
+                            <code class="id" title={acc.clone()}>{ short_id(&acc) }</code>
+                            { ")." }
                             { passkey_line }
                         </span>
                     },
-                    None => html! {
+                    _ => html! {
                         <span>
-                            { format!("Signed in as {}.", uid) }
+                            { "Signed in as " }
+                            <code class="id" title={uid.clone()}>{ short_id(&uid) }</code>
+                            { "." }
                             { passkey_line }
                         </span>
                     },
@@ -1024,7 +1057,7 @@ fn app() -> Html {
                     let status = status.clone();
                     let identity = identity.clone();
                     let booted_account = booted_account.clone();
-                    let label = account.clone();
+                    let label = stored_identity(&account);
                     html! {
                         <button onclick={Callback::from(move |_| {
                             // Cleared before the reboot, not after it. The banner
@@ -1043,7 +1076,9 @@ fn app() -> Html {
                                 Some(Err(e)) => status.set(format!("switch failed: {e:?}")),
                             }
                         })}>
-                            { format!("Switch to {label}") }
+                            <Icon data={IconData::FONT_AWESOME_SOLID_ARROW_RIGHT_ARROW_LEFT} width={"14"} height={"14"} />
+                            { "Switch to " }
+                            <code class="id" title={label.clone()}>{ short_id(&label) }</code>
                         </button>
                     }
                 })
@@ -1076,9 +1111,15 @@ fn app() -> Html {
                 html! {
                     <span>
                         { format!("{count} local item(s) will be lost. ") }
-                        <button onclick={confirm_delete}>{ "Delete anyway" }</button>
+                        <button class="danger" onclick={confirm_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_CHECK} width={"14"} height={"14"} />
+                            { "Delete anyway" }
+                        </button>
                         { " " }
-                        <button onclick={cancel_confirm.clone()}>{ "Cancel" }</button>
+                        <button onclick={cancel_confirm.clone()}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_XMARK} width={"14"} height={"14"} />
+                            { "Cancel" }
+                        </button>
                     </span>
                 }
             } else {
@@ -1090,9 +1131,15 @@ fn app() -> Html {
                 html! {
                     <span>
                         { format!("Refused: {count} local item(s) still pending. ") }
-                        <button onclick={force_delete}>{ "Force delete" }</button>
+                        <button class="danger" onclick={force_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
+                            { "Force delete" }
+                        </button>
                         { " " }
-                        <button onclick={cancel_confirm}>{ "Cancel" }</button>
+                        <button onclick={cancel_confirm}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_XMARK} width={"14"} height={"14"} />
+                            { "Cancel" }
+                        </button>
                     </span>
                 }
             } else {
@@ -1142,7 +1189,10 @@ fn app() -> Html {
                 });
                 html! {
                     <span>
-                        <button onclick={enrol_gate}>{ "Enrol passkey gate" }</button>
+                        <button onclick={enrol_gate}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_FINGERPRINT} width={"14"} height={"14"} />
+                            { "Enrol passkey gate" }
+                        </button>
                     </span>
                 }
             } else {
@@ -1150,16 +1200,25 @@ fn app() -> Html {
             };
 
             html! {
-                <div class="auth-bar">
+                <div class="auth-banner">
                     { account_line }
                     { enrol_html }
                     <span>
-                        <button onclick={logout_keep}>{ "Log out, keep local data" }</button>
+                        <button onclick={logout_keep}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_RIGHT_FROM_BRACKET} width={"14"} height={"14"} />
+                            { "Log out, keep local data" }
+                        </button>
                         { " " }
-                        <button onclick={logout_delete}>{ "Delete local data and log out" }</button>
+                        <button class="danger" onclick={logout_delete}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_TRASH_CAN} width={"14"} height={"14"} />
+                            { "Delete local data and log out" }
+                        </button>
                         { " " }
                         { switch_buttons }
-                        <button onclick={add_account}>{ "Add another account" }</button>
+                        <button onclick={add_account}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_USER_PLUS} width={"14"} height={"14"} />
+                            { "Add another account" }
+                        </button>
                     </span>
                     { confirm_html }
                     { refused_html }
@@ -1168,18 +1227,26 @@ fn app() -> Html {
         } else if prompt_present || stored.is_none() {
             // The button opens the login URL the worker parks; it is inert until one arrives.
             html! {
-                <div class="auth-bar">
+                <div class="auth-banner">
                     <span>
                         { "Sign in to begin. " }
-                        <button disabled={!prompt_present} onclick={open_login}>{ "Sign in" }</button>
+                        <button class="primary" disabled={!prompt_present} onclick={open_login}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_RIGHT_TO_BRACKET} width={"14"} height={"14"} />
+                            { "Sign in" }
+                        </button>
                     </span>
                 </div>
             }
         } else {
             let account = stored.unwrap_or_default();
+            let identity = stored_identity(&account);
             html! {
-                <div class="auth-bar">
-                    <span>{ format!("Signed in as {}.", stored_identity(&account)) }</span>
+                <div class="auth-banner">
+                    <span>
+                        { "Signed in as " }
+                        <code class="id" title={identity.clone()}>{ short_id(&identity) }</code>
+                        { "." }
+                    </span>
                 </div>
             }
         }
@@ -1217,7 +1284,7 @@ fn panes_skeleton() -> Html {
     html! {
         <div class="panes">
             <div class="pane">
-                <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ "count 0, total quantity 0. Converges across every window through Postgres." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "quantity" }</th></tr></thead>
@@ -1225,7 +1292,7 @@ fn panes_skeleton() -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ "count 0. Pick an image file to stage and upload through the content route." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "state" }</th><th>{ "image" }</th></tr></thead>
@@ -1233,7 +1300,7 @@ fn panes_skeleton() -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
                 <p>{ "count 0. Converges across this device's windows through the DB worker, never the server." }</p>
                 <table>
                     <thead><tr><th>{ "id" }</th><th>{ "body" }</th></tr></thead>
@@ -1241,12 +1308,12 @@ fn panes_skeleton() -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
                 <p>{ "Replica mirror: 0 pages (~0 KB), 0 free to reclaim. Covered rows: 0." }</p>
                 <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
             </div>
             <div class="pane">
-                <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ "your data " }<span class="badge local">{ "R26" }</span></h2>
                 <p>{ "Save a zip archive of this device's local data. The archive is not \
                       encrypted and holds every row the device can read: whoever holds \
                       the file holds the data." }</p>
@@ -1570,29 +1637,35 @@ fn dashboard(props: &DashboardProps) -> Html {
     };
 
     let orders_error = orders.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("orders error: {err}") }</p> }
+        html! { <p class="error">{ format!("orders error: {err}") }</p> }
     });
     let notes_error = notes.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("notes error: {err}") }</p> }
+        html! { <p class="error">{ format!("notes error: {err}") }</p> }
     });
     let photos_error = photos.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("photos error: {err}") }</p> }
+        html! { <p class="error">{ format!("photos error: {err}") }</p> }
     });
     let count_error = count.error().map(|err| {
-        html! { <p style="color:#b00;">{ format!("count error: {err}") }</p> }
+        html! { <p class="error">{ format!("count error: {err}") }</p> }
     });
     let urls = (*photo_urls).clone();
 
     html! {
         <div class="panes">
             <div class="pane">
-                <h2>{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_CART_SHOPPING} width={"14"} height={"14"} />{ "orders " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ format!("count {order_count}, total quantity {order_sum}. Converges across every window through Postgres.") }</p>
                 <p>{ "COUNT(*) pushed by the server: " }<strong>{ count_text.to_string() }</strong></p>
                 <div class="row">
-                    <button onclick={add_order} disabled={identity.is_empty()}>{ "Add order" }</button>
+                    <button class="primary" onclick={add_order} disabled={identity.is_empty()}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_PLUS} width={"14"} height={"14"} />
+                        { "Add order" }
+                    </button>
                     if newest_order.is_some() {
-                        <button onclick={remove_order}>{ "Remove newest" }</button>
+                        <button class="danger" onclick={remove_order}>
+                            <Icon data={IconData::FONT_AWESOME_SOLID_MINUS} width={"14"} height={"14"} />
+                            { "Remove newest" }
+                        </button>
                     }
                 </div>
                 { orders_error.unwrap_or_default() }
@@ -1604,7 +1677,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                             let id = row.id.to_string();
                             html! {
                                 <tr key={id.clone()}>
-                                    <td>{ id }</td>
+                                    <td><code class="id" title={id.clone()}>{ short_id(&id) }</code></td>
                                     <td>{ row.quantity.to_string() }</td>
                                 </tr>
                             }
@@ -1613,7 +1686,7 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_IMAGES} width={"14"} height={"14"} />{ "photos " }<span class="badge synced">{ "synced" }</span></h2>
                 <p>{ format!("count {photo_count}. Pick an image file to stage and upload through the content route.") }</p>
                 <div class="row">
                     <input type="file" accept="image/*" onchange={pick_photo} disabled={identity.is_empty()} />
@@ -1626,11 +1699,11 @@ fn dashboard(props: &DashboardProps) -> Html {
                             let id = row.id.to_string();
                             let state = row.content_state.as_deref().unwrap_or("pending");
                             let img = urls.get(&row.id).map(|url| {
-                                html! { <img src={url.clone()} style="max-height:60px;" /> }
+                                html! { <img class="thumb" src={url.clone()} /> }
                             });
                             html! {
                                 <tr key={id.clone()}>
-                                    <td>{ id }</td>
+                                    <td><code class="id" title={id.clone()}>{ short_id(&id) }</code></td>
                                     <td>{ state }</td>
                                     <td>{ img.unwrap_or_default() }</td>
                                 </tr>
@@ -1640,11 +1713,14 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_NOTE_STICKY} width={"14"} height={"14"} />{ "notes " }<span class="badge local">{ "device-only" }</span></h2>
                 <p>{ format!("count {note_count}. Converges across this device's windows through the DB worker, never the server.") }</p>
                 <div class="row">
                     <input type="text" placeholder="note body" value={(*note_text).clone()} oninput={on_note_input} />
-                    <button onclick={save_note}>{ "Save note" }</button>
+                    <button class="primary" onclick={save_note}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_FLOPPY_DISK} width={"14"} height={"14"} />
+                        { "Save note" }
+                    </button>
                 </div>
                 { notes_error.unwrap_or_default() }
                 <table>
@@ -1663,30 +1739,36 @@ fn dashboard(props: &DashboardProps) -> Html {
                 </table>
             </div>
             <div class="pane">
-                <h2>{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />{ "retention " }<span class="badge trim">{ "R15" }</span></h2>
                 <p>{ format!("Replica mirror: {pages} pages (~{kb} KB), {free} free to reclaim. Covered rows: {}.", order_count + note_count + photo_count) }</p>
                 <p>{ "Ending a subscription evicts the rows no live subscription still covers, and the trimming pass hands the freed pages back to storage." }</p>
                 <div class="row">
-                    <button onclick={tidy}>{ "Free up space" }</button>
+                    <button onclick={tidy}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_BROOM} width={"14"} height={"14"} />
+                        { "Free up space" }
+                    </button>
                 </div>
             </div>
             <div class="pane">
-                <h2>{ "your data " }<span class="badge local">{ "R26" }</span></h2>
+                <h2><Icon data={IconData::FONT_AWESOME_SOLID_DATABASE} width={"14"} height={"14"} />{ "your data " }<span class="badge local">{ "R26" }</span></h2>
                 <p>{ "Save a zip archive of this device's local data. The archive is not \
                       encrypted and holds every row the device can read: whoever holds \
                       the file holds the data." }</p>
                 <p>{ "The DB worker exports, not this window: the worker holds the durable replica and the device-private tier, while a tab mirror is in memory and holds only what its subscriptions cover." }</p>
                 <div class="row">
-                    <button onclick={export}>{ "Export local data" }</button>
+                    <button onclick={export}>
+                        <Icon data={IconData::FONT_AWESOME_SOLID_FILE_EXPORT} width={"14"} height={"14"} />
+                        { "Export local data" }
+                    </button>
                 </div>
                 if let Some(message) = (*export_status).clone() {
-                    <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
+                    <p class="status">{ message }</p>
                 }
                 <div class="row">
                     <input type="file" accept=".zip" onchange={import_cb} />
                 </div>
                 if let Some(message) = (*import_status).clone() {
-                    <p style="font-family:monospace;font-size:0.85em;color:#555;">{ message }</p>
+                    <p class="status">{ message }</p>
                 }
             </div>
         </div>

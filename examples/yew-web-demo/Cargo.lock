@@ -577,6 +577,7 @@ dependencies = [
  "wasm-bindgen-test",
  "web-sys",
  "yew",
+ "yew_icons",
 ]
 
 [[package]]
@@ -4311,6 +4312,15 @@ dependencies = [
  "quote",
  "rustversion",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "yew_icons"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d54ad895de028958553f84b46574832ee5ffdf53e2f80e2924a4cc501708fa7f"
+dependencies = [
+ "yew",
 ]
 
 [[package]]
