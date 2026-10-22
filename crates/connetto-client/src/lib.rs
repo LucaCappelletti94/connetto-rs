@@ -1553,11 +1553,11 @@ struct SchemaTableRow {
 /// connetto's own bookkeeping tables are excluded. The relay keeps a per-tab
 /// write counter in this database, and a caller subscribing to it or routing a
 /// live query at it would be reading connetto's internals as though they were
-/// application data. `sqlite_schema` of an attached database has no `table!` to
+/// application data. `sqlite_master` of an attached database has no `table!` to
 /// query through, which is why this one stays a catalogue read.
 fn local_tier_tables(db: &mut SqliteConnection) -> Result<HashSet<String>, ClientError> {
     let rows: Vec<SchemaTableRow> = diesel::sql_query(format!(
-        "SELECT name FROM {LOCAL_SCHEMA}.sqlite_schema WHERE type = 'table' \
+        "SELECT name FROM {LOCAL_SCHEMA}.sqlite_master WHERE type = 'table' \
          AND name NOT LIKE 'sqlite_%' AND name NOT GLOB '_connetto*'"
     ))
     .load(db)?;
@@ -1573,7 +1573,7 @@ diesel::table! {
     /// attached local tier needs a schema-qualified name, which `table!`
     /// cannot express, so `local_tier_tables` stays a raw read and this
     /// serves `main` only.
-    #[sql_name = "sqlite_schema"]
+    #[sql_name = "sqlite_master"]
     sqlite_catalog (name) {
         /// The object kind: `table`, `view`, `index` or `trigger`.
         #[sql_name = "type"]
@@ -1923,7 +1923,7 @@ fn schema_ddl_rows(
     source_schema: &str,
 ) -> Result<Vec<SchemaDdlRow>, ClientError> {
     diesel::sql_query(format!(
-        "SELECT name, sql FROM {}.sqlite_schema \
+        "SELECT name, sql FROM {}.sqlite_master \
          WHERE type = 'table' AND sql IS NOT NULL ORDER BY rowid",
         quote_ident(source_schema)
     ))

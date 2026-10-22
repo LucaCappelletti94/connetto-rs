@@ -134,7 +134,7 @@ fn unlock_within(
     // The codec only reports a bad key on the first read of a real page. An
     // empty new database passes trivially, which is correct: there is nothing
     // yet to decrypt.
-    let probed = conn.batch_execute("SELECT count(*) FROM sqlite_schema;");
+    let probed = conn.batch_execute("SELECT count(*) FROM sqlite_master;");
     keep_waiting(conn, wait);
     probed.map_err(|err| {
         if busy.load(core::sync::atomic::Ordering::Relaxed) {

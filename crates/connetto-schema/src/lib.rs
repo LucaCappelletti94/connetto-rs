@@ -39,7 +39,7 @@ use thiserror::Error;
 
 diesel::table! {
     /// SQLite's own catalogue, read to list the views a translation built.
-    #[sql_name = "sqlite_schema"]
+    #[sql_name = "sqlite_master"]
     sqlite_catalog (name) {
         /// The object kind: `table`, `view`, `index` or `trigger`.
         #[sql_name = "type"]
