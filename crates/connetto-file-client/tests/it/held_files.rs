@@ -28,9 +28,9 @@
 //! Postgres.
 //!
 //! Needs Docker, since the fixture starts its own Postgres.
-
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use connetto_client::teardown::content_dir;
@@ -39,11 +39,11 @@ use connetto_client::{
     HeldCredential, MemoryRefreshStore, PendingWork, ReconnectPolicy, SyncSchema, TransportFactory,
 };
 use connetto_core::auth::ContentCaller;
-use connetto_core::messages::{ContentVerb, HeldWork};
+use connetto_core::messages::{BulkMessage, ContentVerb, ControlMessage, HeldWork};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::{TestGrantChecker, replica_key};
-use connetto_core::traits::ContentTicketSigner;
-use connetto_core::{MAJOR_DIRECTIVE, Major, SchemaVersion};
+use connetto_core::traits::{ContentTicketSigner, IncomingFrame, Transport};
+use connetto_core::{MAJOR_DIRECTIVE, Major, SchemaVersion, WebSocketError};
 use connetto_file_client::{Content, ContentClient, ContentHandle, FsStore, ReqwestHttp};
 use connetto_file_core::{FileId, MimeClass};
 use connetto_file_server::{
@@ -665,6 +665,160 @@ async fn a_held_file_drains_to_its_major() {
         PendingWork::default(),
         "nothing is pending after the drain"
     );
+
+    client.close().await;
+    pump_task.await.expect("the pump ends on close");
+    router.close();
+    files.abort();
+}
+
+/// The relay that kills its connection on the first content ticket
+/// request it is sent, so that request's answer can no longer come. A
+/// connection served after the kill forwards everything, which is how the
+/// redial reaches the manager.
+struct KillOnce {
+    inner: Relay,
+    kill: Arc<AtomicBool>,
+}
+
+impl Transport for KillOnce {
+    type Error = WebSocketError;
+
+    async fn send_control(&mut self, message: ControlMessage) -> Result<(), Self::Error> {
+        self.inner.send_control(message).await
+    }
+
+    async fn send_bulk(&mut self, message: BulkMessage) -> Result<(), Self::Error> {
+        self.inner.send_bulk(message).await
+    }
+
+    async fn recv(&mut self) -> Result<Option<IncomingFrame>, Self::Error> {
+        let frame = self.inner.recv().await?;
+        if matches!(
+            &frame,
+            Some(IncomingFrame::Control(
+                ControlMessage::ContentTicketRequest(_)
+            ))
+        ) && self.kill.swap(false, Ordering::AcqRel)
+        {
+            let _ = self.inner.close().await;
+            return Ok(None);
+        }
+        Ok(frame)
+    }
+
+    async fn close(&mut self) -> Result<(), Self::Error> {
+        self.inner.close().await
+    }
+}
+
+/// The drain story where the wire dies under the in-flight content ticket.
+/// Device A stages a photo at major 1 while offline, the deployment
+/// migrates and hosts major 2 beside major 1, and the device reopens at
+/// major 2. The held write drains over the first drain connection, which
+/// dies when the ticket request goes out, so the wait settles as abandoned
+/// and the walk defers the file. The redial serves the manager directly,
+/// the walk reissues the request on the fresh wire, and the file uploads
+/// once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_ticket_its_wire_dies_and_the_redial_reissues() {
+    let fixture = Fixture::acquire().await;
+    provision(&fixture).await;
+    let chunk_dir = tempdir().expect("temp dir");
+    let (_base_url, signer, files) = start_file_server(&fixture, chunk_dir.path()).await;
+    let signer = Signer(Arc::new(signer));
+
+    // The deployment migrates and hosts both majors. Major 1's first
+    // connection is the drain wire, and its ticket request kills it.
+    fixture
+        .exec("ALTER TABLE photos ADD COLUMN taken_at TEXT")
+        .await;
+    let manager1 = manager(
+        &fixture,
+        PG_DDL_V1,
+        one(),
+        advertised(1, SQLITE_DDL_V1),
+        &signer,
+    );
+    let kill = Arc::new(AtomicBool::new(true));
+    let kill_once: HostedEntry = Arc::new({
+        let manager1 = Arc::clone(&manager1);
+        let kill = Arc::clone(&kill);
+        move |relay: Relay| {
+            let manager1 = Arc::clone(&manager1);
+            let kill = Arc::clone(&kill);
+            Box::pin(async move {
+                let _ = manager1.serve(KillOnce { inner: relay, kill }).await;
+            })
+        }
+    });
+    let manager2 = manager(
+        &fixture,
+        PG_DDL_V2,
+        two(),
+        advertised(2, SQLITE_DDL_V2),
+        &signer,
+    );
+    let router = Router::start(vec![(one(), kill_once), (two(), entry(manager2))]).await;
+    let dir = tempdir().expect("device A's replica dir");
+
+    // Device A at major 1, offline. The entry and the bytes both stay
+    // pending.
+    let file_id = {
+        let (client, pump, content) = open_offline(build(1, SQLITE_DDL_V1), "device-a", dir.path())
+            .await
+            .expect("the offline open");
+        let pump_task = tokio::spawn(pump);
+        let file_id = stage_offline_photo(&content).await;
+        client.close().await;
+        pump_task.await.expect("the pump ends on close");
+        file_id
+    };
+
+    // Device A reopens on the same replica directory with the major 2
+    // build, the way an updated app opens.
+    let (core, pump) = connect_pumped(&router, build(2, SQLITE_DDL_V2), "device-a", dir.path())
+        .await
+        .expect("the update opens");
+    let client = core.client().clone();
+    let ContentHandle::Durable(_content) = core.content().expect("content attached") else {
+        panic!("the durable build places content beside the replica file")
+    };
+    let pump_task = tokio::spawn(pump);
+    let mut events = client.events();
+
+    // The first drain wire settles the held write and then dies under the
+    // ticket request, so the connection says the wire is gone.
+    await_event(
+        &mut events,
+        deadline(),
+        |event| {
+            matches!(
+                event,
+                ClientEvent::Held(HeldWork::WireLost { major }) if *major == one()
+            )
+        },
+        rejected,
+    )
+    .await;
+
+    // The redial reissues the request on its own wire, and the file
+    // reaches the file server through it.
+    wait_for_pg_state(&fixture, file_id.as_bytes(), "available").await;
+    assert_eq!(
+        server_manifests_for(&fixture, file_id.as_bytes()).await,
+        1,
+        "the reissued ticket uploaded the file once"
+    );
+
+    // The batch is done once the settled file leaves the held rows.
+    await_event(
+        &mut events,
+        deadline(),
+        |event| matches!(event, ClientEvent::Held(HeldWork::Drained { major }) if *major == one()),
+        rejected,
+    )
+    .await;
 
     client.close().await;
     pump_task.await.expect("the pump ends on close");

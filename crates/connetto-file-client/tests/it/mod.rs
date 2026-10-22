@@ -5,6 +5,7 @@ mod archive;
 mod builder_content;
 mod held;
 mod held_files;
+mod held_wire;
 mod negotiation;
 mod offline_photo;
 mod resolving;

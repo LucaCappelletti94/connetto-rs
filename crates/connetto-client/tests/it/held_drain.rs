@@ -350,6 +350,12 @@ async fn a_numbered_write_drains_under_its_number_and_settles_by_the_frontier() 
         },
     })));
     assert!(conn.unsynced().is_empty(), "the frontier settled the write");
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Held(HeldWork::WireLost { .. }))),
+        "a settled batch closes its wire without reporting the work as lost"
+    );
 }
 
 #[tokio::test]
@@ -656,4 +662,49 @@ async fn a_held_write_the_old_major_rate_limits_drains_over_the_redial() {
         conn.unsynced().is_empty(),
         "the settled write leaves the queue"
     );
+}
+
+#[tokio::test]
+async fn a_dropped_drain_wire_reports_its_held_work_as_wire_lost() {
+    let dir = tempdir().expect("temp dir");
+    let (mut conn, old_version) = held_under_number(&dir).await;
+
+    // An old server that acks and then hangs up before settling anything.
+    let (client_end, mut server_end) = loopback();
+    tokio::spawn(async move {
+        let _ = server_end.recv().await;
+        let _ = server_end
+            .send_control(ControlMessage::HandshakeAck(HandshakeAck {
+                connection_id: "old".to_owned(),
+                session_token: "old".to_owned(),
+                resume_token: "old".to_owned(),
+                current_cursor: Cursor::new(Vec::new()),
+                schema_version: Some(old_version),
+                initial_credits: 64,
+                writer: Some(WriterGrant {
+                    number: NUMBER,
+                    frontier: 0,
+                }),
+            }))
+            .await;
+        let _ = server_end.close().await;
+    });
+    let timer = conn.drain_timer().expect("a dial is owed");
+    conn.attach_drain(timer, client_end)
+        .await
+        .expect("attach the drain");
+    let events = pump_until(
+        &mut conn,
+        |event| matches!(event, ClientEvent::Held(HeldWork::WireLost { major }) if *major == one()),
+    )
+    .await;
+    assert!(
+        matches!(events.last(), Some(ClientEvent::Held(HeldWork::WireLost { major })) if *major == one()),
+        "the dropped wire reports the held work it still carried"
+    );
+    assert!(
+        conn.drain_timer().is_some(),
+        "the held write is still owed after the drain wire dropped"
+    );
+    assert_eq!(conn.unsynced().len(), 1);
 }

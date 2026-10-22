@@ -9,7 +9,9 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use connetto_client::live::ConnettoClient;
 use connetto_client::{ClientEvent, ConnettoConnection};
-use connetto_core::messages::{CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, ContentVerb};
+use connetto_core::messages::{
+    CONTENT_TICKET_REFUSED, CONTENT_TICKET_SIGNER_ERROR, ContentVerb, HeldWork,
+};
 use connetto_core::traits::Transport;
 use connetto_file_core::{FileId, MaybeSend};
 use tokio::sync::broadcast::error::RecvError;
@@ -70,13 +72,14 @@ where
         .await?;
     loop {
         match events.recv().await {
-            Ok(event) => match classify(event, &request_id, file_id) {
+            Ok(event) => match classify_held(event, &request_id, file_id) {
                 TicketAnswer::Granted(url) => return Ok(url),
                 TicketAnswer::Failed(error) => return Err(error),
                 TicketAnswer::Unrelated(_) => {}
             },
             Err(RecvError::Lagged(_)) => return Err(ContentError::TicketLagged),
-            // The drain wire is gone, so no answer to this request is coming.
+            // The whole connection is gone, so no answer to this request
+            // is coming.
             Err(RecvError::Closed) => return Err(ContentError::TicketAbandoned),
         }
     }
@@ -85,6 +88,9 @@ where
 pub(crate) struct PendingTicket {
     pub(crate) file_id: FileId,
     request_id: String,
+    /// The drain dial generation the request rode on. `None` is the main
+    /// wire, which reissues on its own.
+    dial: Option<u64>,
 }
 
 pub(crate) async fn request_connection_or<T, C>(
@@ -136,6 +142,7 @@ where
     *pending = Some(PendingTicket {
         file_id,
         request_id,
+        dial: None,
     });
     Ok(())
 }
@@ -165,12 +172,14 @@ where
                 return Err(err.into());
             }
         };
-        if let Some(result) = resolve_connection_event(event, file_id, pending, observed) {
+        if let Some(result) = resolve_held_connection_event(event, file_id, pending, observed) {
             return result.map(Some);
         }
     }
 }
 
+/// Asks for one ticket on the drain wire, reissuing it when the dial
+/// generation the request rode on is gone (R31).
 pub(crate) async fn ensure_pending_held_request<T: Transport>(
     connection: &mut ConnettoConnection<T>,
     file_id: FileId,
@@ -180,7 +189,11 @@ pub(crate) async fn ensure_pending_held_request<T: Transport>(
 where
     T::Error: Display,
 {
-    if pending.is_some() {
+    let dial = connection.drain_dial_generation();
+    if pending
+        .as_ref()
+        .is_some_and(|ticket| ticket.dial == Some(dial))
+    {
         return Ok(());
     }
     let request_id = next_request_id();
@@ -190,6 +203,7 @@ where
     *pending = Some(PendingTicket {
         file_id,
         request_id,
+        dial: Some(dial),
     });
     Ok(())
 }
@@ -225,6 +239,17 @@ fn classify(event: ClientEvent, request_id: &str, file_id: FileId) -> TicketAnsw
     }
 }
 
+/// What one pumped event means for a held ticket request, which settles as
+/// abandoned when the drain wire the request rode on is gone (R31).
+fn classify_held(event: ClientEvent, request_id: &str, file_id: FileId) -> TicketAnswer {
+    match event {
+        ClientEvent::Held(HeldWork::WireLost { .. }) => {
+            TicketAnswer::Failed(ContentError::TicketAbandoned)
+        }
+        event => classify(event, request_id, file_id),
+    }
+}
+
 fn resolve_connection_event(
     event: ClientEvent,
     file_id: FileId,
@@ -251,6 +276,22 @@ fn resolve_connection_event(
     };
     pending.take();
     Some(result)
+}
+
+/// What one pumped event means for a held ticket request, settling it as
+/// abandoned when the drain wire it rode on is gone (R31).
+fn resolve_held_connection_event(
+    event: ClientEvent,
+    file_id: FileId,
+    pending: &mut Option<PendingTicket>,
+    observed: &mut Vec<ClientEvent>,
+) -> Option<Result<String, ContentError>> {
+    if matches!(event, ClientEvent::Held(HeldWork::WireLost { .. })) && pending.is_some() {
+        observed.push(event);
+        pending.take();
+        return Some(Err(ContentError::TicketAbandoned));
+    }
+    resolve_connection_event(event, file_id, pending, observed)
 }
 
 /// What one pumped event has to say about one in-flight ticket request,
@@ -297,6 +338,7 @@ mod tests {
         PendingTicket {
             file_id: FileId::from_bytes([1; 32]),
             request_id: "content-7".to_owned(),
+            dial: None,
         }
     }
 

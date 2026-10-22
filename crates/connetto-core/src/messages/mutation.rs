@@ -219,6 +219,13 @@ pub enum HeldWork {
         /// The major whose held work is done.
         major: Major,
     },
+    /// The drain wire the held work rides is gone and a redial is owed, so a
+    /// content ticket asked on it settles as abandoned and is reissued on
+    /// the fresh wire.
+    WireLost {
+        /// The major whose held work is draining.
+        major: Major,
+    },
 }
 
 #[cfg(test)]

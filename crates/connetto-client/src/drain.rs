@@ -88,6 +88,9 @@ pub(crate) struct Drain<T> {
     /// Writers the old major refused, whose entries a number the drain is
     /// issued takes over.
     dead: BTreeSet<WriterRef>,
+    /// The arm count the attached wire's dial carried, so a held content
+    /// ticket told on one wire recognizes the wire it rode on.
+    dial: u64,
     timer: Option<DrainTimer>,
     episode: Backoff<'static>,
     armed: u64,
@@ -104,6 +107,7 @@ impl<T> Drain<T> {
             #[cfg(feature = "device-identity")]
             bind: None,
             dead: BTreeSet::new(),
+            dial: 0,
             timer: None,
             episode: DRAIN_POLICY.start(),
             armed: 0,
@@ -190,6 +194,13 @@ where
     #[must_use]
     pub const fn drain_timer(&self) -> Option<DrainTimer> {
         self.drain.timer
+    }
+
+    /// The dial generation the attached drain wire rode on, so a held
+    /// content ticket told on one wire recognizes the redial (R31).
+    #[must_use]
+    pub const fn drain_dial_generation(&self) -> u64 {
+        self.drain.dial
     }
 
     /// The major whose held work is draining, if any.
@@ -369,9 +380,9 @@ where
         .await;
         match outcome {
             Ok(ack) => {
+                self.drain.dial = timer.armed;
                 self.drain.wire = Some(transport);
                 self.drain.unbind();
-                self.drain.episode = DRAIN_POLICY.start();
                 self.drain_bound(major, writer, request, ack).await
             }
             Err(
@@ -813,13 +824,26 @@ where
     }
 
     /// Close and forget the drain wire, owing a redial when work remains.
+    /// Say on the event stream that the wire is gone when it still carried
+    /// held work, so a held content ticket told on it settles as abandoned
+    /// (R31).
     async fn drop_drain_wire(&mut self) {
+        let major = self.drain.batch.as_ref().map(|batch| batch.major);
         if let Some(mut wire) = self.drain.wire.take() {
             let _ = wire.close().await;
         }
         self.drain.unbind();
         if self.drain.batch.is_some() && self.drain.timer.is_none() {
             self.drain.back_off();
+        }
+        let Some(major) = major else {
+            return;
+        };
+        if self.holds_major(major)
+            || (self.config.held_content.count)(&mut self.db, major).unwrap_or(0) > 0
+        {
+            self.notices
+                .push_back(ClientEvent::Held(HeldWork::WireLost { major }));
         }
     }
 
