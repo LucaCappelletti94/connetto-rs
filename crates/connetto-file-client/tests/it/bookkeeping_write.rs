@@ -30,6 +30,7 @@ use connetto_test_harness::{
 };
 use diesel::prelude::*;
 use tempfile::tempdir;
+use tokio::sync::broadcast::error::RecvError;
 
 /// The application's own table, as Postgres holds it.
 const PG_DDL: &str = "CREATE TABLE photos (id INT PRIMARY KEY, owner TEXT, \
@@ -109,8 +110,15 @@ async fn the_content_outbox_delete_never_rides_an_application_write() {
     {
         let seen = Arc::clone(&seen);
         tokio::spawn(async move {
-            while let Ok(event) = events.recv().await {
-                seen.lock().expect("seen lock poisoned").push(event);
+            loop {
+                match events.recv().await {
+                    Ok(event) => seen.lock().expect("seen lock poisoned").push(event),
+                    Err(RecvError::Lagged(n)) => panic!(
+                        "the collector lagged {n} events, so the negative check \
+                         would run on a partial list"
+                    ),
+                    Err(RecvError::Closed) => break,
+                }
             }
         });
     }
@@ -123,6 +131,9 @@ async fn the_content_outbox_delete_never_rides_an_application_write() {
     wait_for_pg_state(&fixture, file_id.as_bytes(), "available").await;
 
     // Made while the upload's outbox delete would still sit in an unfiltered capture session.
+    // The write is the device's last mutation, so the next applied event the
+    // collector takes in is its own.
+    let events_before = seen.lock().expect("seen lock poisoned").len();
     a.with_conn(|conn| {
         diesel::insert_into(photos::table)
             .values((
@@ -139,8 +150,7 @@ async fn the_content_outbox_delete_never_rides_an_application_write() {
 
     wait_for_app_row(&fixture).await;
 
-    // Lets the collector drain every event sent before the row landed.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    wait_for_applied(&seen, events_before).await;
     let seen = seen.lock().expect("seen lock poisoned").clone();
     let rejected: Vec<u64> = seen
         .iter()
@@ -394,6 +404,27 @@ async fn wait_for_app_row(fixture: &Fixture) {
             tokio::time::Instant::now() < deadline,
             "the application's own write never reached Postgres; the content \
              bookkeeping rode the same mutation and the server refused the whole thing"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// Waits, bounded, until the collector takes in an applied event after `before`.
+async fn wait_for_applied(seen: &Arc<Mutex<Vec<ClientEvent>>>, before: usize) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let applied = seen
+            .lock()
+            .expect("seen lock poisoned")
+            .iter()
+            .skip(before)
+            .any(|event| matches!(event, ClientEvent::MutationApplied { .. }));
+        if applied {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the application write's applied event never arrived"
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
