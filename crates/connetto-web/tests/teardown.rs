@@ -18,8 +18,8 @@ use connetto_file_client::BrowserStore;
 use connetto_file_core::{ChunkHash, ChunkStore};
 use connetto_web::auth::{IdbKeyStore, PendingWork, provision_replica_key};
 use connetto_web::storage::{
-    PendingWipe, ReplicaStorage, WipeError, WipeProgress, mark_wipe_pending, take_pending_wipes,
-    tier_db_name, wipe_replica,
+    PendingWipe, ReplicaStorage, WipeError, WipeProgress, hub_meta_db_name, mark_wipe_pending,
+    take_pending_wipes, tier_db_name, wipe_replica,
 };
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
@@ -208,6 +208,57 @@ async fn a_wipe_destroys_the_tier_beside_the_replica() {
     );
     assert!(
         listed.iter().any(|entry| entry == &tier_db_name(bob)),
+        "and the other identity's is untouched"
+    );
+}
+
+/// The relay hub's own state database goes with the replica, because it
+/// shares the key being shredded and has no key record of its own.
+///
+/// Left behind it would outlive the key that opens it, and the next boot for
+/// this identity would mint a fresh key, meet the surviving file and die at
+/// the unlock, which is the same failure R17 closed for the tier arriving
+/// through the wipe path.
+#[wasm_bindgen_test]
+async fn a_wipe_destroys_the_hub_meta_beside_the_replica() {
+    let storage = ReplicaStorage::install().await;
+    let keys = IdbKeyStore::open().await.expect("open the key store");
+    let alice = "e3-hubmeta-wipe-alice.sqlite";
+    let bob = "e3-hubmeta-wipe-bob.sqlite";
+    let alice_hub = hub_meta_db_name(alice);
+    let bob_hub = hub_meta_db_name(bob);
+    reset(&storage, &keys, alice).await;
+    reset(&storage, &keys, bob).await;
+    storage.delete_db(&alice_hub).expect("clear");
+    storage.delete_db(&bob_hub).expect("clear");
+    // Four databases at once and a rollback journal for each, against a pool
+    // that ships six slots and holds whatever the earlier tests left.
+    storage.reserve(8).await.expect("room in the pool");
+
+    // Two identities, each with a replica and the hub's state database beside
+    // it, both under that identity's one key.
+    for (name, hub) in [(alice, &alice_hub), (bob, &bob_hub)] {
+        let key = provision_replica_key(&keys, name).await.expect("mint");
+        write_marker(&mut open(&storage, name, &key));
+        write_marker(&mut open(&storage, hub, &key));
+    }
+    assert!(
+        storage.exists(&alice_hub) && storage.exists(&bob_hub),
+        "both state databases are here"
+    );
+
+    wipe_replica(&storage, &keys, alice, None, &work(&[]), false)
+        .await
+        .expect("wipe alice");
+
+    // Read off the pool's own listing, not off what the delete returned.
+    let listed = storage.list();
+    assert!(
+        !listed.iter().any(|entry| entry == &alice_hub),
+        "the wiped identity's hub state is gone too"
+    );
+    assert!(
+        listed.iter().any(|entry| entry == &bob_hub),
         "and the other identity's is untouched"
     );
 }

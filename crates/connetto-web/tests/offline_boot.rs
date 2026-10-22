@@ -42,7 +42,6 @@ fn builder() -> WebClientBuilder {
         Some(TIER_DDL),
     );
     WebClientBuilder::new(NOWHERE, SyncSchema::new(bundle))
-        .with_hub_meta_name("r20-offline-boot-hub.sqlite")
         .with_upstream("r20-upstream", "SELECT * FROM items")
         .with_content_namespace("r68-offline-content")
 }

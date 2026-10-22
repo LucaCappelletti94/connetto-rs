@@ -12,11 +12,9 @@ pub const PHOTO_QUERY: &str = "SELECT * FROM photos";
 
 // Distinct names separate test records within the shared pool.
 const ALIGN_DB_PREFIX: &str = "connetto-yew-align";
-const ALIGN_HUB_META: &str = "connetto-yew-align-hub-meta.sqlite";
 const ALIGN_AUTH_DB: &str = "connetto-yew-align-auth.sqlite";
 
 const PHOTO_DB_PREFIX: &str = "connetto-yew-photo";
-const PHOTO_HUB_META: &str = "connetto-yew-photo-hub-meta.sqlite";
 const PHOTO_AUTH_DB: &str = "connetto-yew-photo-auth.sqlite";
 
 /// The one sync schema the worker and every tab build from.
@@ -32,7 +30,7 @@ pub fn demo_schema() -> connetto_client::SyncSchema {
 /// A string describing the VFS, upstream connect, or subscribe failure.
 #[wasm_bindgen]
 pub async fn db_worker_boot_align() -> Result<(), JsValue> {
-    boot_with(ALIGN_DB_PREFIX, ALIGN_HUB_META, ALIGN_AUTH_DB).await
+    boot_with(ALIGN_DB_PREFIX, ALIGN_AUTH_DB).await
 }
 
 /// Worker entry point for the photo test; uses `connetto-yew-photo*` OPFS files.
@@ -42,17 +40,12 @@ pub async fn db_worker_boot_align() -> Result<(), JsValue> {
 /// A string describing the VFS, upstream connect, or subscribe failure.
 #[wasm_bindgen]
 pub async fn db_worker_photo_boot() -> Result<(), JsValue> {
-    boot_with(PHOTO_DB_PREFIX, PHOTO_HUB_META, PHOTO_AUTH_DB).await
+    boot_with(PHOTO_DB_PREFIX, PHOTO_AUTH_DB).await
 }
 
-async fn boot_with(
-    db_prefix: &'static str,
-    hub_meta: &'static str,
-    auth_db: &'static str,
-) -> Result<(), JsValue> {
+async fn boot_with(db_prefix: &'static str, auth_db: &'static str) -> Result<(), JsValue> {
     connetto_web::logging::init_console();
     connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
-        .with_hub_meta_name(hub_meta)
         .with_upstream("db-upstream", DEMO_QUERY)
         .with_upstream("db-photos-upstream", PHOTO_QUERY)
         .with_content_namespace("connetto-photo-content")

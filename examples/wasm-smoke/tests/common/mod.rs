@@ -28,12 +28,11 @@ pub fn auth_config() -> connetto_client::Auth {
 }
 
 /// The logged-in worker these suites boot, gate off, under their own
-/// prefix, hub and account index.
+/// prefix and account index.
 pub fn worker_builder() -> connetto_web::builder::WebDurable {
     use connetto_wasm_smoke::workers::{DB_NAME, DEMO_QUERY, DEMO_WS_URL, demo_schema};
     connetto_web::builder::WebClientBuilder::new(DEMO_WS_URL, demo_schema())
         .with_upstream("e42-upstream", DEMO_QUERY)
-        .with_hub_meta_name("e42-hub-meta.sqlite")
         .with_content_namespace("e42-content")
         .signed_in(auth_config())
         .with_redirect_uri(connetto_wasm_smoke::auth_landing())

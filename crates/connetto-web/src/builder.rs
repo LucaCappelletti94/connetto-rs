@@ -50,8 +50,6 @@ pub(crate) struct WebConfig {
     pub(crate) policy: ReconnectPolicy,
     /// The hub's upstream subscriptions, primary first.
     pub(crate) upstream: Vec<(&'static str, &'static str)>,
-    /// The hub metadata database name.
-    pub(crate) hub_meta_name: &'static str,
     /// The content archive's namespace seed, `None` for a build without files.
     pub(crate) content_namespace: Option<&'static str>,
     /// The content loss-heal queries and their `content_id` columns.
@@ -111,7 +109,6 @@ impl WebClientBuilder {
                     tuning: SyncTuning::default(),
                     policy: ReconnectPolicy::default(),
                     upstream: Vec::new(),
-                    hub_meta_name: "connetto-hub-meta.sqlite",
                     content_namespace: None,
                     content_heal_lost: Vec::new(),
                     content_http: BrowserHttp::new(),
@@ -163,12 +160,6 @@ impl WebClientBuilder {
     /// dials a server that is not ready.
     pub fn with_connect_gate(mut self, channel: &'static str) -> Self {
         self.build.web.connect_gate = Some(channel);
-        self
-    }
-
-    /// Name the database the worker's hub keeps its own state in.
-    pub fn with_hub_meta_name(mut self, name: &'static str) -> Self {
-        self.build.web.hub_meta_name = name;
         self
     }
 
