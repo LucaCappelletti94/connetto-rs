@@ -456,8 +456,8 @@ fn translate_tier<K: CapabilityKey>(tier_sql: &str) -> Result<String, SchemaErro
     Ok(ddl)
 }
 
-/// Print a rerun trigger for every file in the history directory, failing
-/// the build when the directory is not there.
+/// Print a rerun trigger for the history directory and every file in it,
+/// failing the build when the directory is not there.
 ///
 /// # Errors
 ///
@@ -473,6 +473,7 @@ fn rerun_history(dir: &Path) -> Result<(), SchemaError> {
         }
         Err(err) => return Err(err.into()),
     };
+    println!("cargo::rerun-if-changed={}", dir.display());
     for entry in entries {
         let path = entry.map_err(SchemaError::from)?.path();
         println!("cargo::rerun-if-changed={}", path.display());
@@ -547,9 +548,10 @@ pub(crate) fn emit_to<K: CapabilityKey, Id: BotRegistryIdSql>(
     if let Some(tier) = tier {
         let tier_sql = std::fs::read_to_string(tier.source())?;
         let tier_ddl = translate_tier::<K>(&tier_sql)?;
-        bundle = bundle.with_local_tier(tier_ddl.clone());
         let history = boundary::tier_history(tier.history(), bundle.major(), &tier_ddl)?;
-        bundle = bundle.with_tier_history(history)?;
+        bundle = bundle
+            .with_local_tier(tier_ddl)
+            .with_tier_history(history)?;
     }
     std::fs::write(out_dir.join("connetto-cap-policies.sql"), &cap)?;
     std::fs::write(out_dir.join("connetto-schema.rs"), render(&bundle, &cap))?;

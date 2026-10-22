@@ -27,7 +27,7 @@ diesel::table! {
     /// SQLite's own catalogue, the typed read behind the shape. The pragma
     /// columns the shape needs beside it are read raw, since diesel has no
     /// query type for a pragma.
-    #[sql_name = "sqlite_schema"]
+    #[sql_name = "sqlite_master"]
     tier_sqlite_schema (name) {
         /// The object kind, `table`, `view`, `index` or `trigger`.
         #[sql_name = "type"]
@@ -88,7 +88,7 @@ pub struct TierTable {
     pub columns: Vec<TierColumn>,
     /// The table's indexes, by name, SQLite's own autoindexes excluded.
     pub indexes: Vec<TierIndex>,
-    /// The table's `CREATE` statement, as SQLite holds it in `sqlite_schema`.
+    /// The table's `CREATE` statement, as SQLite holds it in `sqlite_master`.
     pub create_sql: String,
 }
 
@@ -246,7 +246,10 @@ pub fn read_tier_shape(conn: &mut SqliteConnection) -> Result<TierShape, ShapeEr
                 );
             }
             "trigger" => {
-                if tables.contains_key(&table) {
+                if tables
+                    .keys()
+                    .any(|owner| owner.eq_ignore_ascii_case(&table))
+                {
                     triggers.insert(name, statement);
                 }
             }
@@ -660,6 +663,23 @@ mod tests {
             shape.views.get("note_words"),
             Some(&"CREATE VIEW note_words AS SELECT body FROM notes".to_string())
         );
+    }
+
+    /// A trigger that fires on the table with different case spelling
+    /// counts as the table's, so it stays in the shape.
+    #[test]
+    fn a_trigger_named_on_the_table_with_different_case_is_in_the_shape() {
+        let mut conn = open(
+            "CREATE TABLE notes (a TEXT);
+             CREATE TRIGGER notes_touch AFTER INSERT ON NOTES BEGIN SELECT 1; END;",
+        );
+        let shape = read_tier_shape(&mut conn).expect("read the shape");
+        assert_eq!(
+            shape.triggers.len(),
+            1,
+            "the trigger stays in the shape under the table's own spelling"
+        );
+        assert!(shape.triggers.contains_key("notes_touch"));
     }
 
     /// SQLite's own indexes, built for its own constraints, stay out of the

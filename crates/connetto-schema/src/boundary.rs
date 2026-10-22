@@ -75,7 +75,7 @@ struct BoundaryFile {
 diesel::table! {
     /// The catalogue one export reads its objects from, the same catalogue
     /// the shape reader walks for its tables and views.
-    #[sql_name = "sqlite_schema"]
+    #[sql_name = "sqlite_master"]
     boundary_catalog (name) {
         /// The object kind: `table`, `view`, `index` or `trigger`.
         #[sql_name = "type"]
@@ -258,7 +258,7 @@ pub(crate) fn generate(
                 statements.push(object_sql(new, &index.name));
             }
             for (trigger, table_name) in &new.trigger_tables {
-                if table_name.as_str() == name.as_str() {
+                if table_name.eq_ignore_ascii_case(name) {
                     statements.push(object_sql(new, trigger));
                 }
             }
@@ -297,7 +297,7 @@ pub(crate) fn generate(
             }
         }
         if rebuild_required(&diff, old_table, new_table) {
-            rebuild_table(old_name, new_name, new_table, new, &diff, &mut statements);
+            rebuild_table(new_name, new_table, new, &diff, &mut statements);
         } else {
             stable_table(old_name, new_name, old, new, decls, &diff, &mut statements);
         }
@@ -572,6 +572,17 @@ fn rebuild_required(diff: &ColumnDiff, old_table: &TierTable, new_table: &TierTa
             return true;
         }
     }
+    // SQLite appends an added column, so the carried columns lead the new
+    // table in their own order unless the change added one between them.
+    if new_table
+        .columns
+        .iter()
+        .take(diff.carried.len())
+        .zip(&diff.carried)
+        .any(|(column, (new_name, _))| column.name != *new_name)
+    {
+        return true;
+    }
     // The carried columns must lead the new table in the old table's
     // relative order, which a plain alter keeps but a reorder does not.
     let mut last: Option<usize> = None;
@@ -591,9 +602,8 @@ fn rebuild_required(diff: &ColumnDiff, old_table: &TierTable, new_table: &TierTa
 
 /// The rebuild path for one table, the one that moves the data across a
 /// temporary copy built from the newer export, so every change at once
-/// takes effect under the old table's name.
+/// takes effect under the table's final name.
 fn rebuild_table(
-    old_name: &str,
     new_name: &str,
     new_table: &TierTable,
     new: &LoadedExport,
@@ -619,14 +629,14 @@ fn rebuild_table(
             .join(", ");
         statements.push(format!(
             "INSERT INTO {tmp} ({new_columns}) SELECT {old_columns} FROM {}",
-            connetto_core::sql::quote_ident(old_name)
+            connetto_core::sql::quote_ident(new_name)
         ));
     }
     // The temporary copy's indexes and triggers die with the old table, so
     // the newer export's ones come back verbatim under the final name.
     statements.push(format!(
         "DROP TABLE {}",
-        connetto_core::sql::quote_ident(old_name)
+        connetto_core::sql::quote_ident(new_name)
     ));
     statements.push(format!(
         "ALTER TABLE {tmp} RENAME TO {}",
@@ -636,7 +646,7 @@ fn rebuild_table(
         statements.push(object_sql(new, &index.name));
     }
     for (trigger, table) in &new.trigger_tables {
-        if table == new_name {
+        if table.eq_ignore_ascii_case(new_name) {
             statements.push(object_sql(new, trigger));
         }
     }
@@ -703,13 +713,13 @@ fn stable_table(
     // A trigger the older export fires that the newer one keeps unchanged
     // stays, every other one it fires is dropped.
     for (trigger, table) in &old.trigger_tables {
-        if table != old_name {
+        if !table.eq_ignore_ascii_case(old_name) {
             continue;
         }
         let kept = new
             .trigger_tables
             .get(trigger)
-            .is_some_and(|new_table_name| new_table_name == new_name)
+            .is_some_and(|new_table_name| new_table_name.eq_ignore_ascii_case(new_name))
             && new.shape.triggers.get(trigger) == old.shape.triggers.get(trigger);
         if !kept {
             statements.push(format!(
@@ -721,13 +731,13 @@ fn stable_table(
     // A trigger the newer export fires that the older one did not keep
     // unchanged comes back verbatim.
     for (trigger, table) in &new.trigger_tables {
-        if table != new_name {
+        if !table.eq_ignore_ascii_case(new_name) {
             continue;
         }
         let unchanged = old
             .trigger_tables
             .get(trigger)
-            .is_some_and(|old_table_name| old_table_name == old_name)
+            .is_some_and(|old_table_name| old_table_name.eq_ignore_ascii_case(old_name))
             && old.shape.triggers.get(trigger) == new.shape.triggers.get(trigger);
         if !unchanged {
             statements.push(object_sql(new, trigger));
@@ -1223,6 +1233,34 @@ mod tests {
         assert_eq!(column_values(&mut conn, "a", "y"), vec!["one".to_owned()]);
     }
 
+    /// A trigger that fires on a new table with different case spelling is
+    /// created with the table, the shape reading the trigger as the
+    /// table's.
+    #[test]
+    fn a_trigger_named_on_the_new_table_with_different_case_is_created() {
+        let old = export(1, "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);");
+        let new = export(
+            2,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);
+             CREATE TABLE b (x INTEGER PRIMARY KEY, y TEXT);
+             CREATE TRIGGER b_tr AFTER INSERT ON B BEGIN SELECT 1; END;",
+        );
+        let boundary = step(&old, &new, &no_decls()).expect("generate the step");
+        assert!(
+            boundary.contains("CREATE TRIGGER b_tr"),
+            "the trigger must ride the new table: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);",
+            "INSERT INTO a VALUES (1, 'one');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);
+             CREATE TABLE b (x INTEGER PRIMARY KEY, y TEXT);
+             CREATE TRIGGER b_tr AFTER INSERT ON B BEGIN SELECT 1; END;",
+        );
+        assert_eq!(column_values(&mut conn, "b", "y"), Vec::<String>::new());
+    }
+
     /// A table the boundary file declares dropped is dropped, and nothing
     /// the file did not declare is.
     #[test]
@@ -1272,6 +1310,43 @@ mod tests {
             "CREATE TABLE b (x INTEGER PRIMARY KEY, y TEXT);",
         );
         assert_eq!(column_values(&mut conn, "b", "y"), vec!["one".to_owned()]);
+    }
+
+    /// A table the boundary renames and whose change forces the rebuild path
+    /// runs the rebuild under its new name, keeping the rows.
+    #[test]
+    fn a_table_renamed_and_rebuilt_runs_the_rebuild_under_the_new_name() {
+        let old = export(1, "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT, w TEXT);");
+        let new = export(2, "CREATE TABLE b (x INTEGER PRIMARY KEY, y TEXT);");
+        let boundary = step(&old, &new, &decls(&[], &[("a", "w")], &[("a", "b")], &[]))
+            .expect("generate the step");
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT, w TEXT);",
+            "INSERT INTO a VALUES (1, 'one', 'w');",
+            &boundary,
+            "CREATE TABLE b (x INTEGER PRIMARY KEY, y TEXT);",
+        );
+        assert_eq!(column_values(&mut conn, "b", "y"), vec!["one".to_owned()]);
+    }
+
+    /// A column added between carried columns takes the rebuild path, which
+    /// keeps the new table's column order.
+    #[test]
+    fn a_column_added_between_carried_ones_rebuilds() {
+        let old = export(1, "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);");
+        let new = export(2, "CREATE TABLE a (x INTEGER PRIMARY KEY, z TEXT, y TEXT);");
+        let boundary = step(&old, &new, &no_decls()).expect("generate the step");
+        assert!(
+            boundary.contains("connetto_rebuild"),
+            "a middle add must rebuild: {boundary}"
+        );
+        let mut conn = migrate(
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, y TEXT);",
+            "INSERT INTO a VALUES (1, 'one');",
+            &boundary,
+            "CREATE TABLE a (x INTEGER PRIMARY KEY, z TEXT, y TEXT);",
+        );
+        assert_eq!(column_values(&mut conn, "a", "y"), vec!["one".to_owned()]);
     }
 
     /// A nullable column with a constant default is added with an add
