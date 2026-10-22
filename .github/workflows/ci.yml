@@ -190,9 +190,9 @@ jobs:
       - name: Run nightly clippy
         run: |
           failed=()
-          while read -r cwd flags target; do
-            echo "::group::nightly clippy ${cwd} ${flags} ${target}"
-            if ! (cd "$cwd" && cargo +nightly clippy --all-targets $flags ${target:+"$target"} -- -D warnings </dev/null); then
+          while read -r cwd args; do
+            echo "::group::nightly clippy ${cwd} ${args}"
+            if ! (cd "$cwd" && cargo +nightly clippy --all-targets $args -- -D warnings </dev/null); then
               failed+=("$cwd")
             fi
             echo "::endgroup::"
