@@ -299,9 +299,9 @@ enum TabOut {
 /// A fault while handling one tab's frame: either close that tab, or a
 /// hub-fatal error.
 enum TabFault {
-    /// Close the offending tab, telling it why.
     /// Close the tab with a typed refusal it can act on.
     Refuse(FatalErrorReason),
+    /// Close the offending tab, telling it why.
     Close(String),
     /// The hub itself failed.
     Hub(RelayError),

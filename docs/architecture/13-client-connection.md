@@ -295,7 +295,7 @@ One consequence reaches the application: trusted schema off means a function the
 
 ## Application schema majors and the update path (R31)
 
-**The major is declared once, in the schema source.** A line `-- connetto:major N` in the Postgres schema source is read by `SchemaBundle::new` into `SchemaBundle::major()`, majors start at 1, and a source without the line fails. The application's `build.rs` and the server's boot translation read the same file, so the two cannot disagree, and the line sits inside the bundle hash. The client sends its major in the `Handshake` and the server refuses another with `FatalErrorReason::MajorMismatch { server, client }`. The client reads an older own major as `ClientError::UpdateRequired` and a newer one as `ClientError::ServerBehind`. The bundle-hash check stays and catches the same major built from a different schema. Chapter 02 describes the wire side.
+**The major is declared once, in the schema source.** A line `-- connetto:major N` in the Postgres schema source is read by `SchemaBundle::new` into `SchemaBundle::major()`, majors start at 1, and a source without the line fails. The line sits inside the bundle hash. One schema source, read by the application's `build.rs` and the server's boot translation alike, is the deployment's convention, and the handshake is what enforces it at the wire. The client sends its major in the `Handshake` and the server refuses another with `FatalErrorReason::MajorMismatch { server, client }`. The client reads an older own major as `ClientError::UpdateRequired` and a newer one as `ClientError::ServerBehind`. The bundle-hash check stays and catches the same major built from a different schema. Chapter 02 describes the wire side.
 
 ---
 
