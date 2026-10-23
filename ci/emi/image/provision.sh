@@ -92,7 +92,7 @@ cargo install wasm-pack --locked --version $WASM_PACK_VERSION
 rm -rf ~/.cargo/registry
 ln -s $CACHE/cargo-registry ~/.cargo/registry
 # Every git dependency main locks, fetched into the image, so a job fetches only what moved since.
-git clone -q --depth 1 https://github.com/LucaCappelletti94/connetto-rs /tmp/connetto-rs
+git clone -q --depth 1 https://github.com/connetto-rs/connetto-rs /tmp/connetto-rs
 for lock in /tmp/connetto-rs/Cargo.lock /tmp/connetto-rs/crates/*/Cargo.lock /tmp/connetto-rs/examples/*/Cargo.lock; do
   (cd "\$(dirname "\$lock")" && CARGO_NET_GIT_FETCH_WITH_CLI=true cargo fetch --locked)
 done
@@ -109,6 +109,10 @@ echo "$(jq -r '.digest | sub("^sha256:"; "")' <<<"$asset")  /tmp/actions-runner.
 tar xzf /tmp/actions-runner.tar.gz -C "$run_home"
 "$run_home/bin/installdependencies.sh" >/dev/null
 chown -R "$RUNNER:$RUNNER" "$run_home"
+
+echo "== A process killed for memory fails its step, never the runner service around it"
+install -d /etc/systemd/system.conf.d
+printf '[Manager]\nDefaultOOMPolicy=continue\n' > /etc/systemd/system.conf.d/oom-policy.conf
 
 echo "== Job hooks: the VM's peak memory and sccache's statistics, printed in every job's log"
 install -d /opt/ci-hooks

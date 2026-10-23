@@ -39,7 +39,7 @@ openfga-client = { version = "0.6.1", default-features = false }
 # Tracks the branch rather than a revision, matching subql, which takes the
 # same crate that way. A revision here put two copies of it in one graph,
 # because cargo treats a rev source and a branch source as different packages.
-pg2sqlite = { git = "https://github.com/LucaCappelletti94/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
+pg2sqlite = { git = "https://github.com/connetto-rs/pg2sqlite", branch = "main", default-features = false, features = ["std"] }
 # `signal` is the binary's graceful shutdown: SIGINT and SIGTERM stop the
 # listener and close every live session with ServerShuttingDown.
 tokio = { workspace = true, features = ["signal"] }

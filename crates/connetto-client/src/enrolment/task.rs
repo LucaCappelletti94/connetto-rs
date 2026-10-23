@@ -1348,7 +1348,18 @@ pub(crate) async fn run<L: Link>(link: L, mut enroller: Enroller) {
             run.on_connected(by_look).await;
         }
         by_look = false;
-        let look = next_look(run.held.as_ref(), SystemTime::now());
+        let now = SystemTime::now();
+        // Re-check only the crossing that stops the peer link, so a crossed window closes it at the wake (R76).
+        #[cfg(feature = "peer")]
+        if matches!(run.peer_standing, Standing::Fresh | Standing::Aging)
+            && !matches!(
+                Standing::of(run.held.as_ref(), now),
+                Standing::Fresh | Standing::Aging
+            )
+        {
+            let _ = run.stand_by().await;
+        }
+        let look = next_look(run.held.as_ref(), now);
         tokio::select! {
             () = run.link.ended() => break,
             event = events.recv() => match event {

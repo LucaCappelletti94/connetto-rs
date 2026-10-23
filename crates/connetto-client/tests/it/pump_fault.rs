@@ -1,7 +1,9 @@
 //! A pump that stops on a fault it cannot recover from says why and releases
 //! everything waiting on it.
 
-use connetto_client::{ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir};
+use connetto_client::{
+    ClientBuilder, ClientError, ClientEvent, ConnettoClient, DataDir, MemoryRefreshStore,
+};
 use connetto_core::messages::{
     BulkMessage, ControlMessage, FatalError, FatalErrorReason, HandshakeAck, LivePatch, WriterGrant,
 };
@@ -143,7 +145,11 @@ async fn client() -> (
         super::support::Once::new(script.clone()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        key_store,
+        MemoryRefreshStore::default(),
+    )
     .connect_with_pump()
     .await
     .expect("the builder connects");
@@ -170,7 +176,11 @@ async fn client_no_driver() -> (
         super::support::Once::new(script.clone()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), key_store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        key_store,
+        MemoryRefreshStore::default(),
+    )
     .open_driven()
     .await
     .expect("the builder opens the replica");

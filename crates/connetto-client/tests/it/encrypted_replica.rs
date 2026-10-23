@@ -13,7 +13,9 @@
 //! pretend when no codec is linked, because in a codec-less SQLite `PRAGMA key`
 //! is an unrecognised pragma that succeeds and encrypts nothing.
 
-use connetto_client::{ClientBuilder, ClientError, DataDir, ReplicaKey, SyncSchema, cipher};
+use connetto_client::{
+    ClientBuilder, ClientError, DataDir, MemoryRefreshStore, ReplicaKey, SyncSchema, cipher,
+};
 use connetto_core::schema::SchemaBundle;
 use connetto_core::test_support::FakeTransport;
 use diesel::connection::SimpleConnection;
@@ -103,7 +105,11 @@ async fn an_encrypted_replica_is_ciphertext_at_rest_and_a_plaintext_one_is_not()
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("connect");
@@ -162,7 +168,11 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
             super::support::Once::new(FakeTransport::accepting()),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await
         .expect("first connect");
@@ -187,7 +197,11 @@ async fn a_fresh_process_with_the_cached_key_resumes_with_its_unsynced_work() {
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("reopen with the cached key");
@@ -217,7 +231,11 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
             super::support::Once::new(FakeTransport::accepting()),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await
         .expect("first connect");
@@ -237,7 +255,11 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential.clone())
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await;
     match wrong {
@@ -267,7 +289,11 @@ async fn a_process_without_the_key_cannot_read_the_replica() {
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("a discarded replica re-boots under the new key");
@@ -306,7 +332,11 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
             super::support::Once::new(FakeTransport::accepting()),
         )
         .signed_in(credential.clone())
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await
         .expect("connect the encrypted replica");
@@ -334,7 +364,11 @@ async fn the_durable_local_tier_is_encrypted_under_the_replica_key_and_resumes()
         super::support::Once::new(FakeTransport::accepting()),
     )
     .signed_in(credential)
-    .durable(DataDir::new(dir.path().to_path_buf()), store)
+    .durable(
+        DataDir::new(dir.path().to_path_buf()),
+        store,
+        MemoryRefreshStore::default(),
+    )
     .connect_driven()
     .await
     .expect("reopen the encrypted replica");
@@ -372,7 +406,11 @@ async fn a_tier_file_from_another_connection_cannot_attach_to_an_encrypted_repli
             super::support::Once::new(FakeTransport::accepting()),
         )
         .signed_in(credential)
-        .durable(DataDir::new(dir.path().to_path_buf()), store)
+        .durable(
+            DataDir::new(dir.path().to_path_buf()),
+            store,
+            MemoryRefreshStore::default(),
+        )
         .connect_driven()
         .await;
         assert!(
